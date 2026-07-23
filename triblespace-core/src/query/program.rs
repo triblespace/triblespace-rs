@@ -1030,6 +1030,27 @@ pub trait TypedProgramSpec {
     /// [`ProgramGrouping`]'s V1 family-local planning contract.
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
+    /// Certifies that an accepted value reported by the selected exact
+    /// confirmation Program is already a sound positive witness for the
+    /// paired fully-bound Support route.
+    ///
+    /// The residual engine uses this only for the first frozen candidate of
+    /// one authoritative Confirm activation, and only after a real Program
+    /// replacement has consumed its affine credit. Returning `true` must
+    /// therefore mean that an incremental `accepted(candidate)` effect from
+    /// `confirm_route` proves the same Boolean fact as draining
+    /// `support_route` with that candidate bound. The default is deliberately
+    /// conservative: route-key equality alone is not such a certificate.
+    fn certifies_confirm_positive_tap(
+        &self,
+        _confirm_request: ProgramRequest,
+        _confirm_route: ProgramRoute,
+        _support_request: ProgramRequest,
+        _support_route: ProgramRoute,
+    ) -> bool {
+        false
+    }
+
     fn dispatch(&self, state: &Self::State) -> DispatchClass;
 
     /// Selects the physical budget source for this continuation.
@@ -1208,6 +1229,14 @@ trait ErasedProgramSpec {
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
+    fn certifies_confirm_positive_tap(
+        &self,
+        confirm_request: ProgramRequest,
+        confirm_route: ProgramRoute,
+        support_request: ProgramRequest,
+        support_route: ProgramRoute,
+    ) -> bool;
+
     fn seed_batch(
         &self,
         runtime: &mut ProgramRuntime,
@@ -1287,6 +1316,25 @@ impl<'a> ProgramRef<'a> {
 
     pub(crate) fn route(self, request: ProgramRequest) -> Option<ProgramRoute> {
         self.erased.route(request)
+    }
+
+    pub(crate) fn same_spec(self, other: Self) -> bool {
+        std::ptr::eq(self.erased, other.erased)
+    }
+
+    pub(crate) fn certifies_confirm_positive_tap(
+        self,
+        confirm_request: ProgramRequest,
+        confirm_route: ProgramRoute,
+        support_request: ProgramRequest,
+        support_route: ProgramRoute,
+    ) -> bool {
+        self.erased.certifies_confirm_positive_tap(
+            confirm_request,
+            confirm_route,
+            support_request,
+            support_route,
+        )
     }
 
     pub(crate) fn seed_batch(
@@ -1717,6 +1765,32 @@ where
         }
     }
 
+    fn certifies_confirm_positive_tap(
+        &self,
+        confirm_request: ProgramRequest,
+        confirm_route: ProgramRoute,
+        support_request: ProgramRequest,
+        support_route: ProgramRoute,
+    ) -> bool {
+        if confirm_route.key.arm != support_route.key.arm {
+            return false;
+        }
+        let (selected, confirm_key) = self.selected(confirm_route.key);
+        let (_, support_key) = self.selected(support_route.key);
+        selected.certifies_confirm_positive_tap(
+            confirm_request,
+            ProgramRoute {
+                key: confirm_key,
+                ..confirm_route
+            },
+            support_request,
+            ProgramRoute {
+                key: support_key,
+                ..support_route
+            },
+        )
+    }
+
     fn seed_batch(
         &self,
         runtime: &mut ProgramRuntime,
@@ -1809,6 +1883,32 @@ where
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
         TypedProgramSpec::route(self, request)
+    }
+
+    fn certifies_confirm_positive_tap(
+        &self,
+        confirm_request: ProgramRequest,
+        confirm_route: ProgramRoute,
+        support_request: ProgramRequest,
+        support_route: ProgramRoute,
+    ) -> bool {
+        assert_eq!(
+            confirm_route.key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program received a composed Confirm route arm"
+        );
+        assert_eq!(
+            support_route.key.arm,
+            ProgramRouteArm::Direct,
+            "a direct typed Program received a composed Support route arm"
+        );
+        TypedProgramSpec::certifies_confirm_positive_tap(
+            self,
+            confirm_request,
+            confirm_route,
+            support_request,
+            support_route,
+        )
     }
 
     fn seed_batch(

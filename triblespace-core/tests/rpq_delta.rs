@@ -1007,6 +1007,51 @@ fn certified_chunk_target_confirm_root(
     ]))
 }
 
+fn exact_tap_target_confirm_root(
+    set: TribleSet,
+    bound: Inline<GenId>,
+    candidates: Vec<RawInline>,
+    ops: &[PathOp],
+    suffix: Option<DynConstraint>,
+) -> Root {
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let mut children = vec![
+        Box::new(start.is(bound)) as DynConstraint,
+        Box::new(CertifiedOrderedDomain(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: 4,
+            values: candidates,
+        })) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, start, end, ops)) as DynConstraint,
+    ];
+    children.extend(suffix);
+    Arc::new(IntersectionConstraint::new(children))
+}
+
+fn exact_only_chunk_target_confirm_root(
+    set: TribleSet,
+    bound: Inline<GenId>,
+    candidates: Vec<RawInline>,
+    ops: &[PathOp],
+    suffix: DynConstraint,
+) -> Root {
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(bound)) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: 4,
+            values: candidates,
+        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, start, end, ops)) as DynConstraint,
+        suffix,
+    ]))
+}
+
 fn formula_target_confirm_root(
     set: TribleSet,
     bound: Inline<GenId>,
@@ -3563,6 +3608,198 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
 }
 
 #[test]
+fn forward_exact_confirm_tap_publishes_b0_without_a_second_traversal() {
+    let graph = Graph::new(6, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
+    let first = graph.value(1).raw;
+    let later = graph.value(5).raw;
+    let absent = [u8::MAX; 32];
+    let candidates = vec![first, later, absent, first, graph.value(3).raw];
+    let ops = repeated(graph.attribute, false);
+    let lowering = ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All);
+
+    let mut exact_only = Query::new(
+        target_confirm_root(
+            graph.set.clone(),
+            END,
+            graph.value(0),
+            candidates.clone(),
+            &ops,
+        ),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(lowering)
+    .start_width(1)
+    .cap(1);
+    let mut expected: Vec<_> = exact_only.by_ref().collect();
+    let exact_work = exact_only.stats().delta_transition_candidates_examined;
+    expected.sort_unstable();
+
+    let mut query = Query::new(
+        exact_tap_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates.clone(),
+            &ops,
+            None,
+        ),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(lowering)
+    .start_width(1)
+    .cap(1);
+    let early = query
+        .next()
+        .expect("the exact Confirm replacement should publish reachable B[0]");
+    assert_eq!(early, first);
+    assert_eq!(query.stats().delta_positive_support_terminal_commits, 1);
+    assert_eq!(query.stats().delta_direct_terminal_publication_rows, 1);
+    assert!(
+        query.stats().delta_transition_candidates_examined < exact_work,
+        "the exact Confirm must remain live after its first tapped value"
+    );
+
+    let mut actual = vec![early];
+    actual.extend(query.by_ref());
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual.iter().filter(|&&value| value == first).count(),
+        1,
+        "duplicate B[0] occurrences must settle through one value-keyed P entry"
+    );
+    assert_eq!(
+        query.stats().delta_transition_candidates_examined,
+        exact_work,
+        "the tap must reuse the exact Confirm walk rather than launch Support"
+    );
+
+    let false_candidates = vec![absent, graph.value(3).raw, later];
+    let mut false_control = Query::new(
+        target_confirm_root(
+            graph.set.clone(),
+            END,
+            graph.value(0),
+            false_candidates.clone(),
+            &ops,
+        ),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(lowering)
+    .start_width(1)
+    .cap(1);
+    let mut false_expected: Vec<_> = false_control.by_ref().collect();
+    let false_exact_work = false_control.stats().delta_transition_candidates_examined;
+    false_expected.sort_unstable();
+    let mut false_query = Query::new(
+        exact_tap_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            false_candidates,
+            &ops,
+            None,
+        ),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(lowering)
+    .start_width(1)
+    .cap(1);
+    let mut false_actual: Vec<_> = false_query.by_ref().collect();
+    false_actual.sort_unstable();
+    assert_eq!(false_actual, false_expected);
+    assert_eq!(
+        false_query.stats().delta_positive_support_terminal_commits,
+        0
+    );
+    assert_eq!(
+        false_query.stats().delta_transition_candidates_examined,
+        false_exact_work,
+        "an unreachable B[0] must not pay a duplicate negative Support walk"
+    );
+}
+
+#[test]
+fn forward_exact_confirm_chunk_tap_that_dies_is_not_replayed_from_g_minus_p() {
+    let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let first = graph.value(1).raw;
+    let survivor = graph.value(4).raw;
+    let candidates = vec![first, survivor, [u8::MAX; 32], first];
+    let ops = repeated(graph.attribute, false);
+    let lowering = ResidualLowering::HYBRID;
+
+    let control_calls = Arc::new(Mutex::new(Vec::new()));
+    let mut control = Query::new(
+        exact_only_chunk_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates.clone(),
+            &ops,
+            Box::new(CandidateValueTraceFilter {
+                variable: END,
+                accepted: survivor,
+                calls: Arc::clone(&control_calls),
+            }),
+        ),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(lowering)
+    .start_width(1)
+    .cap(1);
+    let expected: Vec<_> = control.by_ref().collect();
+    let exact_work = control.stats().delta_transition_candidates_examined;
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut query = Query::new(
+        exact_tap_target_confirm_root(
+            graph.set.clone(),
+            graph.value(0),
+            candidates,
+            &ops,
+            Some(Box::new(CandidateValueTraceFilter {
+                variable: END,
+                accepted: survivor,
+                calls: Arc::clone(&calls),
+            })),
+        ),
+        project_end,
+    )
+    .solve_residual_state_lazy_with(lowering)
+    .start_width(1)
+    .cap(1);
+    let actual: Vec<_> = query.by_ref().collect();
+    assert_eq!(actual, expected);
+    assert_eq!(actual, [survivor]);
+    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(
+        query
+            .stats()
+            .delta_positive_support_chunk_homomorphic_commits,
+        1
+    );
+    assert_eq!(
+        query.stats().delta_transition_candidates_examined,
+        exact_work,
+        "Chunk publication must not add a fully-bound Support traversal"
+    );
+
+    let calls = calls.lock().expect("candidate-value trace poisoned");
+    let first_visits = calls
+        .iter()
+        .flatten()
+        .filter(|&&value| value == first)
+        .count();
+    let survivor_visits = calls
+        .iter()
+        .flatten()
+        .filter(|&&value| value == survivor)
+        .count();
+    assert_eq!(
+        first_visits, 1,
+        "B[0] entered K, died there, and must not replay from G minus P"
+    );
+    assert_eq!(survivor_visits, 1);
+}
+
+#[test]
 fn target_confirm_positive_support_classifies_a_chunk_homomorphic_commit() {
     let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
     let absent = [u8::MAX; 32];
@@ -3748,6 +3985,35 @@ fn target_confirm_nullable_support_seed_is_not_publication_authority() {
         query.stats().delta_direct_terminal_publication_batches,
         0,
         "nullable seed acceptance is not a runtime Support receipt"
+    );
+    assert!(query.stats().delta_transition_candidates_examined > 0);
+}
+
+#[test]
+fn forward_exact_confirm_nullable_seed_stays_on_the_late_exact_path() {
+    let graph = Graph::new(2, &[(0, 1)]);
+    let start = graph.value(0).raw;
+    let candidates = vec![start, start, start];
+    let root = exact_tap_target_confirm_root(
+        graph.set.clone(),
+        graph.value(0),
+        candidates,
+        &[PathOp::Attr(graph.attribute.raw()), PathOp::Star],
+        None,
+    );
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .start_width(1)
+        .cap(1);
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), [start]);
+    assert_eq!(query.stats().delta_positive_support_terminal_commits, 0);
+    assert_eq!(
+        query.stats().delta_direct_terminal_publication_rows,
+        0,
+        "seed-time nullable acceptance must not acquire replacement authority"
     );
     assert!(query.stats().delta_transition_candidates_examined > 0);
 }

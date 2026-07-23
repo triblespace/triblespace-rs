@@ -2758,6 +2758,38 @@ impl TypedProgramSpec for RegularPathConstraint {
         Some(route)
     }
 
+    fn certifies_confirm_positive_tap(
+        &self,
+        confirm_request: ProgramRequest,
+        confirm_route: ProgramRoute,
+        support_request: ProgramRequest,
+        support_route: ProgramRoute,
+    ) -> bool {
+        let ProgramAction::Confirm(variable) = confirm_request.action else {
+            return false;
+        };
+        if self.start == self.end
+            || variable != self.end
+            || support_request.action != ProgramAction::Support
+            || !confirm_request.bound.is_set(self.start)
+            || confirm_request.bound.is_set(self.end)
+        {
+            return false;
+        }
+        let mut fully_bound = confirm_request.bound;
+        fully_bound.set(self.end);
+        support_request.bound == fully_bound
+            && confirm_route.key == RPQ_BOUND_FORWARD
+            && support_route.key == RPQ_BOUND_FORWARD
+            && confirm_route.variable == self.end
+            && support_route.variable == self.end
+            && confirm_route.stratum == support_route.stratum
+            && confirm_route.completion == ProgramCompletion::PageableOnly
+            && support_route.completion == ProgramCompletion::PageableOnly
+            && confirm_route.exposure == ProgramExposure::Production
+            && support_route.exposure == ProgramExposure::Production
+    }
+
     fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
         let ProgramAction::Propose(variable) = batch.request.action else {
             panic!("RPQ complete actions support only proposals")
@@ -3446,6 +3478,64 @@ mod delta_program_tests {
             .completion,
             ProgramCompletion::PageableOnly
         );
+    }
+
+    #[test]
+    fn positive_tap_certificate_is_only_distinct_endpoint_bound_forward_confirm() {
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path =
+            RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr([1; ID_LEN])]);
+        let confirm_forward = ProgramRequest {
+            action: ProgramAction::Confirm(end.index),
+            bound: VariableSet::new_singleton(start.index),
+        };
+        let confirm_inverse = ProgramRequest {
+            action: ProgramAction::Confirm(start.index),
+            bound: VariableSet::new_singleton(end.index),
+        };
+        let support = ProgramRequest {
+            action: ProgramAction::Support,
+            bound: VariableSet::new_singleton(start.index)
+                .union(VariableSet::new_singleton(end.index)),
+        };
+        let forward_route = path.route(confirm_forward).unwrap();
+        let inverse_route = path.route(confirm_inverse).unwrap();
+        let support_route = path.route(support).unwrap();
+
+        assert!(path.certifies_confirm_positive_tap(
+            confirm_forward,
+            forward_route,
+            support,
+            support_route,
+        ));
+        assert!(!path.certifies_confirm_positive_tap(
+            confirm_inverse,
+            inverse_route,
+            support,
+            support_route,
+        ));
+
+        let same = RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            start,
+            &[PathOp::Attr([1; ID_LEN]), PathOp::Star],
+        );
+        let same_confirm = ProgramRequest {
+            action: ProgramAction::Confirm(start.index),
+            bound: VariableSet::new_empty(),
+        };
+        let same_support = ProgramRequest {
+            action: ProgramAction::Support,
+            bound: VariableSet::new_singleton(start.index),
+        };
+        assert!(!same.certifies_confirm_positive_tap(
+            same_confirm,
+            same.route(same_confirm).unwrap(),
+            same_support,
+            same.route(same_support).unwrap(),
+        ));
     }
 
     #[test]

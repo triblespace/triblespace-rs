@@ -9,18 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Eligible target-Confirm activations now run a one-occurrence positive
-  Support hedge.** The scheduler independently selects a fully-bound Support
-  route under the same Program policy, installs the complete exact Confirm
-  fallback first, and then seeds only occurrence zero. A generation-fenced
-  parent ledger and clone-safe occurrence link let replacement of one real
-  branch-local producer credit commit and immediately release the witness;
-  duplicate or stale receipts cannot publish twice, a false first occurrence
-  never feeds later candidates, and exact Confirm continues to quiescence with
-  SET subtraction. Nullable seed acceptance is deliberately declined and its
-  uninstalled typed state is affinely discarded before ordinary cleanup.
+- **Eligible target-Confirm activations can publish their first candidate from
+  the authoritative exact traversal.** A new structural Program certificate
+  lets distinct-endpoint forward RPQ Confirm reuse a real replacement receipt
+  that newly accepts occurrence zero, avoiding the duplicate fully-bound
+  Support walk while exact Confirm remains the sole completeness owner.
+  Inverse, same-variable, mixed-family, and uncertified routes retain the
+  one-occurrence Support hedge. Both feeders share the generation-fenced
+  parent SET ledger and immediate grant/release path, so duplicate or stale
+  receipts cannot publish twice, a false first occurrence never feeds later
+  candidates, and quiescent finalization receives exactly `G \ P`. Nullable
+  seed acceptance remains deliberately ineligible for early publication.
   Ineligible continuations still acquire no ledger, and generic joined
-  `AfterChildren` propagation remains outside this first production caller.
+  `AfterChildren` propagation remains outside the Support fallback.
 - **Residual Confirm continuations now carry an executable publication
   receipt.** The private three-valued proof distinguishes an exact terminal
   binding, a nonterminal chunk that first crosses the parent-local candidate

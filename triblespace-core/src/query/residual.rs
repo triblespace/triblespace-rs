@@ -101,7 +101,7 @@ mod materialize;
 mod set_admit;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
-    DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, PositiveSupportSeed,
+    DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, PositivePublicationSeed,
     TerminalPublicationBatch,
 };
 
@@ -10834,20 +10834,38 @@ impl ResidualStateMachine {
                 };
                 match select_program(constraint, plan.program_scope, support_request) {
                     ProgramOffer::Selected(support_spec, support_route) => {
-                        PositiveSupportSeed::from_confirm_transition(
-                            support_spec,
-                            DeltaDesc::leaf(support_route.variable, confirmer),
-                            support_request,
-                            support_route,
-                            state,
-                            &desc,
-                            &successor,
-                            self.full,
-                            plan,
-                            &self.interner.formula_pcs,
-                            support_variables,
-                            self.direct_terminal_publication_full(),
-                        )
+                        if spec.same_spec(support_spec)
+                            && spec.certifies_confirm_positive_tap(
+                                program_request,
+                                route,
+                                support_request,
+                                support_route,
+                            )
+                        {
+                            PositivePublicationSeed::exact_confirm_tap(
+                                state,
+                                &desc,
+                                &successor,
+                                self.full,
+                                plan,
+                                &self.interner.formula_pcs,
+                            )
+                        } else {
+                            PositivePublicationSeed::support_hedge(
+                                support_spec,
+                                DeltaDesc::leaf(support_route.variable, confirmer),
+                                support_request,
+                                support_route,
+                                state,
+                                &desc,
+                                &successor,
+                                self.full,
+                                plan,
+                                &self.interner.formula_pcs,
+                                support_variables,
+                                self.direct_terminal_publication_full(),
+                            )
+                        }
                     }
                     ProgramOffer::Absent | ProgramOffer::Deferred => None,
                 }

@@ -669,26 +669,71 @@ impl PositivePublicationCertificate {
     }
 }
 
-/// Optional one-occurrence positive hedge attached to an exact Confirm seed.
-///
-/// The caller constructs this descriptor only after independently selecting a
-/// fully-bound Support route under the same Program exposure policy. Keeping
-/// the semantic Confirm state and publication certificate beside that route
-/// prevents the physical child from inventing either identity later.
-pub(super) struct PositiveSupportSeed<'a> {
+/// Physical fallback feeder for one exact positive Support hedge.
+struct PositiveSupportSeed<'a> {
     spec: ProgramRef<'a>,
     desc: DeltaDesc,
     request: ProgramRequest,
     route: ProgramRoute,
-    confirm_state: StateId,
-    certificate: PositivePublicationCertificate,
     support_variables: VariableSet,
     direct_terminal_full: Option<VariableSet>,
 }
 
-impl<'a> PositiveSupportSeed<'a> {
+/// Optional positive-publication feeder attached to an exact Confirm seed.
+///
+/// Both variants retain the semantic Confirm identity and certificate. An
+/// exact tap reuses the authoritative Confirm Program's accepted endpoint at
+/// a real replacement boundary. The fallback variant independently runs one
+/// fully-bound Support route and proves its value through the linked physical
+/// child.
+pub(super) struct PositivePublicationSeed<'a> {
+    confirm_state: StateId,
+    certificate: PositivePublicationCertificate,
+    feeder: PositivePublicationFeeder<'a>,
+}
+
+enum PositivePublicationFeeder<'a> {
+    ExactConfirmTap,
+    SupportHedge(PositiveSupportSeed<'a>),
+}
+
+impl<'a> PositivePublicationSeed<'a> {
+    fn certificate(
+        previous: &StateDesc,
+        successor: &StateDesc,
+        full: VariableSet,
+        plan: &ResidualPlan,
+        formula_pcs: &FormulaPcInterner,
+    ) -> Option<PositivePublicationCertificate> {
+        let certificate = PositivePublicationCertificate::from_confirm_transition(
+            previous,
+            successor,
+            full,
+            plan,
+            formula_pcs,
+        );
+        certificate.eligible().then_some(certificate)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn from_confirm_transition(
+    pub(super) fn exact_confirm_tap(
+        confirm_state: StateId,
+        previous: &StateDesc,
+        successor: &StateDesc,
+        full: VariableSet,
+        plan: &ResidualPlan,
+        formula_pcs: &FormulaPcInterner,
+    ) -> Option<Self> {
+        let certificate = Self::certificate(previous, successor, full, plan, formula_pcs)?;
+        Some(Self {
+            confirm_state,
+            certificate,
+            feeder: PositivePublicationFeeder::ExactConfirmTap,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn support_hedge(
         spec: ProgramRef<'a>,
         desc: DeltaDesc,
         request: ProgramRequest,
@@ -702,22 +747,18 @@ impl<'a> PositiveSupportSeed<'a> {
         support_variables: VariableSet,
         direct_terminal_full: Option<VariableSet>,
     ) -> Option<Self> {
-        let certificate = PositivePublicationCertificate::from_confirm_transition(
-            previous,
-            successor,
-            full,
-            plan,
-            formula_pcs,
-        );
-        certificate.eligible().then_some(Self {
-            spec,
-            desc,
-            request,
-            route,
+        let certificate = Self::certificate(previous, successor, full, plan, formula_pcs)?;
+        Some(Self {
             confirm_state,
             certificate,
-            support_variables,
-            direct_terminal_full,
+            feeder: PositivePublicationFeeder::SupportHedge(PositiveSupportSeed {
+                spec,
+                desc,
+                request,
+                route,
+                support_variables,
+                direct_terminal_full,
+            }),
         })
     }
 }
@@ -756,6 +797,19 @@ struct PositiveSupportLink {
 struct PositiveSupportWitness {
     brand: RegistryBrand,
     link: PositiveSupportLink,
+}
+
+/// Affine proof that one exact Confirm Program replacement consumed a real
+/// current-registry credit and newly accepted its frozen first candidate.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+#[must_use = "an exact Confirm witness must be committed or deliberately discarded"]
+struct PositiveConfirmWitness {
+    brand: RegistryBrand,
+    parent: ActivationId,
+    generation: u64,
+    occurrence: usize,
+    value: RawInline,
 }
 
 /// One semantic Terminal origin that must be introduced to the outer
@@ -804,11 +858,18 @@ struct PositivePublicationGrant {
 struct PositivePublicationLedger {
     generation: u64,
     open: bool,
+    source: PositivePublicationSource,
     /// Canonical state is retained only to validate which Confirm reducer
     /// opened this affine parent; it is never a publication key.
     confirm_state: StateId,
     certificate: PositivePublicationCertificate,
     published: BTreeSet<RawInline>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositivePublicationSource {
+    ExactConfirmTap,
+    SupportHedge,
 }
 
 /// Boxed registration keeps the dormant activation tax to one nullable
@@ -1174,6 +1235,9 @@ struct ProgramReplaceOutcome {
     /// Present only for the first accepted-or-supported receipt, and only
     /// after `replace_program` consumed the current registry's real credit.
     positive_support: Option<Box<PositiveSupportWitness>>,
+    /// Present only when an exact-tap Confirm replacement newly accepted its
+    /// frozen B[0] and consumed the current registry's real credit.
+    positive_confirm: Option<Box<PositiveConfirmWitness>>,
     dead_search_pages: usize,
     dead_source_telemetry_pages: usize,
     quiescence: Option<QuiescenceProof>,
@@ -1366,6 +1430,35 @@ impl ProducerRegistry {
         confirm_state: StateId,
         certificate: PositivePublicationCertificate,
     ) -> Option<PositiveConfirmParentId> {
+        self.open_positive_publication_from(
+            activation,
+            confirm_state,
+            certificate,
+            PositivePublicationSource::SupportHedge,
+        )
+    }
+
+    fn open_confirm_positive_publication(
+        &mut self,
+        activation: ActivationId,
+        confirm_state: StateId,
+        certificate: PositivePublicationCertificate,
+    ) -> Option<PositiveConfirmParentId> {
+        self.open_positive_publication_from(
+            activation,
+            confirm_state,
+            certificate,
+            PositivePublicationSource::ExactConfirmTap,
+        )
+    }
+
+    fn open_positive_publication_from(
+        &mut self,
+        activation: ActivationId,
+        confirm_state: StateId,
+        certificate: PositivePublicationCertificate,
+        source: PositivePublicationSource,
+    ) -> Option<PositiveConfirmParentId> {
         let parent = self.positive_parent(activation)?;
         if !matches!(
             &self.state.activations.get(&activation)?.reducer,
@@ -1390,6 +1483,7 @@ impl ProducerRegistry {
             PositivePublicationRegistration::Eligible(PositivePublicationLedger {
                 generation,
                 open: true,
+                source,
                 confirm_state,
                 certificate,
                 published: BTreeSet::new(),
@@ -1443,7 +1537,10 @@ impl ProducerRegistry {
             else {
                 return None;
             };
-            if !ledger.open || !ledger.certificate.eligible() {
+            if !ledger.open
+                || ledger.source != PositivePublicationSource::SupportHedge
+                || !ledger.certificate.eligible()
+            {
                 return None;
             }
             let terminal = terminal_full.is_some_and(|full| {
@@ -1501,19 +1598,8 @@ impl ProducerRegistry {
         Some(child)
     }
 
-    /// Sole positive-publication linearization point.
-    ///
-    /// This exclusive mutable registry borrow is the scheduler's CAS law.
-    /// Current query-clone brand, physical child/link, generation, open
-    /// Confirm reducer, indexed original occurrence, and certificate are
-    /// revalidated before the first `(parent, value)` insertion wins. Every
-    /// later or malformed hedge is an inert `None`.
-    ///
-    /// The returned private grant is an affine contract, not runtime-enforced
-    /// linearity: that eventual production caller must consume it immediately
-    /// with `release_positive_publication`, before performing fallible work.
-    /// In particular, the outer `direct_terminal_full` must arrive here
-    /// unfiltered by the physical child activation's class.
+    /// Commits a linked physical Support witness through the semantic parent's
+    /// sole positive-publication linearization point.
     #[cfg_attr(not(test), allow(dead_code))]
     fn commit_positive_publication(
         &mut self,
@@ -1541,15 +1627,116 @@ impl ProducerRegistry {
             DeltaReturn::PositiveSupport { bound, row } => (*bound, row.clone()),
             _ => return None,
         };
-        let Some(activation) = self.state.activations.get_mut(&link.parent) else {
+        self.commit_positive_value(
+            link.parent,
+            link.generation,
+            link.occurrence,
+            link.value,
+            PositivePublicationSource::SupportHedge,
+            Some(child_context),
+            direct_terminal_full,
+        )
+    }
+
+    /// Commits one branch-local exact Confirm replacement witness.
+    ///
+    /// Witness construction already required a newly accepted B[0] after a
+    /// real Program credit was consumed. This preflight deliberately repeats
+    /// the authoritative acceptance check before entering the shared SET
+    /// linearization point.
+    fn commit_confirm_positive_publication(
+        &mut self,
+        witness: PositiveConfirmWitness,
+        direct_terminal_full: Option<VariableSet>,
+    ) -> Option<PositivePublicationGrant> {
+        if witness.brand != self.brand {
+            return None;
+        }
+        let Some(activation) = self.state.activations.get(&witness.parent) else {
+            return None;
+        };
+        if !activation.accepted.contains(&witness.value) {
+            return None;
+        }
+        self.commit_positive_value(
+            witness.parent,
+            witness.generation,
+            witness.occurrence,
+            witness.value,
+            PositivePublicationSource::ExactConfirmTap,
+            None,
+            direct_terminal_full,
+        )
+    }
+
+    /// Mints exact-tap authority only from a newly accepted B[0] after the
+    /// replacement that observed it has consumed its real Program credit.
+    fn exact_confirm_positive_witness(
+        &self,
+        parent: ActivationId,
+        newly_accepted: &[RawInline],
+    ) -> Option<PositiveConfirmWitness> {
+        let activation = self.state.activations.get(&parent)?;
+        let DeltaReducer::Confirm { original } = &activation.reducer else {
+            return None;
+        };
+        let value = *original.one_parent_values().first()?;
+        if !newly_accepted.contains(&value) || !activation.accepted.contains(&value) {
+            return None;
+        }
+        let PositivePublicationRegistration::Eligible(ledger) =
+            activation.positive_publication.as_deref()?
+        else {
+            return None;
+        };
+        if !ledger.open
+            || ledger.source != PositivePublicationSource::ExactConfirmTap
+            || !ledger.certificate.eligible()
+            || ledger.published.contains(&value)
+        {
+            return None;
+        }
+        Some(PositiveConfirmWitness {
+            brand: self.brand,
+            parent,
+            generation: ledger.generation,
+            occurrence: 0,
+            value,
+        })
+    }
+
+    /// Sole positive-publication SET linearization point.
+    ///
+    /// This exclusive mutable registry borrow is the scheduler's CAS law.
+    /// Current semantic source, generation, open Confirm reducer, indexed
+    /// original occurrence, and continuation certificate are revalidated
+    /// before the first `(parent, value)` insertion wins.
+    ///
+    /// The returned private grant must be consumed immediately with
+    /// `release_positive_publication`, before fallible work. The outer
+    /// `direct_terminal_full` arrives unfiltered by any feeder's physical
+    /// activation class.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_positive_value(
+        &mut self,
+        parent_activation: ActivationId,
+        generation: u64,
+        occurrence: usize,
+        value: RawInline,
+        source: PositivePublicationSource,
+        support_child_context: Option<(VariableSet, Box<[RawInline]>)>,
+        direct_terminal_full: Option<VariableSet>,
+    ) -> Option<PositivePublicationGrant> {
+        let Some(activation) = self.state.activations.get_mut(&parent_activation) else {
             return None;
         };
         let DeltaReducer::Confirm { original } = &activation.reducer else {
             return None;
         };
-        if positive_support_child_context(&activation.return_to, link.value) != Some(child_context)
-        {
-            return None;
+        if let Some(child_context) = support_child_context {
+            if positive_support_child_context(&activation.return_to, value) != Some(child_context) {
+                return None;
+            }
         }
         let DeltaReturn::Stable {
             desc,
@@ -1566,10 +1753,11 @@ impl ProducerRegistry {
             return None;
         };
         if !ledger.open
-            || ledger.generation != link.generation
+            || ledger.generation != generation
+            || ledger.source != source
             || !ledger.certificate.eligible()
-            || original.one_parent_values().get(link.occurrence) != Some(&link.value)
-            || ledger.published.contains(&link.value)
+            || original.one_parent_values().get(occurrence) != Some(&value)
+            || ledger.published.contains(&value)
             || parent.len() != desc.bound.count()
             || *set_admit_result != ledger.certificate.crosses_set_boundary
         {
@@ -1587,10 +1775,10 @@ impl ProducerRegistry {
                         .is_empty()
                         .then_some(TerminalOriginRegistration {
                             family: ledger.confirm_state,
-                            origin: link.parent,
+                            origin: parent_activation,
                         });
                 PositivePublicationRoute::Terminal {
-                    origin: link.parent,
+                    origin: parent_activation,
                     full,
                     registration,
                 }
@@ -1607,11 +1795,11 @@ impl ProducerRegistry {
         };
         let return_to = activation.return_to.clone();
         assert!(
-            ledger.published.insert(link.value),
+            ledger.published.insert(value),
             "preflighted positive publication lost its first-winner race"
         );
         Some(PositivePublicationGrant {
-            value: link.value,
+            value,
             return_to,
             route,
         })
@@ -2731,6 +2919,8 @@ impl ProducerRegistry {
                 .remove(&parent.key.nonce),
             Some(CreditKind::Program { join: parent_join })
         );
+        let positive_confirm =
+            self.exact_confirm_positive_witness(activation_id, accepted.as_slice());
 
         let mut dead_search_pages = 0usize;
         let mut dead_source_telemetry_pages = 0usize;
@@ -2798,6 +2988,7 @@ impl ProducerRegistry {
             },
             positive_support_reducer,
             positive_support: positive_support.map(Box::new),
+            positive_confirm: positive_confirm.map(Box::new),
             dead_search_pages,
             dead_source_telemetry_pages,
             quiescence,
@@ -5236,7 +5427,7 @@ impl DeltaScheduler {
         successor: StateDesc,
         set_admit_result: bool,
         batch: CandidateBatch,
-        positive_support: Option<PositiveSupportSeed<'a>>,
+        positive_publication: Option<PositivePublicationSeed<'a>>,
     ) -> DeltaSeedOutcome {
         let confirm_state = self.prepare_program(desc, route, spec);
         let stride = successor.bound.count();
@@ -5309,23 +5500,43 @@ impl DeltaScheduler {
                     DeltaSettlement::Retargeted(active) => finalizer_active = Some(active),
                 }
                 retired.push(ProgramActivation(activation.0));
-            } else if let (Some(hedge), Some(value)) = (positive_support.as_ref(), first_candidate)
+            } else if let (Some(publication), Some(value)) =
+                (positive_publication.as_ref(), first_candidate)
             {
-                let parent = self
-                    .registry
-                    .open_positive_publication(activation, hedge.confirm_state, hedge.certificate)
-                    .expect("eligible live Confirm rejected its positive ledger");
-                let child = self
-                    .registry
-                    .open_positive_support_activation(
-                        parent,
-                        0,
-                        value,
-                        hedge.support_variables,
-                        hedge.direct_terminal_full,
-                    )
-                    .expect("eligible Confirm occurrence rejected its positive Support child");
-                support_activations.push(child);
+                match &publication.feeder {
+                    PositivePublicationFeeder::ExactConfirmTap => {
+                        self.registry
+                            .open_confirm_positive_publication(
+                                activation,
+                                publication.confirm_state,
+                                publication.certificate,
+                            )
+                            .expect("eligible live Confirm rejected its exact positive ledger");
+                    }
+                    PositivePublicationFeeder::SupportHedge(support) => {
+                        let parent = self
+                            .registry
+                            .open_positive_publication(
+                                activation,
+                                publication.confirm_state,
+                                publication.certificate,
+                            )
+                            .expect("eligible live Confirm rejected its positive ledger");
+                        let child = self
+                            .registry
+                            .open_positive_support_activation(
+                                parent,
+                                0,
+                                value,
+                                support.support_variables,
+                                support.direct_terminal_full,
+                            )
+                            .expect(
+                                "eligible Confirm occurrence rejected its positive Support child",
+                            );
+                        support_activations.push(child);
+                    }
+                }
             }
         }
         if !retired.is_empty() {
@@ -5344,14 +5555,21 @@ impl DeltaScheduler {
 
         let mut support_active = None;
         let mut completed_activation_ids = Vec::new();
-        if let Some(hedge) = positive_support.filter(|_| !support_activations.is_empty()) {
+        if !support_activations.is_empty() {
+            let Some(PositivePublicationSeed {
+                feeder: PositivePublicationFeeder::SupportHedge(support),
+                ..
+            }) = positive_publication
+            else {
+                unreachable!("positive Support activations lost their physical feeder")
+            };
             let PositiveSupportSeed {
                 spec,
                 desc,
                 request,
                 route,
                 ..
-            } = hedge;
+            } = support;
             let support_state = self.prepare_program(desc, route, spec);
             let mut rows = Vec::with_capacity(
                 support_activations
@@ -8026,6 +8244,20 @@ impl DeltaScheduler {
                     ));
                 }
             }
+            if let Some(witness) = outcome.positive_confirm.take() {
+                if let Some(grant) = self
+                    .registry
+                    .commit_confirm_positive_publication(*witness, direct_terminal_full)
+                {
+                    task_effects.absorb(Self::release_positive_publication(
+                        grant,
+                        plan,
+                        stable,
+                        stable_interner,
+                        stats,
+                    ));
+                }
+            }
             // Raw accepted/supported reports from a PositiveSupport child are
             // merely witness material. Only a successful semantic
             // commit/release above is stable progress; independently retained
@@ -10398,6 +10630,45 @@ mod tests {
         (activation, parent)
     }
 
+    fn open_tapped_confirm(
+        registry: &mut ProducerRegistry,
+        values: impl IntoIterator<Item = RawInline>,
+        initial_accepted: Option<RawInline>,
+    ) -> (
+        ActivationId,
+        PositiveConfirmParentId,
+        ProducerCredit,
+        Vec<RawInline>,
+    ) {
+        let original = shared_one_parent_candidates(values.into_iter().collect());
+        let activation = registry.open_program_activation(
+            DeltaReducer::Confirm { original },
+            terminal_positive_return(Vec::new()),
+            None,
+            None,
+        );
+        let mut installed = registry.install_program_roots(
+            activation,
+            [ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(0),
+                accepted: initial_accepted,
+            }],
+        );
+        let parent = registry
+            .open_confirm_positive_publication(
+                activation,
+                StateId(17),
+                terminal_positive_certificate(),
+            )
+            .expect("Confirm activation should register an exact-tap parent");
+        let (_, credit) = installed
+            .roots
+            .pop()
+            .expect("one exact Confirm Program root");
+        (activation, parent, credit, installed.initial_accepted)
+    }
+
     fn terminal_positive_commit_fixture() -> (
         ProducerRegistry,
         ActivationId,
@@ -11270,6 +11541,181 @@ mod tests {
             registry.reserve_terminal_receipts(1),
             [ActivationId::test(4)]
         );
+    }
+
+    #[test]
+    fn exact_confirm_replacement_publishes_b0_once_and_finalizes_g_minus_p() {
+        let first = value(41);
+        let later = value(42);
+        let mut registry = ProducerRegistry::new();
+        let (activation, parent, credit, initial) =
+            open_tapped_confirm(&mut registry, [first, later, first], None);
+        assert!(initial.is_empty());
+        assert!(
+            registry
+                .open_positive_support_activation(
+                    parent,
+                    0,
+                    first,
+                    VariableSet::new_singleton(0),
+                    Some(terminal_positive_full()),
+                )
+                .is_none(),
+            "an exact-tap ledger must not lend authority to a Support child"
+        );
+
+        let mut first_page = registry.replace_program(
+            credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            [first],
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            Some(ProgramResume::Immediate(positive_test_work(1))),
+        );
+        assert!(!first_page.positive_support_reducer);
+        assert!(first_page.positive_support.is_none());
+        assert_eq!(first_page.accepted.as_slice(), [first]);
+        let witness = *first_page
+            .positive_confirm
+            .take()
+            .expect("a real exact replacement accepting B[0] must mint one witness");
+        let (_, _, continuation_credit) = first_page
+            .scheduled
+            .pop()
+            .expect("the exact Confirm continuation should remain live");
+        assert!(first_page.quiescence.is_none());
+
+        let grant = registry
+            .commit_confirm_positive_publication(witness, Some(terminal_positive_full()))
+            .expect("the exact B[0] witness should win its parent SET ledger");
+        let root = PositiveCertificateLeaf {
+            variable: 0,
+            page_local: false,
+        };
+        let plan = ResidualPlan::compile(&root);
+        let released = DeltaScheduler::release_positive_publication(
+            grant,
+            &plan,
+            &mut Worklist::new(),
+            &mut StateInterner::default(),
+            &mut ResidualStateStats::default(),
+        );
+        assert_eq!(
+            released
+                .publication
+                .expect("Terminal exact tap must publish")
+                .rows
+                .rows,
+            [first]
+        );
+        assert_eq!(
+            registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .published,
+            BTreeSet::from([first])
+        );
+
+        let second_page = registry.replace_program(
+            continuation_credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            [first, later],
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            second_page.positive_confirm.is_none(),
+            "an already accepted B[0] must not mint a second receipt"
+        );
+        assert_eq!(second_page.accepted.as_slice(), [later]);
+        let proof = second_page
+            .quiescence
+            .expect("the final exact page should quiesce");
+        let RegistrySettlement::ConfirmFinalizer(seed) = registry.settle_quiescence(proof) else {
+            panic!("nonempty B must enter the exact Confirm finalizer")
+        };
+        assert!(!seed.state.accepted.contains(&first));
+        assert!(seed.state.accepted.contains(&later));
+        assert_eq!(seed.activation, activation);
+    }
+
+    #[test]
+    fn exact_confirm_tap_requires_b0_to_be_newly_accepted_by_a_replacement() {
+        let first = value(43);
+        let later = value(44);
+
+        let mut wrong_value = ProducerRegistry::new();
+        let (_, parent, credit, _) = open_tapped_confirm(&mut wrong_value, [first, later], None);
+        let wrong_page = wrong_value.replace_program(
+            credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            [later],
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(wrong_page.positive_confirm.is_none());
+        assert!(wrong_value
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .published
+            .is_empty());
+        let RegistrySettlement::ConfirmFinalizer(seed) = wrong_value.settle_quiescence(
+            wrong_page
+                .quiescence
+                .expect("the wrong-value page should quiesce"),
+        ) else {
+            panic!("the exact Confirm result should still finalize")
+        };
+        assert!(!seed.state.accepted.contains(&first));
+        assert!(seed.state.accepted.contains(&later));
+
+        let mut nullable = ProducerRegistry::new();
+        let (_, parent, credit, initial) =
+            open_tapped_confirm(&mut nullable, [first, first], Some(first));
+        assert_eq!(initial, [first]);
+        let nullable_page = nullable.replace_program(
+            credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            nullable_page.positive_confirm.is_none(),
+            "seed-time nullable acceptance is not replacement authority"
+        );
+        assert!(nullable
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .published
+            .is_empty());
+        let RegistrySettlement::ConfirmFinalizer(seed) = nullable.settle_quiescence(
+            nullable_page
+                .quiescence
+                .expect("the nullable root should quiesce after its real page"),
+        ) else {
+            panic!("nullable acceptance must remain on the exact late path")
+        };
+        assert!(seed.state.accepted.contains(&first));
     }
 
     #[test]
