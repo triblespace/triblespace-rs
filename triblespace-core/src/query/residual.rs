@@ -98,6 +98,8 @@ use super::*;
 
 mod delta;
 mod materialize;
+#[cfg(test)]
+mod positive_hedge_credit;
 mod set_admit;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
