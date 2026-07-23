@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Positive Support hedges now spend parent-local demand credit.** Each public
+  pull may assign one demand unit to one parked semantic parent; only then may
+  validated exact Confirm work mint additional allowance. Support Program
+  tasks reserve that allowance before dispatch and settle it against actual
+  examined work, refunding short pages and retiring every unspent unit on
+  success, exhaustion, cancellation, or parent closure. Wakes remain
+  parent-isolated, Exact credit returns the directed Exact lease to global
+  arbitration, and clones preserve both parked affine custody and ledger
+  conservation. New post-validation statistics expose assigned demand,
+  Support work, paired and credited Exact work, retired credit, and
+  source-specific publication wins.
 - **Positive Support hedges now have explicit live-but-parked scheduler
   custody.** Their opaque typed handles and affine producer credits can leave
   the runnable Program frontier without being consumed, survive deep clones
@@ -16,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction as queued work. A directed parked lease is released without
   claiming quiescence or stable progress, so the exact Confirm parent remains
   the sole completeness-bearing runnable lineage. Demand and exact-work credit
-  assignment remain a separate policy layer.
+  assignment are layered on this custody without changing SET semantics.
 - **Eligible target-Confirm activations can publish their first candidate from
   the authoritative exact traversal.** A new structural Program certificate
   lets every eligible exact RPQ Confirm reuse a real replacement receipt that

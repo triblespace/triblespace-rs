@@ -835,6 +835,136 @@ struct PositivePublicationGrant {
     /// release precondition has passed.
     return_to: DeltaReturn,
     route: PositivePublicationRoute,
+    source: PositivePublicationSource,
+}
+
+/// Parent-local conservation ledger for demand-bounded Support speculation.
+///
+/// Demand (`D`) starts the hedge and exact Confirm work (`C`) may add credit
+/// only after that point. Runnable Support work reserves credit before its
+/// opaque Program handle crosses the dispatch boundary, then settles the
+/// reservation against the validated examined count (`S`). Every other unit
+/// is eventually retired when the hedge or its semantic parent closes.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PositiveSupportWorkBudget {
+    started: bool,
+    demand_minted: usize,
+    exact_minted: usize,
+    reserved: usize,
+    spent: usize,
+    retired: usize,
+}
+
+impl PositiveSupportWorkBudget {
+    fn minted(&self) -> usize {
+        self.demand_minted
+            .checked_add(self.exact_minted)
+            .expect("positive Support minted-work count overflow")
+    }
+
+    fn available(&self) -> usize {
+        let accounted = self
+            .reserved
+            .checked_add(self.spent)
+            .and_then(|value| value.checked_add(self.retired))
+            .expect("positive Support accounted-work count overflow");
+        self.minted()
+            .checked_sub(accounted)
+            .expect("positive Support work ledger overspent its minted credit")
+    }
+
+    fn assert_conservation(&self) {
+        assert_eq!(
+            self.minted(),
+            self.available()
+                .checked_add(self.reserved)
+                .and_then(|value| value.checked_add(self.spent))
+                .and_then(|value| value.checked_add(self.retired))
+                .expect("positive Support conservation count overflow"),
+            "positive Support work ledger violated D + C = available + reserved + S + retired"
+        );
+    }
+
+    fn mint_demand(&mut self) {
+        self.started = true;
+        self.demand_minted = self
+            .demand_minted
+            .checked_add(1)
+            .expect("positive Support demand credit overflow");
+        self.assert_conservation();
+    }
+
+    fn mint_exact(&mut self, examined: usize) -> usize {
+        if !self.started || examined == 0 {
+            return 0;
+        }
+        self.exact_minted = self
+            .exact_minted
+            .checked_add(examined)
+            .expect("positive Support exact-work credit overflow");
+        self.assert_conservation();
+        examined
+    }
+
+    fn reserve(&mut self, requested: usize) -> usize {
+        let granted = self.available().min(requested);
+        self.reserved = self
+            .reserved
+            .checked_add(granted)
+            .expect("positive Support reserved-work count overflow");
+        self.assert_conservation();
+        granted
+    }
+
+    fn settle(&mut self, granted: usize, examined: usize) {
+        assert!(
+            examined <= granted,
+            "positive Support Program examined beyond its affine work grant"
+        );
+        self.reserved = self
+            .reserved
+            .checked_sub(granted)
+            .expect("positive Support settled an unknown work reservation");
+        self.spent = self
+            .spent
+            .checked_add(examined)
+            .expect("positive Support spent-work count overflow");
+        self.assert_conservation();
+    }
+
+    fn retire_available(&mut self) -> usize {
+        assert_eq!(
+            self.reserved, 0,
+            "positive Support allowance retired across a live dispatch reservation"
+        );
+        let retired = self.available();
+        self.retired = self
+            .retired
+            .checked_add(retired)
+            .expect("positive Support retired-work count overflow");
+        self.assert_conservation();
+        retired
+    }
+}
+
+/// Affine reservation carried beside one selected PositiveSupport Program
+/// task. It intentionally implements neither [`Clone`] nor [`Copy`].
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+#[must_use = "a positive Support work grant must be settled exactly once"]
+struct PositiveSupportWorkGrant {
+    brand: RegistryBrand,
+    parent: ActivationId,
+    child: ActivationId,
+    generation: u64,
+    granted: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PositiveExactWorkAccounting {
+    paired: bool,
+    credited: usize,
 }
 
 /// Dormant scheduler-owned publication state attached to the authoritative
@@ -858,6 +988,8 @@ struct PositivePublicationLedger {
     /// cancellation custody only: they never participate in publication SET
     /// identity or exact Confirm completeness.
     support_children: SmallVec<[ActivationId; 1]>,
+    /// Demand-bounded physical allowance shared by every linked Support child.
+    support_work: PositiveSupportWorkBudget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1503,6 +1635,7 @@ impl ProducerRegistry {
                 certificate,
                 published: BTreeSet::new(),
                 support_children: SmallVec::new(),
+                support_work: PositiveSupportWorkBudget::default(),
             })
         } else {
             PositivePublicationRegistration::Private {
@@ -1650,6 +1783,328 @@ impl ProducerRegistry {
             return SmallVec::new();
         };
         ledger.support_children.clone()
+    }
+
+    fn positive_support_parent_for_child(
+        &self,
+        child: ActivationId,
+    ) -> Option<PositiveConfirmParentId> {
+        let activation = self.state.activations.get(&child)?;
+        let DeltaReducer::PositiveSupport { link, .. } = &activation.reducer else {
+            return None;
+        };
+        (link.child == child).then_some(PositiveConfirmParentId {
+            brand: self.brand,
+            activation: link.parent,
+        })
+    }
+
+    fn positive_publication_parent(
+        &self,
+        activation: ActivationId,
+    ) -> Option<PositiveConfirmParentId> {
+        let activation_state = self.state.activations.get(&activation)?;
+        matches!(
+            activation_state.positive_publication.as_deref(),
+            Some(PositivePublicationRegistration::Eligible(_))
+        )
+        .then_some(PositiveConfirmParentId {
+            brand: self.brand,
+            activation,
+        })
+    }
+
+    fn live_positive_support_child(
+        &self,
+        parent: ActivationId,
+        generation: u64,
+        children: &[ActivationId],
+    ) -> bool {
+        children.iter().copied().any(|child| {
+            self.state
+                .activations
+                .get(&child)
+                .is_some_and(|activation| {
+                    matches!(
+                        &activation.reducer,
+                        DeltaReducer::PositiveSupport { link, .. }
+                            if link.child == child
+                                && link.parent == parent
+                                && link.generation == generation
+                    )
+                })
+        })
+    }
+
+    fn positive_support_budget_available(&self, parent: PositiveConfirmParentId) -> usize {
+        if parent.brand != self.brand {
+            return 0;
+        }
+        let Some(activation) = self.state.activations.get(&parent.activation) else {
+            return 0;
+        };
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            activation.positive_publication.as_deref()
+        else {
+            return 0;
+        };
+        if !ledger.open
+            || !ledger
+                .authorization
+                .authorizes(PositivePublicationSource::SupportHedge)
+            || !self.live_positive_support_child(
+                parent.activation,
+                ledger.generation,
+                &ledger.support_children,
+            )
+        {
+            return 0;
+        }
+        ledger.support_work.available()
+    }
+
+    /// Assigns one public-pull demand token to one exact semantic parent.
+    ///
+    /// The scheduler selects a concrete parked child before entering this
+    /// transaction. Revalidation here ensures demand can neither start an
+    /// orphan hedge nor cross a closed publication generation.
+    fn mint_positive_support_demand(&mut self, parent: PositiveConfirmParentId) -> bool {
+        if parent.brand != self.brand {
+            return false;
+        }
+        let (generation, children) = {
+            let Some(activation) = self.state.activations.get(&parent.activation) else {
+                return false;
+            };
+            let Some(PositivePublicationRegistration::Eligible(ledger)) =
+                activation.positive_publication.as_deref()
+            else {
+                return false;
+            };
+            if !ledger.open
+                || !ledger
+                    .authorization
+                    .authorizes(PositivePublicationSource::SupportHedge)
+                || !ledger.certificate.eligible()
+            {
+                return false;
+            }
+            (ledger.generation, ledger.support_children.clone())
+        };
+        if !self.live_positive_support_child(parent.activation, generation, &children) {
+            return false;
+        }
+        let activation = self
+            .state
+            .activations
+            .get_mut(&parent.activation)
+            .expect("validated positive Support parent disappeared");
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            activation.positive_publication.as_deref_mut()
+        else {
+            unreachable!("validated positive Support parent lost its ledger")
+        };
+        assert!(ledger.open && ledger.generation == generation);
+        ledger.support_work.mint_demand();
+        true
+    }
+
+    /// Reserves at most `requested` units immediately before physical Program
+    /// dispatch. The returned grant is affine and must accompany this exact
+    /// selected task until its validated receipt settles.
+    fn reserve_positive_support_work(
+        &mut self,
+        child: ActivationId,
+        requested: usize,
+    ) -> Option<PositiveSupportWorkGrant> {
+        let link = {
+            let activation = self.state.activations.get(&child)?;
+            let DeltaReducer::PositiveSupport { link, .. } = &activation.reducer else {
+                return None;
+            };
+            if link.child != child {
+                return None;
+            }
+            link.as_ref().clone()
+        };
+        let activation = self.state.activations.get_mut(&link.parent)?;
+        let PositivePublicationRegistration::Eligible(ledger) =
+            activation.positive_publication.as_deref_mut()?
+        else {
+            return None;
+        };
+        if !ledger.open
+            || ledger.generation != link.generation
+            || !ledger.support_work.started
+            || !ledger.support_children.contains(&child)
+        {
+            return None;
+        }
+        let granted = ledger.support_work.reserve(requested);
+        (granted > 0).then_some(PositiveSupportWorkGrant {
+            brand: self.brand,
+            parent: link.parent,
+            child,
+            generation: link.generation,
+            granted,
+        })
+    }
+
+    fn settle_positive_support_work(
+        &mut self,
+        grant: PositiveSupportWorkGrant,
+        child: ActivationId,
+        examined: usize,
+    ) -> usize {
+        assert_eq!(
+            grant.brand, self.brand,
+            "positive Support work grant crossed registries"
+        );
+        assert_eq!(
+            grant.child, child,
+            "positive Support work grant crossed physical children"
+        );
+        let child_activation = self
+            .state
+            .activations
+            .get(&child)
+            .expect("positive Support work settled after its child disappeared");
+        assert!(matches!(
+            &child_activation.reducer,
+            DeltaReducer::PositiveSupport { link, .. }
+                if link.child == child
+                    && link.parent == grant.parent
+                    && link.generation == grant.generation
+        ));
+        let parent = self
+            .state
+            .activations
+            .get_mut(&grant.parent)
+            .expect("positive Support work settled after its parent disappeared");
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            parent.positive_publication.as_deref_mut()
+        else {
+            panic!("positive Support work settled after its ledger disappeared")
+        };
+        assert_eq!(
+            ledger.generation, grant.generation,
+            "positive Support work settled across ledger generations"
+        );
+        ledger.support_work.settle(grant.granted, examined);
+        examined
+    }
+
+    /// Accounts one validated exact Confirm Program replacement. The paired
+    /// total is diagnostic; only a started, open parent with a live linked
+    /// Support child mints usable `C`.
+    fn account_positive_exact_work(
+        &mut self,
+        parent: ActivationId,
+        examined: usize,
+    ) -> PositiveExactWorkAccounting {
+        let (generation, children, paired) = {
+            let Some(activation) = self.state.activations.get(&parent) else {
+                return PositiveExactWorkAccounting::default();
+            };
+            if !matches!(&activation.reducer, DeltaReducer::Confirm { .. }) {
+                return PositiveExactWorkAccounting::default();
+            }
+            let Some(PositivePublicationRegistration::Eligible(ledger)) =
+                activation.positive_publication.as_deref()
+            else {
+                return PositiveExactWorkAccounting::default();
+            };
+            (
+                ledger.generation,
+                ledger.support_children.clone(),
+                ledger.authorization == PositivePublicationAuthorization::ExactAndSupport,
+            )
+        };
+        if !paired {
+            return PositiveExactWorkAccounting::default();
+        }
+        let live_child = self.live_positive_support_child(parent, generation, &children);
+        let activation = self
+            .state
+            .activations
+            .get_mut(&parent)
+            .expect("paired exact Confirm disappeared during work accounting");
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            activation.positive_publication.as_deref_mut()
+        else {
+            unreachable!("paired exact Confirm lost its positive ledger")
+        };
+        let credited = if ledger.open && live_child {
+            ledger.support_work.mint_exact(examined)
+        } else {
+            0
+        };
+        PositiveExactWorkAccounting {
+            paired: true,
+            credited,
+        }
+    }
+
+    /// Burns every unspent unit after the last linked Support child leaves
+    /// live registry custody.
+    fn retire_orphaned_positive_support_work(&mut self, parent: PositiveConfirmParentId) -> usize {
+        if parent.brand != self.brand {
+            return 0;
+        }
+        let (generation, children) = {
+            let Some(activation) = self.state.activations.get(&parent.activation) else {
+                return 0;
+            };
+            let Some(PositivePublicationRegistration::Eligible(ledger)) =
+                activation.positive_publication.as_deref()
+            else {
+                return 0;
+            };
+            (ledger.generation, ledger.support_children.clone())
+        };
+        if self.live_positive_support_child(parent.activation, generation, &children) {
+            return 0;
+        }
+        let activation = self
+            .state
+            .activations
+            .get_mut(&parent.activation)
+            .expect("positive Support parent disappeared during allowance retirement");
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            activation.positive_publication.as_deref_mut()
+        else {
+            unreachable!("positive Support parent lost its allowance ledger")
+        };
+        ledger.support_work.retire_available()
+    }
+
+    fn retire_positive_support_work(&mut self, parent: PositiveConfirmParentId) -> usize {
+        if parent.brand != self.brand {
+            return 0;
+        }
+        let Some(activation) = self.state.activations.get_mut(&parent.activation) else {
+            return 0;
+        };
+        let Some(PositivePublicationRegistration::Eligible(ledger)) =
+            activation.positive_publication.as_deref_mut()
+        else {
+            return 0;
+        };
+        ledger.support_work.retire_available()
+    }
+
+    fn assert_no_positive_support_reservations(&self) {
+        for activation in self.state.activations.values() {
+            if let Some(PositivePublicationRegistration::Eligible(ledger)) =
+                activation.positive_publication.as_deref()
+            {
+                ledger.support_work.assert_conservation();
+                assert_eq!(
+                    ledger.support_work.reserved, 0,
+                    "positive Support reservation crossed a scheduler boundary"
+                );
+            }
+        }
     }
 
     /// Commits a linked physical Support witness through the semantic parent's
@@ -1859,6 +2314,7 @@ impl ProducerRegistry {
             value,
             return_to,
             route,
+            source,
         })
     }
 
@@ -1902,6 +2358,7 @@ impl ProducerRegistry {
                 PositivePublicationRegistration::Private { .. } => None,
             })
             .expect("validated positive-publication ledger disappeared");
+        ledger.support_work.retire_available();
         ledger.open = false;
         ledger.generation = closed_generation;
         Some(ledger.clone())
@@ -3702,6 +4159,7 @@ impl ProducerRegistry {
     }
 
     fn deep_clone(&self) -> (Self, BTreeMap<CreditKey, ProducerCredit>) {
+        self.assert_no_positive_support_reservations();
         let state = self.state.clone();
         let brand = RegistryBrand::fresh();
         let mut remap = BTreeMap::new();
@@ -3891,6 +4349,7 @@ struct ProgramTask {
 struct ProgramTaskReceipt {
     activation: ActivationId,
     credit: ProducerCredit,
+    support_grant: Option<PositiveSupportWorkGrant>,
 }
 
 #[derive(Default)]
@@ -4160,6 +4619,33 @@ impl ProgramWorklist {
             removed.push((state, tasks));
         }
         removed
+    }
+
+    /// Removes the newest task matching one scheduler-owned predicate while
+    /// preserving every retained bucket's append order.
+    fn take_one_matching(
+        &mut self,
+        mut matches: impl FnMut(&ProgramTask) -> bool,
+    ) -> Option<(DeltaStateId, ProgramTask)> {
+        let state = self
+            .iter()
+            .filter_map(|(state, bucket)| bucket.tasks.iter().any(&mut matches).then_some(state))
+            .last()?;
+        let (mut selected, empty) = {
+            let bucket = self
+                .get_mut(&state)
+                .expect("selected typed Program wake state disappeared");
+            let selected =
+                bucket.take_matching(1, ProgramSelectionOrder::Lifo, |task| matches(task));
+            (selected, bucket.is_empty())
+        };
+        if empty {
+            self.deactivate(state);
+        }
+        let task = selected
+            .pop()
+            .expect("selected typed Program wake predicate became false");
+        Some((state, task))
     }
 }
 
@@ -4787,6 +5273,26 @@ fn even_limits(work_budget: usize, task_count: usize) -> Vec<usize> {
     limits
 }
 
+fn validated_program_examined(
+    pages: &[ProgramPage],
+    receipt_local_fused_total: Option<usize>,
+) -> Vec<usize> {
+    let mut examined: Vec<_> = pages.iter().map(|page| page.examined).collect();
+    if let Some(total) = receipt_local_fused_total {
+        assert_eq!(
+            examined.len(),
+            1,
+            "receipt-local fusion must retain one affine input"
+        );
+        assert!(
+            total >= examined[0],
+            "receipt-local fused total fell below its final validated page"
+        );
+        examined[0] = total;
+    }
+    examined
+}
+
 /// Which physical layer consumed one bounded backend call. Source misses are
 /// evidence about root discovery, not about the sparse graph traversal credit
 /// retained by the activation; only transition misses widen that credit.
@@ -4823,6 +5329,13 @@ pub(super) struct DeltaStepOutcome {
     /// widening outer search `S`. Terminal traversal first exhausts its local
     /// geometric quantum; only a saturated still-live miss reaches this tier.
     pub(super) allows_global_width_growth: bool,
+    /// A newly runnable Support sibling invalidated the directed Exact lease.
+    /// The Exact activation remains live and runnable, but must return to
+    /// global arbitration rather than retaining scalar priority.
+    pub(super) release_directed_lease: bool,
+    /// A public-pull demand token assigned during this step. Unlike Exact
+    /// credit wakeups, D owns an explicit latency preference.
+    pub(super) demand_preference: Option<ActiveDeltaContinuation>,
 }
 
 impl DeltaStepOutcome {
@@ -4844,6 +5357,8 @@ impl DeltaStepOutcome {
             completed_activations: 0,
             completed_transition_cohort: false,
             allows_global_width_growth: false,
+            release_directed_lease: false,
+            demand_preference: None,
         }
     }
 }
@@ -4878,6 +5393,9 @@ pub(super) enum ActiveDeltaStatus {
     /// The activation remains live, but all of its affine work is deliberately
     /// parked outside the runnable scheduler frontier.
     Parked,
+    /// The activation remains ordinary runnable custody, but another lineage
+    /// must receive global arbitration before it may resume.
+    Released,
     /// The activation reached quiescence and was removed from the registry.
     Quiescent,
 }
@@ -5320,6 +5838,10 @@ pub(super) struct DeltaScheduler {
     /// handles in the same state-indexed shape lets cancellation and cloning
     /// preserve their exact typed runtime without exposing them to global pop.
     parked_positive_support_worklist: ProgramWorklist,
+    /// One public pull may carry one unassigned demand token while the machine
+    /// searches for a concrete parked Support parent. Assignment consumes it
+    /// permanently into that parent's conservation ledger.
+    unassigned_public_pull_demand: bool,
     program_runtimes: AHashMap<DeltaStateId, ProgramRuntime>,
     /// Program-only cohort scratch is lazy so non-Program queries retain the
     /// baseline scheduler footprint. One allocation is amortized across all
@@ -5345,6 +5867,7 @@ impl DeltaScheduler {
             source_worklist: BTreeMap::new(),
             program_worklist: ProgramWorklist::default(),
             parked_positive_support_worklist: ProgramWorklist::default(),
+            unassigned_public_pull_demand: false,
             program_runtimes: AHashMap::new(),
             program_scratch: None,
             activation_width: 1,
@@ -5615,6 +6138,7 @@ impl DeltaScheduler {
         set_admit_result: bool,
         batch: CandidateBatch,
         positive_publication: Option<PositivePublicationSeed<'a>>,
+        stats: &mut ResidualStateStats,
     ) -> DeltaSeedOutcome {
         let confirm_state = self.prepare_program(desc, route, spec);
         let stride = successor.bound.count();
@@ -5844,12 +6368,16 @@ impl DeltaScheduler {
                     &retired,
                 );
             }
-            support_active = self.file_parked_positive_support_state(support_state, tasks);
+            let _ = self.file_parked_positive_support_state(support_state, tasks);
+            support_active = self.assign_public_pull_demand(stats);
         }
 
         DeltaSeedOutcome {
             continuation: None,
             publication: None,
+            // A newly assigned public demand token explicitly prefers the
+            // Support hedge. Without demand the exact Confirm remains the
+            // directed latency lineage and Support stays parked.
             active: support_active.or(finalizer_active).or(graph_active),
             terminal_activations: Vec::new(),
             completed_activation_ids,
@@ -6900,7 +7428,16 @@ impl DeltaScheduler {
             value,
             return_to,
             route,
+            source,
         } = grant;
+        match source {
+            PositivePublicationSource::ExactConfirmTap => {
+                stats.delta_positive_publication_exact_wins += 1;
+            }
+            PositivePublicationSource::SupportHedge => {
+                stats.delta_positive_publication_support_wins += 1;
+            }
+        }
         let DeltaReturn::Stable { desc, parent, .. } = return_to else {
             unreachable!("a preflighted positive publication lost its Stable return")
         };
@@ -7201,6 +7738,111 @@ impl DeltaScheduler {
         Some(ActiveDeltaContinuation { state, activation })
     }
 
+    fn has_runnable_positive_support_parent(&self, parent: PositiveConfirmParentId) -> bool {
+        self.program_worklist.iter().any(|(_, bucket)| {
+            bucket.tasks.iter().any(|task| {
+                self.registry
+                    .positive_support_parent_for_child(task.activation)
+                    == Some(parent)
+            })
+        })
+    }
+
+    /// Moves at most one parked task for this semantic parent onto the
+    /// runnable frontier. Parent-local available credit and the absence of an
+    /// existing runnable sibling are revalidated at the move boundary.
+    fn wake_one_positive_support_parent(
+        &mut self,
+        parent: PositiveConfirmParentId,
+    ) -> Option<ActiveDeltaContinuation> {
+        if self.registry.positive_support_budget_available(parent) == 0
+            || self.has_runnable_positive_support_parent(parent)
+        {
+            return None;
+        }
+        let registry = &self.registry;
+        let (state, task) = self
+            .parked_positive_support_worklist
+            .take_one_matching(|task| {
+                registry.positive_support_parent_for_child(task.activation) == Some(parent)
+            })?;
+        let activation = task.activation;
+        let mut tasks = vec![task];
+        self.program_worklist.append(state, &mut tasks);
+        Some(ActiveDeltaContinuation { state, activation })
+    }
+
+    /// Consumes the query's one unassigned pull token into one concrete
+    /// parked parent and immediately prefers that newly runnable Support
+    /// lineage.
+    fn assign_public_pull_demand(
+        &mut self,
+        stats: &mut ResidualStateStats,
+    ) -> Option<ActiveDeltaContinuation> {
+        if !self.unassigned_public_pull_demand {
+            return None;
+        }
+        let mut parents = Vec::new();
+        let mut seen = AHashSet::new();
+        for (_, bucket) in self.parked_positive_support_worklist.iter() {
+            for task in &bucket.tasks {
+                let Some(parent) = self
+                    .registry
+                    .positive_support_parent_for_child(task.activation)
+                else {
+                    continue;
+                };
+                if !self.has_runnable_positive_support_parent(parent) && seen.insert(parent) {
+                    parents.push(parent);
+                }
+            }
+        }
+        for parent in parents.into_iter().rev() {
+            if !self.registry.mint_positive_support_demand(parent) {
+                continue;
+            }
+            self.unassigned_public_pull_demand = false;
+            stats.delta_positive_support_demand_assigned += 1;
+            return Some(
+                self.wake_one_positive_support_parent(parent)
+                    .expect("assigned positive Support demand failed to wake parked custody"),
+            );
+        }
+        None
+    }
+
+    /// Opens one idempotent public-pull demand token. It may remain
+    /// unassigned while stable work runs and be consumed by a Support child
+    /// seeded later in the same pull.
+    pub(super) fn begin_public_pull_demand(
+        &mut self,
+        stats: &mut ResidualStateStats,
+    ) -> Option<ActiveDeltaContinuation> {
+        self.unassigned_public_pull_demand = true;
+        self.assign_public_pull_demand(stats)
+    }
+
+    /// Retires a token that was never assigned during the public pull.
+    pub(super) fn retire_unassigned_public_pull_demand(&mut self) {
+        self.unassigned_public_pull_demand = false;
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_unassigned_public_pull_demand(&self) -> bool {
+        self.unassigned_public_pull_demand
+    }
+
+    fn wake_positive_support_parents(
+        &mut self,
+        parents: impl IntoIterator<Item = PositiveConfirmParentId>,
+    ) -> bool {
+        let mut woke = false;
+        for parent in parents {
+            woke |= self.wake_one_positive_support_parent(parent).is_some();
+        }
+        woke
+    }
+
     /// Moves already queued PositiveSupport tasks out of runnable selection
     /// while retaining their exact state grouping and affine credits.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -7230,15 +7872,19 @@ impl DeltaScheduler {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         requested: &AHashSet<ActivationId>,
-    ) -> Vec<ActivationId> {
+    ) -> (Vec<ActivationId>, usize) {
         let live: AHashSet<_> = requested
             .iter()
             .copied()
             .filter(|&activation| self.registry.is_live_positive_support(activation))
             .collect();
         if live.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
+        let parents: BTreeSet<_> = live
+            .iter()
+            .filter_map(|&child| self.registry.positive_support_parent_for_child(child))
+            .collect();
 
         let mut groups = BTreeMap::<DeltaStateId, Vec<ProgramTask>>::new();
         for (state, mut tasks) in self
@@ -7313,7 +7959,11 @@ impl DeltaScheduler {
                 "PositiveSupport cancellation left affine work outside its queued or parked custody"
             );
         }
-        completed
+        let retired = parents
+            .into_iter()
+            .map(|parent| self.registry.retire_orphaned_positive_support_work(parent))
+            .sum();
+        (completed, retired)
     }
 
     fn has_active_source(&self, active: ActiveDeltaContinuation) -> bool {
@@ -7465,7 +8115,12 @@ impl DeltaScheduler {
         &mut self,
         active: ActiveDeltaContinuation,
         search_width: usize,
-    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
+    ) -> (
+        DeltaStateId,
+        Vec<ProgramTask>,
+        Vec<Option<PositiveSupportWorkGrant>>,
+        PhysicalDispatch,
+    ) {
         let (selection, empty, remainder_tasks) = {
             let bucket = self
                 .program_worklist
@@ -7477,7 +8132,12 @@ impl DeltaScheduler {
         if empty {
             self.program_worklist.deactivate(active.state);
         }
-        let ProgramSelection { key, tasks, limits } = selection;
+        let ProgramSelection {
+            key,
+            tasks,
+            mut limits,
+        } = selection;
+        let support_grants = self.reserve_positive_support_selection(&tasks, &mut limits);
         let kind = match key.class.pacing() {
             ProgramPacing::Search => PhysicalDispatchKind::Source,
             ProgramPacing::Activation => PhysicalDispatchKind::Program,
@@ -7490,13 +8150,18 @@ impl DeltaScheduler {
             limits,
             remainder_tasks,
         );
-        (active.state, tasks, dispatch)
+        (active.state, tasks, support_grants, dispatch)
     }
 
     fn pop_program_bounded(
         &mut self,
         search_width: usize,
-    ) -> (DeltaStateId, Vec<ProgramTask>, PhysicalDispatch) {
+    ) -> (
+        DeltaStateId,
+        Vec<ProgramTask>,
+        Vec<Option<PositiveSupportWorkGrant>>,
+        PhysicalDispatch,
+    ) {
         let id = self
             .program_worklist
             .last_id()
@@ -7518,7 +8183,12 @@ impl DeltaScheduler {
         if empty {
             self.program_worklist.deactivate(id);
         }
-        let ProgramSelection { key, tasks, limits } = selection;
+        let ProgramSelection {
+            key,
+            tasks,
+            mut limits,
+        } = selection;
+        let support_grants = self.reserve_positive_support_selection(&tasks, &mut limits);
         let kind = match key.class.pacing() {
             ProgramPacing::Search => PhysicalDispatchKind::Source,
             ProgramPacing::Activation => PhysicalDispatchKind::Program,
@@ -7531,7 +8201,37 @@ impl DeltaScheduler {
             limits,
             remainder_tasks,
         );
-        (id, tasks, dispatch)
+        (id, tasks, support_grants, dispatch)
+    }
+
+    fn reserve_positive_support_selection(
+        &mut self,
+        tasks: &[ProgramTask],
+        limits: &mut [usize],
+    ) -> Vec<Option<PositiveSupportWorkGrant>> {
+        assert_eq!(tasks.len(), limits.len());
+        let mut selected_parents = AHashSet::new();
+        let mut grants = Vec::with_capacity(tasks.len());
+        for (task, limit) in tasks.iter().zip(limits) {
+            let Some(parent) = self
+                .registry
+                .positive_support_parent_for_child(task.activation)
+            else {
+                grants.push(None);
+                continue;
+            };
+            assert!(
+                selected_parents.insert(parent),
+                "one physical cohort selected two runnable Support tasks for one semantic parent"
+            );
+            let grant = self
+                .registry
+                .reserve_positive_support_work(task.activation, *limit)
+                .expect("runnable PositiveSupport task had no available work allowance");
+            *limit = grant.granted;
+            grants.push(Some(grant));
+        }
+        grants
     }
 
     #[cfg(test)]
@@ -7728,12 +8428,14 @@ impl DeltaScheduler {
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
         let outcome = if has_program {
-            let (state, tasks, dispatch) = self.pop_active_program(active, search_width);
+            let (state, tasks, support_grants, dispatch) =
+                self.pop_active_program(active, search_width);
             let physical = self.step_program(
                 root,
                 plan,
                 state,
                 tasks,
+                support_grants,
                 &dispatch.task_limits,
                 true,
                 direct_terminal_full,
@@ -7843,9 +8545,18 @@ impl DeltaScheduler {
             !runnable || !parked,
             "one activation remained both runnable and parked after a directed step"
         );
-        let resume = settled.or_else(|| runnable.then_some(active));
+        let release_directed_lease = outcome.release_directed_lease;
+        let resume = (!release_directed_lease)
+            .then(|| settled.or_else(|| runnable.then_some(active)))
+            .flatten();
         let status = if yielded {
             ActiveDeltaStatus::Yielded
+        } else if release_directed_lease {
+            debug_assert!(
+                runnable,
+                "a released Exact lease lost its ordinary runnable custody"
+            );
+            ActiveDeltaStatus::Released
         } else if resume.is_some() {
             ActiveDeltaStatus::Pending
         } else if live && parked {
@@ -7891,7 +8602,7 @@ impl DeltaScheduler {
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
         if !self.program_worklist.is_empty() {
-            let (state, tasks, dispatch) = self.pop_program_bounded(search_width);
+            let (state, tasks, support_grants, dispatch) = self.pop_program_bounded(search_width);
             let examined_before = stats
                 .delta_source_candidates_examined
                 .saturating_add(stats.delta_transition_candidates_examined);
@@ -7900,6 +8611,7 @@ impl DeltaScheduler {
                 plan,
                 state,
                 tasks,
+                support_grants,
                 &dispatch.task_limits,
                 false,
                 direct_terminal_publication_full,
@@ -8212,6 +8924,8 @@ impl DeltaScheduler {
                 completed_activations,
                 completed_transition_cohort: completed_activations > 1,
                 allows_global_width_growth: true,
+                release_directed_lease: false,
+                demand_preference: None,
             },
             terminal_publications,
             retired_search_receipt: false,
@@ -8231,6 +8945,7 @@ impl DeltaScheduler {
         plan: &ResidualPlan,
         state: DeltaStateId,
         mut tasks: Vec<ProgramTask>,
+        support_grants: Vec<Option<PositiveSupportWorkGrant>>,
         limits: &[usize],
         directed_active: bool,
         direct_terminal_full: Option<VariableSet>,
@@ -8240,6 +8955,7 @@ impl DeltaScheduler {
     ) -> DeltaPhysicalOutcome {
         assert!(!tasks.is_empty());
         assert_eq!(tasks.len(), limits.len());
+        assert_eq!(tasks.len(), support_grants.len());
         assert!(limits.iter().all(|&limit| limit > 0));
 
         let address = self
@@ -8259,6 +8975,8 @@ impl DeltaScheduler {
         );
 
         let row_count = tasks.len();
+        let directed_positive_support =
+            directed_active && self.registry.is_live_positive_support(tasks[0].activation);
         let mut scratch = self
             .program_scratch
             .take()
@@ -8285,10 +9003,11 @@ impl DeltaScheduler {
         );
         scratch.task_receipts.clear();
         scratch.work.clear();
-        for task in tasks.drain(..) {
+        for (task, support_grant) in tasks.drain(..).zip(support_grants) {
             scratch.task_receipts.push(ProgramTaskReceipt {
                 activation: task.activation,
                 credit: task.credit,
+                support_grant,
             });
             scratch.work.push(task.work);
         }
@@ -8430,6 +9149,10 @@ impl DeltaScheduler {
             scratch.fused_receipt.clear();
             fused_steps += 1;
         }
+        let validated_examined = validated_program_examined(
+            &scratch.receipt.pages,
+            receipt_local_fusion.then_some(total_examined),
+        );
         let final_source_telemetry_cohort =
             scratch.receipt.source_pages > 0 && scratch.receipt.transition_pages == 0;
         scratch.receipt.source_pages = source_pages;
@@ -8519,6 +9242,8 @@ impl DeltaScheduler {
         let mut completed_activations = 0usize;
         let mut terminal_publications = OrderedActivationSet::default();
         let mut positive_support_retirements = AHashSet::new();
+        let mut credited_support_parents = BTreeSet::new();
+        let mut exhausted_support_parents = BTreeSet::new();
 
         scratch.retired_activations.clear();
         let ProgramSchedulerScratch {
@@ -8552,7 +9277,11 @@ impl DeltaScheduler {
             .zip(supported_ranges.drain(..))
             .enumerate()
         {
-            let ProgramTaskReceipt { activation, credit } = task;
+            let ProgramTaskReceipt {
+                activation,
+                credit,
+                support_grant,
+            } = task;
             let terminal = self.registry.physical_activation_class(activation)
                 == DeltaPhysicalClass::TerminalStreaming;
             let within_search_page = self.registry.program_credit_within_search_page(&credit);
@@ -8581,6 +9310,39 @@ impl DeltaScheduler {
                 page.resume,
             );
             let positive_support_reducer = outcome.positive_support_reducer;
+            assert_eq!(
+                positive_support_reducer,
+                support_grant.is_some(),
+                "PositiveSupport dispatch lost or manufactured its affine work grant"
+            );
+            let examined = validated_examined[input];
+            if let Some(grant) = support_grant {
+                let parent = PositiveConfirmParentId {
+                    brand: self.registry.brand,
+                    activation: grant.parent,
+                };
+                stats.delta_positive_support_examined += self
+                    .registry
+                    .settle_positive_support_work(grant, activation, examined);
+                // A short physical page refunds the unexamined reservation.
+                // Reconsider this parent only after every selected receipt has
+                // been replaced, refiled, and cancelled.
+                credited_support_parents.insert(parent);
+            } else {
+                let accounting = self
+                    .registry
+                    .account_positive_exact_work(activation, examined);
+                if accounting.paired {
+                    stats.delta_positive_support_exact_paired_examined += examined;
+                }
+                if accounting.credited > 0 {
+                    stats.delta_positive_support_exact_credited += accounting.credited;
+                    credited_support_parents.insert(PositiveConfirmParentId {
+                        brand: self.registry.brand,
+                        activation,
+                    });
+                }
+            }
             // A real Program receipt has already spent the child's affine
             // credit. Commit its witness and consume any resulting grant
             // immediately, before scheduling, settlement, or other fallible
@@ -8694,9 +9456,14 @@ impl DeltaScheduler {
             }
             if let Some(proof) = outcome.quiescence {
                 assert_eq!(proof.activation, activation);
-                if let Some(parent) = self.registry.positive_parent(proof.activation) {
+                let exhausted_support_parent = self
+                    .registry
+                    .positive_support_parent_for_child(proof.activation);
+                if let Some(parent) = self.registry.positive_publication_parent(proof.activation) {
                     positive_support_retirements
                         .extend(self.registry.positive_support_children(parent));
+                    stats.delta_positive_support_credit_retired +=
+                        self.registry.retire_positive_support_work(parent);
                 }
                 match self.settle_quiescence(proof) {
                     DeltaSettlement::Retargeted(active) => {
@@ -8720,6 +9487,9 @@ impl DeltaScheduler {
                             completed_activation_ids.push(old_activation);
                         }
                     }
+                }
+                if let Some(parent) = exhausted_support_parent {
+                    exhausted_support_parents.insert(parent);
                 }
                 // Whether this proof removed the activation or transferred it
                 // to the engine finalizer, the just-drained Program family's
@@ -8772,8 +9542,9 @@ impl DeltaScheduler {
         }
         let _ = self.file_program_state(state, runnable);
         let _ = self.file_parked_positive_support_state(state, parked);
-        let cancelled =
+        let (cancelled, cancellation_retired) =
             self.retire_positive_support_activations(root, plan, &positive_support_retirements);
+        stats.delta_positive_support_credit_retired += cancellation_retired;
         completed_activations += cancelled.len();
         completed_activation_ids.extend(cancelled);
         if !retired_activations.is_empty() {
@@ -8785,6 +9556,16 @@ impl DeltaScheduler {
                 &retired_activations,
             );
         }
+        for parent in exhausted_support_parents {
+            stats.delta_positive_support_credit_retired +=
+                self.registry.retire_orphaned_positive_support_work(parent);
+        }
+        let demand_preference = self.assign_public_pull_demand(stats);
+        let exact_credit_wake = self.wake_positive_support_parents(credited_support_parents);
+        let release_directed_lease = directed_active
+            && !directed_positive_support
+            && (demand_preference.is_some() || exact_credit_wake);
+        self.registry.assert_no_positive_support_reservations();
         children.clear();
         direct.clear();
         accepted.clear();
@@ -8812,6 +9593,8 @@ impl DeltaScheduler {
                 completed_activations,
                 completed_transition_cohort: !search_cohort && completed_activations > 1,
                 allows_global_width_growth: true,
+                release_directed_lease,
+                demand_preference,
             },
             terminal_publications,
             retired_search_receipt: retired_search_receipts > 0,
@@ -9054,6 +9837,8 @@ impl DeltaScheduler {
                 completed_activations,
                 completed_transition_cohort: false,
                 allows_global_width_growth: true,
+                release_directed_lease: false,
+                demand_preference: None,
             },
             terminal_publications,
             retired_search_receipt: false,
@@ -9136,6 +9921,7 @@ impl DeltaScheduler {
             source_worklist,
             program_worklist,
             parked_positive_support_worklist,
+            unassigned_public_pull_demand: self.unassigned_public_pull_demand,
             program_runtimes: self.program_runtimes.clone(),
             program_scratch: None,
             activation_width: self.activation_width,
@@ -9227,6 +10013,67 @@ mod tests {
         assert_eq!(retargeted.get(&third_key), Some(&third));
         assert!(retargeted.contains_key(&first_key));
         assert!(!retargeted.contains_key(&missing_key));
+    }
+
+    #[test]
+    fn positive_support_budget_conserves_demand_exact_reservations_and_refunds() {
+        let mut budget = PositiveSupportWorkBudget::default();
+        assert_eq!(
+            budget.mint_exact(7),
+            0,
+            "exact work before external demand must not become retroactive credit"
+        );
+        budget.mint_demand();
+        assert_eq!(budget.mint_exact(4), 4);
+        assert_eq!(budget.minted(), 5);
+
+        // Model two physical roots reserving from the same semantic parent.
+        // Sequential reservation, rather than per-row limits, is the
+        // authoritative aggregate cap.
+        let first = budget.reserve(4);
+        let second = budget.reserve(4);
+        assert_eq!((first, second), (4, 1));
+        assert_eq!(budget.available(), 0);
+        budget.settle(first, 1);
+        budget.settle(second, 1);
+        assert_eq!(budget.spent, 2);
+        assert_eq!(
+            budget.available(),
+            3,
+            "unexamined reservation must refund through the same ledger"
+        );
+
+        let cloned = budget.clone();
+        assert_eq!(cloned, budget);
+        cloned.assert_conservation();
+        assert_eq!(budget.retire_available(), 3);
+        assert_eq!(budget.retired, 3);
+        assert_eq!(budget.available(), 0);
+        budget.assert_conservation();
+    }
+
+    #[test]
+    fn positive_exact_credit_uses_cumulative_receipt_local_fusion_work() {
+        let final_page = ProgramPage {
+            examined: 1,
+            resume: None,
+        };
+        let examined = validated_program_examined(&[final_page], Some(4));
+        assert_eq!(examined, [4]);
+
+        let mut budget = PositiveSupportWorkBudget::default();
+        budget.mint_demand();
+        assert_eq!(budget.mint_exact(examined[0]), 4);
+        assert_eq!(
+            (
+                budget.demand_minted,
+                budget.exact_minted,
+                budget.available()
+            ),
+            (1, 4, 5),
+            "C must use cumulative validated work, not the final fused page"
+        );
+        budget.assert_conservation();
     }
 
     #[derive(Clone)]
@@ -9323,6 +10170,8 @@ mod tests {
     #[derive(Clone, Copy)]
     struct OneShotSupportState {
         keep_cleanup_live: bool,
+        accept_candidate: bool,
+        report_support: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -9372,12 +10221,23 @@ mod tests {
         ) {
             assert_eq!(states.len(), batch.limits.len());
             for (input, state) in states.drain(..).enumerate() {
-                effects.support(u32::try_from(input).unwrap());
+                let input = u32::try_from(input).unwrap();
+                if state.accept_candidate {
+                    let candidate = batch.candidate_sets[input as usize]
+                        .and_then(|candidates| candidates.first())
+                        .copied()
+                        .expect("accepting one-shot Confirm lost its candidate");
+                    effects.accept(input, candidate);
+                } else if state.report_support {
+                    effects.support(input);
+                }
                 effects.page(
                     1,
                     state.keep_cleanup_live.then_some(TypedResume::Immediate(
                         OneShotSupportState {
                             keep_cleanup_live: false,
+                            accept_candidate: state.accept_candidate,
+                            report_support: state.report_support,
                         },
                     )),
                 );
@@ -9427,6 +10287,24 @@ mod tests {
         candidate: RawInline,
         keep_cleanup_live: bool,
     ) -> (ActivationId, ActiveDeltaContinuation) {
+        queue_one_shot_positive_support_with_result(
+            scheduler,
+            root,
+            parent,
+            candidate,
+            keep_cleanup_live,
+            true,
+        )
+    }
+
+    fn queue_one_shot_positive_support_with_result(
+        scheduler: &mut DeltaScheduler,
+        root: &OneShotSupportProgram,
+        parent: PositiveConfirmParentId,
+        candidate: RawInline,
+        keep_cleanup_live: bool,
+        report_support: bool,
+    ) -> (ActivationId, ActiveDeltaContinuation) {
         let child = scheduler
             .registry
             .open_positive_support_activation(
@@ -9456,7 +10334,11 @@ mod tests {
                 .get_mut(&state)
                 .expect("prepared one-shot Support lost its runtime"),
             ProgramActivation(child.0),
-            OneShotSupportState { keep_cleanup_live },
+            OneShotSupportState {
+                keep_cleanup_live,
+                accept_candidate: false,
+                report_support,
+            },
         );
         let active = scheduler
             .file_program_state(
@@ -9477,6 +10359,17 @@ mod tests {
         activation: ActivationId,
         credit: ProducerCredit,
     ) -> ActiveDeltaContinuation {
+        queue_exact_confirm_program(scheduler, state, activation, credit, false, false)
+    }
+
+    fn queue_exact_confirm_program(
+        scheduler: &mut DeltaScheduler,
+        state: DeltaStateId,
+        activation: ActivationId,
+        credit: ProducerCredit,
+        keep_cleanup_live: bool,
+        accept_candidate: bool,
+    ) -> ActiveDeltaContinuation {
         let work = insert_engine_program_state(
             &OneShotSupportProgram,
             scheduler
@@ -9485,7 +10378,9 @@ mod tests {
                 .expect("prepared one-shot Support lost its runtime"),
             ProgramActivation(activation.0),
             OneShotSupportState {
-                keep_cleanup_live: false,
+                keep_cleanup_live,
+                accept_candidate,
+                report_support: false,
             },
         );
         scheduler
@@ -9549,6 +10444,15 @@ mod tests {
         assert!(scheduler.has_active_parked_positive_support(support_active));
         assert!(scheduler.has_active_program(exact_active));
         assert!(stable.is_empty());
+        assert_eq!(
+            scheduler
+                .registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .support_work,
+            PositiveSupportWorkBudget::default(),
+            "parked Support must not cold-start without public demand"
+        );
     }
 
     #[test]
@@ -9569,6 +10473,15 @@ mod tests {
             exact_credit,
         );
         scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        assert!(
+            scheduler.registry.mint_positive_support_demand(parent),
+            "the parked parent should accept clone-test demand"
+        );
+        let original_budget = scheduler
+            .registry
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .support_work;
 
         let original_key = scheduler
             .parked_positive_support_worklist
@@ -9595,10 +10508,24 @@ mod tests {
         assert_eq!(cloned_task.credit.brand, cloned.registry.brand);
         assert!(cloned.has_active_parked_positive_support(support_active));
         assert!(cloned.has_active_program(exact_active));
+        let cloned_parent = PositiveConfirmParentId {
+            brand: cloned.registry.brand,
+            activation: parent.activation,
+        };
+        assert_eq!(
+            cloned
+                .registry
+                .positive_publication_snapshot(cloned_parent)
+                .unwrap()
+                .support_work,
+            original_budget,
+            "deep clone must preserve the started parent budget exactly"
+        );
 
-        let completed =
+        let (completed, retired) =
             cloned.retire_positive_support_activations(&root, &plan, &AHashSet::from_iter([child]));
         assert_eq!(completed, [child]);
+        assert_eq!(retired, 1);
         assert!(!cloned.registry.is_live(child));
         assert!(!cloned.has_active_parked_positive_support(support_active));
         assert!(
@@ -9606,6 +10533,345 @@ mod tests {
                 && scheduler.has_active_parked_positive_support(support_active),
             "cancelling the clone mutated original parked custody"
         );
+        assert_eq!(
+            scheduler
+                .registry
+                .positive_publication_snapshot(parent)
+                .unwrap()
+                .support_work
+                .available(),
+            1,
+            "clone-local retirement mutated the original started budget"
+        );
+    }
+
+    #[test]
+    fn one_public_demand_assigns_exactly_one_of_two_parked_parents() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        let first_value = value(31);
+        let second_value = value(32);
+        let (_, first_parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [first_value], None, true);
+        let (first_child, first_active) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            first_parent,
+            first_value,
+            false,
+        );
+        let (_, second_parent, _, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [second_value], None, true);
+        let (second_child, second_active) = queue_one_shot_positive_support(
+            &mut scheduler,
+            &root,
+            second_parent,
+            second_value,
+            false,
+        );
+        scheduler
+            .park_positive_support_activations(&AHashSet::from_iter([first_child, second_child]));
+
+        let mut stats = ResidualStateStats::default();
+        let preferred = scheduler
+            .begin_public_pull_demand(&mut stats)
+            .expect("one pull should assign one parked parent");
+        let assigned_parent = scheduler
+            .registry
+            .positive_support_parent_for_child(preferred.activation)
+            .unwrap();
+        let unassigned_parent = if assigned_parent == first_parent {
+            second_parent
+        } else {
+            first_parent
+        };
+        assert_eq!(stats.delta_positive_support_demand_assigned, 1);
+        assert!(!scheduler.has_unassigned_public_pull_demand());
+        assert_eq!(
+            scheduler
+                .registry
+                .positive_publication_snapshot(assigned_parent)
+                .unwrap()
+                .support_work
+                .demand_minted,
+            1
+        );
+        assert_eq!(
+            scheduler
+                .registry
+                .positive_publication_snapshot(unassigned_parent)
+                .unwrap()
+                .support_work,
+            PositiveSupportWorkBudget::default()
+        );
+        assert!(
+            scheduler.has_active_program(preferred),
+            "assigned D should prefer its newly runnable Support task"
+        );
+        assert_eq!(
+            usize::from(scheduler.has_active_parked_positive_support(first_active))
+                + usize::from(scheduler.has_active_parked_positive_support(second_active)),
+            1,
+            "the other parent's Support task must remain parked"
+        );
+    }
+
+    #[test]
+    fn pending_public_demand_is_idempotent_retirable_and_clone_local() {
+        let root = OneShotSupportProgram;
+        let mut scheduler = DeltaScheduler::new();
+        let mut stats = ResidualStateStats::default();
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
+        assert_eq!(stats.delta_positive_support_demand_assigned, 0);
+
+        let mut cloned = scheduler.deep_clone();
+        for (index, current) in [&mut scheduler, &mut cloned].into_iter().enumerate() {
+            let candidate = value(50 + index as u8);
+            let (_, parent, _, _) =
+                open_tapped_confirm_with_support(&mut current.registry, [candidate], None, true);
+            let (child, _) =
+                queue_one_shot_positive_support(current, &root, parent, candidate, false);
+            current.park_positive_support_activations(&AHashSet::from_iter([child]));
+            let mut branch_stats = ResidualStateStats::default();
+            assert!(
+                current
+                    .assign_public_pull_demand(&mut branch_stats)
+                    .is_some(),
+                "each clone should observably consume its copied pending demand"
+            );
+            assert_eq!(branch_stats.delta_positive_support_demand_assigned, 1);
+        }
+
+        let mut retired = DeltaScheduler::new();
+        assert!(retired.begin_public_pull_demand(&mut stats).is_none());
+        retired.retire_unassigned_public_pull_demand();
+        let candidate = value(59);
+        let (_, parent, _, _) =
+            open_tapped_confirm_with_support(&mut retired.registry, [candidate], None, true);
+        let (child, _) =
+            queue_one_shot_positive_support(&mut retired, &root, parent, candidate, false);
+        retired.park_positive_support_activations(&AHashSet::from_iter([child]));
+        assert!(
+            retired.assign_public_pull_demand(&mut stats).is_none(),
+            "retired pending demand must not assign to later parked work"
+        );
+    }
+
+    #[test]
+    fn exact_credit_wakes_support_and_releases_the_directed_exact_lease() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(41);
+        let (parent_activation, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (child, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+
+        let before_d = scheduler
+            .registry
+            .account_positive_exact_work(parent_activation, 3);
+        assert_eq!(
+            before_d,
+            PositiveExactWorkAccounting {
+                paired: true,
+                credited: 0,
+            },
+            "paired exact work must not become retroactive C before D"
+        );
+
+        let mut stats = ResidualStateStats::default();
+        assert_eq!(
+            scheduler.begin_public_pull_demand(&mut stats),
+            Some(support_active)
+        );
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        let spent_d = scheduler
+            .registry
+            .reserve_positive_support_work(child, 1)
+            .expect("assigned D should reserve one Support work unit");
+        assert_eq!(
+            scheduler
+                .registry
+                .settle_positive_support_work(spent_d, child, 1),
+            1
+        );
+        let exact_active = queue_exact_confirm_program(
+            &mut scheduler,
+            support_active.state,
+            parent_activation,
+            exact_credit,
+            true,
+            false,
+        );
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let stepped = scheduler.step_active_bounded(
+            &root,
+            &plan,
+            exact_active,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(stepped.status, ActiveDeltaStatus::Released);
+        assert!(stepped.resume.is_none());
+        assert!(!stepped.outcome.has_stable_effect());
+        assert!(scheduler.has_active_program(exact_active));
+        assert!(scheduler.has_active_program(support_active));
+        assert!(!scheduler.has_active_parked_positive_support(support_active));
+        assert_eq!(stats.delta_positive_support_exact_paired_examined, 1);
+        assert_eq!(stats.delta_positive_support_exact_credited, 1);
+        let budget = scheduler
+            .registry
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .support_work;
+        assert_eq!(
+            (
+                budget.demand_minted,
+                budget.exact_minted,
+                budget.spent,
+                budget.available()
+            ),
+            (1, 1, 1, 1)
+        );
+        budget.assert_conservation();
+    }
+
+    #[test]
+    fn same_batch_exact_win_cancels_support_instead_of_waking_refunded_credit() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(42);
+        let (parent_activation, parent, exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (child, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        let mut stats = ResidualStateStats::default();
+        assert_eq!(
+            scheduler.begin_public_pull_demand(&mut stats),
+            Some(support_active)
+        );
+        let exact_active = queue_exact_confirm_program(
+            &mut scheduler,
+            support_active.state,
+            parent_activation,
+            exact_credit,
+            true,
+            true,
+        );
+
+        let stepped = scheduler.step_active_bounded(
+            &root,
+            &plan,
+            exact_active,
+            1,
+            Some(terminal_positive_full()),
+            &mut Worklist::new(),
+            &mut StateInterner::default(),
+            &mut stats,
+        );
+
+        assert_eq!(stepped.status, ActiveDeltaStatus::Yielded);
+        assert!(
+            stepped.outcome.publication.is_some(),
+            "the exact receipt should win publication"
+        );
+        assert!(!scheduler.registry.is_live(child));
+        assert!(!scheduler.has_active_program(support_active));
+        assert!(!scheduler.has_active_parked_positive_support(support_active));
+        assert_eq!(stats.delta_positive_support_exact_credited, 1);
+        assert_eq!(stats.delta_positive_publication_exact_wins, 1);
+        assert_eq!(stats.delta_positive_publication_support_wins, 0);
+        assert_eq!(stats.delta_positive_support_credit_retired, 2);
+        let budget = scheduler
+            .registry
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .support_work;
+        assert_eq!(
+            (
+                budget.demand_minted,
+                budget.exact_minted,
+                budget.spent,
+                budget.retired,
+                budget.available()
+            ),
+            (1, 1, 0, 2, 0)
+        );
+        budget.assert_conservation();
+    }
+
+    #[test]
+    fn natural_support_miss_retires_refunded_allowance() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(43);
+        let (parent_activation, parent, _exact_credit, _) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        let (child, support_active) = queue_one_shot_positive_support_with_result(
+            &mut scheduler,
+            &root,
+            parent,
+            candidate,
+            false,
+            false,
+        );
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        let mut stats = ResidualStateStats::default();
+        assert_eq!(
+            scheduler.begin_public_pull_demand(&mut stats),
+            Some(support_active)
+        );
+        assert_eq!(
+            scheduler
+                .registry
+                .account_positive_exact_work(parent_activation, 3)
+                .credited,
+            3
+        );
+
+        let stepped = scheduler.step_active_bounded(
+            &root,
+            &plan,
+            support_active,
+            4,
+            Some(terminal_positive_full()),
+            &mut Worklist::new(),
+            &mut StateInterner::default(),
+            &mut stats,
+        );
+
+        assert_eq!(stepped.status, ActiveDeltaStatus::Quiescent);
+        assert!(!scheduler.registry.is_live(child));
+        assert_eq!(stats.delta_positive_support_examined, 1);
+        assert_eq!(stats.delta_positive_support_credit_retired, 3);
+        let budget = scheduler
+            .registry
+            .positive_publication_snapshot(parent)
+            .unwrap()
+            .support_work;
+        assert_eq!(
+            (
+                budget.demand_minted,
+                budget.exact_minted,
+                budget.spent,
+                budget.retired,
+                budget.available()
+            ),
+            (1, 3, 1, 3, 0)
+        );
+        budget.assert_conservation();
     }
 
     #[test]
@@ -11678,6 +12944,9 @@ mod tests {
                 ActiveDeltaStatus::Parked => {
                     panic!("non-Support materializer entered the parked hedge lane")
                 }
+                ActiveDeltaStatus::Released => {
+                    panic!("non-Confirm materializer released its directed lease")
+                }
             }
         }
         assert!(
@@ -11989,7 +13258,11 @@ mod tests {
                     .get_mut(&state)
                     .expect("prepared support Program lost its runtime"),
                 ProgramActivation(old_activation.0),
-                OneShotSupportState { keep_cleanup_live },
+                OneShotSupportState {
+                    keep_cleanup_live,
+                    accept_candidate: false,
+                    report_support: true,
+                },
             );
             let active = scheduler
                 .file_program_state(
@@ -12051,13 +13324,17 @@ mod tests {
         let (_parent_activation, parent, _exact_credit, initial) =
             open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
         assert!(initial.is_empty());
-        let (child, active) =
+        let (child, initially_active) =
             queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, true);
-        let state = active.state;
-
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        let active = scheduler
+            .begin_public_pull_demand(&mut stats)
+            .expect("public demand should wake the parked Support child");
+        assert_eq!(active, initially_active);
+        let state = active.state;
         let stepped = scheduler.step_active_bounded(
             &root,
             &plan,
@@ -12098,6 +13375,9 @@ mod tests {
             BTreeSet::from([candidate])
         );
         assert!(stable.is_empty());
+        assert_eq!(stats.delta_positive_support_demand_assigned, 1);
+        assert_eq!(stats.delta_positive_support_examined, 1);
+        assert_eq!(stats.delta_positive_publication_support_wins, 1);
     }
 
     #[test]
@@ -12142,7 +13422,7 @@ mod tests {
         ) else {
             panic!("the exact Confirm must retain its pageable finalizer")
         };
-        let completed = scheduler.retire_positive_support_activations(&root, &plan, &targets);
+        let (completed, _) = scheduler.retire_positive_support_activations(&root, &plan, &targets);
 
         assert_eq!(completed, [child]);
         assert!(
@@ -12202,7 +13482,7 @@ mod tests {
             .positive_support_children(parent)
             .into_iter()
             .collect();
-        let completed = scheduler.retire_positive_support_activations(&root, &plan, &targets);
+        let (completed, _) = scheduler.retire_positive_support_activations(&root, &plan, &targets);
 
         assert_eq!(completed, [child]);
         assert!(
@@ -15204,7 +16484,8 @@ mod tests {
 
         assert_eq!(scheduler.program_worklist.len(), 1);
         assert_eq!(scheduler.program_worklist[&state].tasks.len(), 2);
-        let (popped_state, hot, dispatch) = scheduler.pop_active_program(active, 1);
+        let (popped_state, hot, _support_grants, dispatch) =
+            scheduler.pop_active_program(active, 1);
         assert_eq!(popped_state, state);
         assert_eq!(dispatch.kind, PhysicalDispatchKind::Program);
         assert_eq!(hot.len(), 1);
@@ -15398,7 +16679,7 @@ mod tests {
         let local_nonce = local.credit.key.nonce;
         let active = scheduler.file_program_state(state, initial).unwrap();
 
-        let (_, selected, _) = scheduler.pop_active_program(active, 2);
+        let (_, selected, _, _) = scheduler.pop_active_program(active, 2);
         assert_eq!(selected.len(), 2);
         assert!(!scheduler.program_worklist.contains_key(&state));
         let parked_capacity = scheduler.program_worklist.buckets[state.0 as usize]
@@ -15457,7 +16738,7 @@ mod tests {
         let dormant_active = scheduler
             .file_program_state(dormant_state, dormant_tasks)
             .unwrap();
-        let (_, mut popped, _) = scheduler.pop_active_program(dormant_active, 1);
+        let (_, mut popped, _, _) = scheduler.pop_active_program(dormant_active, 1);
         let dormant_capacity = scheduler.program_worklist.buckets[dormant_state.0 as usize]
             .tasks
             .capacity();
@@ -15545,7 +16826,7 @@ mod tests {
         );
         let storage_nonces: Vec<_> = tasks.iter().map(|task| task.credit.key.nonce).collect();
         let active = scheduler.file_program_state(state, tasks).unwrap();
-        let (popped_state, selected, dispatch) = if active_pop {
+        let (popped_state, selected, _support_grants, dispatch) = if active_pop {
             scheduler.pop_active_program(active, 3)
         } else {
             scheduler.pop_program_bounded(3)
@@ -15643,7 +16924,7 @@ mod tests {
         );
         let _ = scheduler.file_program_state(state, vec![s0, q0, s1, q1]);
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(4);
+        let (popped_state, tasks, _support_grants, dispatch) = scheduler.pop_program_bounded(4);
         assert_eq!(popped_state, state);
         assert_eq!(dispatch.kind, PhysicalDispatchKind::Source);
         assert_eq!(dispatch.task_limits, [1, 1, 1, 1]);
@@ -15709,7 +16990,7 @@ mod tests {
         );
         let _ = scheduler.file_program_state(state, vec![a0, b0, a1, b1, a2]);
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(4);
+        let (popped_state, tasks, _support_grants, dispatch) = scheduler.pop_program_bounded(4);
         assert_eq!(popped_state, state);
         assert_eq!(dispatch.kind, PhysicalDispatchKind::Program);
         assert_eq!(dispatch.task_limits, [1, 1, 1, 1]);
@@ -15797,7 +17078,7 @@ mod tests {
         );
         let _ = scheduler.file_program_state(state, vec![a0, b0, c0, a1, incompatible, b1, c1]);
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(8);
+        let (popped_state, tasks, _support_grants, dispatch) = scheduler.pop_program_bounded(8);
         assert_eq!(popped_state, state);
         assert_eq!(
             tasks
@@ -16027,6 +17308,7 @@ mod tests {
                     candidates: CandidatePayload::Tagged(vec![(0, value(7)), (1, value(8))]),
                 },
                 None,
+                &mut ResidualStateStats::default(),
             )
             .active
             .expect("both Confirm parents must seed one live Program root");
@@ -16651,6 +17933,7 @@ mod tests {
                     candidates: CandidatePayload::Values(vec![value(7)]),
                 },
                 None,
+                &mut ResidualStateStats::default(),
             )
             .active
             .expect("Confirm Program seeded one graph task");
@@ -16751,6 +18034,7 @@ mod tests {
                     candidates: CandidatePayload::Tagged(vec![(0, value(7)), (1, value(8))]),
                 },
                 None,
+                &mut ResidualStateStats::default(),
             )
             .active
             .expect("both Confirm parents must seed one live Program root");
@@ -16848,7 +18132,7 @@ mod tests {
         let retained = n0.credit.key.nonce;
         let _ = scheduler.file_program_state(state, vec![n0, w0, n1, w1, w2]);
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(8);
+        let (popped_state, tasks, _support_grants, dispatch) = scheduler.pop_program_bounded(8);
         assert_eq!(popped_state, state);
         assert_eq!(
             tasks
@@ -16956,7 +18240,7 @@ mod tests {
             ],
         );
 
-        let (popped_state, tasks, dispatch) = scheduler.pop_program_bounded(8);
+        let (popped_state, tasks, _support_grants, dispatch) = scheduler.pop_program_bounded(8);
         assert_eq!(popped_state, state);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].activation, wide);
