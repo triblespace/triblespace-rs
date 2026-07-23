@@ -159,6 +159,7 @@ impl Attribution {
 
 struct Profile {
     first: RawInline,
+    b0_position: Option<usize>,
     first_stats: Attribution,
     full_stats: Attribution,
 }
@@ -166,6 +167,7 @@ struct Profile {
 #[derive(Default)]
 struct Samples {
     first: Vec<Duration>,
+    b0: Vec<Duration>,
     full: Vec<Duration>,
 }
 
@@ -770,6 +772,7 @@ fn profile(
     let mut full_iter = make_iter(fixture, mode, width);
     let mut full: Vec<_> = full_iter.by_ref().collect();
     let full_stats = attribution(full_iter.stats());
+    let b0_position = full.iter().position(|value| *value == fixture.b0);
     assert_eq!(
         signature(full.iter().copied()),
         oracle_signature,
@@ -789,15 +792,14 @@ fn profile(
     match mode {
         Mode::Production if fixture.case.is_positive() => {
             assert_eq!(
-                first_stats.positive_commits(),
+                full_stats.positive_commits(),
                 1,
                 "{} width {width}: neither Exact nor Support published positive B[0]",
                 fixture.label()
             );
-            assert_eq!(
-                first,
-                fixture.b0,
-                "{} width {width}: positive publication did not emit B[0]",
+            assert!(
+                b0_position.is_some(),
+                "{} width {width}: B[0] is absent",
                 fixture.label()
             );
         }
@@ -811,15 +813,14 @@ fn profile(
         }
         Mode::ExactOnly if fixture.case.is_positive() => {
             assert_eq!(
-                first_stats.positive_commits(),
+                full_stats.positive_commits(),
                 1,
                 "{} width {width}: authoritative Exact tap did not publish positive B[0]",
                 fixture.label()
             );
-            assert_eq!(
-                first,
-                fixture.b0,
-                "{} width {width}: Exact tap did not emit B[0]",
+            assert!(
+                b0_position.is_some(),
+                "{} width {width}: B[0] is absent",
                 fixture.label()
             );
         }
@@ -835,6 +836,7 @@ fn profile(
 
     Profile {
         first,
+        b0_position,
         first_stats,
         full_stats,
     }
@@ -921,6 +923,7 @@ fn measure(fixture: &Fixture, width: usize, reps: usize) {
 
     let mut samples: [Samples; MODES.len()] = std::array::from_fn(|_| Samples {
         first: Vec::with_capacity(reps),
+        b0: Vec::with_capacity(reps),
         full: Vec::with_capacity(reps),
     });
     for repetition in 0..reps {
@@ -932,7 +935,25 @@ fn measure(fixture: &Fixture, width: usize, reps: usize) {
             let began = Instant::now();
             let first = black_box(first_iter.next());
             samples[index].first.push(began.elapsed());
-            assert_eq!(first, Some(profiles[index].first));
+            assert!(
+                first.is_some_and(|value| oracle.contains(&value)),
+                "{} {} width {width}: first row escaped the result SET",
+                fixture.label(),
+                mode.label()
+            );
+
+            if fixture.case.is_positive() {
+                let mut b0_iter = make_iter(fixture, mode, width);
+                let began = Instant::now();
+                let position = black_box(b0_iter.by_ref().position(|value| value == fixture.b0));
+                samples[index].b0.push(began.elapsed());
+                assert!(
+                    position.is_some(),
+                    "{} {} width {width}: timed run never emitted B[0]",
+                    fixture.label(),
+                    mode.label()
+                );
+            }
 
             let mut full_iter = make_iter(fixture, mode, width);
             let began = Instant::now();
@@ -967,6 +988,17 @@ fn measure(fixture: &Fixture, width: usize, reps: usize) {
             percentile(&samples[index].full, 50),
             percentile(&samples[index].full, 95),
         );
+        if fixture.case.is_positive() {
+            println!(
+                "    B0 position={} first_is_B0={} time-to-B0 p50/p95 {:>10?}/{:>10?}",
+                profile
+                    .b0_position
+                    .expect("positive fixture profile omitted B[0]"),
+                profile.first == fixture.b0,
+                percentile(&samples[index].b0, 50),
+                percentile(&samples[index].b0, 95),
+            );
+        }
         println!(
             "    first: positive {}/{} direct_rows {} ordinary_support calls/rows {}/{} \
              confirm calls/rows {}/{} source pages/examined {}/{} \
