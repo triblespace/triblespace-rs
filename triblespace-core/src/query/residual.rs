@@ -11751,6 +11751,16 @@ impl ResidualStateMachine {
                                     "a pending affine activation has an exact continuation",
                                 ));
                         }
+                        ActiveDeltaStatus::Parked => {
+                            // PositiveSupport remains affine scheduler custody,
+                            // but it is a latency hedge rather than a semantic
+                            // completeness owner. Release the directed lease
+                            // so the exact Confirm parent can run globally.
+                            debug_assert!(focused.resume.is_none());
+                            debug_assert!(focused.outcome.completed_activation_ids.is_empty());
+                            debug_assert!(!focused.outcome.has_stable_effect());
+                            self.account_delta_feedback(&focused.outcome);
+                        }
                         ActiveDeltaStatus::Quiescent => {
                             // Quiescence carries the exact activation receipt
                             // used by the terminal yield ledger. It has no

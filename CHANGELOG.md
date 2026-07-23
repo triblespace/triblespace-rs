@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Positive Support hedges now have explicit live-but-parked scheduler
+  custody.** Their opaque typed handles and affine producer credits can leave
+  the runnable Program frontier without being consumed, survive deep clones
+  with fresh registry brands, and are drained by the same cancellation
+  transaction as queued work. A directed parked lease is released without
+  claiming quiescence or stable progress, so the exact Confirm parent remains
+  the sole completeness-bearing runnable lineage. Demand and exact-work credit
+  assignment remain a separate policy layer.
 - **Eligible target-Confirm activations can publish their first candidate from
   the authoritative exact traversal.** A new structural Program certificate
   lets every eligible exact RPQ Confirm reuse a real replacement receipt that

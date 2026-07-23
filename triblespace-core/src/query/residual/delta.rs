@@ -4826,8 +4826,25 @@ pub(super) struct DeltaStepOutcome {
 }
 
 impl DeltaStepOutcome {
-    fn has_stable_effect(&self) -> bool {
+    pub(super) fn has_stable_effect(&self) -> bool {
         self.continuation.is_some() || self.publication.is_some()
+    }
+
+    /// Releases a directed lease whose affine work remains scheduler-owned
+    /// but is deliberately ineligible for physical dispatch.
+    fn parked_lease_release() -> Self {
+        Self {
+            continuation: None,
+            publication: None,
+            completed_activation_ids: Vec::new(),
+            retargeted: RetargetedActivations::default(),
+            dead_pages: 0,
+            source_dead_pages: 0,
+            transition_dead_pages: 0,
+            completed_activations: 0,
+            completed_transition_cohort: false,
+            allows_global_width_growth: false,
+        }
     }
 }
 
@@ -4858,6 +4875,9 @@ pub(super) enum ActiveDeltaStatus {
     Yielded,
     /// The activation still owns a scheduled source or transition credit.
     Pending,
+    /// The activation remains live, but all of its affine work is deliberately
+    /// parked outside the runnable scheduler frontier.
+    Parked,
     /// The activation reached quiescence and was removed from the registry.
     Quiescent,
 }
@@ -5293,6 +5313,13 @@ pub(super) struct DeltaScheduler {
     /// product expansion are family-private states distinguished only by
     /// opaque physical dispatch classes.
     program_worklist: ProgramWorklist,
+    /// Affine PositiveSupport custody that is live but not runnable.
+    ///
+    /// Parked hedges do not own semantic completeness: their exact Confirm
+    /// parents remain on the ordinary runnable frontier. Keeping the opaque
+    /// handles in the same state-indexed shape lets cancellation and cloning
+    /// preserve their exact typed runtime without exposing them to global pop.
+    parked_positive_support_worklist: ProgramWorklist,
     program_runtimes: AHashMap<DeltaStateId, ProgramRuntime>,
     /// Program-only cohort scratch is lazy so non-Program queries retain the
     /// baseline scheduler footprint. One allocation is amortized across all
@@ -5317,6 +5344,7 @@ impl DeltaScheduler {
             worklist: BTreeMap::new(),
             source_worklist: BTreeMap::new(),
             program_worklist: ProgramWorklist::default(),
+            parked_positive_support_worklist: ProgramWorklist::default(),
             program_runtimes: AHashMap::new(),
             program_scratch: None,
             activation_width: 1,
@@ -5352,6 +5380,9 @@ impl DeltaScheduler {
     }
 
     pub(super) fn is_empty(&self) -> bool {
+        // PositiveSupport is a latency hedge, never a completeness owner.
+        // Parked custody therefore cannot keep the semantic scheduler alive;
+        // every live hedge has an exact Confirm parent on the runnable path.
         self.worklist.is_empty()
             && self.source_worklist.is_empty()
             && self.program_worklist.is_empty()
@@ -5813,7 +5844,7 @@ impl DeltaScheduler {
                     &retired,
                 );
             }
-            support_active = self.file_program_state(support_state, tasks);
+            support_active = self.file_parked_positive_support_state(support_state, tasks);
         }
 
         DeltaSeedOutcome {
@@ -7146,6 +7177,46 @@ impl DeltaScheduler {
         Some(ActiveDeltaContinuation { state, activation })
     }
 
+    /// Files typed PositiveSupport custody without making it globally
+    /// runnable. Credits and opaque handles remain untouched and affine.
+    fn file_parked_positive_support_state(
+        &mut self,
+        state: DeltaStateId,
+        mut tasks: Vec<ProgramTask>,
+    ) -> Option<ActiveDeltaContinuation> {
+        let activation = tasks.last()?.activation;
+        assert!(
+            self.interner.program(state).is_some(),
+            "parked positive Support task was filed under a legacy delta state"
+        );
+        assert!(
+            tasks.iter().all(|task| {
+                task.activation == task.credit.key.activation
+                    && self.registry.is_live_positive_support(task.activation)
+            }),
+            "only live PositiveSupport Program tasks may enter the parked lane"
+        );
+        self.parked_positive_support_worklist
+            .append(state, &mut tasks);
+        Some(ActiveDeltaContinuation { state, activation })
+    }
+
+    /// Moves already queued PositiveSupport tasks out of runnable selection
+    /// while retaining their exact state grouping and affine credits.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn park_positive_support_activations(&mut self, activations: &AHashSet<ActivationId>) {
+        for &activation in activations {
+            assert!(
+                self.registry.is_live_positive_support(activation),
+                "only live PositiveSupport activations may be parked"
+            );
+        }
+        let groups = self.program_worklist.take_activations(activations);
+        for (state, tasks) in groups {
+            let _ = self.file_parked_positive_support_state(state, tasks);
+        }
+    }
+
     /// Discards every queued opaque handle for the selected PositiveSupport
     /// hedges, consumes their issued producer credits, and retires each child
     /// through ordinary cleanup quiescence.
@@ -7169,7 +7240,18 @@ impl DeltaScheduler {
             return Vec::new();
         }
 
-        let groups = self.program_worklist.take_activations(&live);
+        let mut groups = BTreeMap::<DeltaStateId, Vec<ProgramTask>>::new();
+        for (state, mut tasks) in self
+            .program_worklist
+            .take_activations(&live)
+            .into_iter()
+            .chain(
+                self.parked_positive_support_worklist
+                    .take_activations(&live),
+            )
+        {
+            groups.entry(state).or_default().append(&mut tasks);
+        }
         let mut completed = Vec::with_capacity(live.len());
         for (state, tasks) in groups {
             let address = self
@@ -7228,7 +7310,7 @@ impl DeltaScheduler {
         for activation in live {
             assert!(
                 !self.registry.is_live(activation),
-                "PositiveSupport cancellation left affine work outside the Program worklist"
+                "PositiveSupport cancellation left affine work outside its queued or parked custody"
             );
         }
         completed
@@ -7253,6 +7335,12 @@ impl DeltaScheduler {
 
     fn has_active_program(&self, active: ActiveDeltaContinuation) -> bool {
         self.program_worklist
+            .get(&active.state)
+            .is_some_and(|bucket| bucket.contains_activation(active.activation))
+    }
+
+    fn has_active_parked_positive_support(&self, active: ActiveDeltaContinuation) -> bool {
+        self.parked_positive_support_worklist
             .get(&active.state)
             .is_some_and(|bucket| bucket.contains_activation(active.activation))
     }
@@ -7606,6 +7694,22 @@ impl DeltaScheduler {
         let has_source = self.has_active_source(active);
         let has_transition = self.has_active_transition(active);
         let has_program = self.has_active_program(active);
+        let has_parked_program = self.has_active_parked_positive_support(active);
+        if has_parked_program {
+            assert!(
+                !has_source && !has_transition && !has_program,
+                "parked PositiveSupport activation remained runnable"
+            );
+            assert!(
+                self.registry.is_live_positive_support(active.activation),
+                "parked PositiveSupport lease lost its live affine activation"
+            );
+            return ActiveDeltaStepOutcome {
+                outcome: DeltaStepOutcome::parked_lease_release(),
+                status: ActiveDeltaStatus::Parked,
+                resume: None,
+            };
+        }
         assert!(
             has_source || has_transition || has_program,
             "active delta continuation has no scheduled affine task"
@@ -7731,12 +7835,26 @@ impl DeltaScheduler {
         // receipt remains authoritative even though the old registry entry
         // has already been removed; queue liveness must not be used to infer
         // or discard that handoff.
-        let resume = settled.or_else(|| live.then_some(active));
+        let runnable = self.has_active_source(active)
+            || self.has_active_transition(active)
+            || self.has_active_program(active);
+        let parked = self.has_active_parked_positive_support(active);
+        debug_assert!(
+            !runnable || !parked,
+            "one activation remained both runnable and parked after a directed step"
+        );
+        let resume = settled.or_else(|| runnable.then_some(active));
         let status = if yielded {
             ActiveDeltaStatus::Yielded
         } else if resume.is_some() {
             ActiveDeltaStatus::Pending
+        } else if live && parked {
+            ActiveDeltaStatus::Parked
         } else {
+            debug_assert!(
+                !live,
+                "live delta activation lost both runnable and parked affine custody"
+            );
             ActiveDeltaStatus::Quiescent
         };
         ActiveDeltaStepOutcome {
@@ -8643,7 +8761,17 @@ impl DeltaScheduler {
             debug_assert!(input < row_count);
         }
 
-        let _ = self.file_program_state(state, tasks);
+        let mut runnable = Vec::with_capacity(tasks.len());
+        let mut parked = Vec::new();
+        for task in tasks {
+            if self.registry.is_live_positive_support(task.activation) {
+                parked.push(task);
+            } else {
+                runnable.push(task);
+            }
+        }
+        let _ = self.file_program_state(state, runnable);
+        let _ = self.file_parked_positive_support_state(state, parked);
         let cancelled =
             self.retire_positive_support_activations(root, plan, &positive_support_retirements);
         completed_activations += cancelled.len();
@@ -8982,6 +9110,21 @@ impl DeltaScheduler {
             }
             program_worklist.append(id, &mut tasks);
         }
+        let mut parked_positive_support_worklist = ProgramWorklist::default();
+        for (id, bucket) in self.parked_positive_support_worklist.iter() {
+            let mut tasks = Vec::with_capacity(bucket.tasks.len());
+            for task in &bucket.tasks {
+                let credit = remap
+                    .remove(&task.credit.key)
+                    .expect("delta clone omitted one parked positive Support credit");
+                tasks.push(ProgramTask {
+                    activation: task.activation,
+                    credit,
+                    work: task.work.clone(),
+                });
+            }
+            parked_positive_support_worklist.append(id, &mut tasks);
+        }
         assert!(
             remap.is_empty(),
             "delta registry held a live credit without a scheduled task"
@@ -8992,6 +9135,7 @@ impl DeltaScheduler {
             worklist,
             source_worklist,
             program_worklist,
+            parked_positive_support_worklist,
             program_runtimes: self.program_runtimes.clone(),
             program_scratch: None,
             activation_width: self.activation_width,
@@ -9325,6 +9469,143 @@ mod tests {
             )
             .expect("the positive Support child filed one affine task");
         (child, active)
+    }
+
+    fn queue_exact_confirm_credit(
+        scheduler: &mut DeltaScheduler,
+        state: DeltaStateId,
+        activation: ActivationId,
+        credit: ProducerCredit,
+    ) -> ActiveDeltaContinuation {
+        let work = insert_engine_program_state(
+            &OneShotSupportProgram,
+            scheduler
+                .program_runtimes
+                .get_mut(&state)
+                .expect("prepared one-shot Support lost its runtime"),
+            ProgramActivation(activation.0),
+            OneShotSupportState {
+                keep_cleanup_live: false,
+            },
+        );
+        scheduler
+            .file_program_state(
+                state,
+                vec![ProgramTask {
+                    activation,
+                    credit,
+                    work,
+                }],
+            )
+            .expect("the exact Confirm parent filed one affine task")
+    }
+
+    #[test]
+    fn parked_positive_support_releases_its_lease_while_exact_remains_runnable() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(6);
+        let (parent_activation, parent, exact_credit, initial) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        assert!(initial.is_empty());
+        let (child, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        let exact_active = queue_exact_confirm_credit(
+            &mut scheduler,
+            support_active.state,
+            parent_activation,
+            exact_credit,
+        );
+
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        assert!(scheduler.has_active_program(exact_active));
+        assert!(!scheduler.has_active_program(support_active));
+        assert!(scheduler.has_active_parked_positive_support(support_active));
+        assert!(
+            !scheduler.is_empty(),
+            "parked Support must not hide its runnable exact parent"
+        );
+
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let released = scheduler.step_active_bounded(
+            &root,
+            &plan,
+            support_active,
+            1,
+            Some(terminal_positive_full()),
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+
+        assert_eq!(released.status, ActiveDeltaStatus::Parked);
+        assert!(released.resume.is_none());
+        assert!(!released.outcome.has_stable_effect());
+        assert!(released.outcome.completed_activation_ids.is_empty());
+        assert!(scheduler.registry.is_live(child));
+        assert!(scheduler.has_active_parked_positive_support(support_active));
+        assert!(scheduler.has_active_program(exact_active));
+        assert!(stable.is_empty());
+    }
+
+    #[test]
+    fn parked_positive_support_survives_deep_clone_with_rebranded_credit() {
+        let root = OneShotSupportProgram;
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let mut scheduler = DeltaScheduler::new();
+        let candidate = value(7);
+        let (parent_activation, parent, exact_credit, initial) =
+            open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
+        assert!(initial.is_empty());
+        let (child, support_active) =
+            queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        let exact_active = queue_exact_confirm_credit(
+            &mut scheduler,
+            support_active.state,
+            parent_activation,
+            exact_credit,
+        );
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+
+        let original_key = scheduler
+            .parked_positive_support_worklist
+            .get(&support_active.state)
+            .unwrap()
+            .tasks
+            .iter()
+            .find(|task| task.activation == child)
+            .unwrap()
+            .credit
+            .key;
+        let original_brand = scheduler.registry.brand;
+        let mut cloned = scheduler.deep_clone();
+        let cloned_task = cloned
+            .parked_positive_support_worklist
+            .get(&support_active.state)
+            .unwrap()
+            .tasks
+            .iter()
+            .find(|task| task.activation == child)
+            .expect("the cloned scheduler retained parked Support custody");
+        assert_eq!(cloned_task.credit.key, original_key);
+        assert_ne!(cloned_task.credit.brand, original_brand);
+        assert_eq!(cloned_task.credit.brand, cloned.registry.brand);
+        assert!(cloned.has_active_parked_positive_support(support_active));
+        assert!(cloned.has_active_program(exact_active));
+
+        let completed =
+            cloned.retire_positive_support_activations(&root, &plan, &AHashSet::from_iter([child]));
+        assert_eq!(completed, [child]);
+        assert!(!cloned.registry.is_live(child));
+        assert!(!cloned.has_active_parked_positive_support(support_active));
+        assert!(
+            scheduler.registry.is_live(child)
+                && scheduler.has_active_parked_positive_support(support_active),
+            "cancelling the clone mutated original parked custody"
+        );
     }
 
     #[test]
@@ -11394,6 +11675,9 @@ mod tests {
                 ActiveDeltaStatus::Quiescent => {
                     panic!("nonempty materializer orphaned its candidate result")
                 }
+                ActiveDeltaStatus::Parked => {
+                    panic!("non-Support materializer entered the parked hedge lane")
+                }
             }
         }
         assert!(
@@ -11827,6 +12111,9 @@ mod tests {
         assert!(initial.is_empty());
         let (child, support_active) =
             queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        scheduler.park_positive_support_activations(&AHashSet::from_iter([child]));
+        assert!(!scheduler.has_active_program(support_active));
+        assert!(scheduler.has_active_parked_positive_support(support_active));
 
         let exact_page = scheduler.registry.replace_program(
             exact_credit,
@@ -11865,6 +12152,10 @@ mod tests {
         assert!(
             !scheduler.has_active_program(support_active),
             "exact quiescence left the Support hedge runnable"
+        );
+        assert!(
+            !scheduler.has_active_parked_positive_support(support_active),
+            "exact quiescence left the Support hedge parked"
         );
         assert_eq!(finalizer.activation, parent_activation);
         assert!(
