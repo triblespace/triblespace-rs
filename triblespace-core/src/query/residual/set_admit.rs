@@ -8,6 +8,9 @@
 //! positions during one bounded scan and emits them in ascending position
 //! order during a second bounded phase.
 
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
 use im::OrdMap;
 
 use super::{CandidatePayload, DeferredCandidateCursor, RawInline};
@@ -21,6 +24,7 @@ pub(super) enum SetAdmissionPhaseKind {
 #[derive(Clone, Debug)]
 struct ScanState {
     input: DeferredCandidateCursor,
+    preclaimed: Option<Arc<BTreeSet<RawInline>>>,
     last_position: OrdMap<RawInline, usize>,
     value_at_position: OrdMap<usize, RawInline>,
     next_position: usize,
@@ -52,14 +56,47 @@ pub(super) struct SetAdmissionPage {
 
 impl SetAdmissionState {
     /// Empty inputs need no Program state and can resume synchronously.
-    pub(super) fn start(mut input: CandidatePayload) -> Option<Self> {
+    pub(super) fn start(input: CandidatePayload) -> Option<Self> {
+        Self::start_with_preclaims(input, None)
+    }
+
+    /// Starts one-parent SET admission with immutable representatives that
+    /// have already crossed this relation boundary.
+    ///
+    /// Preclaimed occurrences still consume bounded scan work and positions,
+    /// but they never enter the last-position maps and therefore cannot emit.
+    #[allow(dead_code)]
+    pub(super) fn start_preclaimed(
+        input: CandidatePayload,
+        preclaimed: Arc<BTreeSet<RawInline>>,
+    ) -> Option<Self> {
+        let preclaimed = (!preclaimed.is_empty()).then_some(preclaimed);
+        Self::start_with_preclaims(input, preclaimed)
+    }
+
+    fn start_with_preclaims(
+        mut input: CandidatePayload,
+        preclaimed: Option<Arc<BTreeSet<RawInline>>>,
+    ) -> Option<Self> {
         if input.is_empty() {
             return None;
+        }
+        match &input {
+            CandidatePayload::Values(_) => {}
+            CandidatePayload::Tagged(pairs) => assert!(
+                pairs.iter().all(|(parent, _)| *parent == 0),
+                "value-only SET preclaims cannot span tagged parents"
+            ),
+            CandidatePayload::Deferred(candidates) => assert_eq!(
+                candidates.parent_count, 1,
+                "value-only SET preclaims require a one-parent deferred payload"
+            ),
         }
         input.defer_for_shared_activation(1);
         Some(Self {
             phase: SetAdmissionPhase::Scan(ScanState {
                 input: input.shared_one_parent_cursor(),
+                preclaimed,
                 last_position: OrdMap::new(),
                 value_at_position: OrdMap::new(),
                 next_position: 0,
@@ -106,17 +143,23 @@ impl SetAdmissionState {
                         .next_position
                         .checked_add(1)
                         .expect("SET-admission position overflowed");
-                    if let Some(previous) = state.last_position.insert(value, position) {
-                        assert_eq!(
-                            state.value_at_position.remove(&previous),
-                            Some(value),
-                            "SET-admission position maps diverged"
+                    if state
+                        .preclaimed
+                        .as_ref()
+                        .map_or(true, |preclaimed| !preclaimed.contains(&value))
+                    {
+                        if let Some(previous) = state.last_position.insert(value, position) {
+                            assert_eq!(
+                                state.value_at_position.remove(&previous),
+                                Some(value),
+                                "SET-admission position maps diverged"
+                            );
+                        }
+                        assert!(
+                            state.value_at_position.insert(position, value).is_none(),
+                            "SET-admission position was reused"
                         );
                     }
-                    assert!(
-                        state.value_at_position.insert(position, value).is_none(),
-                        "SET-admission position was reused"
-                    );
                     self.phase = SetAdmissionPhase::Scan(state);
                     examined += 1;
                 }
@@ -157,6 +200,10 @@ mod tests {
         let mut input = CandidatePayload::Values(values.iter().copied().map(value).collect());
         input.defer_for_shared_activation(1);
         input
+    }
+
+    fn preclaims(values: &[u8]) -> Arc<BTreeSet<RawInline>> {
+        Arc::new(values.iter().copied().map(value).collect())
     }
 
     fn drain(mut state: SetAdmissionState, grants: &[usize]) -> Vec<RawInline> {
@@ -200,5 +247,88 @@ mod tests {
         }
         let emit_clone = state.clone();
         assert_eq!(drain(state, &[1]), drain(emit_clone, &[3]));
+    }
+
+    #[test]
+    fn preclaimed_scan_suppresses_every_later_occurrence() {
+        let expected = vec![value(1), value(3)];
+        for grants in [&[1][..], &[2][..], &[3, 1, 4, 2][..]] {
+            let state =
+                SetAdmissionState::start_preclaimed(input(&[1, 2, 1, 3, 2]), preclaims(&[2]))
+                    .unwrap();
+            assert_eq!(drain(state, grants), expected);
+        }
+
+        let state = SetAdmissionState::start_preclaimed(input(&[2, 1]), preclaims(&[2])).unwrap();
+        let previous_rank = state.rank();
+        let page = state.advance(1);
+        assert_eq!(page.examined, 1);
+        assert!(page.emitted.is_empty());
+        let next = page.next.unwrap();
+        assert!(
+            next.rank() < previous_rank,
+            "consuming only a preclaimed occurrence must lower rank"
+        );
+    }
+
+    #[test]
+    fn empty_preclaims_match_ordinary_set_admission() {
+        for values in [
+            &[][..],
+            &[1][..],
+            &[1, 2, 3, 2, 1, 4][..],
+            &[4, 1, 4, 3, 2, 1][..],
+            &[7, 7, 7, 7][..],
+        ] {
+            let ordinary = SetAdmissionState::start(input(values));
+            let preclaimed = SetAdmissionState::start_preclaimed(input(values), preclaims(&[]));
+            match (ordinary, preclaimed) {
+                (None, None) => {}
+                (Some(ordinary), Some(preclaimed)) => {
+                    let actual = drain(ordinary, &[1, 3, 2]);
+                    assert_eq!(actual, drain(preclaimed, &[2, 1, 4]));
+
+                    let mut contiguous =
+                        CandidatePayload::Values(values.iter().copied().map(value).collect());
+                    assert!(contiguous.admit_set_tail_stable(1));
+                    assert_eq!(actual, contiguous.one_parent_values());
+                }
+                _ => panic!("empty preclaims changed SET-admission liveness"),
+            }
+        }
+    }
+
+    #[test]
+    fn preclaims_are_clone_independent_in_scan_and_emit() {
+        let input = [4, 2, 4, 3, 2, 1];
+        let mut state =
+            SetAdmissionState::start_preclaimed(self::input(&input), preclaims(&[2])).unwrap();
+
+        let page = state.advance(2);
+        state = page.next.unwrap();
+        assert_eq!(state.phase_kind(), SetAdmissionPhaseKind::Scan);
+        let scan_clone = state.clone();
+        assert_eq!(drain(state, &[2, 1]), drain(scan_clone, &[1, 3]));
+
+        let mut state =
+            SetAdmissionState::start_preclaimed(self::input(&input), preclaims(&[2])).unwrap();
+        while state.phase_kind() == SetAdmissionPhaseKind::Scan {
+            let previous_rank = state.rank();
+            let page = state.advance(1);
+            let next = page.next.expect("several unclaimed values remain to emit");
+            assert!(next.rank() < previous_rank);
+            state = next;
+        }
+        let emit_clone = state.clone();
+        assert_eq!(drain(state, &[1]), drain(emit_clone, &[3]));
+    }
+
+    #[test]
+    fn preclaimed_admission_rejects_multiple_parent_payloads() {
+        let tagged = CandidatePayload::Tagged(vec![(0, value(1)), (1, value(2))]);
+        assert!(std::panic::catch_unwind(|| {
+            SetAdmissionState::start_preclaimed(tagged, preclaims(&[1]));
+        })
+        .is_err());
     }
 }

@@ -82,7 +82,7 @@
 //! computation while row values remain payload.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -5252,6 +5252,55 @@ impl CandidatePayload {
                 true
             }
             Self::Deferred(_) => false,
+        }
+    }
+
+    /// Admits a one-parent contiguous payload while treating `preclaimed`
+    /// values as representatives that were published before this boundary.
+    ///
+    /// The explicit parent count makes the value-only preclaim domain
+    /// unambiguous. Deferred ropes remain untouched so their admission can run
+    /// as bounded Program work.
+    #[allow(dead_code)]
+    fn admit_set_tail_stable_preclaimed(
+        &mut self,
+        parent_count: usize,
+        preclaimed: &BTreeSet<RawInline>,
+    ) -> bool {
+        assert_eq!(
+            parent_count, 1,
+            "value-only SET preclaims require exactly one affine parent"
+        );
+        match self {
+            Self::Values(values) => {
+                let mut admitted =
+                    AHashSet::with_capacity(values.len().saturating_add(preclaimed.len()));
+                admitted.extend(preclaimed.iter().copied());
+                values.reverse();
+                values.retain(|value| admitted.insert(*value));
+                values.reverse();
+                true
+            }
+            Self::Tagged(pairs) => {
+                assert!(
+                    pairs.iter().all(|(parent, _)| *parent == 0),
+                    "value-only SET preclaims cannot span tagged parents"
+                );
+                let mut admitted =
+                    AHashSet::with_capacity(pairs.len().saturating_add(preclaimed.len()));
+                admitted.extend(preclaimed.iter().copied().map(|value| (0, value)));
+                pairs.reverse();
+                pairs.retain(|pair| admitted.insert(*pair));
+                pairs.reverse();
+                true
+            }
+            Self::Deferred(candidates) => {
+                assert_eq!(
+                    candidates.parent_count, 1,
+                    "value-only SET preclaims require a one-parent deferred payload"
+                );
+                false
+            }
         }
     }
 
@@ -19684,6 +19733,65 @@ mod tests {
         assert!(!deferred.admit_set_tail_stable(1));
         assert!(matches!(deferred, CandidatePayload::Deferred(_)));
         assert_eq!(deferred.tagged_snapshot(), before);
+    }
+
+    #[test]
+    fn candidate_tail_admission_consumes_one_parent_preclaims() {
+        let preclaimed = BTreeSet::from([raw(2)]);
+
+        let mut values = CandidatePayload::Values(vec![raw(1), raw(2), raw(1), raw(3), raw(2)]);
+        assert!(values.admit_set_tail_stable_preclaimed(1, &preclaimed));
+        assert_eq!(values, [(0, raw(1)), (0, raw(3))]);
+
+        // Tagged storage is accepted only when its complete, explicit domain
+        // is the same affine parent.
+        let mut tagged = CandidatePayload::Tagged(vec![
+            (0, raw(1)),
+            (0, raw(2)),
+            (0, raw(1)),
+            (0, raw(3)),
+            (0, raw(2)),
+        ]);
+        assert!(tagged.admit_set_tail_stable_preclaimed(1, &preclaimed));
+        assert_eq!(tagged, [(0, raw(1)), (0, raw(3))]);
+    }
+
+    #[test]
+    fn empty_candidate_preclaims_match_ordinary_tail_admission() {
+        let empty = BTreeSet::new();
+        for values in [
+            vec![],
+            vec![raw(1)],
+            vec![raw(1), raw(2), raw(1)],
+            vec![raw(4), raw(1), raw(4), raw(3), raw(2), raw(1)],
+        ] {
+            let mut ordinary = CandidatePayload::Values(values.clone());
+            let mut preclaimed = CandidatePayload::Values(values);
+            assert!(ordinary.admit_set_tail_stable(1));
+            assert!(preclaimed.admit_set_tail_stable_preclaimed(1, &empty));
+            assert_eq!(ordinary.tagged_snapshot(), preclaimed.tagged_snapshot());
+        }
+    }
+
+    #[test]
+    fn value_only_candidate_preclaims_fail_closed_for_multiple_parents() {
+        let preclaimed = BTreeSet::from([raw(1)]);
+        let mut tagged = CandidatePayload::Tagged(vec![(0, raw(1)), (1, raw(2))]);
+        let before = tagged.tagged_snapshot();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tagged.admit_set_tail_stable_preclaimed(2, &preclaimed);
+        }))
+        .is_err());
+        assert_eq!(tagged.tagged_snapshot(), before);
+
+        let mut deferred = deferred_candidate_payload(2, vec![(0, raw(1)), (1, raw(2))]);
+        let before = deferred.tagged_snapshot();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deferred.admit_set_tail_stable_preclaimed(2, &preclaimed);
+        }))
+        .is_err());
+        assert_eq!(deferred.tagged_snapshot(), before);
+        assert!(matches!(deferred, CandidatePayload::Deferred(_)));
     }
 
     #[test]
