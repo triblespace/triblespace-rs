@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claiming quiescence or stable progress, so the exact Confirm parent remains
   the sole completeness-bearing runnable lineage. Demand and exact-work credit
   assignment are layered on this custody without changing SET semantics.
+- **The RPQ positive-publication probe suite now covers bound-inverse and
+  same-variable routes.** A deterministic release harness compares the
+  production occurrence-zero Support hedge with an exact-Confirm-only control
+  across near, far, and missing first candidates, reporting first-result and
+  full-drain latency together with transition work and a production-equivalent
+  Support seed/step trace.
 - **Eligible target-Confirm activations can publish their first candidate from
   the authoritative exact traversal.** A new structural Program certificate
   lets every eligible exact RPQ Confirm reuse a real replacement receipt that
