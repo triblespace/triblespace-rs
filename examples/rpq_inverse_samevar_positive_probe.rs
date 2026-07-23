@@ -6,10 +6,12 @@
 //! bound-inverse fanout fixtures independently oppose predecessor order and
 //! forward-destination order: one makes inverse Exact expensive and forward
 //! Support cheap, while the other makes Exact cheap and Support expensive.
-//! The production lane is compared with a harness-only Confirm-only control:
-//! both use the same fallback `RegularPathConstraint` Confirm Program, while
-//! the control masks only the fully-bound Support route behind
-//! `ProgramExposure::Explicit`.
+//! The production lane is compared with two controls. `exact-only` masks only
+//! the fully-bound Support route behind `ProgramExposure::Explicit`.
+//! `service-gated` keeps the production root and hard `S <= D + C` work law,
+//! but uses pure one-parent Program kernel time to throttle later Support
+//! wakes. It is intentionally not full processor sharing: elapsed service
+//! never mints additional Support work.
 //!
 //! Run with:
 //! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=51] [warmups=5] [run-id] [revision] [suite=all|fanout]`
@@ -90,6 +92,7 @@ impl Case {
 enum Mode {
     Production,
     ExactOnly,
+    ServiceGated,
 }
 
 impl Mode {
@@ -97,11 +100,12 @@ impl Mode {
         match self {
             Self::Production => "production",
             Self::ExactOnly => "exact-only",
+            Self::ServiceGated => "service-gated",
         }
     }
 }
 
-const MODES: [Mode; 2] = [Mode::Production, Mode::ExactOnly];
+const MODES: [Mode; 3] = [Mode::Production, Mode::ExactOnly, Mode::ServiceGated];
 
 struct Fixture {
     shape: Shape,
@@ -155,6 +159,13 @@ struct Attribution {
     transition_candidates_examined: usize,
     terminal_calls: usize,
     nonterminal_calls: usize,
+    service_exact_cohorts: usize,
+    service_support_cohorts: usize,
+    service_fallback_cohorts: usize,
+    service_exact_ns: u128,
+    service_support_ns: u128,
+    service_wakes: usize,
+    service_deferrals: usize,
 }
 
 impl Attribution {
@@ -683,7 +694,7 @@ fn make_root<'a>(fixture: &'a Fixture, path: DynConstraint<'a>) -> Root<'a> {
 fn make_query(fixture: &Fixture, mode: Mode) -> Query<Root<'_>, Project, RawInline> {
     let fallback = regular_path(fixture);
     let path: DynConstraint<'_> = match mode {
-        Mode::Production => Box::new(fallback),
+        Mode::Production | Mode::ServiceGated => Box::new(fallback),
         Mode::ExactOnly => {
             let preferred = MaskedSupportRpq {
                 inner: regular_path(fixture),
@@ -702,6 +713,7 @@ fn make_iter(fixture: &Fixture, mode: Mode, width: usize) -> ProbeIter<'_> {
         .cap(width)
         .start_width(width)
         .growth(2)
+        .positive_support_service_gated(matches!(mode, Mode::ServiceGated))
 }
 
 fn signature(items: impl IntoIterator<Item = RawInline>) -> Signature {
@@ -738,6 +750,13 @@ fn attribution(stats: &ResidualStateStats) -> Attribution {
         transition_candidates_examined: stats.delta_transition_candidates_examined,
         terminal_calls: stats.delta_terminal_calls,
         nonterminal_calls: stats.delta_nonterminal_calls,
+        service_exact_cohorts: stats.delta_positive_support_service_gated_exact_cohorts,
+        service_support_cohorts: stats.delta_positive_support_service_gated_support_cohorts,
+        service_fallback_cohorts: stats.delta_positive_support_service_gated_fallback_cohorts,
+        service_exact_ns: stats.delta_positive_support_service_gated_exact_ns,
+        service_support_ns: stats.delta_positive_support_service_gated_support_ns,
+        service_wakes: stats.delta_positive_support_service_gated_wakes,
+        service_deferrals: stats.delta_positive_support_service_gated_deferrals,
     }
 }
 
@@ -802,6 +821,34 @@ fn assert_accounting(
             fixture.label()
         );
     }
+    if !matches!(mode, Mode::ServiceGated) {
+        assert_eq!(
+            (
+                stats.service_exact_cohorts,
+                stats.service_support_cohorts,
+                stats.service_fallback_cohorts,
+                stats.service_exact_ns,
+                stats.service_support_ns,
+                stats.service_wakes,
+                stats.service_deferrals,
+            ),
+            (0, 0, 0, 0, 0, 0, 0),
+            "{} {} width {width} {phase}: disabled service gate accrued telemetry",
+            fixture.label(),
+            mode.label()
+        );
+    } else {
+        assert!(
+            stats.service_exact_ns >= stats.service_exact_cohorts as u128,
+            "{} service-gated width {width} {phase}: exact service lost a cohort",
+            fixture.label()
+        );
+        assert!(
+            stats.service_support_ns >= stats.service_support_cohorts as u128,
+            "{} service-gated width {width} {phase}: Support service lost a cohort",
+            fixture.label()
+        );
+    }
 }
 
 fn profile(
@@ -858,7 +905,7 @@ fn profile(
     );
 
     match mode {
-        Mode::Production if fixture.case.is_positive() => {
+        Mode::Production | Mode::ServiceGated if fixture.case.is_positive() => {
             assert_eq!(
                 (
                     full_stats.positive_commits(),
@@ -874,7 +921,7 @@ fn profile(
                 fixture.label()
             );
         }
-        Mode::Production => {
+        Mode::Production | Mode::ServiceGated => {
             assert_eq!(
                 (
                     full_stats.positive_commits(),
@@ -948,7 +995,9 @@ fn print_tsv_header() {
          rows_per_sec\tfirst_is_b0\tpositive_total\texact_wins\tsupport_wins\t\
          demand_assigned\texact_examined_total\texact_credited\tsupport_examined\t\
          credit_retired\tbound_slack\tsource_examined\ttransition_examined\t\
-         terminal_calls\tnonterminal_calls"
+         terminal_calls\tnonterminal_calls\tservice_exact_cohorts\t\
+         service_support_cohorts\tservice_fallback_cohorts\tservice_exact_ns\t\
+         service_support_ns\tservice_wakes\tservice_deferrals"
     );
 }
 
@@ -968,8 +1017,9 @@ fn print_tsv_row(
     let operations_per_second = context.reps as f64 * 1_000_000_000.0 / total_ns as f64;
     let rows_per_second = context.reps as f64 * rows as f64 * 1_000_000_000.0 / total_ns as f64;
     println!(
-        "rpq-hedge-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\
-         {:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "rpq-hedge-v2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\
+         {:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\
+         {}\t{}\t{}\t{}\t{}\t{}",
         context.run_id,
         context.revision,
         context.nodes,
@@ -1003,6 +1053,13 @@ fn print_tsv_row(
         stats.transition_candidates_examined,
         stats.terminal_calls,
         stats.nonterminal_calls,
+        stats.service_exact_cohorts,
+        stats.service_support_cohorts,
+        stats.service_fallback_cohorts,
+        stats.service_exact_ns,
+        stats.service_support_ns,
+        stats.service_wakes,
+        stats.service_deferrals,
     );
 }
 
@@ -1167,6 +1224,24 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
             profile.full_stats.exact_wins,
             profile.full_stats.support_wins,
         );
+        eprintln!(
+            "    service gate: first exact/support/fallback cohorts {}/{}/{} \
+             ns {}/{} wakes/deferrals {}/{}; full {}/{}/{} ns {}/{} wakes/deferrals {}/{}",
+            profile.first_stats.service_exact_cohorts,
+            profile.first_stats.service_support_cohorts,
+            profile.first_stats.service_fallback_cohorts,
+            profile.first_stats.service_exact_ns,
+            profile.first_stats.service_support_ns,
+            profile.first_stats.service_wakes,
+            profile.first_stats.service_deferrals,
+            profile.full_stats.service_exact_cohorts,
+            profile.full_stats.service_support_cohorts,
+            profile.full_stats.service_fallback_cohorts,
+            profile.full_stats.service_exact_ns,
+            profile.full_stats.service_support_ns,
+            profile.full_stats.service_wakes,
+            profile.full_stats.service_deferrals,
+        );
 
         let first_is_b0 = profile.first == fixture.b0;
         print_tsv_row(
@@ -1213,6 +1288,7 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
 
     let production = &profiles[0];
     let confirm_only = &profiles[1];
+    let service_gated = &profiles[2];
     eprintln!(
         "  production - exact-only full actual-work delta: \
          source_pages {:+} source_examined {:+} transition_pages {:+} \
@@ -1240,6 +1316,35 @@ fn measure(fixture: &Fixture, width: usize, context: &BenchmarkContext<'_>) {
         signed_delta(
             production.full_stats.nonterminal_calls,
             confirm_only.full_stats.nonterminal_calls
+        ),
+    );
+    eprintln!(
+        "  service-gated - production full actual-work delta: \
+         source_pages {:+} source_examined {:+} transition_pages {:+} \
+         transition_examined {:+} terminal_dispatches {:+} nonterminal_dispatches {:+}",
+        signed_delta(
+            service_gated.full_stats.source_pages,
+            production.full_stats.source_pages
+        ),
+        signed_delta(
+            service_gated.full_stats.source_candidates_examined,
+            production.full_stats.source_candidates_examined
+        ),
+        signed_delta(
+            service_gated.full_stats.transition_pages,
+            production.full_stats.transition_pages
+        ),
+        signed_delta(
+            service_gated.full_stats.transition_candidates_examined,
+            production.full_stats.transition_candidates_examined
+        ),
+        signed_delta(
+            service_gated.full_stats.terminal_calls,
+            production.full_stats.terminal_calls
+        ),
+        signed_delta(
+            service_gated.full_stats.nonterminal_calls,
+            production.full_stats.nonterminal_calls
         ),
     );
 }
@@ -1287,7 +1392,9 @@ fn main() {
     );
     eprintln!(
         "production is the unwrapped OpaqueLeaves+Production lane; exact-only keeps \
-         the same fallback exact Confirm Program but policy-defers only Support."
+         the same fallback exact Confirm Program but policy-defers only Support; \
+         service-gated keeps the production root and count authority while pure \
+         one-parent kernel time may defer authorized Support wakes."
     );
     for fixture in &fixtures {
         for width in WIDTHS {

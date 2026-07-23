@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
 
@@ -967,6 +968,101 @@ struct PositiveExactWorkAccounting {
     credited: usize,
 }
 
+/// Experimental physical-service lane for one positive-publication race.
+///
+/// This is scheduler payload only. It never enters a canonical delta
+/// descriptor, Program address, registry credit, or publication key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositiveSupportServiceLane {
+    Exact,
+    Support,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PositiveSupportServiceAccount {
+    exact_ns: u128,
+    support_ns: u128,
+}
+
+/// Query-local elapsed-service ledger for the experimental wake throttle.
+///
+/// Costs enter this ledger only when one whole physical Program cohort maps
+/// to one semantic parent and one lane. The strict comparison gives Exact the
+/// tie: Support may resume only while its accumulated service is lower.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PositiveSupportServiceLedger {
+    accounts: AHashMap<ActivationId, PositiveSupportServiceAccount>,
+}
+
+impl PositiveSupportServiceLedger {
+    fn charge(
+        &mut self,
+        parent: ActivationId,
+        lane: PositiveSupportServiceLane,
+        elapsed_ns: u128,
+    ) -> u128 {
+        // A clock with coarser resolution than one physical call must still
+        // record progress or a zero-cost lane could monopolize the race.
+        let elapsed_ns = elapsed_ns.max(1);
+        let account = self.accounts.entry(parent).or_default();
+        let total = match lane {
+            PositiveSupportServiceLane::Exact => &mut account.exact_ns,
+            PositiveSupportServiceLane::Support => &mut account.support_ns,
+        };
+        *total = total
+            .checked_add(elapsed_ns)
+            .expect("positive Support elapsed-service count overflow");
+        elapsed_ns
+    }
+
+    fn should_wake_support(&self, parent: ActivationId) -> bool {
+        let account = self.accounts.get(&parent).copied().unwrap_or_default();
+        account.support_ns < account.exact_ns
+    }
+
+    #[cfg(test)]
+    fn account(&self, parent: ActivationId) -> PositiveSupportServiceAccount {
+        self.accounts.get(&parent).copied().unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositiveSupportServiceCohort {
+    Unrelated,
+    Pure {
+        parent: PositiveConfirmParentId,
+        lane: PositiveSupportServiceLane,
+    },
+    Fallback,
+}
+
+fn classify_positive_support_service_routes(
+    routes: impl IntoIterator<Item = Option<(PositiveConfirmParentId, PositiveSupportServiceLane)>>,
+) -> PositiveSupportServiceCohort {
+    let mut pure = None;
+    let mut saw_unrelated = false;
+    for route in routes {
+        let Some(current) = route else {
+            if pure.is_some() {
+                return PositiveSupportServiceCohort::Fallback;
+            }
+            saw_unrelated = true;
+            continue;
+        };
+        if saw_unrelated {
+            return PositiveSupportServiceCohort::Fallback;
+        }
+        match pure {
+            None => pure = Some(current),
+            Some(previous) if previous == current => {}
+            Some(_) => return PositiveSupportServiceCohort::Fallback,
+        }
+    }
+    pure.map_or(PositiveSupportServiceCohort::Unrelated, |(parent, lane)| {
+        PositiveSupportServiceCohort::Pure { parent, lane }
+    })
+}
+
 /// Dormant scheduler-owned publication state attached to the authoritative
 /// Confirm activation.
 ///
@@ -1797,6 +1893,64 @@ impl ProducerRegistry {
             brand: self.brand,
             activation: link.parent,
         })
+    }
+
+    /// Maps one live Program activation onto the elapsed-service race it can
+    /// honestly represent.
+    ///
+    /// Exact work is eligible only after public demand has started the hedge;
+    /// otherwise historical Confirm work would become a fictitious service
+    /// lead. Support work revalidates the same open generation.
+    fn positive_support_service_lane(
+        &self,
+        activation: ActivationId,
+    ) -> Option<(PositiveConfirmParentId, PositiveSupportServiceLane)> {
+        let state = self.state.activations.get(&activation)?;
+        if let DeltaReducer::PositiveSupport { link, .. } = &state.reducer {
+            if link.child != activation {
+                return None;
+            }
+            let parent = self.state.activations.get(&link.parent)?;
+            let PositivePublicationRegistration::Eligible(ledger) =
+                parent.positive_publication.as_deref()?
+            else {
+                return None;
+            };
+            return (ledger.open
+                && ledger.generation == link.generation
+                && ledger.authorization == PositivePublicationAuthorization::ExactAndSupport
+                && ledger.support_work.started)
+                .then_some((
+                    PositiveConfirmParentId {
+                        brand: self.brand,
+                        activation: link.parent,
+                    },
+                    PositiveSupportServiceLane::Support,
+                ));
+        }
+        if !matches!(&state.reducer, DeltaReducer::Confirm { .. }) {
+            return None;
+        }
+        let PositivePublicationRegistration::Eligible(ledger) =
+            state.positive_publication.as_deref()?
+        else {
+            return None;
+        };
+        (ledger.open
+            && ledger.authorization == PositivePublicationAuthorization::ExactAndSupport
+            && ledger.support_work.started
+            && self.live_positive_support_child(
+                activation,
+                ledger.generation,
+                &ledger.support_children,
+            ))
+        .then_some((
+            PositiveConfirmParentId {
+                brand: self.brand,
+                activation,
+            },
+            PositiveSupportServiceLane::Exact,
+        ))
     }
 
     fn positive_publication_parent(
@@ -5851,6 +6005,12 @@ pub(super) struct DeltaScheduler {
     /// the `Assigned` state until the public pull closes so repeated internal
     /// begin calls cannot mint another D.
     public_pull_demand: PublicPullDemandState,
+    /// Experimental physical-service throttle for PositiveSupport wakes.
+    ///
+    /// This switch and its query-local ledger are physical scheduler payload;
+    /// neither participates in canonical state or publication semantics.
+    positive_support_service_gated: bool,
+    positive_support_service: PositiveSupportServiceLedger,
     program_runtimes: AHashMap<DeltaStateId, ProgramRuntime>,
     /// Program-only cohort scratch is lazy so non-Program queries retain the
     /// baseline scheduler footprint. One allocation is amortized across all
@@ -5877,12 +6037,42 @@ impl DeltaScheduler {
             program_worklist: ProgramWorklist::default(),
             parked_positive_support_worklist: ProgramWorklist::default(),
             public_pull_demand: PublicPullDemandState::Closed,
+            positive_support_service_gated: false,
+            positive_support_service: PositiveSupportServiceLedger::default(),
             program_runtimes: AHashMap::new(),
             program_scratch: None,
             activation_width: 1,
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
         }
+    }
+
+    pub(super) fn set_positive_support_service_gated(&mut self, enabled: bool) {
+        self.positive_support_service_gated = enabled;
+        if !enabled {
+            self.positive_support_service.accounts.clear();
+        }
+    }
+
+    /// Constructs an empty parallel sibling with the same experimental
+    /// physical policy. Delta splitting is refused after terminal admission,
+    /// so no live per-parent service account crosses this boundary.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(super) fn empty_sibling(&self) -> Self {
+        let mut sibling = Self::new();
+        sibling.positive_support_service_gated = self.positive_support_service_gated;
+        sibling
+    }
+
+    fn classify_positive_support_service_cohort(
+        &self,
+        tasks: &[ProgramTask],
+    ) -> PositiveSupportServiceCohort {
+        classify_positive_support_service_routes(
+            tasks
+                .iter()
+                .map(|task| self.registry.positive_support_service_lane(task.activation)),
+        )
     }
 
     /// Mints exact per-parent terminal receipts without filing sparse source
@@ -7757,6 +7947,21 @@ impl DeltaScheduler {
         })
     }
 
+    fn can_wake_positive_support_parent(&self, parent: PositiveConfirmParentId) -> bool {
+        self.registry.positive_support_budget_available(parent) > 0
+            && !self.has_runnable_positive_support_parent(parent)
+            && self
+                .parked_positive_support_worklist
+                .iter()
+                .any(|(_, bucket)| {
+                    bucket.tasks.iter().any(|task| {
+                        self.registry
+                            .positive_support_parent_for_child(task.activation)
+                            == Some(parent)
+                    })
+                })
+    }
+
     /// Moves at most one parked task for this semantic parent onto the
     /// runnable frontier. Parent-local available credit and the absence of an
     /// existing runnable sibling are revalidated at the move boundary.
@@ -7848,10 +8053,33 @@ impl DeltaScheduler {
     fn wake_positive_support_parents(
         &mut self,
         parents: impl IntoIterator<Item = PositiveConfirmParentId>,
+        service_cohort: Option<PositiveSupportServiceCohort>,
+        stats: &mut ResidualStateStats,
     ) -> bool {
         let mut woke = false;
         for parent in parents {
-            woke |= self.wake_one_positive_support_parent(parent).is_some();
+            let service_gated = matches!(
+                service_cohort,
+                Some(PositiveSupportServiceCohort::Pure {
+                    parent: cohort_parent,
+                    ..
+                }) if cohort_parent == parent
+            );
+            if service_gated
+                && !self
+                    .positive_support_service
+                    .should_wake_support(parent.activation)
+            {
+                if self.can_wake_positive_support_parent(parent) {
+                    stats.delta_positive_support_service_gated_deferrals += 1;
+                }
+                continue;
+            }
+            let parent_woke = self.wake_one_positive_support_parent(parent).is_some();
+            if service_gated && parent_woke {
+                stats.delta_positive_support_service_gated_wakes += 1;
+            }
+            woke |= parent_woke;
         }
         woke
     }
@@ -7974,7 +8202,19 @@ impl DeltaScheduler {
         }
         let retired = parents
             .into_iter()
-            .map(|parent| self.registry.retire_orphaned_positive_support_work(parent))
+            .map(|parent| {
+                let retired = self.registry.retire_orphaned_positive_support_work(parent);
+                if self
+                    .registry
+                    .positive_support_service_lane(parent.activation)
+                    .is_none()
+                {
+                    self.positive_support_service
+                        .accounts
+                        .remove(&parent.activation);
+                }
+                retired
+            })
             .sum();
         (completed, retired)
     }
@@ -8986,6 +9226,17 @@ impl DeltaScheduler {
                 .all(|task| ProgramCohortKey::of(&self.registry, task) == cohort_key),
             "one typed program cohort mixed incompatible physical dispatch shapes"
         );
+        let service_cohort = self
+            .positive_support_service_gated
+            .then(|| self.classify_positive_support_service_cohort(&tasks));
+        if matches!(service_cohort, Some(PositiveSupportServiceCohort::Fallback)) {
+            stats.delta_positive_support_service_gated_fallback_cohorts += 1;
+        }
+        let measure_service = matches!(
+            service_cohort,
+            Some(PositiveSupportServiceCohort::Pure { .. })
+        );
+        let mut kernel_service_ns = 0u128;
 
         let row_count = tasks.len();
         let directed_positive_support =
@@ -9025,6 +9276,7 @@ impl DeltaScheduler {
             scratch.work.push(task.work);
         }
         scratch.receipt.clear();
+        let kernel_started = measure_service.then(Instant::now);
         spec.step_batch_for(
             self.program_runtimes
                 .get_mut(&state)
@@ -9040,6 +9292,11 @@ impl DeltaScheduler {
             },
             &mut scratch.receipt,
         );
+        if let Some(started) = kernel_started {
+            kernel_service_ns = kernel_service_ns
+                .checked_add(started.elapsed().as_nanos())
+                .expect("positive Support kernel-service count overflow");
+        }
         assert_eq!(
             scratch.receipt.pages.len(),
             row_count,
@@ -9117,6 +9374,7 @@ impl DeltaScheduler {
             scratch.work.clear();
             scratch.work.push(child.work);
             let fused_limits = [remaining];
+            let kernel_started = measure_service.then(Instant::now);
             spec.step_batch_for(
                 self.program_runtimes
                     .get_mut(&state)
@@ -9132,6 +9390,11 @@ impl DeltaScheduler {
                 },
                 &mut scratch.fused_receipt,
             );
+            if let Some(started) = kernel_started {
+                kernel_service_ns = kernel_service_ns
+                    .checked_add(started.elapsed().as_nanos())
+                    .expect("positive Support fused kernel-service count overflow");
+            }
             assert_eq!(
                 scratch.fused_receipt.pages.len(),
                 1,
@@ -9161,6 +9424,27 @@ impl DeltaScheduler {
             std::mem::swap(&mut scratch.receipt, &mut scratch.fused_receipt);
             scratch.fused_receipt.clear();
             fused_steps += 1;
+        }
+        if let Some(PositiveSupportServiceCohort::Pure { parent, lane }) = service_cohort {
+            let charged =
+                self.positive_support_service
+                    .charge(parent.activation, lane, kernel_service_ns);
+            match lane {
+                PositiveSupportServiceLane::Exact => {
+                    stats.delta_positive_support_service_gated_exact_cohorts += 1;
+                    stats.delta_positive_support_service_gated_exact_ns = stats
+                        .delta_positive_support_service_gated_exact_ns
+                        .checked_add(charged)
+                        .expect("positive Support exact service telemetry overflow");
+                }
+                PositiveSupportServiceLane::Support => {
+                    stats.delta_positive_support_service_gated_support_cohorts += 1;
+                    stats.delta_positive_support_service_gated_support_ns = stats
+                        .delta_positive_support_service_gated_support_ns
+                        .checked_add(charged)
+                        .expect("positive Support service telemetry overflow");
+                }
+            }
         }
         let validated_examined = validated_program_examined(
             &scratch.receipt.pages,
@@ -9477,6 +9761,9 @@ impl DeltaScheduler {
                         .extend(self.registry.positive_support_children(parent));
                     stats.delta_positive_support_credit_retired +=
                         self.registry.retire_positive_support_work(parent);
+                    self.positive_support_service
+                        .accounts
+                        .remove(&parent.activation);
                 }
                 match self.settle_quiescence(proof) {
                     DeltaSettlement::Retargeted(active) => {
@@ -9572,9 +9859,19 @@ impl DeltaScheduler {
         for parent in exhausted_support_parents {
             stats.delta_positive_support_credit_retired +=
                 self.registry.retire_orphaned_positive_support_work(parent);
+            if self
+                .registry
+                .positive_support_service_lane(parent.activation)
+                .is_none()
+            {
+                self.positive_support_service
+                    .accounts
+                    .remove(&parent.activation);
+            }
         }
         let demand_preference = self.assign_public_pull_demand(stats);
-        let exact_credit_wake = self.wake_positive_support_parents(credited_support_parents);
+        let exact_credit_wake =
+            self.wake_positive_support_parents(credited_support_parents, service_cohort, stats);
         let release_directed_lease = directed_active
             && !directed_positive_support
             && (demand_preference.is_some() || exact_credit_wake);
@@ -9935,6 +10232,8 @@ impl DeltaScheduler {
             program_worklist,
             parked_positive_support_worklist,
             public_pull_demand: self.public_pull_demand,
+            positive_support_service_gated: self.positive_support_service_gated,
+            positive_support_service: self.positive_support_service.clone(),
             program_runtimes: self.program_runtimes.clone(),
             program_scratch: None,
             activation_width: self.activation_width,
@@ -9961,6 +10260,226 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn positive_support_service_ledger_gives_exact_the_tie_and_is_parent_local() {
+        let first = ActivationId(7);
+        let second = ActivationId(11);
+        let mut ledger = PositiveSupportServiceLedger::default();
+
+        // Initial public demand bypasses this predicate in the scheduler. At
+        // the zero/zero starting tie the service gate itself prefers Exact.
+        assert!(!ledger.should_wake_support(first));
+
+        assert_eq!(
+            ledger.charge(first, PositiveSupportServiceLane::Support, 3),
+            3
+        );
+        assert!(!ledger.should_wake_support(first));
+        assert_eq!(
+            ledger.charge(first, PositiveSupportServiceLane::Exact, 2),
+            2
+        );
+        assert!(!ledger.should_wake_support(first));
+        assert_eq!(
+            ledger.charge(first, PositiveSupportServiceLane::Exact, 1),
+            1
+        );
+        assert_eq!(
+            ledger.account(first),
+            PositiveSupportServiceAccount {
+                exact_ns: 3,
+                support_ns: 3,
+            }
+        );
+        assert!(
+            !ledger.should_wake_support(first),
+            "Exact must win an elapsed-service tie"
+        );
+        ledger.charge(first, PositiveSupportServiceLane::Exact, 1);
+        assert!(ledger.should_wake_support(first));
+
+        assert_eq!(
+            ledger.account(second),
+            PositiveSupportServiceAccount::default()
+        );
+        assert!(!ledger.should_wake_support(second));
+    }
+
+    #[test]
+    fn positive_support_service_cohort_requires_one_parent_and_one_lane() {
+        let brand = RegistryBrand(1);
+        let first = PositiveConfirmParentId {
+            brand,
+            activation: ActivationId(3),
+        };
+        let second = PositiveConfirmParentId {
+            brand,
+            activation: ActivationId(5),
+        };
+        let exact = Some((first, PositiveSupportServiceLane::Exact));
+        let support = Some((first, PositiveSupportServiceLane::Support));
+        let other_exact = Some((second, PositiveSupportServiceLane::Exact));
+
+        assert_eq!(
+            classify_positive_support_service_routes([None, None]),
+            PositiveSupportServiceCohort::Unrelated
+        );
+        assert_eq!(
+            classify_positive_support_service_routes([exact, exact]),
+            PositiveSupportServiceCohort::Pure {
+                parent: first,
+                lane: PositiveSupportServiceLane::Exact,
+            }
+        );
+        for routes in [
+            vec![exact, None],
+            vec![None, exact],
+            vec![exact, support],
+            vec![exact, other_exact],
+        ] {
+            assert_eq!(
+                classify_positive_support_service_routes(routes),
+                PositiveSupportServiceCohort::Fallback
+            );
+        }
+    }
+
+    #[test]
+    fn positive_support_service_ledger_clamps_zero_and_allows_cheap_catch_up() {
+        let parent = ActivationId(3);
+        let mut ledger = PositiveSupportServiceLedger::default();
+
+        assert_eq!(
+            ledger.charge(parent, PositiveSupportServiceLane::Exact, 0),
+            1
+        );
+        assert!(ledger.should_wake_support(parent));
+        assert_eq!(
+            ledger.charge(parent, PositiveSupportServiceLane::Support, 0),
+            1
+        );
+        assert!(!ledger.should_wake_support(parent));
+
+        ledger.charge(parent, PositiveSupportServiceLane::Exact, 8);
+        for expected_support in [3, 5, 7, 9] {
+            assert!(ledger.should_wake_support(parent));
+            ledger.charge(parent, PositiveSupportServiceLane::Support, 2);
+            assert_eq!(ledger.account(parent).support_ns, expected_support);
+        }
+        assert!(
+            !ledger.should_wake_support(parent),
+            "Support must stop after crossing Exact's service"
+        );
+    }
+
+    #[test]
+    fn positive_support_service_oracle_preserves_count_authority() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Lane {
+            Exact,
+            Support,
+        }
+
+        fn run(exact_costs: &[u128], support_costs: &[u128]) -> Vec<Lane> {
+            let parent = ActivationId(1);
+            let mut ledger = PositiveSupportServiceLedger::default();
+            let mut exact = 0usize;
+            let mut support = 0usize;
+            let demand = 1usize;
+            let mut trace = Vec::new();
+
+            // This is the production initial-D bypass: Support runs once even
+            // though the zero/zero service predicate gives Exact the tie.
+            if let Some(&cost) = support_costs.first() {
+                ledger.charge(parent, PositiveSupportServiceLane::Support, cost);
+                support += 1;
+                trace.push(Lane::Support);
+            }
+            while exact < exact_costs.len() {
+                let cost = exact_costs[exact];
+                exact += 1;
+                ledger.charge(parent, PositiveSupportServiceLane::Exact, cost);
+                trace.push(Lane::Exact);
+
+                // One exact examined unit authorizes at most one additional
+                // Support unit. Elapsed service may throttle that authority,
+                // but it never mints work.
+                while support < support_costs.len()
+                    && support < demand + exact
+                    && ledger.should_wake_support(parent)
+                {
+                    let cost = support_costs[support];
+                    support += 1;
+                    ledger.charge(parent, PositiveSupportServiceLane::Support, cost);
+                    trace.push(Lane::Support);
+                }
+                assert!(support <= demand + exact);
+            }
+            trace
+        }
+
+        assert_eq!(
+            run(&[1, 1, 1, 1], &[3, 3]),
+            vec![
+                Lane::Support,
+                Lane::Exact,
+                Lane::Exact,
+                Lane::Exact,
+                Lane::Exact,
+                Lane::Support,
+            ]
+        );
+        assert_eq!(
+            run(&[8], &[1, 1, 1]),
+            vec![Lane::Support, Lane::Exact, Lane::Support],
+            "hard D+C authority, not elapsed service, limits cheap catch-up"
+        );
+
+        // Exhaustively vary a small deterministic cost matrix. Every Support
+        // dispatch after the initial D must have both count authority and an
+        // elapsed-service deficit.
+        for exact_cost in 1..=4 {
+            for support_cost in 1..=4 {
+                let trace = run(&[exact_cost; 4], &[support_cost; 5]);
+                let support = trace.iter().filter(|&&lane| lane == Lane::Support).count();
+                let exact = trace.iter().filter(|&&lane| lane == Lane::Exact).count();
+                assert!(support <= 1 + exact);
+            }
+        }
+    }
+
+    #[test]
+    fn positive_support_service_policy_is_clone_local_and_sibling_preserved() {
+        let parent = ActivationId(5);
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.set_positive_support_service_gated(true);
+        scheduler
+            .positive_support_service
+            .charge(parent, PositiveSupportServiceLane::Exact, 13);
+
+        let mut cloned = scheduler.clone();
+        assert!(cloned.positive_support_service_gated);
+        assert_eq!(
+            cloned.positive_support_service.account(parent),
+            scheduler.positive_support_service.account(parent)
+        );
+        cloned
+            .positive_support_service
+            .charge(parent, PositiveSupportServiceLane::Support, 7);
+        assert_ne!(
+            cloned.positive_support_service.account(parent),
+            scheduler.positive_support_service.account(parent),
+            "cloned physical ledgers must diverge independently"
+        );
+
+        let sibling = scheduler.empty_sibling();
+        assert!(sibling.positive_support_service_gated);
+        assert_eq!(
+            sibling.positive_support_service.account(parent),
+            PositiveSupportServiceAccount::default()
+        );
+    }
 
     #[test]
     fn retargeted_activations_preserve_map_semantics_across_storage_shapes() {

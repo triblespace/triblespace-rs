@@ -2550,6 +2550,28 @@ pub struct ResidualStateStats {
     /// Minted Support allowance burned on child exhaustion, cancellation, or
     /// semantic-parent closure before physical examination.
     pub delta_positive_support_credit_retired: usize,
+    /// Pure one-parent exact Confirm Program cohorts observed while the
+    /// experimental elapsed-cost hedge scheduler was enabled.
+    pub delta_positive_support_service_gated_exact_cohorts: usize,
+    /// Pure one-parent PositiveSupport Program cohorts observed while the
+    /// experimental elapsed-cost hedge scheduler was enabled.
+    pub delta_positive_support_service_gated_support_cohorts: usize,
+    /// Hedge-relevant Program cohorts whose physical cost could not be
+    /// attributed to exactly one semantic parent and one lane. These cohorts
+    /// retain the ordinary count-based wake policy.
+    pub delta_positive_support_service_gated_fallback_cohorts: usize,
+    /// Wall-clock nanoseconds charged to pure one-parent exact Confirm
+    /// cohorts by the experimental elapsed-cost scheduler.
+    pub delta_positive_support_service_gated_exact_ns: u128,
+    /// Wall-clock nanoseconds charged to pure one-parent PositiveSupport
+    /// cohorts by the experimental elapsed-cost scheduler.
+    pub delta_positive_support_service_gated_support_ns: u128,
+    /// Parked Support continuations actually woken after the elapsed-cost
+    /// ledger found their lane behind the exact lane.
+    pub delta_positive_support_service_gated_wakes: usize,
+    /// Otherwise-authorized Support wakes deferred because exact wins an
+    /// elapsed-service tie or remains behind.
+    pub delta_positive_support_service_gated_deferrals: usize,
     /// Positive-publication SET races won by an exact Confirm receipt.
     pub delta_positive_publication_exact_wins: usize,
     /// Positive-publication SET races won by a physical Support receipt.
@@ -12059,7 +12081,7 @@ impl ResidualStateMachine {
             next_activation: self.next_activation,
             interner: self.interner.clone(),
             worklist: Worklist::new(),
-            delta: DeltaScheduler::new(),
+            delta: self.delta.empty_sibling(),
             stats: ResidualStateStats::default(),
             binding: Binding::default(),
             emit_vars: Vec::new(),
@@ -12513,6 +12535,27 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
         self.state.cap = cap.max(1);
         self.state.width = self.state.width.min(self.state.cap);
         self.state.terminal_demand_width = self.state.terminal_demand_width.min(self.state.cap);
+        self
+    }
+
+    /// Enables an experimental elapsed-service gate between an exact Confirm
+    /// and its PositiveSupport hedge.
+    ///
+    /// Only physical Program cohorts attributable to exactly one semantic
+    /// parent and one lane feed the elapsed ledger. Mixed or ambiguous
+    /// cohorts retain the ordinary count-based wake policy. Initial public
+    /// demand still starts Support immediately, and the authoritative
+    /// demand/credit work bound is unchanged. Consequently this is a
+    /// conservative throttle, not full processor sharing: cheap Support work
+    /// still cannot exceed the independently authoritative `S <= D + C`
+    /// examined-work allowance.
+    #[doc(hidden)]
+    pub fn positive_support_service_gated(mut self, enabled: bool) -> Self {
+        assert!(
+            !self.iteration_started,
+            "cannot change the positive Support service gate after iteration starts"
+        );
+        self.state.delta.set_positive_support_service_gated(enabled);
         self
     }
 
