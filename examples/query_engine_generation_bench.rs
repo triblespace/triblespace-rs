@@ -205,7 +205,9 @@ mod allocation_probe {
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 #[cfg(rpq_confirm_admission_probe)]
 use triblespace::core::query::regularpathconstraint::{
-    rpq_confirm_admission_probe_bound_confirm_batches, rpq_confirm_admission_probe_fit_closed_runs,
+    rpq_confirm_admission_probe_bound_confirm_batches,
+    rpq_confirm_admission_probe_fit_closed_present_child_ordered,
+    rpq_confirm_admission_probe_fit_closed_runs,
     rpq_confirm_admission_probe_force_first_target_ordinary,
     rpq_confirm_admission_probe_force_ordinary,
     rpq_confirm_admission_probe_force_singleton_ordinary,
@@ -270,6 +272,7 @@ enum ProbeMode {
     Hybrid,
     ProbeOne,
     FitClosedRuns,
+    FitClosedPresentChild,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -277,12 +280,13 @@ const PROBE_TIMING_ORDER_COUNT: usize = 24;
 
 #[cfg(rpq_confirm_admission_probe)]
 impl ProbeMode {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Certified,
         Self::Ordinary,
         Self::Hybrid,
         Self::ProbeOne,
         Self::FitClosedRuns,
+        Self::FitClosedPresentChild,
     ];
     const TIMED: [Self; 4] = [
         Self::Certified,
@@ -298,6 +302,7 @@ impl ProbeMode {
             Self::Hybrid => "H_SINGLETON_ORDINARY",
             Self::ProbeOne => "J_PROBE_ONE_ORDINARY",
             Self::FitClosedRuns => "K_FIT_CLOSED_RUNS",
+            Self::FitClosedPresentChild => "KP_PRESENT_CHILD_ORDERED",
         }
     }
 
@@ -309,10 +314,17 @@ impl ProbeMode {
         rpq_confirm_admission_probe_force_ordinary(matches!(self, Self::Ordinary));
         rpq_confirm_admission_probe_force_singleton_ordinary(matches!(
             self,
-            Self::Hybrid | Self::FitClosedRuns
+            Self::Hybrid | Self::FitClosedRuns | Self::FitClosedPresentChild
         ));
         rpq_confirm_admission_probe_force_first_target_ordinary(matches!(self, Self::ProbeOne));
-        rpq_confirm_admission_probe_fit_closed_runs(matches!(self, Self::FitClosedRuns));
+        rpq_confirm_admission_probe_fit_closed_runs(matches!(
+            self,
+            Self::FitClosedRuns | Self::FitClosedPresentChild
+        ));
+        rpq_confirm_admission_probe_fit_closed_present_child_ordered(matches!(
+            self,
+            Self::FitClosedPresentChild
+        ));
     }
 }
 
@@ -2560,14 +2572,18 @@ fn run_crossover_mode<S: TriblePattern>(
         forced_confirm_batches,
         target_decisions,
     );
-    if mode == ProbeMode::FitClosedRuns {
+    if matches!(
+        mode,
+        ProbeMode::FitClosedRuns | ProbeMode::FitClosedPresentChild
+    ) {
         println!(
             "fit_closed_run_receipt backend={backend:?} width={} repeat={repeat} \
              original_mixed_cohorts={} bulk_runs={} bulk_inputs={} pageable_runs={} \
              pageable_inputs={} salvaged_fit_inputs={} max_run_inputs={} \
              max_bulk_run_inputs={} max_pageable_run_inputs={} \
              nonfit_resumed={} nonfit_empty_program={} nonfit_non_positive={} \
-             nonfit_grant={}",
+             nonfit_grant={} present_child_branch_slot_scans={} \
+             present_child_lookups={} absent_child_lookups_eliminated={}",
             cell.width,
             callbacks.fit_closed_original_mixed_cohorts,
             callbacks.fit_closed_bulk_runs,
@@ -2582,6 +2598,9 @@ fn run_crossover_mode<S: TriblePattern>(
             callbacks.fit_closed_nonfit_empty_program_inputs,
             callbacks.fit_closed_nonfit_non_positive_inputs,
             callbacks.fit_closed_nonfit_grant_inputs,
+            callbacks.fit_closed_present_child_branch_slot_scans,
+            callbacks.fit_closed_present_child_lookups,
+            callbacks.fit_closed_absent_child_lookups_eliminated,
         );
     }
 
@@ -3026,6 +3045,9 @@ fn nonplacement_callbacks(
     callbacks.fit_closed_nonfit_empty_program_inputs = 0;
     callbacks.fit_closed_nonfit_non_positive_inputs = 0;
     callbacks.fit_closed_nonfit_grant_inputs = 0;
+    callbacks.fit_closed_present_child_branch_slot_scans = 0;
+    callbacks.fit_closed_present_child_lookups = 0;
+    callbacks.fit_closed_absent_child_lookups_eliminated = 0;
     callbacks
 }
 
@@ -3294,6 +3316,86 @@ fn correctness_backend<S: TriblePattern>(
     );
     assert_fit_closed_runs_equivalence(backend, cell, &hybrid, &fit_closed, &fit_closed_repeat);
 
+    let fit_closed_present = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::FitClosedPresentChild,
+        0,
+        Some(target_token),
+    );
+    let fit_closed_present_repeat = run_crossover_mode(
+        backend,
+        store,
+        fixture,
+        cell,
+        ProbeMode::FitClosedPresentChild,
+        1,
+        Some(target_token),
+    );
+    assert_eq!(
+        crossover_target_fragments_for(&fit_closed_present, target_token),
+        FROZEN_H_K4_FRAGMENTS,
+        "present-child traversal changed the frozen H target fragments",
+    );
+    assert_crossover_target_receipt(
+        backend,
+        cell,
+        target_token,
+        &fit_closed_present,
+        &hybrid_fragments,
+    );
+    assert_fit_closed_runs_equivalence(
+        backend,
+        cell,
+        &hybrid,
+        &fit_closed_present,
+        &fit_closed_present_repeat,
+    );
+    assert_eq!(
+        fit_closed_present.rows, fit_closed.rows,
+        "present-child traversal changed K's exact callback order",
+    );
+    assert_eq!(
+        fit_closed_present.order_digest, fit_closed.order_digest,
+        "present-child traversal changed K's ordered result digest",
+    );
+    assert_eq!(
+        fit_closed_present.stats, fit_closed.stats,
+        "present-child traversal changed the complete residual-state receipt",
+    );
+    assert_eq!(
+        nonplacement_callbacks(fit_closed_present.callbacks),
+        nonplacement_callbacks(fit_closed.callbacks),
+        "present-child traversal changed a non-structural callback receipt",
+    );
+    assert_eq!(
+        fit_closed
+            .callbacks
+            .fit_closed_present_child_branch_slot_scans,
+        0,
+        "the frozen all-byte control unexpectedly used the present-child walk",
+    );
+    assert!(
+        fit_closed_present
+            .callbacks
+            .fit_closed_present_child_branch_slot_scans
+            > 0
+    );
+    assert!(
+        fit_closed_present
+            .callbacks
+            .fit_closed_present_child_lookups
+            > 0
+    );
+    assert!(
+        fit_closed_present
+            .callbacks
+            .fit_closed_absent_child_lookups_eliminated
+            > 0
+    );
+
     let probe_one = run_crossover_mode(
         backend,
         store,
@@ -3353,6 +3455,7 @@ fn correctness_backend<S: TriblePattern>(
         ("O", &ordinary),
         ("H", &hybrid),
         ("K", &fit_closed),
+        ("KP", &fit_closed_present),
     ] {
         assert_eq!(
             control.callbacks.first_target_confirm_consumptions, 0,
@@ -3365,6 +3468,7 @@ fn correctness_backend<S: TriblePattern>(
         ("H", &hybrid),
         ("J", &probe_one),
         ("K", &fit_closed),
+        ("KP", &fit_closed_present),
     ] {
         let signature = tally(run.rows.iter().copied());
         assert_eq!(signature.rows, cell.expected.len());

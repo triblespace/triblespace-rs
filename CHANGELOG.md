@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PATCH now has an order-preserving present-child traversal probe.** A
+  prefix-located bounded view can scan each physical child table once into the
+  existing 256-bit `ByteSet`, drain only present keys in ascending order, and
+  retain the frozen all-byte lookup walk as a same-binary control. Exact
+  sparse, dense, recursive, archive-local-leaf, and RPQ state/novelty
+  differentials accompany structural slot-scan, present-lookup, and eliminated
+  absent-lookup receipts.
 - **The sealed RPQ Confirm crossover now includes a request-local ProbeOne
   diagnostic.** J sends exactly the first concrete target CandidateBatch
   through ordinary Confirm, atomically consumes that request-local flag, and

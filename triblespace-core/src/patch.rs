@@ -1834,6 +1834,55 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Enumerate a whole already-matched infix segment in lexicographic byte
+    /// order by first collecting the keys physically present in each branch.
+    ///
+    /// Unlike [`Self::ordered_infixes_from_matched_prefix`], this diagnostic
+    /// probe performs one linear child-table scan and then probes only keys
+    /// that are actually present. The frozen all-byte walk remains intact as
+    /// its same-binary control.
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    fn present_child_ordered_infixes_from_matched_prefix<
+        const PREFIX_LEN: usize,
+        const INFIX_LEN: usize,
+        F,
+    >(
+        &self,
+        stats: &mut PATCHPresentChildOrderedStats,
+        for_each: &mut F,
+    ) where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        debug_assert!(PREFIX_LEN <= self.end_depth());
+        if PREFIX_LEN + INFIX_LEN <= self.end_depth() {
+            let infix: [u8; INFIX_LEN] =
+                core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+            for_each(&infix);
+            return;
+        }
+
+        let BodyRef::Branch(branch) = self.body_ref() else {
+            unreachable!("a leaf always covers the complete key");
+        };
+        let mut present = crate::patch::bytetable::ByteSet::new_empty();
+        stats.branch_slot_scans += branch.child_table.len();
+        for child in branch.child_table.iter().flatten() {
+            present.insert(child.key());
+        }
+        let present_count = present.popcount() as usize;
+        stats.present_child_lookups += present_count;
+        stats.absent_child_lookups_eliminated += 256 - present_count;
+        while let Some(child_byte) = present.drain_next_ascending() {
+            let child = branch
+                .child_table
+                .table_get(child_byte)
+                .expect("a key collected from the branch table must remain present");
+            child.present_child_ordered_infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(
+                stats, for_each,
+            );
+        }
+    }
+
     /// Diagnostic: accumulate (branch nodes, total child-table slots,
     /// heap-`Leaf` nodes, `LocalLeaf` slots) over the subtree. Used to
     /// decompose a PATCH's *structural* byte size (vs resident RSS).
@@ -2155,6 +2204,18 @@ pub(crate) struct PATCHInfixPage<const INFIX_LEN: usize> {
     exhausted: bool,
 }
 
+/// Structural work performed by the present-child ordered traversal probe.
+///
+/// This is correctness-only instrumentation: it is returned directly by the
+/// distinct probe traversal and is absent from production builds.
+#[cfg(any(test, rpq_confirm_admission_probe))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PATCHPresentChildOrderedStats {
+    pub(crate) branch_slot_scans: usize,
+    pub(crate) present_child_lookups: usize,
+    pub(crate) absent_child_lookups_eliminated: usize,
+}
+
 impl<const INFIX_LEN: usize> PATCHInfixPage<INFIX_LEN> {
     const EMPTY: Self = Self {
         examined: 0,
@@ -2246,6 +2307,27 @@ impl<
         if let Some(located) = self.located {
             located.ordered_infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(&mut for_each);
         }
+    }
+
+    /// Enumerate the already-located subtree in the same lexicographic order
+    /// as [`Self::for_each_ordered`], but visit only child bytes observed in
+    /// one physical scan of each branch table.
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    pub(crate) fn for_each_present_child_ordered<F>(
+        self,
+        mut for_each: F,
+    ) -> PATCHPresentChildOrderedStats
+    where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        let mut stats = PATCHPresentChildOrderedStats::default();
+        if let Some(located) = self.located {
+            located.present_child_ordered_infixes_from_matched_prefix::<PREFIX_LEN, INFIX_LEN, F>(
+                &mut stats,
+                &mut for_each,
+            );
+        }
+        stats
     }
 }
 
@@ -3427,6 +3509,111 @@ mod tests {
         bounded.for_each_ordered(|infix| ordered.push(*infix));
         assert_eq!(ordered, pageable);
         assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let mut present_child_ordered = Vec::new();
+        let stats = patch
+            .bounded_infixes::<4, 4>(&selected, infixes.len() as u64)
+            .expect("the exact selected infix segment must fit")
+            .for_each_present_child_ordered(|infix| present_child_ordered.push(*infix));
+        assert_eq!(present_child_ordered, ordered);
+        assert!(stats.branch_slot_scans > 0);
+        assert!(stats.present_child_lookups > 0);
+        assert!(stats.absent_child_lookups_eliminated > 0);
+    }
+
+    fn assert_identity_present_child_order<const KEY_LEN: usize>(
+        patch: &PATCH<KEY_LEN, IdentitySchema, ()>,
+    ) -> (Vec<[u8; KEY_LEN]>, PATCHPresentChildOrderedStats) {
+        let count = patch.len();
+        let mut frozen = Vec::new();
+        patch
+            .bounded_infixes::<0, KEY_LEN>(&[], count)
+            .expect("the exact full-key segment must fit")
+            .for_each_ordered(|infix| frozen.push(*infix));
+        let mut present_child = Vec::new();
+        let stats = patch
+            .bounded_infixes::<0, KEY_LEN>(&[], count)
+            .expect("the exact full-key segment must fit")
+            .for_each_present_child_ordered(|infix| present_child.push(*infix));
+
+        assert_eq!(present_child, frozen);
+        assert!(present_child.windows(2).all(|pair| pair[0] < pair[1]));
+        let (branches, slots, _, _) = patch.node_stats();
+        assert_eq!(stats.branch_slot_scans, slots as usize);
+        assert_eq!(
+            stats.present_child_lookups + stats.absent_child_lookups_eliminated,
+            branches as usize * 256,
+        );
+        (present_child, stats)
+    }
+
+    #[test]
+    fn present_child_ordered_bounded_infixes_match_frozen_sparse_branches() {
+        let mut patch = PATCH::<2, IdentitySchema, ()>::new();
+        for key in [[0xf0, 0x30], [0x10, 0x20], [0x80, 0x10]] {
+            patch.insert(&Entry::new(&key));
+        }
+
+        let (actual, stats) = assert_identity_present_child_order(&patch);
+        assert_eq!(actual, vec![[0x10, 0x20], [0x80, 0x10], [0xf0, 0x30]]);
+        assert_eq!(stats.present_child_lookups, 3);
+        assert_eq!(stats.absent_child_lookups_eliminated, 253);
+    }
+
+    #[test]
+    fn present_child_ordered_bounded_infixes_match_frozen_dense_branch() {
+        let mut patch = PATCH::<2, IdentitySchema, ()>::new();
+        for first in u8::MIN..=u8::MAX {
+            patch.insert(&Entry::new(&[first, 0x5a]));
+        }
+
+        let (actual, stats) = assert_identity_present_child_order(&patch);
+        assert_eq!(actual.len(), 256);
+        assert_eq!(stats.branch_slot_scans, 256);
+        assert_eq!(stats.present_child_lookups, 256);
+        assert_eq!(stats.absent_child_lookups_eliminated, 0);
+    }
+
+    #[test]
+    fn present_child_ordered_bounded_infixes_match_frozen_recursive_branches() {
+        let mut patch = PATCH::<3, IdentitySchema, ()>::new();
+        for first in [0x10, 0x40, 0x90] {
+            for second in [0x05, 0x20, 0x80, 0xf0] {
+                patch.insert(&Entry::new(&[first, second, first ^ second]));
+            }
+        }
+
+        let (_, stats) = assert_identity_present_child_order(&patch);
+        let (branches, _, _, _) = patch.node_stats();
+        assert!(branches > 1, "fixture must recurse through nested branches");
+        assert!(stats.present_child_lookups > 3);
+        assert!(stats.absent_child_lookups_eliminated > 0);
+    }
+
+    #[test]
+    fn present_child_ordered_bounded_infixes_match_frozen_local_leaves() {
+        #[repr(C, align(16))]
+        struct AlignedKey([u8; 16]);
+
+        let storage = std::sync::Arc::new([
+            AlignedKey([0xf0; 16]),
+            AlignedKey([0x10; 16]),
+            AlignedKey([0x80; 16]),
+            AlignedKey([0x20; 16]),
+        ]);
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let mut patch = PATCH::<16, IdentitySchema, ()>::new();
+        for key in storage.iter() {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
+            patch.insert_archive(&entry);
+        }
+
+        assert!(patch.node_stats().3 > 0, "fixture must contain a LocalLeaf");
+        let (actual, stats) = assert_identity_present_child_order(&patch);
+        assert_eq!(actual, vec![[0x10; 16], [0x20; 16], [0x80; 16], [0xf0; 16]]);
+        assert!(stats.branch_slot_scans > 0);
+        assert!(stats.present_child_lookups > 0);
+        assert!(stats.absent_child_lookups_eliminated > 0);
     }
 
     #[test]

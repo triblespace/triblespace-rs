@@ -14,6 +14,8 @@ use crate::inline::IntoInline;
 use crate::inline::RawInline;
 use crate::patch::PATCHBoundedInfixes;
 use crate::patch::PATCHInfixPage;
+#[cfg(any(test, rpq_confirm_admission_probe))]
+use crate::patch::PATCHPresentChildOrderedStats;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::residual::FrameSeedRow;
@@ -399,6 +401,7 @@ std::thread_local! {
     static BULK_TRANSITION_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAGEABLE_TRANSITION_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FIT_CLOSED_RUNS_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FIT_CLOSED_PRESENT_CHILD_ORDERED_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FIT_CLOSED_ORIGINAL_MIXED_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FIT_CLOSED_BULK_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FIT_CLOSED_BULK_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -412,6 +415,9 @@ std::thread_local! {
     static FIT_CLOSED_NONFIT_EMPTY_PROGRAM_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FIT_CLOSED_NONFIT_NON_POSITIVE_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FIT_CLOSED_NONFIT_GRANT_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_PRESENT_CHILD_BRANCH_SLOT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_PRESENT_CHILD_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIT_CLOSED_ABSENT_CHILD_LOOKUPS_ELIMINATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(any(test, rpq_confirm_admission_probe))]
@@ -430,6 +436,9 @@ struct FitClosedRunProbeSnapshot {
     nonfit_empty_program_inputs: usize,
     nonfit_non_positive_inputs: usize,
     nonfit_grant_inputs: usize,
+    present_child_branch_slot_scans: usize,
+    present_child_lookups: usize,
+    absent_child_lookups_eliminated: usize,
 }
 
 #[cfg(any(test, rpq_confirm_admission_probe))]
@@ -450,6 +459,11 @@ fn fit_closed_run_probe_snapshot() -> FitClosedRunProbeSnapshot {
         nonfit_non_positive_inputs: FIT_CLOSED_NONFIT_NON_POSITIVE_INPUTS
             .with(std::cell::Cell::get),
         nonfit_grant_inputs: FIT_CLOSED_NONFIT_GRANT_INPUTS.with(std::cell::Cell::get),
+        present_child_branch_slot_scans: FIT_CLOSED_PRESENT_CHILD_BRANCH_SLOT_SCANS
+            .with(std::cell::Cell::get),
+        present_child_lookups: FIT_CLOSED_PRESENT_CHILD_LOOKUPS.with(std::cell::Cell::get),
+        absent_child_lookups_eliminated: FIT_CLOSED_ABSENT_CHILD_LOOKUPS_ELIMINATED
+            .with(std::cell::Cell::get),
     }
 }
 
@@ -468,12 +482,21 @@ fn reset_fit_closed_run_probe_counters() {
     FIT_CLOSED_NONFIT_EMPTY_PROGRAM_INPUTS.with(|value| value.set(0));
     FIT_CLOSED_NONFIT_NON_POSITIVE_INPUTS.with(|value| value.set(0));
     FIT_CLOSED_NONFIT_GRANT_INPUTS.with(|value| value.set(0));
+    FIT_CLOSED_PRESENT_CHILD_BRANCH_SLOT_SCANS.with(|value| value.set(0));
+    FIT_CLOSED_PRESENT_CHILD_LOOKUPS.with(|value| value.set(0));
+    FIT_CLOSED_ABSENT_CHILD_LOOKUPS_ELIMINATED.with(|value| value.set(0));
 }
 
 #[cfg(any(test, rpq_confirm_admission_probe))]
 #[doc(hidden)]
 pub fn rpq_confirm_admission_probe_fit_closed_runs(enabled: bool) {
     FIT_CLOSED_RUNS_ENABLED.with(|value| value.set(enabled));
+}
+
+#[cfg(any(test, rpq_confirm_admission_probe))]
+#[doc(hidden)]
+pub fn rpq_confirm_admission_probe_fit_closed_present_child_ordered(enabled: bool) {
+    FIT_CLOSED_PRESENT_CHILD_ORDERED_ENABLED.with(|value| value.set(enabled));
 }
 
 #[cfg(test)]
@@ -1491,6 +1514,13 @@ enum PositiveDeltaInfixes<'a> {
     InverseAttr(PATCHBoundedInfixes<'a, TRIBLE_LEN, { 32 + ID_LEN }, ID_LEN, VAEOrder, ()>),
 }
 
+#[cfg(any(test, rpq_confirm_admission_probe))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FitClosedOrderedTraversal {
+    FrozenAllBytes,
+    PresentChildren,
+}
+
 impl PositiveDeltaInfixes<'_> {
     fn len(&self) -> usize {
         match self {
@@ -1515,13 +1545,33 @@ impl PositiveDeltaInfixes<'_> {
     }
 
     #[cfg(any(test, rpq_confirm_admission_probe))]
-    fn for_each_ordered(self, mut for_each: impl FnMut(RawInline)) {
+    fn for_each_ordered(
+        self,
+        traversal: FitClosedOrderedTraversal,
+        mut for_each: impl FnMut(RawInline),
+    ) -> PATCHPresentChildOrderedStats {
         match self {
-            Self::Empty => {}
-            Self::Attr(infixes) => infixes.for_each_ordered(|value: &[u8; 32]| for_each(*value)),
-            Self::InverseAttr(infixes) => {
-                infixes.for_each_ordered(|entity: &[u8; ID_LEN]| for_each(id_into_value(entity)))
-            }
+            Self::Empty => PATCHPresentChildOrderedStats::default(),
+            Self::Attr(infixes) => match traversal {
+                FitClosedOrderedTraversal::FrozenAllBytes => {
+                    infixes.for_each_ordered(|value: &[u8; 32]| for_each(*value));
+                    PATCHPresentChildOrderedStats::default()
+                }
+                FitClosedOrderedTraversal::PresentChildren => {
+                    infixes.for_each_present_child_ordered(|value: &[u8; 32]| for_each(*value))
+                }
+            },
+            Self::InverseAttr(infixes) => match traversal {
+                FitClosedOrderedTraversal::FrozenAllBytes => {
+                    infixes
+                        .for_each_ordered(|entity: &[u8; ID_LEN]| for_each(id_into_value(entity)));
+                    PATCHPresentChildOrderedStats::default()
+                }
+                FitClosedOrderedTraversal::PresentChildren => infixes
+                    .for_each_present_child_ordered(|entity: &[u8; ID_LEN]| {
+                        for_each(id_into_value(entity))
+                    }),
+            },
         }
     }
 }
@@ -1840,6 +1890,9 @@ pub struct RpqConfirmAdmissionProbeSnapshot {
     pub fit_closed_nonfit_empty_program_inputs: usize,
     pub fit_closed_nonfit_non_positive_inputs: usize,
     pub fit_closed_nonfit_grant_inputs: usize,
+    pub fit_closed_present_child_branch_slot_scans: usize,
+    pub fit_closed_present_child_lookups: usize,
+    pub fit_closed_absent_child_lookups_eliminated: usize,
 }
 
 #[cfg(rpq_confirm_admission_probe)]
@@ -1924,6 +1977,7 @@ pub fn rpq_confirm_admission_probe_target_decisions() -> Vec<(u32, usize, usize,
 #[doc(hidden)]
 pub fn rpq_confirm_admission_probe_reset_callbacks() {
     FIT_CLOSED_RUNS_ENABLED.with(|value| value.set(false));
+    FIT_CLOSED_PRESENT_CHILD_ORDERED_ENABLED.with(|value| value.set(false));
     TARGET_CONFIRM_TOKEN.with(|value| value.set(None));
     TARGET_CONFIRM_PARENTS.with(|value| value.set(0));
     TARGET_CONFIRM_CANDIDATES.with(|value| value.set(0));
@@ -2015,6 +2069,9 @@ pub fn rpq_confirm_admission_probe_snapshot() -> RpqConfirmAdmissionProbeSnapsho
         fit_closed_nonfit_empty_program_inputs: fit_closed.nonfit_empty_program_inputs,
         fit_closed_nonfit_non_positive_inputs: fit_closed.nonfit_non_positive_inputs,
         fit_closed_nonfit_grant_inputs: fit_closed.nonfit_grant_inputs,
+        fit_closed_present_child_branch_slot_scans: fit_closed.present_child_branch_slot_scans,
+        fit_closed_present_child_lookups: fit_closed.present_child_lookups,
+        fit_closed_absent_child_lookups_eliminated: fit_closed.absent_child_lookups_eliminated,
     }
 }
 
@@ -2991,6 +3048,16 @@ impl RegularPathConstraint {
             };
             counter.with(|value| value.set(value.get() + 1));
         }
+    }
+
+    #[cfg(any(test, rpq_confirm_admission_probe))]
+    fn record_present_child_ordered_probe(stats: PATCHPresentChildOrderedStats) {
+        FIT_CLOSED_PRESENT_CHILD_BRANCH_SLOT_SCANS
+            .with(|value| value.set(value.get() + stats.branch_slot_scans));
+        FIT_CLOSED_PRESENT_CHILD_LOOKUPS
+            .with(|value| value.set(value.get() + stats.present_child_lookups));
+        FIT_CLOSED_ABSENT_CHILD_LOOKUPS_ELIMINATED
+            .with(|value| value.set(value.get() + stats.absent_child_lookups_eliminated));
     }
 
     fn pageable_delta_value_is_included(
@@ -4171,6 +4238,12 @@ impl TypedProgramSpec for RegularPathConstraint {
             if bulk_inputs > 0 {
                 debug_assert!(bulk_inputs < placements.len());
                 Self::record_fit_closed_run_probe(&runs, &placements);
+                let ordered_traversal =
+                    if FIT_CLOSED_PRESENT_CHILD_ORDERED_ENABLED.with(std::cell::Cell::get) {
+                        FitClosedOrderedTraversal::PresentChildren
+                    } else {
+                        FitClosedOrderedTraversal::FrozenAllBytes
+                    };
                 let mut placements = placements.into_iter().enumerate();
                 for run in runs {
                     if run.bulk {
@@ -4186,45 +4259,53 @@ impl TypedProgramSpec for RegularPathConstraint {
                             FitClosedPlacement::Bulk(input) => {
                                 assert!(run.bulk, "fit-closed RPQ run mixed placements");
                                 for branch in input.branches {
-                                    branch.infixes.for_each_ordered(|value| {
-                                        let accepted = branch.target_accepting
-                                            && input
-                                                .node
-                                                .source
-                                                .is_none_or(|anchor| value == anchor);
-                                        if branch.terminal {
-                                            if accepted {
-                                                effects.accept(input_tag, value);
+                                    let FitClosedBulkBranch {
+                                        pc,
+                                        target_accepting,
+                                        terminal,
+                                        infixes,
+                                    } = branch;
+                                    let traversal_stats =
+                                        infixes.for_each_ordered(ordered_traversal, |value| {
+                                            let accepted = target_accepting
+                                                && input
+                                                    .node
+                                                    .source
+                                                    .is_none_or(|anchor| value == anchor);
+                                            if terminal {
+                                                if accepted {
+                                                    effects.accept(input_tag, value);
+                                                }
+                                                return;
                                             }
-                                            return;
-                                        }
-                                        let child = RpqNode {
-                                            source: input.node.source,
-                                            value,
-                                            pc: branch.pc,
-                                        };
-                                        let state = RpqState::transition(
-                                            input.variable,
-                                            child,
-                                            RpqExpandCursor::Start,
-                                        );
-                                        let accepted = accepted.then_some(value);
-                                        match batch.stratum {
-                                            ProgramStratum::Finite => {
-                                                effects.finite_child(input_tag, state, accepted)
+                                            let child = RpqNode {
+                                                source: input.node.source,
+                                                value,
+                                                pc,
+                                            };
+                                            let state = RpqState::transition(
+                                                input.variable,
+                                                child,
+                                                RpqExpandCursor::Start,
+                                            );
+                                            let accepted = accepted.then_some(value);
+                                            match batch.stratum {
+                                                ProgramStratum::Finite => {
+                                                    effects.finite_child(input_tag, state, accepted)
+                                                }
+                                                ProgramStratum::Fixpoint => effects.fixpoint_child(
+                                                    input_tag,
+                                                    state,
+                                                    RpqNoveltyKey {
+                                                        source: child.source,
+                                                        value: child.value,
+                                                        pc: child.pc,
+                                                    },
+                                                    accepted,
+                                                ),
                                             }
-                                            ProgramStratum::Fixpoint => effects.fixpoint_child(
-                                                input_tag,
-                                                state,
-                                                RpqNoveltyKey {
-                                                    source: child.source,
-                                                    value: child.value,
-                                                    pc: child.pc,
-                                                },
-                                                accepted,
-                                            ),
-                                        }
-                                    });
+                                        });
+                                    Self::record_present_child_ordered_probe(traversal_stats);
                                 }
                                 effects.account_transition(input.fanout);
                                 effects.page(input.fanout, None);
@@ -5379,8 +5460,19 @@ mod seeded_frame_tests {
         limits: &[usize],
         fit_closed_runs: bool,
     ) -> (ProgramBatchEffects, usize, usize, FitClosedRunProbeSnapshot) {
+        one_support_transition_cohort_with_ordered_probe(path, rows, limits, fit_closed_runs, false)
+    }
+
+    fn one_support_transition_cohort_with_ordered_probe(
+        path: &RegularPathConstraint,
+        rows: &[RawInline],
+        limits: &[usize],
+        fit_closed_runs: bool,
+        present_child_ordered: bool,
+    ) -> (ProgramBatchEffects, usize, usize, FitClosedRunProbeSnapshot) {
         assert_eq!(rows.len(), limits.len() * 2);
         rpq_confirm_admission_probe_fit_closed_runs(fit_closed_runs);
+        rpq_confirm_admission_probe_fit_closed_present_child_ordered(present_child_ordered);
         reset_fit_closed_run_probe_counters();
         let mut bound = VariableSet::new_singleton(path.start);
         bound.set(path.end);
@@ -5426,6 +5518,7 @@ mod seeded_frame_tests {
             &mut effects,
         );
         rpq_confirm_admission_probe_fit_closed_runs(false);
+        rpq_confirm_admission_probe_fit_closed_present_child_ordered(false);
         (
             effects,
             take_bulk_transition_cohorts(),
@@ -5508,6 +5601,22 @@ mod seeded_frame_tests {
         limits: &[usize],
         fit_closed_runs: bool,
     ) -> crate::query::program::TypedEffectTestSnapshot<RpqState, RpqNoveltyKey> {
+        typed_support_transition_snapshot_with_ordered_probe(
+            path,
+            rows,
+            limits,
+            fit_closed_runs,
+            false,
+        )
+    }
+
+    fn typed_support_transition_snapshot_with_ordered_probe(
+        path: &RegularPathConstraint,
+        rows: &[RawInline],
+        limits: &[usize],
+        fit_closed_runs: bool,
+        present_child_ordered: bool,
+    ) -> crate::query::program::TypedEffectTestSnapshot<RpqState, RpqNoveltyKey> {
         assert_eq!(rows.len(), limits.len() * 2);
         let mut bound = VariableSet::new_singleton(path.start);
         bound.set(path.end);
@@ -5539,6 +5648,7 @@ mod seeded_frame_tests {
         let mut effects = TypedEffectSink::default();
         reset_fit_closed_run_probe_counters();
         rpq_confirm_admission_probe_fit_closed_runs(fit_closed_runs);
+        rpq_confirm_admission_probe_fit_closed_present_child_ordered(present_child_ordered);
         TypedProgramSpec::step_typed(
             path,
             &mut states,
@@ -5552,6 +5662,7 @@ mod seeded_frame_tests {
             &mut effects,
         );
         rpq_confirm_admission_probe_fit_closed_runs(false);
+        rpq_confirm_admission_probe_fit_closed_present_child_ordered(false);
         effects.test_snapshot()
     }
 
@@ -6223,7 +6334,18 @@ mod seeded_frame_tests {
 
         let pageable = typed_support_transition_snapshot(&path, &rows, &[2, 2, 2], false);
         let fit_closed = typed_support_transition_snapshot(&path, &rows, &[2, 2, 2], true);
+        let fit_closed_present = typed_support_transition_snapshot_with_ordered_probe(
+            &path,
+            &rows,
+            &[2, 2, 2],
+            true,
+            true,
+        );
         assert_eq!(fit_closed, pageable);
+        assert_eq!(
+            fit_closed_present, fit_closed,
+            "present-child ordered traversal must preserve exact states and novelty words",
+        );
         assert_eq!(fit_closed.pages.len(), 3);
         assert_eq!(fit_closed.children.len(), 6);
         assert!(fit_closed
@@ -6236,6 +6358,23 @@ mod seeded_frame_tests {
         ));
         assert!(fit_closed.pages[0].1.is_none());
         assert!(fit_closed.pages[2].1.is_none());
+
+        let (frozen_effects, _, _, frozen_probe) =
+            one_support_transition_cohort_with_ordered_probe(&path, &rows, &[2, 2, 2], true, false);
+        let (present_effects, _, _, present_probe) =
+            one_support_transition_cohort_with_ordered_probe(&path, &rows, &[2, 2, 2], true, true);
+        assert_eq!(
+            transition_effects_snapshot(&present_effects),
+            transition_effects_snapshot(&frozen_effects),
+        );
+        let mut present_without_traversal = present_probe;
+        present_without_traversal.present_child_branch_slot_scans = 0;
+        present_without_traversal.present_child_lookups = 0;
+        present_without_traversal.absent_child_lookups_eliminated = 0;
+        assert_eq!(present_without_traversal, frozen_probe);
+        assert!(present_probe.present_child_branch_slot_scans > 0);
+        assert!(present_probe.present_child_lookups > 0);
+        assert!(present_probe.absent_child_lookups_eliminated > 0);
     }
 
     #[test]
