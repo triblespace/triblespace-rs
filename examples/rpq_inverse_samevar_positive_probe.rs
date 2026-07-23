@@ -2,13 +2,17 @@
 //! same-variable RPQ Confirm routes.
 //!
 //! Each route is exercised with candidate occurrence zero (`B[0]`) at a near
-//! positive witness, a far positive witness, or a miss. The production lane
-//! is compared with a harness-only Confirm-only control: both use the same
-//! fallback `RegularPathConstraint` Confirm Program, while the control masks
-//! only the fully-bound Support route behind `ProgramExposure::Explicit`.
+//! positive witness, a far positive witness, or a miss. Two additional
+//! bound-inverse fanout fixtures independently oppose predecessor order and
+//! forward-destination order: one makes inverse Exact expensive and forward
+//! Support cheap, while the other makes Exact cheap and Support expensive.
+//! The production lane is compared with a harness-only Confirm-only control:
+//! both use the same fallback `RegularPathConstraint` Confirm Program, while
+//! the control masks only the fully-bound Support route behind
+//! `ProgramExposure::Explicit`.
 //!
 //! Run with:
-//! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=51] [warmups=5] [run-id] [revision]`
+//! `cargo run --release --example rpq_inverse_samevar_positive_probe -- [nodes=4096] [reps=51] [warmups=5] [run-id] [revision] [suite=all|fanout]`
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::hint::black_box;
@@ -62,6 +66,8 @@ enum Case {
     PositiveNear,
     PositiveFar,
     MissFirst,
+    FanoutSupportCheap,
+    FanoutExactCheap,
 }
 
 impl Case {
@@ -70,6 +76,8 @@ impl Case {
             Self::PositiveNear => "positive-near",
             Self::PositiveFar => "positive-far",
             Self::MissFirst => "miss-first",
+            Self::FanoutSupportCheap => "fanout-support-cheap",
+            Self::FanoutExactCheap => "fanout-exact-cheap",
         }
     }
 
@@ -380,6 +388,9 @@ fn ordered_candidates(
         Case::PositiveNear => near,
         Case::PositiveFar => far,
         Case::MissFirst => miss,
+        Case::FanoutSupportCheap | Case::FanoutExactCheap => {
+            unreachable!("fanout fixtures construct their candidate bags directly")
+        }
     };
     let mut candidates = Vec::with_capacity(hits.len() + 1);
     candidates.push(first);
@@ -433,6 +444,97 @@ fn build_inverse_fixtures(node_count: usize) -> Vec<Fixture> {
         }
     })
     .collect()
+}
+
+/// Builds a pair of direct-edge fanout fixtures whose two physical search
+/// orders are deliberately independent:
+///
+/// - `fanout-support-cheap`: `candidate -> target` is the candidate's only
+///   forward edge, but `candidate` sorts after every other predecessor of
+///   `target`, so inverse Exact must scan the whole fan-in.
+/// - `fanout-exact-cheap`: `candidate` sorts before every other predecessor of
+///   `target`, but `target` sorts after every other destination of `candidate`,
+///   so forward Support must scan the whole fan-out.
+///
+/// Both candidate bags put the sole positive at occurrence zero and follow it
+/// with graph-absent misses. The misses force the bound-end constant to plan
+/// before the candidate proposer, so the RPQ really executes its inverse
+/// Confirm route rather than binding the candidate first and confirming the
+/// target forward. The raw SET oracle is still exactly `{candidate}` and
+/// imposes no encounter order.
+fn build_inverse_fanout_fixtures(fanout: usize) -> Vec<Fixture> {
+    fn candidates(positive: RawInline, miss_domain: u32) -> Vec<RawInline> {
+        std::iter::once(positive)
+            .chain((0..DISTINCT_HITS - 1).map(|index| value(id(miss_domain, index)).raw))
+            .collect()
+    }
+
+    let attribute = id(330, 0);
+
+    let support_target = id(334, 0);
+    let support_candidate = id(333, 0);
+    let support_predecessors: Vec<_> = (0..fanout).map(|index| id(332, index)).collect();
+    assert!(support_predecessors
+        .iter()
+        .all(|predecessor| value(*predecessor).raw < value(support_candidate).raw));
+    let mut support_set = TribleSet::new();
+    for predecessor in support_predecessors {
+        insert_edge(&mut support_set, predecessor, attribute, support_target);
+    }
+    insert_edge(
+        &mut support_set,
+        support_candidate,
+        attribute,
+        support_target,
+    );
+    let support_candidate_raw = value(support_candidate).raw;
+    let support_candidates = candidates(support_candidate_raw, 390);
+
+    let exact_candidate = id(335, 0);
+    let exact_predecessors: Vec<_> = (0..fanout).map(|index| id(336, index)).collect();
+    let exact_decoys: Vec<_> = (0..fanout).map(|index| id(337, index)).collect();
+    let exact_target = id(338, 0);
+    assert!(exact_predecessors
+        .iter()
+        .all(|predecessor| value(exact_candidate).raw < value(*predecessor).raw));
+    assert!(exact_decoys
+        .iter()
+        .all(|decoy| value(*decoy).raw < value(exact_target).raw));
+    let mut exact_set = TribleSet::new();
+    for predecessor in exact_predecessors {
+        insert_edge(&mut exact_set, predecessor, attribute, exact_target);
+    }
+    for decoy in exact_decoys {
+        insert_edge(&mut exact_set, exact_candidate, attribute, decoy);
+    }
+    insert_edge(&mut exact_set, exact_candidate, attribute, exact_target);
+    let exact_candidate_raw = value(exact_candidate).raw;
+    let exact_candidates = candidates(exact_candidate_raw, 391);
+
+    vec![
+        Fixture {
+            shape: Shape::BoundInverse,
+            case: Case::FanoutSupportCheap,
+            set: support_set,
+            bound_end: Some(value(support_target)),
+            candidates: support_candidates,
+            operations: vec![PathOp::Attr(attribute.raw()), PathOp::Plus],
+            expected: vec![support_candidate_raw],
+            b0: support_candidate_raw,
+            b0_distance: Some(1),
+        },
+        Fixture {
+            shape: Shape::BoundInverse,
+            case: Case::FanoutExactCheap,
+            set: exact_set,
+            bound_end: Some(value(exact_target)),
+            candidates: exact_candidates,
+            operations: vec![PathOp::Attr(attribute.raw()), PathOp::Plus],
+            expected: vec![exact_candidate_raw],
+            b0: exact_candidate_raw,
+            b0_distance: Some(1),
+        },
+    ]
 }
 
 fn build_same_variable_fixtures(node_count: usize) -> Vec<Fixture> {
@@ -1152,14 +1254,23 @@ fn main() {
     let warmups = args.get(3).and_then(|arg| arg.parse().ok()).unwrap_or(5);
     let run_id = args.get(4).map(String::as_str).unwrap_or("run-1");
     let revision = args.get(5).map(String::as_str).unwrap_or("unknown");
+    let suite = args.get(6).map(String::as_str).unwrap_or("all");
     assert!(
         node_count >= DISTINCT_HITS * 2,
         "nodes must leave room for distinct sampled witnesses"
     );
     assert!(reps > 0, "reps must be positive");
 
-    let mut fixtures = build_inverse_fixtures(node_count);
-    fixtures.extend(build_same_variable_fixtures(node_count));
+    let fixtures = match suite {
+        "all" => {
+            let mut fixtures = build_inverse_fixtures(node_count);
+            fixtures.extend(build_inverse_fanout_fixtures(node_count));
+            fixtures.extend(build_same_variable_fixtures(node_count));
+            fixtures
+        }
+        "fanout" => build_inverse_fanout_fixtures(node_count),
+        _ => panic!("unknown suite {suite:?}; expected all or fanout"),
+    };
     let context = BenchmarkContext {
         nodes: node_count,
         reps,
@@ -1171,7 +1282,8 @@ fn main() {
     eprintln!(
         "RPQ inverse/same-variable positive-publication probe: \
          nodes={node_count} reps={reps} warmups={warmups} \
-         distinct_hits={DISTINCT_HITS} widths={WIDTHS:?} run={run_id} revision={revision}"
+         distinct_hits={DISTINCT_HITS} widths={WIDTHS:?} suite={suite} \
+         run={run_id} revision={revision}"
     );
     eprintln!(
         "production is the unwrapped OpaqueLeaves+Production lane; exact-only keeps \

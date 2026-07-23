@@ -30,10 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assignment are layered on this custody without changing SET semantics.
 - **The RPQ positive-publication probe suite now covers bound-inverse and
   same-variable routes.** A deterministic release harness compares the
-  production occurrence-zero Support hedge with an exact-Confirm-only control
-  across near, far, and missing first candidates, reporting first-result and
-  full-drain latency together with transition work and a production-equivalent
-  Support seed/step trace.
+  demand-bounded production race with an exact-Confirm-only control across
+  near, far, and missing first candidates. Opposed bound-inverse fanout
+  fixtures independently put the positive candidate last in predecessor order
+  with a cheap forward witness, or first in predecessor order with the target
+  last in its forward fanout. The harness checks raw result SETs without
+  imposing output order, and separately reports first-result, time-to-first-
+  candidate, and full-drain latency. Direct post-validation counters replace
+  observer wrappers that could perturb Program identity.
 - **Eligible target-Confirm activations can publish their first candidate from
   the authoritative exact traversal.** A new structural Program certificate
   lets every eligible exact RPQ Confirm reuse a real replacement receipt that
