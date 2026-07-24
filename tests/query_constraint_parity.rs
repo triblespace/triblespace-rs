@@ -8,15 +8,24 @@
 //! fixpoint may deduplicate path witnesses *within* each occurrence, but
 //! neither may accidentally merge the projected activation identities.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::debug::query::EstimateOverrideConstraint;
-use triblespace::core::query::residual::{FormulaScope, ProgramScope, ResidualLowering};
-use triblespace::core::query::{Binding, Constraint, Query};
+use triblespace::core::query::equalityconstraint::EqualityConstraint;
+use triblespace::core::query::residual::{
+    FormulaScope, ProgramScope, ResidualLowering, ResidualShadowEpoch, ResidualShadowStatus,
+};
+use triblespace::core::query::{
+    Binding, CandidateSink, Constraint, EstimateSink, ProgramAction, ProgramExposure, ProgramRef,
+    ProgramRequest, ProposalCoverage, ProposalLayout, Query, RowsView, TypedProgramSpec,
+    VariableId, VariableSet,
+};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
 
@@ -55,6 +64,100 @@ fn multiset<T: Eq + Hash>(items: impl IntoIterator<Item = T>) -> HashMap<T, usiz
 
 fn combined_effects() -> ResidualLowering {
     ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All)
+}
+
+/// Transparent equality leaf which observes only the ordinary proposal seam.
+///
+/// Its typed Program is still the built-in equality Program. Under Production
+/// Program policy that Explicit route must be rejected, leaving the certified
+/// Formula machine to invoke this wrapper's ordinary action.
+struct ObservedExplicitEquality {
+    inner: EqualityConstraint,
+    a: VariableId,
+    b: VariableId,
+    ordinary_proposals: Arc<AtomicUsize>,
+}
+
+impl ObservedExplicitEquality {
+    fn new(a: VariableId, b: VariableId, ordinary_proposals: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner: EqualityConstraint::new(a, b),
+            a,
+            b,
+            ordinary_proposals,
+        }
+    }
+}
+
+impl Clone for ObservedExplicitEquality {
+    fn clone(&self) -> Self {
+        Self::new(self.a, self.b, Arc::clone(&self.ordinary_proposals))
+    }
+}
+
+impl<'a> Constraint<'a> for ObservedExplicitEquality {
+    fn variables(&self) -> VariableSet {
+        self.inner.variables()
+    }
+
+    fn fixed_denotation(&self) -> bool {
+        self.inner.fixed_denotation()
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        self.inner.proposal_coverage(variable, bound)
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.inner.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.ordinary_proposals.fetch_add(1, Ordering::SeqCst);
+        self.inner.propose(variable, view, candidates);
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.inner.confirm(variable, view, candidates);
+    }
+
+    fn propose_certified_with_receipt(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) -> ProposalLayout {
+        self.ordinary_proposals.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .propose_certified_with_receipt(variable, view, candidates)
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.inner.satisfied(view)
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        self.inner.residual_confirm_is_page_local()
+    }
+
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        self.inner.residual_program()
+    }
 }
 
 /// Runs the stable schedulers around one replaceable residual-capability seam.
@@ -302,4 +405,109 @@ fn finite_union_and_cyclic_rpq_coexist_in_one_root() {
             )
         )
     });
+}
+
+/// WholeRoot Formula exposure and Production Program selection are
+/// independent controls inside one query.
+///
+/// Equality advertises an Explicit Program, so the ordinary policy must leave
+/// it on the certified action seam. The repeated path advertises a Production
+/// Program and must run natively in the same exposed Formula. Two physical
+/// source occurrences carry `a`, while `a -> c` has two path witnesses; raw
+/// projected SET identity collapses both forms of duplicate without losing
+/// any affine parent or retaining action debt at full drain.
+#[test]
+fn whole_root_production_mixes_ordinary_explicit_equality_with_native_rpq() {
+    let a = fixture_id(71);
+    let b = fixture_id(72);
+    let c = fixture_id(73);
+    let d = fixture_id(74);
+    let a_v: Inline<GenId> = (&a).to_inline();
+    let b_v: Inline<GenId> = (&b).to_inline();
+    let c_v: Inline<GenId> = (&c).to_inline();
+    let d_v: Inline<GenId> = (&d).to_inline();
+
+    let mut graph = TribleSet::new();
+    insert_edge(&mut graph, &a, &b);
+    insert_edge(&mut graph, &b, &a);
+    insert_edge(&mut graph, &a, &c);
+    insert_edge(&mut graph, &b, &c);
+    insert_edge(&mut graph, &d, &c);
+
+    let source_values = [a_v, a_v, d_v];
+    let sources = SortedSlice::new(&source_values).unwrap();
+    let source = Variable::<GenId>::new(0);
+    let mirror = Variable::<GenId>::new(1);
+    let target = Variable::<GenId>::new(2);
+    let ordinary_equality_proposals = Arc::new(AtomicUsize::new(0));
+    let equality = ObservedExplicitEquality::new(
+        source.index,
+        mirror.index,
+        Arc::clone(&ordinary_equality_proposals),
+    );
+    let source_bound = VariableSet::new_singleton(source.index);
+    let equality_route = equality
+        .inner
+        .route(ProgramRequest {
+            action: ProgramAction::Propose(mirror.index),
+            bound: source_bound,
+        })
+        .expect("peer-bound equality proposal route");
+    assert_eq!(equality_route.exposure, ProgramExposure::Explicit);
+
+    let traversal = path!(graph, mirror parity::edge+ target);
+    let mirror_bound = VariableSet::new_singleton(mirror.index);
+    let traversal_route = traversal
+        .route(ProgramRequest {
+            action: ProgramAction::Propose(target.index),
+            bound: mirror_bound,
+        })
+        .expect("source-bound repeated path proposal route");
+    assert_eq!(traversal_route.exposure, ProgramExposure::Production);
+
+    let epoch = ResidualShadowEpoch::new();
+    let solved = Query::new_projected(
+        and!(sources.has(source), equality, traversal),
+        [source.index, target.index],
+        move |binding| Some((*binding.get(source.index)?, *binding.get(target.index)?)),
+    )
+    .solve_residual_state_lazy_with(ResidualLowering::WHOLE_ROOT_PRODUCTION)
+    .cap(8)
+    .start_width(1)
+    .growth(2)
+    .shadow(epoch)
+    .collect_profiled();
+
+    let result_len = solved.results.len();
+    let results: BTreeSet<_> = solved.results.into_iter().collect();
+    let expected = BTreeSet::from([
+        (a_v.raw, a_v.raw),
+        (a_v.raw, b_v.raw),
+        (a_v.raw, c_v.raw),
+        (d_v.raw, c_v.raw),
+    ]);
+    assert_eq!(results, expected);
+    assert_eq!(
+        result_len,
+        results.len(),
+        "public projection must already have raw SET identity"
+    );
+    assert!(
+        ordinary_equality_proposals.load(Ordering::SeqCst) > 0,
+        "Production Program scope must defer Explicit equality to its ordinary action"
+    );
+    assert!(
+        solved.stats.delta_transition_pages > 0,
+        "the Production RPQ sibling must execute through its native transition Program"
+    );
+    assert_eq!(solved.shadow.status, ResidualShadowStatus::Closed);
+    assert!(!solved.shadow.events.is_empty());
+    assert!(
+        solved
+            .shadow
+            .events
+            .iter()
+            .all(|event| event.completion.is_some()),
+        "the fully drained mixed Formula retained affine action debt"
+    );
 }
