@@ -2362,6 +2362,14 @@ pub struct ResidualStateStats {
     /// Concrete `(preferred variable, exact proposer occurrence)` groups filed
     /// by Ready planning, summed across pops.
     pub ready_proposal_groups: usize,
+    /// Synthetic WholeRoot proposal groups that entered their root Formula
+    /// continuation directly from Ready. Each transition removes one outer
+    /// Formula-entry state that invokes no constraint protocol verb.
+    pub formula_ready_direct_entries: usize,
+    /// Outer Propose-state pops that entered a finite Formula continuation
+    /// without invoking a constraint protocol verb. UnionLeaves retains this
+    /// compatibility boundary; synthetic WholeRoot entry bypasses it.
+    pub formula_outer_entry_pops: usize,
     /// Candidate-state chunks that planned row-local confirmation actions (or
     /// committed a fully checked candidate frontier) without invoking a
     /// constraint verb.
@@ -7459,6 +7467,7 @@ fn ready_plan_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
+    next_activation: &mut u64,
 ) -> ContinuationToken {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -7639,6 +7648,26 @@ fn ready_plan_transition<'a>(
 
     let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
         let variable_plan = &plans[action.variable_plan];
+        if plan.synthetic_root_formula {
+            assert!(
+                plan.has_finite_formula(action.leaf),
+                "synthetic WholeRoot proposal did not name its Formula occurrence"
+            );
+            stats.formula_ready_direct_entries += 1;
+            return start_formula_proposal_transition(
+                root,
+                plan,
+                desc.bound,
+                variable_plan.variable,
+                &variable_plan.relevant,
+                action.leaf,
+                selected,
+                next_activation,
+                worklist,
+                interner,
+                stats,
+            );
+        }
         file_with_plan(
             worklist,
             interner,
@@ -7672,6 +7701,57 @@ fn ready_plan_transition<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn start_formula_proposal_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    bound: VariableSet,
+    variable: VariableId,
+    relevant: &ChildSet,
+    proposer: usize,
+    rows: RowBatch,
+    next_activation: &mut u64,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> Option<ContinuationToken> {
+    assert!(
+        plan.has_finite_formula(proposer),
+        "Formula proposal entry named an opaque occurrence"
+    );
+    let activations = allocate_activations(next_activation, rows.row_count);
+    let formula_root = plan
+        .finite_formula
+        .root(proposer)
+        .expect("a lowered formula has a root");
+    let proposer_checked =
+        plan.formula_proposer_starts_checked(root, proposer, formula_root, variable, bound);
+    let counter = interner.start_formula_with_proposer_checked(
+        &plan.finite_formula,
+        variable,
+        proposer,
+        UnionVerb::Propose {
+            relevant: relevant.clone(),
+        },
+        proposer_checked,
+    );
+    file_with_plan(
+        worklist,
+        interner,
+        plan,
+        StateDesc {
+            bound,
+            phase: ResidualPhase::Formula { counter },
+        },
+        StateBucket::Formula(FormulaBatch::from_proposal(
+            rows,
+            activations,
+            &plan.finite_formula.node(formula_root).kind,
+        )),
+        stats,
+    )
+}
+
 fn propose_action_transition<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
@@ -7687,40 +7767,17 @@ fn propose_action_transition<'a>(
 ) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
     if plan.has_finite_formula(proposer) {
-        let activations = allocate_activations(next_activation, rows.row_count);
-        let formula_root = plan
-            .finite_formula
-            .root(proposer)
-            .expect("a lowered formula has a root");
-        let proposer_checked = plan.formula_proposer_starts_checked(
+        return start_formula_proposal_transition(
             root,
-            proposer,
-            formula_root,
-            variable,
+            plan,
             desc.bound,
-        );
-        let counter = interner.start_formula_with_proposer_checked(
-            &plan.finite_formula,
             variable,
+            relevant,
             proposer,
-            UnionVerb::Propose {
-                relevant: relevant.clone(),
-            },
-            proposer_checked,
-        );
-        return file_with_plan(
+            rows,
+            next_activation,
             worklist,
             interner,
-            plan,
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Formula { counter },
-            },
-            StateBucket::Formula(FormulaBatch::from_proposal(
-                rows,
-                activations,
-                &plan.finite_formula.node(formula_root).kind,
-            )),
             stats,
         );
     }
@@ -9318,6 +9375,7 @@ fn execute_task<'a>(
                 worklist,
                 interner,
                 stats,
+                next_activation,
             );
             StepOutcome::Advanced(continuation)
         }
@@ -9329,7 +9387,9 @@ fn execute_task<'a>(
             },
             StateBucket::Rows(rows),
         ) => {
-            if !plan.has_finite_formula(*proposer) {
+            if plan.has_finite_formula(*proposer) {
+                stats.formula_outer_entry_pops += 1;
+            } else {
                 stats.propose_action_pops += 1;
             }
             let continuation = propose_action_transition(
@@ -18510,6 +18570,7 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
+        let mut next_activation = 0;
 
         let _continuation = ready_plan_transition(
             &root,
@@ -18522,6 +18583,7 @@ mod tests {
             &mut worklist,
             &mut interner,
             &mut stats,
+            &mut next_activation,
         );
 
         let mut actions = Vec::new();
@@ -18567,6 +18629,7 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
+        let mut next_activation = 0;
 
         let _continuation = ready_plan_transition(
             &root,
@@ -18579,6 +18642,7 @@ mod tests {
             &mut worklist,
             &mut interner,
             &mut stats,
+            &mut next_activation,
         );
 
         let mut actions = Vec::new();
@@ -18717,6 +18781,7 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
+        let mut next_activation = 0;
         let _ = ready_plan_transition(
             &root,
             &plan,
@@ -18728,23 +18793,33 @@ mod tests {
             &mut worklist,
             &mut interner,
             &mut stats,
+            &mut next_activation,
         );
 
         let mut actions = Vec::new();
         for level in worklist.values() {
             for (&id, bucket) in level {
-                let ResidualPhase::Propose {
-                    variable, proposer, ..
-                } = interner.get(id).phase
-                else {
-                    panic!("Ready planning filed a non-proposal state")
+                let ResidualPhase::Formula { counter } = interner.get(id).phase else {
+                    panic!("synthetic Ready planning did not enter Formula directly")
                 };
-                actions.push((variable, proposer, bucket.row_count()));
+                let resume = interner.formula_resume(counter);
+                let FormulaFocus::Plan {
+                    stage: FormulaStage::Propose,
+                    ..
+                } = interner.formula(counter).focus
+                else {
+                    panic!("synthetic Ready entry did not start the root proposal Plan")
+                };
+                actions.push((resume.variable, resume.occurrence, bucket.row_count()));
             }
         }
         actions.sort_unstable();
         assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 0, 1)]);
         assert_eq!(stats.ready_preferred_variable_groups, 2);
+        assert_eq!(stats.ready_proposal_groups, 2);
+        assert_eq!(stats.formula_ready_direct_entries, 2);
+        assert_eq!(stats.formula_outer_entry_pops, 0);
+        assert_eq!(next_activation, 2);
     }
 
     #[test]
@@ -23890,6 +23965,8 @@ mod tests {
         assert_eq!(lowered.stats.propose_action_pops, 2);
         assert_eq!(lowered.stats.propose_calls, 2);
         assert_eq!(lowered.stats.confirm_action_pops, 0);
+        assert_eq!(lowered.stats.formula_ready_direct_entries, 0);
+        assert_eq!(lowered.stats.formula_outer_entry_pops, 1);
         assert_eq!(lowered.shadow.events.len(), 4);
         assert_eq!(
             lowered

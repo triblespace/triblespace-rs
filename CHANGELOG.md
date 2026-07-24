@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Synthetic WholeRoot Formula proposals enter directly from Ready.** After
+  Ready has preserved the root constraint's aggregate estimate, exact
+  row-local variable choice, and singleton Formula occurrence, it now
+  allocates that occurrence's affine payload and files the canonical root
+  Formula continuation immediately. This removes the intervening Propose state
+  that performed no constraint protocol action; ordinary opaque proposals and
+  UnionLeaves formula entry retain their existing paths.
 - **Shared PositiveSupport service liveness is exact and quiescent probes are
   lock-free.** Shard runtimes and in-flight packet guards now retain one
   counted registration whose final drop reconciles the global lease under the
