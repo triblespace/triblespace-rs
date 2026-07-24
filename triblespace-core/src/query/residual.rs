@@ -6182,7 +6182,7 @@ fn debug_assert_candidates_grouped(candidates: &CandidatePayload, parent_count: 
     candidates.debug_assert_valid_for(parent_count);
 }
 
-/// Persistent set-valued output owned by one live Formula OR frame.
+/// Persistent set-valued output owned by one live Formula OR reducer cell.
 ///
 /// The outer vector follows affine parent order.  Each parent owns an
 /// independent ordered set, so equal values in different parents remain
@@ -6564,7 +6564,7 @@ impl FormulaBatch {
         assert_ne!(
             stage,
             FormulaStage::Support,
-            "Boolean support never enters a candidate reducer frame"
+            "Boolean support never installs a candidate stream"
         );
         // Both protocol verbs preserve ascending parent groups.
         debug_assert_candidates_grouped(&result, self.parents.row_count);
@@ -7013,9 +7013,7 @@ impl SetAdmissionDestination {
     fn take_candidates(&mut self) -> CandidatePayload {
         assert_eq!(self.parent_count(), 1, "SET admission is parent-local");
         match self {
-            Self::Formula(batch) => {
-                std::mem::replace(batch.input_mut(), CandidatePayload::empty(1))
-            }
+            Self::Formula(batch) => batch.take_current(),
             Self::Candidate(batch) => {
                 std::mem::replace(&mut batch.candidates, CandidatePayload::empty(1))
             }
@@ -7025,15 +7023,22 @@ impl SetAdmissionDestination {
     fn install_candidates(&mut self, candidates: CandidatePayload) {
         assert_eq!(self.parent_count(), 1, "SET admission is parent-local");
         candidates.debug_assert_valid_for(1);
-        let destination = match self {
-            Self::Formula(batch) => batch.input_mut(),
-            Self::Candidate(batch) => &mut batch.candidates,
-        };
-        assert!(
-            destination.is_empty(),
-            "SET-admission destination retained its original candidates"
-        );
-        *destination = candidates;
+        match self {
+            Self::Formula(batch) => {
+                assert!(
+                    !batch.has_current(),
+                    "Formula SET-admission destination retained its candidate stream"
+                );
+                batch.install_current(candidates);
+            }
+            Self::Candidate(batch) => {
+                assert!(
+                    batch.candidates.is_empty(),
+                    "SET-admission destination retained its original candidates"
+                );
+                batch.candidates = candidates;
+            }
+        }
     }
 
     fn into_live_bucket(self, stride: usize) -> Option<StateBucket> {
@@ -11760,8 +11765,8 @@ impl ResidualStateMachine {
     }
 
     /// Suspends a currently focused formula Atom behind one transition reducer
-    /// activation per affine parent. The exact Action cursor and every payload
-    /// frame remain activation data; [`DeltaDesc`] names only the common
+    /// activation per affine parent. The exact Action cursor and live payload
+    /// cells remain activation data; [`DeltaDesc`] names only the common
     /// structural expansion kernel. Page-local finite confirmations retain the
     /// formula's geometric candidate split; grouped repeated confirmations keep
     /// their complete parent candidate sequence.
