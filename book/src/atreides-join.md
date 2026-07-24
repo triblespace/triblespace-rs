@@ -106,10 +106,14 @@ search space as follows:
    - the base‑2 logarithm of the estimate (smaller estimates are tried first),
    - the number of other variables the constraints could influence (ties favour
      the most connected variable, which tends to prune the search faster).
-4. Ask the relevant constraints to `propose` candidates for that variable.
-   Composite constraints enumerate the tightest member and call `confirm` on the
-   rest so that each candidate is checked without materialising cross
-   products.
+4. Ask the covering occurrence with the smallest raw estimate to `propose`
+   candidates for that variable; structural occurrence order breaks ties.
+   Relevant occurrences then `confirm` in the planner-selected specificity
+   order. Residual planning uses ascending raw estimates per row; a
+   whole-frontier composite may select one order for the block (the current
+   Intersection uses its first row). An Exact proposer may skip its own
+   refinement, while a Covering proposer must confirm its output. This checks
+   each candidate without materialising cross products.
 5. Push the candidates onto a stack and recurse until every variable is bound or
    the stack runs empty, in which case the engine backtracks.
 

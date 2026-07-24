@@ -16,7 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are removed. Planning always uses `ProposalCoverage` for logical source
   eligibility. `propose_with_layout` and its `ProposalLayout` report only
   physical `(parent, value)` uniqueness for optional deduplication elision, and
-  estimates remain cost guidance only.
+  estimates remain cost guidance only. The never-shipped directed unit-pricing
+  types and hook are also removed. Per row, the covering source with the
+  smallest raw estimate proposes. Residual planning refines relevant
+  occurrences in ascending raw-estimate order per row, with structural
+  occurrence order breaking ties; whole-frontier composites may select one
+  specificity order for their block. An Exact proposer may skip its own
+  refinement, while a Covering proposer must self-confirm.
 - **Certified WholeRoot AND quotes can cross Ready as deferred affine
   choices.** The experimental residual scheduler preserves its V3.1 outer
   proposal shell while carrying each row's stable-preorder child ordinal and
@@ -126,18 +132,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attachments.** `from_shards` accepts already-constructed Succinct archive
   constraints, validates their exact ordered entity/attribute/value terms, and
   preserves normalized union ordering, duplicate, tag, and Program semantics.
-- **Flattened residual AND planning can price directed backend work instead of
-  raw proposal width alone.** Lawful leaves may publish immutable logarithmic
-  proposal and confirmation unit classes while their existing estimates quote
-  physical candidate occurrences. The directed price chooses a source within
-  one target variable; cross-variable ordering and generic composite estimates
-  remain on raw cardinalities. Planning includes proposal, engine SET
-  admission, and every required confirmation occurrence, with an atomic
-  raw-cardinality fallback unless all relevant peers opt in. HashSet and
-  single-position Succinct sources publish broad hash/sequential versus
-  random-rank classes; finite-formula actions, repeated-position Succinct
-  targets, and multi-shard UnionArchive constraints remain on raw-cardinality
-  estimates.
 - **Finite equality work and pointwise TribleSet checks stay on the ordinary
   hybrid path, while TribleSet proposal cursors remain production-resumable.**
   Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are

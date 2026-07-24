@@ -7,15 +7,16 @@ use smallvec::SmallVec;
 /// [`and!`](crate::and) macro or directly via [`new`](Self::new).
 ///
 /// Only covering children may act as sources; every target-containing child
-/// remains a validator whether or not it supplies an estimate, and a covering
-/// proposer validates itself. Per row, the source with the lowest
-/// [`estimate`](Constraint::estimate) proposes candidates. Lower child index
-/// breaks equal estimates, and the remaining children
-/// [`confirm`](Constraint::confirm) them in whole-frontier passes, one per
-/// child. That deferral is
-/// what fuses the per-branch confirm trickle into one ragged batch per
-/// (child, level), which is what makes batched probe streams and accelerator
-/// dispatch possible in the first place.
+/// remains a validator whether or not it supplies an estimate. Per row, the
+/// source with the lowest raw [`estimate`](Constraint::estimate) proposes
+/// candidates, with lower child index breaking ties. An Exact proposer may
+/// skip its own refinement; a Covering proposer validates itself. The other
+/// relevant validators [`confirm`](Constraint::confirm) through
+/// whole-frontier passes, one per child, in the ascending raw-estimate order
+/// selected from the frontier's first row. That deferral is what fuses the
+/// per-branch confirm trickle into one ragged batch per (child, level), which is
+/// what makes batched probe streams and accelerator dispatch possible in the
+/// first place.
 ///
 /// Variables from all children are exposed as a single union, so the
 /// engine sees one flat set of variables regardless of how many
@@ -530,75 +531,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct DirectedMultiplicitySource {
-        occurrences: usize,
-        classes: ActionUnitClasses,
-    }
-
-    impl Constraint<'static> for DirectedMultiplicitySource {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(0)
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            if variable == 0 && !bound.is_set(variable) {
-                ProposalCoverage::Exact
-            } else {
-                ProposalCoverage::None
-            }
-        }
-
-        fn action_unit_classes(
-            &self,
-            variable: VariableId,
-            bound: VariableSet,
-        ) -> Option<ActionUnitClasses> {
-            (variable == 0 && !bound.is_set(variable)).then_some(self.classes)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != 0 {
-                return false;
-            }
-            out.fill(self.occurrences, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            if variable == 0 {
-                for row in 0..view.len() as u32 {
-                    candidates.extend_row(row, std::iter::repeat_n(MEMBER, self.occurrences));
-                }
-            }
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            if variable == 0 {
-                candidates.retain(|_, value| *value == MEMBER);
-            }
-        }
-
-        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
-            true
-        }
-    }
-
     #[test]
     fn relational_intersection_never_promotes_a_low_quoted_none_validator() {
         let constraint = IntersectionConstraint::new(vec![
@@ -725,40 +657,5 @@ mod tests {
         constraint.propose(0, &view, &mut CandidateSink::Tagged(&mut candidates));
 
         assert_eq!(candidates, vec![(0, MEMBER), (1, MEMBER), (1, MEMBER)]);
-    }
-
-    #[test]
-    fn nested_relational_intersection_keeps_raw_scalar_source_order() {
-        type DynConstraint = Box<dyn Constraint<'static> + Send + Sync>;
-
-        let inner = IntersectionConstraint::new(vec![
-            Box::new(DirectedMultiplicitySource {
-                occurrences: 8,
-                classes: ActionUnitClasses::new(
-                    ProposalUnitClass::HASH_TABLE_ENUMERATION,
-                    ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
-                ),
-            }) as DynConstraint,
-            Box::new(DirectedMultiplicitySource {
-                occurrences: 29,
-                classes: ActionUnitClasses::new(
-                    ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
-                    ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
-                ),
-            }) as DynConstraint,
-        ]);
-        let root = IntersectionConstraint::new(vec![Box::new(inner) as DynConstraint]);
-
-        let mut estimate = usize::MAX;
-        assert!(root.estimate(
-            0,
-            &RowsView::EMPTY,
-            &mut EstimateSink::Scalar(&mut estimate),
-        ));
-        assert_eq!(estimate, 8);
-
-        let mut scalar = Vec::new();
-        root.propose(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut scalar));
-        assert_eq!(scalar, vec![MEMBER; 8]);
     }
 }

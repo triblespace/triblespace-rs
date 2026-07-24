@@ -138,11 +138,15 @@ An expansion still performs the familiar Atreides negotiation:
    each row's selected occurrence bag while still batching rows whose preferred
    variable agrees; no row is reassigned to an estimate-similar variable.
 4. For each group, propose that variable. The DAG asks the root constraint; an
-   intersection chooses its tightest child per row and runs the remaining
-   children as whole-frontier confirmation passes. The residual engine makes
-   the same proposer and confirmer choices explicit worklist actions. A union
-   remains an opaque leaf that evaluates its still-satisfied alternatives
-   independently and merges their candidates.
+   intersection chooses the covering child with the smallest raw estimate per
+   row, using structural occurrence order for ties. Relevant children refine
+   in the planner-selected specificity order. Residual planning uses ascending
+   raw estimates per row; the whole-frontier Intersection path applies the
+   first row's raw order to the block. An Exact proposer may skip itself, while
+   a Covering proposer must self-confirm. The residual engine makes these
+   proposer and confirmer choices explicit worklist actions. A union remains
+   an opaque leaf that evaluates its still-satisfied alternatives independently
+   and merges their candidates.
 5. Extend the parent rows with the surviving `(row, value)` pairs. Rows without
    candidates disappear.
 
