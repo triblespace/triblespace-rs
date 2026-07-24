@@ -9,8 +9,11 @@
 //! RUSTFLAGS="--cfg engine_legacy_binding" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_scalar" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual" cargo run --release --example query_engine_generation_bench
+//! RUSTFLAGS="--cfg engine_current_whole_production" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_full" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints" \
+//!   cargo run --release --example query_engine_generation_bench
+//! RUSTFLAGS="--cfg engine_current_residual --cfg engine_counter_geometry" \
 //!   cargo run --release --example query_engine_generation_bench
 //! ```
 //!
@@ -19,17 +22,34 @@
 //! before its samples are reported.
 
 #![allow(unexpected_cfgs)]
-#![cfg_attr(engine_prefix_checkpoints, allow(dead_code))]
+#![cfg_attr(
+    any(engine_prefix_checkpoints, engine_counter_geometry),
+    allow(dead_code)
+)]
 
 #[cfg(any(
     all(engine_legacy_binding, engine_current_scalar),
     all(engine_legacy_binding, engine_current_residual),
+    all(engine_legacy_binding, engine_current_whole_production),
     all(engine_legacy_binding, engine_current_full),
     all(engine_current_scalar, engine_current_residual),
+    all(engine_current_scalar, engine_current_whole_production),
     all(engine_current_scalar, engine_current_full),
+    all(engine_current_residual, engine_current_whole_production),
     all(engine_current_residual, engine_current_full),
+    all(engine_current_whole_production, engine_current_full),
 ))]
 compile_error!("select exactly one benchmark engine");
+
+#[cfg(all(
+    engine_counter_geometry,
+    not(any(
+        engine_current_residual,
+        engine_current_whole_production,
+        engine_current_full
+    ))
+))]
+compile_error!("engine_counter_geometry requires one residual-engine selector");
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -188,12 +208,15 @@ const ENGINE: &str = "legacy Binding DFS";
 const ENGINE: &str = "current scalar DFS";
 #[cfg(engine_current_residual)]
 const ENGINE: &str = "current residual";
+#[cfg(engine_current_whole_production)]
+const ENGINE: &str = "current whole-root residual / production Programs";
 #[cfg(engine_current_full)]
 const ENGINE: &str = "current whole-root residual";
 #[cfg(not(any(
     engine_legacy_binding,
     engine_current_scalar,
     engine_current_residual,
+    engine_current_whole_production,
     engine_current_full
 )))]
 const ENGINE: &str = "ordinary Query iterator";
@@ -216,7 +239,18 @@ macro_rules! engine_query {
         {
             query.residual_lowering(triblespace::core::query::residual::ResidualLowering::FULL)
         }
-        #[cfg(not(any(engine_current_scalar, engine_current_full)))]
+        #[cfg(engine_current_whole_production)]
+        {
+            query.residual_lowering(triblespace::core::query::residual::ResidualLowering::new(
+                triblespace::core::query::residual::FormulaScope::WholeRoot,
+                triblespace::core::query::residual::ProgramScope::Production,
+            ))
+        }
+        #[cfg(not(any(
+            engine_current_scalar,
+            engine_current_whole_production,
+            engine_current_full
+        )))]
         {
             query
         }
@@ -726,7 +760,7 @@ fn parse_arg(position: usize, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-#[cfg(not(engine_prefix_checkpoints))]
+#[cfg(not(any(engine_prefix_checkpoints, engine_counter_geometry)))]
 fn profile_cell<I, F>(label: &str, expected: &[Pair], repetitions: usize, mut make: F)
 where
     I: Iterator<Item = Pair>,
@@ -745,7 +779,7 @@ where
     allocation_probe::Snapshot::now().report_since(&before, label, repetitions);
 }
 
-#[cfg(not(engine_prefix_checkpoints))]
+#[cfg(not(any(engine_prefix_checkpoints, engine_counter_geometry)))]
 fn main() {
     let component_count = parse_arg(1, 32);
     let ring_size = parse_arg(2, 64);
@@ -911,6 +945,111 @@ fn main() {
         || mixed_pull(&archive, &fixture),
         |limit| mixed_prefix(&archive, &fixture, limit),
     );
+}
+
+#[cfg(engine_counter_geometry)]
+fn counter_geometry_lowering() -> triblespace::core::query::residual::ResidualLowering {
+    #[cfg(engine_current_residual)]
+    {
+        triblespace::core::query::residual::ResidualLowering::HYBRID
+    }
+    #[cfg(engine_current_whole_production)]
+    {
+        triblespace::core::query::residual::ResidualLowering::new(
+            triblespace::core::query::residual::FormulaScope::WholeRoot,
+            triblespace::core::query::residual::ProgramScope::Production,
+        )
+    }
+    #[cfg(engine_current_full)]
+    {
+        triblespace::core::query::residual::ResidualLowering::FULL
+    }
+}
+
+#[cfg(engine_counter_geometry)]
+fn counter_geometry_cell<I, F>(label: &str, expected: &[Pair], mut query: I, snapshot: F)
+where
+    I: Iterator<Item = Pair>,
+    F: Fn(&I) -> (usize, String),
+{
+    let actual: Vec<_> = query.by_ref().collect();
+    let signature = tally(actual.iter().copied());
+    let (current_width, stats) = snapshot(&query);
+    exact_check(actual, expected, label, "counter geometry");
+    println!(
+        "counter_geometry cell={label:?} rows={} checksum={:#018x} \
+         current_width={current_width} stats={stats}",
+        signature.rows, signature.checksum,
+    );
+}
+
+#[cfg(engine_counter_geometry)]
+fn main() {
+    let component_count = parse_arg(1, 32);
+    let ring_size = parse_arg(2, 64);
+    let fanout = parse_arg(3, 2);
+    let fixture = Fixture::new(component_count, ring_size, fanout);
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
+
+    let finite_expected = fixture.finite_union_oracle();
+    let nested_expected = fixture.nested_formula_oracle();
+    let rpq_expected = fixture.cyclic_rpq_oracle();
+    let mixed_expected = fixture.mixed_formula_rpq_oracle();
+    let lowering = counter_geometry_lowering();
+
+    println!("diagnostic: exact untimed counter geometry");
+    println!("engine: {ENGINE}");
+    println!("revision: {REVISION}");
+    println!("lowering: {lowering:?}");
+    println!(
+        "fixture: {component_count} components x {ring_size} nodes, fanout {fanout}, \
+         {} tribles",
+        fixture.graph.len(),
+    );
+
+    counter_geometry_cell(
+        "finite OR-of-AND / TribleSet",
+        &finite_expected,
+        finite_union_query!(&fixture.graph, &fixture).solve_residual_state_lazy_with(lowering),
+        |query| (query.current_width(), format!("{:?}", query.stats())),
+    );
+    counter_geometry_cell(
+        "finite OR-of-AND / SuccinctArchive",
+        &finite_expected,
+        finite_union_query!(&archive, &fixture).solve_residual_state_lazy_with(lowering),
+        |query| (query.current_width(), format!("{:?}", query.stats())),
+    );
+    counter_geometry_cell(
+        "recursive AND/OR / TribleSet",
+        &nested_expected,
+        nested_formula_query!(&fixture.graph, &fixture).solve_residual_state_lazy_with(lowering),
+        |query| (query.current_width(), format!("{:?}", query.stats())),
+    );
+    counter_geometry_cell(
+        "recursive AND/OR / SuccinctArchive",
+        &nested_expected,
+        nested_formula_query!(&archive, &fixture).solve_residual_state_lazy_with(lowering),
+        |query| (query.current_width(), format!("{:?}", query.stats())),
+    );
+    counter_geometry_cell(
+        "cyclic RPQ / TribleSet",
+        &rpq_expected,
+        cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(lowering),
+        |query| (query.current_width(), format!("{:?}", query.stats())),
+    );
+    counter_geometry_cell(
+        "formula + cyclic RPQ / TribleSet sibling",
+        &mixed_expected,
+        mixed_formula_rpq_query!(&fixture.graph, &fixture).solve_residual_state_lazy_with(lowering),
+        |query| (query.current_width(), format!("{:?}", query.stats())),
+    );
+    counter_geometry_cell(
+        "formula + cyclic RPQ / SuccinctArchive sibling",
+        &mixed_expected,
+        mixed_formula_rpq_query!(&archive, &fixture).solve_residual_state_lazy_with(lowering),
+        |query| (query.current_width(), format!("{:?}", query.stats())),
+    );
+    println!("oracle parity: all seven counter-geometry cells exact");
 }
 
 #[cfg(engine_prefix_checkpoints)]
