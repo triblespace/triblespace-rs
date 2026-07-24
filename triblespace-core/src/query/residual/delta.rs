@@ -2633,7 +2633,7 @@ fn append_one_parent_page(output: &mut CandidatePayload, values: Vec<RawInline>)
 
 /// Exact affine continuation owned by one reducer activation.
 ///
-/// Stable formula PC IDs intentionally live here rather than in [`DeltaDesc`]:
+/// Stable formula cursors intentionally live here rather than in [`DeltaDesc`]:
 /// two activations may expand the same RPQ product kernel while returning to
 /// different arena-interned ancestor states and payload-frame stacks.
 #[derive(Clone)]
@@ -2649,7 +2649,7 @@ enum DeltaReturn {
     },
     Formula {
         bound: VariableSet,
-        counter: FormulaPcId,
+        cursor: FormulaCursor,
         batch: FormulaBatch,
     },
     FormulaOrAdmit {
@@ -2660,7 +2660,7 @@ enum DeltaReturn {
     FormulaOrEmit {
         bound: VariableSet,
         batch: FormulaBatch,
-        counter: FormulaPcId,
+        cursor: FormulaCursor,
     },
     /// Minimal full-bound row retained by a physical PositiveSupport child.
     ///
@@ -8268,7 +8268,7 @@ impl DeltaScheduler {
         request: ProgramRequest,
         route: ProgramRoute,
         bound: VariableSet,
-        counter: FormulaPcId,
+        cursor: FormulaCursor,
         stage: FormulaStage,
         batch: FormulaBatch,
         stream_proposal: bool,
@@ -8295,7 +8295,7 @@ impl DeltaScheduler {
                 reducer,
                 DeltaReturn::Formula {
                     bound,
-                    counter,
+                    cursor,
                     batch,
                 },
                 None,
@@ -8680,7 +8680,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         bound: VariableSet,
-        counter: FormulaPcId,
+        cursor: FormulaCursor,
         stage: FormulaStage,
         batch: FormulaBatch,
         seeds: Vec<ResidualDeltaSeed>,
@@ -8712,7 +8712,7 @@ impl DeltaScheduler {
                 reducer,
                 DeltaReturn::Formula {
                     bound,
-                    counter,
+                    cursor,
                     batch,
                 },
                 seeds[range].iter().map(|seed| seed.output),
@@ -8779,7 +8779,7 @@ impl DeltaScheduler {
         &mut self,
         desc: DeltaDesc,
         bound: VariableSet,
-        counter: FormulaPcId,
+        cursor: FormulaCursor,
         stage: FormulaStage,
         batch: FormulaBatch,
         stream_proposal: bool,
@@ -8810,7 +8810,7 @@ impl DeltaScheduler {
                 reducer,
                 DeltaReturn::Formula {
                     bound,
-                    counter,
+                    cursor,
                     batch,
                 },
                 source_candidates,
@@ -8993,7 +8993,7 @@ impl DeltaScheduler {
                         queue.push_front(FormulaReducerSeed::Emit(FormulaOrEmissionSeed {
                             bound: seed.bound,
                             batch,
-                            counter: seed.counter,
+                            cursor: seed.cursor,
                         }));
                     }
                 }
@@ -9012,7 +9012,7 @@ impl DeltaScheduler {
                             finish_formula_or_emission(
                                 plan,
                                 seed.bound,
-                                seed.counter,
+                                seed.cursor,
                                 seed.batch,
                                 result,
                                 stable,
@@ -9035,7 +9035,7 @@ impl DeltaScheduler {
                         DeltaReturn::FormulaOrEmit {
                             bound: seed.bound,
                             batch: seed.batch,
-                            counter: seed.counter,
+                            cursor: seed.cursor,
                         },
                         None,
                         None,
@@ -9197,13 +9197,13 @@ impl DeltaScheduler {
             (
                 DeltaReturn::Formula {
                     bound,
-                    counter,
+                    cursor,
                     batch,
                 },
                 DeltaCompletion::Candidates(result),
             ) => {
                 if matches!(
-                    &stable_interner.formula(counter).focus,
+                    &stable_interner.formula(cursor).focus,
                     FormulaFocus::Action {
                         stage: FormulaStage::Propose,
                         ..
@@ -9216,7 +9216,7 @@ impl DeltaScheduler {
                 let continuation = finish_formula_action_result(
                     plan,
                     bound,
-                    counter,
+                    cursor,
                     batch,
                     result,
                     stable,
@@ -9257,7 +9257,7 @@ impl DeltaScheduler {
                 DeltaReturn::FormulaOrEmit {
                     bound,
                     batch,
-                    counter,
+                    cursor,
                 },
                 DeltaCompletion::Candidates(result),
             ) => {
@@ -9265,7 +9265,7 @@ impl DeltaScheduler {
                 let continuation = finish_formula_or_emission(
                     plan,
                     bound,
-                    counter,
+                    cursor,
                     batch,
                     result,
                     stable,
@@ -9463,12 +9463,12 @@ impl DeltaScheduler {
             ),
             DeltaReturn::Formula {
                 bound,
-                counter,
+                cursor,
                 batch,
             } => finish_formula_action_result(
                 plan,
                 bound,
-                counter,
+                cursor,
                 batch,
                 candidates,
                 stable,
@@ -9508,25 +9508,27 @@ impl DeltaScheduler {
     ) -> FormulaReducerDrain {
         let DeltaReturn::Formula {
             bound,
-            counter,
+            cursor,
             batch,
         } = return_to
         else {
             panic!("delta support returned to a candidate continuation")
         };
         assert!(matches!(
-            &stable_interner.formula(counter).focus,
+            &stable_interner.formula(cursor).focus,
             FormulaFocus::Action {
                 stage: FormulaStage::Support,
                 ..
             }
         ));
-        let completed = stable_interner
-            .formula_pcs
-            .complete(&plan.finite_formula, counter);
+        let completed = cursor.with_pc(
+            stable_interner
+                .formula_pcs
+                .complete(&plan.finite_formula, cursor.pc),
+        );
         let desc = StateDesc {
             bound,
-            phase: ResidualPhase::Formula { counter },
+            phase: ResidualPhase::Formula { cursor },
         };
         let mut reducer_seeds = Vec::new();
         let continuation = propagate_formula_support(
@@ -12469,6 +12471,13 @@ mod tests {
     };
 
     use super::*;
+
+    fn test_formula_cursor(pc: u32) -> FormulaCursor {
+        FormulaCursor {
+            pc: FormulaPcId(pc),
+            resume: FormulaResumeId(0),
+        }
+    }
 
     #[test]
     fn retargeted_activations_preserve_map_semantics_across_storage_shapes() {
@@ -17666,7 +17675,7 @@ mod tests {
                 input: CandidatePayload::Values(vec![value(2), value(2), value(1), value(3)]),
                 // The test deliberately stops before EOF; this exact saved
                 // PC must remain opaque to every intermediate page.
-                continuation: FormulaReducerContinuation::Complete(FormulaPcId(u32::MAX)),
+                continuation: FormulaReducerContinuation::Complete(test_formula_cursor(u32::MAX)),
             })],
             &plan,
             &mut stable,
@@ -17753,7 +17762,7 @@ mod tests {
                 batch: formula_or_reducer_batch(&[7, 3, 1, 6, 2, 5, 4, 8]),
                 // Seven values are emitted by the tested 1 -> 2 -> 4 pages,
                 // so EOF never observes this deliberately opaque PC.
-                counter: FormulaPcId(u32::MAX),
+                cursor: test_formula_cursor(u32::MAX),
             })],
             &plan,
             &mut stable,
@@ -18058,14 +18067,14 @@ mod tests {
             0,
             UnionVerb::Propose { relevant },
         );
-        let action = stable_interner.formula_pcs.select_child_with(
+        let action = parent.with_pc(stable_interner.formula_pcs.select_child_with(
             &plan.finite_formula,
-            parent,
+            parent.pc,
             0,
             FormulaReturnKind::Child,
             FormulaStage::Propose,
             true,
-        );
+        ));
         let batch = FormulaBatch::from_proposal(
             RowBatch::seed(),
             vec![super::super::ActivationId(11)],
@@ -18075,7 +18084,7 @@ mod tests {
             DeltaReducer::quiescent_proposal(),
             DeltaReturn::Formula {
                 bound: VariableSet::new_empty(),
-                counter: action,
+                cursor: action,
                 batch,
             },
             [output(7, 0, true)],
@@ -18165,14 +18174,14 @@ mod tests {
             0,
             UnionVerb::Propose { relevant },
         );
-        let action = stable_interner.formula_pcs.select_child_with(
+        let action = parent.with_pc(stable_interner.formula_pcs.select_child_with(
             &plan.finite_formula,
-            parent,
+            parent.pc,
             0,
             FormulaReturnKind::Child,
             FormulaStage::Propose,
             true,
-        );
+        ));
         assert_eq!(children.len(), 1);
 
         let seeded = scheduler.seed_formula_reducers(
@@ -18242,14 +18251,14 @@ mod tests {
             // Force the empty AND arm's Support action. A true witness selects
             // that arm, whose complete Confirm frame immediately contributes
             // the immutable root candidate to a fresh OR admission reducer.
-            let support_action = stable_interner.formula_pcs.select_child_with(
+            let support_action = parent.with_pc(stable_interner.formula_pcs.select_child_with(
                 &plan.finite_formula,
-                parent,
+                parent.pc,
                 0,
                 FormulaReturnKind::Guard,
                 FormulaStage::Support,
                 true,
-            );
+            ));
             let batch = FormulaBatch::from_confirmation(
                 CandidateBatch {
                     parents: RowBatch::seed(),
@@ -18281,7 +18290,7 @@ mod tests {
                 DeltaReducer::Support { published: false },
                 DeltaReturn::Formula {
                     bound: VariableSet::new_empty(),
-                    counter: support_action,
+                    cursor: support_action,
                     batch,
                 },
                 None,
@@ -19682,7 +19691,7 @@ mod tests {
                     .unwrap()
                     .return_to = DeltaReturn::Formula {
                     bound: VariableSet::new_empty(),
-                    counter: FormulaPcId(0),
+                    cursor: test_formula_cursor(0),
                     batch: formula_or_reducer_batch(&[]),
                 };
             },
@@ -21036,13 +21045,16 @@ mod tests {
             panic!("the streaming fixture requires a linear AND root")
         };
         assert_eq!(children.len(), 2);
-        let counter = stable_interner
-            .formula_pcs
-            .skip_child(&plan.finite_formula, counter, 1);
-        let counter =
-            stable_interner
-                .formula_pcs
-                .select_child_as_action(&plan.finite_formula, counter, 0);
+        let counter = counter.with_pc(stable_interner.formula_pcs.skip_child(
+            &plan.finite_formula,
+            counter.pc,
+            1,
+        ));
+        let counter = counter.with_pc(stable_interner.formula_pcs.select_child_as_action(
+            &plan.finite_formula,
+            counter.pc,
+            0,
+        ));
         assert_eq!(
             plan.interned_formula_proposal_streamability(
                 &stable_interner.formula_pcs,
@@ -21054,7 +21066,7 @@ mod tests {
         );
         DeltaReturn::Formula {
             bound: VariableSet::new_empty(),
-            counter,
+            cursor: counter,
             batch: FormulaBatch::from_proposal(
                 RowBatch {
                     rows: Vec::new(),
@@ -21069,7 +21081,7 @@ mod tests {
     fn support_formula_return() -> DeltaReturn {
         DeltaReturn::Formula {
             bound: VariableSet::new_empty(),
-            counter: FormulaPcId(7),
+            cursor: test_formula_cursor(7),
             batch: FormulaBatch::from_proposal(
                 RowBatch {
                     rows: Vec::new(),
@@ -21455,7 +21467,7 @@ mod tests {
             },
             DeltaReturn::Formula {
                 bound: VariableSet::new_empty(),
-                counter: FormulaPcId(0),
+                cursor: test_formula_cursor(0),
                 batch: formula_batch,
             },
             None,
@@ -22891,7 +22903,7 @@ mod tests {
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Formula {
                     bound: VariableSet::new_empty(),
-                    counter: FormulaPcId(0),
+                    cursor: test_formula_cursor(0),
                     batch,
                 },
                 [output(7, 0, true)],
@@ -22931,7 +22943,7 @@ mod tests {
             },
             DeltaReturn::Formula {
                 bound: VariableSet::new_empty(),
-                counter: FormulaPcId(0),
+                cursor: test_formula_cursor(0),
                 batch: empty_batch,
             },
             std::iter::empty::<ResidualDeltaOutput>(),
@@ -25222,7 +25234,7 @@ mod tests {
 
     #[test]
     fn cloning_live_formula_activation_remaps_credit_and_preserves_return_payload() {
-        let counter = FormulaPcId(7);
+        let cursor = test_formula_cursor(7);
         let bound = VariableSet::new_singleton(0);
         let batch = FormulaBatch::from_proposal(
             RowBatch {
@@ -25239,7 +25251,7 @@ mod tests {
             DeltaReducer::quiescent_proposal(),
             DeltaReturn::Formula {
                 bound,
-                counter,
+                cursor,
                 batch,
             },
             [output(7, 0, true)],
@@ -25269,14 +25281,14 @@ mod tests {
             );
             let DeltaReturn::Formula {
                 bound: returned_bound,
-                counter: returned_counter,
+                cursor: returned_cursor,
                 batch: returned_batch,
             } = completed.return_to
             else {
                 panic!("formula activation returned to a stable continuation")
             };
             assert_eq!(returned_bound, bound);
-            assert_eq!(returned_counter, counter);
+            assert_eq!(returned_cursor, cursor);
             assert_eq!(returned_batch.parents.rows, [value(9)]);
             assert_eq!(returned_batch.parents.row_count, 1);
         }
@@ -25301,7 +25313,7 @@ mod tests {
             finish_registry_proposal(registry, proof)
         }
 
-        let counter = FormulaPcId(7);
+        let cursor = test_formula_cursor(7);
         let bound = VariableSet::new_singleton(0);
         let batch = FormulaBatch::from_proposal(
             RowBatch {
@@ -25318,7 +25330,7 @@ mod tests {
             DeltaReducer::quiescent_proposal(),
             DeltaReturn::Formula {
                 bound,
-                counter,
+                cursor,
                 batch,
             },
             None,
@@ -25361,14 +25373,14 @@ mod tests {
             );
             let DeltaReturn::Formula {
                 bound: returned_bound,
-                counter: returned_counter,
+                cursor: returned_cursor,
                 batch: returned_batch,
             } = completed.return_to
             else {
                 panic!("formula source returned to a stable continuation")
             };
             assert_eq!(returned_bound, bound);
-            assert_eq!(returned_counter, counter);
+            assert_eq!(returned_cursor, cursor);
             assert_eq!(returned_batch.parents.rows, [value(9)]);
             assert_eq!(returned_batch.parents.row_count, 1);
         }
@@ -25393,7 +25405,6 @@ mod tests {
             FormulaPcRecord {
                 focus: focus.clone(),
                 return_to: None,
-                resume,
             },
             1,
         );
@@ -25405,7 +25416,6 @@ mod tests {
                     done: ChildSet::empty(2).with_inserted(0),
                 },
                 return_to: None,
-                resume,
             },
             1,
         );
@@ -25418,7 +25428,6 @@ mod tests {
             FormulaPcRecord {
                 focus,
                 return_to: Some(return_to),
-                resume,
             },
             3,
         );
@@ -25426,7 +25435,9 @@ mod tests {
 
         let mut scheduler = DeltaScheduler::new();
         let desc = DeltaDesc::formula(0, 3, FormulaNodeId(7));
-        for (index, counter) in [first, second].into_iter().enumerate() {
+        let first = FormulaCursor { pc: first, resume };
+        let second = FormulaCursor { pc: second, resume };
+        for (index, cursor) in [first, second].into_iter().enumerate() {
             let batch = FormulaBatch::from_proposal(
                 RowBatch {
                     rows: vec![value(index as u8)],
@@ -25441,7 +25452,7 @@ mod tests {
                 DeltaReducer::quiescent_proposal(),
                 DeltaReturn::Formula {
                     bound: VariableSet::new_singleton(0),
-                    counter,
+                    cursor,
                     batch,
                 },
                 [output(index as u8, 0, false)],
@@ -25466,7 +25477,7 @@ mod tests {
         assert_eq!(scheduler.worklist.len(), 1);
         let bucket = scheduler.worklist.values().next().unwrap();
         assert_eq!(bucket.len(), 2);
-        let counters: Vec<_> = bucket
+        let cursors: Vec<_> = bucket
             .iter()
             .map(|task| {
                 let activation = scheduler
@@ -25475,12 +25486,12 @@ mod tests {
                     .activations
                     .get(&task.activation)
                     .unwrap();
-                let DeltaReturn::Formula { counter, .. } = &activation.return_to else {
+                let DeltaReturn::Formula { cursor, .. } = &activation.return_to else {
                     panic!("formula task lost its formula continuation")
                 };
-                *counter
+                *cursor
             })
             .collect();
-        assert_eq!(counters, [first, second]);
+        assert_eq!(cursors, [first, second]);
     }
 }
