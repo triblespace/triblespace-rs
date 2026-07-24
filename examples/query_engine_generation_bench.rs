@@ -820,6 +820,47 @@ fn main() {
     );
     println!("oracle parity: all seven query/backend cells exact");
 
+    #[cfg(all(engine_deferred_carrier_probe, engine_current_full))]
+    if let Ok(cell) = std::env::var("ENGINE_CARRIER_ACCOUNTING_CELL") {
+        use triblespace::core::query::residual::{
+            FormulaScope, ProgramScope, ResidualLowering, ResidualStateSolve,
+        };
+
+        let controls = [
+            ("full", ResidualLowering::FULL),
+            (
+                "program-disabled",
+                ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+            ),
+        ];
+        for (control, lowering) in controls {
+            for repetition in 0..repetitions {
+                let solved: ResidualStateSolve<Pair> = match cell.as_str() {
+                    "formula-trible" => nested_formula_query!(&fixture.graph, &fixture)
+                        .solve_residual_state_lazy_with(lowering)
+                        .collect_profiled(),
+                    "mixed-trible" => mixed_formula_rpq_query!(&fixture.graph, &fixture)
+                        .solve_residual_state_lazy_with(lowering)
+                        .collect_profiled(),
+                    _ => panic!("unknown ENGINE_CARRIER_ACCOUNTING_CELL {cell:?}"),
+                };
+                let expected = match cell.as_str() {
+                    "formula-trible" => &nested_expected,
+                    "mixed-trible" => &mixed_expected,
+                    _ => unreachable!(),
+                };
+                let result_rows = solved.results.len();
+                exact_check(solved.results, expected, &cell, control);
+                println!(
+                    "carrier_accounting cell={cell:?} control={control:?} \
+                     repetition={repetition} rows={result_rows} stats={:?}",
+                    solved.stats
+                );
+            }
+        }
+        return;
+    }
+
     if let Ok(cell) = std::env::var("ENGINE_PROFILE_CELL") {
         match cell.as_str() {
             "finite-trible" => profile_cell(&cell, &finite_expected, repetitions, || {

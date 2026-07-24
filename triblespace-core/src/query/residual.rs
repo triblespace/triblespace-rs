@@ -2417,18 +2417,114 @@ pub struct ResidualStateStats {
     pub ready_proposal_groups: usize,
     /// Coalesced quoted-entry carrier chunks popped before Formula
     /// materialization. This is planning control, not a protocol action.
-    #[cfg(test)]
+    #[cfg(any(test, engine_deferred_carrier_probe))]
     pub formula_outer_entry_pops: usize,
     /// Concrete first-child groups materialized from popped quoted carriers.
-    #[cfg(test)]
+    #[cfg(any(test, engine_deferred_carrier_probe))]
     pub formula_ready_quote_groups: usize,
     /// Root Formula Plan filings elided by quoted carrier pops.
-    #[cfg(test)]
+    #[cfg(any(test, engine_deferred_carrier_probe))]
     pub formula_ready_quote_root_plan_filings_elided: usize,
     /// Child-estimate row values computed by recursive root-AND quotes across
     /// every variable considered by Ready.
-    #[cfg(test)]
+    #[cfg(any(test, engine_deferred_carrier_probe))]
     pub formula_ready_quote_estimate_rows: usize,
+    /// Probe-only count of newly allocated `Vec<FormulaReadyChoice>` values.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_vec_creations: usize,
+    /// Probe-only subset of choice-vector creations with non-zero capacity.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_vec_nonzero_capacity_creations: usize,
+    /// Probe-only sum of lengths of newly created choice vectors.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_vec_elements: usize,
+    /// Probe-only sum of capacities of newly created choice vectors.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_vec_capacity: usize,
+    /// Probe-only newly created choice vectors whose values are all equal.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_vec_uniform_batches: usize,
+    /// Probe-only newly created choice vectors containing distinct values.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_vec_heterogeneous_batches: usize,
+    /// Probe-only choice vectors created while selecting a variable subgroup.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_selection_vec_creations: usize,
+    /// Probe-only scheduling tail cuts attempted on quoted carriers.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_tail_calls: usize,
+    /// Probe-only partial scheduling tail cuts that allocate a new choice Vec.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_tail_allocations: usize,
+    /// Probe-only choice rows moved into allocating scheduling tail cuts.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_tail_rows: usize,
+    /// Probe-only choice capacity returned by allocating scheduling tail cuts.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_tail_capacity: usize,
+    /// Probe-only quoted-carrier splits performed for Rayon.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_parallel_splits: usize,
+    /// Probe-only calls appending one quoted choice Vec to another.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_append_calls: usize,
+    /// Probe-only choice rows supplied by quoted carrier appends.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_append_rows: usize,
+    /// Probe-only appends whose exact pre-capacity required growth.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_append_reallocations_predicted: usize,
+    /// Probe-only appends whose observed left-hand capacity changed.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_append_capacity_changes: usize,
+    /// Probe-only total observed left-hand capacity growth across appends.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_choice_append_capacity_growth: usize,
+    /// Probe-only quoted carrier filings into the canonical worklist.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_filings: usize,
+    /// Probe-only parent rows carried by quoted carrier filings.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_filing_rows: usize,
+    /// Probe-only quoted carrier filings whose row-local choices are equal.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_uniform_filings: usize,
+    /// Probe-only quoted carrier filings containing distinct choices.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_heterogeneous_filings: usize,
+    /// Probe-only choice capacity retained by uniform carrier filings.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_uniform_choice_capacity: usize,
+    /// Probe-only choice capacity retained by heterogeneous carrier filings.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_heterogeneous_choice_capacity: usize,
+    /// Probe-only quoted carrier filings that merged into a live bucket.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_merge_filings: usize,
+    /// Probe-only parent rows supplied by quoted carrier merge filings.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_merge_rows: usize,
+    /// Probe-only merges of two uniform carriers carrying the same choice.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_equal_uniform_merges: usize,
+    /// Probe-only carrier merges whose resulting choice batch is heterogeneous.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_heterogeneous_result_merges: usize,
+    /// Probe-only quoted carrier chunks materialized into Formula.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_pops: usize,
+    /// Probe-only parent rows materialized by quoted carrier pops.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_pop_rows: usize,
+    /// Probe-only popped carriers whose choices are all equal.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_uniform_pops: usize,
+    /// Probe-only popped carriers containing distinct choices.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_heterogeneous_pops: usize,
+    /// Probe-only choice capacity retained until carrier pop.
+    #[cfg(engine_deferred_carrier_probe)]
+    pub formula_ready_carrier_pop_choice_capacity: usize,
     /// Candidate-state chunks that planned row-local confirmation actions (or
     /// committed a fully checked candidate frontier) without invoking a
     /// constraint verb.
@@ -4497,6 +4593,30 @@ impl FormulaReadyChoice {
     }
 }
 
+#[cfg(engine_deferred_carrier_probe)]
+fn formula_ready_choices_are_uniform(choices: &[FormulaReadyChoice]) -> bool {
+    choices
+        .first()
+        .is_none_or(|first| choices.iter().all(|choice| choice == first))
+}
+
+#[cfg(engine_deferred_carrier_probe)]
+fn record_formula_ready_choice_vec(
+    stats: &mut ResidualStateStats,
+    choices: &[FormulaReadyChoice],
+    capacity: usize,
+) {
+    stats.formula_ready_choice_vec_creations += 1;
+    stats.formula_ready_choice_vec_nonzero_capacity_creations += usize::from(capacity != 0);
+    stats.formula_ready_choice_vec_elements += choices.len();
+    stats.formula_ready_choice_vec_capacity += capacity;
+    if formula_ready_choices_are_uniform(choices) {
+        stats.formula_ready_choice_vec_uniform_batches += 1;
+    } else {
+        stats.formula_ready_choice_vec_heterogeneous_batches += 1;
+    }
+}
+
 /// Affine quoted-entry payload. Choices are carried beside rows until the
 /// canonical outer Formula state has had a chance to merge independent Ready
 /// histories; every structural operation preserves positional alignment.
@@ -4521,16 +4641,22 @@ impl QuotedRowBatch {
         choices: &[FormulaReadyChoice],
         stride: usize,
         indices: &[usize],
+        stats: &mut ResidualStateStats,
     ) -> Self {
         assert_eq!(
             rows.row_count,
             choices.len(),
             "quoted Formula choices must align with source rows"
         );
-        Self::new(
-            rows.selected(stride, indices),
-            indices.iter().map(|&row| choices[row]).collect(),
-        )
+        let selected_choices: Vec<_> = indices.iter().map(|&row| choices[row]).collect();
+        #[cfg(engine_deferred_carrier_probe)]
+        {
+            stats.formula_ready_choice_selection_vec_creations += 1;
+            record_formula_ready_choice_vec(stats, &selected_choices, selected_choices.capacity());
+        }
+        #[cfg(not(engine_deferred_carrier_probe))]
+        let _ = stats;
+        Self::new(rows.selected(stride, indices), selected_choices)
     }
 
     fn append(&mut self, mut other: Self) {
@@ -7179,6 +7305,28 @@ impl StateBucket {
     }
 }
 
+#[cfg(engine_deferred_carrier_probe)]
+fn record_formula_ready_choice_tail(
+    stats: &mut ResidualStateStats,
+    source_choice_len: usize,
+    tail: &StateBucket,
+    parallel: bool,
+) {
+    stats.formula_ready_choice_tail_calls += 1;
+    let StateBucket::QuotedRows(tail) = tail else {
+        unreachable!("quoted choice tail changed payload kind")
+    };
+    if tail.choices.len() == source_choice_len {
+        // Whole-bucket moves use `mem::take` and do not allocate a new Vec.
+        return;
+    }
+    stats.formula_ready_choice_tail_allocations += 1;
+    stats.formula_ready_choice_tail_rows += tail.choices.len();
+    stats.formula_ready_choice_tail_capacity += tail.choices.capacity();
+    stats.formula_ready_choice_parallel_splits += usize::from(parallel);
+    record_formula_ready_choice_vec(stats, &tail.choices, tail.choices.capacity());
+}
+
 /// Exact protocol verb selected by one concrete residual action state.
 ///
 /// The leaf is a compiled action occurrence, not a constraint address. Outer
@@ -7523,6 +7671,18 @@ fn file_with_span(
     if rows == 0 {
         return None;
     }
+    #[cfg(engine_deferred_carrier_probe)]
+    if let StateBucket::QuotedRows(batch) = &bucket {
+        stats.formula_ready_carrier_filings += 1;
+        stats.formula_ready_carrier_filing_rows += rows;
+        if formula_ready_choices_are_uniform(&batch.choices) {
+            stats.formula_ready_carrier_uniform_filings += 1;
+            stats.formula_ready_carrier_uniform_choice_capacity += batch.choices.capacity();
+        } else {
+            stats.formula_ready_carrier_heterogeneous_filings += 1;
+            stats.formula_ready_carrier_heterogeneous_choice_capacity += batch.choices.capacity();
+        }
+    }
     let candidates = match &bucket {
         StateBucket::Rows(_) | StateBucket::QuotedRows(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
@@ -7534,7 +7694,53 @@ fn file_with_span(
     if let Some(existing) = level.get_mut(&id) {
         stats.bucket_merges += 1;
         stats.rows_merged += rows;
+        #[cfg(engine_deferred_carrier_probe)]
+        let quoted_merge = match (&*existing, &bucket) {
+            (StateBucket::QuotedRows(left), StateBucket::QuotedRows(right)) => Some((
+                left.choices.len(),
+                left.choices.capacity(),
+                formula_ready_choices_are_uniform(&left.choices),
+                left.choices.first().copied(),
+                right.choices.len(),
+                formula_ready_choices_are_uniform(&right.choices),
+                right.choices.first().copied(),
+            )),
+            _ => None,
+        };
+        #[cfg(engine_deferred_carrier_probe)]
+        if let Some((
+            left_len,
+            left_capacity,
+            left_uniform,
+            left_first,
+            right_len,
+            right_uniform,
+            right_first,
+        )) = quoted_merge
+        {
+            stats.formula_ready_carrier_merge_filings += 1;
+            stats.formula_ready_carrier_merge_rows += rows;
+            stats.formula_ready_choice_append_calls += 1;
+            stats.formula_ready_choice_append_rows += right_len;
+            stats.formula_ready_choice_append_reallocations_predicted +=
+                usize::from(left_len.saturating_add(right_len) > left_capacity);
+            stats.formula_ready_carrier_equal_uniform_merges +=
+                usize::from(left_uniform && right_uniform && left_first == right_first);
+        }
         existing.append(bucket);
+        #[cfg(engine_deferred_carrier_probe)]
+        if let Some((_, left_capacity, ..)) = quoted_merge {
+            let StateBucket::QuotedRows(merged) = &*existing else {
+                unreachable!("quoted carrier merge changed payload kind")
+            };
+            let merged_capacity = merged.choices.capacity();
+            stats.formula_ready_choice_append_capacity_changes +=
+                usize::from(merged_capacity != left_capacity);
+            stats.formula_ready_choice_append_capacity_growth +=
+                merged_capacity.saturating_sub(left_capacity);
+            stats.formula_ready_carrier_heterogeneous_result_merges +=
+                usize::from(!formula_ready_choices_are_uniform(&merged.choices));
+        }
     } else {
         if known {
             stats.state_reentries += 1;
@@ -7613,7 +7819,7 @@ fn quote_formula_ready_and<'a>(
 ) -> Option<Vec<FormulaReadyChoice>> {
     assert!(plan.certified_denotation);
     assert_eq!(aggregate.len(), view.len());
-    #[cfg(not(test))]
+    #[cfg(not(any(test, engine_deferred_carrier_probe)))]
     let _ = stats;
     if root.proposal_coverage(variable, bound) < ProposalCoverage::Covering {
         // Preserve V3.1 Ready eligibility before considering stronger typed
@@ -7672,7 +7878,7 @@ fn quote_formula_ready_and<'a>(
             );
             column.resize(view.len(), usize::MAX);
         }
-        #[cfg(test)]
+        #[cfg(any(test, engine_deferred_carrier_probe))]
         {
             stats.formula_ready_quote_estimate_rows += view.len();
         }
@@ -7704,6 +7910,8 @@ fn quote_formula_ready_and<'a>(
             .all(|&choice| choice != FormulaReadyChoice::UNSELECTED),
         "an ordinary covering root-AND source was not a legal Formula source"
     );
+    #[cfg(engine_deferred_carrier_probe)]
+    record_formula_ready_choice_vec(stats, &choices, choices.capacity());
     Some(choices)
 }
 
@@ -8112,8 +8320,13 @@ fn ready_quoted_plan_transition<'a>(
     let mut continuation = None;
     for (variable_plan, indices) in groups {
         let variable = plans[variable_plan].variable;
-        let selected =
-            QuotedRowBatch::selected(&rows, &plans[variable_plan].choices, vars.len(), &indices);
+        let selected = QuotedRowBatch::selected(
+            &rows,
+            &plans[variable_plan].choices,
+            vars.len(),
+            &indices,
+            stats,
+        );
         prefer_continuation(
             &mut continuation,
             file_with_plan(
@@ -8173,6 +8386,18 @@ fn quoted_formula_propose_transition<'a>(
     );
     assert_eq!(batch.rows.row_count, batch.choices.len());
 
+    #[cfg(engine_deferred_carrier_probe)]
+    {
+        stats.formula_ready_carrier_pops += 1;
+        stats.formula_ready_carrier_pop_rows += batch.rows.row_count;
+        stats.formula_ready_carrier_pop_choice_capacity += batch.choices.capacity();
+        if formula_ready_choices_are_uniform(&batch.choices) {
+            stats.formula_ready_carrier_uniform_pops += 1;
+        } else {
+            stats.formula_ready_carrier_heterogeneous_pops += 1;
+        }
+    }
+
     let first_choice = *batch
         .choices
         .first()
@@ -8187,7 +8412,7 @@ fn quoted_formula_propose_transition<'a>(
         uniform_choice &= choice == first_choice;
         any_exact |= choice.exact();
     }
-    #[cfg(test)]
+    #[cfg(any(test, engine_deferred_carrier_probe))]
     {
         stats.formula_outer_entry_pops += 1;
         stats.formula_ready_quote_root_plan_filings_elided += 1;
@@ -8229,7 +8454,7 @@ fn quoted_formula_propose_transition<'a>(
         );
         groups
     });
-    #[cfg(test)]
+    #[cfg(any(test, engine_deferred_carrier_probe))]
     {
         stats.formula_ready_quote_groups += groups.as_ref().map_or(1, BTreeMap::len);
     }
@@ -10852,7 +11077,17 @@ impl ResidualStateMachine {
         let candidate_pages =
             plan.is_some_and(|plan| desc.uses_candidate_pages(plan, &self.interner.formula_pcs));
         let before = bucket.occupancy(candidate_pages);
+        #[cfg(engine_deferred_carrier_probe)]
+        let quoted_choice_len = if let StateBucket::QuotedRows(batch) = &bucket {
+            Some(batch.choices.len())
+        } else {
+            None
+        };
         let chunk = bucket.take_tail(desc.bound.count(), width, candidate_pages);
+        #[cfg(engine_deferred_carrier_probe)]
+        if let Some(source_choice_len) = quoted_choice_len {
+            record_formula_ready_choice_tail(&mut self.stats, source_choice_len, &chunk, false);
+        }
         let remainder = bucket.occupancy(candidate_pages);
         if remainder != 0 {
             assert!(is_full, "only a full pop may leave a remainder");
@@ -10942,7 +11177,17 @@ impl ResidualStateMachine {
             before >= cohort_occupancy,
             "canonical bucket lost part of its newly filed continuation cohort"
         );
+        #[cfg(engine_deferred_carrier_probe)]
+        let quoted_choice_len = if let StateBucket::QuotedRows(batch) = &bucket {
+            Some(batch.choices.len())
+        } else {
+            None
+        };
         let chunk = bucket.take_tail(desc.bound.count(), take, candidate_pages);
+        #[cfg(engine_deferred_carrier_probe)]
+        if let Some(source_choice_len) = quoted_choice_len {
+            record_formula_ready_choice_tail(&mut self.stats, source_choice_len, &chunk, false);
+        }
         let remainder = bucket.occupancy(candidate_pages);
         if remainder != 0 {
             self.stats.partial_pops += 1;
@@ -12947,12 +13192,36 @@ impl ResidualStateMachine {
             if let Some((rank, id, candidate_pages)) = splittable {
                 let desc = self.interner.get(id);
                 let stride = desc.bound.count();
-                let right_bucket = self
-                    .worklist
-                    .get_mut(&rank)
-                    .and_then(|level| level.get_mut(&id))
-                    .and_then(|bucket| bucket.split_for_parallel(stride, candidate_pages))
-                    .expect("selected residual payload is splittable");
+                let (right_bucket, quoted_choice_len) = {
+                    let bucket = self
+                        .worklist
+                        .get_mut(&rank)
+                        .and_then(|level| level.get_mut(&id))
+                        .expect("selected residual payload exists");
+                    #[cfg(engine_deferred_carrier_probe)]
+                    let quoted_choice_len = if let StateBucket::QuotedRows(batch) = &*bucket {
+                        Some(batch.choices.len())
+                    } else {
+                        None
+                    };
+                    #[cfg(not(engine_deferred_carrier_probe))]
+                    let quoted_choice_len: Option<usize> = None;
+                    let right_bucket = bucket
+                        .split_for_parallel(stride, candidate_pages)
+                        .expect("selected residual payload is splittable");
+                    (right_bucket, quoted_choice_len)
+                };
+                #[cfg(engine_deferred_carrier_probe)]
+                if let Some(source_choice_len) = quoted_choice_len {
+                    record_formula_ready_choice_tail(
+                        &mut self.stats,
+                        source_choice_len,
+                        &right_bucket,
+                        true,
+                    );
+                }
+                #[cfg(not(engine_deferred_carrier_probe))]
+                let _ = quoted_choice_len;
 
                 let mut right = self.parallel_sibling();
                 assert!(
@@ -19845,6 +20114,32 @@ mod tests {
         assert_eq!(stats.formula_outer_entry_pops, 1);
         assert_eq!(stats.formula_ready_quote_groups, 2);
         assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 1);
+        #[cfg(engine_deferred_carrier_probe)]
+        {
+            assert_eq!(stats.formula_ready_choice_vec_creations, 2);
+            assert_eq!(stats.formula_ready_choice_vec_nonzero_capacity_creations, 2);
+            assert_eq!(stats.formula_ready_choice_vec_elements, 2);
+            assert_eq!(stats.formula_ready_choice_vec_uniform_batches, 2);
+            assert_eq!(stats.formula_ready_choice_vec_heterogeneous_batches, 0);
+            assert_eq!(stats.formula_ready_choice_selection_vec_creations, 0);
+            assert_eq!(stats.formula_ready_choice_tail_calls, 0);
+            assert_eq!(stats.formula_ready_carrier_filings, 2);
+            assert_eq!(stats.formula_ready_carrier_filing_rows, 2);
+            assert_eq!(stats.formula_ready_carrier_uniform_filings, 2);
+            assert_eq!(stats.formula_ready_carrier_heterogeneous_filings, 0);
+            assert_eq!(stats.formula_ready_carrier_merge_filings, 1);
+            assert_eq!(stats.formula_ready_carrier_merge_rows, 1);
+            assert_eq!(stats.formula_ready_choice_append_calls, 1);
+            assert_eq!(stats.formula_ready_choice_append_rows, 1);
+            assert_eq!(stats.formula_ready_choice_append_reallocations_predicted, 1);
+            assert_eq!(stats.formula_ready_choice_append_capacity_changes, 1);
+            assert_eq!(stats.formula_ready_carrier_equal_uniform_merges, 0);
+            assert_eq!(stats.formula_ready_carrier_heterogeneous_result_merges, 1);
+            assert_eq!(stats.formula_ready_carrier_pops, 1);
+            assert_eq!(stats.formula_ready_carrier_pop_rows, 2);
+            assert_eq!(stats.formula_ready_carrier_uniform_pops, 0);
+            assert_eq!(stats.formula_ready_carrier_heterogeneous_pops, 1);
+        }
 
         let mut entered = Vec::new();
         let mut activation_ids = std::collections::BTreeSet::new();
