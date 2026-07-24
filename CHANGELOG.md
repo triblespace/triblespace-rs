@@ -29,11 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child-minimum estimate law; OR remains a quote barrier. Plain Ready keys,
   variable plans, canonical state descriptors, state buckets, and release
   telemetry retain their V3.1 layouts.
-- **The cross-generation query benchmark can select whole-root residual
-  lowering explicitly.** `engine_current_full` measures the same fixture and
-  oracle cells as the legacy, scalar, and ordinary-query adapters, while
-  prefix diagnostics now report the lowering policy actually selected by the
-  measured adapter.
+- **The cross-generation query benchmark names each current residual policy
+  consistently.** `engine_current_residual` follows the ordinary
+  `WHOLE_ROOT_PRODUCTION` default in normal, prefix, and untimed counter
+  diagnostics; `engine_current_hybrid` selects the explicit fused-Formula
+  control; and `engine_current_full` selects maximal `WholeRoot + All`
+  lowering. The opt-in `engine_counter_geometry` mode reports exact scheduler
+  counters for the same seven oracle-gated cells without collecting timings.
 - **Finite-Formula structural control is interned independently from its
   canonical outer Candidate exit.** Residual Formula state now carries an
   exact `(program-counter, candidate-exit)` cursor. The exit records only the

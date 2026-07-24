@@ -446,8 +446,8 @@ fn parallel_forced_routing_places_physically_and_stays_set_identical() {
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
     // The public parallel residual entry preserves the query's selected
-    // lowering (HYBRID for a fresh query), so production-qualified typed
-    // Programs stay reachable.
+    // lowering (WHOLE_ROOT_PRODUCTION for a fresh query), so
+    // production-qualified typed Programs stay reachable.
     let mut results: Vec<(Id, Id)> = query.into_par_residual_state_iter().collect();
 
     results.sort();
