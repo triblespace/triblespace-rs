@@ -2323,12 +2323,10 @@ impl RegularPathConstraint {
                     }
                     if target_accepting
                         && node.source.is_none_or(|anchor| value == anchor)
-                        && !accepted.contains(&value)
+                        && accepted.insert(value)
+                        && accepted.len() > budget.raw_occurrences
                     {
-                        if accepted.len() == budget.raw_occurrences {
-                            return false;
-                        }
-                        accepted.insert(value);
+                        return false;
                     }
                     pending.push_back(child);
                     true
