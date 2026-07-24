@@ -12,8 +12,8 @@ use triblespace::core::inline::RawInline;
 use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace::core::query::residual::ResidualStateStats;
 use triblespace::core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, Query, RowsView, TriblePattern,
-    VariableContext, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, RowsView,
+    TriblePattern, VariableContext, VariableId, VariableSet,
 };
 use triblespace::core::trible::{Trible, TribleSet};
 use triblespace::prelude::*;
@@ -24,6 +24,10 @@ struct Atomic<C>(C);
 impl<'a, C: Constraint<'a>> Constraint<'a> for Atomic<C> {
     fn variables(&self) -> VariableSet {
         self.0.variables()
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        self.0.proposal_coverage(variable, bound)
     }
 
     fn estimate(
@@ -113,9 +117,8 @@ fn project(binding: &Binding, p: VariableId, x: VariableId) -> Option<(RawInline
 
 #[derive(Clone, Copy)]
 enum Mode {
-    Sequential,
-    ResidualAtomic,
-    ResidualPaged,
+    Atomic,
+    Paged,
 }
 
 fn run<S: TriblePattern>(store: &S, fixture: Fixture, mode: Mode, first: bool) -> (usize, u64) {
@@ -137,45 +140,30 @@ fn run<S: TriblePattern>(store: &S, fixture: Fixture, mode: Mode, first: bool) -
     };
 
     match mode {
-        Mode::ResidualAtomic => {
+        Mode::Atomic => {
             let root = IntersectionConstraint::new(vec![
                 Atomic(store.pattern(p, attrs[0], x)),
                 Atomic(store.pattern(p, attrs[1], x)),
                 Atomic(store.pattern(p, attrs[2], x)),
             ]);
-            let mut iter = Query::new(root, move |binding| project(binding, p.index, x.index))
-                .solve_residual_state_lazy();
+            let mut iter = Query::new(root, move |binding| project(binding, p.index, x.index));
             if first {
                 tally(&mut iter.take(1))
             } else {
                 tally(&mut iter)
             }
         }
-        Mode::Sequential | Mode::ResidualPaged => {
+        Mode::Paged => {
             let root = IntersectionConstraint::new(vec![
                 store.pattern(p, attrs[0], x),
                 store.pattern(p, attrs[1], x),
                 store.pattern(p, attrs[2], x),
             ]);
-            let query = Query::new(root, move |binding| project(binding, p.index, x.index));
-            match mode {
-                Mode::Sequential => {
-                    let mut iter = query.sequential();
-                    if first {
-                        tally(&mut iter.take(1))
-                    } else {
-                        tally(&mut iter)
-                    }
-                }
-                Mode::ResidualPaged => {
-                    let mut iter = query.solve_residual_state_lazy();
-                    if first {
-                        tally(&mut iter.take(1))
-                    } else {
-                        tally(&mut iter)
-                    }
-                }
-                Mode::ResidualAtomic => unreachable!(),
+            let mut iter = Query::new(root, move |binding| project(binding, p.index, x.index));
+            if first {
+                tally(&mut iter.take(1))
+            } else {
+                tally(&mut iter)
             }
         }
     }
@@ -219,11 +207,7 @@ fn bench_backend<S: TriblePattern>(
     expected: usize,
     reps: usize,
 ) {
-    let modes = [
-        ("seq", Mode::Sequential),
-        ("res-atomic", Mode::ResidualAtomic),
-        ("res-paged", Mode::ResidualPaged),
-    ];
+    let modes = [("atomic", Mode::Atomic), ("paged", Mode::Paged)];
     for &(_, mode) in &modes {
         std::hint::black_box(run(store, fixture, mode, true));
         std::hint::black_box(run(store, fixture, mode, false));

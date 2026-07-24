@@ -49,11 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child-minimum estimate law; OR remains a quote barrier. Plain Ready keys,
   variable plans, canonical state descriptors, state buckets, and release
   telemetry retain their V3.1 layouts.
-- **The cross-generation query benchmark can select whole-root residual
-  lowering explicitly.** `engine_current_full` measures the same fixture and
-  oracle cells as the legacy, scalar, and default HYBRID adapters, while
-  prefix diagnostics now report the lowering policy actually selected by the
-  measured adapter.
 - **Finite-Formula structural control is interned independently from its
   canonical outer Candidate exit.** Residual Formula state now carries an
   exact `(program-counter, candidate-exit)` cursor. The exit records only the
@@ -128,10 +123,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scheduling behavior.
 - **Typed Program activation retirement scans its arena at most once per
   cohort.** A fully drained arena retires immediately; singleton receipts keep
-  their allocation-free scalar scan, while wider live arenas build activation
-  membership once. Every checked path validates owners before deleting novelty
-  in original receipt order, removing the activation-count multiplier without
-  taxing insert/take.
+  their allocation-free one-entry scan, while wider live arenas build
+  activation membership once. Every checked path validates owners before
+  deleting novelty in original receipt order, removing the activation-count
+  multiplier without taxing insert/take.
 - **Canonical Succinct archive paging is production-qualified.** Propose,
   Confirm, and Support routes participate in ordinary hybrid lowering, keeping
   their typed paging and physical-backend seam available without requiring
@@ -204,11 +199,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse before each stable handoff; later pages cannot replay an equal
   value for the same parent, while independent parent activations remain
   independent.
-- **Sequential and residual proposal actions now enter the search as SETs.**
-  The scalar cursor reverse-stably removes duplicate proposed values before
-  DFS, while residual actions admit `(parent, value)` pairs at their stable
-  boundary. Tail-pop order and equal values under distinct parents remain
-  intact, while proposal telemetry continues to report raw occurrence counts.
+- **Proposal actions now enter the search as SETs.** One-row actions
+  reverse-stably remove duplicate proposed values, while wider actions admit
+  `(parent, value)` pairs at their stable boundary. Tail-pop order and equal
+  values under distinct parents remain intact, while proposal telemetry
+  continues to report raw occurrence counts.
 - **Breaking: query heads now have relational SET semantics.** `find!` emits
   each distinct ordered tuple of raw projected inline values once, collapsing
   assignments that differ only in hidden witnesses. The empty head therefore
@@ -266,8 +261,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Source-less relational queries now fail at construction.** A surviving,
   non-full seed must expose a covering proposal source for at least one
-  variable, so sequential and residual execution reject filter-only roots at
-  the same construction boundary. Seeds already proven false remain valid
+  variable, so every residual width rejects filter-only roots at the same
+  construction boundary. Seeds already proven false remain valid
   empty queries, and peer-dependent sources such as Equality remain eligible
   after another constraint binds their peer.
 
@@ -300,17 +295,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-variable bag-equivalence law. Equal ordering keys now use an explicit
   lower-variable-ID tie break instead of inheriting unstable-sort behavior.
   Within an intersection, equal child estimates likewise choose the lower
-  child occurrence consistently across sequential and residual execution.
+  child occurrence consistently across residual widths.
 
 ### Removed
 
-- **Breaking: the unpublished bound-variable-set scheduler family is gone.**
+- **Breaking: the unpublished query-engine families are gone.**
   `Query` now has one block-native production engine: the canonical residual
   state machine, with adaptive ordinary iteration and an explicit saturated
   residual/Rayon control. The `solve_blocked`, `solve_dag*`,
   `lazy_dag_scheduler`, and `into_par_dag_iter` APIs, their worklist types,
-  gates, statistics, probes, and dedicated benchmarks were removed outright.
-  `Query::sequential()` remains the scalar block-of-one semantic control.
+  gates, statistics, probes, and dedicated benchmarks were removed outright,
+  together with the scalar DFS selector and runtime. Historical engine
+  comparisons remain reproducible from frozen Git revisions rather than a
+  compatibility matrix in the current tree.
+- **Obsolete query-engine tuning fixtures are gone.** The source-identical
+  cross-generation benchmark and the experimental backoff-policy matrix were
+  deleted instead of being kept compiling against adapters that no longer
+  exist. Current probes compare meaningful lowering, geometry, constraint, or
+  backend choices within the single residual runtime.
 - **The unpublished estimate-free constructed-Program planner is gone.**
   Residual queries now always keep the ordinary adaptive Ready/Candidate
   negotiation and select typed Program routes only after that semantic action
@@ -456,19 +458,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cold cohorts and nonterminal leases remain unchanged; output does not widen
   search `S`, and projected demand `q` is still charged only after a successful
   public projection.
-- **The cross-generation query benchmark can diagnose live prefix costs.**
-  Its opt-in checkpoint mode separates cumulative time-to-N, fresh-query
-  time-to-N, and drop-at-N cancellation cost at 1/10/63/64/65/100/1,000 rows,
-  while preserving exact full-result oracle gates and reporting untimed prefix
-  order evidence plus FULL-residual scheduler snapshots.
-- **A source-identical benchmark compares query-engine generations.**
-  `query_engine_generation_bench` runs finite unions, recursive AND/OR,
-  cyclic regular paths, and mixed formula/path queries against independent
-  relational oracles on both TribleSet and SuccinctArchive. Compile-time
-  terminal adapters select the historical Binding/Vec DFS, today's scalar
-  block-of-one DFS, or the residual state scheduler while keeping fixtures
-  and query expressions byte-identical; the probe reports construction,
-  pull-to-first, geometric prefix, and full-drain throughput separately.
 - **Finite RPQ helper joins enter private seeded residual frames.** Closure-free
   forward, existential, and same-variable fallback joins now import captured
   endpoint values as a canonical one-row seed instead of starting a nested
@@ -491,7 +480,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Built-in constraints gain an executable residual capability matrix.**
   Constants, equality, inclusive ranges, sorted slices, hash-set and hash-map
   membership, finite unions, diagnostic wrappers, and repeated pattern
-  variables now have exact relational SET parity across the scalar oracle,
+  variables now have exact relational SET parity across the independent oracle,
   conservative and full residual lowering, fixed width one, geometric growth,
   and a cloned live remainder. Static capability assertions and runtime
   counters distinguish native paging/formula execution from the semantically
@@ -515,7 +504,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delta identity remains structural while the scheduler physically partitions
   source activations by bound-row schema, candidate mode, and cursor family.
   One block-native hook receives a same-schema row batch with ragged per-parent
-  limits and tagged outputs; its scalar default preserves existing constraints.
+  limits and tagged outputs; its one-row default preserves existing constraints.
   Page limits share the current global geometric budget instead of multiplying
   it by cohort size.
 - **Residual transition pages expose one block-native cohort seam.** Live
@@ -628,13 +617,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cohorts use these retained views to prove every fresh positive branch fits
   the geometric page budget before emitting, eliminating the former count
   descent followed by a second enumeration descent.
-- **Residual lowering has nine canonical, scheduler-independent forms.**
+- **Residual lowering has nine canonical, execution-independent forms.**
   `ResidualLowering` crosses the `FormulaScope` chain (`OpaqueLeaves`,
   `UnionLeaves`, `WholeRoot`) with the independent `ProgramScope` chain
   (`Disabled`, `Production`, `All`);
-  whole-root lowering structurally absorbs union-leaf lowering. Scheduler
-  setters no longer rewrite lowering, and `Query::residual_lowering` selects it
-  independently. Whole-root scope keeps variable selection and the commit
+  whole-root lowering structurally absorbs union-leaf lowering.
+  `Query::residual_lowering` selects the structural form independently of
+  geometric width. Whole-root scope keeps variable selection and the commit
   barrier outside a canonical AND/OR program, flattens only the maximal exposed
   root conjunction, and preserves opaque scope and group-reducer boundaries.
   Root-AND confirmations retain candidate-occurrence paging once no selected
@@ -662,8 +651,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   begins. `ActionOutcome::Aborted` records action unwinds, and a serially
   exhausted wrapper remains closed when later converted to Rayon.
 - **Ordinary `Query` owns a canonical residual-state cursor.**
-  `residual_state_scheduler` explicitly selects the arbitrary-root residual
-  machine and keeps borrow-free raw state behind `Query::next`. Mid-iteration
+  The arbitrary-root residual machine keeps borrow-free raw state behind
+  `Query::next`. Mid-iteration
   clones snapshot candidate remainders and staged raw rows without requiring
   `R: Clone`; a partially consumed residual query converts to Rayon as one
   exact unsplittable remainder leaf. Fresh ordinary Rayon conversion divides
@@ -848,7 +837,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grades remain exact under adaptive child order, OR guard reconvergence,
   delta suspension, query cloning, and independent Rayon shard execution.
 - **One-parent residual candidate payloads stay tagless.** Ordinary and lowered
-  formula actions now receive the scalar `Values` candidate sink whenever one
+  formula actions now receive the plain `Values` candidate sink whenever one
   affine parent is live, while reconverged multi-parent work promotes to the
   existing tagged COO representation. Splits, partitions, compaction, and
   delta handoffs normalize back to values at singleton boundaries without
@@ -985,7 +974,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `triblespace-gpu::WgpuSuccinctArchive` keep all six Jerky wavelet matrices
   resident and execute whole-frontier confirmation ranks in WGPU while the
   canonical archive, planner, prefix navigation, proposals, estimates, and
-  scalar queries stay on CPU. An 8,192-rank default admission threshold,
+  small query actions stay on CPU. An 8,192-rank default admission threshold,
   per-wrapper fallback/fragmentation counters, a CPU fake-backend gate, and a
   native Metal parity gate keep this hybrid explicit. The deterministic
   `residual_reconverge_bench` compares canonical CPU, wrapper CPU, forced WGPU,
@@ -1008,10 +997,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merges retain the original cursor path.
 - **The public `Constraint` protocol is now block-native.** Every verb receives
   a borrowed `RowsView` of sibling partial bindings; `EstimateSink` and
-  `CandidateSink` provide scalar/plain-value representations for the explicit
-  sequential scheduler and per-row/tagged representations for frontier
-  execution. The sequential engine is therefore the block-of-one case rather
-  than a separate constraint API. Custom constraints must obey four soundness
+  `CandidateSink` provide compact plain-value representations for one-row
+  actions and per-row/tagged representations for wider frontier execution.
+  Custom constraints must obey four soundness
   laws: `propose` receives and owns an empty sink, `confirm` only filters, and
   `satisfied` is exact whenever all relevant variables are bound. The latter
   includes constant, zero-variable constraints and lets unions reject dead arms
@@ -1023,26 +1011,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unions, regular paths, and custom wrappers all exercise the same residual
   substrate; exact seed rejection starts no worklist. This is a full semantic
   coverage switch, not a claim that residual control overhead pays back for
-  every shape. `residual_state_scheduler` and `sequential` remain explicit
-  controls, and structural lowering remains an independent choice.
+  every shape. Structural lowering remains an explicit independent choice.
   Demand-adaptive chunk width starts with depth-first, first-result-oriented
   execution and grows into readiness-gated batch harvesting. Residual planning
   cohorts explicit `(variable, proposer occurrence)` actions and never
   reassigns a row's choice, because that action owns candidate support and
   first-seen order.
-  `Query::sequential()` explicitly selects the scalar block-of-one DFS
-  specialization, while ordinary fresh Rayon iteration partitions the adaptive
-  affine residual frontier into at most one shard per worker. A partially
+  Ordinary fresh Rayon iteration partitions the adaptive affine residual
+  frontier into at most one shard per worker. A partially
   consumed ordinary residual query still drains its exact remainder as one
   Rayon leaf. The constraint protocol states the row-homomorphism law that
   makes chunking and sharding semantics-neutral.
   Fully-bound rows stay raw until the consumer pulls them: the worklist never
   stores projected `R`s, preserving `Query` auto traits and allowing exact
   mid-iteration clones without `R: Clone`.
-  Fully drained schedulers preserve the same distinct raw projected-row set,
-  but result order may differ. Probe solvers require a never-pulled `Query`;
-  freshness is tracked explicitly so exhausted zero-variable queries cannot be
-  mistaken for untouched ones.
+  Fully drained geometry and lowering variants preserve the same distinct raw
+  projected-row set, but result order may differ. Probe solvers require a
+  never-pulled `Query`; freshness is tracked explicitly so exhausted
+  zero-variable queries cannot be mistaken for untouched ones.
 - **`Pile::restore()` is now `Pile::amputate()` — the destructive
   truncation stops wearing a comforting name.** The operation TRUNCATES
   the pile file at the first invalid record, destroying everything after

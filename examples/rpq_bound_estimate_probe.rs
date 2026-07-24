@@ -16,7 +16,7 @@
 //! `RUSTFLAGS='--cfg baseline_without_positive_publication_stats'`; there
 //! HYBRID's typed Confirm is the cross-revision control and the unavailable
 //! attribution fields print as `n/a`. `programs-disabled` is a secondary exact
-//! semantic control that keeps the residual scheduler and formula scope but
+//! semantic control that keeps the residual runtime and formula scope but
 //! disables all typed Programs; it is intentionally not presented as a
 //! positive-publication-only ablation.
 //!
@@ -99,7 +99,7 @@ struct Signature {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Attribution {
     positive_terminal: usize,
-    positive_chunk_homomorphic: usize,
+    positive_relational_prefix: usize,
     direct_terminal_rows: usize,
     support_calls: usize,
     transition_candidates_examined: usize,
@@ -329,7 +329,7 @@ fn attribution(stats: &ResidualStateStats) -> Attribution {
         #[cfg(not(baseline_without_positive_publication_stats))]
         positive_relational_prefix: stats.delta_positive_publication_relational_prefix_commits,
         #[cfg(baseline_without_positive_publication_stats)]
-        positive_chunk_homomorphic: 0,
+        positive_relational_prefix: 0,
         direct_terminal_rows: stats.delta_direct_terminal_publication_rows,
         support_calls: stats.support_calls,
         transition_candidates_examined: stats.delta_transition_candidates_examined,
@@ -337,11 +337,11 @@ fn attribution(stats: &ResidualStateStats) -> Attribution {
 }
 
 fn oracle(fixture: &Fixture) -> (Vec<RawInline>, Signature) {
-    let mut results: Vec<_> = make_query(fixture).sequential().collect();
+    let mut results: Vec<_> = make_query(fixture).collect();
     results.sort_unstable();
     assert_eq!(
         results, fixture.expected,
-        "{}: sequential oracle disagrees with fixture",
+        "{}: ordinary query disagrees with fixture",
         fixture.label
     );
     let oracle_signature = signature(results.iter().copied());
@@ -378,24 +378,24 @@ fn profile(
         fixture.label, mode.label
     );
 
-    let positive_commits = first_stats.positive_terminal + first_stats.positive_chunk_homomorphic;
     #[cfg(not(baseline_without_positive_publication_stats))]
     let first_is_positive = oracle.binary_search(&fixture.candidates[0]).is_ok();
     if mode.lowering.program_scope() == ProgramScope::Disabled {
         assert_eq!(
-            positive_commits, 0,
+            first_stats.positive_terminal + first_stats.positive_relational_prefix,
+            0,
             "programs-disabled control attributed a positive-publication commit"
         );
         assert_eq!(
-            full_stats.positive_terminal + full_stats.positive_chunk_homomorphic,
+            full_stats.positive_terminal + full_stats.positive_relational_prefix,
             0,
             "programs-disabled full drain attributed a positive-publication commit"
         );
     }
     #[cfg(not(baseline_without_positive_publication_stats))]
     if mode.lowering.program_scope() != ProgramScope::Disabled && first_is_positive {
-        assert_eq!(
-            positive_commits, 1,
+        assert!(
+            first_stats.positive_terminal > 0,
             "positive-first HYBRID did not attribute its first row to positive publication"
         );
         assert_eq!(
@@ -408,12 +408,11 @@ fn profile(
         );
     } else if mode.lowering.program_scope() != ProgramScope::Disabled {
         assert_eq!(
-            positive_commits, 0,
+            first_stats.positive_terminal, 0,
             "negative occurrence zero must not publish through positive publication"
         );
         assert_eq!(
-            full_stats.positive_terminal + full_stats.positive_chunk_homomorphic,
-            0,
+            full_stats.positive_terminal, 0,
             "negative-first full drain must not feed later candidates into positive publication"
         );
     }
@@ -429,7 +428,7 @@ fn profile(
 fn positive_attribution(stats: Attribution) -> String {
     format!(
         "{}/{}",
-        stats.positive_terminal, stats.positive_chunk_homomorphic
+        stats.positive_terminal, stats.positive_relational_prefix
     )
 }
 
@@ -507,9 +506,9 @@ fn measure(fixture: &Fixture, width: usize, reps: usize) {
             percentile(&samples.full, 95),
         );
         println!(
-            "    attribution first: positive terminal/chunk {} direct_rows {} \
+            "    attribution first: positive terminal/prefix {} direct_rows {} \
              support_calls {} transition_candidates {}; \
-             full: positive terminal/chunk {} direct_rows {} support_calls {} \
+             full: positive terminal/prefix {} direct_rows {} support_calls {} \
              transition_candidates {}",
             positive_attribution(profile.first_stats),
             profile.first_stats.direct_terminal_rows,

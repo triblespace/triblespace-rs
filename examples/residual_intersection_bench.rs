@@ -116,9 +116,8 @@ fn tally<T: std::hash::Hash>(items: impl IntoIterator<Item = T>) -> (usize, u64)
 
 #[derive(Clone, Copy)]
 enum Mode {
-    Sequential,
-    Residual,
-    ResidualLazy,
+    Adaptive,
+    Saturated,
 }
 
 fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
@@ -127,9 +126,8 @@ fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
         pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
     );
     match mode {
-        Mode::Sequential => tally(query.sequential()),
-        Mode::Residual => tally(query.solve_residual_state()),
-        Mode::ResidualLazy => tally(query.solve_residual_state_lazy()),
+        Mode::Adaptive => tally(query),
+        Mode::Saturated => tally(query.solve_residual_state()),
     }
 }
 
@@ -164,9 +162,8 @@ fn run_nested_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
         )
     );
     match mode {
-        Mode::Sequential => tally(query.sequential()),
-        Mode::Residual => tally(query.solve_residual_state()),
-        Mode::ResidualLazy => tally(query.solve_residual_state_lazy()),
+        Mode::Adaptive => tally(query),
+        Mode::Saturated => tally(query.solve_residual_state()),
     }
 }
 
@@ -185,22 +182,14 @@ fn run_nested_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), Resi
     (tally(solve.results), solve.stats)
 }
 
-#[derive(Clone, Copy)]
-enum FirstMode {
-    Sequential,
-    ResidualEager,
-    ResidualLazy,
-}
-
-fn run_first<S: TriblePattern>(kb: &S, mode: FirstMode) -> (usize, u64) {
+fn run_first<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
     let query = find!(
         (p: Inline<_>, x: Inline<_>),
         pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
     );
     match mode {
-        FirstMode::Sequential => tally(query.sequential().take(1)),
-        FirstMode::ResidualEager => tally(query.solve_residual_state().into_iter().take(1)),
-        FirstMode::ResidualLazy => tally(query.solve_residual_state_lazy().take(1)),
+        Mode::Adaptive => tally(query.take(1)),
+        Mode::Saturated => tally(query.solve_residual_state().into_iter().take(1)),
     }
 }
 
@@ -216,11 +205,7 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 fn bench_first_result<S: TriblePattern>(label: &str, kb: &S, reps: usize) {
-    let modes = [
-        ("seq", FirstMode::Sequential),
-        ("res-eager", FirstMode::ResidualEager),
-        ("res-lazy", FirstMode::ResidualLazy),
-    ];
+    let modes = [("adaptive", Mode::Adaptive), ("saturated", Mode::Saturated)];
     for &(_, mode) in &modes {
         std::hint::black_box(run_first(kb, mode));
     }
@@ -238,7 +223,7 @@ fn bench_first_result<S: TriblePattern>(label: &str, kb: &S, reps: usize) {
 
     println!("  first result ({label}):");
     for (mode_index, &(name, _)) in modes.iter().enumerate() {
-        // Search order is intentionally scheduler-dependent, so only the
+        // Search order is intentionally geometry-dependent, so only the
         // existence of one prefix row is shared here. Full-drain signatures
         // below remain the exact semantic parity gate.
         assert_eq!(
@@ -250,11 +235,7 @@ fn bench_first_result<S: TriblePattern>(label: &str, kb: &S, reps: usize) {
 }
 
 fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
-    let modes = [
-        ("seq", Mode::Sequential),
-        ("residual", Mode::Residual),
-        ("res-lazy", Mode::ResidualLazy),
-    ];
+    let modes = [("adaptive", Mode::Adaptive), ("saturated", Mode::Saturated)];
 
     // Untimed full drains pay any one-time setup before the measurements.
     for &(_, mode) in &modes {
@@ -295,14 +276,14 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
     let (signature, stats) = run_residual_profiled(kb);
     assert_eq!(
         signature.0, expected,
-        "profiled residual row-count mismatch"
+        "profiled saturated row-count mismatch"
     );
     assert_eq!(
         signature, reference,
-        "profiled residual result signature mismatch"
+        "profiled saturated result signature mismatch"
     );
     println!(
-        "  profile: states {} + hits {}, pops {}, bucket merges {} ({} rows); \
+        "  saturated profile: states {} + hits {}, pops {}, bucket merges {} ({} rows); \
          propose {} calls/{} rows/max {}, confirm {} calls/{} rows/max {}",
         stats.states_interned,
         stats.interner_hits,
@@ -320,10 +301,10 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
     let (lazy_signature, lazy_stats) = run_lazy_residual_profiled(kb);
     assert_eq!(
         lazy_signature, reference,
-        "profiled lazy residual result signature mismatch"
+        "profiled adaptive result signature mismatch"
     );
     println!(
-        "  lazy profile: states {} + hits {}, pops {} (full {} / readiness {} / partial {}), \
+        "  adaptive profile: states {} + hits {}, pops {} (full {} / readiness {} / partial {}), \
          live merges {} ({} rows), reentries {} ({} rows); propose {} calls/{} rows/max {}, \
          confirm {} calls/{} rows/max {}",
         lazy_stats.states_interned,
@@ -346,11 +327,7 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
 }
 
 fn bench_nested_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
-    let modes = [
-        ("seq", Mode::Sequential),
-        ("residual", Mode::Residual),
-        ("res-lazy", Mode::ResidualLazy),
-    ];
+    let modes = [("adaptive", Mode::Adaptive), ("saturated", Mode::Saturated)];
     for &(_, mode) in &modes {
         std::hint::black_box(run_nested_query(kb, mode));
     }

@@ -9,13 +9,11 @@ adapt to the values already found instead of being fixed before evaluation.
 
 The current protocol is **block-native**. Its unit of work is not necessarily
 one partial binding, but a block of partial bindings that have the same set of
-bound variables. Every live ordinary iterator uses the canonical
-residual-state worklist.
-[`Query::sequential`](triblespace::core::query::Query::sequential) remains an
-explicit scalar control and speaks the same protocol with blocks of one row.
-This shared interface is the important part of the design: a constraint has
-one implementation whether its probes are issued one at a time, fused into a
-CPU loop, or dispatched to a batch-oriented accelerator.
+bound variables. Every live ordinary iterator uses one canonical
+residual-state machine. Narrow states naturally call the same protocol with a
+single row; reconverged states can call it with larger row blocks. A constraint
+therefore has one implementation whether its probes are issued one at a time,
+fused into a CPU loop, or dispatched to a batch-oriented accelerator.
 
 ## Bindings as row blocks
 
@@ -37,7 +35,7 @@ order is not part of the protocol: constraints locate a variable with
 seed block, represented as one virtual zero-width row. Consequently the empty
 binding is an ordinary input to the protocol rather than a special engine case.
 
-When the engine asks for candidates for another variable, the blocked form of
+When the engine asks for candidates for another variable, the tagged form of
 [`CandidateSink`](triblespace::core::query::CandidateSink) stores a ragged
 matrix as `(row, value)` pairs:
 
@@ -49,8 +47,8 @@ Here row 0 has two extensions, row 1 dies, and row 2 has one. Pairs remain
 grouped by row. A one-row caller instead uses the plain-values sink, where the
 row index is statically zero and no tag is stored. Estimates follow the same
 pattern through [`EstimateSink`](triblespace::core::query::EstimateSink): a
-blocked caller receives one estimate per row, while the sequential caller
-writes one scalar estimate directly into its cursor state.
+multi-row action receives one estimate per row, while a one-row action can use
+the compact scalar representation.
 
 ## The constraint protocol
 
@@ -126,7 +124,8 @@ eligibility comes from `proposal_coverage`.
 Constraints are otherwise stateless. Each method receives the current
 `RowsView`; the engine does not notify constraints when it backtracks, chunks a
 frontier, or processes work in a different order. This is what allows the same
-constraint tree to run under every scheduler.
+constraint tree to run at every residual width and on either serial or parallel
+executors.
 
 ## One expansion step
 
@@ -146,25 +145,12 @@ An expansion still performs the familiar Atreides negotiation:
 5. Extend the parent rows with the surviving `(row, value)` pairs. Rows without
    candidates disappear.
 
-There is still no standalone join plan. The difference from the original
-engine is that several sibling searches can negotiate and probe together.
+There is no standalone join plan or second depth-first engine. Width one is the
+low-latency edge of this same execution model: one-row actions use plain-value
+sinks without allocating row tags, and a surviving continuation remains hot so
+the machine can descend before harvesting wider sibling cohorts.
 
-## Sequential scheduler: a block of one
-
-[`Query::sequential`](triblespace::core::query::Query::sequential) selects the
-original depth-first behavior. It keeps a stack of bound variables and a
-parallel row of values, plus a variable-to-column index for constant-time
-lookup. At each depth it refreshes influenced estimates, chooses one variable,
-calls `propose` with a one-row `RowsView` and a plain-values sink, then tries the
-returned values one by one. Exhausting a proposal vector pops the cursor and
-backtracks. Completing the cursor invokes the result conversion closure.
-
-Thus the sequential path does not emulate batching by allocating tagged rows:
-it is the zero-overhead scalar representation of the same protocol. It remains
-valuable for low first-result latency, tiny candidate sets, and workloads where
-there is no useful frontier to fuse.
-
-## Canonical residual-state engine
+## Canonical residual-state machine
 
 The residual engine keys a bucket by its **remaining computation**, not merely
 by the bindings or the route that produced it. Its conservative explicit
@@ -180,9 +166,9 @@ orthogonal three-level policy: `Disabled` admits no typed Programs,
 `Production` admits production-qualified routes, and `All` also admits
 explicit routes. A structurally absent route may still use older transition
 hooks. A route deferred by policy instead uses the stable ordinary
-`Constraint` action; it never falls through to a legacy pager or strengthens
+`Constraint` action; it never falls through to an older pager or strengthens
 an ordinary proposal receipt. The formula and Program scope chains therefore
-form nine scheduler-independent lowering combinations.
+form nine structural lowering combinations.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:
@@ -256,7 +242,7 @@ block-native cohort seam. The batch carries row-aligned nodes, affine cursors,
 and ragged limits whose sum is the current global width; successors return with
 input-node tags. A constraint may page some rows while leaving other `Start`
 rows to the existing eager block expansion, so one negated fallback does not
-erase bounded positive work. The default lowers the cohort to scalar page
+erase bounded positive work. The default lowers the cohort to one-node page
 calls, while storage or accelerator constraints can fuse it without changing
 canonical state or producer-credit semantics.
 
@@ -296,11 +282,11 @@ the same already-located Ring walk. A resident WGPU two-bound proposal is a
 distinct preferred production family; a structurally declined action falls
 back to the canonical production Succinct route.
 
-[`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
-selects the residual cursor for any root while preserving the query's chosen
-lowering (`HYBRID` by default; `Query::residual_lowering` may change it).
-`solve_residual_state_lazy` is the separate conservative-lowering capability
-control and exposes its width policy;
+Ordinary [`Query`](triblespace::core::query::Query) iteration owns the residual
+cursor for every root and uses `HYBRID` lowering by default;
+`Query::residual_lowering` may change that structural choice before the first
+pull. `solve_residual_state_lazy` is a separate conservative-lowering probe
+entry point that exposes width controls;
 `solve_residual_state` is the eager saturated form, and
 `solve_residual_state_profiled` reports state, merge, action, and batch
 measurements. Fully drained variants preserve the distinct raw projected-row
@@ -311,12 +297,11 @@ partially consumed query can snapshot its exact remainder without requiring
 
 ## Terminal projection and SET identity
 
-Every semantic action admits a SET before publishing successors. Sequential
-and residual proposal actions remove duplicate values for each affine parent,
-and residual sources and transitions perform the same admission at their
-stable boundary. Internal probes may still carry occurrence bags before that
-boundary, but every complete raw binding is therefore unique when it reaches
-projection.
+Every semantic action admits a SET before publishing successors. Proposal
+actions remove duplicate values for each affine parent, and residual sources
+and transitions perform the same admission at their stable boundary. Internal
+probes may still carry occurrence bags before that boundary, but every complete
+raw binding is therefore unique when it reaches projection.
 
 For a strict `find!` head, projection is not injective: complete bindings that
 differ only in hidden witnesses can have the same public identity. The terminal
@@ -476,13 +461,12 @@ sorted output before timing and reports the CPU, forced-WGPU, and thresholded
 hybrid paths separately rather than treating executor choice as a planner
 mode.
 
-A partially consumed ordinary residual query converted through
+A partially consumed ordinary query converted through
 `into_par_iter()` is drained as one parallel leaf so its exact remaining state
-cannot be restarted. This also applies to a partially consumed explicit scalar
-query: its exact scalar cursor is drained by one leaf rather than partitioned
-by a second solver. The explicit saturated block-native entry point requires a
-fresh query. With one Rayon worker it has a zero split budget; with `N` workers
-it permits at most `N - 1` splits. In every case the result
+cannot be restarted or partitioned by a second solver. The explicit saturated
+block-native entry point requires a fresh query. With one Rayon worker it has a
+zero split budget; with `N` workers it permits at most `N - 1` splits. In every
+case the result
 guarantee is equality of the distinct raw projected-row set, not iteration
 order.
 
@@ -517,13 +501,13 @@ definition, as a query only returns data satisfying its constraints.[^2]
 The query engine uses the Atreides family of worst-case optimal join
 algorithms. These algorithms leverage the same cardinality estimates surfaced
 through `Constraint::estimate` to guide variable choice over partial bindings,
-providing skew-resistant and predictable performance. The sequential scheduler
-explores those choices depth-first. The residual engine makes the exact
-proposer occurrence and remaining confirmer set part of canonical state so
-equivalent futures can reconverge after their selected actions run. Because
-every path refreshes estimates during evaluation, binding order adapts whenever
-a constraint updates its influence set—there is no separate planning artifact
-to maintain.
+providing skew-resistant and predictable performance. The residual machine
+makes the exact proposer occurrence and remaining confirmer set part of
+canonical state so equivalent futures can reconverge after their selected
+actions run. At width one it follows the hot continuation depth-first; as width
+grows it batches equivalent futures. Because every path refreshes estimates
+during evaluation, binding order adapts whenever a constraint updates its
+influence set—there is no separate planning artifact to maintain.
 For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
 
 ## Query Languages

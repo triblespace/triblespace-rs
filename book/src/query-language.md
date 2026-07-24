@@ -502,17 +502,17 @@ uniqueness of `(parent, value)` occurrences in that particular sink, allowing
 an optional deduplication elision. It does not strengthen proposal coverage or
 alter the constraint's SET meaning.
 
-The explicit `Query::sequential()` scheduler calls these methods with a one-row
-[`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks;
-every live fresh ordinary iterator uses canonical residual states with row
-blocks and tagged candidate frontiers. Implementations without a specialized
-batch operation can loop over the rows, use `CandidateSink::extend_row`, and
-use the `confirm_per_row` adapter.
+Every live fresh ordinary iterator uses canonical residual states. A one-row
+action receives a one-row
+[`RowsView`](triblespace::core::query::RowsView) and compact plain-value sinks;
+reconverged multi-row actions use tagged candidate frontiers. Implementations
+without a specialized batch operation can loop over the rows, use
+`CandidateSink::extend_row`, and use the `confirm_per_row` adapter.
 
 The four row-taking operations must also be row-homomorphic: evaluating
 non-empty consecutive sub-blocks independently and concatenating their
 row-remapped outputs must equal evaluating the original block. The block-native
-schedulers, including ordinary `Query::into_par_iter()` and the explicit
+runtime, including ordinary `Query::into_par_iter()` and the explicit
 `Query::into_par_residual_state_iter()` frontier-sharding path, are free to
 change block boundaries; block-global top-k or first-row semantics would
 therefore be incorrect. Diagnostics may observe call boundaries, but must not
@@ -533,7 +533,7 @@ variables are present in the view. That exactness is required for sound
 composition with `or!` and for constant, zero-variable checks; it is not
 merely an optional early-pruning optimization. Zero-variable roots are settled
 once during construction. The [Query Engine](query-engine.md#the-constraint-protocol)
-chapter explains the protocol and its schedulers in detail.
+chapter explains the protocol and its residual execution model in detail.
 
 ## Regular path queries
 

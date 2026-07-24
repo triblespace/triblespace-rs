@@ -161,19 +161,8 @@ depth-first traversal from thrashing through unrelated values.
 
 ## Implementation notes
 
-- The explicit `Query::sequential()` scheduler keeps a stack of bound variables
-  and a parallel row of values. It presents that cursor to constraints as a
-  one-row `RowsView`; `Binding` is now only reconstructed at the
-  result-projection boundary. Each selected scalar proposal action is
-  reverse-stably admitted to SET support before descent. Fresh Rayon
-  consumption does not split that scalar proposal stack: `into_par_iter()`
-  moves an unstarted query into canonical residual execution, while a started
-  scalar cursor drains as one exact leaf. The terminal gate remains the
-  universal final guard and preserves one result per distinct ordered raw
-  query head. A `touched_variables` set marks which estimates need refreshing
-  before the next decision point.
-- The ordinary iterator lifts the same negotiation to blocks of sibling rows
-  through canonical residual states for every live root. Those states key
+- The ordinary iterator negotiates blocks of sibling rows through canonical
+  residual states for every live root. Those states key
   future work by bound schema, planned action, and checked leaf occurrences.
   Planning makes both the exact adaptive variable and proposer occurrence
   explicit in action state, so equivalent futures may reconverge into larger
@@ -182,7 +171,15 @@ depth-first traversal from thrashing through unrelated values.
   payloads carry occurrence bags until the corresponding residual admission
   slice admits `(parent row, value)` pairs to SET support: an intra-parent
   duplicate vanishes while equal values under distinct parents remain
-  independent.
+  independent. Width-one actions use the compact one-row protocol shape and
+  keep a successful continuation hot; geometric widening later harvests larger
+  compatible blocks without switching solvers.
+- `Binding` is reconstructed only at the result-projection boundary. The
+  terminal gate remains the universal final guard and preserves one result per
+  distinct ordered raw query head. A fresh query converted through
+  `into_par_iter()` moves the same affine residual frontier into Rayon; a
+  started query drains its exact remainder as one leaf rather than restarting
+  the search.
 - Highly skewed data still behaves predictably: even if one attribute dominates
   the dataset, the other constraints continue to bound the search space tightly
   and prevent runaway exploration.
