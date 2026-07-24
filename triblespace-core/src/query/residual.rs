@@ -103,8 +103,8 @@ mod positive_hedge_credit;
 mod set_admit;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
-    DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, PositivePublicationSeed,
-    TerminalPublicationBatch,
+    DeltaScheduler, DeltaSchedulerStep, DeltaSeedOutcome, DeltaStepOutcome,
+    GlobalServicePacketEvent, PositivePublicationSeed, TerminalPublicationBatch,
 };
 
 /// One deterministic route from the owned root to an opaque residual leaf.
@@ -2566,13 +2566,13 @@ pub struct ResidualStateStats {
     /// Examined-service ticks charged to Support packets. A validated
     /// zero-examined quiescence receipt costs one dispatch tick.
     pub delta_positive_support_service_support_examined: usize,
-    /// Exact Confirm packets settled by the query-global service ledger.
+    /// Coalesced Exact Confirm packets settled by the query-global ledger.
     pub delta_positive_support_service_exact_packets: usize,
-    /// Support packets settled through its one affine query-global lease.
+    /// Coalesced Support packets settled through its affine query-global lease.
     pub delta_positive_support_service_support_packets: usize,
-    /// Largest exact Confirm service packet observed.
+    /// Largest summed coalesced exact Confirm service packet observed.
     pub max_delta_positive_support_service_exact_packet: usize,
-    /// Largest Support service packet observed.
+    /// Largest summed coalesced Support service packet observed.
     pub max_delta_positive_support_service_support_packet: usize,
     /// Largest exact packet across the iterator-global ledger. This is its
     /// single additive packet term for the cumulative bound.
@@ -9260,8 +9260,19 @@ enum MachineStep {
 }
 
 /// Boundary between scheduler work and the generic public projection shell.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 enum PullAdvance {
     EmitReady,
+    Deferred { packet_nonce: u64 },
+    Cooperate,
+    Exhausted,
+}
+
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+enum PullStep<R> {
+    Item(R),
+    Deferred { packet_nonce: u64 },
+    Cooperate,
     Exhausted,
 }
 
@@ -9855,6 +9866,9 @@ struct ResidualStateMachine {
     terminal_demand_width: usize,
     terminal_demand_consumed: usize,
     terminal_demand_exhausted: bool,
+    /// A public pull may be cooperatively suspended by the parallel executor
+    /// while preserving its one affine demand token.
+    public_pull_in_progress: bool,
     /// Cumulative successful public projections, independent of telemetry
     /// resets and of the currently open demand window.
     terminal_projected_rows: usize,
@@ -10101,6 +10115,7 @@ impl ResidualStateMachine {
             terminal_demand_width: 1,
             terminal_demand_consumed: 0,
             terminal_demand_exhausted: false,
+            public_pull_in_progress: false,
             terminal_projected_rows: 0,
             width: lazy_start_width().clamp(1, cap),
             growth: lazy_growth(),
@@ -11854,7 +11869,7 @@ impl ResidualStateMachine {
                 && !self.delta.is_empty()
                 && !self.has_full_stable(plan, width)
             {
-                let outcome = self.delta.step_bounded(
+                let step = self.delta.try_step_bounded(
                     root,
                     plan,
                     width,
@@ -11863,7 +11878,25 @@ impl ResidualStateMachine {
                     &mut self.interner,
                     &mut self.stats,
                 );
+                let (outcome, global_packet_event) = match step {
+                    DeltaSchedulerStep::Deferred { packet_nonce } => {
+                        return PullAdvance::Deferred { packet_nonce };
+                    }
+                    DeltaSchedulerStep::Completed {
+                        outcome,
+                        global_packet_event,
+                    } => (outcome, global_packet_event),
+                };
                 self.accept_delta_step(outcome);
+                match global_packet_event {
+                    Some(GlobalServicePacketEvent::StillOpen { packet_nonce }) => {
+                        return PullAdvance::Deferred { packet_nonce };
+                    }
+                    Some(GlobalServicePacketEvent::Closed) => {
+                        return PullAdvance::Cooperate;
+                    }
+                    None => {}
+                }
                 continue;
             }
             match self.pop_once_with_dispatch(
@@ -11897,7 +11930,7 @@ impl ResidualStateMachine {
                     // token before servicing the shared cyclic frontier.
                     self.active_delta = None;
                     self.active_delta_after_yield = false;
-                    let outcome = self.delta.step_bounded(
+                    let step = self.delta.try_step_bounded(
                         root,
                         plan,
                         width,
@@ -11906,7 +11939,25 @@ impl ResidualStateMachine {
                         &mut self.interner,
                         &mut self.stats,
                     );
+                    let (outcome, global_packet_event) = match step {
+                        DeltaSchedulerStep::Deferred { packet_nonce } => {
+                            return PullAdvance::Deferred { packet_nonce };
+                        }
+                        DeltaSchedulerStep::Completed {
+                            outcome,
+                            global_packet_event,
+                        } => (outcome, global_packet_event),
+                    };
                     self.accept_delta_step(outcome);
+                    match global_packet_event {
+                        Some(GlobalServicePacketEvent::StillOpen { packet_nonce }) => {
+                            return PullAdvance::Deferred { packet_nonce };
+                        }
+                        Some(GlobalServicePacketEvent::Closed) => {
+                            return PullAdvance::Cooperate;
+                        }
+                        None => {}
+                    }
                 }
                 MachineStep::DeltaSeeded {
                     continuation,
@@ -11940,38 +11991,50 @@ impl ResidualStateMachine {
         projection_gate: &mut ProjectionGate,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
-    ) -> Option<R>
+    ) -> PullStep<R>
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        // A projection panic may be caught outside the iterator. The raw row
-        // is consumed before user code, and the next pull similarly retires
-        // any still-unassigned demand token before observing an early exit.
-        self.delta.retire_unassigned_public_pull_demand();
         if projection_gate.is_done() {
             self.retire_staged_projection_receipts();
-            return None;
+            self.delta.retire_unassigned_public_pull_demand();
+            self.public_pull_in_progress = false;
+            return PullStep::Exhausted;
         }
-        // Do not interpret a pull after proven scheduler exhaustion as demand
-        // for a wider terminal window. This matters for an elided zero-variable
-        // full head: its single semantic seed needs no claim table, and after
-        // that seed is consumed there is no remaining work to promote.
-        if self.emit_next >= self.emit_count && self.worklist.is_empty() && self.delta.is_empty() {
-            return None;
+
+        if !self.public_pull_in_progress {
+            // A projection panic may be caught outside the iterator. The raw
+            // row is consumed before user code, and a genuinely new pull
+            // retires any still-unassigned predecessor demand token. Internal
+            // parallel suspension deliberately does neither.
+            self.delta.retire_unassigned_public_pull_demand();
+            // Do not interpret a pull after proven scheduler exhaustion as
+            // demand for a wider terminal window. This matters for an elided
+            // zero-variable full head: its single semantic seed needs no claim
+            // table, and after that seed is consumed there is no remaining
+            // work to promote.
+            if self.emit_next >= self.emit_count
+                && self.worklist.is_empty()
+                && self.delta.is_empty()
+            {
+                return PullStep::Exhausted;
+            }
+            let support_preference = self.delta.begin_public_pull_demand(&mut self.stats);
+            if self.delta.global_service_lane_is_active() {
+                // The service scheduler owns a strict global lane preference,
+                // never an activation-local sprint.
+                self.active_delta = None;
+                self.active_delta_after_yield = false;
+            } else if let Some(support) = support_preference {
+                // Assigned production demand owns the activation-local latency
+                // preference. Exact remains ordinary runnable custody.
+                self.active_delta = Some(support);
+                self.active_delta_after_yield = false;
+            }
+            self.confirm_terminal_demand();
+            self.public_pull_in_progress = true;
         }
-        let support_preference = self.delta.begin_public_pull_demand(&mut self.stats);
-        if self.delta.global_service_lane_is_active() {
-            // The service scheduler owns a strict global lane preference,
-            // never an activation-local sprint.
-            self.active_delta = None;
-            self.active_delta_after_yield = false;
-        } else if let Some(support) = support_preference {
-            // Assigned production demand owns the activation-local latency
-            // preference. Exact remains ordinary runnable custody.
-            self.active_delta = Some(support);
-            self.active_delta_after_yield = false;
-        }
-        self.confirm_terminal_demand();
+
         loop {
             let draining_unprojected_emit = self.emit_next < self.emit_count;
             while self.emit_next < self.emit_count {
@@ -11987,6 +12050,11 @@ impl ResidualStateMachine {
                 for (column, &variable) in self.emit_vars.iter().enumerate() {
                     self.binding.set(variable, &self.emit_rows[start + column]);
                 }
+                // Internal packet suspension keeps this token live, but user
+                // projection is an unwind boundary. Clear it before invoking
+                // arbitrary code so a caught panic resumes as a genuinely new
+                // public pull; a filtered row restores the same pull below.
+                self.public_pull_in_progress = false;
                 match projection_gate.project(&self.binding, postprocessing) {
                     ProjectionStep::Yield(result) => {
                         if let Some(projection) = &mut projection {
@@ -11998,14 +12066,19 @@ impl ResidualStateMachine {
                             self.retire_staged_projection_receipts();
                         }
                         self.delta.retire_unassigned_public_pull_demand();
-                        return Some(result);
+                        self.public_pull_in_progress = false;
+                        return PullStep::Item(result);
                     }
-                    ProjectionStep::Skip => drop(projection),
+                    ProjectionStep::Skip => {
+                        drop(projection);
+                        self.public_pull_in_progress = true;
+                    }
                     ProjectionStep::Done => {
                         drop(projection);
                         self.retire_staged_projection_receipts();
                         self.delta.retire_unassigned_public_pull_demand();
-                        return None;
+                        self.public_pull_in_progress = false;
+                        return PullStep::Exhausted;
                     }
                 }
             }
@@ -12023,9 +12096,14 @@ impl ResidualStateMachine {
                 base_estimates,
             ) {
                 PullAdvance::EmitReady => {}
+                PullAdvance::Deferred { packet_nonce } => {
+                    return PullStep::Deferred { packet_nonce };
+                }
+                PullAdvance::Cooperate => return PullStep::Cooperate,
                 PullAdvance::Exhausted => {
                     self.delta.retire_unassigned_public_pull_demand();
-                    return None;
+                    self.public_pull_in_progress = false;
+                    return PullStep::Exhausted;
                 }
             }
         }
@@ -12043,15 +12121,24 @@ impl ResidualStateMachine {
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        self.pull_with_dispatch(
-            &DirectActionDispatch,
-            root,
-            plan,
-            postprocessing,
-            projection,
-            influences,
-            base_estimates,
-        )
+        loop {
+            match self.pull_with_dispatch(
+                &DirectActionDispatch,
+                root,
+                plan,
+                postprocessing,
+                projection,
+                influences,
+                base_estimates,
+            ) {
+                PullStep::Item(item) => return Some(item),
+                PullStep::Cooperate => {}
+                PullStep::Exhausted => return None,
+                PullStep::Deferred { .. } => {
+                    panic!("serial residual iterator was deferred by a parallel service packet")
+                }
+            }
+        }
     }
 
     /// Observed counterpart of [`Self::pull`]. Both wrappers instantiate the
@@ -12070,15 +12157,24 @@ impl ResidualStateMachine {
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        self.pull_with_dispatch(
-            &ShadowActionDispatch { epoch },
-            root,
-            plan,
-            postprocessing,
-            projection,
-            influences,
-            base_estimates,
-        )
+        loop {
+            match self.pull_with_dispatch(
+                &ShadowActionDispatch { epoch },
+                root,
+                plan,
+                postprocessing,
+                projection,
+                influences,
+                base_estimates,
+            ) {
+                PullStep::Item(item) => return Some(item),
+                PullStep::Cooperate => {}
+                PullStep::Exhausted => return None,
+                PullStep::Deferred { .. } => {
+                    panic!("serial shadow iterator was deferred by a parallel service packet")
+                }
+            }
+        }
     }
 }
 
@@ -12121,6 +12217,7 @@ impl ResidualStateMachine {
             terminal_demand_width: self.terminal_demand_width,
             terminal_demand_consumed: 0,
             terminal_demand_exhausted: false,
+            public_pull_in_progress: false,
             terminal_projected_rows: self.terminal_projected_rows,
             width: self.width,
             growth: self.growth,
@@ -12146,13 +12243,6 @@ impl ResidualStateMachine {
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<Self> {
-        // The experimental debt theorem owns one scalar next-dispatch
-        // account for the whole query. Independent Rayon shards would each
-        // mint an initial Support packet; sharing only the totals would still
-        // lack the global dispatcher needed to serialize lane admission.
-        if self.delta.uses_positive_support_global_service_debt() {
-            return None;
-        }
         // StateId is a machine-local family key. Once a terminal admission
         // exists, splitting would require either a shared projected-yield
         // ledger or origin propagation through every stable bucket.
@@ -12281,7 +12371,14 @@ impl ResidualStateMachine {
             // rather than manufacturing a second query from the seed.
             let width = self.width.max(1);
             if !self.delta.is_empty() && !self.has_full_stable(plan, width) {
-                let outcome = self.delta.step_bounded(
+                // Recursive Rayon splitting may overlap an already-running
+                // sibling fold. Once the query-global service epoch is live,
+                // packet control belongs to the cooperative fold executor;
+                // split negotiation must neither join nor wait on it.
+                if self.delta.global_service_lane_is_active() {
+                    return None;
+                }
+                let step = self.delta.try_step_bounded(
                     root,
                     plan,
                     width,
@@ -12290,10 +12387,20 @@ impl ResidualStateMachine {
                     &mut self.interner,
                     &mut self.stats,
                 );
+                let (outcome, global_packet_event) = match step {
+                    DeltaSchedulerStep::Deferred { .. } => return None,
+                    DeltaSchedulerStep::Completed {
+                        outcome,
+                        global_packet_event,
+                    } => (outcome, global_packet_event),
+                };
                 // Split negotiation deliberately leaves every stable result
                 // in the cold worklist; it only consumes the same geometric
                 // feedback as the serial scheduler.
                 self.account_delta_feedback(&outcome);
+                if global_packet_event.is_some() {
+                    return None;
+                }
                 continue;
             }
             if self.worklist.is_empty() {
@@ -12570,9 +12677,9 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
     /// dispatches it only while its cumulative validated examined work is
     /// strictly behind Exact. Exact owns ties. The policy changes physical
     /// order only; raw projected tuple SET semantics are unchanged. Parallel
-    /// iteration currently remains one unsplit producer so the stated debt
-    /// bound is genuinely query-global rather than one initial allowance per
-    /// shard.
+    /// siblings join lane-neutral affine parts of the same coalesced service
+    /// packet and share one cumulative debt ledger while retaining independent
+    /// local Program queues and runtimes.
     pub fn positive_support_global_service_debt(mut self) -> Self {
         assert!(
             !self.iteration_started,
@@ -12635,6 +12742,26 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         self.iteration_started = true;
         self.state.pull(
+            &self.root,
+            &self.plan,
+            &self.postprocessing,
+            &mut self.projection,
+            &self.influences,
+            &self.base_estimates,
+        )
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl<'a, C, P, R> ResidualStateIter<C, P, R>
+where
+    C: Constraint<'a> + 'a,
+    P: Fn(&Binding) -> Option<R>,
+{
+    fn poll_parallel(&mut self) -> PullStep<R> {
+        self.iteration_started = true;
+        self.state.pull_with_dispatch(
+            &DirectActionDispatch,
             &self.root,
             &self.plan,
             &self.postprocessing,
@@ -12957,7 +13084,9 @@ pub use parallel::{ResidualShadowParIter, ResidualStateParIter};
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
-    use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
+    use rayon::iter::plumbing::{
+        bridge_unindexed, Folder, Reducer, UnindexedConsumer, UnindexedProducer,
+    };
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     /// Parallel iterator over one affine residual-state frontier.
@@ -13088,6 +13217,10 @@ mod parallel {
             let ResidualStateParIter {
                 inner: mut iter, ..
             } = self;
+            debug_assert!(
+                !iter.state.delta.uses_global_service_debt(),
+                "global service execution must retain its affine shard at round boundaries"
+            );
             while !folder.full() {
                 match iter.next() {
                     Some(item) => folder = folder.consume(item),
@@ -13096,6 +13229,178 @@ mod parallel {
             }
             folder
         }
+    }
+
+    struct BroadcastLeaf<Prod, Con> {
+        producer: Prod,
+        consumer: Con,
+    }
+
+    enum BroadcastReduction<Red> {
+        Leaf(usize),
+        Branch {
+            reducer: Red,
+            left: Box<Self>,
+            right: Box<Self>,
+        },
+    }
+
+    impl<Red> BroadcastReduction<Red> {
+        fn finish<Out>(self, results: &mut [Option<Out>]) -> Out
+        where
+            Red: Reducer<Out>,
+        {
+            match self {
+                Self::Leaf(slot) => results[slot]
+                    .take()
+                    .expect("global-service broadcast leaf returned no consumer result"),
+                Self::Branch {
+                    reducer,
+                    left,
+                    right,
+                } => {
+                    let left = left.finish(results);
+                    let right = right.finish(results);
+                    reducer.reduce(left, right)
+                }
+            }
+        }
+    }
+
+    /// Pre-splits producer and consumer through the same left/right topology
+    /// as `bridge_unindexed`, while retaining that exact reducer tree for the
+    /// broadcast results.
+    fn plan_global_service_broadcast<Prod, Con>(
+        producer: Prod,
+        consumer: Con,
+        leaves: &mut Vec<BroadcastLeaf<Prod, Con>>,
+    ) -> BroadcastReduction<Con::Reducer>
+    where
+        Prod: UnindexedProducer,
+        Con: UnindexedConsumer<Prod::Item>,
+    {
+        if consumer.full() {
+            let slot = leaves.len();
+            leaves.push(BroadcastLeaf { producer, consumer });
+            return BroadcastReduction::Leaf(slot);
+        }
+        let (left_producer, right_producer) = producer.split();
+        let Some(right_producer) = right_producer else {
+            let slot = leaves.len();
+            leaves.push(BroadcastLeaf {
+                producer: left_producer,
+                consumer,
+            });
+            return BroadcastReduction::Leaf(slot);
+        };
+
+        let reducer = consumer.to_reducer();
+        let left_consumer = consumer.split_off_left();
+        let left = plan_global_service_broadcast(left_producer, left_consumer, leaves);
+        let right = plan_global_service_broadcast(right_producer, consumer, leaves);
+        BroadcastReduction::Branch {
+            reducer,
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    /// Runs one query leaf on its assigned pool worker. A deferred shard keeps
+    /// both its affine iterator and consumer folder while cooperatively
+    /// helping unrelated/nested Rayon work. Broadcast pins one such loop per
+    /// worker, so a waiter can never be stolen beneath another same-query
+    /// packet owner.
+    fn run_global_service_broadcast_leaf<'a, C, P, R, Con>(
+        producer: ResidualStateParIter<C, P, R>,
+        consumer: Con,
+    ) -> Con::Result
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+        Con: UnindexedConsumer<R>,
+    {
+        let mut iter = producer.inner;
+        let mut folder = consumer.into_folder();
+        'pull: while !folder.full() {
+            match iter.poll_parallel() {
+                PullStep::Item(item) => folder = folder.consume(item),
+                PullStep::Deferred { packet_nonce } => {
+                    while iter.state.delta.global_service_active_packet_nonce()
+                        == Some(packet_nonce)
+                    {
+                        if folder.full() {
+                            break 'pull;
+                        }
+                        match rayon::yield_now() {
+                            Some(rayon::Yield::Executed) => {}
+                            Some(rayon::Yield::Idle) | None => std::thread::yield_now(),
+                        }
+                    }
+                }
+                PullStep::Cooperate => {}
+                PullStep::Exhausted => break,
+            }
+        }
+        folder.complete()
+    }
+
+    /// Drives query-global service debt through one pinned leaf per available
+    /// pool worker. Unlike a returned `fold_with`, every deferred leaf retains
+    /// its exact consumer folder and resumes after packet closure; unlike an
+    /// ordinary wait loop, worker pinning prevents nested same-query owner
+    /// inversion. The pre-recorded reducer tree preserves arbitrary
+    /// `UnindexedConsumer` composition exactly.
+    fn drive_global_service_broadcast<'a, C, P, R, Con>(
+        root: ResidualStateParIter<C, P, R>,
+        consumer: Con,
+    ) -> Con::Result
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+        Con: UnindexedConsumer<R>,
+    {
+        let workers = rayon::current_num_threads();
+        let mut leaves = Vec::with_capacity(workers);
+        let reduction = plan_global_service_broadcast(root, consumer, &mut leaves);
+        assert!(
+            leaves.len() <= workers,
+            "global-service split budget exceeded the consuming Rayon pool"
+        );
+
+        let mut slots = std::iter::repeat_with(|| None)
+            .take(workers)
+            .collect::<Vec<_>>();
+        for (slot, leaf) in slots.iter_mut().zip(leaves) {
+            *slot = Some(leaf);
+        }
+        let slots = Mutex::new(slots);
+        let returned = rayon::broadcast(|context| {
+            debug_assert_eq!(context.num_threads(), workers);
+            let worker = context.index();
+            let leaf = slots
+                .lock()
+                .expect("global-service broadcast slots were poisoned")[worker]
+                .take();
+            leaf.map(|BroadcastLeaf { producer, consumer }| {
+                (
+                    worker,
+                    run_global_service_broadcast_leaf(producer, consumer),
+                )
+            })
+        });
+
+        let mut results = std::iter::repeat_with(|| None)
+            .take(workers)
+            .collect::<Vec<_>>();
+        for (worker, result) in returned.into_iter().flatten() {
+            assert!(
+                results[worker].replace(result).is_none(),
+                "one global-service worker returned two consumer results"
+            );
+        }
+        reduction.finish(&mut results)
     }
 
     impl<'a, C, P, R> ParallelIterator for ResidualStateParIter<C, P, R>
@@ -13115,7 +13420,11 @@ mod parallel {
             } else {
                 rayon::current_num_threads().saturating_sub(1)
             };
-            bridge_unindexed(self, consumer)
+            if self.inner.state.delta.uses_global_service_debt() {
+                drive_global_service_broadcast(self, consumer)
+            } else {
+                bridge_unindexed(self, consumer)
+            }
         }
     }
 
@@ -13192,6 +13501,11 @@ mod parallel {
         fn split(mut self) -> (Self, Option<Self>) {
             if self.inner.inner.projection.is_empty_head()
                 || self.inner.inner.iteration_started
+                // The ordinary parallel executor owns the internal
+                // defer/resume queue. Shadow epochs currently retain their
+                // exact serial pull boundary under global service debt rather
+                // than silently treating Deferred as exhaustion.
+                || self.inner.inner.state.delta.uses_global_service_debt()
                 || self.split_budget == 0
             {
                 self.split_budget = 0;
@@ -13351,8 +13665,14 @@ mod tests {
     use crate::query::unionconstraint::UnionConstraint;
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
+    #[cfg(feature = "parallel")]
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(feature = "parallel")]
+    use std::sync::Condvar;
     use std::sync::Mutex;
+    #[cfg(feature = "parallel")]
+    use std::time::Duration;
 
     #[test]
     fn residual_lowering_has_exactly_nine_canonical_forms() {
@@ -13673,6 +13993,379 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[derive(Clone)]
+    struct GatedFanoutLeaf {
+        variable: VariableId,
+        gate: VariableId,
+        unbound_estimate: usize,
+        bound_estimate: usize,
+        values: Arc<Vec<RawInline>>,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl Constraint<'static> for GatedFanoutLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(
+                if view.col(self.gate).is_some() {
+                    self.bound_estimate
+                } else {
+                    self.unbound_estimate
+                },
+                view.len(),
+            );
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == self.variable {
+                for row in 0..view.len() {
+                    candidates.extend_row(row as u32, self.values.iter().copied());
+                }
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == self.variable {
+                candidates.retain(|_, candidate| self.values.contains(candidate));
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            true
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[derive(Clone)]
+    struct ParallelSupportProbe {
+        source: RawInline,
+        accepted: Arc<Vec<RawInline>>,
+        seed_gate: Option<Arc<ParallelSupportSeedGate>>,
+        nested_owner_probe: Option<Arc<NestedRayonOwnerProbe>>,
+    }
+
+    #[cfg(feature = "parallel")]
+    struct ParallelSupportSeedGate {
+        arrivals: Mutex<usize>,
+        changed: Condvar,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl ParallelSupportSeedGate {
+        fn new() -> Self {
+            Self {
+                arrivals: Mutex::new(0),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn arrive(&self) {
+            let mut arrivals = self.arrivals.lock().unwrap();
+            *arrivals += 1;
+            if *arrivals >= 2 {
+                self.changed.notify_all();
+                return;
+            }
+            let (arrivals, timeout) = self
+                .changed
+                .wait_timeout_while(arrivals, Duration::from_secs(2), |arrivals| *arrivals < 2)
+                .unwrap();
+            assert!(
+                !timeout.timed_out() || *arrivals >= 2,
+                "parallel Support fixture never seeded a second physical shard"
+            );
+        }
+    }
+
+    /// Forces one service part to depend on nested Rayon work after its
+    /// sibling part is free to settle and enter the packet wait loop.
+    #[cfg(feature = "parallel")]
+    struct NestedRayonOwnerProbe {
+        calls: AtomicUsize,
+        quick_finished: AtomicBool,
+        notified: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl NestedRayonOwnerProbe {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                quick_finished: AtomicBool::new(false),
+                notified: Mutex::new(false),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn run(&self) {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    self.quick_finished.store(true, Ordering::Release);
+                }
+                1 => {
+                    while !self.quick_finished.load(Ordering::Acquire) {
+                        let _ = rayon::yield_now();
+                    }
+                    rayon::join(
+                        || {
+                            let notified = self.notified.lock().unwrap();
+                            let (notified, timeout) = self
+                                .changed
+                                .wait_timeout_while(notified, Duration::from_secs(2), |notified| {
+                                    !*notified
+                                })
+                                .unwrap();
+                            assert!(
+                                !timeout.timed_out() || *notified,
+                                "deferred service worker did not execute nested owner work"
+                            );
+                        },
+                        || {
+                            *self.notified.lock().unwrap() = true;
+                            self.changed.notify_all();
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[derive(Clone, Copy)]
+    struct ParallelSupportState {
+        supported: bool,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl TypedProgramSpec for ParallelSupportProbe {
+        type State = ParallelSupportState;
+        type NoveltyKey = ();
+        type Rank = u8;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            (request.action == ProgramAction::Support
+                && request.bound.is_set(0)
+                && request.bound.is_set(1))
+            .then_some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: 1,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+                exposure: ProgramExposure::Production,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            1
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            if let Some(seed_gate) = &self.seed_gate {
+                seed_gate.arrive();
+            }
+            let target = batch
+                .view
+                .col(1)
+                .expect("parallel Support probe lost its bound target");
+            let source = batch
+                .view
+                .col(0)
+                .expect("parallel Support probe lost its bound source");
+            for (parent, row) in batch.view.iter().enumerate() {
+                effects.finite_root(
+                    u32::try_from(parent).expect("too many parallel Support parents"),
+                    ParallelSupportState {
+                        supported: row[source] == self.source
+                            && self.accepted.contains(&row[target]),
+                    },
+                    None,
+                );
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: &mut Vec<Self::State>,
+            batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            if let Some(nested_owner_probe) = &self.nested_owner_probe {
+                nested_owner_probe.run();
+            }
+            assert_eq!(states.len(), batch.limits.len());
+            for (input, state) in states.drain(..).enumerate() {
+                if state.supported {
+                    effects
+                        .support(u32::try_from(input).expect("too many parallel Support inputs"));
+                }
+                effects.page(1, None);
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    struct ParallelServiceRpq {
+        program: PreferredProgram<
+            ParallelSupportProbe,
+            crate::query::regularpathconstraint::RegularPathConstraint,
+        >,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl Constraint<'static> for ParallelServiceRpq {
+        fn variables(&self) -> VariableSet {
+            self.program.fallback().variables()
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            self.program.fallback().fixed_denotation()
+        }
+
+        fn proposal_coverage(
+            &self,
+            _variable: VariableId,
+            _bound: VariableSet,
+        ) -> ProposalCoverage {
+            ProposalCoverage::None
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.program.fallback().estimate(variable, view, out)
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.program.fallback().propose(variable, view, candidates);
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.program.fallback().confirm(variable, view, candidates);
+        }
+
+        fn estimate_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.program
+                .fallback()
+                .estimate_certified(variable, view, out)
+        }
+
+        fn propose_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.program
+                .fallback()
+                .propose_certified(variable, view, candidates);
+        }
+
+        fn confirm_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.program
+                .fallback()
+                .confirm_certified(variable, view, candidates);
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            self.program.fallback().satisfied(view)
+        }
+
+        fn influence(&self, variable: VariableId) -> VariableSet {
+            self.program.fallback().influence(variable)
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.program.fallback().residual_confirm_is_page_local()
+        }
+
+        fn residual_delta_confirm_grouping_requirements(
+            &self,
+            variable: VariableId,
+        ) -> Option<VariableSet> {
+            self.program
+                .fallback()
+                .residual_delta_confirm_grouping_requirements(variable)
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::preferred(&self.program))
         }
     }
 
@@ -16108,6 +16801,10 @@ mod tests {
         assert!(iter.state.emit_origins.is_none());
         assert_eq!(iter.stats().delta_direct_terminal_publication_batches, 0);
         assert!(
+            !iter.state.public_pull_in_progress,
+            "a caught user projection panic must not masquerade as an internal packet resume"
+        );
+        assert!(
             iter.state.delta.has_unassigned_public_pull_demand(),
             "caught projection panic should leave only the unassigned token for next-pull cleanup"
         );
@@ -17241,6 +17938,56 @@ mod tests {
             .build()
             .unwrap()
             .install(operation)
+    }
+
+    #[cfg(feature = "parallel")]
+    #[derive(Default)]
+    struct GlobalServiceDispatchGateState {
+        targeted_packets: BTreeSet<u64>,
+        parts: BTreeMap<u64, BTreeSet<u64>>,
+        released_packets: BTreeSet<u64>,
+        timed_out_packets: BTreeSet<u64>,
+    }
+
+    #[cfg(feature = "parallel")]
+    #[derive(Default)]
+    struct GlobalServiceDispatchGate {
+        state: Mutex<GlobalServiceDispatchGateState>,
+        changed: Condvar,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl GlobalServiceDispatchGate {
+        fn observe(&self, packet_nonce: u64, part_nonce: u64) {
+            let mut state = self.state.lock().unwrap();
+            if !state.targeted_packets.contains(&packet_nonce) {
+                if state.targeted_packets.len() >= 2 {
+                    return;
+                }
+                state.targeted_packets.insert(packet_nonce);
+            }
+            state
+                .parts
+                .entry(packet_nonce)
+                .or_default()
+                .insert(part_nonce);
+            if state.parts[&packet_nonce].len() >= 2 {
+                state.released_packets.insert(packet_nonce);
+                self.changed.notify_all();
+                return;
+            }
+            let (mut state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(2), |state| {
+                    !state.released_packets.contains(&packet_nonce)
+                })
+                .unwrap();
+            if timeout.timed_out() && !state.released_packets.contains(&packet_nonce) {
+                state.timed_out_packets.insert(packet_nonce);
+                state.released_packets.insert(packet_nonce);
+                self.changed.notify_all();
+            }
+        }
     }
 
     #[cfg(feature = "parallel")]
@@ -23273,6 +24020,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "parallel")]
     fn program_fallback_rpq(
         inner: crate::query::regularpathconstraint::RegularPathConstraint,
         counters: &ProgramFallbackCounters,
@@ -25910,7 +26658,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn global_service_debt_keeps_one_query_global_parallel_producer() {
+    fn global_service_debt_parallel_split_shares_coordinator_not_liveness() {
         let root = FanoutLeaf {
             variable: 0,
             values: Arc::new(Vec::new()),
@@ -25922,19 +26670,227 @@ mod tests {
         machine.emit_rows = (0..7).map(raw).collect();
         machine.emit_count = 7;
 
-        assert!(
-            machine
-                .split_for_parallel(
-                    &root,
-                    &plan,
-                    &[VariableSet::new_empty(); 128],
-                    &[usize::MAX; 128],
-                )
-                .is_none(),
-            "fresh parallel shards would each mint an initial Support bypass"
+        let right = machine
+            .split_for_parallel(
+                &root,
+                &plan,
+                &[VariableSet::new_empty(); 128],
+                &[usize::MAX; 128],
+            )
+            .expect("global service debt must not suppress an affine split");
+        assert!(machine
+            .delta
+            .shares_global_service_coordinator_with(&right.delta));
+        assert!(!machine
+            .delta
+            .shares_global_service_liveness_slot_with(&right.delta));
+        assert_eq!((machine.emit_count, right.emit_count), (4, 3));
+        assert_eq!(machine.emit_rows, (0..4).map(raw).collect::<Vec<_>>());
+        assert_eq!(right.emit_rows, (4..7).map(raw).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn global_service_parallel_executor_reopens_two_overlapping_packets() {
+        use crate::id::{ExclusiveId, Id};
+        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+        use crate::trible::{Trible, TribleSet};
+
+        const PARENT: VariableId = 2;
+
+        let attribute = Id::new([221; crate::id::ID_LEN]).unwrap();
+        let source = Id::new([222; crate::id::ID_LEN]).unwrap();
+        let target = Id::new([223; crate::id::ID_LEN]).unwrap();
+        let source_value: Inline<GenId> = source.to_inline();
+        let mut graph = TribleSet::new();
+        graph.insert(&Trible::new::<GenId>(
+            ExclusiveId::force_ref(&source),
+            &attribute,
+            &target.to_inline(),
+        ));
+        let target_value: Inline<GenId> = target.to_inline();
+        let mut accepted = vec![target_value.raw];
+        for byte in 100..132 {
+            let destination = Id::new([byte; crate::id::ID_LEN]).unwrap();
+            let destination_value: Inline<GenId> = destination.to_inline();
+            graph.insert(&Trible::new::<GenId>(
+                ExclusiveId::force_ref(&source),
+                &attribute,
+                &destination_value,
+            ));
+            accepted.push(destination_value.raw);
+        }
+        let accepted = Arc::new(accepted);
+        let parents = Arc::new((0..32).map(|value| raw(value + 1)).collect::<Vec<_>>());
+        let candidates = Arc::new(
+            std::iter::once(target_value.raw)
+                .chain((0..7).map(|index| {
+                    let value: Inline<GenId> = Id::new([180 + index; crate::id::ID_LEN])
+                        .unwrap()
+                        .to_inline();
+                    value.raw
+                }))
+                .collect::<Vec<_>>(),
         );
-        assert_eq!(machine.emit_count, 7);
-        assert_eq!(machine.emit_rows, (0..7).map(raw).collect::<Vec<_>>());
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let operations = [PathOp::Attr(attribute.raw()), PathOp::Plus];
+        let make = |seed_gate: Option<Arc<ParallelSupportSeedGate>>,
+                    nested_owner_probe: Option<Arc<NestedRayonOwnerProbe>>| {
+            Arc::new(IntersectionConstraint::new(vec![
+                Box::new(GatedFanoutLeaf {
+                    variable: PARENT,
+                    gate: PARENT,
+                    unbound_estimate: 0,
+                    bound_estimate: 0,
+                    values: Arc::clone(&parents),
+                }) as ShapeConstraint,
+                Box::new(start.is(source.to_inline())) as ShapeConstraint,
+                Box::new(GatedFanoutLeaf {
+                    variable: end.index,
+                    gate: start.index,
+                    unbound_estimate: 128,
+                    bound_estimate: 0,
+                    values: Arc::clone(&candidates),
+                }) as ShapeConstraint,
+                Box::new(ParallelServiceRpq {
+                    program: PreferredProgram::new(
+                        ParallelSupportProbe {
+                            source: source_value.raw,
+                            accepted: Arc::clone(&accepted),
+                            seed_gate,
+                            nested_owner_probe,
+                        },
+                        RegularPathConstraint::new(graph.clone(), start, end, &operations),
+                    ),
+                }) as ShapeConstraint,
+            ]))
+        };
+        let project = |binding: &Binding| {
+            Some((
+                binding.get(PARENT).copied()?,
+                binding.get(end.index).copied()?,
+            ))
+        };
+
+        let mut serial = Query::new(make(None, None), project)
+            .solve_residual_state_lazy_with(ResidualLowering::new(
+                FormulaScope::OpaqueLeaves,
+                ProgramScope::All,
+            ))
+            .cap(1)
+            .start_width(1)
+            .positive_support_global_service_debt();
+        assert!(
+            serial.plan.certified_denotation,
+            "the contention fixture must retain a fixed-denotation root"
+        );
+        let mut expected: Vec<_> = serial.by_ref().collect();
+        expected.sort_unstable();
+        let mut oracle = parents
+            .iter()
+            .copied()
+            .map(|parent| (parent, target_value.raw))
+            .collect::<Vec<_>>();
+        oracle.sort_unstable();
+        assert_eq!(
+            expected, oracle,
+            "the contention fixture itself changed its exact projected SET"
+        );
+        assert!(
+            serial
+                .stats()
+                .delta_positive_support_service_exact_packets
+                .saturating_add(
+                    serial
+                        .stats()
+                        .delta_positive_support_service_support_packets
+                )
+                >= 2,
+            "the fixture did not exercise two serial global service packets: stats={:?}",
+            serial.stats()
+        );
+
+        let gate = Arc::new(GlobalServiceDispatchGate::default());
+        let observed = Arc::clone(&gate);
+        let seed_gate = Arc::new(ParallelSupportSeedGate::new());
+        let nested_owner_probe = Arc::new(NestedRayonOwnerProbe::new());
+        let mut parallel = Query::new(
+            make(Some(seed_gate), Some(Arc::clone(&nested_owner_probe))),
+            project,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .cap(1)
+        .start_width(1)
+        .positive_support_global_service_debt();
+        parallel
+            .state
+            .delta
+            .install_global_service_dispatch_probe(Arc::new(move |packet, part| {
+                observed.observe(packet, part);
+            }));
+        let mut actual = with_parallel_workers(2, || parallel.into_par_iter().collect::<Vec<_>>());
+
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        let state = gate.state.lock().unwrap();
+        assert_eq!(
+            state.targeted_packets.len(),
+            2,
+            "the fixture did not execute two distinct global service packets"
+        );
+        assert!(
+            state.timed_out_packets.is_empty(),
+            "a targeted packet never admitted a concurrent second dispatch: {:?}",
+            state.timed_out_packets
+        );
+        for packet in &state.targeted_packets {
+            assert!(
+                state.parts[packet].len() >= 2,
+                "packet {packet} did not overlap two physical service parts"
+            );
+        }
+        drop(state);
+
+        let count_seed_gate = Arc::new(ParallelSupportSeedGate::new());
+        let count = with_parallel_workers(2, || {
+            Query::new(make(Some(count_seed_gate), None), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    ProgramScope::All,
+                ))
+                .cap(1)
+                .start_width(1)
+                .positive_support_global_service_debt()
+                .into_par_iter()
+                .count()
+        });
+        assert_eq!(
+            count,
+            expected.len(),
+            "broadcast reduction changed the parallel count consumer"
+        );
+
+        let cancellation_seed_gate = Arc::new(ParallelSupportSeedGate::new());
+        let found = with_parallel_workers(2, || {
+            Query::new(make(Some(cancellation_seed_gate), None), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    ProgramScope::All,
+                ))
+                .cap(1)
+                .start_width(1)
+                .positive_support_global_service_debt()
+                .into_par_iter()
+                .find_any(|(_, value)| *value == target_value.raw)
+        });
+        assert!(
+            found.is_some_and(|row| expected.contains(&row)),
+            "broadcast cancellation returned a value outside the exact SET"
+        );
     }
 
     #[cfg(feature = "parallel")]

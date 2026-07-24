@@ -3340,6 +3340,31 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
             "workers={workers}"
         );
     }
+
+    #[cfg(feature = "parallel")]
+    for workers in [2, 4] {
+        let (root, fully_bound_satisfied_calls) = make();
+        let query = Query::new(root, project_outer)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .cap(1)
+            .start_width(1)
+            .positive_support_global_service_debt();
+        let mut actual = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap()
+            .install(|| query.into_par_iter().collect::<Vec<_>>());
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "global service debt changed raw projected output with workers={workers}"
+        );
+        assert_eq!(
+            fully_bound_satisfied_calls.load(Ordering::Relaxed),
+            0,
+            "global service debt fell back to legacy reachability with workers={workers}"
+        );
+    }
 }
 
 #[test]

@@ -5,7 +5,8 @@
 //! can share one expansion cohort without becoming semantically conflated.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use ahash::{AHashMap, AHashSet};
 
@@ -983,16 +984,20 @@ enum PositiveSupportServiceLease {
     Reserved,
 }
 
-/// Non-cloneable authority for exactly one dispatched Support packet.
+/// Non-cloneable authority for one lane-neutral global service packet part.
 ///
-/// Dropping this token leaves the ledger reserved, which is deliberately
-/// fail-closed: no second packet or deep clone can cross the missing receipt.
+/// `nonce` identifies the one coalesced query-global packet while
+/// `part_nonce` distinguishes overlapping shard receipts within it. The
+/// runtime guard abandons the entire packet if any part is dropped unsettled,
+/// so no later packet or deep clone can cross a missing charge.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
-#[must_use = "a Support service packet reservation must be settled exactly once"]
+#[must_use = "a global service packet part must be settled exactly once"]
 struct PositiveSupportPacketReservation {
     brand: RegistryBrand,
     nonce: u64,
+    lane: ProgramServiceLane,
+    part_nonce: u64,
 }
 
 /// Experimental query-global service-debt account for PositiveSupport.
@@ -1058,9 +1063,11 @@ impl PositiveSupportServiceDebtLedger {
         let started = match self.lease {
             PositiveSupportServiceLease::Dormant => true,
             PositiveSupportServiceLease::Idle | PositiveSupportServiceLease::Parked => false,
-            PositiveSupportServiceLease::Reserved => {
-                panic!("service demand crossed an in-flight Support packet")
-            }
+            // A different residual shard may discover a new service parent
+            // while this query's one attributable packet is in flight. The
+            // packet retains the affine lease; its eventual settlement will
+            // observe query-global shard liveness and return to Parked.
+            PositiveSupportServiceLease::Reserved => return false,
         };
         self.lease = PositiveSupportServiceLease::Parked;
         self.assert_affine_custody();
@@ -1079,7 +1086,37 @@ impl PositiveSupportServiceDebtLedger {
         if !self.support_is_admissible(support_ready) {
             return None;
         }
+        self.reserve_lane(ProgramServiceLane::Support)
+    }
 
+    fn reserve_exact(&mut self) -> Option<PositiveSupportPacketReservation> {
+        if self.next_lane() != Some(ProgramServiceLane::Exact) {
+            return None;
+        }
+        self.reserve_lane(ProgramServiceLane::Exact)
+    }
+
+    fn next_lane(&self) -> Option<ProgramServiceLane> {
+        self.assert_affine_custody();
+        if self.lease != PositiveSupportServiceLease::Parked {
+            return None;
+        }
+        if !self.attribution_tainted
+            && (!self.initial_bypass_spent || self.support_service < self.exact_service)
+        {
+            Some(ProgramServiceLane::Support)
+        } else {
+            Some(ProgramServiceLane::Exact)
+        }
+    }
+
+    fn reserve_lane(
+        &mut self,
+        lane: ProgramServiceLane,
+    ) -> Option<PositiveSupportPacketReservation> {
+        if self.next_lane() != Some(lane) {
+            return None;
+        }
         self.initial_bypass_spent = true;
         let nonce = self.next_packet_nonce;
         self.next_packet_nonce = self
@@ -1092,38 +1129,36 @@ impl PositiveSupportServiceDebtLedger {
         Some(PositiveSupportPacketReservation {
             brand: self.brand,
             nonce,
+            lane,
+            part_nonce: 0,
         })
     }
 
-    fn settle_support(
-        &mut self,
-        reservation: PositiveSupportPacketReservation,
-        service: u64,
-        remains_live: bool,
+    fn validate_settlement(
+        &self,
+        reservation: &PositiveSupportPacketReservation,
+        lane: ProgramServiceLane,
     ) {
-        assert!(
-            service > 0,
-            "Support service packets must have positive cost"
-        );
         assert_eq!(
             reservation.brand, self.brand,
-            "Support service reservation belongs to another query branch"
+            "service reservation belongs to another query branch"
+        );
+        assert_eq!(
+            reservation.lane, lane,
+            "service reservation crossed attributable lanes"
         );
         assert_eq!(
             self.active_packet_nonce,
             Some(reservation.nonce),
-            "Support settled an unknown service packet reservation"
+            "service settled an unknown packet reservation"
         );
         assert!(
             matches!(self.lease, PositiveSupportServiceLease::Reserved),
-            "Support settled without affine packet custody"
+            "service settled without affine packet custody"
         );
+    }
 
-        self.support_service = self
-            .support_service
-            .checked_add(service)
-            .expect("positive Support cumulative service overflow");
-        self.max_support_packet = self.max_support_packet.max(service);
+    fn finish_settlement(&mut self, remains_live: bool) {
         self.active_packet_nonce = None;
         self.lease = if remains_live {
             PositiveSupportServiceLease::Parked
@@ -1134,26 +1169,60 @@ impl PositiveSupportServiceDebtLedger {
         self.assert_packet_bounds_if_attributed();
     }
 
-    fn settle_exact(&mut self, service: u64, remains_live: bool) {
-        assert!(service > 0, "Exact service packets must have positive cost");
-        assert_eq!(
-            self.lease,
-            PositiveSupportServiceLease::Parked,
-            "Exact service settled without an active query-global lane"
+    fn settle_support(
+        &mut self,
+        reservation: &PositiveSupportPacketReservation,
+        service: u64,
+        remains_live: bool,
+    ) {
+        assert!(
+            service > 0,
+            "Support service packets must have positive cost"
         );
+        self.validate_settlement(reservation, ProgramServiceLane::Support);
+
+        self.support_service = self
+            .support_service
+            .checked_add(service)
+            .expect("positive Support cumulative service overflow");
+        self.max_support_packet = self.max_support_packet.max(service);
+        self.finish_settlement(remains_live);
+    }
+
+    fn settle_exact(
+        &mut self,
+        reservation: &PositiveSupportPacketReservation,
+        service: u64,
+        remains_live: bool,
+    ) {
+        assert!(service > 0, "Exact service packets must have positive cost");
+        self.validate_settlement(reservation, ProgramServiceLane::Exact);
 
         self.exact_service = self
             .exact_service
             .checked_add(service)
             .expect("positive Exact cumulative service overflow");
         self.max_exact_packet = self.max_exact_packet.max(service);
+        self.finish_settlement(remains_live);
+    }
+
+    /// Abandons an unsettled packet without ever reopening attributable
+    /// admission. This is the unwind-only fail-closed transition used by the
+    /// shared parallel coordinator.
+    fn abandon_packet(
+        &mut self,
+        reservation: &PositiveSupportPacketReservation,
+        remains_live: bool,
+    ) {
+        self.validate_settlement(reservation, reservation.lane);
+        self.active_packet_nonce = None;
+        self.attribution_tainted = true;
         self.lease = if remains_live {
             PositiveSupportServiceLease::Parked
         } else {
             PositiveSupportServiceLease::Idle
         };
         self.assert_affine_custody();
-        self.assert_packet_bounds_if_attributed();
     }
 
     /// Permanently invalidates this epoch's service proof.
@@ -1258,6 +1327,523 @@ impl PositiveSupportServiceDebtLedger {
                         .expect("Exact service packet bound overflow"),
                 "Exact crossed one packet ahead while Support remained live"
             );
+        }
+    }
+}
+
+/// One query-run service account shared by every residual Rayon shard.
+///
+/// The scalar debt ledger and packet are global. Overlapping shards join one
+/// coalesced packet in the selected lane, contribute one affine part receipt,
+/// and charge the ledger only when its final part settles. Each scheduler
+/// keeps its own registry, Program runtimes, and queues, and contributes only
+/// one weak Boolean liveness slot. A dropped shard therefore disappears from
+/// global liveness without a cross-shard registry walk or explicit teardown.
+struct PositiveSupportGlobalServiceCoordinator {
+    ledger: PositiveSupportServiceDebtLedger,
+    active_packet: Option<PositiveSupportActiveGlobalPacket>,
+    next_shard_id: u64,
+    shard_liveness: Vec<Weak<AtomicBool>>,
+    abandoned: bool,
+}
+
+struct PositiveSupportActiveGlobalPacket {
+    nonce: u64,
+    lane: ProgramServiceLane,
+    admission_horizon: u64,
+    admitted_shards: AHashSet<u64>,
+    next_part_nonce: u64,
+    live_parts: AHashSet<u64>,
+    service: u64,
+}
+
+enum PositiveSupportGlobalPartReservation {
+    Deferred(u64),
+    Reserved(PositiveSupportPacketReservation),
+}
+
+impl PositiveSupportGlobalServiceCoordinator {
+    fn global_live(&mut self) -> bool {
+        let mut live = false;
+        self.shard_liveness.retain(|slot| {
+            let Some(slot) = slot.upgrade() else {
+                return false;
+            };
+            live |= slot.load(Ordering::Acquire);
+            true
+        });
+        live
+    }
+
+    fn reconcile_idle_lease(&mut self) -> bool {
+        let live = self.global_live();
+        assert_eq!(
+            self.active_packet.is_some(),
+            self.ledger.active_packet_nonce.is_some(),
+            "coalesced packet and affine ledger custody diverged"
+        );
+        if self.ledger.active_packet_nonce.is_none() {
+            match (self.ledger.lease, live) {
+                (PositiveSupportServiceLease::Parked, false) => {
+                    self.ledger.lease = PositiveSupportServiceLease::Idle;
+                }
+                (PositiveSupportServiceLease::Idle, true) => {
+                    self.ledger.lease = PositiveSupportServiceLease::Parked;
+                }
+                _ => {}
+            }
+            self.ledger.assert_affine_custody();
+        }
+        live
+    }
+
+    fn reserve_part(&mut self, shard_id: u64) -> PositiveSupportGlobalPartReservation {
+        if let Some(packet) = self.active_packet.as_mut() {
+            assert_eq!(
+                self.ledger.active_packet_nonce,
+                Some(packet.nonce),
+                "coalesced packet lost its affine ledger reservation"
+            );
+            if shard_id >= packet.admission_horizon || !packet.admitted_shards.insert(shard_id) {
+                return PositiveSupportGlobalPartReservation::Deferred(packet.nonce);
+            }
+            let part_nonce = packet.next_part_nonce;
+            packet.next_part_nonce = packet
+                .next_part_nonce
+                .checked_add(1)
+                .expect("positive Support service packet part nonce overflow");
+            assert!(
+                packet.live_parts.insert(part_nonce),
+                "coalesced packet reused a live part nonce"
+            );
+            return PositiveSupportGlobalPartReservation::Reserved(
+                PositiveSupportPacketReservation {
+                    brand: self.ledger.brand,
+                    nonce: packet.nonce,
+                    lane: packet.lane,
+                    part_nonce,
+                },
+            );
+        }
+
+        let lane = self
+            .ledger
+            .next_lane()
+            .expect("a live service query had no attributable lane");
+        let reservation = match lane {
+            ProgramServiceLane::Exact => self.ledger.reserve_exact(),
+            ProgramServiceLane::Support => self.ledger.reserve_support(true),
+            ProgramServiceLane::Neutral => unreachable!(),
+        }
+        .expect("selected global service lane failed to reserve its affine packet");
+        let admission_horizon = self.next_shard_id;
+        assert!(
+            shard_id < admission_horizon,
+            "global service shard was not registered before packet admission"
+        );
+        let mut admitted_shards = AHashSet::new();
+        assert!(admitted_shards.insert(shard_id));
+        let mut live_parts = AHashSet::new();
+        assert!(live_parts.insert(reservation.part_nonce));
+        self.active_packet = Some(PositiveSupportActiveGlobalPacket {
+            nonce: reservation.nonce,
+            lane,
+            admission_horizon,
+            admitted_shards,
+            next_part_nonce: reservation
+                .part_nonce
+                .checked_add(1)
+                .expect("positive Support service packet part nonce overflow"),
+            live_parts,
+            service: 0,
+        });
+        PositiveSupportGlobalPartReservation::Reserved(reservation)
+    }
+
+    fn settle_part(
+        &mut self,
+        reservation: &PositiveSupportPacketReservation,
+        service: u64,
+    ) -> PositiveSupportGlobalSettlement {
+        assert!(
+            service > 0,
+            "coalesced global service packet parts must have positive cost"
+        );
+        assert!(
+            !self.abandoned,
+            "PositiveSupport global service coordinator was abandoned"
+        );
+        assert_eq!(
+            reservation.brand, self.ledger.brand,
+            "service packet part belongs to another query branch"
+        );
+
+        let packet = self
+            .active_packet
+            .as_mut()
+            .expect("service packet part settled without an active packet");
+        assert_eq!(
+            (reservation.nonce, reservation.lane),
+            (packet.nonce, packet.lane),
+            "service packet part crossed its coalesced packet"
+        );
+        assert!(
+            packet.live_parts.remove(&reservation.part_nonce),
+            "service packet part settled an unknown affine receipt"
+        );
+        packet.service = packet
+            .service
+            .checked_add(service)
+            .expect("coalesced positive Support packet service overflow");
+        let lane = packet.lane;
+        if !packet.live_parts.is_empty() {
+            return PositiveSupportGlobalSettlement {
+                lane,
+                packet_nonce: packet.nonce,
+                closed_packet: None,
+            };
+        }
+
+        let packet = self
+            .active_packet
+            .take()
+            .expect("last service packet part lost its coalesced packet");
+        let remains_live = self.global_live();
+        let prior_max_packet = match packet.lane {
+            ProgramServiceLane::Exact => {
+                let prior = self.ledger.max_exact_packet;
+                self.ledger
+                    .settle_exact(reservation, packet.service, remains_live);
+                prior
+            }
+            ProgramServiceLane::Support => {
+                let prior = self.ledger.max_support_packet;
+                self.ledger
+                    .settle_support(reservation, packet.service, remains_live);
+                prior
+            }
+            ProgramServiceLane::Neutral => unreachable!(),
+        };
+        PositiveSupportGlobalSettlement {
+            lane,
+            packet_nonce: packet.nonce,
+            closed_packet: Some(PositiveSupportGlobalPacketClosure {
+                service: packet.service,
+                prior_max_packet,
+            }),
+        }
+    }
+
+    fn abandon_part(&mut self, reservation: &PositiveSupportPacketReservation) {
+        if self.abandoned {
+            return;
+        }
+        assert_eq!(
+            reservation.brand, self.ledger.brand,
+            "abandoned service packet part belongs to another query branch"
+        );
+        let packet = self
+            .active_packet
+            .as_ref()
+            .expect("abandoned service packet part lost its coalesced packet");
+        assert_eq!(
+            (reservation.nonce, reservation.lane),
+            (packet.nonce, packet.lane),
+            "abandoned service packet part crossed its coalesced packet"
+        );
+        assert!(
+            packet.live_parts.contains(&reservation.part_nonce),
+            "abandoned an unknown service packet part"
+        );
+
+        self.active_packet = None;
+        let remains_live = self.global_live();
+        self.ledger.abandon_packet(reservation, remains_live);
+        self.abandoned = true;
+    }
+}
+
+/// Clone policy is deliberately explicit:
+///
+/// - `parallel_sibling` shares the query-run coordinator and registers a new
+///   liveness slot;
+/// - `try_deep_clone` snapshots and rebrands an independent query branch.
+struct PositiveSupportGlobalServiceRuntime {
+    coordinator: Arc<Mutex<PositiveSupportGlobalServiceCoordinator>>,
+    local_live: Arc<AtomicBool>,
+    shard_id: u64,
+    #[cfg(all(test, feature = "parallel"))]
+    dispatch_probe: Option<GlobalServiceDispatchTestProbe>,
+}
+
+#[cfg(all(test, feature = "parallel"))]
+pub(super) type GlobalServiceDispatchTestProbe = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+enum PositiveSupportGlobalTurn {
+    Inactive,
+    Deferred(u64),
+    Reserved(PositiveSupportGlobalPacketGuard),
+}
+
+struct PositiveSupportGlobalPacketGuard {
+    coordinator: Arc<Mutex<PositiveSupportGlobalServiceCoordinator>>,
+    local_live: Arc<AtomicBool>,
+    reservation: Option<PositiveSupportPacketReservation>,
+}
+
+struct PositiveSupportGlobalSettlement {
+    lane: ProgramServiceLane,
+    packet_nonce: u64,
+    closed_packet: Option<PositiveSupportGlobalPacketClosure>,
+}
+
+struct PositiveSupportGlobalPacketClosure {
+    service: u64,
+    prior_max_packet: u64,
+}
+
+impl PositiveSupportGlobalServiceRuntime {
+    fn dormant() -> Self {
+        Self::from_ledger(PositiveSupportServiceDebtLedger::dormant(), false)
+    }
+
+    fn from_ledger(ledger: PositiveSupportServiceDebtLedger, live: bool) -> Self {
+        let local_live = Arc::new(AtomicBool::new(live));
+        let coordinator = Arc::new(Mutex::new(PositiveSupportGlobalServiceCoordinator {
+            ledger,
+            active_packet: None,
+            next_shard_id: 1,
+            shard_liveness: vec![Arc::downgrade(&local_live)],
+            abandoned: false,
+        }));
+        Self {
+            coordinator,
+            local_live,
+            shard_id: 0,
+            #[cfg(all(test, feature = "parallel"))]
+            dispatch_probe: None,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PositiveSupportGlobalServiceCoordinator> {
+        self.coordinator
+            .lock()
+            .expect("PositiveSupport global service coordinator was poisoned")
+    }
+
+    fn demand_arrived(&self) -> bool {
+        self.local_live.store(true, Ordering::Release);
+        let mut coordinator = self.lock();
+        assert!(
+            !coordinator.abandoned,
+            "PositiveSupport global service coordinator was abandoned"
+        );
+        coordinator.ledger.demand_arrived()
+    }
+
+    fn global_lane_is_active(&self) -> bool {
+        let mut coordinator = self.lock();
+        if coordinator.abandoned {
+            return false;
+        }
+        coordinator.reconcile_idle_lease();
+        matches!(
+            coordinator.ledger.lease,
+            PositiveSupportServiceLease::Parked | PositiveSupportServiceLease::Reserved
+        )
+    }
+
+    #[cfg(feature = "parallel")]
+    fn active_packet_nonce(&self) -> Option<u64> {
+        self.lock()
+            .active_packet
+            .as_ref()
+            .map(|packet| packet.nonce)
+    }
+
+    fn try_reserve_turn(&self, local_live: bool) -> PositiveSupportGlobalTurn {
+        self.local_live.store(local_live, Ordering::Release);
+        if !local_live {
+            return PositiveSupportGlobalTurn::Inactive;
+        }
+
+        let mut coordinator = self.lock();
+        assert!(
+            !coordinator.abandoned,
+            "PositiveSupport global service coordinator was abandoned"
+        );
+        assert!(
+            coordinator.reconcile_idle_lease(),
+            "a live service shard disappeared from query-global liveness"
+        );
+        match coordinator.reserve_part(self.shard_id) {
+            PositiveSupportGlobalPartReservation::Deferred(packet_nonce) => {
+                PositiveSupportGlobalTurn::Deferred(packet_nonce)
+            }
+            PositiveSupportGlobalPartReservation::Reserved(reservation) => {
+                drop(coordinator);
+                PositiveSupportGlobalTurn::Reserved(PositiveSupportGlobalPacketGuard {
+                    coordinator: Arc::clone(&self.coordinator),
+                    local_live: Arc::clone(&self.local_live),
+                    reservation: Some(reservation),
+                })
+            }
+        }
+    }
+
+    #[cfg_attr(not(any(test, feature = "parallel")), allow(dead_code))]
+    fn parallel_sibling(&self) -> Self {
+        let local_live = Arc::new(AtomicBool::new(false));
+        let mut coordinator = self.lock();
+        let shard_id = coordinator.next_shard_id;
+        coordinator.next_shard_id = coordinator
+            .next_shard_id
+            .checked_add(1)
+            .expect("PositiveSupport global service shard id overflow");
+        coordinator.shard_liveness.push(Arc::downgrade(&local_live));
+        drop(coordinator);
+        Self {
+            coordinator: Arc::clone(&self.coordinator),
+            local_live,
+            shard_id,
+            #[cfg(all(test, feature = "parallel"))]
+            dispatch_probe: self.dispatch_probe.clone(),
+        }
+    }
+
+    fn try_deep_clone(&self, local_live: bool) -> Option<Self> {
+        let coordinator = self.lock();
+        if coordinator.abandoned {
+            return None;
+        }
+        assert_eq!(
+            coordinator.active_packet.is_some(),
+            coordinator.ledger.active_packet_nonce.is_some(),
+            "coalesced packet and affine ledger custody diverged"
+        );
+        let mut ledger = coordinator.ledger.try_deep_clone()?;
+        ledger.lease = match (ledger.lease, local_live) {
+            (PositiveSupportServiceLease::Dormant, false) => PositiveSupportServiceLease::Dormant,
+            (PositiveSupportServiceLease::Dormant, true) => return None,
+            (_, true) => PositiveSupportServiceLease::Parked,
+            (_, false) => PositiveSupportServiceLease::Idle,
+        };
+        ledger.assert_affine_custody();
+        #[cfg(all(test, feature = "parallel"))]
+        {
+            let mut cloned = Self::from_ledger(ledger, local_live);
+            cloned.dispatch_probe = self.dispatch_probe.clone();
+            Some(cloned)
+        }
+        #[cfg(not(all(test, feature = "parallel")))]
+        {
+            Some(Self::from_ledger(ledger, local_live))
+        }
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn install_dispatch_probe(&mut self, probe: GlobalServiceDispatchTestProbe) {
+        self.dispatch_probe = Some(probe);
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn notify_dispatch_started(&self, guard: &PositiveSupportGlobalPacketGuard) {
+        let Some(probe) = &self.dispatch_probe else {
+            return;
+        };
+        let reservation = guard
+            .reservation
+            .as_ref()
+            .expect("dispatch probe observed a settled global service part");
+        probe(reservation.nonce, reservation.part_nonce);
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> PositiveSupportServiceDebtSnapshot {
+        let coordinator = self.lock();
+        PositiveSupportServiceDebtSnapshot::from(&coordinator.ledger)
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn shares_coordinator_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.coordinator, &other.coordinator)
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn shares_liveness_slot_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.local_live, &other.local_live)
+    }
+}
+
+impl PositiveSupportGlobalPacketGuard {
+    fn lane(&self) -> ProgramServiceLane {
+        self.reservation
+            .as_ref()
+            .expect("settled global service packet lost its lane")
+            .lane
+    }
+
+    fn settle(mut self, service: u64, local_live: bool) -> PositiveSupportGlobalSettlement {
+        self.local_live.store(local_live, Ordering::Release);
+        let reservation = self
+            .reservation
+            .as_ref()
+            .expect("global service packet settled twice");
+        let mut coordinator = self
+            .coordinator
+            .lock()
+            .expect("PositiveSupport global service coordinator was poisoned");
+        assert!(
+            !coordinator.abandoned,
+            "PositiveSupport global service coordinator was abandoned"
+        );
+        let settlement = coordinator.settle_part(reservation, service);
+        self.reservation.take();
+        settlement
+    }
+}
+
+impl Drop for PositiveSupportGlobalPacketGuard {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.as_ref() else {
+            return;
+        };
+        let Ok(mut coordinator) = self.coordinator.lock() else {
+            return;
+        };
+        coordinator.abandon_part(reservation);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PositiveSupportServiceDebtSnapshot {
+    brand: RegistryBrand,
+    lease: PositiveSupportServiceLease,
+    initial_bypass_spent: bool,
+    exact_service: u64,
+    support_service: u64,
+    max_exact_packet: u64,
+    max_support_packet: u64,
+    next_packet_nonce: u64,
+    active_packet_nonce: Option<u64>,
+    attribution_tainted: bool,
+}
+
+#[cfg(test)]
+impl From<&PositiveSupportServiceDebtLedger> for PositiveSupportServiceDebtSnapshot {
+    fn from(ledger: &PositiveSupportServiceDebtLedger) -> Self {
+        Self {
+            brand: ledger.brand,
+            lease: ledger.lease,
+            initial_bypass_spent: ledger.initial_bypass_spent,
+            exact_service: ledger.exact_service,
+            support_service: ledger.support_service,
+            max_exact_packet: ledger.max_exact_packet,
+            max_support_packet: ledger.max_support_packet,
+            next_packet_nonce: ledger.next_packet_nonce,
+            active_packet_nonce: ledger.active_packet_nonce,
+            attribution_tainted: ledger.attribution_tainted,
         }
     }
 }
@@ -5896,6 +6482,26 @@ pub(super) struct DeltaStepOutcome {
     pub(super) demand_preference: Option<ActiveDeltaContinuation>,
 }
 
+/// One attempt to advance the global cyclic frontier.
+///
+/// `Deferred` is an executor signal, not semantic exhaustion: this shard has
+/// already contributed to the still-open query-global service packet and must
+/// be rescheduled after that packet closes.
+pub(super) enum DeltaSchedulerStep {
+    Deferred {
+        packet_nonce: u64,
+    },
+    Completed {
+        outcome: DeltaStepOutcome,
+        global_packet_event: Option<GlobalServicePacketEvent>,
+    },
+}
+
+pub(super) enum GlobalServicePacketEvent {
+    StillOpen { packet_nonce: u64 },
+    Closed,
+}
+
 impl DeltaStepOutcome {
     pub(super) fn has_stable_effect(&self) -> bool {
         self.continuation.is_some() || self.publication.is_some()
@@ -6448,8 +7054,8 @@ pub(super) struct DeltaScheduler {
     positive_support_service_locator_boundary_probes: usize,
     /// Mutually exclusive PositiveSupport admission currency.
     positive_support_scheduling: PositiveSupportScheduling,
-    /// One aggregate affine lease for the opt-in global service policy.
-    positive_support_service_debt: PositiveSupportServiceDebtLedger,
+    /// One aggregate affine query-run lease shared by parallel siblings.
+    positive_support_service_debt: Option<PositiveSupportGlobalServiceRuntime>,
     /// One public pull may carry one demand token while the machine searches
     /// for a concrete parked Support parent. Assignment consumes the token
     /// permanently into that parent's conservation ledger, while retaining
@@ -6492,7 +7098,7 @@ impl DeltaScheduler {
             #[cfg(test)]
             positive_support_service_locator_boundary_probes: 0,
             positive_support_scheduling: PositiveSupportScheduling::CountCredit,
-            positive_support_service_debt: PositiveSupportServiceDebtLedger::dormant(),
+            positive_support_service_debt: None,
             public_pull_demand: PublicPullDemandState::Closed,
             program_runtimes: AHashMap::new(),
             program_scratch: None,
@@ -6518,19 +7124,39 @@ impl DeltaScheduler {
         );
         self.positive_support_scheduling = PositiveSupportScheduling::GlobalServiceDebt;
         self.program_lane_selection = ProgramLaneSelection::LanePure;
-    }
-
-    #[cfg(feature = "parallel")]
-    pub(super) fn uses_positive_support_global_service_debt(&self) -> bool {
-        self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
+        self.positive_support_service_debt = Some(PositiveSupportGlobalServiceRuntime::dormant());
     }
 
     pub(super) fn global_service_lane_is_active(&self) -> bool {
         self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
-            && matches!(
-                self.positive_support_service_debt.lease,
-                PositiveSupportServiceLease::Parked | PositiveSupportServiceLease::Reserved
-            )
+            && self
+                .positive_support_service_debt
+                .as_ref()
+                .expect("global service policy lost its query-run coordinator")
+                .global_lane_is_active()
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(super) fn uses_global_service_debt(&self) -> bool {
+        self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(super) fn global_service_active_packet_nonce(&self) -> Option<u64> {
+        self.positive_support_service_debt
+            .as_ref()
+            .and_then(PositiveSupportGlobalServiceRuntime::active_packet_nonce)
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    pub(super) fn install_global_service_dispatch_probe(
+        &mut self,
+        probe: GlobalServiceDispatchTestProbe,
+    ) {
+        self.positive_support_service_debt
+            .as_mut()
+            .expect("global service scheduler lost its coordinator")
+            .install_dispatch_probe(probe);
     }
 
     fn lane_selection_is_active(&self) -> bool {
@@ -8580,7 +9206,11 @@ impl DeltaScheduler {
                 }
                 self.public_pull_demand = PublicPullDemandState::Assigned;
                 stats.delta_positive_support_service_parents_started += 1;
-                let epoch_started = self.positive_support_service_debt.demand_arrived();
+                let epoch_started = self
+                    .positive_support_service_debt
+                    .as_ref()
+                    .expect("global service demand lost its query-run coordinator")
+                    .demand_arrived();
                 if epoch_started {
                     stats.delta_positive_support_service_epochs += 1;
                 }
@@ -8684,73 +9314,110 @@ impl DeltaScheduler {
         woke
     }
 
-    /// Chooses the next attributable global Program lane. Exact owns ties;
-    /// Support receives one initial packet and thereafter only runs while its
-    /// cumulative validated service is strictly behind.
-    fn arm_global_service_lane(&mut self) {
-        if self.positive_support_scheduling != PositiveSupportScheduling::GlobalServiceDebt {
-            return;
-        }
-        if !self.global_service_lane_is_active() {
-            self.next_program_lane = None;
-            self.next_program_state = None;
-            self.global_service_woken_support_tasks = 0;
-            return;
-        }
+    fn assert_local_global_service_pair(&self) {
+        // Production reachability makes this pair structural. A positive
+        // publication is opened only after nonquiescent Exact roots exist,
+        // those roots are filed before Support is parked, and every Exact
+        // quiescence/positive path retires the linked Support children before
+        // returning. Conversely, losing the final Support child makes the
+        // parent ineligible for service start. Therefore a service-started
+        // live parent can expose neither lane without the other.
+        let exact = self
+            .program_worklist
+            .last_id_in_lane(&self.registry, ProgramServiceLane::Exact)
+            .is_some();
+        let support = self
+            .program_worklist
+            .last_id_in_lane(&self.registry, ProgramServiceLane::Support)
+            .is_some()
+            || self
+                .parked_positive_support_worklist
+                .last_id_in_lane(&self.registry, ProgramServiceLane::Support)
+                .is_some();
+        assert!(
+            exact && support,
+            "an active global-service shard must furnish both Exact and Support lanes"
+        );
+    }
+
+    /// Arms the already-reserved query-global Program lane in this shard.
+    ///
+    /// Reservation precedes local wake/pop. Overlapping shards receive
+    /// distinct affine parts of the same coalesced packet and therefore move
+    /// only work from its one query-global selected lane.
+    fn arm_global_service_lane(&mut self, lane: Option<ProgramServiceLane>) {
         self.next_program_lane = None;
         self.next_program_state = None;
         self.global_service_woken_support_tasks = 0;
-        if self
-            .positive_support_service_debt
-            .support_is_admissible(true)
-        {
-            self.global_service_woken_support_tasks = self.wake_global_service_support_lane();
-            assert!(
-                self.global_service_woken_support_tasks > 0,
-                "admissible Support service lane had no parked task"
-            );
-            let state = self
-                .program_worklist
-                .last_id_in_lane(&self.registry, ProgramServiceLane::Support)
-                .expect("admissible Support service lane lost its queued packet");
-            self.next_program_lane = Some(ProgramServiceLane::Support);
-            self.next_program_state = Some(state);
-        } else if let Some(state) = self
-            .program_worklist
-            .last_id_in_lane(&self.registry, ProgramServiceLane::Exact)
-        {
-            self.next_program_lane = Some(ProgramServiceLane::Exact);
-            self.next_program_state = Some(state);
+        match lane {
+            Some(ProgramServiceLane::Support) => {
+                self.global_service_woken_support_tasks = self.wake_global_service_support_lane();
+                assert!(
+                    self.global_service_woken_support_tasks > 0,
+                    "reserved Support service lane had no parked task"
+                );
+                let state = self
+                    .program_worklist
+                    .last_id_in_lane(&self.registry, ProgramServiceLane::Support)
+                    .expect("reserved Support service lane lost its queued packet");
+                self.next_program_lane = Some(ProgramServiceLane::Support);
+                self.next_program_state = Some(state);
+            }
+            Some(ProgramServiceLane::Exact) => {
+                let state = self
+                    .program_worklist
+                    .last_id_in_lane(&self.registry, ProgramServiceLane::Exact)
+                    .expect("reserved Exact service lane lost its queued packet");
+                self.next_program_lane = Some(ProgramServiceLane::Exact);
+                self.next_program_state = Some(state);
+            }
+            Some(ProgramServiceLane::Neutral) => unreachable!(),
+            None => {}
         }
     }
 
-    fn reserve_global_service_packet(
-        &mut self,
-        lane: ProgramServiceLane,
-    ) -> Option<PositiveSupportPacketReservation> {
-        match (self.positive_support_scheduling, lane) {
-            (PositiveSupportScheduling::GlobalServiceDebt, ProgramServiceLane::Support) => {
-                self.positive_support_service_debt.reserve_support(true)
+    fn reserve_global_service_packet(&mut self) -> PositiveSupportGlobalTurn {
+        if self.positive_support_scheduling != PositiveSupportScheduling::GlobalServiceDebt {
+            return PositiveSupportGlobalTurn::Inactive;
+        }
+        let local_live = self.registry.has_live_started_positive_support();
+        match self
+            .positive_support_service_debt
+            .as_ref()
+            .expect("global service policy lost its query-run coordinator")
+            .try_reserve_turn(local_live)
+        {
+            PositiveSupportGlobalTurn::Inactive => {
+                self.arm_global_service_lane(None);
+                PositiveSupportGlobalTurn::Inactive
             }
-            _ => None,
+            PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                self.arm_global_service_lane(None);
+                PositiveSupportGlobalTurn::Deferred(packet_nonce)
+            }
+            PositiveSupportGlobalTurn::Reserved(turn) => {
+                self.assert_local_global_service_pair();
+                self.arm_global_service_lane(Some(turn.lane()));
+                PositiveSupportGlobalTurn::Reserved(turn)
+            }
         }
     }
 
     fn settle_global_service_packet(
         &mut self,
         lane: ProgramServiceLane,
-        reservation: Option<PositiveSupportPacketReservation>,
+        reservation: Option<PositiveSupportGlobalPacketGuard>,
         examined: usize,
         stats: &mut ResidualStateStats,
-    ) {
+    ) -> Option<GlobalServicePacketEvent> {
         if self.positive_support_scheduling != PositiveSupportScheduling::GlobalServiceDebt
             || lane == ProgramServiceLane::Neutral
         {
             assert!(
                 reservation.is_none(),
-                "neutral/count dispatch retained a global Support reservation"
+                "neutral/count dispatch retained a global service packet part"
             );
-            return;
+            return None;
         }
         // A quiescent typed receipt may validate zero candidates while still
         // consuming one physical dispatch. Service ticks are therefore
@@ -8758,38 +9425,49 @@ impl DeltaScheduler {
         // debt theorem rather than silently becoming free.
         let charged = examined.max(1);
         let service = u64::try_from(charged).expect("Program service does not fit u64");
-        let remains_live = self.registry.has_live_started_positive_support();
+        let settlement = reservation
+            .expect("attributable service packet lost its global turn")
+            .settle(service, self.registry.has_live_started_positive_support());
+        assert_eq!(
+            settlement.lane, lane,
+            "global service packet part crossed its selected Program lane"
+        );
+        let PositiveSupportGlobalSettlement {
+            lane: _,
+            packet_nonce,
+            closed_packet,
+        } = settlement;
+        let packet_closed = closed_packet.is_some();
         match lane {
             ProgramServiceLane::Exact => {
-                assert!(
-                    reservation.is_none(),
-                    "Exact packet received a Support reservation"
-                );
-                let prior_max = self.positive_support_service_debt.max_exact_packet;
-                self.positive_support_service_debt
-                    .settle_exact(service, remains_live);
                 stats.delta_positive_support_service_exact_examined += charged;
-                stats.delta_positive_support_service_exact_packets += 1;
-                stats.max_delta_positive_support_service_exact_packet = stats
-                    .max_delta_positive_support_service_exact_packet
-                    .max(charged);
-                stats.delta_positive_support_service_exact_packet_allowance +=
-                    charged.saturating_sub(prior_max as usize);
+                if let Some(closed) = closed_packet {
+                    let packet = usize::try_from(closed.service)
+                        .expect("coalesced Exact service packet does not fit usize");
+                    let prior_max = usize::try_from(closed.prior_max_packet)
+                        .expect("prior Exact service packet maximum does not fit usize");
+                    stats.delta_positive_support_service_exact_packets += 1;
+                    stats.max_delta_positive_support_service_exact_packet = stats
+                        .max_delta_positive_support_service_exact_packet
+                        .max(packet);
+                    stats.delta_positive_support_service_exact_packet_allowance +=
+                        packet.saturating_sub(prior_max);
+                }
             }
             ProgramServiceLane::Support => {
-                let prior_max = self.positive_support_service_debt.max_support_packet;
-                self.positive_support_service_debt.settle_support(
-                    reservation.expect("Support packet lost its global affine reservation"),
-                    service,
-                    remains_live,
-                );
                 stats.delta_positive_support_service_support_examined += charged;
-                stats.delta_positive_support_service_support_packets += 1;
-                stats.max_delta_positive_support_service_support_packet = stats
-                    .max_delta_positive_support_service_support_packet
-                    .max(charged);
-                stats.delta_positive_support_service_support_packet_allowance +=
-                    charged.saturating_sub(prior_max as usize);
+                if let Some(closed) = closed_packet {
+                    let packet = usize::try_from(closed.service)
+                        .expect("coalesced Support service packet does not fit usize");
+                    let prior_max = usize::try_from(closed.prior_max_packet)
+                        .expect("prior Support service packet maximum does not fit usize");
+                    stats.delta_positive_support_service_support_packets += 1;
+                    stats.max_delta_positive_support_service_support_packet = stats
+                        .max_delta_positive_support_service_support_packet
+                        .max(packet);
+                    stats.delta_positive_support_service_support_packet_allowance +=
+                        packet.saturating_sub(prior_max);
+                }
                 // `step_program` files every live PositiveSupport recurrence
                 // directly into parked custody. Only tasks woken for another
                 // parent/state but excluded from this physical packet need a
@@ -8818,6 +9496,11 @@ impl DeltaScheduler {
             }
             ProgramServiceLane::Neutral => unreachable!(),
         }
+        Some(if packet_closed {
+            GlobalServicePacketEvent::Closed
+        } else {
+            GlobalServicePacketEvent::StillOpen { packet_nonce }
+        })
     }
 
     /// Moves already queued PositiveSupport tasks out of runnable selection
@@ -9563,7 +10246,12 @@ impl DeltaScheduler {
             !runnable || !parked,
             "one activation remained both runnable and parked after a directed step"
         );
-        let release_directed_lease = outcome.release_directed_lease;
+        // A query-global service epoch may remain active solely because a
+        // sibling shard still owns work. That does not manufacture ordinary
+        // runnable custody for a locally exhausted directed activation.
+        // Release is meaningful only when this shard can actually return the
+        // exact continuation to its ordinary queue.
+        let release_directed_lease = outcome.release_directed_lease && runnable;
         let resume = (!release_directed_lease)
             .then(|| settled.or_else(|| runnable.then_some(active)))
             .flatten();
@@ -9609,6 +10297,7 @@ impl DeltaScheduler {
         self.step_bounded(root, plan, width, None, stable, stable_interner, stats)
     }
 
+    #[cfg(test)]
     pub(super) fn step_bounded<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -9619,7 +10308,39 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
-        self.arm_global_service_lane();
+        match self.try_step_bounded(
+            root,
+            plan,
+            search_width,
+            direct_terminal_publication_full,
+            stable,
+            stable_interner,
+            stats,
+        ) {
+            DeltaSchedulerStep::Completed { outcome, .. } => outcome,
+            DeltaSchedulerStep::Deferred { .. } => {
+                panic!("serial delta step was deferred behind a parallel service packet")
+            }
+        }
+    }
+
+    pub(super) fn try_step_bounded<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        search_width: usize,
+        direct_terminal_publication_full: Option<VariableSet>,
+        stable: &mut Worklist,
+        stable_interner: &mut StateInterner,
+        stats: &mut ResidualStateStats,
+    ) -> DeltaSchedulerStep {
+        let service_reservation = match self.reserve_global_service_packet() {
+            PositiveSupportGlobalTurn::Inactive => None,
+            PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                return DeltaSchedulerStep::Deferred { packet_nonce };
+            }
+            PositiveSupportGlobalTurn::Reserved(turn) => Some(turn),
+        };
         if !self.program_worklist.is_empty() {
             let (state, tasks, support_grants, dispatch) = self.pop_program_bounded(search_width);
             let service_lane = if self.positive_support_scheduling
@@ -9641,7 +10362,18 @@ impl DeltaScheduler {
             } else {
                 ProgramServiceLane::Neutral
             };
-            let service_reservation = self.reserve_global_service_packet(service_lane);
+            assert_eq!(
+                service_reservation.as_ref().map(|turn| turn.lane()),
+                (service_lane != ProgramServiceLane::Neutral).then_some(service_lane),
+                "Program service lane diverged from its reserved global turn"
+            );
+            #[cfg(all(test, feature = "parallel"))]
+            if let Some(turn) = service_reservation.as_ref() {
+                self.positive_support_service_debt
+                    .as_ref()
+                    .expect("global service dispatch lost its coordinator")
+                    .notify_dispatch_started(turn);
+            }
             let examined_before = stats
                 .delta_source_candidates_examined
                 .saturating_add(stats.delta_transition_candidates_examined);
@@ -9658,7 +10390,7 @@ impl DeltaScheduler {
                 stable_interner,
                 stats,
             );
-            self.settle_global_service_packet(
+            let global_packet_event = self.settle_global_service_packet(
                 service_lane,
                 service_reservation,
                 physical.validated_program_examined,
@@ -9675,18 +10407,24 @@ impl DeltaScheduler {
             );
             outcome.allows_global_width_growth =
                 retired_search_receipt || physical_allows_global_width_growth;
-            return outcome;
+            return DeltaSchedulerStep::Completed {
+                outcome,
+                global_packet_event,
+            };
         }
         if self.worklist.is_empty() {
-            return self.step_source(
-                root,
-                plan,
-                search_width,
-                direct_terminal_publication_full,
-                stable,
-                stable_interner,
-                stats,
-            );
+            return DeltaSchedulerStep::Completed {
+                outcome: self.step_source(
+                    root,
+                    plan,
+                    search_width,
+                    direct_terminal_publication_full,
+                    stable,
+                    stable_interner,
+                    stats,
+                ),
+                global_packet_event: None,
+            };
         }
 
         let (desc, tasks, dispatch) = self.pop_bounded(search_width);
@@ -9712,7 +10450,10 @@ impl DeltaScheduler {
             &physical.terminal_publications,
             stats,
         );
-        outcome
+        DeltaSchedulerStep::Completed {
+            outcome,
+            global_packet_event: None,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11003,6 +11744,13 @@ impl DeltaScheduler {
             positive_support_service_demand_queued.len(),
             "service-demand locator clone found duplicate or missing membership"
         );
+        let positive_support_service_live = registry.has_live_started_positive_support();
+        let positive_support_service_debt =
+            self.positive_support_service_debt.as_ref().map(|service| {
+                service
+                    .try_deep_clone(positive_support_service_live)
+                    .expect("cannot clone a scheduler across an in-flight service packet")
+            });
         Self {
             registry,
             interner: self.interner.clone(),
@@ -11022,10 +11770,7 @@ impl DeltaScheduler {
             positive_support_service_locator_boundary_probes: self
                 .positive_support_service_locator_boundary_probes,
             positive_support_scheduling: self.positive_support_scheduling,
-            positive_support_service_debt: self
-                .positive_support_service_debt
-                .try_deep_clone()
-                .expect("cannot clone a scheduler across an in-flight Support packet"),
+            positive_support_service_debt,
             public_pull_demand: self.public_pull_demand,
             program_runtimes: self.program_runtimes.clone(),
             program_scratch: None,
@@ -11040,7 +11785,45 @@ impl DeltaScheduler {
         let mut sibling = Self::new();
         sibling.positive_support_scheduling = self.positive_support_scheduling;
         sibling.program_lane_selection = self.program_lane_selection;
+        sibling.positive_support_service_debt = self
+            .positive_support_service_debt
+            .as_ref()
+            .map(PositiveSupportGlobalServiceRuntime::parallel_sibling);
         sibling
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    pub(super) fn shares_global_service_coordinator_with(&self, other: &Self) -> bool {
+        self.positive_support_service_debt
+            .as_ref()
+            .expect("left scheduler lost its global service coordinator")
+            .shares_coordinator_with(
+                other
+                    .positive_support_service_debt
+                    .as_ref()
+                    .expect("right scheduler lost its global service coordinator"),
+            )
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    pub(super) fn shares_global_service_liveness_slot_with(&self, other: &Self) -> bool {
+        self.positive_support_service_debt
+            .as_ref()
+            .expect("left scheduler lost its global service coordinator")
+            .shares_liveness_slot_with(
+                other
+                    .positive_support_service_debt
+                    .as_ref()
+                    .expect("right scheduler lost its global service coordinator"),
+            )
+    }
+
+    #[cfg(test)]
+    fn global_service_debt_snapshot(&self) -> PositiveSupportServiceDebtSnapshot {
+        self.positive_support_service_debt
+            .as_ref()
+            .expect("global service scheduler lost its coordinator")
+            .snapshot()
     }
 }
 
@@ -11189,7 +11972,7 @@ mod tests {
         let reservation = ledger
             .reserve_support(true)
             .expect("selected Support packet must reserve the global lease");
-        ledger.settle_support(reservation, service, remains_live);
+        ledger.settle_support(&reservation, service, remains_live);
         trace.push(TestServiceLane::Support);
     }
 
@@ -11199,7 +11982,10 @@ mod tests {
         trace: &mut Vec<TestServiceLane>,
     ) {
         assert_eq!(next_service_lane(ledger), TestServiceLane::Exact);
-        ledger.settle_exact(service, true);
+        let reservation = ledger
+            .reserve_exact()
+            .expect("selected Exact packet must reserve the global lease");
+        ledger.settle_exact(&reservation, service, true);
         trace.push(TestServiceLane::Exact);
     }
 
@@ -11302,7 +12088,7 @@ mod tests {
         let initial = ledger
             .reserve_support(true)
             .expect("the first epoch demand authorizes one initial packet");
-        ledger.settle_support(initial, 5, true);
+        ledger.settle_support(&initial, 5, true);
         assert!(!ledger.demand_arrived());
         assert!(!ledger.support_is_admissible(true));
         assert!(
@@ -11310,7 +12096,8 @@ mod tests {
             "later public pulls must not mint another query-global bypass"
         );
 
-        ledger.settle_exact(6, true);
+        let exact = ledger.reserve_exact().expect("Exact owns the debt tie");
+        ledger.settle_exact(&exact, 6, true);
         assert!(ledger.support_is_admissible(true));
     }
 
@@ -11342,7 +12129,7 @@ mod tests {
         assert!(ledger.active_packet_nonce.is_some());
         assert!(ledger.try_deep_clone().is_none());
 
-        ledger.settle_support(reservation, 3, false);
+        ledger.settle_support(&reservation, 3, false);
         assert_eq!(ledger.lease, PositiveSupportServiceLease::Idle);
         assert_eq!(ledger.support_service, 3);
         assert!(ledger.active_packet_nonce.is_none());
@@ -11356,13 +12143,211 @@ mod tests {
     }
 
     #[test]
+    fn positive_support_global_service_coalesces_overlapping_parts() {
+        fn reserved(turn: PositiveSupportGlobalTurn) -> PositiveSupportGlobalPacketGuard {
+            match turn {
+                PositiveSupportGlobalTurn::Reserved(guard) => guard,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("live global-service shard failed to reserve a packet part")
+                }
+                PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                    panic!("live global-service shard was deferred on packet {packet_nonce}")
+                }
+            }
+        }
+
+        let left = PositiveSupportGlobalServiceRuntime::dormant();
+        let right = left.parallel_sibling();
+        assert!(left.demand_arrived());
+        assert!(!right.demand_arrived());
+
+        let support_left = reserved(left.try_reserve_turn(true));
+        let support_right = reserved(right.try_reserve_turn(true));
+        let left_receipt = support_left
+            .reservation
+            .as_ref()
+            .expect("left Support part retained its receipt");
+        let right_receipt = support_right
+            .reservation
+            .as_ref()
+            .expect("right Support part retained its receipt");
+        assert_eq!(
+            (left_receipt.lane, right_receipt.lane),
+            (ProgramServiceLane::Support, ProgramServiceLane::Support)
+        );
+        assert_eq!(
+            left_receipt.nonce, right_receipt.nonce,
+            "overlapping shards must join one global packet nonce"
+        );
+        assert_ne!(
+            left_receipt.part_nonce, right_receipt.part_nonce,
+            "overlapping shards still require distinct affine part receipts"
+        );
+        let support_nonce = left_receipt.nonce;
+        let opened = left.snapshot();
+        assert!(opened.initial_bypass_spent);
+        assert_eq!(opened.next_packet_nonce, 1);
+        assert_eq!(opened.active_packet_nonce, Some(support_nonce));
+        assert_eq!((opened.support_service, opened.max_support_packet), (0, 0));
+
+        let first = support_left.settle(2, true);
+        assert_eq!(first.lane, ProgramServiceLane::Support);
+        assert!(
+            first.closed_packet.is_none(),
+            "a non-final part must not charge the global ledger"
+        );
+        let half_settled = left.snapshot();
+        assert_eq!(half_settled.active_packet_nonce, Some(support_nonce));
+        assert_eq!(
+            (
+                half_settled.next_packet_nonce,
+                half_settled.support_service,
+                half_settled.max_support_packet,
+            ),
+            (1, 0, 0),
+            "partial settlement must neither mint nor charge a packet"
+        );
+        assert_eq!(
+            match left.try_reserve_turn(true) {
+                PositiveSupportGlobalTurn::Deferred(packet_nonce) => packet_nonce,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("settled shard unexpectedly became inactive")
+                }
+                PositiveSupportGlobalTurn::Reserved(_) => {
+                    panic!("one shard re-entered an open coalesced packet")
+                }
+            },
+            support_nonce
+        );
+        assert_eq!(
+            match right.try_reserve_turn(true) {
+                PositiveSupportGlobalTurn::Deferred(packet_nonce) => packet_nonce,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("live part owner unexpectedly became inactive")
+                }
+                PositiveSupportGlobalTurn::Reserved(_) => {
+                    panic!("one shard minted a second live part in one packet")
+                }
+            },
+            support_nonce
+        );
+        let late = left.parallel_sibling();
+        assert_eq!(
+            match late.try_reserve_turn(true) {
+                PositiveSupportGlobalTurn::Deferred(packet_nonce) => packet_nonce,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("late live shard unexpectedly became inactive")
+                }
+                PositiveSupportGlobalTurn::Reserved(_) => {
+                    panic!("a shard created after packet admission extended its finite cohort")
+                }
+            },
+            support_nonce
+        );
+        drop(late);
+
+        let closed = support_right.settle(3, true);
+        let support_packet = closed
+            .closed_packet
+            .expect("the final Support part must close the coalesced packet");
+        assert_eq!(closed.lane, ProgramServiceLane::Support);
+        assert_eq!(
+            (support_packet.service, support_packet.prior_max_packet),
+            (5, 0),
+            "the packet charge is the sum of its parts, not their maximum"
+        );
+        let support_snapshot = left.snapshot();
+        assert_eq!(
+            (
+                support_snapshot.next_packet_nonce,
+                support_snapshot.support_service,
+                support_snapshot.max_support_packet,
+            ),
+            (1, 5, 5)
+        );
+        left.lock().ledger.assert_packet_bounds();
+
+        let exact_left = reserved(left.try_reserve_turn(true));
+        let exact_right = reserved(right.try_reserve_turn(true));
+        assert_eq!(exact_left.lane(), ProgramServiceLane::Exact);
+        assert_eq!(exact_right.lane(), ProgramServiceLane::Exact);
+        assert_eq!(
+            exact_left
+                .reservation
+                .as_ref()
+                .expect("left Exact part retained its receipt")
+                .nonce,
+            exact_right
+                .reservation
+                .as_ref()
+                .expect("right Exact part retained its receipt")
+                .nonce
+        );
+        assert!(exact_left.settle(1, true).closed_packet.is_none());
+        let exact_packet = exact_right
+            .settle(5, true)
+            .closed_packet
+            .expect("the final Exact part must close the coalesced packet");
+        assert_eq!(
+            (exact_packet.service, exact_packet.prior_max_packet),
+            (6, 0)
+        );
+        let exact_snapshot = left.snapshot();
+        assert_eq!(
+            (
+                exact_snapshot.next_packet_nonce,
+                exact_snapshot.support_service,
+                exact_snapshot.exact_service,
+                exact_snapshot.max_support_packet,
+                exact_snapshot.max_exact_packet,
+            ),
+            (2, 5, 6, 5, 6)
+        );
+
+        let later_support = reserved(left.try_reserve_turn(true));
+        assert_eq!(later_support.lane(), ProgramServiceLane::Support);
+        let later_support_packet = later_support
+            .settle(4, true)
+            .closed_packet
+            .expect("one-part later Support packet must close immediately");
+        assert_eq!(
+            (
+                later_support_packet.service,
+                later_support_packet.prior_max_packet,
+            ),
+            (4, 5)
+        );
+        let after_smaller_support = left.snapshot();
+        assert_eq!(
+            (
+                after_smaller_support.next_packet_nonce,
+                after_smaller_support.support_service,
+                after_smaller_support.exact_service,
+                after_smaller_support.max_support_packet,
+                after_smaller_support.max_exact_packet,
+            ),
+            (3, 9, 6, 5, 6),
+            "a later H=4 packet raises total H but must leave qH=max(5, 4)=5"
+        );
+        {
+            let coordinator = left.lock();
+            assert_eq!(
+                coordinator.ledger.next_lane(),
+                Some(ProgramServiceLane::Exact),
+                "Exact must run after Support crosses the cumulative service tie"
+            );
+            coordinator.ledger.assert_packet_bounds();
+        }
+    }
+
+    #[test]
     fn positive_support_idle_clone_rebrands_without_refunding_debt() {
         let mut ledger = PositiveSupportServiceDebtLedger::dormant();
         assert!(ledger.demand_arrived());
         let initial = ledger
             .reserve_support(true)
             .expect("the iterator owns one initial Support bypass");
-        ledger.settle_support(initial, 3, false);
+        ledger.settle_support(&initial, 3, false);
         assert_eq!(ledger.lease, PositiveSupportServiceLease::Idle);
 
         let mut cloned = ledger
@@ -11395,11 +12380,12 @@ mod tests {
         );
 
         assert!(!cloned.demand_arrived());
-        cloned.settle_exact(4, true);
+        let exact = cloned.reserve_exact().expect("Exact owns the debt tie");
+        cloned.settle_exact(&exact, 4, true);
         let next = cloned
             .reserve_support(true)
             .expect("the clone may spend only debt-authorized Support");
-        cloned.settle_support(next, 1, false);
+        cloned.settle_support(&next, 1, false);
         assert_eq!((cloned.exact_service, cloned.support_service), (4, 4));
         assert_eq!(
             (ledger.lease, ledger.exact_service, ledger.support_service),
@@ -11426,7 +12412,10 @@ mod tests {
             "demand cannot revive a poisoned service epoch"
         );
 
-        ledger.settle_exact(100, false);
+        let exact = ledger
+            .reserve_exact()
+            .expect("tainted service admits Exact");
+        ledger.settle_exact(&exact, 100, false);
         assert_eq!(ledger.lease, PositiveSupportServiceLease::Idle);
         assert!(
             !ledger.demand_arrived(),
@@ -11451,7 +12440,7 @@ mod tests {
         let mut ledger = PositiveSupportServiceDebtLedger::dormant();
         assert!(ledger.demand_arrived());
         let reservation = ledger.reserve_support(true).unwrap();
-        ledger.settle_support(reservation, 0, true);
+        ledger.settle_support(&reservation, 0, true);
     }
 
     #[test]
@@ -11459,7 +12448,10 @@ mod tests {
     fn positive_support_service_debt_rejects_zero_cost_exact_packets() {
         let mut ledger = PositiveSupportServiceDebtLedger::dormant();
         assert!(ledger.demand_arrived());
-        ledger.settle_exact(0, true);
+        let initial = ledger.reserve_support(true).unwrap();
+        ledger.settle_support(&initial, 1, true);
+        let exact = ledger.reserve_exact().unwrap();
+        ledger.settle_exact(&exact, 0, true);
     }
 
     #[test]
@@ -12206,10 +13198,12 @@ mod tests {
         let mut scheduler = DeltaScheduler::new();
         scheduler.enable_positive_support_global_service_debt();
         let candidate = value(69);
-        let (_, parent, _, _) =
+        let (exact, parent, exact_credit, _) =
             open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
-        let (support, _) =
+        let (support, support_active) =
             queue_one_shot_positive_support(&mut scheduler, &root, parent, candidate, false);
+        let _ =
+            queue_exact_confirm_credit(&mut scheduler, support_active.state, exact, exact_credit);
         scheduler.assert_runnable_positive_support_task_index();
         assert_eq!(scheduler.runnable_positive_support_tasks[&parent], 1);
         scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
@@ -12255,7 +13249,15 @@ mod tests {
             "a no-candidate service pull must not rediscover parked tasks"
         );
 
-        scheduler.arm_global_service_lane();
+        let _turn = match scheduler.reserve_global_service_packet() {
+            PositiveSupportGlobalTurn::Reserved(turn) => turn,
+            PositiveSupportGlobalTurn::Inactive => {
+                panic!("started service parent failed to activate the initial Support turn")
+            }
+            PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                panic!("single scheduler was deferred on packet {packet_nonce}")
+            }
+        };
         scheduler.assert_runnable_positive_support_task_index();
         assert_eq!(
             scheduler.next_program_lane,
@@ -12377,7 +13379,7 @@ mod tests {
             (0, 0)
         );
         assert_eq!(
-            scheduler.positive_support_service_debt.lease,
+            scheduler.global_service_debt_snapshot().lease,
             PositiveSupportServiceLease::Dormant
         );
     }
@@ -12429,7 +13431,7 @@ mod tests {
             1
         );
         assert_eq!(
-            scheduler.positive_support_service_debt.lease,
+            scheduler.global_service_debt_snapshot().lease,
             PositiveSupportServiceLease::Idle
         );
         scheduler.assert_runnable_positive_support_task_index();
@@ -12443,9 +13445,9 @@ mod tests {
         let mut scheduler = DeltaScheduler::new();
         scheduler.enable_positive_support_global_service_debt();
         let candidate = value(71);
-        let (_, parent, _, _) =
+        let (exact, parent, exact_credit, _) =
             open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
-        let (support, _) = queue_positive_support_with_examined(
+        let (support, support_active) = queue_positive_support_with_examined(
             &mut scheduler,
             &root,
             parent,
@@ -12454,6 +13456,8 @@ mod tests {
             true,
             7,
         );
+        let _ =
+            queue_exact_confirm_credit(&mut scheduler, support_active.state, exact, exact_credit);
         scheduler.park_positive_support_activations(&AHashSet::from_iter([support]));
         let mut stats = ResidualStateStats::default();
         assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
@@ -12483,7 +13487,7 @@ mod tests {
             stats.delta_positive_support_service_support_packet_allowance,
             7
         );
-        assert_eq!(scheduler.positive_support_service_debt.support_service, 7);
+        assert_eq!(scheduler.global_service_debt_snapshot().support_service, 7);
     }
 
     #[test]
@@ -12544,15 +13548,21 @@ mod tests {
         scheduler.enable_positive_support_global_service_debt();
         let mut children = AHashSet::new();
         for candidate in [value(77), value(78)] {
-            let (_, parent, _, _) =
+            let (exact, parent, exact_credit, _) =
                 open_tapped_confirm_with_support(&mut scheduler.registry, [candidate], None, true);
-            let (child, _) = queue_one_shot_positive_support_with_result(
+            let (child, support_active) = queue_one_shot_positive_support_with_result(
                 &mut scheduler,
                 &root,
                 parent,
                 candidate,
                 false,
                 false,
+            );
+            let _ = queue_exact_confirm_credit(
+                &mut scheduler,
+                support_active.state,
+                exact,
+                exact_credit,
             );
             children.insert(child);
         }
@@ -12599,7 +13609,7 @@ mod tests {
         let first = ledger
             .reserve_support(true)
             .expect("the first epoch owns one initial Support bypass");
-        ledger.settle_support(first, 7, false);
+        ledger.settle_support(&first, 7, false);
         assert_eq!(ledger.lease, PositiveSupportServiceLease::Idle);
         assert!(ledger.initial_bypass_spent);
         assert_eq!(
@@ -12623,11 +13633,14 @@ mod tests {
             ledger.reserve_support(true).is_none(),
             "empty turnover minted a second initial Support bypass"
         );
-        ledger.settle_exact(8, true);
+        let exact = ledger
+            .reserve_exact()
+            .expect("Exact must repay carried debt");
+        ledger.settle_exact(&exact, 8, true);
         let second = ledger
             .reserve_support(true)
             .expect("carried Exact service eventually repays prior Support debt");
-        ledger.settle_support(second, 1, false);
+        ledger.settle_support(&second, 1, false);
         assert_eq!(ledger.lease, PositiveSupportServiceLease::Idle);
         assert_eq!(
             (
@@ -12637,7 +13650,7 @@ mod tests {
                 ledger.max_support_packet,
                 ledger.next_packet_nonce,
             ),
-            (8, 8, 8, 7, 2)
+            (8, 8, 8, 7, 3)
         );
         assert_eq!(ledger.brand, first_brand);
         ledger.assert_packet_bounds();
@@ -12677,7 +13690,7 @@ mod tests {
         );
         scheduler.park_positive_support_activations(&AHashSet::from_iter([first_child]));
         assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
-        let first_brand = scheduler.positive_support_service_debt.brand;
+        let first_brand = scheduler.global_service_debt_snapshot().brand;
         let _ = scheduler.step_bounded(
             &root,
             &plan,
@@ -12687,16 +13700,14 @@ mod tests {
             &mut stable_interner,
             &mut stats,
         );
-        assert_eq!(
-            scheduler.positive_support_service_debt.lease,
-            PositiveSupportServiceLease::Idle
-        );
+        let debt = scheduler.global_service_debt_snapshot();
+        assert_eq!(debt.lease, PositiveSupportServiceLease::Idle);
         assert_eq!(
             (
-                scheduler.positive_support_service_debt.exact_service,
-                scheduler.positive_support_service_debt.support_service,
-                scheduler.positive_support_service_debt.max_exact_packet,
-                scheduler.positive_support_service_debt.max_support_packet,
+                debt.exact_service,
+                debt.support_service,
+                debt.max_exact_packet,
+                debt.max_support_packet,
             ),
             (0, 7, 0, 7)
         );
@@ -12729,14 +13740,9 @@ mod tests {
         );
         scheduler.park_positive_support_activations(&AHashSet::from_iter([second_child]));
         assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
-        assert_eq!(scheduler.positive_support_service_debt.brand, first_brand);
-        assert_eq!(
-            (
-                scheduler.positive_support_service_debt.exact_service,
-                scheduler.positive_support_service_debt.support_service,
-            ),
-            (0, 7)
-        );
+        let debt = scheduler.global_service_debt_snapshot();
+        assert_eq!(debt.brand, first_brand);
+        assert_eq!((debt.exact_service, debt.support_service), (0, 7));
         let _ = scheduler.step_bounded(
             &root,
             &plan,
@@ -12746,11 +13752,9 @@ mod tests {
             &mut stable_interner,
             &mut stats,
         );
+        let debt = scheduler.global_service_debt_snapshot();
         assert_eq!(
-            (
-                scheduler.positive_support_service_debt.exact_service,
-                scheduler.positive_support_service_debt.support_service,
-            ),
+            (debt.exact_service, debt.support_service),
             (8, 7),
             "the second parent must pay the carried Support debt with Exact"
         );
@@ -12763,20 +13767,18 @@ mod tests {
             &mut stable_interner,
             &mut stats,
         );
+        let debt = scheduler.global_service_debt_snapshot();
         assert_eq!(
             (
-                scheduler.positive_support_service_debt.exact_service,
-                scheduler.positive_support_service_debt.support_service,
-                scheduler.positive_support_service_debt.max_exact_packet,
-                scheduler.positive_support_service_debt.max_support_packet,
+                debt.exact_service,
+                debt.support_service,
+                debt.max_exact_packet,
+                debt.max_support_packet,
             ),
             (8, 8, 8, 7)
         );
-        assert_eq!(
-            scheduler.positive_support_service_debt.lease,
-            PositiveSupportServiceLease::Idle
-        );
-        assert_eq!(scheduler.positive_support_service_debt.next_packet_nonce, 2);
+        assert_eq!(debt.lease, PositiveSupportServiceLease::Idle);
+        assert_eq!(debt.next_packet_nonce, 3);
         assert_eq!(stats.delta_positive_support_service_parents_started, 2);
         assert_eq!(stats.delta_positive_support_service_epochs, 1);
         assert_eq!(
@@ -12818,14 +13820,10 @@ mod tests {
 
         let mut cloned = scheduler.deep_clone();
         assert_ne!(cloned.registry.brand, scheduler.registry.brand);
-        assert_ne!(
-            cloned.positive_support_service_debt.brand,
-            scheduler.positive_support_service_debt.brand
-        );
-        assert_eq!(
-            cloned.positive_support_service_debt.lease,
-            PositiveSupportServiceLease::Parked
-        );
+        let cloned_debt = cloned.global_service_debt_snapshot();
+        let original_debt = scheduler.global_service_debt_snapshot();
+        assert_ne!(cloned_debt.brand, original_debt.brand);
+        assert_eq!(cloned_debt.lease, PositiveSupportServiceLease::Parked);
         let cloned_parent = PositiveConfirmParentId {
             brand: cloned.registry.brand,
             activation: parent.activation,
@@ -12848,7 +13846,7 @@ mod tests {
         );
         assert_eq!(clone_stats.delta_positive_publication_support_wins, 1);
         assert_eq!(
-            scheduler.positive_support_service_debt.lease,
+            scheduler.global_service_debt_snapshot().lease,
             PositiveSupportServiceLease::Parked,
             "stepping the clone mutated the original service lease"
         );
