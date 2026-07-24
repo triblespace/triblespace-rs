@@ -8,8 +8,9 @@
 //! unless they explicitly expose structure.
 //! [`FormulaScope`] selects a chain of formula boundaries. `UnionLeaves`
 //! executes exposed Unions as arbitrary finite AND/OR trees through a canonical
-//! program counter and affine payload-frame stack. Candidate actions descend to
-//! Atom nodes. `WholeRoot` absorbs that scope and instead makes the maximal
+//! program counter, one affine candidate stream, and an OR-only reducer stack.
+//! Candidate actions descend to Atom nodes. `WholeRoot` absorbs that scope and
+//! instead makes the maximal
 //! exposed root one synthetic formula occurrence after outer
 //! variable selection. It flattens only the maximal root AND region and retains
 //! candidate-occurrence paging once that AND's exact remaining confirmation
@@ -1026,7 +1027,7 @@ impl FiniteFormulaProgram {
     /// Whether the active synthetic-root continuation is the exact analogue
     /// of an outer Candidate state whose entire remaining confirmation suffix
     /// is page-local. Only a maximal root AND may expose candidate pages. OR
-    /// reducers and nested formula frames retain complete parent groups.
+    /// reducers and nested formula control retain complete parent groups.
     #[cfg(test)]
     fn root_confirm_suffix_accepts_pages(
         &self,
@@ -4227,6 +4228,42 @@ impl FormulaPcInterner {
             .expect("interned residual formula return address exists")
     }
 
+    /// Returns the immediate structural owner of one candidate result.
+    ///
+    /// This is canonical control information: no payload tag or reducer depth
+    /// participates in the decision. A root has no return edge; every nested
+    /// candidate child has a `Child` edge to an exact parent Plan.
+    fn result_destination(
+        &self,
+        program: &FiniteFormulaProgram,
+        counter: FormulaPcId,
+    ) -> FormulaResultDestination {
+        let Some(return_to) = self.get(counter).return_to else {
+            return FormulaResultDestination::Root;
+        };
+        let address = self.return_by_id(return_to);
+        assert_eq!(
+            address.kind,
+            FormulaReturnKind::Child,
+            "Boolean support guards do not carry candidate results"
+        );
+        let FormulaFocus::Plan { node, stage, .. } = &self.get(address.parent).focus else {
+            panic!("a Formula result return edge named a non-Plan parent")
+        };
+        assert_ne!(
+            *stage,
+            FormulaStage::Support,
+            "candidate result returned to a Boolean support Plan"
+        );
+        match program.node(*node).kind {
+            FiniteFormulaNodeKind::And { .. } => FormulaResultDestination::ParentAnd,
+            FiniteFormulaNodeKind::Or { .. } => FormulaResultDestination::ParentOr,
+            FiniteFormulaNodeKind::Atom => {
+                panic!("a Formula result return edge named an Atom parent")
+            }
+        }
+    }
+
     fn grade(&self, id: FormulaPcId) -> usize {
         self.grades[id.0 as usize]
     }
@@ -6030,43 +6067,20 @@ impl FormulaOrAccumulator {
 }
 
 #[derive(Clone, Debug)]
-enum FormulaPayloadFrame {
+struct FormulaOrCell {
     /// Every OR child reads the same immutable source and admits its result
     /// into one activation-private persistent ordered-set shell. Admission and
-    /// later ordered emission are engine Program phases, never synchronous
-    /// whole-group normalization at this frame boundary.
-    Or {
-        source: CandidatePayload,
-        accumulator: FormulaOrAccumulator,
-    },
-    /// AND threads one ascending-parent-grouped candidate stream through its
-    /// selected proposer and remaining confirmers. Empty current streams
-    /// annihilate this branch without erasing the enclosing OR activation.
-    And { current: CandidatePayload },
+    /// later ordered emission are engine Program phases. AND has no payload
+    /// cell: its one affine stream lives in `FormulaBatch::current`.
+    source: CandidatePayload,
+    accumulator: FormulaOrAccumulator,
 }
 
-impl FormulaPayloadFrame {
+impl FormulaOrCell {
     fn empty_like(&self, parent_count: usize) -> Self {
-        match self {
-            Self::Or { .. } => Self::Or {
-                source: CandidatePayload::empty(parent_count),
-                accumulator: FormulaOrAccumulator::empty(parent_count),
-            },
-            Self::And { .. } => Self::And {
-                current: CandidatePayload::empty(parent_count),
-            },
-        }
-    }
-
-    fn result(self, parent_count: usize) -> CandidatePayload {
-        match self {
-            Self::Or { .. } => {
-                panic!("Formula OR result crossed its pageable ordered-emission boundary")
-            }
-            Self::And { current } => {
-                current.debug_assert_valid_for(parent_count);
-                current
-            }
+        Self {
+            source: CandidatePayload::empty(parent_count),
+            accumulator: FormulaOrAccumulator::empty(parent_count),
         }
     }
 }
@@ -6075,43 +6089,66 @@ impl FormulaPayloadFrame {
 struct FormulaBatch {
     activations: Vec<ActivationId>,
     parents: RowBatch,
-    /// One activation-private reducer frame per live composite on the formula
-    /// path. Frame shape follows the structural PC and therefore remains
-    /// payload rather than canonical state identity.
-    frames: Vec<FormulaPayloadFrame>,
+    /// The one affine candidate stream threaded through every AND and Atom.
+    /// Structural AND entry and return are deliberately payload no-ops.
+    current: CandidatePayload,
+    /// Only irreducible OR fan-out owns a payload cell. Its structural nesting
+    /// follows the canonical PC, but cell depth is never consulted to decide a
+    /// child result's destination.
+    ors: Vec<FormulaOrCell>,
 }
 
-#[derive(Clone, Debug)]
-enum FormulaFrameDestination {
-    Root(CandidatePayload),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormulaResultDestination {
+    Root,
     ParentAnd,
-    ParentOr(CandidatePayload),
+    ParentOr,
 }
 
 impl FormulaBatch {
-    fn root_frame(
-        kind: &FiniteFormulaNodeKind,
-        mut source: CandidatePayload,
-        parent_count: usize,
-    ) -> FormulaPayloadFrame {
-        match kind {
-            FiniteFormulaNodeKind::Or { .. } => {
-                // OR source is immutable from frame entry onward. Freezing it
-                // here makes machine clones and every arm selection share the
-                // occurrence storage even before the first child is chosen.
-                source.defer_for_shared_activation(parent_count);
-                FormulaPayloadFrame::Or {
-                    source,
-                    accumulator: FormulaOrAccumulator::empty(parent_count),
-                }
+    fn open_or(&mut self) {
+        let parent_count = self.parents.row_count;
+        self.current.defer_for_shared_activation(parent_count);
+        let source = std::mem::replace(&mut self.current, CandidatePayload::empty(parent_count));
+        self.ors.push(FormulaOrCell {
+            source,
+            accumulator: FormulaOrAccumulator::empty(parent_count),
+        });
+    }
+
+    /// Starts one supported child of the current OR. Proposal arms receive an
+    /// empty stream; confirmation arms share the OR's frozen source. The child
+    /// may then thread that stream through any number of structural ANDs.
+    fn begin_or_arm(&mut self, stage: FormulaStage) {
+        let parent_count = self.parents.row_count;
+        assert!(
+            self.current.is_empty(),
+            "a Formula OR retained its preceding arm result"
+        );
+        self.current = match stage {
+            FormulaStage::Support => {
+                panic!("Boolean support cannot begin a candidate OR arm")
             }
-            // A root Atom uses the same single-stream payload as a one-child
-            // conjunction. Nested atoms continue to operate directly on
-            // their enclosing connective frame.
-            FiniteFormulaNodeKind::And { .. } | FiniteFormulaNodeKind::Atom => {
-                FormulaPayloadFrame::And { current: source }
-            }
-        }
+            FormulaStage::Propose => CandidatePayload::empty(parent_count),
+            FormulaStage::Confirm => self
+                .ors
+                .last()
+                .expect("a Formula OR arm lost its reducer cell")
+                .source
+                .clone(),
+        };
+    }
+
+    fn take_current(&mut self) -> CandidatePayload {
+        std::mem::replace(
+            &mut self.current,
+            CandidatePayload::empty(self.parents.row_count),
+        )
+    }
+
+    fn install_current(&mut self, current: CandidatePayload) {
+        current.debug_assert_valid_for(self.parents.row_count);
+        self.current = current;
     }
 
     fn from_proposal(
@@ -6121,15 +6158,16 @@ impl FormulaBatch {
     ) -> Self {
         assert_eq!(parents.row_count, activations.len());
         let parent_count = activations.len();
-        Self {
+        let mut batch = Self {
             activations,
             parents,
-            frames: vec![Self::root_frame(
-                root_kind,
-                CandidatePayload::empty(parent_count),
-                parent_count,
-            )],
+            current: CandidatePayload::empty(parent_count),
+            ors: Vec::new(),
+        };
+        if matches!(root_kind, FiniteFormulaNodeKind::Or { .. }) {
+            batch.open_or();
         }
+        batch
     }
 
     fn from_confirmation(
@@ -6141,105 +6179,64 @@ impl FormulaBatch {
         // CandidateBatch inherits the protocol's ascending-parent grouping;
         // formula traversal and splitting require no stronger value order.
         debug_assert_candidates_grouped(&batch.candidates, batch.parents.row_count);
-        let parent_count = batch.parents.row_count;
-        Self {
+        let mut batch = Self {
             activations,
             parents: batch.parents,
-            frames: vec![Self::root_frame(root_kind, batch.candidates, parent_count)],
+            current: batch.candidates,
+            ors: Vec::new(),
+        };
+        if matches!(root_kind, FiniteFormulaNodeKind::Or { .. }) {
+            batch.open_or();
         }
+        batch
     }
 
     fn page_candidate_count(&self) -> usize {
-        match self.frames.as_slice() {
-            [FormulaPayloadFrame::And { current }] => current.len(),
-            _ => 0,
+        if self.ors.is_empty() {
+            self.current.len()
+        } else {
+            0
         }
     }
 
     fn input(&self) -> &CandidatePayload {
-        match self
-            .frames
-            .last()
-            .expect("formula payload has no root frame")
-        {
-            FormulaPayloadFrame::Or { source, .. } => source,
-            FormulaPayloadFrame::And { current } => current,
-        }
+        &self.current
     }
 
     fn input_mut(&mut self) -> &mut CandidatePayload {
-        match self
-            .frames
-            .last_mut()
-            .expect("formula payload has no root frame")
-        {
-            FormulaPayloadFrame::Or { source, .. } => source,
-            FormulaPayloadFrame::And { current } => current,
-        }
-    }
-
-    fn current_frame_is_or(&self) -> bool {
-        matches!(self.frames.last(), Some(FormulaPayloadFrame::Or { .. }))
-    }
-
-    fn parent_frame_is_or(&self) -> bool {
-        self.frames
-            .len()
-            .checked_sub(2)
-            .and_then(|parent| self.frames.get(parent))
-            .is_some_and(|frame| matches!(frame, FormulaPayloadFrame::Or { .. }))
+        &mut self.current
     }
 
     fn admit_current_or_value(&mut self, parent: u32, value: RawInline) {
-        let FormulaPayloadFrame::Or { accumulator, .. } = self
-            .frames
+        let accumulator = &mut self
+            .ors
             .last_mut()
             .expect("Formula OR admission lost its reducer frame")
-        else {
-            panic!("Formula OR admission resumed into a non-OR frame")
-        };
+            .accumulator;
         accumulator.insert(parent, value);
     }
 
     fn current_or_set(&self) -> OrdSet<RawInline> {
-        let FormulaPayloadFrame::Or { accumulator, .. } = self
-            .frames
+        let accumulator = &self
+            .ors
             .last()
             .expect("Formula OR emission lost its reducer frame")
-        else {
-            panic!("Formula OR emission resumed from a non-OR frame")
-        };
+            .accumulator;
         accumulator.singleton_set()
     }
 
-    /// Pops a completed non-OR child before its result enters an enclosing
-    /// OR.  The exact child PC remains private reducer payload until admission
-    /// reaches EOF, so canonical control cannot observe a partial union.
-    fn take_child_result_for_or(&mut self) -> CandidatePayload {
-        assert!(self.parent_frame_is_or());
-        self.frames
-            .pop()
-            .expect("returning Formula child lost its payload frame")
-            .result(self.parents.row_count)
-    }
-
-    /// Installs an already ordered/distinct OR result after its emission
-    /// receipt reaches EOF.  A parent OR receives the result through a second
-    /// admission receipt; a parent AND may consume it immediately, and a root
-    /// result waits for the ordinary outer candidate continuation.
-    fn return_emitted_or(&mut self, result: CandidatePayload) -> FormulaFrameDestination {
-        assert!(self.current_frame_is_or());
-        self.frames
+    /// Pops one completed OR reducer and installs its ordered/distinct result
+    /// as the affine stream. Canonical PC control alone decides whether that
+    /// stream returns to the root, a parent AND, or a parent OR.
+    fn install_emitted_or(&mut self, result: CandidatePayload) {
+        assert!(
+            self.current.is_empty(),
+            "a Formula OR retained an arm result during ordered emission"
+        );
+        self.ors
             .pop()
             .expect("emitted Formula OR lost its payload frame");
-        match self.frames.last_mut() {
-            None => FormulaFrameDestination::Root(result),
-            Some(FormulaPayloadFrame::And { current }) => {
-                *current = result;
-                FormulaFrameDestination::ParentAnd
-            }
-            Some(FormulaPayloadFrame::Or { .. }) => FormulaFrameDestination::ParentOr(result),
-        }
+        self.install_current(result);
     }
 
     /// Freezes the exact candidate occurrence bag at the cyclic action-opening
@@ -6262,12 +6259,12 @@ impl FormulaBatch {
         self.shared_confirm_original()
     }
 
-    /// Every live Formula candidate frame now has a pageable completion path:
-    /// AND installs the result directly, while OR admits it through its own
-    /// engine reducer.  Confirm finalization therefore has no connective-shape
-    /// exception left at this boundary.
+    /// `FormulaBatch` always owns a `current` candidate stream by construction:
+    /// unlike the erased frame vector, the field cannot represent an absent
+    /// root payload. AND installs a finalized result directly, while any OR
+    /// ancestry admits it through its own pageable reducer after return.
     fn confirm_finalizer_capable(&self) -> bool {
-        !self.frames.is_empty()
+        true
     }
 
     fn action_candidate_count(&self, stage: FormulaStage) -> usize {
@@ -6277,109 +6274,49 @@ impl FormulaBatch {
         }
     }
 
-    /// Applies one complete Atom action result to an AND frame. OR results
-    /// must first cross the pageable admission receipt.
+    /// Installs one complete Atom result as the affine candidate stream.
+    /// Canonical control decides separately whether it must next enter a
+    /// parent OR's pageable admission reducer.
     fn apply_action_result(&mut self, stage: FormulaStage, result: CandidatePayload) {
         assert_ne!(
             stage,
             FormulaStage::Support,
             "Boolean support never enters a candidate reducer frame"
         );
-        // Both protocol verbs preserve ascending parent groups. AND needs
-        // only that grouping; OR is deliberately rejected below.
+        // Both protocol verbs preserve ascending parent groups.
         debug_assert_candidates_grouped(&result, self.parents.row_count);
-        match (self.frames.last_mut().unwrap(), stage) {
-            (FormulaPayloadFrame::Or { .. }, FormulaStage::Propose | FormulaStage::Confirm) => {
-                panic!("Formula OR action bypassed pageable admission")
-            }
-            (FormulaPayloadFrame::And { current }, FormulaStage::Propose) => {
-                assert!(current.is_empty(), "an AND ran two proposers");
-                *current = result;
-            }
-            (FormulaPayloadFrame::And { current }, FormulaStage::Confirm) => {
-                *current = result;
-            }
-            (_, FormulaStage::Support) => unreachable!("support was rejected above"),
+        if stage == FormulaStage::Propose {
+            assert!(self.current.is_empty(), "an AND ran two proposers");
         }
+        self.current = result;
     }
 
     fn validate_tags(&self) {
         assert!(
-            self.frames.iter().all(|frame| match frame {
-                FormulaPayloadFrame::Or {
-                    source,
-                    accumulator,
-                } => {
-                    source.all_parents_in(self.parents.row_count)
-                        && accumulator.sets.len() == self.parents.row_count
-                        && accumulator.unique_len
-                            == accumulator.sets.iter().map(OrdSet::len).sum::<usize>()
-                }
-                FormulaPayloadFrame::And { current } => {
-                    current.all_parents_in(self.parents.row_count)
-                }
-            }),
+            self.current.all_parents_in(self.parents.row_count)
+                && self.ors.iter().all(|cell| {
+                    cell.source.all_parents_in(self.parents.row_count)
+                        && cell.accumulator.sets.len() == self.parents.row_count
+                        && cell.accumulator.unique_len
+                            == cell.accumulator.sets.iter().map(OrdSet::len).sum::<usize>()
+                }),
             "formula action emitted an invalid candidate row tag"
         );
     }
 
-    fn enter(&mut self, kind: &FiniteFormulaNodeKind, stage: FormulaStage) {
-        let parent_count = self.parents.row_count;
-        let input = match stage {
-            FormulaStage::Support => {
-                panic!("Boolean support does not allocate candidate reducer frames")
+    fn enter_node(&mut self, kind: &FiniteFormulaNodeKind) {
+        match kind {
+            FiniteFormulaNodeKind::And { .. } => {}
+            FiniteFormulaNodeKind::Or { .. } => self.open_or(),
+            FiniteFormulaNodeKind::Atom => {
+                panic!("an Atom cannot own a Formula structural payload")
             }
-            FormulaStage::Propose => CandidatePayload::empty(parent_count),
-            FormulaStage::Confirm => {
-                // Every OR arm reads one immutable source. Freeze it before
-                // cloning a nested frame so arm selection shares an Arc root
-                // instead of copying an O(n) Values/Tagged bag per arm.
-                self.input_mut().defer_for_shared_activation(parent_count);
-                self.input().clone()
-            }
-        };
-        self.frames.push(match kind {
-            FiniteFormulaNodeKind::And { .. } => FormulaPayloadFrame::And { current: input },
-            FiniteFormulaNodeKind::Or { .. } => FormulaPayloadFrame::Or {
-                source: input,
-                accumulator: FormulaOrAccumulator::empty(parent_count),
-            },
-            FiniteFormulaNodeKind::Atom => panic!("an Atom cannot own a formula payload frame"),
-        });
-    }
-
-    fn return_frame(&mut self) {
-        assert!(
-            self.frames.len() >= 2,
-            "the root formula frame cannot return"
-        );
-        let result = self
-            .frames
-            .pop()
-            .expect("a returning formula node has a payload frame")
-            .result(self.parents.row_count);
-        match self
-            .frames
-            .last_mut()
-            .expect("a returning formula node has a parent frame")
-        {
-            FormulaPayloadFrame::Or { .. } => {
-                panic!("Formula child bypassed pageable OR admission")
-            }
-            FormulaPayloadFrame::And { current } => *current = result,
         }
     }
 
     fn current_is_live(&self) -> Vec<bool> {
-        let FormulaPayloadFrame::And { current } = self
-            .frames
-            .last()
-            .expect("formula payload has no current frame")
-        else {
-            panic!("only an AND frame has annihilating current streams")
-        };
         let mut live = vec![false; self.parents.row_count];
-        current.mark_live_parents(&mut live);
+        self.current.mark_live_parents(&mut live);
         live
     }
 
@@ -6393,14 +6330,7 @@ impl FormulaBatch {
     /// bounded engine SET-admission Program.
     fn admit_current_and_set_tail_stable(&mut self) -> bool {
         let parent_count = self.parents.row_count;
-        let FormulaPayloadFrame::And { current } = self
-            .frames
-            .last_mut()
-            .expect("formula payload has no current frame")
-        else {
-            panic!("Formula OR crossed an AND candidate admission boundary")
-        };
-        current.admit_set_tail_stable(parent_count)
+        self.current.admit_set_tail_stable(parent_count)
     }
 
     fn append(&mut self, mut other: Self) {
@@ -6408,33 +6338,17 @@ impl FormulaBatch {
         let right_parents = other.parents.row_count;
         self.parents.append(other.parents);
         self.activations.append(&mut other.activations);
-        assert_eq!(self.frames.len(), other.frames.len());
-
-        for (left, right) in self.frames.iter_mut().zip(other.frames) {
-            match (left, right) {
-                (
-                    FormulaPayloadFrame::Or {
-                        source: left_source,
-                        accumulator: left_accumulator,
-                    },
-                    FormulaPayloadFrame::Or {
-                        source: right_source,
-                        accumulator: right_accumulator,
-                    },
-                ) => {
-                    left_source.append_disjoint(right_source, left_parents, right_parents);
-                    left_accumulator.append(right_accumulator);
-                }
-                (
-                    FormulaPayloadFrame::And {
-                        current: left_current,
-                    },
-                    FormulaPayloadFrame::And {
-                        current: right_current,
-                    },
-                ) => left_current.append_disjoint(right_current, left_parents, right_parents),
-                _ => panic!("one formula state received incompatible payload-frame shapes"),
-            }
+        self.current
+            .append_disjoint(other.current, left_parents, right_parents);
+        assert_eq!(
+            self.ors.len(),
+            other.ors.len(),
+            "one Formula state received incompatible OR layouts"
+        );
+        for (left, right) in self.ors.iter_mut().zip(other.ors) {
+            left.source
+                .append_disjoint(right.source, left_parents, right_parents);
+            left.accumulator.append(right.accumulator);
         }
     }
 
@@ -6451,10 +6365,11 @@ impl FormulaBatch {
                         row_count: 0,
                     },
                 ),
-                frames: self
-                    .frames
+                current: std::mem::replace(&mut self.current, CandidatePayload::empty(0)),
+                ors: self
+                    .ors
                     .iter_mut()
-                    .map(|frame| std::mem::replace(frame, frame.empty_like(0)))
+                    .map(|cell| std::mem::replace(cell, cell.empty_like(0)))
                     .collect(),
             };
         }
@@ -6465,20 +6380,13 @@ impl FormulaBatch {
         let activations = self.activations.split_off(first);
 
         let old_parent_count = first + take;
-        let frames = self
-            .frames
+        let current = self.current.take_parent_tail(first, old_parent_count);
+        let ors = self
+            .ors
             .iter_mut()
-            .map(|frame| match frame {
-                FormulaPayloadFrame::Or {
-                    source,
-                    accumulator,
-                } => FormulaPayloadFrame::Or {
-                    source: source.take_parent_tail(first, old_parent_count),
-                    accumulator: accumulator.take_tail(first),
-                },
-                FormulaPayloadFrame::And { current } => FormulaPayloadFrame::And {
-                    current: current.take_parent_tail(first, old_parent_count),
-                },
+            .map(|cell| FormulaOrCell {
+                source: cell.source.take_parent_tail(first, old_parent_count),
+                accumulator: cell.accumulator.take_tail(first),
             })
             .collect();
         Self {
@@ -6487,7 +6395,8 @@ impl FormulaBatch {
                 rows,
                 row_count: take,
             },
-            frames,
+            current,
+            ors,
         }
     }
 
@@ -6496,17 +6405,13 @@ impl FormulaBatch {
     /// before the scheduler calls this. A bisected parent is copied into both
     /// pages, while each speculative candidate remains affine to one page.
     fn take_candidate_tail(&mut self, stride: usize, width: usize) -> Self {
-        assert_eq!(
-            self.frames.len(),
-            1,
-            "only a synthetic root AND may expose candidate pages"
+        assert!(
+            self.ors.is_empty(),
+            "only an empty-OR Formula layout may expose candidate pages"
         );
-        let FormulaPayloadFrame::And { current } = &mut self.frames[0] else {
-            panic!("only a synthetic root AND may expose candidate pages")
-        };
-        let take = current.len().min(width.max(1));
+        let take = self.current.len().min(width.max(1));
         debug_assert!(take > 0);
-        if take == current.len() {
+        if take == self.current.len() {
             return Self {
                 activations: std::mem::take(&mut self.activations),
                 parents: std::mem::replace(
@@ -6516,14 +6421,14 @@ impl FormulaBatch {
                         row_count: 0,
                     },
                 ),
-                frames: vec![FormulaPayloadFrame::And {
-                    current: std::mem::replace(current, CandidatePayload::Tagged(Vec::new())),
-                }],
+                current: std::mem::replace(&mut self.current, CandidatePayload::Tagged(Vec::new())),
+                ors: Vec::new(),
             };
         }
 
-        let (tail_candidates, first_tail_parent, prefix_parent_count) =
-            current.take_candidate_tail(self.parents.row_count, take);
+        let (tail_candidates, first_tail_parent, prefix_parent_count) = self
+            .current
+            .take_candidate_tail(self.parents.row_count, take);
         assert!(
             first_tail_parent < self.parents.row_count,
             "constraint emitted an invalid candidate row tag"
@@ -6546,9 +6451,8 @@ impl FormulaBatch {
                 rows: tail_rows,
                 row_count: tail_parent_count,
             },
-            frames: vec![FormulaPayloadFrame::And {
-                current: tail_candidates,
-            }],
+            current: tail_candidates,
+            ors: Vec::new(),
         }
     }
 
@@ -6563,27 +6467,25 @@ impl FormulaBatch {
                 return BTreeMap::from([(first.clone(), self)]);
             }
         }
-        let RowBatch { rows, row_count } = self.parents;
+        let Self {
+            activations,
+            parents: RowBatch { rows, row_count },
+            current,
+            ors,
+        } = self;
         let mut remap = vec![u32::MAX; row_count];
         let mut groups: BTreeMap<K, Self> = BTreeMap::new();
-        let empty_frames: Vec<_> = self
-            .frames
-            .iter()
-            .map(|frame| frame.empty_like(0))
-            .collect();
+        let empty_ors: Vec<_> = ors.iter().map(|cell| cell.empty_like(0)).collect();
 
-        for (parent, (child, activation)) in assignment
-            .iter()
-            .zip(self.activations.into_iter())
-            .enumerate()
-        {
+        for (parent, (child, activation)) in assignment.iter().zip(activations).enumerate() {
             let group = groups.entry(child.clone()).or_insert_with(|| Self {
                 activations: Vec::new(),
                 parents: RowBatch {
                     rows: Vec::new(),
                     row_count: 0,
                 },
-                frames: empty_frames.clone(),
+                current: CandidatePayload::empty(0),
+                ors: empty_ors.clone(),
             });
             remap[parent] = u32::try_from(group.parents.row_count)
                 .expect("too many partitioned formula parents");
@@ -6601,8 +6503,7 @@ impl FormulaBatch {
             assignment: &[K],
             remap: &[u32],
             groups: &mut BTreeMap<K, FormulaBatch>,
-            frame: usize,
-            field: usize,
+            or_cell: Option<usize>,
         ) where
             K: Clone + Ord,
         {
@@ -6619,59 +6520,48 @@ impl FormulaBatch {
                 let target = groups
                     .get_mut(&assignment[parent])
                     .expect("every formula assignment created its group");
-                match (&mut target.frames[frame], field) {
-                    (FormulaPayloadFrame::Or { source, .. }, 0) => {
-                        source.as_tagged_mut().push((remap[parent], value))
+                let values = match or_cell {
+                    None => &mut target.current,
+                    Some(cell) => {
+                        &mut target
+                            .ors
+                            .get_mut(cell)
+                            .expect("partitioned Formula lost an OR cell")
+                            .source
                     }
-                    (FormulaPayloadFrame::And { current }, 0) => {
-                        current.as_tagged_mut().push((remap[parent], value))
-                    }
-                    _ => panic!("formula frame field disagrees with its structural shape"),
-                }
+                };
+                values.as_tagged_mut().push((remap[parent], value));
             }
         }
-        for (frame, payload) in self.frames.into_iter().enumerate() {
-            match payload {
-                FormulaPayloadFrame::Or {
-                    source,
-                    accumulator,
-                } => {
-                    partition_values(source, assignment, &remap, &mut groups, frame, 0);
-                    assert_eq!(accumulator.sets.len(), row_count);
-                    for (parent, set) in accumulator.sets.into_iter().enumerate() {
-                        let target = groups
-                            .get_mut(&assignment[parent])
-                            .expect("every Formula assignment created its group");
-                        let FormulaPayloadFrame::Or { accumulator, .. } = &mut target.frames[frame]
-                        else {
-                            panic!("Formula accumulator disagrees with its structural frame")
-                        };
-                        accumulator.push_parent_set(set);
-                    }
-                }
-                FormulaPayloadFrame::And { current } => {
-                    partition_values(current, assignment, &remap, &mut groups, frame, 0);
-                }
+        partition_values(current, assignment, &remap, &mut groups, None);
+        for (cell_index, cell) in ors.into_iter().enumerate() {
+            partition_values(
+                cell.source,
+                assignment,
+                &remap,
+                &mut groups,
+                Some(cell_index),
+            );
+            assert_eq!(cell.accumulator.sets.len(), row_count);
+            for (parent, set) in cell.accumulator.sets.into_iter().enumerate() {
+                let target = groups
+                    .get_mut(&assignment[parent])
+                    .expect("every Formula assignment created its group");
+                target.ors[cell_index].accumulator.push_parent_set(set);
             }
         }
         for group in groups.values_mut() {
             let parent_count = group.parents.row_count;
-            for frame in &mut group.frames {
-                match frame {
-                    FormulaPayloadFrame::Or { source, .. } => {
-                        source.normalize_for(parent_count);
-                        source.defer_for_shared_activation(parent_count);
-                    }
-                    FormulaPayloadFrame::And { current } => {
-                        current.normalize_for(parent_count);
-                    }
-                }
+            group.current.normalize_for(parent_count);
+            for cell in &mut group.ors {
+                cell.source.normalize_for(parent_count);
+                cell.source.defer_for_shared_activation(parent_count);
             }
         }
         groups
     }
 
-    /// Moves every affine parent, including its complete reducer-frame stack,
+    /// Moves every affine parent, including its complete OR-reducer stack,
     /// into a one-parent payload suitable for activation-local cyclic work.
     /// Candidate tags are normalized to zero by the ordinary partition path.
     fn into_singletons(self, stride: usize) -> Vec<Self> {
@@ -6682,17 +6572,11 @@ impl FormulaBatch {
         groups.into_values().collect()
     }
 
-    fn defer_all_frame_candidates(&mut self) {
+    fn defer_all_candidates(&mut self) {
         let parent_count = self.parents.row_count;
-        for frame in &mut self.frames {
-            match frame {
-                FormulaPayloadFrame::Or { source, .. } => {
-                    source.defer_for_shared_activation(parent_count)
-                }
-                FormulaPayloadFrame::And { current } => {
-                    current.defer_for_shared_activation(parent_count)
-                }
-            }
+        self.current.defer_for_shared_activation(parent_count);
+        for cell in &mut self.ors {
+            cell.source.defer_for_shared_activation(parent_count);
         }
     }
 
@@ -6705,7 +6589,7 @@ impl FormulaBatch {
             parent_count > 0,
             "Formula reducer seed has no affine parent"
         );
-        self.defer_all_frame_candidates();
+        self.defer_all_candidates();
         let mut reversed = Vec::with_capacity(parent_count);
         while self.parents.row_count > 1 {
             reversed.push(self.take_tail(stride, 1));
@@ -6725,7 +6609,7 @@ impl FormulaBatch {
             parent_count > 0,
             "Formula reducer seed has no affine parent"
         );
-        self.defer_all_frame_candidates();
+        self.defer_all_candidates();
         input.debug_assert_valid_for(parent_count);
         input.defer_for_shared_activation(parent_count);
         let mut reversed = Vec::with_capacity(parent_count);
@@ -6741,21 +6625,15 @@ impl FormulaBatch {
         reversed
     }
 
-    fn finish(mut self) -> CandidateBatch {
-        assert_eq!(self.frames.len(), 1);
-        let root = self.frames.pop().unwrap();
+    fn finish(self) -> CandidateBatch {
+        assert!(
+            self.ors.is_empty(),
+            "a Formula root finished with a live OR reducer"
+        );
+        self.current.debug_assert_valid_for(self.activations.len());
         CandidateBatch {
             parents: self.parents,
-            candidates: root.result(self.activations.len()),
-        }
-    }
-
-    fn finish_with_emitted_root(self, candidates: CandidatePayload) -> CandidateBatch {
-        assert!(self.frames.is_empty());
-        candidates.debug_assert_valid_for(self.parents.row_count);
-        CandidateBatch {
-            parents: self.parents,
-            candidates,
+            candidates: self.current,
         }
     }
 }
@@ -8265,9 +8143,10 @@ fn propagate_formula_support(
             };
             let mut batch = batch;
             if truth {
-                enter_selected_formula_frame(
+                enter_selected_formula_node(
                     &plan.finite_formula,
-                    interner.formula(next),
+                    &interner.formula_pcs,
+                    next,
                     &mut batch,
                 );
             }
@@ -8442,9 +8321,13 @@ fn continue_formula_transition(
         }));
         return None;
     }
-    if batch.parent_frame_is_or() {
+    let destination = interner
+        .formula_pcs
+        .result_destination(&plan.finite_formula, counter);
+    if destination == FormulaResultDestination::ParentOr {
         let mut batch = batch;
-        let input = batch.take_child_result_for_or();
+        let input = batch.take_current();
+        debug_assert!(batch.current.is_empty());
         reducer_seeds.push(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
             bound: desc.bound,
             batch,
@@ -8459,9 +8342,9 @@ fn continue_formula_transition(
         .formula_pcs
         .resume_completed(&plan.finite_formula, completed)
     {
-        Ok(InternedFormulaSuccessor::Formula(next)) => {
-            let mut batch = batch;
-            batch.return_frame();
+        Ok(InternedFormulaSuccessor::Formula(next))
+            if destination == FormulaResultDestination::ParentAnd =>
+        {
             continue_formula_transition(
                 plan,
                 desc,
@@ -8476,7 +8359,7 @@ fn continue_formula_transition(
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("ordinary formula completion returned through a support guard")
         }
-        Err(resume) => finish_formula_transition(
+        Err(resume) if destination == FormulaResultDestination::Root => finish_formula_transition(
             plan,
             desc,
             &resume,
@@ -8486,6 +8369,9 @@ fn continue_formula_transition(
             stats,
             reducer_seeds,
         ),
+        Ok(InternedFormulaSuccessor::Formula(_)) | Err(_) => {
+            panic!("Formula result destination disagrees with its exact return PC")
+        }
     }
 }
 
@@ -8504,6 +8390,10 @@ fn finish_formula_or_admission(
     reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
     batch.validate_tags();
+    assert!(
+        batch.current.is_empty(),
+        "Formula OR admission retained its admitted result twice"
+    );
     match continuation {
         FormulaReducerContinuation::Complete(counter) => {
             let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
@@ -8579,13 +8469,16 @@ fn finish_formula_or_emission(
     let successor = interner
         .formula_pcs
         .resume_completed(&plan.finite_formula, completed);
-    let destination = batch.return_emitted_or(result);
+    let destination = interner
+        .formula_pcs
+        .result_destination(&plan.finite_formula, counter);
+    batch.install_emitted_or(result);
     let desc = StateDesc {
         bound,
         phase: ResidualPhase::Formula { counter },
     };
     match (successor, destination) {
-        (Ok(InternedFormulaSuccessor::Formula(next)), FormulaFrameDestination::ParentAnd) => {
+        (Ok(InternedFormulaSuccessor::Formula(next)), FormulaResultDestination::ParentAnd) => {
             continue_formula_transition(
                 plan,
                 &desc,
@@ -8597,7 +8490,9 @@ fn finish_formula_or_emission(
                 reducer_seeds,
             )
         }
-        (Ok(InternedFormulaSuccessor::Formula(next)), FormulaFrameDestination::ParentOr(input)) => {
+        (Ok(InternedFormulaSuccessor::Formula(next)), FormulaResultDestination::ParentOr) => {
+            let input = batch.take_current();
+            debug_assert!(batch.current.is_empty());
             reducer_seeds.push(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
                 bound,
                 batch,
@@ -8606,8 +8501,8 @@ fn finish_formula_or_emission(
             }));
             None
         }
-        (Err(resume), FormulaFrameDestination::Root(result)) => {
-            let candidate = batch.finish_with_emitted_root(result);
+        (Err(resume), FormulaResultDestination::Root) => {
+            let candidate = batch.finish();
             finish_formula_candidate_transition(
                 plan,
                 &desc,
@@ -8622,10 +8517,10 @@ fn finish_formula_or_emission(
         (Ok(InternedFormulaSuccessor::Guard { .. }), _) => {
             unreachable!("candidate OR returned through a support guard")
         }
-        (Ok(InternedFormulaSuccessor::Formula(_)), FormulaFrameDestination::Root(_))
-        | (Err(_), FormulaFrameDestination::ParentAnd)
-        | (Err(_), FormulaFrameDestination::ParentOr(_)) => {
-            panic!("Formula frame stack disagrees with its exact return PC")
+        (Ok(InternedFormulaSuccessor::Formula(_)), FormulaResultDestination::Root)
+        | (Err(_), FormulaResultDestination::ParentAnd)
+        | (Err(_), FormulaResultDestination::ParentOr) => {
+            panic!("Formula result destination disagrees with its exact return PC")
         }
     }
 }
@@ -8758,13 +8653,24 @@ fn select_interned_formula_child(
     }
 }
 
-fn enter_selected_formula_frame(
+fn enter_selected_formula_node(
     program: &FiniteFormulaProgram,
-    counter: &FormulaPcRecord,
+    formula_pcs: &FormulaPcInterner,
+    counter: FormulaPcId,
     batch: &mut FormulaBatch,
 ) {
-    if let FormulaFocus::Plan { node, stage, .. } = &counter.focus {
-        batch.enter(&program.node(*node).kind, *stage);
+    let (node, stage, composite) = match &formula_pcs.get(counter).focus {
+        FormulaFocus::Action { node, stage } => (*node, *stage, false),
+        FormulaFocus::Plan { node, stage, .. } => (*node, *stage, true),
+        FormulaFocus::Complete { .. } => {
+            panic!("a completed Formula node cannot be entered")
+        }
+    };
+    if formula_pcs.result_destination(program, counter) == FormulaResultDestination::ParentOr {
+        batch.begin_or_arm(stage);
+    }
+    if composite {
+        batch.enter_node(&program.node(node).kind);
     }
 }
 
@@ -8786,10 +8692,10 @@ fn formula_or_plan_transition<'a>(
         FormulaFocus::Plan { done, .. } => (done.clone(), resume.occurrence, resume.variable),
         _ => unreachable!("OR planning received an action continuation"),
     };
-    assert!(matches!(
-        batch.frames.last(),
-        Some(FormulaPayloadFrame::Or { .. })
-    ));
+    assert!(
+        !batch.ors.is_empty(),
+        "a Formula OR Plan lost its reducer cell"
+    );
     let child_count = children.len();
     assert!(
         done.is_valid_for(child_count),
@@ -8877,10 +8783,6 @@ fn formula_and_plan_transition<'a>(
         }
         _ => unreachable!("AND planning received an action continuation"),
     };
-    assert!(matches!(
-        batch.frames.last(),
-        Some(FormulaPayloadFrame::And { .. })
-    ));
     assert!(done.is_valid_for(children.len()));
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -9017,7 +8919,12 @@ fn formula_and_plan_transition<'a>(
             children,
             child,
         );
-        enter_selected_formula_frame(&plan.finite_formula, interner.formula(selected), &mut batch);
+        enter_selected_formula_node(
+            &plan.finite_formula,
+            &interner.formula_pcs,
+            selected,
+            &mut batch,
+        );
         prefer_continuation(
             &mut continuation,
             continue_formula_transition(
@@ -9051,18 +8958,22 @@ fn finish_formula_action_result(
         FormulaFocus::Action { stage, .. } => *stage,
         _ => panic!("formula result received a planning continuation"),
     };
-    if batch.current_frame_is_or() {
-        result.debug_assert_valid_for(batch.parents.row_count);
+    let destination = interner
+        .formula_pcs
+        .result_destination(&plan.finite_formula, counter);
+    batch.apply_action_result(stage, result);
+    batch.validate_tags();
+    if destination == FormulaResultDestination::ParentOr {
+        let input = batch.take_current();
+        debug_assert!(batch.current.is_empty());
         reducer_seeds.push(FormulaReducerSeed::Admit(FormulaOrAdmissionSeed {
             bound,
             batch,
-            input: result,
+            input,
             continuation: FormulaReducerContinuation::Complete(counter),
         }));
         return None;
     }
-    batch.apply_action_result(stage, result);
-    batch.validate_tags();
 
     let completed = interner.formula_pcs.complete(&plan.finite_formula, counter);
     let desc = StateDesc {
@@ -9073,20 +8984,24 @@ fn finish_formula_action_result(
         .formula_pcs
         .resume_completed(&plan.finite_formula, completed)
     {
-        Ok(InternedFormulaSuccessor::Formula(next)) => continue_formula_transition(
-            plan,
-            &desc,
-            next,
-            batch,
-            worklist,
-            interner,
-            stats,
-            reducer_seeds,
-        ),
+        Ok(InternedFormulaSuccessor::Formula(next))
+            if destination == FormulaResultDestination::ParentAnd =>
+        {
+            continue_formula_transition(
+                plan,
+                &desc,
+                next,
+                batch,
+                worklist,
+                interner,
+                stats,
+                reducer_seeds,
+            )
+        }
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("candidate action returned through a support guard")
         }
-        Err(resume) => finish_formula_transition(
+        Err(resume) if destination == FormulaResultDestination::Root => finish_formula_transition(
             plan,
             &desc,
             &resume,
@@ -9096,6 +9011,9 @@ fn finish_formula_action_result(
             stats,
             reducer_seeds,
         ),
+        Ok(InternedFormulaSuccessor::Formula(_)) | Err(_) => {
+            panic!("Formula action destination disagrees with its exact return PC")
+        }
     }
 }
 
@@ -9118,11 +9036,14 @@ fn formula_action_transition<'a>(
     };
     assert_eq!(batch.activations.len(), batch.parents.row_count);
 
+    // Take the affine AND/arm stream before the parent-row view borrows the
+    // batch. OR fan-out already cloned its frozen source in `begin_or_arm`.
+    let result = match stage {
+        FormulaStage::Support => None,
+        FormulaStage::Propose => Some(CandidatePayload::empty(batch.parents.row_count)),
+        FormulaStage::Confirm => Some(batch.take_current()),
+    };
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
-    if stage == FormulaStage::Confirm {
-        let parent_count = batch.parents.row_count;
-        batch.input_mut().defer_for_shared_activation(parent_count);
-    }
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     let constraint = plan.resolve_formula_node(root, occurrence, node);
     if stage == FormulaStage::Support {
@@ -9153,11 +9074,7 @@ fn formula_action_transition<'a>(
         return continuation;
     }
 
-    let mut result = match stage {
-        FormulaStage::Support => unreachable!("support returned above"),
-        FormulaStage::Propose => CandidatePayload::empty(batch.parents.row_count),
-        FormulaStage::Confirm => batch.input().clone(),
-    };
+    let mut result = result.expect("support returned before candidate execution");
     let candidates_before = result.len();
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
@@ -11099,11 +11016,8 @@ impl ResidualStateMachine {
             ) == FormulaProposalStreamability::Linear;
         if stream_proposal {
             assert!(
-                batch
-                    .frames
-                    .iter()
-                    .all(|frame| matches!(frame, FormulaPayloadFrame::And { .. })),
-                "a certified linear formula proposal carried a non-AND payload frame"
+                batch.ors.is_empty(),
+                "a certified linear formula proposal carried an OR reducer cell"
             );
         }
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
@@ -19643,6 +19557,65 @@ mod tests {
     }
 
     #[test]
+    fn formula_result_destination_uses_the_immediate_canonical_return_edge() {
+        let nested = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let guarded = IntersectionConstraint::new(vec![
+            shape_leaf(0),
+            Box::new(nested) as ShapeConstraint,
+            shape_leaf(0),
+        ]);
+        let root = UnionConstraint::new(vec![Box::new(guarded) as ShapeConstraint, shape_leaf(0)]);
+        let plan = ResidualPlan::compile_finite_unions(&root);
+        let program = &plan.finite_formula;
+        let outer = program.root(0).unwrap();
+        let FiniteFormulaNodeKind::Or {
+            children: outer_children,
+        } = &program.node(outer).kind
+        else {
+            panic!("formula root is not Or")
+        };
+        let guarded = outer_children[0];
+        let FiniteFormulaNodeKind::And {
+            children: and_children,
+        } = &program.node(guarded).kind
+        else {
+            panic!("outer arm is not And")
+        };
+
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        let mut pcs = FormulaPcInterner::default();
+        let root = pcs.start(program, 0, 0, UnionVerb::Propose { relevant });
+        assert_eq!(
+            pcs.result_destination(program, root),
+            FormulaResultDestination::Root
+        );
+
+        let guarded = pcs.select_child(program, root, 0);
+        assert_eq!(
+            pcs.result_destination(program, guarded),
+            FormulaResultDestination::ParentOr
+        );
+        let guarded_action = pcs.select_child_as_action(program, guarded, 0);
+        assert_eq!(
+            pcs.result_destination(program, guarded_action),
+            FormulaResultDestination::ParentAnd
+        );
+
+        let nested = pcs.select_child(program, guarded, 1);
+        assert_eq!(
+            pcs.result_destination(program, nested),
+            FormulaResultDestination::ParentAnd
+        );
+        let nested_action = pcs.select_child_as_action(program, nested, 0);
+        assert_eq!(
+            pcs.result_destination(program, nested_action),
+            FormulaResultDestination::ParentOr
+        );
+        assert!(and_children.len() > 1);
+    }
+
+    #[test]
     fn formula_payload_installs_ordered_local_or_emission_into_and() {
         let mut batch = FormulaBatch {
             activations: vec![ActivationId(0)],
@@ -19650,31 +19623,73 @@ mod tests {
                 rows: Vec::new(),
                 row_count: 1,
             },
-            frames: vec![
-                FormulaPayloadFrame::And {
-                    current: CandidatePayload::Values(Vec::new()),
-                },
-                FormulaPayloadFrame::Or {
-                    source: CandidatePayload::Values(vec![raw(9)]),
-                    accumulator: FormulaOrAccumulator::empty(1),
-                },
-            ],
+            current: CandidatePayload::Values(Vec::new()),
+            ors: vec![FormulaOrCell {
+                source: CandidatePayload::Values(vec![raw(9)]),
+                accumulator: FormulaOrAccumulator::empty(1),
+            }],
         };
 
         batch.admit_current_or_value(0, raw(2));
         batch.admit_current_or_value(0, raw(1));
         batch.admit_current_or_value(0, raw(2));
         let emitted = CandidatePayload::Values(batch.current_or_set().iter().copied().collect());
-        assert!(matches!(
-            batch.return_emitted_or(emitted),
-            FormulaFrameDestination::ParentAnd
-        ));
-        assert_eq!(batch.frames.len(), 1);
-        let FormulaPayloadFrame::And { current } = &batch.frames[0] else {
-            panic!("local OR returned into the wrong parent-frame shape")
-        };
-        assert!(current.is_values());
-        assert_eq!(current.one_parent_values(), [raw(1), raw(2)]);
+        batch.install_emitted_or(emitted);
+        assert!(batch.ors.is_empty());
+        assert!(batch.current.is_values());
+        assert_eq!(batch.current.one_parent_values(), [raw(1), raw(2)]);
+    }
+
+    #[test]
+    fn formula_payload_erases_nested_and_while_preserving_or_action_fanout() {
+        let mut batch = FormulaBatch::from_confirmation(
+            CandidateBatch {
+                parents: RowBatch::seed(),
+                candidates: CandidatePayload::Values(vec![raw(3), raw(1), raw(3)]),
+            },
+            vec![ActivationId(0)],
+            &FiniteFormulaNodeKind::And {
+                children: Box::new([]),
+            },
+        );
+        batch.enter_node(&FiniteFormulaNodeKind::And {
+            children: Box::new([]),
+        });
+        assert!(batch.ors.is_empty(), "AND entry allocated payload state");
+        assert_eq!(batch.current.one_parent_values(), [raw(3), raw(1), raw(3)]);
+
+        batch.enter_node(&FiniteFormulaNodeKind::Or {
+            children: Box::new([]),
+        });
+        assert_eq!(batch.ors.len(), 1);
+        assert!(batch.current.is_empty());
+        batch.begin_or_arm(FormulaStage::Confirm);
+        let action = CandidatePayload::Values(
+            batch
+                .take_current()
+                .iter()
+                .filter_map(|(parent, value)| {
+                    assert_eq!(parent, 0);
+                    (value != raw(1)).then_some(value)
+                })
+                .collect(),
+        );
+        batch.apply_action_result(FormulaStage::Confirm, action);
+
+        let admitted = batch.take_current();
+        assert!(batch.current.is_empty());
+        for (parent, value) in admitted.iter() {
+            batch.admit_current_or_value(parent, value);
+        }
+        let emitted = CandidatePayload::Values(batch.current_or_set().iter().copied().collect());
+        batch.install_emitted_or(emitted);
+        assert!(batch.ors.is_empty());
+        assert_eq!(batch.current.one_parent_values(), [raw(3)]);
+
+        batch.enter_node(&FiniteFormulaNodeKind::And {
+            children: Box::new([]),
+        });
+        assert_eq!(batch.current.one_parent_values(), [raw(3)]);
     }
 
     #[test]
@@ -19695,7 +19710,8 @@ mod tests {
         let batch = FormulaBatch {
             activations: vec![ActivationId(0)],
             parents: RowBatch::seed(),
-            frames: vec![FormulaPayloadFrame::And { current: segmented }],
+            current: segmented,
+            ors: Vec::new(),
         };
         let mut singletons = batch.into_singletons(0);
         assert_eq!(singletons.len(), 1);
@@ -19752,20 +19768,17 @@ mod tests {
             },
         );
 
-        batch.enter(
-            &FiniteFormulaNodeKind::And {
-                children: Vec::new().into_boxed_slice(),
-            },
-            FormulaStage::Confirm,
-        );
-        let [FormulaPayloadFrame::Or {
-            source: CandidatePayload::Deferred(source),
-            ..
-        }, FormulaPayloadFrame::And {
-            current: CandidatePayload::Deferred(child),
-        }] = batch.frames.as_slice()
-        else {
-            panic!("Confirm frame entry did not preserve shared deferred storage")
+        assert!(batch.current.is_empty());
+        assert_eq!(batch.ors.len(), 1);
+        batch.begin_or_arm(FormulaStage::Confirm);
+        batch.enter_node(&FiniteFormulaNodeKind::And {
+            children: Vec::new().into_boxed_slice(),
+        });
+        let CandidatePayload::Deferred(source) = &batch.ors[0].source else {
+            panic!("root OR source was not frozen")
+        };
+        let CandidatePayload::Deferred(child) = &batch.current else {
+            panic!("Confirm arm did not preserve shared deferred storage")
         };
         assert!(Arc::ptr_eq(
             &source.root.as_ref().unwrap().node,
@@ -19819,10 +19832,11 @@ mod tests {
         for (parent, batch) in singletons.iter().enumerate() {
             assert_eq!(batch.parents.rows, [raw(10 + parent as u8)]);
             assert_eq!(batch.parents.row_count, 1);
-            let FormulaPayloadFrame::Or {
+            assert!(batch.current.is_empty());
+            let FormulaOrCell {
                 source: CandidatePayload::Deferred(source),
                 accumulator,
-            } = &batch.frames[0]
+            } = &batch.ors[0]
             else {
                 panic!("Formula reducer singleton materialized its OR source")
             };
@@ -19910,19 +19924,15 @@ mod tests {
                 rows: [1, 2, 3, 4, 5, 6].map(raw).into_iter().collect(),
                 row_count: 3,
             },
-            frames: vec![
-                FormulaPayloadFrame::Or {
-                    source: candidate_payload(3, vec![(0, raw(20)), (2, raw(21))]),
-                    accumulator: {
-                        let mut accumulator = FormulaOrAccumulator::empty(3);
-                        accumulator.insert(1, raw(22));
-                        accumulator
-                    },
+            current: candidate_payload(3, vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]),
+            ors: vec![FormulaOrCell {
+                source: candidate_payload(3, vec![(0, raw(20)), (2, raw(21))]),
+                accumulator: {
+                    let mut accumulator = FormulaOrAccumulator::empty(3);
+                    accumulator.insert(1, raw(22));
+                    accumulator
                 },
-                FormulaPayloadFrame::And {
-                    current: candidate_payload(3, vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]),
-                },
-            ],
+            }],
         };
         let mut groups = batch.partition(2, &[7u8, 7, 7]);
         assert_eq!(groups.len(), 1);
@@ -19933,13 +19943,10 @@ mod tests {
         );
         assert_eq!(group.parents.rows, [1, 2, 3, 4, 5, 6].map(raw));
         assert_eq!(group.parents.row_count, 3);
-        let [FormulaPayloadFrame::Or {
+        let FormulaOrCell {
             source,
             accumulator,
-        }, FormulaPayloadFrame::And { current }] = group.frames.as_slice()
-        else {
-            panic!("uniform partition changed formula frame shapes")
-        };
+        } = &group.ors[0];
         assert_eq!(source, &vec![(0, raw(20)), (2, raw(21))]);
         assert!(accumulator.sets[0].is_empty());
         assert_eq!(
@@ -19947,7 +19954,10 @@ mod tests {
             [raw(22)]
         );
         assert!(accumulator.sets[2].is_empty());
-        assert_eq!(current, &vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]);
+        assert_eq!(
+            group.current,
+            vec![(0, raw(30)), (1, raw(31)), (2, raw(32))]
+        );
 
         let empty = FormulaBatch {
             activations: Vec::new(),
@@ -19955,9 +19965,8 @@ mod tests {
                 rows: Vec::new(),
                 row_count: 0,
             },
-            frames: vec![FormulaPayloadFrame::And {
-                current: CandidatePayload::Tagged(Vec::new()),
-            }],
+            current: CandidatePayload::Tagged(Vec::new()),
+            ors: Vec::new(),
         };
         assert!(empty.partition::<u8>(0, &[]).is_empty());
     }
@@ -26690,7 +26699,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn recursive_formula_parallel_split_preserves_deep_affine_frame_stack() {
+    fn recursive_formula_parallel_split_preserves_deep_affine_payload() {
         let make = || {
             let leaf = |estimate| VerbLeaf {
                 variable: 1,
@@ -27892,9 +27901,8 @@ mod tests {
                     rows: Vec::new(),
                     row_count,
                 },
-                frames: vec![FormulaPayloadFrame::And {
-                    current: candidate_payload(row_count, current),
-                }],
+                current: candidate_payload(row_count, current),
+                ors: Vec::new(),
             })
         };
         let first = file_with_plan(
@@ -27934,12 +27942,9 @@ mod tests {
             [ActivationId(10), ActivationId(11), ActivationId(12)]
         );
         assert_eq!(page.parents.row_count, 3);
-        let [FormulaPayloadFrame::And { current }] = page.frames.as_slice() else {
-            panic!("formula continuation lost its root AND frame")
-        };
         assert_eq!(
-            current,
-            &vec![
+            page.current,
+            vec![
                 (0, raw(10)),
                 (0, raw(11)),
                 (1, raw(12)),

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Finite Formula AND now threads one affine candidate payload without
+  structural frames.** `FormulaBatch` stores one `current` stream plus only
+  irreducible OR source/ordered-set cells. Canonical PC return edges, rather
+  than payload-stack shape, decide whether a completed action or connective
+  returns to the root, a parent AND, or a parent OR. Parent partitioning,
+  paging, cloning, delta finalization, and ordered OR admission preserve the
+  same SET and lazy-scheduling semantics.
 - **Shared PositiveSupport service liveness is exact and quiescent probes are
   lock-free.** Shard runtimes and in-flight packet guards now retain one
   counted registration whose final drop reconciles the global lease under the

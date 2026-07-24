@@ -2635,7 +2635,7 @@ fn append_one_parent_page(output: &mut CandidatePayload, values: Vec<RawInline>)
 ///
 /// Stable formula PC IDs intentionally live here rather than in [`DeltaDesc`]:
 /// two activations may expand the same RPQ product kernel while returning to
-/// different arena-interned ancestor states and payload-frame stacks.
+/// different arena-interned ancestor states and OR-reducer payloads.
 #[derive(Clone)]
 enum DeltaReturn {
     Stable {
@@ -8915,6 +8915,10 @@ impl DeltaScheduler {
                     );
                 }
                 FormulaReducerSeed::Admit(seed) if seed.batch.parents.row_count > 1 => {
+                    assert!(
+                        seed.batch.current.is_empty(),
+                        "Formula OR admission retained its input in current"
+                    );
                     let singletons = seed
                         .batch
                         .into_structural_singletons_with_input(seed.bound.count(), seed.input);
@@ -8928,6 +8932,10 @@ impl DeltaScheduler {
                     }
                 }
                 FormulaReducerSeed::Admit(mut seed) => {
+                    assert!(
+                        seed.batch.current.is_empty(),
+                        "Formula OR admission retained its input in current"
+                    );
                     assert_eq!(
                         seed.batch.parents.row_count, 1,
                         "Formula OR admission requires one affine parent"
@@ -22861,23 +22869,19 @@ mod tests {
     #[test]
     fn formula_confirm_finalizer_accepts_or_ancestry_now_that_admission_is_pageable() {
         fn formula_batch(original: &CandidatePayload, with_or: bool) -> FormulaBatch {
-            let mut frames = vec![FormulaPayloadFrame::And {
-                current: original.clone(),
-            }];
-            if with_or {
-                frames.push(FormulaPayloadFrame::Or {
+            let ors = if with_or {
+                vec![FormulaOrCell {
                     source: original.clone(),
                     accumulator: FormulaOrAccumulator::empty(1),
-                });
+                }]
             } else {
-                frames.push(FormulaPayloadFrame::And {
-                    current: original.clone(),
-                });
-            }
+                Vec::new()
+            };
             FormulaBatch {
                 activations: vec![super::super::ActivationId(11)],
                 parents: RowBatch::seed(),
-                frames,
+                current: original.clone(),
+                ors,
             }
         }
 
