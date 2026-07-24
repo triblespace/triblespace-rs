@@ -11117,6 +11117,120 @@ impl ResidualStateMachine {
         }
     }
 
+    /// Publishes one completed, nonterminal Program proposal back into the
+    /// ordinary canonical Candidate continuation.
+    ///
+    /// Completion is selected only after projected demand has widened beyond
+    /// the scalar latency lane. The Program family still owns the action and
+    /// certifies the complete occurrence bag; only its physical execution
+    /// changes from affine pages to one block-native cohort.
+    #[cold]
+    #[inline(never)]
+    fn finish_complete_program_candidate(
+        &mut self,
+        family: StateId,
+        desc: StateDesc,
+        successor: StateDesc,
+        mut rows: RowBatch,
+        completion: (
+            usize,
+            ProgramCompleteAdmission,
+            usize,
+            Vec<(u32, RawInline)>,
+        ),
+        plan: &ResidualPlan,
+    ) -> DeltaSeedOutcome {
+        let (first_parent, admission, raw_occurrence_count, occurrences) = completion;
+        match admission {
+            ProgramCompleteAdmission::LegacyUnquoted => {
+                assert_eq!(
+                    first_parent, 0,
+                    "legacy unquoted completion did not retain its whole batch"
+                );
+            }
+            ProgramCompleteAdmission::Exact {
+                drain_work_units,
+                raw_occurrences,
+            } => {
+                let capacity = self.width.max(1);
+                debug_assert!(drain_work_units <= capacity);
+                debug_assert!(raw_occurrences <= capacity);
+                assert_eq!(raw_occurrences, raw_occurrence_count);
+            }
+        }
+
+        if first_parent > 0 {
+            let completed_parent_count = rows.row_count - first_parent;
+            let mut deferred = StateBucket::Rows(rows);
+            let completed = deferred.take_tail(desc.bound.count(), completed_parent_count, false);
+            let receipt = file_with_plan(
+                &mut self.worklist,
+                &mut self.interner,
+                plan,
+                desc.clone(),
+                deferred,
+                &mut self.stats,
+            )
+            .expect("bounded complete-action prefix is nonempty");
+            debug_assert_eq!(receipt.state, family);
+            let StateBucket::Rows(completed) = completed else {
+                unreachable!("bounded complete split preserved row payloads")
+            };
+            rows = completed;
+        }
+
+        let seeded_parents = rows.row_count;
+        self.stats.propose_action_pops += 1;
+        self.stats.propose_calls += 1;
+        self.stats.propose_rows += seeded_parents;
+        self.stats.max_propose_rows = self.stats.max_propose_rows.max(seeded_parents);
+
+        let mut candidates = CandidatePayload::from_tagged(occurrences, seeded_parents);
+        candidates.debug_assert_valid_for(rows.row_count);
+        debug_assert!(
+            {
+                let mut admitted = candidates.clone();
+                admitted.admit_set_forward_stable(rows.row_count)
+                    && admitted.len() == candidates.len()
+            },
+            "typed complete adapter returned a duplicate candidate"
+        );
+        self.stats.candidates_proposed += raw_occurrence_count;
+        self.stats.max_propose_candidates =
+            self.stats.max_propose_candidates.max(raw_occurrence_count);
+
+        if crosses_candidate_set_boundary(&desc, &successor, plan, &self.interner.formula_pcs) {
+            assert!(
+                candidates.admit_set_tail_stable(rows.row_count),
+                "completed Program proposal returned a deferred candidate payload"
+            );
+        }
+        let parent_columns = desc.bound.count();
+        let candidate = CandidateBatch {
+            parents: rows,
+            candidates,
+        };
+        let continuation = candidate.compact(parent_columns).and_then(|candidate| {
+            file_with_plan(
+                &mut self.worklist,
+                &mut self.interner,
+                plan,
+                successor,
+                StateBucket::Candidates(candidate),
+                &mut self.stats,
+            )
+        });
+        DeltaSeedOutcome {
+            continuation,
+            publication: None,
+            active: None,
+            terminal_activations: Vec::new(),
+            completed_activation_ids: Vec::new(),
+            terminal_family: None,
+            seeded_parents,
+        }
+    }
+
     /// Converts one eligible proposer action into activation-owned cyclic
     /// work.
     fn seed_delta_proposal<'a>(
@@ -11185,6 +11299,12 @@ impl ResidualStateMachine {
         let complete_terminal_candidate = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
+            && program.is_some_and(|(_, route)| {
+                route.completion == ProgramCompletion::CompleteActionEquivalent
+            });
+        let complete_wide_candidate = !terminal_streaming
+            && self.terminal_demand_width > 1
+            && selected_parent_count > 1
             && program.is_some_and(|(_, route)| {
                 route.completion == ProgramCompletion::CompleteActionEquivalent
             });
@@ -11267,6 +11387,25 @@ impl ResidualStateMachine {
                     direct_terminal_publication_full,
                     plan,
                 ));
+            }
+            if complete_wide_candidate {
+                let capacity = self.width.max(1);
+                let completion = {
+                    let affinity = ProgramCompleteAffinity::new(&rows);
+                    let vars: Vec<VariableId> = program_request.bound.into_iter().collect();
+                    let batch = ProgramCompleteBatch {
+                        request: program_request,
+                        route,
+                        view: rows_view(&vars, &rows.rows, rows.row_count),
+                    };
+                    spec.try_complete_bounded(batch, capacity, &affinity)
+                        .map(|completion| completion.into_parts_for(batch, &affinity, &rows))
+                };
+                if let Some(completion) = completion {
+                    return Ok(self.finish_complete_program_candidate(
+                        state, desc, successor, rows, completion, plan,
+                    ));
+                }
             }
             self.stats.propose_action_pops += 1;
             self.stats.propose_calls += 1;
