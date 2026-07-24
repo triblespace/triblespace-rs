@@ -8195,7 +8195,7 @@ fn quoted_formula_propose_transition<'a>(
     relevant.insert(0);
     let root_checked =
         plan.formula_proposer_starts_checked(root, 0, quote.root, variable, desc.bound);
-    let mut common_counter = interner.start_formula_with_proposer_checked(
+    let mut common_cursor = interner.start_formula_with_proposer_checked(
         &plan.finite_formula,
         variable,
         0,
@@ -8208,14 +8208,14 @@ fn quoted_formula_propose_transition<'a>(
     let skipped = formula_ready_common_skips(root, plan, quote, variable);
     for child in 0..quote.children.len() {
         if skipped.contains(child) {
-            common_counter =
-                interner
-                    .formula_pcs
-                    .skip_child(&plan.finite_formula, common_counter, child);
+            common_cursor = common_cursor.with_pc(interner.formula_pcs.skip_child(
+                &plan.finite_formula,
+                common_cursor.pc,
+                child,
+            ));
         }
     }
-    let exact_counter =
-        any_exact.then(|| interner.formula_pcs.with_proposer_checked(common_counter));
+    let exact_cursor = any_exact.then(|| interner.formula_pcs.with_proposer_checked(common_cursor));
 
     let groups: Option<BTreeMap<FormulaReadyChoice, Vec<usize>>> = (!uniform_choice).then(|| {
         let mut groups = BTreeMap::new();
@@ -8235,10 +8235,10 @@ fn quoted_formula_propose_transition<'a>(
 
     let mut file_choice =
         |choice: FormulaReadyChoice, rows: RowBatch, activations: Vec<ActivationId>| {
-            let counter = if choice.exact() {
-                exact_counter.expect("an Exact quoted choice has no checked root PC")
+            let cursor = if choice.exact() {
+                exact_cursor.expect("an Exact quoted choice has no checked root PC")
             } else {
-                common_counter
+                common_cursor
             };
             let mut formula_batch = FormulaBatch::from_proposal(
                 rows,
@@ -8248,10 +8248,11 @@ fn quoted_formula_propose_transition<'a>(
             let selected = select_interned_formula_child(
                 &plan.finite_formula,
                 &mut interner.formula_pcs,
-                counter,
+                cursor.pc,
                 &quote.children,
                 choice.child(),
             );
+            let selected = cursor.with_pc(selected);
             enter_selected_formula_frame(
                 &plan.finite_formula,
                 interner.formula(selected),
@@ -8263,7 +8264,7 @@ fn quoted_formula_propose_transition<'a>(
                 plan,
                 StateDesc {
                     bound: desc.bound,
-                    phase: ResidualPhase::Formula { counter: selected },
+                    phase: ResidualPhase::Formula { cursor: selected },
                 },
                 StateBucket::Formula(formula_batch),
                 stats,
@@ -20019,7 +20020,7 @@ mod tests {
         let mut activation_ids = std::collections::BTreeSet::new();
         for level in worklist.values() {
             for (&id, bucket) in level {
-                let ResidualPhase::Formula { counter } = interner.get(id).phase else {
+                let ResidualPhase::Formula { cursor } = interner.get(id).phase else {
                     panic!("quoted carrier did not enter a Formula child")
                 };
                 let StateBucket::Formula(batch) = bucket else {
@@ -20032,16 +20033,18 @@ mod tests {
                 let FormulaFocus::Action {
                     node,
                     stage: FormulaStage::Propose,
-                } = interner.formula(counter).focus
+                } = interner.formula(cursor).focus
                 else {
                     panic!("quoted source did not enter its proposal Action")
                 };
                 let return_to = interner
-                    .formula(counter)
+                    .formula(cursor)
                     .return_to
                     .expect("selected child should retain one root return edge");
                 let parent = interner.formula_pcs.return_by_id(return_to).parent;
-                let FormulaFocus::Plan { done, .. } = &interner.formula(parent).focus else {
+                let FormulaFocus::Plan { done, .. } =
+                    &interner.formula(cursor.with_pc(parent)).focus
+                else {
                     panic!("selected child did not retain its root AND continuation")
                 };
                 assert!(
@@ -20055,7 +20058,7 @@ mod tests {
                 entered.push((
                     marker,
                     node,
-                    interner.formula_resume(counter).proposer_checked,
+                    interner.formula_resume(cursor).proposer_checked,
                 ));
             }
         }
@@ -20073,6 +20076,161 @@ mod tests {
             2,
             "each carrier row must retain one unique affine activation"
         );
+    }
+
+    #[test]
+    fn deferred_ready_receipt_partitions_share_structural_root_pc_without_coalescing() {
+        const PARENT: VariableId = 0;
+        const TARGET: VariableId = 1;
+        let exact_calls = Arc::new(AtomicUsize::new(0));
+        let covering_calls = Arc::new(AtomicUsize::new(0));
+        let quoted = |coverage, estimates, calls: &Arc<AtomicUsize>| {
+            Box::new(QuotedEstimateLeaf {
+                parent: Some(PARENT),
+                variable: TARGET,
+                coverage,
+                estimates,
+                estimate_calls: Arc::clone(calls),
+            }) as ShapeConstraint
+        };
+        let root = IntersectionConstraint::new(vec![
+            quoted(ProposalCoverage::Exact, [1, 9], &exact_calls),
+            quoted(ProposalCoverage::Covering, [9, 1], &covering_calls),
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let quote = plan.formula_ready_quote.as_ref().unwrap();
+        assert_eq!(quote.children.len(), 2);
+        assert!(
+            !plan.formula_proposer_starts_checked(
+                &root,
+                0,
+                quote.root,
+                TARGET,
+                VariableSet::new_singleton(PARENT),
+            ),
+            "an Exact and a Covering source have only a Covering common receipt"
+        );
+
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(PARENT),
+            phase: ResidualPhase::Ready,
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let carrier = ready_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            RowBatch {
+                rows: vec![raw(0), raw(1)],
+                row_count: 2,
+            },
+            root.variables(),
+            &[VariableSet::new_empty(); 128],
+            &[1; 128],
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        let carrier_desc = interner.get(carrier.state).clone();
+        let StateBucket::QuotedRows(batch) = worklist
+            .get_mut(&carrier.rank)
+            .unwrap()
+            .remove(&carrier.state)
+            .unwrap()
+        else {
+            panic!("Ready did not preserve its row-local Formula receipts")
+        };
+        assert_eq!(
+            batch.choices,
+            [
+                FormulaReadyChoice::new(0, true),
+                FormulaReadyChoice::new(1, false),
+            ]
+        );
+
+        let mut next_activation = 0;
+        quoted_formula_propose_transition(
+            &root,
+            &plan,
+            &carrier_desc,
+            TARGET,
+            batch,
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+
+        let mut partitions = Vec::new();
+        for (&rank, level) in &worklist {
+            for (&state, bucket) in level {
+                let ResidualPhase::Formula { cursor } = interner.get(state).phase else {
+                    panic!("a quoted receipt partition did not enter Formula")
+                };
+                let StateBucket::Formula(batch) = bucket else {
+                    panic!("a quoted receipt partition lost its Formula payload")
+                };
+                assert_eq!(batch.parents.row_count, 1);
+                let return_to = interner
+                    .formula(cursor)
+                    .return_to
+                    .expect("the selected child lost its root continuation");
+                let parent = interner.formula_pcs.return_by_id(return_to).parent;
+                partitions.push((
+                    batch.parents.rows[0][0],
+                    state,
+                    rank,
+                    cursor,
+                    cursor.with_pc(parent),
+                    interner.formula_resume(cursor).proposer_checked,
+                ));
+            }
+        }
+        partitions.sort_unstable_by_key(|partition| partition.0);
+        assert_eq!(partitions.len(), 2);
+        let exact = partitions[0];
+        let covering = partitions[1];
+        assert_ne!(exact.1, covering.1, "row-local partitions became one state");
+        assert_eq!(
+            exact.2, covering.2,
+            "receipt strength must not perturb the structural rank band"
+        );
+        assert_eq!(
+            exact.4.pc, covering.4.pc,
+            "checked and unchecked outer resumes duplicated the root PC"
+        );
+        assert_ne!(
+            exact.4.resume, covering.4.resume,
+            "row-local discharge receipts were quotiented with structure"
+        );
+        assert!(exact.5);
+        assert!(!covering.5);
+        assert_ne!(
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Formula { cursor: exact.4 },
+            },
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Formula { cursor: covering.4 },
+            },
+            "equal structural roots must retain distinct outer futures"
+        );
+
+        assert_eq!(interner.formula_pcs.resume_len(), 2);
+        assert_eq!(
+            interner.formula_pcs.len(),
+            3,
+            "one shared root and two selected children are the exact structural PCs"
+        );
+        assert_eq!(interner.formula_pcs.return_len(), 2);
+        assert_eq!(next_activation, 2);
+        assert_eq!(stats.formula_ready_quote_groups, 2);
     }
 
     #[test]
@@ -20261,11 +20419,11 @@ mod tests {
             &mut interner,
             &mut stats,
         );
-        let ResidualPhase::Formula { counter } = interner.get(entered.state).phase else {
+        let ResidualPhase::Formula { cursor } = interner.get(entered.state).phase else {
             panic!("quoted carrier did not enter its selected Formula child")
         };
         assert!(
-            interner.formula_resume(counter).proposer_checked,
+            interner.formula_resume(cursor).proposer_checked,
             "carrier entry lost the Exact root receipt and would self-confirm"
         );
     }
@@ -20634,14 +20792,14 @@ mod tests {
                 right_arm_calls.load(Ordering::Relaxed),
             )
         );
-        let ResidualPhase::Formula { counter } = interner.get(token.state).phase else {
+        let ResidualPhase::Formula { cursor } = interner.get(token.state).phase else {
             panic!("quoted OR carrier did not enter Formula")
         };
         let FormulaFocus::Plan {
             node,
             stage: FormulaStage::Propose,
             ..
-        } = interner.formula(counter).focus
+        } = interner.formula(cursor).focus
         else {
             panic!("quote crossed through the selected OR into one of its arms")
         };
