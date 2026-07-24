@@ -9,6 +9,7 @@
 //! RUSTFLAGS="--cfg engine_legacy_binding" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_scalar" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual" cargo run --release --example query_engine_generation_bench
+//! RUSTFLAGS="--cfg engine_current_full" cargo run --release --example query_engine_generation_bench
 //! RUSTFLAGS="--cfg engine_current_residual --cfg engine_prefix_checkpoints" \
 //!   cargo run --release --example query_engine_generation_bench
 //! ```
@@ -23,7 +24,10 @@
 #[cfg(any(
     all(engine_legacy_binding, engine_current_scalar),
     all(engine_legacy_binding, engine_current_residual),
+    all(engine_legacy_binding, engine_current_full),
     all(engine_current_scalar, engine_current_residual),
+    all(engine_current_scalar, engine_current_full),
+    all(engine_current_residual, engine_current_full),
 ))]
 compile_error!("select exactly one benchmark engine");
 
@@ -184,7 +188,14 @@ const ENGINE: &str = "legacy Binding DFS";
 const ENGINE: &str = "current scalar DFS";
 #[cfg(engine_current_residual)]
 const ENGINE: &str = "current residual";
-#[cfg(not(any(engine_legacy_binding, engine_current_scalar, engine_current_residual)))]
+#[cfg(engine_current_full)]
+const ENGINE: &str = "current whole-root residual";
+#[cfg(not(any(
+    engine_legacy_binding,
+    engine_current_scalar,
+    engine_current_residual,
+    engine_current_full
+)))]
 const ENGINE: &str = "ordinary Query iterator";
 
 const REVISION: &str = match option_env!("ENGINE_REVISION") {
@@ -201,7 +212,11 @@ macro_rules! engine_query {
         {
             query.sequential()
         }
-        #[cfg(not(engine_current_scalar))]
+        #[cfg(engine_current_full)]
+        {
+            query.residual_lowering(triblespace::core::query::residual::ResidualLowering::FULL)
+        }
+        #[cfg(not(any(engine_current_scalar, engine_current_full)))]
         {
             query
         }
@@ -1159,7 +1174,10 @@ where
     }
 }
 
-#[cfg(all(engine_prefix_checkpoints, engine_current_residual))]
+#[cfg(all(
+    engine_prefix_checkpoints,
+    any(engine_current_residual, engine_current_full)
+))]
 fn residual_checkpoint_stats<I, F>(label: &str, mut query: I, snapshot: F)
 where
     I: Iterator<Item = Pair>,
@@ -1193,6 +1211,21 @@ where
         "residual_stats cell={label:?} checkpoint=full rows={rows} current_width={current_width} \
          stats={stats}",
     );
+}
+
+#[cfg(all(
+    engine_prefix_checkpoints,
+    any(engine_current_residual, engine_current_full)
+))]
+fn benchmark_residual_lowering() -> triblespace::core::query::residual::ResidualLowering {
+    #[cfg(engine_current_residual)]
+    {
+        triblespace::core::query::residual::ResidualLowering::HYBRID
+    }
+    #[cfg(engine_current_full)]
+    {
+        triblespace::core::query::residual::ResidualLowering::FULL
+    }
 }
 
 #[cfg(engine_prefix_checkpoints)]
@@ -1246,25 +1279,24 @@ fn main() {
     );
     println!("oracle parity: all three prefix-diagnostic cells exact");
 
-    #[cfg(engine_current_residual)]
+    #[cfg(any(engine_current_residual, engine_current_full))]
     {
-        use triblespace::core::query::residual::ResidualLowering;
-
         residual_checkpoint_stats(
             "cyclic RPQ / TribleSet",
-            cyclic_rpq_query!(&fixture).solve_residual_state_lazy_with(ResidualLowering::FULL),
+            cyclic_rpq_query!(&fixture)
+                .solve_residual_state_lazy_with(benchmark_residual_lowering()),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
         residual_checkpoint_stats(
             "formula + cyclic RPQ / TribleSet sibling",
             mixed_formula_rpq_query!(&fixture.graph, &fixture)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+                .solve_residual_state_lazy_with(benchmark_residual_lowering()),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
         residual_checkpoint_stats(
             "formula + cyclic RPQ / SuccinctArchive sibling",
             mixed_formula_rpq_query!(&archive, &fixture)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL),
+                .solve_residual_state_lazy_with(benchmark_residual_lowering()),
             |query| (query.current_width(), format!("{:?}", query.stats())),
         );
     }

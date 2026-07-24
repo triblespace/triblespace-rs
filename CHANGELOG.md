@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The cross-generation query benchmark can select whole-root residual
+  lowering explicitly.** `engine_current_full` measures the same fixture and
+  oracle cells as the legacy, scalar, and default HYBRID adapters, while
+  prefix diagnostics now report the lowering policy actually selected by the
+  measured adapter.
 - **Certified WholeRoot ANDs compile a recursive Ready quote.** Standard
   intersections now expose an explicit child-minimum estimate proof. Across
   the maximal root AND region, Ready uses the resulting preorder quote columns
