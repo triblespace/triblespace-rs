@@ -1741,6 +1741,17 @@ impl PositiveSupportGlobalServiceRuntime {
     }
 
     fn global_lane_is_active(&self) -> bool {
+        if self.shared.active_packet_nonce.load(Ordering::Acquire)
+            != NO_ACTIVE_GLOBAL_SERVICE_PACKET
+        {
+            // A published packet is sufficient for this conservative
+            // scheduling question. The coordinator remains authoritative for
+            // admission, debt, settlement, abandonment, and cloning; a probe
+            // racing the final clear may therefore return one harmless stale
+            // positive without weakening any of those transitions.
+            return true;
+        }
+
         let mut coordinator = self.lock();
         if coordinator.abandoned {
             return false;
@@ -12622,6 +12633,100 @@ mod tests {
             .is_err(),
             "an abandoned direct receipt reopened attributable scheduling"
         );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn shared_active_lane_probe_bypasses_coordinator_for_published_packet() {
+        let owner = PositiveSupportGlobalServiceRuntime::dormant();
+        let probe = owner.parallel_sibling();
+        assert!(owner.demand_arrived());
+        let packet = match owner.try_reserve_turn(true) {
+            PositiveSupportGlobalTurn::Reserved(guard) => guard,
+            PositiveSupportGlobalTurn::Inactive => {
+                panic!("live global-service shard failed to reserve a packet")
+            }
+            PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                panic!("opening shard was deferred on packet {packet_nonce}")
+            }
+        };
+        assert!(
+            owner.active_packet_nonce().is_some(),
+            "the real packet did not publish its fast-path witness"
+        );
+
+        let held_coordinator = owner.shared.coordinator.lock().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let probe_thread = std::thread::spawn(move || {
+            result_tx.send(probe.global_lane_is_active()).unwrap();
+        });
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("active lane probe blocked on the held coordinator"),
+            "a published packet failed to keep its global lane active"
+        );
+        drop(held_coordinator);
+        probe_thread.join().unwrap();
+
+        assert!(packet.settle(1, false).closed_packet.is_some());
+        assert_eq!(
+            owner.active_packet_nonce(),
+            None,
+            "final close left the scheduling fast path permanently positive"
+        );
+        assert!(
+            !owner.global_lane_is_active(),
+            "final close kept an inactive global lane schedulable"
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn shared_inactive_lane_probe_locks_and_reconciles_last_live_shard() {
+        let owner = PositiveSupportGlobalServiceRuntime::dormant();
+        let probe = owner.parallel_sibling();
+        assert!(owner.demand_arrived());
+        assert_eq!(owner.snapshot().lease, PositiveSupportServiceLease::Parked);
+        assert!(matches!(
+            owner.try_reserve_turn(false),
+            PositiveSupportGlobalTurn::Inactive
+        ));
+        assert_eq!(owner.active_packet_nonce(), None);
+        assert_eq!(owner.global_live_scans(), 0);
+
+        let held_coordinator = owner.shared.coordinator.lock().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let probe_thread = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            result_tx.send(probe.global_lane_is_active()).unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("inactive lane probe thread did not start");
+        assert!(
+            matches!(
+                result_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a None-mirror lane probe bypassed its authoritative coordinator"
+        );
+
+        drop(held_coordinator);
+        assert!(
+            !result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("inactive lane probe did not resume after coordinator unlock"),
+            "last-live retirement failed to reconcile the global lane to inactive"
+        );
+        probe_thread.join().unwrap();
+        assert_eq!(
+            owner.global_live_scans(),
+            1,
+            "the authoritative None path did not rescan Weak shard liveness"
+        );
+        assert_eq!(owner.snapshot().lease, PositiveSupportServiceLease::Idle);
     }
 
     #[cfg(feature = "parallel")]
