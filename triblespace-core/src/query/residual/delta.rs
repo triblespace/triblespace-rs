@@ -1163,7 +1163,7 @@ fn append_one_parent_page(output: &mut CandidatePayload, values: Vec<RawInline>)
 ///
 /// Stable formula cursors intentionally live here rather than in [`DeltaDesc`]:
 /// two activations may expand the same RPQ product kernel while returning to
-/// different arena-interned ancestor states and payload-frame stacks.
+/// different arena-interned ancestor states and OR-reducer payloads.
 #[derive(Clone)]
 enum DeltaReturn {
     Stable {
@@ -3956,7 +3956,7 @@ impl ProducerRegistry {
     ///
     /// Nonempty quiescent proposals always transfer to the private
     /// Seal/Merge/Emit Program. Stable and finite-formula Confirm activations
-    /// transfer whenever their live candidate frame can be finalized
+    /// transfer whenever their live candidate stream can be finalized
     /// independently. Engine-owned Formula OR reducers settle directly
     /// through their own pageable Program families.
     fn settle_quiescence(&mut self, proof: QuiescenceProof) -> RegistrySettlement {
@@ -6423,7 +6423,7 @@ impl DeltaScheduler {
                 FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
                 FormulaStage::Propose => DeltaReducer::quiescent_proposal(),
                 FormulaStage::Confirm => DeltaReducer::Confirm {
-                    original: batch.shared_contiguous_confirm_original(),
+                    original: batch.take_contiguous_confirm_original(),
                 },
             };
             activations.push(self.registry.open_program_activation(
@@ -6809,7 +6809,7 @@ impl DeltaScheduler {
 
     /// Suspends each affine formula parent behind one activation-local reducer.
     /// Empty seed ranges complete immediately with an empty action result, so
-    /// an empty RPQ arm can still return through AND/OR frames.
+    /// an empty RPQ arm can still return through its exact Formula continuation.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn seed_formula(
         &mut self,
@@ -6840,7 +6840,7 @@ impl DeltaScheduler {
                 FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
                 FormulaStage::Propose => DeltaReducer::quiescent_proposal(),
                 FormulaStage::Confirm => DeltaReducer::Confirm {
-                    original: batch.shared_confirm_original(),
+                    original: batch.take_confirm_original(),
                 },
             };
             let started = self.registry.start_many(
@@ -6908,7 +6908,7 @@ impl DeltaScheduler {
     }
 
     /// Suspends one bounded source generator per affine formula parent. The
-    /// exact Action PC and reducer frames remain activation payload; the
+    /// exact Action PC and live payload cells remain activation payload; the
     /// structural descriptor names only the shared expansion kernel.
     pub(super) fn seed_source_formula(
         &mut self,
@@ -6931,7 +6931,7 @@ impl DeltaScheduler {
                 }
                 FormulaStage::Propose => (DeltaReducer::quiescent_proposal(), None),
                 FormulaStage::Confirm => {
-                    let original = batch.shared_contiguous_confirm_original();
+                    let original = batch.take_contiguous_confirm_original();
                     let mut source_candidates = original.one_parent_values().to_vec();
                     source_candidates.sort_unstable();
                     source_candidates.dedup();
@@ -6997,7 +6997,8 @@ impl DeltaScheduler {
                     );
                     let input = seed.destination.take_candidates();
                     input.debug_assert_valid_for(1);
-                    let Some(program_state) = SetAdmissionState::start(input) else {
+                    if input.is_empty() {
+                        seed.destination.install_candidates(input);
                         if let Some(bucket) = seed
                             .destination
                             .into_live_bucket(seed.successor.bound.count())
@@ -7015,7 +7016,9 @@ impl DeltaScheduler {
                             );
                         }
                         continue;
-                    };
+                    }
+                    let program_state = SetAdmissionState::start(input)
+                        .expect("nonempty SET-admission input starts a Program");
 
                     let mut output = CandidatePayload::empty(1);
                     output.defer_for_shared_activation(1);
@@ -7050,6 +7053,10 @@ impl DeltaScheduler {
                     );
                 }
                 FormulaReducerSeed::Admit(seed) if seed.batch.parents.row_count > 1 => {
+                    assert!(
+                        !seed.batch.has_current(),
+                        "Formula OR admission retained its input in current"
+                    );
                     let singletons = seed
                         .batch
                         .into_structural_singletons_with_input(seed.bound.count(), seed.input);
@@ -7063,6 +7070,10 @@ impl DeltaScheduler {
                     }
                 }
                 FormulaReducerSeed::Admit(mut seed) => {
+                    assert!(
+                        !seed.batch.has_current(),
+                        "Formula OR admission retained its input in current"
+                    );
                     assert_eq!(
                         seed.batch.parents.row_count, 1,
                         "Formula OR admission requires one affine parent"
@@ -13246,8 +13257,8 @@ mod tests {
 
     #[test]
     fn empty_formula_or_reducers_drain_admission_and_emission_synchronously() {
-        // A one-arm union retains a real OR frame but lets one empty admission
-        // complete its child and immediately discover the empty root emission.
+        // A one-arm union retains a real OR reducer cell but lets one empty
+        // admission complete its child and discover the empty root emission.
         // Neither zero-rank reducer may manufacture a sentinel Program task.
         let root = UnionConstraint::new(vec![MixedExpansion]);
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
@@ -13346,7 +13357,7 @@ mod tests {
                 },
             );
             // Force the empty AND arm's Support action. A true witness selects
-            // that arm, whose complete Confirm frame immediately contributes
+            // that arm, whose complete Confirm result immediately contributes
             // the immutable root candidate to a fresh OR admission reducer.
             let support_action = parent.with_pc(stable_interner.formula_pcs.select_child_with(
                 &plan.finite_formula,
@@ -16544,7 +16555,8 @@ mod tests {
             vec![super::super::ActivationId(9)],
             &FiniteFormulaNodeKind::Atom,
         );
-        let formula_original = formula_batch.shared_contiguous_confirm_original();
+        let formula_original = formula_batch.take_contiguous_confirm_original();
+        assert!(!formula_batch.has_current());
         let formula = registry.open_program_activation(
             DeltaReducer::Confirm {
                 original: formula_original,
@@ -17957,23 +17969,18 @@ mod tests {
     #[test]
     fn formula_confirm_finalizer_accepts_or_ancestry_now_that_admission_is_pageable() {
         fn formula_batch(original: &CandidatePayload, with_or: bool) -> FormulaBatch {
-            let mut frames = vec![FormulaPayloadFrame::And {
-                current: original.clone(),
-            }];
-            if with_or {
-                frames.push(FormulaPayloadFrame::Or {
+            let cells = if with_or {
+                vec![FormulaLiveCell::Or {
                     source: original.clone(),
                     accumulator: FormulaOrAccumulator::empty(1),
-                });
+                }]
             } else {
-                frames.push(FormulaPayloadFrame::And {
-                    current: original.clone(),
-                });
-            }
+                Vec::new()
+            };
             FormulaBatch {
                 activations: vec![super::super::ActivationId(11)],
                 parents: RowBatch::seed(),
-                frames,
+                cells,
             }
         }
 
@@ -19341,7 +19348,7 @@ mod tests {
     fn batched_delta_step_keeps_dead_page_and_seeded_formula_handoff_independent() {
         // Keep a real, streamable formula boundary in this white-box fixture.
         // A lone opaque root is deliberately normalized to the flat action
-        // plan, while an OR frame is a streaming barrier by construction.
+        // plan, while an OR reducer cell is a streaming barrier by construction.
         let root = IntersectionConstraint::new(vec![MixedExpansion, MixedExpansion]);
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let formula_root = plan
@@ -19688,6 +19695,140 @@ mod tests {
         assert_eq!(
             batch.candidates.iter().collect::<Vec<_>>(),
             vec![(0, value(1)), (0, value(2)), (0, value(1))]
+        );
+    }
+
+    #[test]
+    fn formula_set_admission_owns_current_until_eof_then_reinstalls_the_exact_set() {
+        let root = IntersectionConstraint::new(vec![MixedExpansion; 3]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let program = &plan.finite_formula;
+        let formula_root = program.root(0).expect("synthetic formula has a root");
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+
+        let mut scheduler = DeltaScheduler::new();
+        let mut stable = Worklist::new();
+        let mut stable_interner = StateInterner::default();
+        let mut stats = ResidualStateStats {
+            candidates_proposed: 3,
+            ..ResidualStateStats::default()
+        };
+        let start = stable_interner.start_formula(program, 0, 0, UnionVerb::Propose { relevant });
+        let action = start.with_pc(
+            stable_interner
+                .formula_pcs
+                .select_child_as_action(program, start.pc, 0),
+        );
+        let completed = action.with_pc(stable_interner.formula_pcs.complete(program, action.pc));
+        let Ok(InternedFormulaSuccessor::Formula(next)) = stable_interner
+            .formula_pcs
+            .resume_completed(program, completed)
+        else {
+            panic!("the root proposer did not return to its AND suffix")
+        };
+        let successor = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula { cursor: next },
+        };
+
+        let mut input = CandidatePayload::Values(vec![value(1), value(2), value(1)]);
+        input.defer_for_shared_activation(1);
+        let mut batch = FormulaBatch::from_proposal(
+            RowBatch::seed(),
+            vec![super::super::ActivationId(11)],
+            &program.node(formula_root).kind,
+        );
+        batch.apply_action_result(FormulaStage::Propose, input);
+        assert!(matches!(
+            batch.cells.as_slice(),
+            [FormulaLiveCell::Current(CandidatePayload::Deferred(_))]
+        ));
+
+        let seeded = scheduler.seed_formula_reducers(
+            vec![FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
+                successor,
+                destination: SetAdmissionDestination::Formula(batch),
+            })],
+            &plan,
+            &mut stable,
+            &mut stable_interner,
+            &mut stats,
+        );
+        let mut active = seeded
+            .active
+            .expect("nonempty Formula SET admission opened one Program");
+        assert!(
+            stable.is_empty(),
+            "Formula re-entered stable before SET EOF"
+        );
+        let activation = scheduler
+            .registry
+            .state
+            .activations
+            .get(&active.activation)
+            .expect("Formula SET-admission activation remains live");
+        assert!(matches!(
+            &activation.reducer,
+            DeltaReducer::SetAdmit {
+                output: CandidatePayload::Deferred(_)
+            }
+        ));
+        let DeltaReturn::SetAdmission { destination, .. } = &activation.return_to else {
+            panic!("SET admission lost its Formula destination")
+        };
+        let SetAdmissionDestination::Formula(destination) = destination else {
+            panic!("Formula SET admission retained a Candidate destination")
+        };
+        assert!(
+            !destination.has_current(),
+            "the saved Formula return retained a dummy Current during admission"
+        );
+        assert!(
+            destination.cells.is_empty(),
+            "AND-only Formula ancestry left non-live payload during admission"
+        );
+
+        for _ in 0..16 {
+            let step = scheduler.step_active(
+                &root,
+                &plan,
+                active,
+                1,
+                &mut stable,
+                &mut stable_interner,
+                &mut stats,
+            );
+            if let Some(resume) = step.resume {
+                active = resume;
+                continue;
+            }
+            assert_eq!(step.status, ActiveDeltaStatus::Yielded);
+            break;
+        }
+        assert!(
+            !stable.is_empty(),
+            "Formula SET admission did not reach EOF"
+        );
+        let StateBucket::Formula(batch) =
+            stable.values().flat_map(BTreeMap::values).next().unwrap()
+        else {
+            panic!("SET admission returned a non-Formula payload")
+        };
+        assert!(matches!(
+            batch.cells.as_slice(),
+            [FormulaLiveCell::Current(CandidatePayload::Deferred(_))]
+        ));
+        assert_eq!(
+            batch.input().iter().collect::<Vec<_>>(),
+            vec![(0, value(2)), (0, value(1))],
+            "bounded SET admission changed tail-stable affine semantics"
+        );
+        assert_eq!(
+            stats.candidates_proposed, 3,
+            "SET admission rewrote raw Formula action telemetry"
         );
     }
 
@@ -20507,6 +20648,7 @@ mod tests {
             kind: FormulaReturnKind::Child,
             parent,
             child: 1,
+            destination: Some(FormulaResultDestination::ParentAnd),
         });
         let second = formula_pcs.intern_record(
             FormulaPcRecord {

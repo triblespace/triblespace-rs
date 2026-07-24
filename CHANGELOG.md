@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reducer suspensions retain the full cursor, so equal Formula structure can
   share arena records without merging distinct checked/confirm futures,
   changing rank bands, or weakening affine payload and SET boundaries.
+- **Finite Formula AND now threads one affine candidate payload without
+  structural frames.** `FormulaBatch` stores one live cell per irreducible OR
+  source/ordered-set reducer plus a trailing candidate cell only in phases
+  where that affine stream exists. Proposal planning, Support, action
+  execution, and OR admission/emission therefore retain no dummy candidate
+  payload. Canonical PC return edges, rather than payload-stack shape, decide
+  whether a completed action or connective returns to the root, a parent AND,
+  or a parent OR. Parent partitioning, paging, cloning, delta finalization, and
+  ordered OR admission preserve the same SET and lazy-scheduling semantics.
 - **Positive Support hedges now spend parent-local demand credit.** Each public
   pull may assign one demand unit to one parked semantic parent; only then may
   validated exact Confirm work mint additional allowance. Support Program
