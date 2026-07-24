@@ -1585,6 +1585,15 @@ struct ResidualPlan {
 }
 
 impl ResidualPlan {
+    /// Compile the one plan used by production query execution.
+    ///
+    /// Associative AND regions are native residual leaves, finite Union leaves
+    /// become formula continuations, and only production-qualified typed
+    /// Programs are admitted.
+    fn compile_production<'a>(root: &dyn Constraint<'a>) -> Self {
+        Self::compile_mode(root, FormulaScope::UnionLeaves, ProgramScope::Production)
+    }
+
     fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
         Self::compile_mode(root, FormulaScope::OpaqueLeaves, ProgramScope::Disabled)
     }
@@ -2255,9 +2264,9 @@ impl ProgramScope {
 /// Orthogonal structural lowering selected for one residual solve.
 ///
 /// Formula scope and Program scope are independent three-element chains,
-/// giving exactly nine canonical lowering forms. `Default` is
-/// [`ResidualLowering::CONSERVATIVE`]; fresh [`Query`] values explicitly use
-/// [`ResidualLowering::HYBRID`] instead.
+/// giving exactly nine compiler-probe forms. `Default` is
+/// [`ResidualLowering::CONSERVATIVE`]. Ordinary [`Query`] execution does not
+/// store this policy; it uses the fixed production plan.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub struct ResidualLowering {
@@ -10486,7 +10495,7 @@ impl<'a, C> SeededResidualFrame<C>
 where
     C: Constraint<'a> + 'a,
 {
-    pub(super) fn new(root: C, seed: FrameSeedRow, lowering: ResidualLowering) -> Self {
+    pub(super) fn new(root: C, seed: FrameSeedRow) -> Self {
         let full = root.variables();
         assert!(
             seed.bound.is_subset_of(&full),
@@ -10524,7 +10533,7 @@ where
                 .map_or(usize::MAX, |(_, estimate)| estimate)
         });
 
-        let plan = ResidualPlan::compile_lowering(&root, lowering);
+        let plan = ResidualPlan::compile_production(&root);
         let machine = ResidualStateMachine::new_seeded_for_plan(full, &plan, seed);
         Self {
             root,
@@ -10549,12 +10558,8 @@ where
 }
 
 impl ResidualQueryState {
-    pub(super) fn new<'a>(
-        root: &dyn Constraint<'a>,
-        seed: Option<FrameSeedRow>,
-        lowering: ResidualLowering,
-    ) -> Self {
-        let plan = ResidualPlan::compile_lowering(root, lowering);
+    pub(super) fn new<'a>(root: &dyn Constraint<'a>, seed: Option<FrameSeedRow>) -> Self {
+        let plan = ResidualPlan::compile_production(root);
         let machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, seed);
         Self { plan, machine }
     }
@@ -13325,7 +13330,8 @@ where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
-    /// Lazily executes any root constraint through canonical residual states.
+    /// Lazily executes any root constraint through the production residual
+    /// plan.
     ///
     /// The first pull uses a one-parent depth-first batch by default. Filing a
     /// nonempty successor preserves that width. When a full proposal or
@@ -13345,15 +13351,37 @@ where
     ///
     /// Panics if iteration has already started on this query.
     pub fn solve_residual_state_lazy(self) -> ResidualStateIter<C, P, R> {
-        self.solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        assert_fresh(&self);
+        let Query {
+            constraint,
+            postprocessing,
+            projection,
+            influences,
+            base_estimates,
+            seed,
+            ..
+        } = self;
+        let full = constraint.variables();
+        let plan = ResidualPlan::compile_production(&constraint);
+        let state = ResidualStateMachine::new_for_plan(full, &plan, seed);
+        ResidualStateIter {
+            root: constraint,
+            plan,
+            postprocessing,
+            projection,
+            influences,
+            base_estimates,
+            state,
+            iteration_started: false,
+        }
     }
 
     /// Lazily executes through residual states with explicit structural
     /// lowering.
     ///
-    /// Lowering is independent of scheduler selection. Passing
-    /// [`ResidualLowering::CONSERVATIVE`] is identical to
-    /// [`solve_residual_state_lazy`](Self::solve_residual_state_lazy).
+    /// This is a compiler probe. Ordinary execution and
+    /// [`solve_residual_state_lazy`](Self::solve_residual_state_lazy) use the
+    /// fixed production plan.
     ///
     /// # Panics
     ///
@@ -13495,17 +13523,12 @@ mod parallel {
         /// admission. A selected typed Program route may retain one complete
         /// parent activation instead when that enables traversal reuse.
         ///
-        /// The iterator preserves the query's selected [`ResidualLowering`].
-        /// Fresh queries use [`ResidualLowering::HYBRID`] by default; an explicit
-        /// [`Query::residual_lowering`] override remains in force.
-        ///
         /// # Panics
         ///
         /// Panics if the query has already been pulled, like the serial
         /// residual entry points.
         pub fn into_par_residual_state_iter(self) -> ResidualStateParIter<C, P, R> {
-            let lowering = self.residual_lowering;
-            let mut residual = self.solve_residual_state_lazy_with(lowering);
+            let mut residual = self.solve_residual_state_lazy();
             residual.state.width = residual.state.cap;
             residual.into_par_iter()
         }
@@ -13936,6 +13959,26 @@ mod tests {
             _candidates: &mut CandidateSink<'_>,
         ) {
         }
+    }
+
+    #[test]
+    fn production_plan_flattens_and_lowers_union_leaves_with_production_programs() {
+        let and_root = IntersectionConstraint::new(vec![ShapeLeaf(0), ShapeLeaf(1)]);
+        let and_plan = ResidualPlan::compile_production(&and_root);
+        assert_eq!(and_plan.leaves.len(), 2);
+        assert!(and_plan
+            .leaves
+            .iter()
+            .all(|leaf| leaf.lowering == LeafLowering::Opaque));
+        assert_eq!(and_plan.program_scope, ProgramScope::Production);
+        assert!(!and_plan.synthetic_root_formula);
+
+        let union_root = UnionConstraint::new(vec![ShapeLeaf(0), ShapeLeaf(0)]);
+        let union_plan = ResidualPlan::compile_production(&union_root);
+        assert_eq!(union_plan.leaves.len(), 1);
+        assert_eq!(union_plan.leaves[0].lowering, LeafLowering::FiniteFormula);
+        assert_eq!(union_plan.program_scope, ProgramScope::Production);
+        assert!(!union_plan.synthetic_root_formula);
     }
 
     #[derive(Clone, Copy)]
@@ -17544,22 +17587,14 @@ mod tests {
 
     #[test]
     fn private_seeded_frame_settles_fully_bound_truth_before_filing() {
-        let mut live = SeededResidualFrame::new(
-            ZeroVariableTruth(true),
-            FrameSeedRow::empty(),
-            ResidualLowering::FULL,
-        );
+        let mut live = SeededResidualFrame::new(ZeroVariableTruth(true), FrameSeedRow::empty());
         let first = live
             .next_binding()
             .expect("a true zero-variable seed emits once");
         assert!(first.bound.is_empty());
         assert!(live.next_binding().is_none());
 
-        let mut dead = SeededResidualFrame::new(
-            ZeroVariableTruth(false),
-            FrameSeedRow::empty(),
-            ResidualLowering::FULL,
-        );
+        let mut dead = SeededResidualFrame::new(ZeroVariableTruth(false), FrameSeedRow::empty());
         assert!(dead.next_binding().is_none());
         assert!(dead.machine.worklist.is_empty());
         assert!(dead.machine.delta.is_empty());
@@ -17570,7 +17605,6 @@ mod tests {
         let mut accepted_seed = SeededResidualFrame::new(
             variable.is(Inline::new(accepted)),
             FrameSeedRow::one(variable.index, accepted),
-            ResidualLowering::FULL,
         );
         assert_eq!(
             accepted_seed
@@ -17584,7 +17618,6 @@ mod tests {
         let mut rejected_seed = SeededResidualFrame::new(
             variable.is(Inline::new(accepted)),
             FrameSeedRow::one(variable.index, [4; 32]),
-            ResidualLowering::FULL,
         );
         assert!(rejected_seed.next_binding().is_none());
         assert!(rejected_seed.machine.worklist.is_empty());
@@ -17600,7 +17633,6 @@ mod tests {
                 values: Arc::new(vec![[9; 32]]),
             },
             FrameSeedRow::one(0, value),
-            ResidualLowering::FULL,
         );
 
         let (&rank, level) = frame
@@ -25300,7 +25332,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn conservative_query_clone_snapshots_parked_candidate_remainder() {
+    fn production_query_clone_snapshots_parked_candidate_remainder() {
         let values: Vec<_> = (0..64).map(raw).collect();
         let root = Arc::new(IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
@@ -25314,8 +25346,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             }) as ShapeConstraint,
         ]));
-        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .residual_lowering(ResidualLowering::CONSERVATIVE);
+        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied());
 
         assert_eq!(query.next(), Some(raw(63)));
         let runtime = query.residual.as_deref().expect("residual cursor started");
@@ -25332,7 +25363,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn full_lowering_query_clone_snapshots_parked_formula_remainder() {
+    fn full_lowering_probe_clone_snapshots_parked_formula_remainder() {
         let values: Vec<_> = (0..64).map(raw).collect();
         let root = Arc::new(IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
@@ -25347,16 +25378,15 @@ mod tests {
             }) as ShapeConstraint,
         ]));
         let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .residual_lowering(ResidualLowering::FULL);
+            .solve_residual_state_lazy_with(ResidualLowering::FULL);
 
         let first = query.next().expect("the formula frontier is nonempty");
-        let runtime = query.residual.as_deref().expect("residual cursor started");
-        assert!(runtime.machine.worklist.values().any(|level| {
+        assert!(query.state.worklist.values().any(|level| {
             level
                 .values()
                 .any(|bucket| matches!(bucket, StateBucket::Formula(_)))
         }));
-        assert!(runtime.machine.stats.partial_pops > 0);
+        assert!(query.state.stats.partial_pops > 0);
 
         let cloned = query.clone();
         let mut left = query.collect::<Vec<_>>();
@@ -25717,7 +25747,7 @@ mod tests {
         };
         let project = |binding: &Binding| binding.get(0).copied();
         let mut opaque: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy()
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
             .collect();
         let epoch = ResidualShadowEpoch::new();
         let mut lowered = Query::new(make(), project)
@@ -25790,7 +25820,7 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         let fresh = || Arc::new(Mutex::new(Vec::new()));
         let mut opaque: Vec<_> = Query::new(make(fresh(), fresh()), project)
-            .solve_residual_state_lazy()
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
             .collect();
         let left_calls = fresh();
         let right_calls = fresh();
@@ -27889,7 +27919,7 @@ mod tests {
 
         let project = |binding: &Binding| binding.get(0).copied();
         let mut opaque = Query::new(make(), project)
-            .solve_residual_state_lazy()
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
             .collect_profiled();
         let mut lowered = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
@@ -28325,8 +28355,9 @@ mod tests {
         let conservative_counters = program_fallback_counters();
         let mut conservative: Vec<_> = with_parallel_workers(4, || {
             Query::new(make(&conservative_counters, true), project)
-                .residual_lowering(ResidualLowering::CONSERVATIVE)
-                .into_par_residual_state_iter()
+                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+                .start_width(block_row_cap())
+                .into_par_iter()
                 .collect()
         });
         assert!(
@@ -28442,8 +28473,9 @@ mod tests {
 
         let mut one_worker = with_parallel_workers(1, || {
             Query::new(make(), project)
-                .residual_lowering(ResidualLowering::CONSERVATIVE)
-                .into_par_residual_state_iter()
+                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+                .start_width(block_row_cap())
+                .into_par_iter()
                 .collect::<Vec<_>>()
         });
         one_worker.sort_unstable();
@@ -28454,8 +28486,9 @@ mod tests {
         calls.lock().unwrap().clear();
         let mut four_workers = with_parallel_workers(4, || {
             Query::new(make(), project)
-                .residual_lowering(ResidualLowering::CONSERVATIVE)
-                .into_par_residual_state_iter()
+                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+                .start_width(block_row_cap())
+                .into_par_iter()
                 .collect::<Vec<_>>()
         });
         four_workers.sort_unstable();
@@ -28657,8 +28690,9 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         let mut custom = with_parallel_workers(4, || {
             Query::new(custom_root, project)
-                .residual_lowering(ResidualLowering::CONSERVATIVE)
-                .into_par_residual_state_iter()
+                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+                .start_width(block_row_cap())
+                .into_par_iter()
                 .collect::<Vec<_>>()
         });
         custom.sort_unstable();
@@ -28698,8 +28732,9 @@ mod tests {
         ]));
         let mut union_results = with_parallel_workers(4, || {
             Query::new(union_root, project)
-                .residual_lowering(ResidualLowering::CONSERVATIVE)
-                .into_par_residual_state_iter()
+                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+                .start_width(block_row_cap())
+                .into_par_iter()
                 .collect::<Vec<_>>()
         });
         union_results.sort_unstable();

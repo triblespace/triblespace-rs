@@ -232,7 +232,7 @@ fn pulled_query_rejects_seed_restarting_configuration() {
     let panics = [
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let query = query.clone();
-            move || drop(query.residual_lowering(ResidualLowering::CONSERVATIVE))
+            move || drop(query.solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE))
         })),
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let query = query.clone();

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: ordinary queries now have one fixed residual compiler policy.**
+  Serial iteration, ordinary Rayon iteration, saturated parallel iteration,
+  and private RPQ subframes all compile native AND regions with finite
+  Union-leaf continuations and production-qualified typed Programs.
+  `Query::residual_lowering` and its per-query policy state are removed.
+  `solve_residual_state_lazy_with` temporarily remains as an explicit
+  compiler-probe seam.
 - **Ordinary Rayon query iteration now reuses the canonical residual
   producer.** A fresh `Query::into_par_iter()` moves directly into the
   adaptive-width residual iterator and its affine splitter instead of entering
@@ -128,11 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deleting novelty in original receipt order, removing the activation-count
   multiplier without taxing insert/take.
 - **Canonical Succinct archive paging is production-qualified.** Propose,
-  Confirm, and Support routes participate in ordinary hybrid lowering, keeping
+  Confirm, and Support routes participate in ordinary production execution, keeping
   their typed paging and physical-backend seam available without requiring
   maximally exposed `ResidualLowering::FULL`.
 - **Typed `UnionArchive` Propose and Support are `Production`; Confirm remains
-  `Explicit`.** Ordinary hybrid lowering keeps sparse, geometrically
+  `Explicit`.** Ordinary production execution keeps sparse, geometrically
   widened paging for low-demand and nonterminal work. A fresh multi-parent
   terminal Propose cohort may instead use its `CompleteActionEquivalent`
   certificate, preserving the exact parent-major then shard-major raw
@@ -154,27 +161,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   targets, and multi-shard UnionArchive constraints remain on raw-cardinality
   estimates.
 - **Finite equality work and pointwise TribleSet checks stay on the ordinary
-  hybrid path, while TribleSet proposal cursors remain production-resumable.**
+  production path, while TribleSet proposal cursors remain production-resumable.**
   Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are
-  explicit Program routes: `ResidualLowering::HYBRID` executes their already
-  bounded ordinary kernels, while `FULL` retains typed representability.
+  explicit Program routes: ordinary execution uses their already bounded
+  kernels, while the `FULL` probe retains typed representability.
   TribleSet Propose remains production-qualified and pageable for low-demand
   and high-fanout work. For multi-parent terminal cohorts, its exact complete
   occurrence-bag certificate lets the geometrically widened scheduler drain a
   batch without opening one Program activation per parent.
 - **Hash-set and hash-map membership filters stay on the ordinary production
   residual path.** Their pointwise Confirm and Support work is already bounded
-  by the scheduler's input page, so HYBRID no longer expands each cheap hash
+  by the scheduler's input page, so production execution does not expand each cheap hash
   lookup into a typed Program activation. The filter-only Program routes remain
   available to `ResidualLowering::FULL` as explicit representability controls.
-- **Ordinary residual queries now use hybrid structural lowering.** Exposed
-  associative AND regions remain flattened into residual occurrences, while
-  other finite logical composites, including Union, stay fused behind their
-  relational constraint kernels. Production-qualified typed Programs such as
-  regular-path execution remain enabled. Explicit Program routes stay on the
-  ordinary constraint protocol under `ResidualLowering::HYBRID`;
-  `ResidualLowering::FULL` opts into them together with the maximally exposed
-  formula interpreter.
+- **Ordinary residual queries use one production structural policy.** Exposed
+  associative AND regions are flattened into residual occurrences, finite
+  Union leaves become formula continuations, and production-qualified typed
+  Programs such as regular-path execution are enabled. Explicit Program
+  routes stay on the ordinary constraint protocol; explicit compiler probes
+  may still request other `ResidualLowering` combinations.
 - **Typed Program selection now has an explicit exposure policy.** Every route
   is `Production` or `Explicit`, and the residual lowering's `ProgramScope`
   independently selects `Disabled`, `Production`, or `All`. The centralized
@@ -617,19 +622,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cohorts use these retained views to prove every fresh positive branch fits
   the geometric page budget before emitting, eliminating the former count
   descent followed by a second enumeration descent.
-- **Residual lowering has nine canonical, execution-independent forms.**
+- **Residual compiler probes have nine canonical, execution-independent
+  forms.**
   `ResidualLowering` crosses the `FormulaScope` chain (`OpaqueLeaves`,
   `UnionLeaves`, `WholeRoot`) with the independent `ProgramScope` chain
   (`Disabled`, `Production`, `All`);
   whole-root lowering structurally absorbs union-leaf lowering.
-  `Query::residual_lowering` selects the structural form independently of
+  `solve_residual_state_lazy_with` selects a probe form independently of
   geometric width. Whole-root scope keeps variable selection and the commit
   barrier outside a canonical AND/OR program, flattens only the maximal exposed
   root conjunction, and preserves opaque scope and group-reducer boundaries.
   Root-AND confirmations retain candidate-occurrence paging once no selected
   activation-reuse route blocks it, including width-one and geometric
-  first-result traces. Ordinary live queries use `ResidualLowering::HYBRID`;
-  explicit residual probe solvers remain conservative by default.
+  first-result traces. Ordinary live queries instead use the one fixed
+  Union-leaf plus production-Program plan.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
   borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route
@@ -784,10 +790,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to legacy paging. This preserves geometric lazy latency for heterogeneous
   wrappers such as the resident succinct two-bound route without bypassing
   exposure policy.
-- **Explicit parallel residual queries preserve their selected lowering.**
-  `Query::into_par_residual_state_iter` now carries the query's selected
-  lowering into its affine shards; fresh queries select `HYBRID`, while an
-  explicit conservative or intermediate `residual_lowering` remains honored.
+- **Explicit parallel residual queries use the production compiler policy.**
+  `Query::into_par_residual_state_iter` carries the same fixed production plan
+  as serial and ordinary Rayon execution into its affine shards. Explicit
+  compiler probes can still convert a configured `ResidualStateIter` into
+  parallel iteration.
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**
   `hash_tokens` previously discarded every token without an alphanumeric
   character, making standalone emoji queries produce an empty term list.
@@ -1011,7 +1018,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unions, regular paths, and custom wrappers all exercise the same residual
   substrate; exact seed rejection starts no worklist. This is a full semantic
   coverage switch, not a claim that residual control overhead pays back for
-  every shape. Structural lowering remains an explicit independent choice.
+  every shape. Production structural lowering is fixed rather than carried as
+  per-query state.
   Demand-adaptive chunk width starts with depth-first, first-result-oriented
   execution and grows into readiness-gated batch harvesting. Residual planning
   cohorts explicit `(variable, proposer occurrence)` actions and never

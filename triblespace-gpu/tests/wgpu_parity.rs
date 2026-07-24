@@ -12,8 +12,8 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::residual::{
-    current_residual_action, ActionVerb, ResidualShadowEpoch, ResidualShadowSnapshot,
-    ResidualShadowSolve, ResidualShadowStatus,
+    current_residual_action, ActionVerb, ResidualLowering, ResidualShadowEpoch,
+    ResidualShadowSnapshot, ResidualShadowSolve, ResidualShadowStatus,
 };
 use triblespace_core::query::{
     Binding, CandidateSink, Candidates, Constraint, ContainsConstraint, EstimateSink, Query,
@@ -102,7 +102,7 @@ fn observed_rank_query(
         ),
         move |binding: &Binding| binding.get(value.index).copied(),
     )
-    .solve_residual_state_lazy()
+    .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
     .cap(64)
     .start_width(64)
     .shadow(epoch.clone())
@@ -124,7 +124,7 @@ fn unshadowed_observed_rank_query(
         ),
         move |binding: &Binding| binding.get(value.index).copied(),
     )
-    .solve_residual_state_lazy()
+    .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
     .cap(64)
     .start_width(64)
     .collect()
@@ -143,7 +143,7 @@ fn direct_rank_query(
         and!(allowed.has(value), gpu.pattern(entity, attribute, value)),
         move |binding: &Binding| binding.get(value.index).copied(),
     )
-    .solve_residual_state_lazy()
+    .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
     .cap(64)
     .start_width(64)
     .shadow(epoch.clone())
@@ -550,7 +550,7 @@ fn observed_wgpu_nested_confirm_restores_outer_attribution() {
         and!(outer_allowed.has(value), nested_constraint),
         move |binding: &Binding| binding.get(value.index).copied(),
     )
-    .solve_residual_state_lazy()
+    .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
     .cap(64)
     .start_width(64)
     .shadow(outer_epoch)

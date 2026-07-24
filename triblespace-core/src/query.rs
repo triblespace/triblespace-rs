@@ -2469,18 +2469,16 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
 /// residual states. It starts with narrow, depth-first action cohorts and
 /// widens as the consumer keeps pulling, while histories with identical future
 /// computation can reconverge under one state identity. The production
-/// lowering flattens exposed associative AND regions, preserves other finite
-/// composites such as Union as fused constraint kernels, and executes
-/// production-qualified regular-path Programs as heterogeneous state actions.
-/// Explicit routes deferred by policy use the ordinary constraint action. A
-/// structurally absent route may instead retain the constraint's legacy pager
-/// or seed hooks. Seed-rejected queries start no runtime. Use
-/// [`Query::residual_lowering`] to select a conservative or intermediate
-/// lowering. Strict-projection keys are claimed before Rust conversion, so
-/// conversion failure or panic never retries the same raw row through another
-/// witness. Full heads need no terminal claim table: engine action admission
-/// already makes complete raw bindings unique, and a full projection is
-/// injective.
+/// plan flattens exposed associative AND regions, lowers finite Union leaves
+/// into continuations, and executes production-qualified regular-path
+/// Programs as heterogeneous state actions. Explicit routes deferred by that
+/// fixed policy use the ordinary constraint action. A structurally absent
+/// route may instead retain the constraint's legacy pager or seed hooks.
+/// Seed-rejected queries start no runtime. Strict-projection keys are claimed
+/// before Rust conversion, so conversion failure or panic never retries the
+/// same raw row through another witness. Full heads need no terminal claim
+/// table: engine action admission already makes complete raw bindings unique,
+/// and a full projection is injective.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -2497,8 +2495,6 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// Raw strict-projection identity and any keys claimed by this exact
     /// iterator snapshot. Full heads carry an elided marker instead.
     projection: ProjectionGate,
-    /// Structural lowering for the one residual solver.
-    residual_lowering: residual::ResidualLowering,
     /// Exact zero-or-one-row seed relation, retained until the residual cursor
     /// is first materialized.
     seed: Option<residual::FrameSeedRow>,
@@ -2537,7 +2533,6 @@ where
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             projection: self.projection.clone(),
-            residual_lowering: self.residual_lowering,
             seed: self.seed.clone(),
             iteration_started: self.iteration_started,
             influences: self.influences,
@@ -2548,26 +2543,6 @@ where
 }
 
 impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
-    /// Select structural lowering for the residual solver.
-    ///
-    /// Ordinary live queries start with [`residual::ResidualLowering::HYBRID`].
-    /// Structural/compiler probes can request
-    /// [`residual::ResidualLowering::CONSERVATIVE`] or any intermediate form
-    /// without changing execution policy.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started. Lowering must be selected
-    /// before the first call to [`Iterator::next`].
-    pub fn residual_lowering(mut self, lowering: residual::ResidualLowering) -> Self {
-        assert!(
-            !self.iteration_started && self.residual.is_none(),
-            "cannot select residual lowering after iteration has started"
-        );
-        self.residual_lowering = lowering;
-        self
-    }
-
     /// Create a new query.
     /// The query takes a constraint and a post-processing function as input,
     /// and returns the results of the query as a stream of values.
@@ -2665,7 +2640,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             constraint,
             postprocessing,
             projection,
-            residual_lowering: residual::ResidualLowering::HYBRID,
             seed,
             iteration_started: false,
             influences,
@@ -2845,7 +2819,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             self.residual = Some(Box::new(residual::ResidualQueryState::new(
                 &self.constraint,
                 Some(seed),
-                self.residual_lowering,
             )));
         }
         self.residual
@@ -2936,8 +2909,7 @@ mod parallel {
             // iterator and producer. QueryParIter is only a type-level adapter;
             // it adds no residual split or execution path of its own.
             if !self.iteration_started && self.residual.is_none() {
-                let lowering = self.residual_lowering;
-                let residual = self.solve_residual_state_lazy_with(lowering);
+                let residual = self.solve_residual_state_lazy();
                 return QueryParIter {
                     inner: QueryParInner::Residual(residual.into_par_iter()),
                 };
@@ -3454,36 +3426,6 @@ mod tests {
     fn projection_gate_rejects_a_missing_strict_parallel_claim_transfer() {
         let mut strict = ProjectionGate::new([0], variable_set([0, 1]));
         strict.attach_shared(None);
-    }
-
-    #[test]
-    fn residual_lowering_configures_the_one_solver() {
-        let mut context = VariableContext::new();
-        let variable = context.next_variable::<U256BE>();
-        let ordinary = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()));
-        assert_eq!(
-            ordinary.residual_lowering,
-            residual::ResidualLowering::HYBRID
-        );
-
-        let conservative = ordinary.residual_lowering(residual::ResidualLowering::CONSERVATIVE);
-        assert_eq!(
-            conservative.residual_lowering,
-            residual::ResidualLowering::CONSERVATIVE
-        );
-
-        let mut context = VariableContext::new();
-        let variable = context.next_variable::<U256BE>();
-        let intermediate = residual::ResidualLowering::new(
-            residual::FormulaScope::UnionLeaves,
-            residual::ProgramScope::All,
-        );
-        let configured = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()))
-            .residual_lowering(intermediate);
-        assert_eq!(
-            configured.residual_lowering, intermediate,
-            "the selected structural lowering remains attached to the query"
-        );
     }
 
     #[test]

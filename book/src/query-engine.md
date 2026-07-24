@@ -264,12 +264,12 @@ exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
 disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
 truths therefore all exercise the same residual substrate. A seed-rejected
 query starts no worklist at all. Production lowering flattens exposed
-associative AND regions, keeps other finite logical composites such as Union as
-fused constraint kernels inside that substrate, and enables
-production-qualified typed Programs for RPQs and other heterogeneous actions.
+associative AND regions, lowers finite Union leaves and their recursive
+AND/OR descendants into continuations, and enables production-qualified typed
+Programs for RPQs and other heterogeneous actions.
 Canonical single-shard SuccinctArchive Propose, Confirm, and Support routes are
 production-qualified, so their pageable typed form participates in ordinary
-hybrid lowering. Program retirement validates a wider activation receipt with
+execution. Program retirement validates a wider activation receipt with
 one arena membership pass, avoiding the previous activation-count by arena-size
 multiplier while retaining cheap singleton and fully drained paths.
 UnionArchive Propose and Support routes are `Production`; Confirm remains
@@ -283,10 +283,10 @@ distinct preferred production family; a structurally declined action falls
 back to the canonical production Succinct route.
 
 Ordinary [`Query`](triblespace::core::query::Query) iteration owns the residual
-cursor for every root and uses `HYBRID` lowering by default;
-`Query::residual_lowering` may change that structural choice before the first
-pull. `solve_residual_state_lazy` is a separate conservative-lowering probe
-entry point that exposes width controls;
+cursor for every root. Its compiler policy is fixed: native AND flattening,
+finite Union-leaf continuations, and production-qualified Programs.
+`solve_residual_state_lazy` uses the same production plan while exposing width
+controls; `solve_residual_state_lazy_with` remains an explicit compiler probe;
 `solve_residual_state` is the eager saturated form, and
 `solve_residual_state_profiled` reports state, merge, action, and batch
 measurements. Fully drained variants preserve the distinct raw projected-row
@@ -358,10 +358,10 @@ Program may keep one complete parent activation intact for physical traversal
 reuse, and a live Formula OR frame retains its private payload. Every shard
 retains canonical state merging locally; state is moved rather than
 duplicated, and the constraint/postprocessor pair is cloned only when a real
-sibling shard is created. Both parallel entry points preserve the query's
-selected residual lowering: fresh queries use hybrid lowering, which keeps
-formula kernels fused and enables transition Programs, while an explicit
-`Query::residual_lowering` override remains in force.
+sibling shard is created. Both ordinary and saturated parallel entry points
+use the same fixed production plan as serial `Query`; compiler-policy
+experiments construct a `ResidualStateIter` explicitly with
+`solve_residual_state_lazy_with`.
 
 ### Opt-in residual action observation
 

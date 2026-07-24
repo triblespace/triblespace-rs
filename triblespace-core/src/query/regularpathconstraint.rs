@@ -13,6 +13,7 @@ use crate::patch::PATCHBoundedInfixes;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::residual::FrameSeedRow;
+#[cfg(test)]
 use crate::query::residual::ResidualLowering;
 use crate::query::residual::SeededResidualFrame;
 use crate::query::CandidateSink;
@@ -414,7 +415,7 @@ where
     #[cfg(test)]
     SEEDED_CHAIN_FRAME_RUNS.with(|runs| runs.set(runs.get() + 1));
 
-    let mut frame = SeededResidualFrame::new(root, seed, ResidualLowering::FULL);
+    let mut frame = SeededResidualFrame::new(root, seed);
     while let Some(binding) = frame.next_binding() {
         if !reducer.observe(&binding) {
             break;

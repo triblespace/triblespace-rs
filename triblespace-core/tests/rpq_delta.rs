@@ -2777,7 +2777,8 @@ fn same_variable_delta_remains_opt_in() {
     let graph = Graph::new(1, &[(0, 0)]);
     let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
 
-    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
+    let mut query = Query::new(root, project_start)
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE);
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(0).raw]);
     assert_eq!(query.stats().delta_source_pages, 0);
     assert_eq!(query.stats().delta_transition_pages, 0);
@@ -4133,7 +4134,8 @@ fn conservative_residual_lowering_keeps_plus_opaque() {
         graph.value(0),
         &repeated(graph.attribute, false),
     );
-    let mut query = Query::new(root, project_end).solve_residual_state_lazy();
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE);
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     let mut expected = [graph.value(1).raw, graph.value(2).raw];
@@ -4157,7 +4159,8 @@ fn conservative_residual_lowering_keeps_plus_opaque() {
         ],
         &repeated(graph.attribute, false),
     );
-    let mut query = Query::new(root, project_end).solve_residual_state_lazy();
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE);
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     let mut expected = [graph.value(2).raw, graph.value(1).raw];

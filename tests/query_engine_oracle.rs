@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::residual::{
     ActionVerb, FormulaScope, ProgramScope, ResidualLowering, ResidualShadowEpoch,
-    ResidualShadowStatus,
+    ResidualShadowStatus, ResidualStateIter,
 };
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
@@ -62,12 +62,12 @@ fn multiset<T: Eq + Hash>(items: impl IntoIterator<Item = T>) -> HashMap<T, usiz
 /// oracle frame. Debug builds otherwise reserve another full `Query` temporary
 /// at every macro expansion and can cross the test thread's stack budget.
 #[inline(never)]
-fn conservative_residual_cursor<'a, C, P, R>(query: Query<C, P, R>) -> Query<C, P, R>
+fn conservative_residual_cursor<'a, C, P, R>(query: Query<C, P, R>) -> ResidualStateIter<C, P, R>
 where
-    C: Constraint<'a>,
+    C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
-    query.residual_lowering(ResidualLowering::CONSERVATIVE)
+    query.solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
 }
 
 #[cfg(feature = "parallel")]
@@ -429,7 +429,7 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
                             .growth(growth)
                     ),
                     expected,
-                    "{}: conservative residual ({geometry})",
+                    "{}: production residual ({geometry})",
                     $label
                 );
 

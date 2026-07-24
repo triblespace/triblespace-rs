@@ -9,7 +9,7 @@ use triblespace_core::inline::RawInline;
 use triblespace_core::query::equalityconstraint::EqualityConstraint;
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::rangeconstraint::InlineRange;
-use triblespace_core::query::residual::{ResidualLowering, ResidualStateStats};
+use triblespace_core::query::residual::ResidualStateStats;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProposalCoverage, Query,
@@ -740,9 +740,7 @@ where
         .solve_residual_state_lazy()
         .cap(1)
         .collect();
-    let mut ordinary: Vec<_> = Query::new(make(), project)
-        .residual_lowering(ResidualLowering::CONSERVATIVE)
-        .collect();
+    let mut ordinary: Vec<_> = Query::new(make(), project).collect();
 
     expected.sort_unstable();
     eager.sort_unstable();
