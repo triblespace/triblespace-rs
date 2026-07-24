@@ -25,14 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oracle cells as the legacy, scalar, and default HYBRID adapters, while
   prefix diagnostics now report the lowering policy actually selected by the
   measured adapter.
-- **Finite-Formula structural control is interned independently from its outer
-  WCO continuation.** Residual Formula state now carries an exact
-  `(program-counter, resume)` cursor: child selection, skipping, completion,
-  and the persistent return spine transform only the structural counter,
-  while proposer discharge replaces only the resume. Delta and private
-  reducer suspensions retain the full cursor, so equal Formula structure can
-  share arena records without merging distinct checked/confirm futures,
-  changing rank bands, or weakening affine payload and SET boundaries.
+- **Finite-Formula structural control is interned independently from its
+  canonical outer Candidate exit.** Residual Formula state now carries an
+  exact `(program-counter, candidate-exit)` cursor. The exit records only the
+  future ordinary Candidate descriptor `(variable, relevant, checked)`, while
+  child selection, skipping, completion, and the persistent return spine
+  transform only the structural counter. Proposal and confirmation histories
+  therefore converge exactly when they reach identical structural control and
+  future Candidate work; exit checked-count plus structural grade supplies the
+  corresponding rank. Delta and private reducer suspensions retain the full
+  cursor, preserving affine payload and SET boundaries across that quotient.
 - **Finite Formula AND now threads one affine candidate payload without
   structural frames.** `FormulaBatch` stores one live cell per irreducible OR
   source/ordered-set reducer plus a trailing candidate cell only in phases
