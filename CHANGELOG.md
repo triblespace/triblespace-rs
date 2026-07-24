@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oracle cells as the legacy, scalar, and default HYBRID adapters, while
   prefix diagnostics now report the lowering policy actually selected by the
   measured adapter.
+- **Finite Formula AND now threads one affine candidate payload without
+  structural frames.** `FormulaBatch` stores one live cell per irreducible OR
+  source/ordered-set reducer plus a trailing candidate cell only in phases
+  where that affine stream exists. Proposal planning, Support, action
+  execution, and OR admission/emission therefore retain no dummy candidate
+  payload. Canonical PC return edges, rather than payload-stack shape, decide
+  whether a completed action or connective returns to the root, a parent AND,
+  or a parent OR. Parent partitioning, paging, cloning, delta finalization, and
+  ordered OR admission preserve the same SET and lazy-scheduling semantics.
 - **Shared PositiveSupport service liveness is exact and quiescent probes are
   lock-free.** Shard runtimes and in-flight packet guards now retain one
   counted registration whose final drop reconciles the global lease under the
