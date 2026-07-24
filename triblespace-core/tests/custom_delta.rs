@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
+use triblespace_core::query::finiteunaryprogram::{self, FiniteUnaryProgramState};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::{
     ResidualLowering, ResidualShadowEpoch, ResidualShadowStatus,
@@ -15,7 +16,6 @@ use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
     ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
     ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
-    ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceBatch,
     ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TypedEffectSink,
     TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
     VariableSet,
@@ -36,6 +36,8 @@ fn raw(byte: u8) -> RawInline {
 #[derive(Default)]
 struct DeltaEvidence {
     seeded_roots: AtomicUsize,
+    proposed_roots: AtomicUsize,
+    confirmed_roots: AtomicUsize,
     expanded_nodes: AtomicUsize,
     continuation_mask: AtomicUsize,
     fully_bound_satisfied_calls: AtomicUsize,
@@ -46,12 +48,12 @@ struct DeltaEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum ProgramSupportPhase {
+enum AlternatingPhase {
     Red,
     Blue,
 }
 
-impl ProgramSupportPhase {
+impl AlternatingPhase {
     fn next(self) -> Self {
         match self {
             Self::Red => Self::Blue,
@@ -62,7 +64,7 @@ impl ProgramSupportPhase {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProgramSupportPageTrace {
-    phase: ProgramSupportPhase,
+    phase: AlternatingPhase,
     value: RawInline,
     offset: usize,
     limit: usize,
@@ -187,177 +189,101 @@ impl<'a> Constraint<'a> for AlternatingClosure {
         })
     }
 
-    fn residual_delta_seeds(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaSeed>,
-    ) -> bool {
-        if variable != END || view.col(END).is_some() {
-            return false;
-        }
-        let Some(start) = view.col(START) else {
-            return false;
-        };
-        let before = seeds.len();
-        seeds.extend(view.iter().enumerate().map(|(parent, row)| {
-            let source = row[start];
-            ResidualDeltaSeed {
-                parent: u32::try_from(parent).expect("too many custom-delta parents"),
-                output: ResidualDeltaOutput {
-                    node: ResidualDeltaNode {
-                        source: Some(source),
-                        value: source,
-                        continuation: 0,
-                    },
-                    accepted: false,
-                },
-            }
-        }));
-        self.evidence
-            .seeded_roots
-            .fetch_add(seeds.len() - before, Ordering::Relaxed);
-        true
-    }
-
-    fn residual_delta_support_seeds(
-        &self,
-        view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaSeed>,
-    ) -> Option<VariableId> {
-        let start = view.col(START)?;
-        let end = view.col(END)?;
-        let before = seeds.len();
-        seeds.extend(view.iter().enumerate().map(|(parent, row)| {
-            ResidualDeltaSeed {
-                parent: u32::try_from(parent).expect("too many custom-support parents"),
-                output: ResidualDeltaOutput {
-                    node: ResidualDeltaNode {
-                        // Support reuses the node's optional anchor as the
-                        // fixed target and reserves continuations 2/3 for its
-                        // Boolean traversal. Proposal keeps using 0/1.
-                        source: Some(row[end]),
-                        value: row[start],
-                        continuation: 2,
-                    },
-                    // `(red, blue)+` has no nullable witness.
-                    accepted: false,
-                },
-            }
-        }));
-        self.evidence
-            .support_seeded_roots
-            .fetch_add(seeds.len() - before, Ordering::Relaxed);
-        Some(END)
-    }
-
-    fn residual_delta_expand(
-        &self,
-        variable: VariableId,
-        nodes: &[ResidualDeltaNode],
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) -> bool {
-        if variable != END {
-            return false;
-        }
-        self.evidence
-            .expanded_nodes
-            .fetch_add(nodes.len(), Ordering::Relaxed);
-        self.evidence.support_expanded_nodes.fetch_add(
-            nodes
-                .iter()
-                .filter(|node| matches!(node.continuation, 2 | 3))
-                .count(),
-            Ordering::Relaxed,
-        );
-        for (tag, node) in nodes.iter().enumerate() {
-            let (edges, next, support) = match node.continuation {
-                0 => (&self.red, 1, false),
-                1 => (&self.blue, 0, false),
-                2 => (&self.red, 3, true),
-                3 => (&self.blue, 2, true),
-                _ => panic!("invalid custom-delta continuation"),
-            };
-            self.evidence
-                .continuation_mask
-                .fetch_or(1_usize << node.continuation, Ordering::Relaxed);
-            successors.extend(
-                edges
-                    .iter()
-                    .filter(|&&(source, _)| source == node.value)
-                    .map(|&(_, target)| {
-                        let accepted = if support {
-                            node.continuation == 3 && node.source == Some(target)
-                        } else {
-                            node.continuation == 1
-                        };
-                        if support && accepted {
-                            self.evidence
-                                .support_witnesses
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        (
-                            u32::try_from(tag).expect("too many custom-delta nodes"),
-                            ResidualDeltaOutput {
-                                node: ResidualDeltaNode {
-                                    source: node.source,
-                                    value: target,
-                                    continuation: next,
-                                },
-                                accepted,
-                            },
-                        )
-                    }),
-            );
-        }
-        true
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 }
 
-/// The same non-RPQ relation with its Boolean traversal expressed through the
-/// generic typed Program contract. The ordinary relation remains the oracle;
-/// only a fully-bound Formula Support action is claimed by the Program.
-struct ProgramAlternatingClosure(AlternatingClosure);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AlternatingAction {
+    Propose,
+    Confirm,
+    Support,
+}
+
+impl AlternatingAction {
+    fn dispatch_base(self) -> u32 {
+        match self {
+            Self::Propose => 0,
+            Self::Confirm => 2,
+            Self::Support => 4,
+        }
+    }
+
+    fn continuation_base(self) -> usize {
+        match self {
+            Self::Propose | Self::Confirm => 0,
+            Self::Support => 2,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
-struct ProgramSupportState {
-    target: RawInline,
+struct AlternatingState {
+    action: AlternatingAction,
+    target: Option<RawInline>,
     value: RawInline,
-    phase: ProgramSupportPhase,
+    phase: AlternatingPhase,
     offset: usize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ProgramSupportNovelty {
-    target: RawInline,
+struct AlternatingNovelty {
+    action: AlternatingAction,
+    target: Option<RawInline>,
     value: RawInline,
-    phase: ProgramSupportPhase,
+    phase: AlternatingPhase,
 }
 
-impl TypedProgramSpec for ProgramAlternatingClosure {
-    type State = ProgramSupportState;
-    type NoveltyKey = ProgramSupportNovelty;
-    type Rank = u64;
+impl AlternatingState {
+    fn novelty(&self) -> AlternatingNovelty {
+        AlternatingNovelty {
+            action: self.action,
+            target: self.target,
+            value: self.value,
+            phase: self.phase,
+        }
+    }
+}
+
+impl TypedProgramSpec for AlternatingClosure {
+    type State = AlternatingState;
+    type NoveltyKey = AlternatingNovelty;
+    type Rank = [u64; 2];
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        (request.action == ProgramAction::Support
-            && request.bound.is_set(START)
-            && request.bound.is_set(END))
-        .then_some(ProgramRoute {
-            key: ProgramKey::new(0),
+        let (key, grouping) = match request.action {
+            ProgramAction::Propose(variable)
+                if variable == END && request.bound.is_set(START) && !request.bound.is_set(END) =>
+            {
+                (ProgramKey::new(0), ProgramGrouping::PageLocal)
+            }
+            ProgramAction::Confirm(variable)
+                if variable == END && request.bound.is_set(START) && !request.bound.is_set(END) =>
+            {
+                (ProgramKey::new(1), ProgramGrouping::ParentAtomic)
+            }
+            ProgramAction::Support if request.bound.is_set(START) && request.bound.is_set(END) => {
+                (ProgramKey::new(2), ProgramGrouping::ParentAtomic)
+            }
+            _ => return None,
+        };
+        Some(ProgramRoute {
+            key,
             variable: END,
             stratum: ProgramStratum::Fixpoint,
-            grouping: ProgramGrouping::ParentAtomic,
+            grouping,
             completion: ProgramCompletion::PageableOnly,
             exposure: ProgramExposure::Production,
         })
     }
 
     fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        match state.phase {
-            ProgramSupportPhase::Red => DispatchClass::new(0),
-            ProgramSupportPhase::Blue => DispatchClass::new(1),
-        }
+        let phase = match state.phase {
+            AlternatingPhase::Red => 0,
+            AlternatingPhase::Blue => 1,
+        };
+        DispatchClass::new(state.action.dispatch_base() + phase)
     }
 
     fn pacing(&self, _state: &Self::State) -> ProgramPacing {
@@ -365,7 +291,11 @@ impl TypedProgramSpec for ProgramAlternatingClosure {
     }
 
     fn progress(&self, state: &Self::State) -> Self::Rank {
-        u64::MAX - u64::try_from(state.offset).expect("custom Program cursor exceeds its rank limb")
+        [
+            u64::from(state.action.dispatch_base()),
+            u64::MAX
+                - u64::try_from(state.offset).expect("custom Program cursor exceeds its rank limb"),
+        ]
     }
 
     fn seed_typed(
@@ -373,35 +303,64 @@ impl TypedProgramSpec for ProgramAlternatingClosure {
         batch: ProgramSeedBatch<'_>,
         effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     ) {
-        assert_eq!(batch.request.action, ProgramAction::Support);
         let start = batch
             .view
             .col(START)
-            .expect("custom Program Support lost its start column");
-        let end = batch
-            .view
-            .col(END)
-            .expect("custom Program Support lost its target column");
-        self.0
-            .evidence
-            .support_seeded_roots
-            .fetch_add(batch.view.len(), Ordering::Relaxed);
+            .expect("custom Program lost its bound start column");
+        let (action, target) = match batch.request.action {
+            ProgramAction::Propose(variable) => {
+                assert_eq!(variable, END);
+                (AlternatingAction::Propose, None)
+            }
+            ProgramAction::Confirm(variable) => {
+                assert_eq!(variable, END);
+                (AlternatingAction::Confirm, None)
+            }
+            ProgramAction::Support => (
+                AlternatingAction::Support,
+                Some(
+                    batch
+                        .view
+                        .col(END)
+                        .expect("custom Program Support lost its target column"),
+                ),
+            ),
+        };
+        match action {
+            AlternatingAction::Propose => {
+                self.evidence
+                    .seeded_roots
+                    .fetch_add(batch.view.len(), Ordering::Relaxed);
+                self.evidence
+                    .proposed_roots
+                    .fetch_add(batch.view.len(), Ordering::Relaxed);
+            }
+            AlternatingAction::Confirm => {
+                self.evidence
+                    .seeded_roots
+                    .fetch_add(batch.view.len(), Ordering::Relaxed);
+                self.evidence
+                    .confirmed_roots
+                    .fetch_add(batch.view.len(), Ordering::Relaxed);
+            }
+            AlternatingAction::Support => {
+                self.evidence
+                    .support_seeded_roots
+                    .fetch_add(batch.view.len(), Ordering::Relaxed);
+            }
+        }
         for (parent, row) in batch.view.iter().enumerate() {
-            let state = ProgramSupportState {
-                target: row[end],
+            let state = AlternatingState {
+                action,
+                target: target.map(|column| row[column]),
                 value: row[start],
-                phase: ProgramSupportPhase::Red,
+                phase: AlternatingPhase::Red,
                 offset: 0,
-            };
-            let novelty = ProgramSupportNovelty {
-                target: state.target,
-                value: state.value,
-                phase: state.phase,
             };
             effects.fixpoint_root(
                 u32::try_from(parent).expect("too many custom Program Support parents"),
-                state,
-                novelty,
+                state.clone(),
+                state.novelty(),
                 None,
             );
         }
@@ -414,15 +373,21 @@ impl TypedProgramSpec for ProgramAlternatingClosure {
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         assert_eq!(states.len(), batch.view.len());
-        self.0
-            .evidence
-            .support_expanded_nodes
+        self.evidence
+            .expanded_nodes
             .fetch_add(states.len(), Ordering::Relaxed);
+        self.evidence.support_expanded_nodes.fetch_add(
+            states
+                .iter()
+                .filter(|state| state.action == AlternatingAction::Support)
+                .count(),
+            Ordering::Relaxed,
+        );
 
         for (input, state) in states.drain(..).enumerate() {
             let edges = match state.phase {
-                ProgramSupportPhase::Red => &self.0.red,
-                ProgramSupportPhase::Blue => &self.0.blue,
+                AlternatingPhase::Red => &self.red,
+                AlternatingPhase::Blue => &self.blue,
             };
             assert!(
                 state.offset <= edges.len(),
@@ -435,106 +400,73 @@ impl TypedProgramSpec for ProgramAlternatingClosure {
             let mut supported = false;
             let input_tag =
                 u32::try_from(input).expect("too many custom Program inputs in one cohort");
+            let phase_bit = usize::from(state.phase == AlternatingPhase::Blue);
+            self.evidence.continuation_mask.fetch_or(
+                1_usize << (state.action.continuation_base() + phase_bit),
+                Ordering::Relaxed,
+            );
 
             for &(source, target) in &edges[state.offset..page_end] {
                 examined += 1;
                 if source != state.value {
                     continue;
                 }
-                if state.phase == ProgramSupportPhase::Blue && target == state.target {
+                if state.action == AlternatingAction::Support
+                    && state.phase == AlternatingPhase::Blue
+                    && Some(target) == state.target
+                {
                     effects.support(input_tag);
-                    self.0
-                        .evidence
+                    self.evidence
                         .support_witnesses
                         .fetch_add(1, Ordering::Relaxed);
                     supported = true;
                     break;
                 }
 
-                let child = ProgramSupportState {
+                let child = AlternatingState {
+                    action: state.action,
                     target: state.target,
                     value: target,
                     phase: state.phase.next(),
                     offset: 0,
                 };
-                let novelty = ProgramSupportNovelty {
-                    target: child.target,
-                    value: child.value,
-                    phase: child.phase,
+                let accepted = match state.action {
+                    AlternatingAction::Propose | AlternatingAction::Confirm
+                        if state.phase == AlternatingPhase::Blue =>
+                    {
+                        Some(target)
+                    }
+                    _ => None,
                 };
-                effects.fixpoint_child(input_tag, child, novelty, None);
+                effects.fixpoint_child(input_tag, child.clone(), child.novelty(), accepted);
                 children += 1;
             }
 
             let next_offset = state.offset + examined;
             let resume = (!supported && next_offset < edges.len()).then(|| {
-                TypedResume::Immediate(ProgramSupportState {
+                TypedResume::Immediate(AlternatingState {
                     offset: next_offset,
                     ..state.clone()
                 })
             });
             effects.account_transition(examined);
             effects.page(examined, resume);
-            self.0
-                .evidence
-                .program_support_pages
-                .lock()
-                .expect("custom Program Support trace poisoned")
-                .push(ProgramSupportPageTrace {
-                    phase: state.phase,
-                    value: state.value,
-                    offset: state.offset,
-                    limit,
-                    examined,
-                    children,
-                    supported,
-                });
+            if state.action == AlternatingAction::Support {
+                self.evidence
+                    .program_support_pages
+                    .lock()
+                    .expect("custom Program Support trace poisoned")
+                    .push(ProgramSupportPageTrace {
+                        phase: state.phase,
+                        value: state.value,
+                        offset: state.offset,
+                        limit,
+                        examined,
+                        children,
+                        supported,
+                    });
+            }
         }
-    }
-}
-
-impl<'a> Constraint<'a> for ProgramAlternatingClosure {
-    fn variables(&self) -> VariableSet {
-        self.0.variables()
-    }
-
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        self.0.proposal_coverage(variable, bound)
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.0.estimate(variable, view, out)
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.0.propose(variable, view, candidates);
-    }
-
-    fn confirm(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.0.confirm(variable, view, candidates);
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        self.0.satisfied(view)
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
     }
 }
 
@@ -573,11 +505,11 @@ fn alternating_closure_with_terminal(
     }
 }
 
-fn program_alternating_closure_with_terminal(
+fn alternating_closure_with_disconnected_prefix(
     evidence: Arc<DeltaEvidence>,
     include_terminal: bool,
     disconnected_prefix: usize,
-) -> ProgramAlternatingClosure {
+) -> AlternatingClosure {
     assert!(disconnected_prefix <= 32);
     let mut inner = alternating_closure_with_terminal(evidence, include_terminal);
 
@@ -599,7 +531,7 @@ fn program_alternating_closure_with_terminal(
     );
     blue.append(&mut inner.blue);
     inner.blue = blue;
-    ProgramAlternatingClosure(inner)
+    inner
 }
 
 #[derive(Clone)]
@@ -687,7 +619,6 @@ struct DirectCohortTrace {
 struct DirectSourceEvidence {
     pages: Mutex<Vec<DirectPageTrace>>,
     cohorts: Mutex<Vec<DirectCohortTrace>>,
-    expanded_nodes: AtomicUsize,
 }
 
 /// A deliberately non-RPQ ordered domain. Sequential execution sees an
@@ -702,26 +633,11 @@ struct PagedDirectDomain {
 impl PagedDirectDomain {
     fn source_page(
         &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
+        parent: RawInline,
         cursor: ResidualDeltaSourceCursor,
         limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
         accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if !(variable == self.variable && view.col(PARENT).is_some()) {
-            return None;
-        }
-        assert!(
-            candidates.is_none(),
-            "a proposal source has no parent candidates"
-        );
-        assert_eq!(view.len(), 1, "each source activation owns one affine row");
-        assert!(
-            roots.is_empty(),
-            "direct pages must not inherit traversal roots"
-        );
+    ) -> ResidualDeltaSourcePage {
         assert!(limit > 0);
 
         let begin = match cursor {
@@ -744,7 +660,6 @@ impl PagedDirectDomain {
                 u64::try_from(end).expect("custom source cursor exceeds u64"),
             )
         });
-        let parent = view.row(0)[view.col(PARENT).expect("paged source parent")];
         self.evidence
             .pages
             .lock()
@@ -756,10 +671,10 @@ impl PagedDirectDomain {
                 accepted: page_values,
                 next,
             });
-        Some(ResidualDeltaSourcePage {
+        ResidualDeltaSourcePage {
             next,
             examined: end - begin,
-        })
+        }
     }
 }
 
@@ -819,156 +734,95 @@ impl<'a> Constraint<'a> for PagedDirectDomain {
             .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        variable == self.variable && view.col(PARENT).is_some()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        self.source_page(variable, view, candidates, cursor, limit, roots, accepted)
-    }
-
-    fn residual_delta_source_pages(
-        &self,
-        variable: VariableId,
-        batch: ResidualDeltaSourceBatch<'_>,
-        pages: &mut Vec<ResidualDeltaSourcePage>,
-        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
-        accepted: &mut Vec<(u32, RawInline)>,
-    ) -> bool {
-        let parent_column = batch.view.col(PARENT).expect("paged source parent");
-        let candidate_mode = batch
-            .candidate_sets
-            .first()
-            .is_some_and(|candidates| candidates.is_some());
-        assert!(batch
-            .candidate_sets
-            .iter()
-            .all(|candidates| candidates.is_some() == candidate_mode));
-        self.evidence
-            .cohorts
-            .lock()
-            .expect("direct source cohort trace poisoned")
-            .push(DirectCohortTrace {
-                vars: batch.view.vars.to_vec(),
-                parents: batch.view.iter().map(|row| row[parent_column]).collect(),
-                candidate_mode,
-                cursors: batch.cursors.to_vec(),
-                limits: batch.limits.to_vec(),
-            });
-
-        for row in 0..batch.view.len() {
-            let mut row_roots = Vec::new();
-            let mut row_accepted = Vec::new();
-            let Some(page) = self.source_page(
-                variable,
-                &batch.view.row_view(row),
-                batch.candidate_sets[row],
-                batch.cursors[row],
-                batch.limits[row],
-                &mut row_roots,
-                &mut row_accepted,
-            ) else {
-                return false;
-            };
-            let tag = u32::try_from(row).expect("custom source cohort exceeds u32 tags");
-            pages.push(page);
-            roots.extend(row_roots.into_iter().map(|root| (tag, root)));
-            accepted.extend(row_accepted.into_iter().map(|value| (tag, value)));
-        }
-        true
-    }
-
-    fn residual_delta_expand(
-        &self,
-        _variable: VariableId,
-        nodes: &[ResidualDeltaNode],
-        _successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) -> bool {
-        self.evidence
-            .expanded_nodes
-            .fetch_add(nodes.len(), Ordering::Relaxed);
-        false
+    fn residual_program(&self) -> Option<ProgramRef<'_>> {
+        Some(ProgramRef::new(self))
     }
 }
 
-/// The same source law without a native cohort override. This pins the
-/// production default that lowers a real compatible block to scalar pages.
-struct ScalarPagedDirectDomain(PagedDirectDomain);
+impl TypedProgramSpec for PagedDirectDomain {
+    type State = FiniteUnaryProgramState;
+    type NoveltyKey = ();
+    type Rank = [u64; 6];
 
-impl<'a> Constraint<'a> for ScalarPagedDirectDomain {
-    fn variables(&self) -> VariableSet {
-        self.0.variables()
+    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+        match request.action {
+            ProgramAction::Propose(variable)
+                if variable == self.variable
+                    && request.bound.is_set(PARENT)
+                    && !request.bound.is_set(variable) =>
+            {
+                finiteunaryprogram::route(self.variable, request)
+            }
+            _ => None,
+        }
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        self.0.proposal_coverage(variable, bound)
+    fn dispatch(&self, state: &Self::State) -> DispatchClass {
+        finiteunaryprogram::dispatch(state)
     }
 
-    fn estimate(
+    fn pacing(&self, state: &Self::State) -> ProgramPacing {
+        finiteunaryprogram::pacing(state)
+    }
+
+    fn progress(&self, state: &Self::State) -> Self::Rank {
+        finiteunaryprogram::progress(state)
+    }
+
+    fn seed_typed(
         &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.0.estimate(variable, view, out)
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        batch: ProgramSeedBatch<'_>,
+        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     ) {
-        self.0.propose(variable, view, candidates);
+        finiteunaryprogram::seed(self.variable, batch, effects);
     }
 
-    fn confirm(
+    fn step_typed(
         &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        states: &mut Vec<Self::State>,
+        batch: TypedProgramBatch<'_>,
+        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
-        self.0.confirm(variable, view, candidates);
-    }
+        let parent_column = batch.view.col(PARENT).expect("paged source parent");
+        if states
+            .first()
+            .is_some_and(|state| matches!(state, FiniteUnaryProgramState::Propose { .. }))
+        {
+            assert!(batch
+                .candidate_sets
+                .iter()
+                .all(|candidates| candidates.is_none()));
+            let cursors = states
+                .iter()
+                .map(|state| match state {
+                    FiniteUnaryProgramState::Propose { cursor } => *cursor,
+                    _ => panic!("one custom source cohort mixed action variants"),
+                })
+                .collect();
+            self.evidence
+                .cohorts
+                .lock()
+                .expect("direct source cohort trace poisoned")
+                .push(DirectCohortTrace {
+                    vars: batch.view.vars.to_vec(),
+                    parents: batch.view.iter().map(|row| row[parent_column]).collect(),
+                    candidate_mode: false,
+                    cursors,
+                    limits: batch.limits.to_vec(),
+                });
+        }
 
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        self.0.satisfied(view)
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.0.residual_proposal_source_is_paged(variable, view)
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        self.0
-            .source_page(variable, view, candidates, cursor, limit, roots, accepted)
-    }
-
-    fn residual_delta_expand(
-        &self,
-        variable: VariableId,
-        nodes: &[ResidualDeltaNode],
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) -> bool {
-        self.0.residual_delta_expand(variable, nodes, successors)
+        let view = batch.view;
+        finiteunaryprogram::step(
+            self.variable,
+            states,
+            batch,
+            effects,
+            |input, cursor, limit, accepted| {
+                self.source_page(view.row(input)[parent_column], cursor, limit, accepted)
+            },
+            |_input, candidate| self.values.contains(candidate),
+        );
     }
 }
 
@@ -988,32 +842,17 @@ fn direct_source_fixture(values: Vec<RawInline>, evidence: Arc<DirectSourceEvide
     ]))
 }
 
-fn scalar_direct_source_fixture(
-    values: Vec<RawInline>,
-    evidence: Arc<DirectSourceEvidence>,
-) -> Root {
-    assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
-    Arc::new(IntersectionConstraint::new(vec![
-        Box::new(PageLocalDomain {
-            variable: PARENT,
-            estimate: 2,
-            values: Arc::new(vec![raw(8), raw(9)]),
-        }) as DynConstraint,
-        Box::new(ScalarPagedDirectDomain(PagedDirectDomain {
-            variable: START,
-            values: Arc::new(values),
-            evidence,
-        })) as DynConstraint,
-    ]))
+fn fixture(evidence: Arc<DeltaEvidence>) -> Root {
+    fixture_with_end_estimate(evidence, 100)
 }
 
-fn fixture(evidence: Arc<DeltaEvidence>) -> Root {
+fn fixture_with_end_estimate(evidence: Arc<DeltaEvidence>, end_estimate: usize) -> Root {
     let machine = alternating_closure(evidence);
     let arm = Box::new(IntersectionConstraint::new(vec![
         Box::new(machine) as DynConstraint,
         Box::new(PageLocalDomain {
             variable: END,
-            estimate: 100,
+            estimate: end_estimate,
             values: Arc::new(vec![raw(2), raw(6)]),
         }) as DynConstraint,
     ])) as DynConstraint;
@@ -1032,8 +871,8 @@ fn fixture(evidence: Arc<DeltaEvidence>) -> Root {
 /// Places the custom transition machine under both recursive Boolean
 /// connectives. The inner OR has a deliberately impossible finite arm; the
 /// guarded outer arm is an AND, and its sibling keeps the outer OR live when
-/// transition Support proves false. PARENT is deliberately projected away so
-/// its two affine rows become observable bag multiplicity.
+/// transition Support proves false. PARENT is deliberately omitted by the
+/// mapper so its two distinct affine full bindings remain observable.
 fn recursive_support_fixture(
     evidence: Arc<DeltaEvidence>,
     include_terminal: bool,
@@ -1084,7 +923,7 @@ fn recursive_support_fixture(
     ]))
 }
 
-fn program_recursive_support_fixture(
+fn paged_support_fixture(
     evidence: Arc<DeltaEvidence>,
     include_terminal: bool,
     disconnected_prefix: usize,
@@ -1101,7 +940,7 @@ fn program_recursive_support_fixture(
         Box::new(end.is(Inline::<UnknownInline>::new(raw(251)))) as DynConstraint,
     ])) as DynConstraint;
     let inner_or = Box::new(UnionConstraint::new(vec![
-        Box::new(program_alternating_closure_with_terminal(
+        Box::new(alternating_closure_with_disconnected_prefix(
             evidence,
             include_terminal,
             disconnected_prefix,
@@ -1279,13 +1118,13 @@ fn custom_support_recursive_formula_is_affine_and_monotone() {
         let position = extension_only
             .iter()
             .position(|value| *value == inherited)
-            .expect("adding one edge must not remove an inherited bag occurrence");
+            .expect("adding one edge must not remove an inherited affine result");
         extension_only.remove(position);
     }
     assert_eq!(extension_only, vec![raw(10), raw(10)]);
 }
 
-fn assert_program_support_case(
+fn assert_paged_support_case(
     include_terminal: bool,
     parent_count: usize,
     disconnected_prefix: usize,
@@ -1301,7 +1140,7 @@ fn assert_program_support_case(
     let oracle_evidence = Arc::new(DeltaEvidence::default());
     let oracle = sorted(
         Query::new(
-            program_recursive_support_fixture(
+            paged_support_fixture(
                 Arc::clone(&oracle_evidence),
                 include_terminal,
                 disconnected_prefix,
@@ -1329,7 +1168,7 @@ fn assert_program_support_case(
 
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(
-        program_recursive_support_fixture(
+        paged_support_fixture(
             Arc::clone(&residual_evidence),
             include_terminal,
             disconnected_prefix,
@@ -1358,7 +1197,7 @@ fn assert_program_support_case(
             .support_seeded_roots
             .load(Ordering::Relaxed),
         parent_count,
-        "each duplicate outer parent needs an independent Program activation"
+        "each affine parent needs an independent Program activation"
     );
     assert_eq!(
         residual_evidence.support_witnesses.load(Ordering::Relaxed),
@@ -1398,8 +1237,8 @@ fn assert_program_support_case(
 #[test]
 fn generic_program_support_is_affine_monotone_and_geometrically_paged() {
     let parent_count = 4;
-    let inherited = assert_program_support_case(false, parent_count, 15);
-    let mut extension = assert_program_support_case(true, parent_count, 15);
+    let inherited = assert_paged_support_case(false, parent_count, 15);
+    let mut extension = assert_paged_support_case(true, parent_count, 15);
     for value in inherited {
         let position = extension
             .iter()
@@ -1421,7 +1260,7 @@ fn live_program_support_clone_is_exact_and_matches_rayon_workers() {
 
     let evidence = Arc::new(DeltaEvidence::default());
     let mut query = Query::new(
-        program_recursive_support_fixture(
+        paged_support_fixture(
             Arc::clone(&evidence),
             true,
             7,
@@ -1436,7 +1275,7 @@ fn live_program_support_clone_is_exact_and_matches_rayon_workers() {
     .start_width(1);
     let first = query
         .next()
-        .expect("the positive Program formula has a nonempty affine bag");
+        .expect("the positive Program formula has a nonempty affine relation");
     assert!(query.stats().delta_transition_pages > 0);
     assert!(
         evidence.support_seeded_roots.load(Ordering::Relaxed) > 0,
@@ -1462,7 +1301,7 @@ fn live_program_support_clone_is_exact_and_matches_rayon_workers() {
     for workers in [1, 4] {
         let evidence = Arc::new(DeltaEvidence::default());
         let query = Query::new(
-            program_recursive_support_fixture(
+            paged_support_fixture(
                 Arc::clone(&evidence),
                 true,
                 7,
@@ -1520,11 +1359,6 @@ fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_candidates_examined, 1);
     assert_eq!(query.stats().delta_source_roots, 0);
-    assert_eq!(
-        evidence.expanded_nodes.load(Ordering::Relaxed),
-        0,
-        "a rootless direct page must resume without traversal lineage"
-    );
 
     drop(query);
     assert_eq!(
@@ -1536,7 +1370,6 @@ fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
         pages,
         "dropping the query must leave the ordered source frontier untouched"
     );
-    assert_eq!(evidence.expanded_nodes.load(Ordering::Relaxed), 0);
 }
 
 fn assert_direct_source_case(values: Vec<RawInline>, expected: Vec<RawInline>) -> Vec<RawInline> {
@@ -1572,7 +1405,6 @@ fn assert_direct_source_case(values: Vec<RawInline>, expected: Vec<RawInline>) -
     assert_eq!(actual, oracle);
     assert_eq!(actual, expected);
     assert_eq!(residual.stats.delta_source_roots, 0);
-    assert_eq!(residual_evidence.expanded_nodes.load(Ordering::Relaxed), 0);
 
     let pages = residual_evidence
         .pages
@@ -1718,46 +1550,6 @@ fn custom_direct_source_batches_compatible_parents_with_one_global_budget() {
 }
 
 #[test]
-fn default_source_pages_consume_one_real_compatible_cohort() {
-    let values = vec![raw(1), raw(2), raw(3)];
-    let oracle = sorted(
-        Query::new(
-            scalar_direct_source_fixture(values.clone(), Arc::default()),
-            project_start,
-        )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-        .collect(),
-    );
-    let evidence = Arc::new(DirectSourceEvidence::default());
-    let residual = Query::new(
-        scalar_direct_source_fixture(values, Arc::clone(&evidence)),
-        project_start,
-    )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
-    .cap(3)
-    .start_width(3)
-    .collect_profiled();
-
-    assert_eq!(sorted(residual.results), oracle);
-    assert_eq!(residual.stats.delta_source_cohorts, 2);
-    assert_eq!(residual.stats.max_delta_source_cohort, 2);
-    assert_eq!(residual.stats.delta_source_pages, 4);
-    assert!(
-        evidence
-            .cohorts
-            .lock()
-            .expect("direct source cohort trace poisoned")
-            .is_empty(),
-        "the scalar leaf must use the trait default rather than a native override"
-    );
-    let pages = evidence.pages.lock().expect("direct source trace poisoned");
-    assert_eq!(pages.len(), 4);
-    assert!(pages
-        .chunks_exact(2)
-        .all(|cohort| cohort.iter().map(|page| page.limit).eq([2, 1])));
-}
-
-#[test]
 fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
     let values = vec![raw(1), raw(2), raw(3), raw(4)];
     let mut expected: Vec<_> = values.iter().flat_map(|value| [*value, *value]).collect();
@@ -1789,7 +1581,6 @@ fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
     let mut reconstructed: Vec<_> = std::iter::once(first).chain(remainder).collect();
     reconstructed.sort_unstable();
     assert_eq!(reconstructed, expected);
-    assert_eq!(evidence.expanded_nodes.load(Ordering::Relaxed), 0);
 
     #[cfg(feature = "parallel")]
     for workers in [1, 4] {
@@ -1814,11 +1605,6 @@ fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
                 .lock()
                 .expect("direct source trace poisoned")
                 .is_empty(),
-            "workers={workers}"
-        );
-        assert_eq!(
-            evidence.expanded_nodes.load(Ordering::Relaxed),
-            0,
             "workers={workers}"
         );
     }
@@ -1885,6 +1671,33 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
         assert!(parallel_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
         assert!(parallel_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
     }
+}
+
+#[test]
+fn custom_cyclic_delta_confirms_a_more_specific_proposal_source() {
+    let evidence = Arc::new(DeltaEvidence::default());
+    let actual = sorted(
+        Query::new(
+            fixture_with_end_estimate(Arc::clone(&evidence), 1),
+            project_end,
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(2)
+        .start_width(1)
+        .collect(),
+    );
+
+    assert_eq!(actual, sorted(vec![raw(2), raw(2), raw(6), raw(6)]));
+    assert_eq!(evidence.proposed_roots.load(Ordering::Relaxed), 0);
+    assert!(
+        evidence.confirmed_roots.load(Ordering::Relaxed) > 0,
+        "the more specific finite domain must make the cyclic Program confirm"
+    );
+    assert_eq!(
+        evidence.continuation_mask.load(Ordering::Relaxed) & 0b11,
+        0b11,
+        "confirmation must execute both typed product states"
+    );
 }
 
 #[test]
