@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child-minimum estimate law; OR remains a quote barrier. Plain Ready keys,
   variable plans, canonical state descriptors, state buckets, and release
   telemetry retain their V3.1 layouts.
+- **The cross-generation query benchmark can select whole-root residual
+  lowering explicitly.** `engine_current_full` measures the same fixture and
+  oracle cells as the legacy, scalar, and default HYBRID adapters, while
+  prefix diagnostics now report the lowering policy actually selected by the
+  measured adapter.
 - **Finite-Formula structural control is interned independently from its
   canonical outer Candidate exit.** Residual Formula state now carries an
   exact `(program-counter, candidate-exit)` cursor. The exit records only the
