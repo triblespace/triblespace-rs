@@ -26875,13 +26875,15 @@ mod tests {
                 Box::new(make_path()) as ShapeConstraint,
             ])
         };
+        // One source in this fixture consumes exactly 68 transition work
+        // units, so this bound admits an exact two-parent cohort.
         let mut eager_cohort = Query::new_projected(make_cohort(), [0, 1], project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::OpaqueLeaves,
                 ProgramScope::All,
             ))
-            .cap(64)
-            .start_width(1)
+            .cap(136)
+            .start_width(136)
             .growth(2)
             .collect_profiled();
         let mut sparse_cohort = Query::new_projected(make_cohort(), [0, 1], project)
@@ -26889,8 +26891,8 @@ mod tests {
                 FormulaScope::OpaqueLeaves,
                 ProgramScope::All,
             ))
-            .cap(64)
-            .start_width(1)
+            .cap(136)
+            .start_width(136)
             .growth(2);
         sparse_cohort.state.eager_terminal_phase_enabled = false;
         let mut sparse_cohort = sparse_cohort.collect_profiled();

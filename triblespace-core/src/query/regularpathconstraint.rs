@@ -21,6 +21,8 @@ use crate::query::DispatchClass;
 use crate::query::EstimateSink;
 use crate::query::ProgramAction;
 use crate::query::ProgramCompleteBatch;
+use crate::query::ProgramCompleteWorkEvidence;
+use crate::query::ProgramCompleteWorkQuote;
 use crate::query::ProgramCompletion;
 use crate::query::ProgramExposure;
 use crate::query::ProgramGrouping;
@@ -34,6 +36,7 @@ use crate::query::ProgramStratum;
 use crate::query::ProposalCoverage;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
+use crate::query::TypedCompleteArbiter;
 use crate::query::TypedCompleteSink;
 use crate::query::TypedEffectSink;
 use crate::query::TypedProgramBatch;
@@ -2270,71 +2273,6 @@ impl RegularPathConstraint {
         Some(RpqExpandPage { next, examined })
     }
 
-    /// Expands one compiled-product node for a certified complete action.
-    ///
-    /// A complete action cannot suspend, so an affine successor cursor has no
-    /// ownership role here. Positive branches therefore consume PATCH's
-    /// family-native borrowed subtree walk, while negated branches reuse their
-    /// complete set evaluators. The pageable lower-bound descent above remains
-    /// exclusively the representation of resumable transition work.
-    fn for_each_complete_delta_successor(
-        &self,
-        program: &DeltaProgram,
-        node: RpqNode,
-        mut emit: impl FnMut(RpqOutput),
-    ) {
-        let state = program.decode(node.pc);
-        for &(step, target) in &program.steps[state] {
-            let pc = program.encode(target);
-            let target_accepting = program.accepting[target as usize];
-            let mut emit_value = |value| {
-                emit(RpqOutput {
-                    node: RpqNode {
-                        source: node.source,
-                        value,
-                        pc,
-                    },
-                    accepted: target_accepting && node.source.is_none_or(|anchor| value == anchor),
-                });
-            };
-            match step {
-                DeltaStep::Attr(attribute) => {
-                    let Some(entity) = value_as_entity(&node.value) else {
-                        continue;
-                    };
-                    let mut prefix = [0u8; ID_LEN * 2];
-                    prefix[..ID_LEN].copy_from_slice(&entity);
-                    prefix[ID_LEN..].copy_from_slice(&attribute);
-                    self.set
-                        .eav
-                        .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
-                            emit_value(*value)
-                        });
-                }
-                DeltaStep::InverseAttr(attribute) => {
-                    let mut prefix = [0u8; 32 + ID_LEN];
-                    prefix[..32].copy_from_slice(&node.value);
-                    prefix[32..].copy_from_slice(&attribute);
-                    self.set
-                        .vae
-                        .infixes::<{ 32 + ID_LEN }, ID_LEN, _>(&prefix, |entity: &[u8; ID_LEN]| {
-                            emit_value(id_into_value(entity))
-                        });
-                }
-                DeltaStep::NotAttr(excluded) => {
-                    for value in eval_not_attr(&self.set, &excluded, &node.value) {
-                        emit_value(value);
-                    }
-                }
-                DeltaStep::InverseNotAttr(excluded) => {
-                    for value in eval_not_attr_inverse(&self.set, &excluded, &node.value) {
-                        emit_value(value);
-                    }
-                }
-            }
-        }
-    }
-
     /// Exhausts one bound-endpoint product traversal for the eager Program
     /// complete-action route.
     ///
@@ -2345,11 +2283,12 @@ impl RegularPathConstraint {
     /// finite histories is valid because proposals denote distinct endpoints.
     /// Separate parent rows still run independent drains and retain their outer
     /// bag multiplicity.
-    fn complete_bound_endpoint(
+    fn complete_bound_endpoint_bounded(
         &self,
         program: &DeltaProgram,
         source: RawInline,
-    ) -> HashSet<RawInline> {
+        budget: ProgramCompleteWorkQuote,
+    ) -> Option<(HashSet<RawInline>, ProgramCompleteWorkQuote)> {
         let root = RpqNode {
             source: None,
             value: source,
@@ -2358,27 +2297,103 @@ impl RegularPathConstraint {
         let mut seen = HashSet::new();
         let mut pending = VecDeque::new();
         let mut accepted = HashSet::new();
+        let mut examined = 0usize;
 
         seen.insert((root.value, root.pc));
         pending.push_back(root);
         if program.accepting[program.start as usize] && is_graph_term(&self.set, &source) {
+            if budget.raw_occurrences == 0 {
+                return None;
+            }
             accepted.insert(source);
         }
 
         while let Some(node) = pending.pop_front() {
-            self.for_each_complete_delta_successor(program, node, |output| {
-                let key = (output.node.value, output.node.pc);
-                if !seen.insert(key) {
-                    return;
+            let state = program.decode(node.pc);
+            for &(step, target) in &program.steps[state] {
+                let pc = program.encode(target);
+                let target_accepting = program.accepting[target as usize];
+                let mut accept_value = |value| {
+                    let child = RpqNode {
+                        source: node.source,
+                        value,
+                        pc,
+                    };
+                    if !seen.insert((child.value, child.pc)) {
+                        return true;
+                    }
+                    if target_accepting
+                        && node.source.is_none_or(|anchor| value == anchor)
+                        && !accepted.contains(&value)
+                    {
+                        if accepted.len() == budget.raw_occurrences {
+                            return false;
+                        }
+                        accepted.insert(value);
+                    }
+                    pending.push_back(child);
+                    true
+                };
+
+                match step {
+                    DeltaStep::Attr(_) | DeltaStep::InverseAttr(_) => {
+                        let remaining = budget.drain_work_units - examined;
+                        let infixes =
+                            self.bounded_positive_delta_infixes(step, &node.value, remaining)?;
+                        examined += infixes.len();
+                        let mut output_fits = true;
+                        infixes.for_each(|value| {
+                            if output_fits {
+                                output_fits = accept_value(value);
+                            }
+                        });
+                        if !output_fits {
+                            return None;
+                        }
+                    }
+                    DeltaStep::NotAttr(_) | DeltaStep::InverseNotAttr(_) => {
+                        let mut after = None;
+                        while let Some(value) =
+                            self.next_pageable_delta_value(step, &node.value, after.as_ref())
+                        {
+                            if examined == budget.drain_work_units {
+                                return None;
+                            }
+                            examined += 1;
+                            after = Some(value);
+                            if self.pageable_delta_value_is_included(step, &node.value, &value) {
+                                if !accept_value(value) {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
                 }
-                if output.accepted {
-                    accepted.insert(output.node.value);
-                }
-                pending.push_back(output.node);
-            });
+            }
         }
 
-        accepted
+        let quote = ProgramCompleteWorkQuote {
+            drain_work_units: examined,
+            raw_occurrences: accepted.len(),
+        };
+        Some((accepted, quote))
+    }
+
+    fn complete_bound_endpoint(
+        &self,
+        program: &DeltaProgram,
+        source: RawInline,
+    ) -> HashSet<RawInline> {
+        self.complete_bound_endpoint_bounded(
+            program,
+            source,
+            ProgramCompleteWorkQuote {
+                drain_work_units: usize::MAX,
+                raw_occurrences: usize::MAX,
+            },
+        )
+        .expect("an unbounded RPQ complete action was declined")
+        .0
     }
 }
 
@@ -2802,6 +2817,67 @@ impl TypedProgramSpec for RegularPathConstraint {
 
         for (parent, row) in batch.view.iter().enumerate() {
             let accepted = self.complete_bound_endpoint(program, row[source_column]);
+            effects.extend_parent(parent as u32, accepted);
+        }
+    }
+
+    fn quote_complete_typed(
+        &self,
+        _batch: ProgramCompleteBatch<'_>,
+    ) -> ProgramCompleteWorkEvidence {
+        // Reachability work and endpoint count are value-dependent and cannot
+        // be quoted without performing the graph-product traversal. The
+        // family-owned transaction below prepares each descending parent
+        // within the arbiter's remaining exact bounds instead.
+        ProgramCompleteWorkEvidence::Declined
+    }
+
+    fn complete_bounded_typed(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        arbiter: &mut TypedCompleteArbiter,
+    ) {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("RPQ complete actions support only proposals")
+        };
+        assert_eq!(variable, batch.route.variable);
+        let Some(RpqRoute::BoundEndpoint { source, program }) = self.program_for_variable(variable)
+        else {
+            panic!("RPQ complete action was not a distinct bound-endpoint route")
+        };
+        let source_column = batch
+            .view
+            .col(source)
+            .expect("RPQ complete action omitted its opposite bound endpoint");
+
+        let mut prepared_reversed = Vec::new();
+        for parent in (0..batch.view.len()).rev() {
+            let budget = arbiter.remaining_tail_capacity(parent);
+            let source = batch.view.row(parent)[source_column];
+            let Some((accepted, quote)) =
+                self.complete_bound_endpoint_bounded(program, source, budget)
+            else {
+                arbiter.reject_tail_parent(parent);
+                break;
+            };
+            assert!(
+                arbiter.try_admit_tail_parent(parent, quote),
+                "bounded RPQ preparation exceeded its exact arbiter grant"
+            );
+            prepared_reversed.push(accepted);
+        }
+
+        let Some(selection) = arbiter.seal_tail_admission() else {
+            return;
+        };
+        assert_eq!(
+            selection.first_parent(),
+            batch.view.len() - prepared_reversed.len(),
+            "RPQ prepared tail disagreed with arbiter selection"
+        );
+        prepared_reversed.reverse();
+        let effects = arbiter.effects_mut();
+        for (parent, accepted) in prepared_reversed.into_iter().enumerate() {
             effects.extend_parent(parent as u32, accepted);
         }
     }
@@ -3929,6 +4005,8 @@ mod seeded_frame_tests {
     use crate::query::ProgramActivation;
     use crate::query::ProgramBatch;
     use crate::query::ProgramBatchEffects;
+    use crate::query::ProgramCompleteAdmission;
+    use crate::query::ProgramCompleteAffinity;
     use crate::query::ProgramCompleteEffects;
     use crate::query::ProgramSeedEffects;
     use crate::query::Query;
@@ -4520,6 +4598,77 @@ mod seeded_frame_tests {
             &mut effects,
         );
         effects.occurrences
+    }
+
+    #[test]
+    fn bounded_complete_product_selects_an_exact_tail() {
+        let attribute = rngid();
+        let sources = [rngid(), rngid(), rngid()];
+        let destinations: Vec<Vec<_>> = [3usize, 2, 1]
+            .into_iter()
+            .map(|count| {
+                (0..count)
+                    .map(|_| id_into_value(&rngid().id.raw()))
+                    .collect()
+            })
+            .collect();
+        let mut set = TribleSet::new();
+        for (source, values) in sources.iter().zip(&destinations) {
+            for &value in values {
+                insert_edge(&mut set, source, &attribute, value);
+            }
+        }
+
+        let start = Variable::<GenId>::new(0);
+        let end = Variable::<GenId>::new(1);
+        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(end.index),
+            bound: VariableSet::new_singleton(start.index),
+        };
+        let program = path.residual_program().unwrap();
+        let route = program.route(request).unwrap();
+        let vars = [start.index];
+        let rows: Vec<_> = sources
+            .iter()
+            .map(|source| id_into_value(&source.id.raw()))
+            .collect();
+        let batch = ProgramCompleteBatch {
+            request,
+            route,
+            view: RowsView::new(&vars, &rows),
+        };
+
+        let affinity = ProgramCompleteAffinity::new(&rows);
+        let completed = program
+            .try_complete_bounded(batch, 3, &affinity)
+            .expect("the final two parents fit exactly");
+        let (first, admission, raw_occurrence_count, mut occurrences) =
+            completed.into_parts_for(batch, &affinity, &rows);
+        assert_eq!(first, 1);
+        assert_eq!(
+            admission,
+            ProgramCompleteAdmission::Exact {
+                drain_work_units: 3,
+                raw_occurrences: 3,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 3);
+        occurrences.sort_unstable();
+        let mut expected: Vec<_> = destinations[1]
+            .iter()
+            .copied()
+            .map(|value| (0, value))
+            .chain(destinations[2].iter().copied().map(|value| (1, value)))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(occurrences, expected);
+
+        let affinity = ProgramCompleteAffinity::new(&rows);
+        assert!(
+            program.try_complete_bounded(batch, 0, &affinity).is_none(),
+            "preparing the rejected boundary must not overrun a zero grant"
+        );
     }
 
     #[test]

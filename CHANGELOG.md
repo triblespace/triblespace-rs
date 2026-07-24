@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **RPQ complete actions now obey exact scheduler work bounds.** Bound-endpoint
+  graph-product traversal admits only a descending parent tail whose examined
+  transitions and distinct endpoint outputs fit the current grant; positive
+  PATCH branches preflight exact fanout, while negated branches remain
+  cursor-bounded.
 - **Ordinary Rayon query iteration now reuses the canonical residual
   producer.** A fresh `Query::into_par_iter()` moves directly into the
   adaptive-width residual iterator and its affine splitter instead of entering
