@@ -11282,7 +11282,7 @@ impl ResidualStateMachine {
                 route.completion == ProgramCompletion::CompleteActionEquivalent
             });
         let complete_wide_candidate = !terminal_streaming
-            && self.width > 1
+            && self.terminal_demand_width > 1
             && program.is_some_and(|(_, route)| {
                 route.completion == ProgramCompletion::CompleteActionEquivalent
             });
@@ -16262,7 +16262,7 @@ mod tests {
     }
 
     #[test]
-    fn nonterminal_exact_completion_refiles_its_prefix_and_preserves_pageable_set_semantics() {
+    fn nonterminal_exact_completion_waits_for_projected_demand_and_preserves_set_semantics() {
         const PARENT: VariableId = 0;
         const TARGET: VariableId = 1;
         const DOWNSTREAM: VariableId = 2;
@@ -16306,47 +16306,74 @@ mod tests {
             ])
         };
 
-        let root = fixture(ProgramCompletion::CompleteActionEquivalent);
-        let plan = ResidualPlan::compile_lowering(
-            &root,
-            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
-        );
-        assert_eq!(plan.len(), 4);
-        let mut relevant = ChildSet::empty(plan.len());
-        relevant.insert(1);
-        relevant.insert(2);
-        let bound = VariableSet::new_singleton(PARENT);
-        let desc = StateDesc {
-            bound,
-            phase: ResidualPhase::Propose {
-                variable: TARGET,
-                relevant: relevant.clone(),
-                proposer: 1,
-            },
-        };
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
-        machine.width = 2;
-        machine.terminal_demand_width = 1;
-        let (family, _) = machine
-            .interner
-            .intern_with_status(desc.clone(), &mut machine.stats);
-        let outcome = machine
-            .seed_delta_proposal(
+        let seed_at_demand = |terminal_demand_width| {
+            let root = fixture(ProgramCompletion::CompleteActionEquivalent);
+            let plan = ResidualPlan::compile_lowering(
                 &root,
-                &plan,
-                SelectedResidualTask {
-                    state: family,
-                    desc: desc.clone(),
-                    bucket: StateBucket::Rows(RowBatch {
-                        rows: (10..15).map(raw).collect(),
-                        row_count: 5,
-                    }),
+                ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
+            );
+            assert_eq!(plan.len(), 4);
+            let mut relevant = ChildSet::empty(plan.len());
+            relevant.insert(1);
+            relevant.insert(2);
+            let desc = StateDesc {
+                bound: VariableSet::new_singleton(PARENT),
+                phase: ResidualPhase::Propose {
+                    variable: TARGET,
+                    relevant,
+                    proposer: 1,
                 },
-            )
-            .expect("the exact nonterminal Program proposal is lowerable");
+            };
+            let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
+            machine.width = 2;
+            machine.terminal_demand_width = terminal_demand_width;
+            let (family, _) = machine
+                .interner
+                .intern_with_status(desc.clone(), &mut machine.stats);
+            let outcome = machine
+                .seed_delta_proposal(
+                    &root,
+                    &plan,
+                    SelectedResidualTask {
+                        state: family,
+                        desc: desc.clone(),
+                        bucket: StateBucket::Rows(RowBatch {
+                            rows: (10..15).map(raw).collect(),
+                            row_count: 5,
+                        }),
+                    },
+                )
+                .expect("the exact nonterminal Program proposal is lowerable");
+            (machine, outcome, family, desc)
+        };
+
+        let (sparse, sparse_outcome, sparse_family, sparse_desc) = seed_at_demand(1);
+        assert_eq!(
+            sparse_outcome.seeded_parents, 5,
+            "S > 1 must not authorize completion before projected demand widens"
+        );
+        assert!(sparse_outcome.active.is_some());
+        assert!(
+            !sparse.delta.is_empty(),
+            "q=1 must leave the typed Program on its sparse scheduler"
+        );
+        assert!(
+            sparse
+                .worklist
+                .values()
+                .all(|level| level.get(&sparse_family).is_none()),
+            "the q=1 sparse route must consume the selected proposal batch"
+        );
+        assert_eq!(sparse.interner.get(sparse_family), &sparse_desc);
+
+        let (machine, outcome, family, desc) = seed_at_demand(2);
         assert_eq!(outcome.seeded_parents, 2);
         assert!(outcome.active.is_none());
         assert!(outcome.publication.is_none());
+        assert!(
+            machine.delta.is_empty(),
+            "q>1 must admit the bounded complete adapter"
+        );
 
         let remainder = machine
             .worklist
