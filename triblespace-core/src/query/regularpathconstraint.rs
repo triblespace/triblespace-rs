@@ -37,7 +37,6 @@ use crate::query::ProposalCoverage;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::TypedCompleteArbiter;
-use crate::query::TypedCompleteSink;
 use crate::query::TypedEffectSink;
 use crate::query::TypedProgramBatch;
 use crate::query::TypedProgramSpec;
@@ -2378,23 +2377,6 @@ impl RegularPathConstraint {
         };
         Some((accepted, quote))
     }
-
-    fn complete_bound_endpoint(
-        &self,
-        program: &DeltaProgram,
-        source: RawInline,
-    ) -> HashSet<RawInline> {
-        self.complete_bound_endpoint_bounded(
-            program,
-            source,
-            ProgramCompleteWorkQuote {
-                drain_work_units: usize::MAX,
-                raw_occurrences: usize::MAX,
-            },
-        )
-        .expect("an unbounded RPQ complete action was declined")
-        .0
-    }
 }
 
 impl RegularPathConstraint {
@@ -2799,26 +2781,6 @@ impl TypedProgramSpec for RegularPathConstraint {
             && support_route.key == RPQ_BOUND_FORWARD
             && confirm_route.variable == self.end
             && support_route.variable == self.end
-    }
-
-    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            panic!("RPQ complete actions support only proposals")
-        };
-        assert_eq!(variable, batch.route.variable);
-        let Some(RpqRoute::BoundEndpoint { source, program }) = self.program_for_variable(variable)
-        else {
-            panic!("RPQ complete action was not a distinct bound-endpoint route")
-        };
-        let source_column = batch
-            .view
-            .col(source)
-            .expect("RPQ complete action omitted its opposite bound endpoint");
-
-        for (parent, row) in batch.view.iter().enumerate() {
-            let accepted = self.complete_bound_endpoint(program, row[source_column]);
-            effects.extend_parent(parent as u32, accepted);
-        }
     }
 
     fn quote_complete_typed(
