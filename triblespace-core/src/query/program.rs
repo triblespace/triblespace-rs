@@ -489,6 +489,28 @@ impl TypedCompleteArbiter {
         );
     }
 
+    /// Returns the exact remaining bounds available to the next descending
+    /// parent before a family prepares that parent's complete result.
+    ///
+    /// Some families can quote from metadata alone and use
+    /// [`Self::try_admit_tail_parent`] directly. Graph-product families must
+    /// instead perform the quoted work to discover its size. Giving them the
+    /// remaining bounds first lets that preparation stop without examining or
+    /// retaining more physical work than the transaction can admit.
+    pub(crate) fn remaining_tail_capacity(&mut self, parent: usize) -> ProgramCompleteWorkQuote {
+        let capacity = self.capacity;
+        let tail = self.begin_tail();
+        Self::check_tail_parent(tail, parent);
+        ProgramCompleteWorkQuote {
+            drain_work_units: capacity
+                .checked_sub(tail.drain_work_units)
+                .expect("typed complete tail exceeded its drain capacity"),
+            raw_occurrences: capacity
+                .checked_sub(tail.raw_occurrences)
+                .expect("typed complete tail exceeded its occurrence capacity"),
+        }
+    }
+
     /// Attempts exactly the next descending parent against both physical
     /// bounds. A rejection closes the tail at that first boundary.
     pub(crate) fn try_admit_tail_parent(
