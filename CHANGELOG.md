@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The cross-generation query benchmark can select whole-root residual
+  lowering explicitly.** `engine_current_full` measures the same fixture and
+  oracle cells as the legacy, scalar, and default HYBRID adapters, while
+  prefix diagnostics now report the lowering policy actually selected by the
+  measured adapter.
 - **Shared PositiveSupport service liveness is exact and quiescent probes are
   lock-free.** Shard runtimes and in-flight packet guards now retain one
   counted registration whose final drop reconciles the global lease under the
