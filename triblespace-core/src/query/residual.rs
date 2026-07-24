@@ -14721,6 +14721,100 @@ mod tests {
         }
     }
 
+    /// A fixed relational source whose proposal cost may depend on one
+    /// already-bound parent. The denotation does not depend on those costs;
+    /// they only force a deterministic heterogeneous Ready choice in tests.
+    #[derive(Clone)]
+    struct CertifiedAdaptiveSource {
+        parent: Option<VariableId>,
+        variable: VariableId,
+        coverage: ProposalCoverage,
+        estimates: [usize; 2],
+        values: Arc<Vec<RawInline>>,
+        proposed_rows: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for CertifiedAdaptiveSource {
+        fn variables(&self) -> VariableSet {
+            self.parent.map_or_else(
+                || VariableSet::new_singleton(self.variable),
+                |parent| {
+                    VariableSet::new_singleton(parent)
+                        .union(VariableSet::new_singleton(self.variable))
+                },
+            )
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable
+                && !bound.is_set(variable)
+                && self.parent.is_none_or(|parent| bound.is_set(parent))
+            {
+                self.coverage
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            let Some(parent) = self.parent else {
+                out.fill(self.estimates[0], view.len());
+                return true;
+            };
+            let Some(parent) = view.col(parent) else {
+                return false;
+            };
+            out.extend(
+                view.iter()
+                    .map(|row| self.estimates[(row[parent][0] & 1) as usize]),
+            );
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.proposed_rows.fetch_add(view.len(), Ordering::Relaxed);
+            for row in 0..view.len() {
+                candidates.extend_row(row as u32, self.values.iter().copied());
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == self.variable {
+                candidates.retain(|_, candidate| self.values.contains(candidate));
+            } else {
+                assert_eq!(Some(variable), self.parent);
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
+        }
+    }
+
     struct TypedOnlyQuoteLeaf {
         variable: VariableId,
         estimate: usize,
@@ -20862,6 +20956,105 @@ mod tests {
         assert_eq!(v31.stats.formula_outer_entry_pops, 0);
         assert_eq!(v31.stats.formula_ready_quote_groups, 0);
         assert_eq!(v31.stats.formula_ready_quote_estimate_rows, 0);
+    }
+
+    #[test]
+    fn deferred_ready_quote_heterogeneous_receipts_full_drain_set_and_affine_closure() {
+        const PARENT: VariableId = 0;
+        const TARGET: VariableId = 1;
+
+        let fixture = || {
+            let parent_rows = Arc::new(AtomicUsize::new(0));
+            let exact_rows = Arc::new(AtomicUsize::new(0));
+            let covering_rows = Arc::new(AtomicUsize::new(0));
+            let root = Arc::new(IntersectionConstraint::new(vec![
+                Box::new(CertifiedAdaptiveSource {
+                    parent: None,
+                    variable: PARENT,
+                    coverage: ProposalCoverage::Exact,
+                    estimates: [2, 2],
+                    values: Arc::new(vec![raw(0), raw(1)]),
+                    proposed_rows: Arc::clone(&parent_rows),
+                }) as ShapeConstraint,
+                Box::new(CertifiedAdaptiveSource {
+                    parent: Some(PARENT),
+                    variable: TARGET,
+                    coverage: ProposalCoverage::Exact,
+                    estimates: [1, 9],
+                    values: Arc::new(vec![raw(42)]),
+                    proposed_rows: Arc::clone(&exact_rows),
+                }),
+                Box::new(CertifiedAdaptiveSource {
+                    parent: Some(PARENT),
+                    variable: TARGET,
+                    coverage: ProposalCoverage::Covering,
+                    estimates: [9, 1],
+                    values: Arc::new(vec![raw(42)]),
+                    proposed_rows: Arc::clone(&covering_rows),
+                }),
+            ]));
+            (root, parent_rows, exact_rows, covering_rows)
+        };
+        let query = |root| {
+            Query::new(root, |binding: &Binding| {
+                Some((binding.get(PARENT).copied()?, binding.get(TARGET).copied()?))
+            })
+            .solve_residual_state_lazy_with(ResidualLowering::new(
+                FormulaScope::WholeRoot,
+                ProgramScope::Disabled,
+            ))
+        };
+
+        let (quoted_root, quoted_parent, quoted_exact, quoted_covering) = fixture();
+        let quoted_epoch = ResidualShadowEpoch::new();
+        let quoted = query(Arc::clone(&quoted_root))
+            .shadow(quoted_epoch)
+            .collect_profiled();
+
+        let (v31_root, v31_parent, v31_exact, v31_covering) = fixture();
+        let mut v31 = query(Arc::clone(&v31_root));
+        assert!(v31.plan.formula_ready_quote.is_some());
+        v31.plan.formula_ready_quote = None;
+        v31.state = ResidualStateMachine::new_for_plan(
+            v31_root.variables(),
+            &v31.plan,
+            Search::NextVariable,
+        );
+        let v31_epoch = ResidualShadowEpoch::new();
+        let v31 = v31.shadow(v31_epoch).collect_profiled();
+
+        // Each target source owns exactly one parent row. This is the semantic
+        // action witness that both Ready receipts ran through completion; it
+        // deliberately says nothing about their physical order or state IDs.
+        assert_eq!(quoted_parent.load(Ordering::Relaxed), 1);
+        assert_eq!(quoted_exact.load(Ordering::Relaxed), 1);
+        assert_eq!(quoted_covering.load(Ordering::Relaxed), 1);
+        assert_eq!(v31_parent.load(Ordering::Relaxed), 1);
+        assert_eq!(v31_exact.load(Ordering::Relaxed), 1);
+        assert_eq!(v31_covering.load(Ordering::Relaxed), 1);
+
+        let quoted_len = quoted.results.len();
+        let v31_len = v31.results.len();
+        let quoted_set: std::collections::BTreeSet<_> = quoted.results.into_iter().collect();
+        let v31_set: std::collections::BTreeSet<_> = v31.results.into_iter().collect();
+        let expected = std::collections::BTreeSet::from([(raw(0), raw(42)), (raw(1), raw(42))]);
+        assert_eq!(
+            quoted_len,
+            quoted_set.len(),
+            "quoted projection was not a SET"
+        );
+        assert_eq!(v31_len, v31_set.len(), "V3.1 projection was not a SET");
+        assert_eq!(quoted_set, expected);
+        assert_eq!(quoted_set, v31_set);
+
+        for shadow in [&quoted.shadow, &v31.shadow] {
+            assert_eq!(shadow.status, ResidualShadowStatus::Closed);
+            assert!(!shadow.events.is_empty());
+            assert!(
+                shadow.events.iter().all(|event| event.completion.is_some()),
+                "a fully drained affine epoch retained packet/action debt"
+            );
+        }
     }
 
     #[test]
