@@ -11117,6 +11117,120 @@ impl ResidualStateMachine {
         }
     }
 
+    /// Publishes one completed, nonterminal Program proposal back into the
+    /// ordinary canonical Candidate continuation.
+    ///
+    /// Completion is selected only after projected demand has widened beyond
+    /// the scalar latency lane. The Program family still owns the action and
+    /// certifies the complete occurrence bag; only its physical execution
+    /// changes from affine pages to one block-native cohort.
+    #[cold]
+    #[inline(never)]
+    fn finish_complete_program_candidate(
+        &mut self,
+        family: StateId,
+        desc: StateDesc,
+        successor: StateDesc,
+        mut rows: RowBatch,
+        completion: (
+            usize,
+            ProgramCompleteAdmission,
+            usize,
+            Vec<(u32, RawInline)>,
+        ),
+        plan: &ResidualPlan,
+    ) -> DeltaSeedOutcome {
+        let (first_parent, admission, raw_occurrence_count, occurrences) = completion;
+        match admission {
+            ProgramCompleteAdmission::LegacyUnquoted => {
+                assert_eq!(
+                    first_parent, 0,
+                    "legacy unquoted completion did not retain its whole batch"
+                );
+            }
+            ProgramCompleteAdmission::Exact {
+                drain_work_units,
+                raw_occurrences,
+            } => {
+                let capacity = self.width.max(1);
+                debug_assert!(drain_work_units <= capacity);
+                debug_assert!(raw_occurrences <= capacity);
+                assert_eq!(raw_occurrences, raw_occurrence_count);
+            }
+        }
+
+        if first_parent > 0 {
+            let completed_parent_count = rows.row_count - first_parent;
+            let mut deferred = StateBucket::Rows(rows);
+            let completed = deferred.take_tail(desc.bound.count(), completed_parent_count, false);
+            let receipt = file_with_plan(
+                &mut self.worklist,
+                &mut self.interner,
+                plan,
+                desc.clone(),
+                deferred,
+                &mut self.stats,
+            )
+            .expect("bounded complete-action prefix is nonempty");
+            debug_assert_eq!(receipt.state, family);
+            let StateBucket::Rows(completed) = completed else {
+                unreachable!("bounded complete split preserved row payloads")
+            };
+            rows = completed;
+        }
+
+        let seeded_parents = rows.row_count;
+        self.stats.propose_action_pops += 1;
+        self.stats.propose_calls += 1;
+        self.stats.propose_rows += seeded_parents;
+        self.stats.max_propose_rows = self.stats.max_propose_rows.max(seeded_parents);
+
+        let mut candidates = CandidatePayload::from_tagged(occurrences, seeded_parents);
+        candidates.debug_assert_valid_for(rows.row_count);
+        debug_assert!(
+            {
+                let mut admitted = candidates.clone();
+                admitted.admit_set_forward_stable(rows.row_count)
+                    && admitted.len() == candidates.len()
+            },
+            "typed complete adapter returned a duplicate candidate"
+        );
+        self.stats.candidates_proposed += raw_occurrence_count;
+        self.stats.max_propose_candidates =
+            self.stats.max_propose_candidates.max(raw_occurrence_count);
+
+        if crosses_candidate_set_boundary(&desc, &successor, plan, &self.interner.formula_pcs) {
+            assert!(
+                candidates.admit_set_tail_stable(rows.row_count),
+                "completed Program proposal returned a deferred candidate payload"
+            );
+        }
+        let parent_columns = desc.bound.count();
+        let candidate = CandidateBatch {
+            parents: rows,
+            candidates,
+        };
+        let continuation = candidate.compact(parent_columns).and_then(|candidate| {
+            file_with_plan(
+                &mut self.worklist,
+                &mut self.interner,
+                plan,
+                successor,
+                StateBucket::Candidates(candidate),
+                &mut self.stats,
+            )
+        });
+        DeltaSeedOutcome {
+            continuation,
+            publication: None,
+            active: None,
+            terminal_activations: Vec::new(),
+            completed_activation_ids: Vec::new(),
+            terminal_family: None,
+            seeded_parents,
+        }
+    }
+
     /// Converts one eligible proposer action into activation-owned cyclic
     /// work.
     fn seed_delta_proposal<'a>(
@@ -11185,6 +11299,12 @@ impl ResidualStateMachine {
         let complete_terminal_candidate = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
+            && program.is_some_and(|(_, route)| {
+                route.completion == ProgramCompletion::CompleteActionEquivalent
+            });
+        let complete_wide_candidate = !terminal_streaming
+            && self.terminal_demand_width > 1
+            && selected_parent_count > 1
             && program.is_some_and(|(_, route)| {
                 route.completion == ProgramCompletion::CompleteActionEquivalent
             });
@@ -11267,6 +11387,25 @@ impl ResidualStateMachine {
                     direct_terminal_publication_full,
                     plan,
                 ));
+            }
+            if complete_wide_candidate {
+                let capacity = self.width.max(1);
+                let completion = {
+                    let affinity = ProgramCompleteAffinity::new(&rows);
+                    let vars: Vec<VariableId> = program_request.bound.into_iter().collect();
+                    let batch = ProgramCompleteBatch {
+                        request: program_request,
+                        route,
+                        view: rows_view(&vars, &rows.rows, rows.row_count),
+                    };
+                    spec.try_complete_bounded(batch, capacity, &affinity)
+                        .map(|completion| completion.into_parts_for(batch, &affinity, &rows))
+                };
+                if let Some(completion) = completion {
+                    return Ok(self.finish_complete_program_candidate(
+                        state, desc, successor, rows, completion, plan,
+                    ));
+                }
             }
             self.stats.propose_action_pops += 1;
             self.stats.propose_calls += 1;
@@ -12018,15 +12157,26 @@ impl ResidualStateMachine {
         }
     }
 
+    fn continuation_fills_demand(
+        &self,
+        plan: &ResidualPlan,
+        token: ContinuationToken,
+        demand: usize,
+    ) -> bool {
+        let desc = self.interner.get(token.state);
+        token.occupancy(desc, plan, &self.interner.formula_pcs) >= demand.max(1)
+    }
+
     /// Accepts a delta-to-stable handoff into its geometric continuation mode.
-    fn accept_delta_step(&mut self, outcome: DeltaStepOutcome) {
-        self.accept_delta_step_with_resume(outcome, None);
+    fn accept_delta_step(&mut self, plan: &ResidualPlan, outcome: DeltaStepOutcome) {
+        self.accept_delta_step_with_resume(plan, outcome, None);
     }
 
     /// Accepts a directed delta handoff while retaining the yielding affine
     /// activation as a suspended physical lease when it still owns work.
     fn accept_delta_step_with_resume(
         &mut self,
+        plan: &ResidualPlan,
         mut outcome: DeltaStepOutcome,
         resume: Option<ActiveDeltaContinuation>,
     ) {
@@ -12034,37 +12184,42 @@ impl ResidualStateMachine {
         debug_assert!(
             resume.is_none() || outcome.continuation.is_some() || outcome.publication.is_some()
         );
-        let retained_yielding_activation = resume.is_some();
-        self.active_delta = resume.or_else(|| outcome.demand_preference.take());
+        let retained = (self.terminal_demand_width == 1)
+            .then(|| resume.or_else(|| outcome.demand_preference.take()))
+            .flatten();
+        let retained_yielding_activation = resume.is_some() && retained.is_some();
+        self.active_delta = retained;
         self.active_delta_after_yield = retained_yielding_activation;
         self.stats.delta_active_live_yields_retained += usize::from(retained_yielding_activation);
-        self.continuation = outcome.continuation.take().map(|token| {
-            let desc = self.interner.get(token.state);
-            let commits_terminal_candidates = match &desc.phase {
-                ResidualPhase::Candidate {
-                    variable,
-                    relevant,
-                    checked,
-                } if relevant == checked => {
-                    let mut committed = desc.bound;
-                    committed.set(*variable);
-                    committed == self.full
+        self.continuation = outcome
+            .continuation
+            .take()
+            .filter(|&token| {
+                self.continuation_fills_demand(plan, token, self.terminal_demand_width)
+            })
+            .map(|token| {
+                let desc = self.interner.get(token.state);
+                let commits_terminal_candidates = match &desc.phase {
+                    ResidualPhase::Candidate {
+                        variable,
+                        relevant,
+                        checked,
+                    } if relevant == checked => {
+                        let mut committed = desc.bound;
+                        committed.set(*variable);
+                        committed == self.full
+                    }
+                    _ => false,
+                };
+                if self.terminal_demand_width > 1
+                    || outcome.completed_transition_cohort
+                    || commits_terminal_candidates
+                {
+                    ActiveContinuation::cohort(token)
+                } else {
+                    ActiveContinuation::probe_one(token)
                 }
-                _ => false,
-            };
-            if outcome.completed_transition_cohort || commits_terminal_candidates {
-                // A geometrically selected activation cohort is already the
-                // engine's chosen throughput unit. Keep its exact appended
-                // tail hot. The same is safe for fully checked candidates
-                // whose commit binds the final variable: their next step can
-                // only emit, so probing one cannot reveal downstream
-                // selectivity and would strand exact results behind live
-                // cyclic work.
-                ActiveContinuation::cohort(token)
-            } else {
-                ActiveContinuation::probe_one(token)
-            }
-        });
+            });
         if let Some(publication) = outcome.publication.take() {
             self.stage_direct_terminal_publication(publication);
         }
@@ -12083,13 +12238,13 @@ impl ResidualStateMachine {
         if !self.continuation_sprint_enabled {
             return None;
         }
+        if !self.continuation_fills_demand(plan, continuation, self.terminal_demand_width) {
+            return None;
+        }
         let desc = self.interner.get(continuation.state);
         let successor_is_underfilled =
             continuation.occupancy(desc, plan, &self.interner.formula_pcs) < width.max(1);
         match self.last_selection {
-            // ProbeOne governs exactly the delta-filed handoff atom. Once it
-            // advances, its ordered fanout is an ordinary semantic cohort;
-            // probing that tail again could reverse observable result order.
             SelectionKind::Continuation(ContinuationMode::ProbeOne) => {
                 Some(ActiveContinuation::cohort(continuation))
             }
@@ -12100,6 +12255,34 @@ impl ResidualStateMachine {
                 Some(ActiveContinuation::cohort(continuation))
             }
             SelectionKind::Full | SelectionKind::Readiness => None,
+        }
+    }
+
+    /// Reconcile latency-only leases with newly confirmed projected demand.
+    ///
+    /// Stable work remains filed under its canonical state and cyclic work
+    /// remains owned by the global delta scheduler, so revoking either token
+    /// changes only physical priority. Negative search feedback may widen
+    /// `self.width` while the caller still wants only one result, so it never
+    /// revokes the latency lane. A scalar directed lease fills only the
+    /// one-result demand window; after a later public pull promotes that
+    /// window, a stable receipt may stay hot exactly while its newly filed
+    /// tail can fill the confirmed demand.
+    fn reconcile_physical_preferences(&mut self, plan: &ResidualPlan) {
+        let demand = self.terminal_demand_width.max(1);
+        if self
+            .continuation
+            .is_some_and(|active| !self.continuation_fills_demand(plan, active.token, demand))
+        {
+            self.continuation = None;
+        } else if demand > 1 {
+            if let Some(active) = &mut self.continuation {
+                active.mode = ContinuationMode::Cohort;
+            }
+        }
+        if demand > 1 {
+            self.active_delta = None;
+            self.active_delta_after_yield = false;
         }
     }
 
@@ -12142,13 +12325,14 @@ impl ResidualStateMachine {
         active: Option<ActiveDeltaContinuation>,
         seeded_parents: usize,
     ) -> Option<ActiveDeltaContinuation> {
-        self.selected_singleton_delta_lane(seeded_parents)
+        (self.terminal_demand_width == 1 && self.selected_singleton_delta_lane(seeded_parents))
             .then_some(active)
             .flatten()
     }
 
     fn accept_delta_seed(
         &mut self,
+        plan: &ResidualPlan,
         continuation: Option<ContinuationToken>,
         publication: Option<TerminalPublicationBatch>,
         active: Option<ActiveDeltaContinuation>,
@@ -12179,7 +12363,17 @@ impl ResidualStateMachine {
             (continuation.is_some() || publication.is_some()) && retained.is_some();
         self.stats.delta_active_live_yields_retained += usize::from(self.active_delta_after_yield);
         self.active_delta = retained;
-        self.continuation = continuation.map(ActiveContinuation::probe_one);
+        self.continuation = continuation
+            .filter(|&token| {
+                self.continuation_fills_demand(plan, token, self.terminal_demand_width)
+            })
+            .map(|token| {
+                if self.terminal_demand_width == 1 {
+                    ActiveContinuation::probe_one(token)
+                } else {
+                    ActiveContinuation::cohort(token)
+                }
+            });
         if let Some(publication) = publication {
             self.stage_direct_terminal_publication(publication);
         }
@@ -12314,6 +12508,7 @@ impl ResidualStateMachine {
             }
 
             let width = self.width;
+            self.reconcile_physical_preferences(plan);
             // A newly seeded activation on the scalar continuation path is
             // the cyclic analogue of `ActiveContinuation`: follow that exact
             // affine lineage before any cold stable cohort. It owns no work;
@@ -12336,9 +12531,11 @@ impl ResidualStateMachine {
                         &mut self.stats,
                     );
                     match focused.status {
-                        ActiveDeltaStatus::Yielded => {
-                            self.accept_delta_step_with_resume(focused.outcome, focused.resume)
-                        }
+                        ActiveDeltaStatus::Yielded => self.accept_delta_step_with_resume(
+                            plan,
+                            focused.outcome,
+                            focused.resume,
+                        ),
                         ActiveDeltaStatus::Pending => {
                             self.account_delta_feedback(&focused.outcome);
                             for activation in focused.outcome.completed_activation_ids {
@@ -12379,7 +12576,7 @@ impl ResidualStateMachine {
                             // used by the terminal yield ledger. It has no
                             // stable effect, but must still pass through the
                             // ordinary receipt acceptance path.
-                            self.accept_delta_step(focused.outcome);
+                            self.accept_delta_step(plan, focused.outcome);
                             self.stats.delta_active_quiescent_releases += 1;
                         }
                     }
@@ -12402,7 +12599,7 @@ impl ResidualStateMachine {
                     &mut self.interner,
                     &mut self.stats,
                 );
-                self.accept_delta_step(outcome);
+                self.accept_delta_step(plan, outcome);
                 continue;
             }
             match self.pop_once_with_dispatch(
@@ -12445,7 +12642,7 @@ impl ResidualStateMachine {
                         &mut self.interner,
                         &mut self.stats,
                     );
-                    self.accept_delta_step(outcome);
+                    self.accept_delta_step(plan, outcome);
                 }
                 MachineStep::DeltaSeeded {
                     continuation,
@@ -12457,6 +12654,7 @@ impl ResidualStateMachine {
                     completed_activation_ids,
                 } => {
                     self.accept_delta_seed(
+                        plan,
                         continuation,
                         publication,
                         active,
@@ -12849,6 +13047,7 @@ impl ResidualStateMachine {
                     terminal_activations,
                     completed_activation_ids,
                 } => self.accept_delta_seed(
+                    plan,
                     continuation,
                     publication,
                     active,
@@ -16352,6 +16551,7 @@ mod tests {
             completed_activation_ids,
         } = outcome;
         machine.accept_delta_seed(
+            &plan,
             continuation,
             publication,
             active,
@@ -16649,6 +16849,7 @@ mod tests {
             completed_activation_ids,
         } = eager;
         iter.state.accept_delta_seed(
+            &iter.plan,
             continuation,
             publication,
             active,
@@ -16966,6 +17167,7 @@ mod tests {
             panic!("the paged source remained live")
         };
         iter.state.accept_delta_seed(
+            &iter.plan,
             None,
             None,
             Some(active),
@@ -29624,6 +29826,8 @@ mod tests {
 
     #[test]
     fn mixed_delta_feedback_arms_probe_without_widening() {
+        let root = CapabilityLeaf { variable: 0 };
+        let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(VariableSet::new_singleton(0), 1, Search::Done);
         machine.width = 4;
         machine.cap = 64;
@@ -29644,23 +29848,26 @@ mod tests {
             rank: 7,
             state,
             rows: 2,
-            candidates: 0,
+            candidates: 2,
         };
 
-        machine.accept_delta_step(DeltaStepOutcome {
-            continuation: Some(token),
-            publication: None,
-            completed_activation_ids: Vec::new(),
-            retargeted: Default::default(),
-            dead_pages: 2,
-            source_dead_pages: 2,
-            transition_dead_pages: 0,
-            completed_activations: 0,
-            completed_transition_cohort: false,
-            allows_global_width_growth: true,
-            release_directed_lease: false,
-            demand_preference: None,
-        });
+        machine.accept_delta_step(
+            &plan,
+            DeltaStepOutcome {
+                continuation: Some(token),
+                publication: None,
+                completed_activation_ids: Vec::new(),
+                retargeted: Default::default(),
+                dead_pages: 2,
+                source_dead_pages: 2,
+                transition_dead_pages: 0,
+                completed_activations: 0,
+                completed_transition_cohort: false,
+                allows_global_width_growth: true,
+                release_directed_lease: false,
+                demand_preference: None,
+            },
+        );
         assert_eq!(machine.width, 4);
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
         assert_eq!(
@@ -29668,20 +29875,23 @@ mod tests {
             Some(ActiveContinuation::probe_one(token))
         );
 
-        machine.accept_delta_step(DeltaStepOutcome {
-            continuation: Some(token),
-            publication: None,
-            completed_activation_ids: Vec::new(),
-            retargeted: Default::default(),
-            dead_pages: 0,
-            source_dead_pages: 0,
-            transition_dead_pages: 0,
-            completed_activations: 2,
-            completed_transition_cohort: true,
-            allows_global_width_growth: true,
-            release_directed_lease: false,
-            demand_preference: None,
-        });
+        machine.accept_delta_step(
+            &plan,
+            DeltaStepOutcome {
+                continuation: Some(token),
+                publication: None,
+                completed_activation_ids: Vec::new(),
+                retargeted: Default::default(),
+                dead_pages: 0,
+                source_dead_pages: 0,
+                transition_dead_pages: 0,
+                completed_activations: 2,
+                completed_transition_cohort: true,
+                allows_global_width_growth: true,
+                release_directed_lease: false,
+                demand_preference: None,
+            },
+        );
         assert_eq!(
             machine.continuation,
             Some(ActiveContinuation::cohort(token))
@@ -29702,78 +29912,90 @@ mod tests {
             state: terminal_state,
             ..token
         };
-        machine.accept_delta_step(DeltaStepOutcome {
-            continuation: Some(terminal),
-            publication: None,
-            completed_activation_ids: Vec::new(),
-            retargeted: Default::default(),
-            dead_pages: 0,
-            source_dead_pages: 0,
-            transition_dead_pages: 0,
-            completed_activations: 0,
-            completed_transition_cohort: false,
-            allows_global_width_growth: true,
-            release_directed_lease: false,
-            demand_preference: None,
-        });
+        machine.accept_delta_step(
+            &plan,
+            DeltaStepOutcome {
+                continuation: Some(terminal),
+                publication: None,
+                completed_activation_ids: Vec::new(),
+                retargeted: Default::default(),
+                dead_pages: 0,
+                source_dead_pages: 0,
+                transition_dead_pages: 0,
+                completed_activations: 0,
+                completed_transition_cohort: false,
+                allows_global_width_growth: true,
+                release_directed_lease: false,
+                demand_preference: None,
+            },
+        );
         assert_eq!(
             machine.continuation,
             Some(ActiveContinuation::cohort(terminal)),
             "fully checked candidates that bind the last variable emit directly"
         );
 
-        machine.accept_delta_step(DeltaStepOutcome {
-            continuation: None,
-            publication: None,
-            completed_activation_ids: Vec::new(),
-            retargeted: Default::default(),
-            dead_pages: 2,
-            source_dead_pages: 2,
-            transition_dead_pages: 0,
-            completed_activations: 0,
-            completed_transition_cohort: false,
-            allows_global_width_growth: true,
-            release_directed_lease: false,
-            demand_preference: None,
-        });
+        machine.accept_delta_step(
+            &plan,
+            DeltaStepOutcome {
+                continuation: None,
+                publication: None,
+                completed_activation_ids: Vec::new(),
+                retargeted: Default::default(),
+                dead_pages: 2,
+                source_dead_pages: 2,
+                transition_dead_pages: 0,
+                completed_activations: 0,
+                completed_transition_cohort: false,
+                allows_global_width_growth: true,
+                release_directed_lease: false,
+                demand_preference: None,
+            },
+        );
         assert_eq!(machine.width, 8);
         assert_eq!(machine.stats.delta_source_negative_steps, 1);
         assert!(machine.continuation.is_none());
 
-        machine.accept_delta_step(DeltaStepOutcome {
-            continuation: None,
-            publication: None,
-            completed_activation_ids: Vec::new(),
-            retargeted: Default::default(),
-            dead_pages: 1,
-            source_dead_pages: 0,
-            transition_dead_pages: 1,
-            completed_activations: 0,
-            completed_transition_cohort: false,
-            allows_global_width_growth: false,
-            release_directed_lease: false,
-            demand_preference: None,
-        });
+        machine.accept_delta_step(
+            &plan,
+            DeltaStepOutcome {
+                continuation: None,
+                publication: None,
+                completed_activation_ids: Vec::new(),
+                retargeted: Default::default(),
+                dead_pages: 1,
+                source_dead_pages: 0,
+                transition_dead_pages: 1,
+                completed_activations: 0,
+                completed_transition_cohort: false,
+                allows_global_width_growth: false,
+                release_directed_lease: false,
+                demand_preference: None,
+            },
+        );
         assert_eq!(
             machine.width, 8,
             "terminal traversal misses widen local effort rather than global search"
         );
         assert_eq!(machine.stats.delta_transition_negative_steps, 1);
 
-        machine.accept_delta_step(DeltaStepOutcome {
-            continuation: None,
-            publication: None,
-            completed_activation_ids: Vec::new(),
-            retargeted: Default::default(),
-            dead_pages: 0,
-            source_dead_pages: 0,
-            transition_dead_pages: 0,
-            completed_activations: 1,
-            completed_transition_cohort: false,
-            allows_global_width_growth: true,
-            release_directed_lease: false,
-            demand_preference: None,
-        });
+        machine.accept_delta_step(
+            &plan,
+            DeltaStepOutcome {
+                continuation: None,
+                publication: None,
+                completed_activation_ids: Vec::new(),
+                retargeted: Default::default(),
+                dead_pages: 0,
+                source_dead_pages: 0,
+                transition_dead_pages: 0,
+                completed_activations: 1,
+                completed_transition_cohort: false,
+                allows_global_width_growth: true,
+                release_directed_lease: false,
+                demand_preference: None,
+            },
+        );
         assert_eq!(machine.width, 8);
         assert_eq!(machine.delta.activation_width(), 2);
         assert_eq!(machine.stats.delta_activations_completed, 3);
@@ -29798,28 +30020,73 @@ mod tests {
             .expect("one cyclic source activation was filed");
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
-        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
+        machine.accept_delta_seed(
+            &plan,
+            None,
+            None,
+            Some(active),
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(machine.active_delta, Some(active));
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::Cohort);
-        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
+        machine.accept_delta_seed(
+            &plan,
+            None,
+            None,
+            Some(active),
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(
             machine.active_delta,
             Some(active),
             "the action after a one-atom planning probe is a singleton cohort"
         );
-        machine.accept_delta_seed(None, None, Some(active), 512, None, Vec::new(), Vec::new());
+        machine.accept_delta_seed(
+            &plan,
+            None,
+            None,
+            Some(active),
+            512,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(
             machine.active_delta.is_none(),
             "a wide cohort must not pick an arbitrary last activation"
         );
 
         machine.last_selection = SelectionKind::Full;
-        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
+        machine.accept_delta_seed(
+            &plan,
+            None,
+            None,
+            Some(active),
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(machine.active_delta, Some(active));
 
         machine.last_selection = SelectionKind::Readiness;
-        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
+        machine.accept_delta_seed(
+            &plan,
+            None,
+            None,
+            Some(active),
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(machine.active_delta, Some(active));
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
@@ -29833,6 +30100,7 @@ mod tests {
         )
         .expect("one stable seed effect was filed");
         machine.accept_delta_seed(
+            &plan,
             Some(stable),
             None,
             Some(active),
@@ -29853,7 +30121,16 @@ mod tests {
         );
 
         machine.continuation_sprint_enabled = false;
-        machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
+        machine.accept_delta_seed(
+            &plan,
+            None,
+            None,
+            Some(active),
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(
             machine.active_delta.is_none(),
             "the stable continuation ablation must also disable cyclic focus"
