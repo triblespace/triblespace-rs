@@ -14611,7 +14611,6 @@ mod tests {
     use crate::query::unionconstraint::UnionConstraint;
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
-    #[cfg(feature = "parallel")]
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     #[cfg(feature = "parallel")]
