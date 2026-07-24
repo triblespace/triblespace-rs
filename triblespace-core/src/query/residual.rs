@@ -30963,8 +30963,11 @@ mod tests {
             ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
         );
         let relevant = ChildSet::empty(formula_plan.len()).with_inserted(0);
-        let mut formula_machine =
-            ResidualStateMachine::new(formula_root.variables(), formula_plan.len(), Search::Done);
+        let mut formula_machine = ResidualStateMachine::new_for_plan(
+            formula_root.variables(),
+            &formula_plan,
+            Search::Done,
+        );
         let start = formula_machine.interner.start_formula(
             &formula_plan.finite_formula,
             0,
