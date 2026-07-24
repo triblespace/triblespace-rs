@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserving ordinary source eligibility, typed-Program execution receipts,
   target validators, lower-occurrence ties, and exact-source discharge.
   Custom exposed ANDs without the stronger estimate proof retain the direct
-  Stage-S root Formula path.
+  Stage-S root Formula path. Quote-disabled Ready planning also retains the
+  exact compact Stage-S variable-plan and action-key representations; quoted
+  roots use separate child-bearing plans and grouping keys, so the recursive
+  optimization does not widen the ordinary hot path.
 - **Synthetic WholeRoot Formula proposals enter directly from Ready.** After
   Ready has preserved the root constraint's aggregate estimate, exact
   row-local variable choice, and singleton Formula occurrence, it now

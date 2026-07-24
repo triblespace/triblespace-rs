@@ -7450,19 +7450,20 @@ fn file(
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProposeAction {
+    // Keep this Stage-S key compact. Root-AND child selection belongs in
+    // `QuotedProposeAction`, never in an Option on the ordinary key.
     variable_plan: usize,
     leaf: usize,
-    formula_child: Option<usize>,
 }
 
 struct VariablePlan {
+    // This is the ordinary Ready hot-path record. Quote-only state belongs in
+    // `QuotedVariablePlan` so roots without a compiled quote retain Stage S's
+    // layout and grouping control flow.
     variable: VariableId,
     relevant: ChildSet,
     /// Tightest flattened leaf occurrence per row.
     proposers: Vec<usize>,
-    /// First root-AND Formula child selected from the same columns that
-    /// supplied this variable's aggregate Ready estimate.
-    formula_quote: Option<FormulaReadySelection>,
 }
 
 struct FormulaReadySelection {
@@ -7470,6 +7471,18 @@ struct FormulaReadySelection {
     selected: Vec<usize>,
     source_coverages: Box<[ProposalCoverage]>,
     execution_source_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct QuotedProposeAction {
+    variable_plan: usize,
+    formula_child: usize,
+}
+
+struct QuotedVariablePlan {
+    variable: VariableId,
+    relevant: ChildSet,
+    selection: FormulaReadySelection,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7660,6 +7673,23 @@ fn ready_plan_transition<'a>(
     stats: &mut ResidualStateStats,
     next_activation: &mut u64,
 ) -> ContinuationToken {
+    if let Some(quote) = &plan.formula_ready_quote {
+        return ready_quoted_plan_transition(
+            root,
+            plan,
+            quote,
+            desc,
+            rows,
+            full,
+            influences,
+            base_estimates,
+            worklist,
+            interner,
+            stats,
+            next_activation,
+        );
+    }
+
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -7676,19 +7706,7 @@ fn ready_plan_transition<'a>(
         estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
         let estimates = &mut estimate_matrix[estimate_start..];
         let mut column = Vec::with_capacity(rows.row_count);
-        let mut formula_quote = None;
-        if let Some(quote) = &plan.formula_ready_quote {
-            debug_assert_eq!(leaf_count, 1);
-            relevant.insert(0);
-            proposers.fill(0);
-            let Some(selection) = quote_formula_ready_and(
-                root, plan, quote, variable, desc.bound, &view, estimates, stats,
-            ) else {
-                estimate_matrix.truncate(estimate_start);
-                continue;
-            };
-            formula_quote = Some(selection);
-        } else if plan.certified_denotation {
+        if plan.certified_denotation {
             let mut peers = Vec::new();
             for leaf in 0..leaf_count {
                 let constraint = plan.resolve(root, leaf);
@@ -7801,7 +7819,6 @@ fn ready_plan_transition<'a>(
             variable,
             relevant,
             proposers,
-            formula_quote,
         });
     }
 
@@ -7845,30 +7862,10 @@ fn ready_plan_transition<'a>(
         let action = ProposeAction {
             variable_plan,
             leaf: plans[variable_plan].proposers[row],
-            formula_child: plans[variable_plan]
-                .formula_quote
-                .as_ref()
-                .map(|quote| quote.selected[row]),
         };
         groups.entry(action).or_default().push(row);
     }
-    let mut previous_outer_action = None;
-    let outer_action_groups = groups
-        .keys()
-        .filter(|action| {
-            let outer_action = (action.variable_plan, action.leaf);
-            let first = previous_outer_action != Some(outer_action);
-            previous_outer_action = Some(outer_action);
-            first
-        })
-        .count();
-    stats.ready_proposal_groups += outer_action_groups;
-    if plan.synthetic_root_formula {
-        stats.formula_ready_direct_entries += outer_action_groups;
-    }
-    if plan.formula_ready_quote.is_some() {
-        stats.formula_ready_quote_root_plan_filings_elided += outer_action_groups;
-    }
+    stats.ready_proposal_groups += groups.len();
 
     let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
         let variable_plan = &plans[action.variable_plan];
@@ -7877,32 +7874,7 @@ fn ready_plan_transition<'a>(
                 plan.has_finite_formula(action.leaf),
                 "synthetic WholeRoot proposal did not name its Formula occurrence"
             );
-            if let Some(child) = action.formula_child {
-                let quote = variable_plan
-                    .formula_quote
-                    .as_ref()
-                    .expect("a quoted Formula action lost its Ready selection");
-                stats.formula_ready_quote_groups += 1;
-                stats.formula_ready_quote_reestimate_rows_avoided += quote
-                    .execution_source_count
-                    .checked_mul(selected.row_count)
-                    .expect("quoted AND estimate-row counter overflow");
-                return start_quoted_formula_proposal_transition(
-                    root,
-                    plan,
-                    desc.bound,
-                    variable_plan.variable,
-                    &variable_plan.relevant,
-                    action.leaf,
-                    quote,
-                    child,
-                    selected,
-                    next_activation,
-                    worklist,
-                    interner,
-                    stats,
-                );
-            }
+            stats.formula_ready_direct_entries += 1;
             return start_formula_proposal_transition(
                 root,
                 plan,
@@ -7947,6 +7919,139 @@ fn ready_plan_transition<'a>(
             prefer_continuation(&mut continuation, file_propose_group(action, selected));
         }
         continuation.expect("Ready planning filed no action")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ready_quoted_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    quote: &FormulaReadyQuote,
+    desc: &StateDesc,
+    rows: RowBatch,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+    next_activation: &mut u64,
+) -> ContinuationToken {
+    assert!(plan.synthetic_root_formula);
+    assert_eq!(
+        plan.len(),
+        1,
+        "a compiled root-AND quote must own one outer Formula occurrence"
+    );
+
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &rows.rows, rows.row_count);
+    let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
+    let mut plans = Vec::with_capacity(unbound.len());
+    let mut estimate_matrix = Vec::with_capacity(unbound.len() * rows.row_count);
+
+    for &variable in &unbound {
+        let estimate_start = estimate_matrix.len();
+        estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
+        let estimates = &mut estimate_matrix[estimate_start..];
+        let Some(selection) = quote_formula_ready_and(
+            root, plan, quote, variable, desc.bound, &view, estimates, stats,
+        ) else {
+            estimate_matrix.truncate(estimate_start);
+            continue;
+        };
+        let mut relevant = ChildSet::empty(1);
+        relevant.insert(0);
+        plans.push(QuotedVariablePlan {
+            variable,
+            relevant,
+            selection,
+        });
+    }
+
+    assert!(!plans.is_empty(), "{CERTIFIED_SOURCE_FRONTIER_ERROR}");
+
+    let mut preferred = Vec::with_capacity(rows.row_count);
+    let mut preferred_counts = vec![0; plans.len()];
+    for row in 0..rows.row_count {
+        let mut best = None;
+        for (pi, plan) in plans.iter().enumerate() {
+            let estimate = estimate_matrix[pi * rows.row_count + row];
+            let key = variable_choice_key(
+                plan.variable,
+                estimate,
+                base_estimates[plan.variable],
+                influences[plan.variable].count(),
+            );
+            if best.is_none_or(|(_, best_key)| key > best_key) {
+                best = Some((pi, key));
+            }
+        }
+        let variable_plan = best
+            .expect("a non-full quoted Ready state has an enabled proposal")
+            .0;
+        preferred.push(variable_plan as u32);
+        preferred_counts[variable_plan] += 1;
+    }
+
+    let preferred_groups = preferred_counts.iter().filter(|&&count| count > 0).count();
+    stats.ready_preferred_variable_groups += preferred_groups;
+
+    let mut groups: BTreeMap<QuotedProposeAction, Vec<usize>> = BTreeMap::new();
+    for (row, &variable_plan) in preferred.iter().enumerate() {
+        let variable_plan = variable_plan as usize;
+        let action = QuotedProposeAction {
+            variable_plan,
+            formula_child: plans[variable_plan].selection.selected[row],
+        };
+        groups.entry(action).or_default().push(row);
+    }
+
+    // Every quoted plan owns the same singleton outer Formula occurrence.
+    // Child selection may refine its physical groups, but Stage S's outer
+    // action count is exactly the number of preferred variables.
+    stats.ready_proposal_groups += preferred_groups;
+    stats.formula_ready_direct_entries += preferred_groups;
+    stats.formula_ready_quote_root_plan_filings_elided += preferred_groups;
+
+    let mut file_propose_group = |action: QuotedProposeAction, selected: RowBatch| {
+        let variable_plan = &plans[action.variable_plan];
+        stats.formula_ready_quote_groups += 1;
+        stats.formula_ready_quote_reestimate_rows_avoided += variable_plan
+            .selection
+            .execution_source_count
+            .checked_mul(selected.row_count)
+            .expect("quoted AND estimate-row counter overflow");
+        start_quoted_formula_proposal_transition(
+            root,
+            plan,
+            desc.bound,
+            variable_plan.variable,
+            &variable_plan.relevant,
+            0,
+            &variable_plan.selection,
+            action.formula_child,
+            selected,
+            next_activation,
+            worklist,
+            interner,
+            stats,
+        )
+    };
+
+    if groups.len() == 1 {
+        let (action, indices) = groups
+            .pop_first()
+            .expect("one quoted proposal group was observed");
+        debug_assert_eq!(indices.len(), rows.row_count);
+        file_propose_group(action, rows).expect("quoted Ready planning filed an empty action")
+    } else {
+        let mut continuation = None;
+        for (action, indices) in groups {
+            let selected = rows.selected(vars.len(), &indices);
+            prefer_continuation(&mut continuation, file_propose_group(action, selected));
+        }
+        continuation.expect("quoted Ready planning filed no action")
     }
 }
 
@@ -19335,6 +19440,27 @@ mod tests {
     }
 
     #[test]
+    fn ready_quote_keeps_plain_planning_layouts_at_stage_s_size() {
+        assert_eq!(
+            std::mem::size_of::<ProposeAction>(),
+            2 * std::mem::size_of::<usize>(),
+            "the plain grouping key must remain exactly two machine words"
+        );
+        assert_eq!(
+            std::mem::size_of::<QuotedProposeAction>(),
+            2 * std::mem::size_of::<usize>(),
+            "the child-bearing key belongs to a separate two-word map"
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(std::mem::size_of::<ProposeAction>(), 16);
+            assert_eq!(std::mem::size_of::<VariablePlan>(), 56);
+            assert_eq!(std::mem::size_of::<QuotedProposeAction>(), 16);
+            assert_eq!(std::mem::size_of::<QuotedVariablePlan>(), 104);
+        }
+    }
+
+    #[test]
     fn ready_directed_cost_keeps_q33_larger_archive_source_direction() {
         const VARIABLE: VariableId = 0;
         let actions = directed_ready_action_fixture(vec![
@@ -19413,6 +19539,10 @@ mod tests {
             &root,
             ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
         );
+        assert!(
+            plan.formula_ready_quote.is_none(),
+            "an uncertified root must retain the Stage-S plain grouping path"
+        );
         let desc = StateDesc {
             bound: VariableSet::new_singleton(PARENT),
             phase: ResidualPhase::Ready,
@@ -19464,6 +19594,10 @@ mod tests {
         assert_eq!(stats.ready_proposal_groups, 2);
         assert_eq!(stats.formula_ready_direct_entries, 2);
         assert_eq!(stats.formula_outer_entry_pops, 0);
+        assert_eq!(stats.formula_ready_quote_groups, 0);
+        assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 0);
+        assert_eq!(stats.formula_ready_quote_estimate_rows, 0);
+        assert_eq!(stats.formula_ready_quote_reestimate_rows_avoided, 0);
         assert_eq!(next_activation, 2);
     }
 
@@ -19919,6 +20053,8 @@ mod tests {
         assert_eq!(right_calls.load(Ordering::Relaxed), 1);
         assert_eq!(stats.formula_ready_quote_groups, 0);
         assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 0);
+        assert_eq!(stats.formula_ready_quote_estimate_rows, 0);
+        assert_eq!(stats.formula_ready_quote_reestimate_rows_avoided, 0);
 
         let bucket = worklist
             .get_mut(&token.rank)
