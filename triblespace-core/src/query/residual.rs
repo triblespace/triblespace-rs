@@ -13219,7 +13219,7 @@ mod parallel {
             } = self;
             debug_assert!(
                 !iter.state.delta.uses_global_service_debt(),
-                "global service execution must retain its affine shard at round boundaries"
+                "global service execution uses the resumable poll executor"
             );
             while !folder.full() {
                 match iter.next() {
@@ -13231,12 +13231,20 @@ mod parallel {
         }
     }
 
-    struct BroadcastLeaf<Prod, Con> {
+    struct GlobalServiceLeaf<Prod, Con> {
         producer: Prod,
         consumer: Con,
+        slot: usize,
+        already_full: bool,
     }
 
-    enum BroadcastReduction<Red> {
+    type ResidualGlobalServiceLeaf<C, P, R, Con> =
+        GlobalServiceLeaf<ResidualStateParIter<C, P, R>, Con>;
+    type PendingGlobalServiceLeaves<C, P, R, Con> =
+        Arc<Mutex<Vec<ResidualGlobalServiceLeaf<C, P, R, Con>>>>;
+    type GlobalServiceResults<Out> = Arc<Mutex<Vec<Option<Out>>>>;
+
+    enum GlobalServiceReduction<Red> {
         Leaf(usize),
         Branch {
             reducer: Red,
@@ -13245,7 +13253,7 @@ mod parallel {
         },
     }
 
-    impl<Red> BroadcastReduction<Red> {
+    impl<Red> GlobalServiceReduction<Red> {
         fn finish<Out>(self, results: &mut [Option<Out>]) -> Out
         where
             Red: Reducer<Out>,
@@ -13253,7 +13261,7 @@ mod parallel {
             match self {
                 Self::Leaf(slot) => results[slot]
                     .take()
-                    .expect("global-service broadcast leaf returned no consumer result"),
+                    .expect("global-service leaf returned no consumer result"),
                 Self::Branch {
                     reducer,
                     left,
@@ -13267,70 +13275,145 @@ mod parallel {
         }
     }
 
-    /// Pre-splits producer and consumer through the same left/right topology
-    /// as `bridge_unindexed`, while retaining that exact reducer tree for the
-    /// broadcast results.
-    fn plan_global_service_broadcast<Prod, Con>(
+    /// Pre-splits producer and consumer through one matching ordered
+    /// left/right topology and retains that exact reducer tree.
+    fn plan_global_service_leaves<Prod, Con>(
         producer: Prod,
         consumer: Con,
-        leaves: &mut Vec<BroadcastLeaf<Prod, Con>>,
-    ) -> BroadcastReduction<Con::Reducer>
+        leaves: &mut Vec<GlobalServiceLeaf<Prod, Con>>,
+    ) -> GlobalServiceReduction<Con::Reducer>
     where
         Prod: UnindexedProducer,
         Con: UnindexedConsumer<Prod::Item>,
     {
         if consumer.full() {
             let slot = leaves.len();
-            leaves.push(BroadcastLeaf { producer, consumer });
-            return BroadcastReduction::Leaf(slot);
+            leaves.push(GlobalServiceLeaf {
+                producer,
+                consumer,
+                slot,
+                already_full: true,
+            });
+            return GlobalServiceReduction::Leaf(slot);
         }
         let (left_producer, right_producer) = producer.split();
         let Some(right_producer) = right_producer else {
             let slot = leaves.len();
-            leaves.push(BroadcastLeaf {
+            leaves.push(GlobalServiceLeaf {
                 producer: left_producer,
                 consumer,
+                slot,
+                already_full: false,
             });
-            return BroadcastReduction::Leaf(slot);
+            return GlobalServiceReduction::Leaf(slot);
         };
 
         let reducer = consumer.to_reducer();
         let left_consumer = consumer.split_off_left();
-        let left = plan_global_service_broadcast(left_producer, left_consumer, leaves);
-        let right = plan_global_service_broadcast(right_producer, consumer, leaves);
-        BroadcastReduction::Branch {
+        let left = plan_global_service_leaves(left_producer, left_consumer, leaves);
+        let right = plan_global_service_leaves(right_producer, consumer, leaves);
+        GlobalServiceReduction::Branch {
             reducer,
             left: Box::new(left),
             right: Box::new(right),
         }
     }
 
-    /// Runs one query leaf on its assigned pool worker. A deferred shard keeps
-    /// both its affine iterator and consumer folder while cooperatively
-    /// helping unrelated/nested Rayon work. Broadcast pins one such loop per
-    /// worker, so a waiter can never be stolen beneath another same-query
-    /// packet owner.
-    fn run_global_service_broadcast_leaf<'a, C, P, R, Con>(
-        producer: ResidualStateParIter<C, P, R>,
-        consumer: Con,
-    ) -> Con::Result
-    where
-        C: Constraint<'a> + Clone + Send + 'a,
-        P: Fn(&Binding) -> Option<R> + Clone + Send,
-        R: Send,
+    fn store_global_service_result<Out>(
+        results: &GlobalServiceResults<Out>,
+        slot: usize,
+        result: Out,
+    ) {
+        let mut results = results.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert!(
+            results[slot].replace(result).is_none(),
+            "one global-service leaf returned two consumer results"
+        );
+    }
+
+    fn complete_unpolled_global_service_leaf<Prod, Con, R>(
+        leaf: GlobalServiceLeaf<Prod, Con>,
+        results: &GlobalServiceResults<Con::Result>,
+    ) where
         Con: UnindexedConsumer<R>,
     {
+        let GlobalServiceLeaf {
+            producer,
+            consumer,
+            slot,
+            already_full: _,
+        } = leaf;
+        drop(producer);
+        store_global_service_result(results, slot, consumer.into_folder().complete());
+    }
+
+    fn spawn_pending_global_service_leaves<'scope, 'a: 'scope, C, P, R, Con>(
+        scope: &rayon::Scope<'scope>,
+        pending: &PendingGlobalServiceLeaves<C, P, R, Con>,
+        results: &GlobalServiceResults<Con::Result>,
+        aborted: &Arc<AtomicBool>,
+    ) where
+        C: Constraint<'a> + Clone + Send + 'a + 'scope,
+        P: Fn(&Binding) -> Option<R> + Clone + Send + 'scope,
+        R: Send + 'scope,
+        Con: UnindexedConsumer<R> + 'scope,
+    {
+        let leaves = {
+            let mut pending = pending.lock().unwrap_or_else(|poison| poison.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        for leaf in leaves {
+            spawn_global_service_leaf(
+                scope,
+                leaf,
+                Arc::clone(pending),
+                Arc::clone(results),
+                Arc::clone(aborted),
+            );
+        }
+    }
+
+    fn run_global_service_leaf<'scope, 'a: 'scope, C, P, R, Con>(
+        scope: &rayon::Scope<'scope>,
+        leaf: ResidualGlobalServiceLeaf<C, P, R, Con>,
+        pending: &PendingGlobalServiceLeaves<C, P, R, Con>,
+        results: &GlobalServiceResults<Con::Result>,
+        aborted: &Arc<AtomicBool>,
+    ) where
+        C: Constraint<'a> + Clone + Send + 'a + 'scope,
+        P: Fn(&Binding) -> Option<R> + Clone + Send + 'scope,
+        R: Send + 'scope,
+        Con: UnindexedConsumer<R> + 'scope,
+    {
+        let GlobalServiceLeaf {
+            producer,
+            consumer,
+            slot,
+            already_full: _,
+        } = leaf;
         let mut iter = producer.inner;
         let mut folder = consumer.into_folder();
-        'pull: while !folder.full() {
+
+        loop {
+            if aborted.load(Ordering::Acquire) {
+                return;
+            }
+            if folder.full() {
+                break;
+            }
             match iter.poll_parallel() {
-                PullStep::Item(item) => folder = folder.consume(item),
+                PullStep::Item(item) => {
+                    folder = folder.consume(item);
+                }
                 PullStep::Deferred { packet_nonce } => {
                     while iter.state.delta.global_service_active_packet_nonce()
                         == Some(packet_nonce)
                     {
+                        if aborted.load(Ordering::Acquire) {
+                            return;
+                        }
                         if folder.full() {
-                            break 'pull;
+                            break;
                         }
                         match rayon::yield_now() {
                             Some(rayon::Yield::Executed) => {}
@@ -13338,20 +13421,102 @@ mod parallel {
                         }
                     }
                 }
-                PullStep::Cooperate => {}
+                PullStep::Cooperate => {
+                    spawn_pending_global_service_leaves(scope, pending, results, aborted);
+                    let _ = rayon::yield_now();
+                }
                 PullStep::Exhausted => break,
             }
         }
-        folder.complete()
+
+        store_global_service_result(results, slot, folder.complete());
     }
 
-    /// Drives query-global service debt through one pinned leaf per available
-    /// pool worker. Unlike a returned `fold_with`, every deferred leaf retains
-    /// its exact consumer folder and resumes after packet closure; unlike an
-    /// ordinary wait loop, worker pinning prevents nested same-query owner
-    /// inversion. The pre-recorded reducer tree preserves arbitrary
-    /// `UnindexedConsumer` composition exactly.
-    fn drive_global_service_broadcast<'a, C, P, R, Con>(
+    fn spawn_global_service_leaf<'scope, 'a: 'scope, C, P, R, Con>(
+        scope: &rayon::Scope<'scope>,
+        leaf: ResidualGlobalServiceLeaf<C, P, R, Con>,
+        pending: PendingGlobalServiceLeaves<C, P, R, Con>,
+        results: GlobalServiceResults<Con::Result>,
+        aborted: Arc<AtomicBool>,
+    ) where
+        C: Constraint<'a> + Clone + Send + 'a + 'scope,
+        P: Fn(&Binding) -> Option<R> + Clone + Send + 'scope,
+        R: Send + 'scope,
+        Con: UnindexedConsumer<R> + 'scope,
+    {
+        scope.spawn(move |scope| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut leaf = Some(leaf);
+                if aborted.load(Ordering::Acquire) {
+                    drop(leaf.take());
+                    return;
+                }
+
+                let packet_active = leaf
+                    .as_ref()
+                    .expect("global-service leaf disappeared")
+                    .producer
+                    .inner
+                    .state
+                    .delta
+                    .global_service_active_packet_nonce()
+                    .is_some();
+                if packet_active {
+                    let mut parked = pending.lock().unwrap_or_else(|poison| poison.into_inner());
+                    let still_active = leaf
+                        .as_ref()
+                        .expect("global-service leaf disappeared")
+                        .producer
+                        .inner
+                        .state
+                        .delta
+                        .global_service_active_packet_nonce()
+                        .is_some();
+                    if !aborted.load(Ordering::Acquire) && still_active {
+                        parked.push(leaf.take().expect("global-service leaf disappeared"));
+                        return;
+                    }
+                }
+
+                if aborted.load(Ordering::Acquire) {
+                    drop(leaf.take());
+                    return;
+                }
+                let skip_polling = {
+                    let leaf = leaf.as_ref().expect("global-service leaf disappeared");
+                    leaf.already_full || leaf.consumer.full()
+                };
+                if skip_polling {
+                    complete_unpolled_global_service_leaf(
+                        leaf.take().expect("global-service leaf disappeared"),
+                        &results,
+                    );
+                    return;
+                }
+                run_global_service_leaf(
+                    scope,
+                    leaf.take().expect("global-service leaf disappeared"),
+                    &pending,
+                    &results,
+                    &aborted,
+                );
+            }));
+            if let Err(payload) = outcome {
+                aborted.store(true, Ordering::Release);
+                std::panic::resume_unwind(payload);
+            }
+        });
+    }
+
+    /// Runs one persistent task per planned producer/consumer leaf. Once a
+    /// leaf starts, its potentially non-Send Folder stays on that worker's
+    /// stack and every produced item reaches it before the next pull, retaining
+    /// ordinary Rayon backpressure and cancellation. A not-yet-started leaf
+    /// that is stolen beneath an active same-query packet owner parks before
+    /// entering user or scheduler code; the packet closer wakes parked leaves.
+    /// This rules out owner/waiter stack inversion without requiring every
+    /// worker in the pool to enter a query-wide barrier.
+    fn drive_global_service_cooperatively<'a, C, P, R, Con>(
         root: ResidualStateParIter<C, P, R>,
         consumer: Con,
     ) -> Con::Result
@@ -13361,45 +13526,42 @@ mod parallel {
         R: Send,
         Con: UnindexedConsumer<R>,
     {
-        let workers = rayon::current_num_threads();
-        let mut leaves = Vec::with_capacity(workers);
-        let reduction = plan_global_service_broadcast(root, consumer, &mut leaves);
-        assert!(
-            leaves.len() <= workers,
-            "global-service split budget exceeded the consuming Rayon pool"
-        );
-
-        let mut slots = std::iter::repeat_with(|| None)
-            .take(workers)
-            .collect::<Vec<_>>();
-        for (slot, leaf) in slots.iter_mut().zip(leaves) {
-            *slot = Some(leaf);
+        if consumer.full() {
+            return consumer.into_folder().complete();
         }
-        let slots = Mutex::new(slots);
-        let returned = rayon::broadcast(|context| {
-            debug_assert_eq!(context.num_threads(), workers);
-            let worker = context.index();
-            let leaf = slots
-                .lock()
-                .expect("global-service broadcast slots were poisoned")[worker]
-                .take();
-            leaf.map(|BroadcastLeaf { producer, consumer }| {
-                (
-                    worker,
-                    run_global_service_broadcast_leaf(producer, consumer),
-                )
-            })
+        let mut leaves = Vec::new();
+        let reduction = plan_global_service_leaves(root, consumer, &mut leaves);
+        let leaf_count = leaves.len();
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let results = Arc::new(Mutex::new(
+            std::iter::repeat_with(|| None)
+                .take(leaf_count)
+                .collect::<Vec<_>>(),
+        ));
+        let aborted = Arc::new(AtomicBool::new(false));
+
+        rayon::in_place_scope(|scope| {
+            for leaf in leaves {
+                spawn_global_service_leaf(
+                    scope,
+                    leaf,
+                    Arc::clone(&pending),
+                    Arc::clone(&results),
+                    Arc::clone(&aborted),
+                );
+            }
         });
-
-        let mut results = std::iter::repeat_with(|| None)
-            .take(workers)
-            .collect::<Vec<_>>();
-        for (worker, result) in returned.into_iter().flatten() {
-            assert!(
-                results[worker].replace(result).is_none(),
-                "one global-service worker returned two consumer results"
-            );
-        }
+        assert!(
+            pending
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "global-service execution ended with parked leaves"
+        );
+        let mut results = Arc::try_unwrap(results)
+            .unwrap_or_else(|_| panic!("global-service results escaped their scope"))
+            .into_inner()
+            .unwrap_or_else(|poison| poison.into_inner());
         reduction.finish(&mut results)
     }
 
@@ -13421,7 +13583,7 @@ mod parallel {
                 rayon::current_num_threads().saturating_sub(1)
             };
             if self.inner.state.delta.uses_global_service_debt() {
-                drive_global_service_broadcast(self, consumer)
+                drive_global_service_cooperatively(self, consumer)
             } else {
                 bridge_unindexed(self, consumer)
             }
@@ -14120,10 +14282,18 @@ mod tests {
         }
     }
 
-    /// Forces one service part to depend on nested Rayon work after its
-    /// sibling part is free to settle and enter the packet wait loop.
+    /// Exercises nested Rayon work while a service packet has multiple
+    /// physical parts, including a bare-yield start-gate falsifier.
+    #[cfg(feature = "parallel")]
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum NestedRayonOwnerMode {
+        Join,
+        BareYield,
+    }
+
     #[cfg(feature = "parallel")]
     struct NestedRayonOwnerProbe {
+        mode: NestedRayonOwnerMode,
         calls: AtomicUsize,
         quick_finished: AtomicBool,
         notified: Mutex<bool>,
@@ -14134,6 +14304,17 @@ mod tests {
     impl NestedRayonOwnerProbe {
         fn new() -> Self {
             Self {
+                mode: NestedRayonOwnerMode::Join,
+                calls: AtomicUsize::new(0),
+                quick_finished: AtomicBool::new(false),
+                notified: Mutex::new(false),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn bare_yield() -> Self {
+            Self {
+                mode: NestedRayonOwnerMode::BareYield,
                 calls: AtomicUsize::new(0),
                 quick_finished: AtomicBool::new(false),
                 notified: Mutex::new(false),
@@ -14142,7 +14323,18 @@ mod tests {
         }
 
         fn run(&self) {
-            match self.calls.fetch_add(1, Ordering::SeqCst) {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.mode == NestedRayonOwnerMode::BareYield {
+                if call == 0 {
+                    let executed = matches!(rayon::yield_now(), Some(rayon::Yield::Executed));
+                    self.quick_finished.store(
+                        executed && self.calls.load(Ordering::SeqCst) == 1,
+                        Ordering::Release,
+                    );
+                }
+                return;
+            }
+            match call {
                 0 => {
                     self.quick_finished.store(true, Ordering::Release);
                 }
@@ -26766,7 +26958,7 @@ mod tests {
                 }) as ShapeConstraint,
             ]))
         };
-        let project = |binding: &Binding| {
+        let project = move |binding: &Binding| {
             Some((
                 binding.get(PARENT).copied()?,
                 binding.get(end.index).copied()?,
@@ -26871,7 +27063,40 @@ mod tests {
         assert_eq!(
             count,
             expected.len(),
-            "broadcast reduction changed the parallel count consumer"
+            "parallel reduction changed the count consumer"
+        );
+
+        let first = with_parallel_workers(2, || {
+            Query::new(make(None, None), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    ProgramScope::All,
+                ))
+                .cap(1)
+                .start_width(1)
+                .positive_support_global_service_debt()
+                .into_par_iter()
+                .find_first(|_| true)
+        });
+        let last = with_parallel_workers(2, || {
+            Query::new(make(None, None), project)
+                .solve_residual_state_lazy_with(ResidualLowering::new(
+                    FormulaScope::OpaqueLeaves,
+                    ProgramScope::All,
+                ))
+                .cap(1)
+                .start_width(1)
+                .positive_support_global_service_debt()
+                .into_par_iter()
+                .find_last(|_| true)
+        });
+        assert!(
+            first.is_some_and(|row| expected.contains(&row)),
+            "find_first returned a value outside the exact projected SET"
+        );
+        assert!(
+            last.is_some_and(|row| expected.contains(&row)),
+            "find_last returned a value outside the exact projected SET"
         );
 
         let cancellation_seed_gate = Arc::new(ParallelSupportSeedGate::new());
@@ -26889,7 +27114,95 @@ mod tests {
         });
         assert!(
             found.is_some_and(|row| expected.contains(&row)),
-            "broadcast cancellation returned a value outside the exact SET"
+            "parallel cancellation returned a value outside the exact SET"
+        );
+
+        // A parallel query must require only the workers that execute its
+        // ordinary bridge jobs. In particular it must not wait for every
+        // thread in the pool: another worker may legitimately be blocked on
+        // the query's result. A pool-wide broadcast deadlocks this topology.
+        let bare_yield_probe = Arc::new(NestedRayonOwnerProbe::bare_yield());
+        let occupied_query = Query::new(make(None, Some(Arc::clone(&bare_yield_probe))), project)
+            .solve_residual_state_lazy_with(ResidualLowering::new(
+                FormulaScope::OpaqueLeaves,
+                ProgramScope::All,
+            ))
+            .cap(1)
+            .start_width(1)
+            .positive_support_global_service_debt();
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let left_rendezvous = Arc::clone(&rendezvous);
+        let right_rendezvous = Arc::clone(&rendezvous);
+        let (execution_tx, execution_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            let result = pool.install(|| {
+                rayon::join(
+                    move || {
+                        left_rendezvous.wait();
+                        let rows = occupied_query.into_par_iter().collect::<Vec<_>>();
+                        finished_tx
+                            .send(())
+                            .expect("occupied-worker receiver disappeared");
+                        rows
+                    },
+                    move || {
+                        right_rendezvous.wait();
+                        finished_rx.recv_timeout(Duration::from_secs(2))
+                    },
+                )
+            });
+            let _ = execution_tx.send(result);
+        });
+        let (mut occupied_actual, observed_completion) = execution_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("parallel query deadlocked behind an unrelated occupied worker");
+        assert!(
+            observed_completion.is_ok(),
+            "parallel query waited for an unrelated occupied pool worker"
+        );
+        occupied_actual.sort_unstable();
+        assert_eq!(occupied_actual, expected);
+        assert!(
+            bare_yield_probe.quick_finished.load(Ordering::Acquire),
+            "a queued leaf either did not execute or entered service beneath the packet owner"
+        );
+
+        // A panic in projection is an abort, not a request to drain the other
+        // leaf consumers. Cleanup must not hang or swallow the panic.
+        let panicking_query = Query::new(make(None, None), |_binding: &Binding| {
+            panic!("projection panic sentinel");
+            #[allow(unreachable_code)]
+            None::<(RawInline, RawInline)>
+        })
+        .solve_residual_state_lazy_with(ResidualLowering::new(
+            FormulaScope::OpaqueLeaves,
+            ProgramScope::All,
+        ))
+        .cap(1)
+        .start_width(1)
+        .positive_support_global_service_debt();
+        let (panic_tx, panic_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.install(|| panicking_query.into_par_iter().collect::<Vec<_>>())
+            }))
+            .is_err();
+            let _ = panic_tx.send(panicked);
+        });
+        assert!(
+            panic_rx
+                .recv_timeout(Duration::from_secs(4))
+                .expect("projection panic left the global-service scope hung"),
+            "projection panic did not propagate out of the parallel executor"
         );
     }
 
