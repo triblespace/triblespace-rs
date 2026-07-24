@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Shared PositiveSupport service liveness is exact and quiescent probes are
+  lock-free.** Shard runtimes and in-flight packet guards now retain one
+  counted registration whose final drop reconciles the global lease under the
+  coordinator mutex. A single published phase lets Dormant, Idle, and Parked
+  scheduling probes avoid that mutex while Reserved deliberately preserves
+  the packet-coalescing contention window and nonce wake protocol.
 - **Typed Program selection has an opt-in lane-pure packet seam.** A
   noncanonical scheduler fence can keep started PositiveSupport Exact,
   started Support, and neutral work in separate physical cohorts without

@@ -5,7 +5,7 @@
 //! can share one expansion cohort without becoming semantically conflated.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use ahash::{AHashMap, AHashSet};
@@ -1364,17 +1364,17 @@ impl PositiveSupportServiceDebtLedger {
 /// The scalar debt ledger and packet are global. Overlapping shards join one
 /// coalesced packet in the selected lane, contribute one affine part receipt,
 /// and charge the ledger only when its final part settles. Each scheduler
-/// keeps its own registry, Program runtimes, and queues, and contributes only
-/// one weak Boolean liveness slot. A dropped shard therefore disappears from
-/// global liveness without a cross-shard registry walk or explicit teardown.
+/// keeps its own registry, Program runtimes, and queues, and owns one exact
+/// registration. Packet guards retain that registration through settlement,
+/// while its final [`Arc`] drop removes live custody under the coordinator
+/// mutex. Quiescent liveness is therefore an exact count rather than a scan of
+/// weak slots.
 struct PositiveSupportGlobalServiceCoordinator {
     ledger: PositiveSupportServiceDebtLedger,
     active_packet: Option<PositiveSupportActiveGlobalPacket>,
     next_shard_id: u64,
-    shard_liveness: Vec<Weak<AtomicBool>>,
+    live_shards: usize,
     abandoned: bool,
-    #[cfg(all(test, feature = "parallel"))]
-    global_live_scans: usize,
 }
 
 struct PositiveSupportActiveGlobalPacket {
@@ -1393,20 +1393,80 @@ enum PositiveSupportGlobalPartReservation {
 }
 
 impl PositiveSupportGlobalServiceCoordinator {
-    fn global_live(&mut self) -> bool {
-        #[cfg(all(test, feature = "parallel"))]
-        {
-            self.global_live_scans += 1;
+    fn global_live(&self) -> bool {
+        self.live_shards > 0
+    }
+
+    fn update_liveness(
+        &mut self,
+        registration: &PositiveSupportGlobalShardRegistration,
+        live: bool,
+    ) {
+        let was_live = registration.live.swap(live, Ordering::AcqRel);
+        match (was_live, live) {
+            (false, true) => {
+                self.live_shards = self
+                    .live_shards
+                    .checked_add(1)
+                    .expect("PositiveSupport live shard count overflow");
+            }
+            (true, false) => {
+                self.live_shards = self
+                    .live_shards
+                    .checked_sub(1)
+                    .expect("PositiveSupport live shard count underflow");
+            }
+            _ => {}
         }
-        let mut live = false;
-        self.shard_liveness.retain(|slot| {
-            let Some(slot) = slot.upgrade() else {
-                return false;
-            };
-            live |= slot.load(Ordering::Acquire);
-            true
-        });
-        live
+        self.assert_liveness_bound();
+    }
+
+    fn assert_liveness_bound(&self) {
+        assert!(
+            u64::try_from(self.live_shards)
+                .is_ok_and(|live_shards| live_shards <= self.next_shard_id),
+            "PositiveSupport live shard count crossed its monotone admission horizon"
+        );
+    }
+
+    fn assert_global_state(&self) {
+        self.assert_liveness_bound();
+        assert_eq!(
+            self.active_packet.is_some(),
+            self.ledger.active_packet_nonce.is_some(),
+            "coalesced packet and affine ledger custody diverged"
+        );
+        if self.active_packet.is_some() {
+            assert_eq!(
+                self.ledger.lease,
+                PositiveSupportServiceLease::Reserved,
+                "an active coalesced packet lost its reserved lease"
+            );
+            return;
+        }
+        match self.ledger.lease {
+            PositiveSupportServiceLease::Dormant => {
+                assert_eq!(
+                    self.live_shards, 0,
+                    "a dormant PositiveSupport epoch retained live shard custody"
+                );
+            }
+            PositiveSupportServiceLease::Idle => {
+                assert_eq!(
+                    self.live_shards, 0,
+                    "an idle PositiveSupport lease retained live shard custody"
+                );
+            }
+            PositiveSupportServiceLease::Parked => {
+                assert!(
+                    self.live_shards > 0,
+                    "a parked PositiveSupport lease lost all live shard custody"
+                );
+            }
+            PositiveSupportServiceLease::Reserved => {
+                panic!("a reserved PositiveSupport lease lost its active packet")
+            }
+        }
     }
 
     fn reconcile_idle_lease(&mut self) -> bool {
@@ -1421,10 +1481,12 @@ impl PositiveSupportGlobalServiceCoordinator {
                 PositiveSupportServiceLease::Reserved,
                 "an active coalesced packet lost its reserved lease"
             );
-            // Liveness cannot affect an already-reserved packet. It is needed
-            // only before opening a packet and when the final part settles or
-            // abandons, so do not rescan every weak shard slot here.
-            return true;
+            // Liveness cannot change an already-reserved lease. The exact
+            // count is nevertheless maintained so its final settlement or
+            // abandonment chooses Parked versus Idle without a read-side
+            // registry scan.
+            self.assert_global_state();
+            return self.global_live();
         }
 
         let live = self.global_live();
@@ -1438,6 +1500,7 @@ impl PositiveSupportGlobalServiceCoordinator {
             _ => {}
         }
         self.ledger.assert_affine_custody();
+        self.assert_global_state();
         live
     }
 
@@ -1604,20 +1667,116 @@ impl PositiveSupportGlobalServiceCoordinator {
         let remains_live = self.global_live();
         self.ledger.abandon_packet(reservation, remains_live);
         self.abandoned = true;
+        self.assert_global_state();
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositiveSupportGlobalPublishedPhase {
+    Dormant,
+    Idle,
+    Parked,
+    Reserved,
+    Abandoned,
+}
+
+impl PositiveSupportGlobalPublishedPhase {
+    fn from_ledger(lease: PositiveSupportServiceLease) -> Self {
+        match lease {
+            PositiveSupportServiceLease::Dormant => Self::Dormant,
+            PositiveSupportServiceLease::Idle => Self::Idle,
+            PositiveSupportServiceLease::Parked => Self::Parked,
+            PositiveSupportServiceLease::Reserved => Self::Reserved,
+        }
+    }
+
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            raw if raw == Self::Dormant as u8 => Self::Dormant,
+            raw if raw == Self::Idle as u8 => Self::Idle,
+            raw if raw == Self::Parked as u8 => Self::Parked,
+            raw if raw == Self::Reserved as u8 => Self::Reserved,
+            raw if raw == Self::Abandoned as u8 => Self::Abandoned,
+            _ => panic!("PositiveSupport published an unknown global service phase"),
+        }
     }
 }
 
 /// Shared phase of one query-run service account.
 ///
 /// It exists only after a real Rayon split. `parallel_sibling` registers a new
-/// liveness slot in the same coordinator; semantic cloning extracts a fresh
-/// direct ledger instead of retaining this sharing topology.
+/// exact shard lifetime in the same coordinator; semantic cloning extracts a
+/// fresh direct ledger instead of retaining this sharing topology.
 struct PositiveSupportGlobalServiceShared {
     coordinator: Mutex<PositiveSupportGlobalServiceCoordinator>,
     /// Lock-free executor wake hint. Packet authority remains entirely under
     /// `coordinator`; this mirror only lets waiters observe that their exact
     /// monotonically increasing packet nonce is no longer active.
     active_packet_nonce: AtomicU64,
+    /// Lock-free quiescent scheduling hint. `Reserved` deliberately sends
+    /// readers through `coordinator`, preserving the V1 contention window in
+    /// which overlapping shards coalesce into the active packet. Every store
+    /// occurs while that mutex is held.
+    published_phase: AtomicU8,
+}
+
+impl PositiveSupportGlobalServiceShared {
+    fn authoritative_phase(
+        coordinator: &PositiveSupportGlobalServiceCoordinator,
+    ) -> PositiveSupportGlobalPublishedPhase {
+        if coordinator.abandoned {
+            PositiveSupportGlobalPublishedPhase::Abandoned
+        } else {
+            PositiveSupportGlobalPublishedPhase::from_ledger(coordinator.ledger.lease)
+        }
+    }
+
+    fn publish_phase(&self, coordinator: &PositiveSupportGlobalServiceCoordinator) {
+        coordinator.assert_global_state();
+        self.published_phase.store(
+            Self::authoritative_phase(coordinator) as u8,
+            Ordering::Release,
+        );
+    }
+
+    fn load_phase(&self) -> PositiveSupportGlobalPublishedPhase {
+        PositiveSupportGlobalPublishedPhase::from_raw(self.published_phase.load(Ordering::Acquire))
+    }
+}
+
+/// Exact lifetime and liveness registration for one residual scheduler shard.
+///
+/// A runtime and every packet guard it mints share this allocation. Its final
+/// [`Arc`] drop is the precise shard-retirement boundary. The weak back-link
+/// avoids making the shared coordinator own its registrations.
+struct PositiveSupportGlobalShardRegistration {
+    shared: Weak<PositiveSupportGlobalServiceShared>,
+    shard_id: u64,
+    /// Read and written only while `shared.coordinator` is held. Atomic
+    /// storage lets an unchanged-false reservation attempt return without an
+    /// inner lock; real transitions still serialize through the coordinator.
+    live: AtomicBool,
+}
+
+impl Drop for PositiveSupportGlobalShardRegistration {
+    fn drop(&mut self) {
+        if !self.live.load(Ordering::Acquire) {
+            // Final Arc ownership proves that no concurrent transition can
+            // make this false registration live. It owns no exact count and
+            // therefore needs no coordinator retirement boundary.
+            return;
+        }
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let Ok(mut coordinator) = shared.coordinator.lock() else {
+            return;
+        };
+        coordinator.update_liveness(self, false);
+        coordinator.reconcile_idle_lease();
+        shared.publish_phase(&coordinator);
+    }
 }
 
 /// `PositiveSupportServiceDebtLedger::reserve_lane` checks the increment before
@@ -1625,9 +1784,10 @@ struct PositiveSupportGlobalServiceShared {
 const NO_ACTIVE_GLOBAL_SERVICE_PACKET: u64 = u64::MAX;
 
 struct PositiveSupportGlobalServiceRuntime {
+    // Drop the registration while this runtime still keeps `shared` alive, so
+    // its exact last-Arc retirement can always serialize through the mutex.
+    registration: Arc<PositiveSupportGlobalShardRegistration>,
     shared: Arc<PositiveSupportGlobalServiceShared>,
-    local_live: Arc<AtomicBool>,
-    shard_id: u64,
 }
 
 #[cfg(all(test, feature = "parallel"))]
@@ -1670,8 +1830,10 @@ enum PositiveSupportServicePacketReservation {
 }
 
 struct PositiveSupportGlobalPacketGuard {
+    // Keep shard custody alive until settlement or abandonment has crossed
+    // the coordinator boundary.
+    registration: Arc<PositiveSupportGlobalShardRegistration>,
     shared: Arc<PositiveSupportGlobalServiceShared>,
-    local_live: Arc<AtomicBool>,
     reservation: Option<PositiveSupportPacketReservation>,
 }
 
@@ -1703,23 +1865,31 @@ impl PositiveSupportGlobalServiceRuntime {
             live,
             "shared service liveness disagreed with its promoted affine lease"
         );
-        let local_live = Arc::new(AtomicBool::new(live));
+        let published_phase = PositiveSupportGlobalPublishedPhase::from_ledger(ledger.lease) as u8;
         let shared = Arc::new(PositiveSupportGlobalServiceShared {
             coordinator: Mutex::new(PositiveSupportGlobalServiceCoordinator {
                 ledger,
                 active_packet: None,
                 next_shard_id: 1,
-                shard_liveness: vec![Arc::downgrade(&local_live)],
+                live_shards: usize::from(live),
                 abandoned: false,
-                #[cfg(all(test, feature = "parallel"))]
-                global_live_scans: 0,
             }),
             active_packet_nonce: AtomicU64::new(NO_ACTIVE_GLOBAL_SERVICE_PACKET),
+            published_phase: AtomicU8::new(published_phase),
         });
-        Self {
-            shared,
-            local_live,
+        let registration = Arc::new(PositiveSupportGlobalShardRegistration {
+            shared: Arc::downgrade(&shared),
             shard_id: 0,
+            live: AtomicBool::new(live),
+        });
+        shared
+            .coordinator
+            .lock()
+            .expect("PositiveSupport global service coordinator was poisoned")
+            .assert_global_state();
+        Self {
+            registration,
+            shared,
         }
     }
 
@@ -1731,25 +1901,39 @@ impl PositiveSupportGlobalServiceRuntime {
     }
 
     fn demand_arrived(&self) -> bool {
-        self.local_live.store(true, Ordering::Release);
         let mut coordinator = self.lock();
         assert!(
             !coordinator.abandoned,
             "PositiveSupport global service coordinator was abandoned"
         );
-        coordinator.ledger.demand_arrived()
+        coordinator.update_liveness(&self.registration, true);
+        let started = coordinator.ledger.demand_arrived();
+        coordinator.reconcile_idle_lease();
+        self.shared.publish_phase(&coordinator);
+        started
     }
 
     fn global_lane_is_active(&self) -> bool {
-        let mut coordinator = self.lock();
-        if coordinator.abandoned {
-            return false;
+        match self.shared.load_phase() {
+            PositiveSupportGlobalPublishedPhase::Dormant
+            | PositiveSupportGlobalPublishedPhase::Idle
+            | PositiveSupportGlobalPublishedPhase::Abandoned => false,
+            PositiveSupportGlobalPublishedPhase::Parked => true,
+            PositiveSupportGlobalPublishedPhase::Reserved => {
+                // Deliberately retain V1's active-packet mutex path. Besides
+                // validating current authority, its contention window gives
+                // sibling reservers time to join the finite packet cohort.
+                let coordinator = self.lock();
+                if coordinator.abandoned {
+                    return false;
+                }
+                coordinator.assert_global_state();
+                matches!(
+                    coordinator.ledger.lease,
+                    PositiveSupportServiceLease::Parked | PositiveSupportServiceLease::Reserved
+                )
+            }
         }
-        coordinator.reconcile_idle_lease();
-        matches!(
-            coordinator.ledger.lease,
-            PositiveSupportServiceLease::Parked | PositiveSupportServiceLease::Reserved
-        )
     }
 
     #[cfg(feature = "parallel")]
@@ -1761,23 +1945,32 @@ impl PositiveSupportGlobalServiceRuntime {
     }
 
     fn try_reserve_turn(&self, local_live: bool) -> PositiveSupportGlobalTurn {
-        self.local_live.store(local_live, Ordering::Release);
-        if !local_live {
+        if !local_live && !self.registration.live.load(Ordering::Acquire) {
+            // An unchanged false registration owns no global custody to
+            // reconcile. Preserve the V1 no-work fast return; only a real
+            // true-to-false transition must serialize and decrement the exact
+            // count.
             return PositiveSupportGlobalTurn::Inactive;
         }
-
         let mut coordinator = self.lock();
         assert!(
             !coordinator.abandoned,
             "PositiveSupport global service coordinator was abandoned"
         );
+        coordinator.update_liveness(&self.registration, local_live);
+        if !local_live {
+            coordinator.reconcile_idle_lease();
+            self.shared.publish_phase(&coordinator);
+            return PositiveSupportGlobalTurn::Inactive;
+        }
         assert!(
             coordinator.reconcile_idle_lease(),
             "a live service shard disappeared from query-global liveness"
         );
         let had_active_packet = coordinator.active_packet.is_some();
-        match coordinator.reserve_part(self.shard_id) {
+        match coordinator.reserve_part(self.registration.shard_id) {
             PositiveSupportGlobalPartReservation::Deferred(packet_nonce) => {
+                self.shared.publish_phase(&coordinator);
                 PositiveSupportGlobalTurn::Deferred(packet_nonce)
             }
             PositiveSupportGlobalPartReservation::Reserved(reservation) => {
@@ -1796,39 +1989,61 @@ impl PositiveSupportGlobalServiceRuntime {
                         "active packet mirror diverged while another shard joined"
                     );
                 }
+                // The Release phase store follows the nonce publication:
+                // observing Reserved therefore also observes its wake nonce.
+                self.shared.publish_phase(&coordinator);
                 drop(coordinator);
                 PositiveSupportGlobalTurn::Reserved(PositiveSupportGlobalPacketGuard {
+                    registration: Arc::clone(&self.registration),
                     shared: Arc::clone(&self.shared),
-                    local_live: Arc::clone(&self.local_live),
                     reservation: Some(reservation),
                 })
             }
         }
     }
 
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    fn synchronize_local_live(&self, local_live: bool) {
+        let mut coordinator = self.lock();
+        assert!(
+            !coordinator.abandoned,
+            "PositiveSupport global service coordinator was abandoned"
+        );
+        coordinator.update_liveness(&self.registration, local_live);
+        coordinator.reconcile_idle_lease();
+        self.shared.publish_phase(&coordinator);
+    }
+
     #[cfg_attr(not(any(test, feature = "parallel")), allow(dead_code))]
     fn parallel_sibling(&self) -> Self {
-        let local_live = Arc::new(AtomicBool::new(false));
         let mut coordinator = self.lock();
         let shard_id = coordinator.next_shard_id;
         coordinator.next_shard_id = coordinator
             .next_shard_id
             .checked_add(1)
             .expect("PositiveSupport global service shard id overflow");
-        coordinator.shard_liveness.push(Arc::downgrade(&local_live));
+        coordinator.assert_liveness_bound();
+        self.shared.publish_phase(&coordinator);
         drop(coordinator);
-        Self {
-            shared: Arc::clone(&self.shared),
-            local_live,
+        let registration = Arc::new(PositiveSupportGlobalShardRegistration {
+            shared: Arc::downgrade(&self.shared),
             shard_id,
+            live: AtomicBool::new(false),
+        });
+        Self {
+            registration,
+            shared: Arc::clone(&self.shared),
         }
     }
 
     fn try_deep_clone_ledger(&self, local_live: bool) -> Option<PositiveSupportServiceDebtLedger> {
-        let coordinator = self.lock();
+        let mut coordinator = self.lock();
         if coordinator.abandoned {
             return None;
         }
+        coordinator.update_liveness(&self.registration, local_live);
+        coordinator.reconcile_idle_lease();
+        self.shared.publish_phase(&coordinator);
         assert_eq!(
             coordinator.active_packet.is_some(),
             coordinator.ledger.active_packet_nonce.is_some(),
@@ -1844,8 +2059,13 @@ impl PositiveSupportGlobalServiceRuntime {
     }
 
     #[cfg(all(test, feature = "parallel"))]
-    fn global_live_scans(&self) -> usize {
-        self.lock().global_live_scans
+    fn live_shards(&self) -> usize {
+        self.lock().live_shards
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn published_phase(&self) -> PositiveSupportGlobalPublishedPhase {
+        self.shared.load_phase()
     }
 
     #[cfg(all(test, feature = "parallel"))]
@@ -1855,7 +2075,7 @@ impl PositiveSupportGlobalServiceRuntime {
 
     #[cfg(all(test, feature = "parallel"))]
     fn shares_liveness_slot_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.local_live, &other.local_live)
+        Arc::ptr_eq(&self.registration, &other.registration)
     }
 }
 
@@ -1998,7 +2218,14 @@ impl PositiveSupportServiceDebtRuntime {
                 );
                 PositiveSupportGlobalServiceRuntime::from_ledger(ledger, local_live)
             }
-            PositiveSupportServiceDebtMode::Shared(runtime) => runtime,
+            PositiveSupportServiceDebtMode::Shared(runtime) => {
+                // The split caller has the authoritative registry view for
+                // this already-shared shard. Publish it before minting the
+                // new false sibling so exact global liveness cannot retain a
+                // stale pre-split state.
+                runtime.synchronize_local_live(local_live);
+                runtime
+            }
         };
         let right_shared = shared.parallel_sibling();
         #[cfg(all(test, feature = "parallel"))]
@@ -2099,7 +2326,6 @@ impl PositiveSupportGlobalPacketGuard {
     }
 
     fn settle(mut self, service: u64, local_live: bool) -> PositiveSupportGlobalSettlement {
-        self.local_live.store(local_live, Ordering::Release);
         let reservation = self
             .reservation
             .as_ref()
@@ -2113,16 +2339,20 @@ impl PositiveSupportGlobalPacketGuard {
             !coordinator.abandoned,
             "PositiveSupport global service coordinator was abandoned"
         );
+        coordinator.update_liveness(&self.registration, local_live);
         let settlement = coordinator.settle_part(reservation, service);
         if settlement.closed_packet.is_some() {
-            // The final part has already reconciled shard liveness and settled
-            // the authoritative ledger. Clear before unlocking so a waiter
-            // that acquires the pending-leaf mutex after the closer drains it
-            // cannot re-park on this retired nonce.
+            // The final part has already settled the authoritative ledger
+            // against the exact shard count. Publish that quiescent phase,
+            // then clear the nonce before unlocking: pending-leaf handoff
+            // still cannot re-park on the retired packet, while a phase
+            // observer never mistakes the packet for authoritative custody.
+            self.shared.publish_phase(&coordinator);
             self.shared
                 .active_packet_nonce
                 .store(NO_ACTIVE_GLOBAL_SERVICE_PACKET, Ordering::Release);
         } else {
+            self.shared.publish_phase(&coordinator);
             debug_assert_eq!(
                 self.shared.active_packet_nonce.load(Ordering::Acquire),
                 reservation.nonce,
@@ -2145,9 +2375,11 @@ impl Drop for PositiveSupportGlobalPacketGuard {
         };
         coordinator.abandon_part(reservation);
         // Abandonment has already removed the authoritative packet, reconciled
-        // liveness, tainted the ledger, and marked the coordinator fail-closed.
-        // A poisoned lock deliberately leaves the mirror untouched: the query
-        // abort path, not a false wake, owns that failure mode.
+        // exact liveness, tainted the ledger, and marked the coordinator
+        // fail-closed. Publish the terminal phase before clearing the wake
+        // nonce. A poisoned lock deliberately leaves both mirrors untouched:
+        // the query abort path, not a false wake, owns that failure mode.
+        self.shared.publish_phase(&coordinator);
         self.shared
             .active_packet_nonce
             .store(NO_ACTIVE_GLOBAL_SERVICE_PACKET, Ordering::Release);
@@ -12569,6 +12801,33 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
+    fn already_shared_split_synchronizes_existing_registration_before_new_sibling() {
+        let mut service = PositiveSupportServiceDebtRuntime::dormant();
+        assert!(service.demand_arrived());
+        let (left, first_false_sibling) = service.into_parallel_pair(true);
+        assert!(left.global_lane_is_active());
+
+        let (left, second_false_sibling) = left.into_parallel_pair(false);
+        let PositiveSupportServiceDebtMode::Shared(left_runtime) = &left.mode else {
+            panic!("an already-shared split returned to a direct ledger");
+        };
+        assert_eq!(left_runtime.live_shards(), 0);
+        assert_eq!(
+            left_runtime.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Idle
+        );
+        assert_eq!(
+            left.snapshot().lease,
+            PositiveSupportServiceLease::Idle,
+            "the already-shared branch ignored the caller's current registry liveness"
+        );
+        assert!(!left.global_lane_is_active());
+        assert!(left.shares_coordinator_with(&first_false_sibling));
+        assert!(left.shares_coordinator_with(&second_false_sibling));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
     fn positive_support_shared_clone_returns_to_an_independent_direct_ledger() {
         let mut source = DeltaScheduler::new();
         source.enable_positive_support_global_service_debt();
@@ -12642,7 +12901,11 @@ mod tests {
         let left = PositiveSupportGlobalServiceRuntime::dormant();
         let right = left.parallel_sibling();
         assert!(left.demand_arrived());
-        assert_eq!(left.global_live_scans(), 0);
+        assert_eq!(left.live_shards(), 1);
+        assert_eq!(
+            left.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Parked
+        );
 
         let support_left = reserved(left.try_reserve_turn(true));
         assert_eq!(support_left.lane(), ProgramServiceLane::Support);
@@ -12651,23 +12914,17 @@ mod tests {
             .expect("opening Support did not publish its packet nonce");
         assert_eq!(left.active_packet_nonce(), Some(support_nonce));
         assert_eq!(
-            left.global_live_scans(),
-            1,
-            "opening a packet must establish current shard liveness"
+            left.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Reserved
         );
 
         let support_right = reserved(right.try_reserve_turn(true));
         assert_eq!(right.active_packet_nonce(), Some(support_nonce));
-        assert_eq!(
-            left.global_live_scans(),
-            1,
-            "joining an active packet must not rescan weak liveness slots"
-        );
+        assert_eq!(left.live_shards(), 2);
         assert!(left.global_lane_is_active());
         assert_eq!(
-            left.global_live_scans(),
-            1,
-            "probing an already-Reserved lane must not rescan weak liveness slots"
+            left.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Reserved
         );
 
         assert!(support_left.settle(2, true).closed_packet.is_none());
@@ -12676,7 +12933,10 @@ mod tests {
             Some(support_nonce),
             "a partial settlement cleared the packet mirror"
         );
-        assert_eq!(left.global_live_scans(), 1);
+        assert_eq!(
+            left.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Reserved
+        );
 
         assert!(support_right.settle(3, true).closed_packet.is_some());
         assert_eq!(
@@ -12685,9 +12945,8 @@ mod tests {
             "the final settlement left a retired packet visible to waiters"
         );
         assert_eq!(
-            left.global_live_scans(),
-            2,
-            "final settlement must reconcile global shard liveness exactly once"
+            left.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Parked
         );
 
         let exact = reserved(left.try_reserve_turn(true));
@@ -12703,10 +12962,376 @@ mod tests {
             Some(support_nonce),
             "a waiter for the retired Support nonce followed the reopened Exact packet"
         );
-        assert_eq!(left.global_live_scans(), 3);
+        assert_eq!(
+            left.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Reserved
+        );
         assert!(exact.settle(5, true).closed_packet.is_some());
         assert_eq!(left.active_packet_nonce(), None);
-        assert_eq!(left.global_live_scans(), 4);
+        assert_eq!(
+            left.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Parked
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn quiescent_phase_probes_bypass_mutex_but_reserved_probe_serializes() {
+        fn reserved(turn: PositiveSupportGlobalTurn) -> PositiveSupportGlobalPacketGuard {
+            match turn {
+                PositiveSupportGlobalTurn::Reserved(guard) => guard,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("live global-service shard failed to reserve a packet part")
+                }
+                PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                    panic!("live global-service shard was deferred on packet {packet_nonce}")
+                }
+            }
+        }
+
+        let owner = PositiveSupportGlobalServiceRuntime::dormant();
+
+        let dormant_probe = owner.parallel_sibling();
+        assert_eq!(
+            owner.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Dormant
+        );
+        let coordinator = owner.lock();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let dormant_thread = std::thread::spawn(move || {
+            result_tx
+                .send(dormant_probe.global_lane_is_active())
+                .unwrap();
+        });
+        assert!(!result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Dormant phase probe entered the coordinator mutex"));
+        dormant_thread.join().unwrap();
+        drop(coordinator);
+
+        let parked_probe = owner.parallel_sibling();
+        assert!(owner.demand_arrived());
+        assert_eq!(
+            owner.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Parked
+        );
+        let coordinator = owner.lock();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let parked_thread = std::thread::spawn(move || {
+            result_tx
+                .send(parked_probe.global_lane_is_active())
+                .unwrap();
+        });
+        assert!(result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Parked phase probe entered the coordinator mutex"));
+        parked_thread.join().unwrap();
+        drop(coordinator);
+
+        owner.synchronize_local_live(false);
+        assert_eq!(
+            owner.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Idle
+        );
+        let idle_probe = owner.parallel_sibling();
+        let coordinator = owner.lock();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let idle_thread = std::thread::spawn(move || {
+            let active = idle_probe.global_lane_is_active();
+            let unchanged_false_is_inactive = matches!(
+                idle_probe.try_reserve_turn(false),
+                PositiveSupportGlobalTurn::Inactive
+            );
+            result_tx
+                .send((active, unchanged_false_is_inactive))
+                .unwrap();
+        });
+        assert_eq!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("Idle phase probe entered the coordinator mutex"),
+            (false, true)
+        );
+        idle_thread.join().unwrap();
+        drop(coordinator);
+
+        assert!(!owner.demand_arrived());
+        let packet = reserved(owner.try_reserve_turn(true));
+        let reserved_probe = owner.parallel_sibling();
+        assert_eq!(
+            owner.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Reserved
+        );
+        let coordinator = owner.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reserved_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(reserved_probe.global_lane_is_active())
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Reserved phase probe thread did not start");
+        assert_eq!(
+            result_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "Reserved phase probe bypassed the coordinator mutex"
+        );
+        drop(coordinator);
+        assert!(result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Reserved phase probe did not resume after mutex release"));
+        reserved_thread.join().unwrap();
+        assert!(packet.settle(1, false).closed_packet.is_some());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn last_live_runtime_drop_reconciles_the_quiescent_lease_to_idle() {
+        let owner = PositiveSupportGlobalServiceRuntime::dormant();
+        let observer = owner.parallel_sibling();
+        assert!(owner.demand_arrived());
+        assert_eq!(observer.live_shards(), 1);
+        assert_eq!(
+            observer.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Parked
+        );
+
+        drop(owner);
+
+        assert_eq!(observer.live_shards(), 0);
+        assert_eq!(observer.snapshot().lease, PositiveSupportServiceLease::Idle);
+        assert_eq!(
+            observer.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Idle
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn packet_guard_retains_exact_registration_after_runtime_drop() {
+        fn reserved(turn: PositiveSupportGlobalTurn) -> PositiveSupportGlobalPacketGuard {
+            match turn {
+                PositiveSupportGlobalTurn::Reserved(guard) => guard,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("live global-service shard failed to reserve a packet part")
+                }
+                PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                    panic!("live global-service shard was deferred on packet {packet_nonce}")
+                }
+            }
+        }
+
+        let owner = PositiveSupportGlobalServiceRuntime::dormant();
+        let observer = owner.parallel_sibling();
+        assert!(owner.demand_arrived());
+        let packet = reserved(owner.try_reserve_turn(true));
+        drop(owner);
+
+        assert_eq!(
+            observer.live_shards(),
+            1,
+            "runtime drop retired registration custody still held by its packet guard"
+        );
+        assert_eq!(
+            observer.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Reserved
+        );
+
+        assert!(packet.settle(1, false).closed_packet.is_some());
+        assert_eq!(observer.live_shards(), 0);
+        assert_eq!(
+            observer.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Idle
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn final_close_observes_late_live_sibling_outside_admission_horizon() {
+        fn reserved(turn: PositiveSupportGlobalTurn) -> PositiveSupportGlobalPacketGuard {
+            match turn {
+                PositiveSupportGlobalTurn::Reserved(guard) => guard,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("live global-service shard failed to reserve a packet part")
+                }
+                PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                    panic!("live global-service shard was deferred on packet {packet_nonce}")
+                }
+            }
+        }
+
+        let owner = PositiveSupportGlobalServiceRuntime::dormant();
+        assert!(owner.demand_arrived());
+        let packet = reserved(owner.try_reserve_turn(true));
+        let packet_nonce = packet
+            .reservation
+            .as_ref()
+            .expect("active packet guard lost its reservation")
+            .nonce;
+
+        let late = owner.parallel_sibling();
+        assert_eq!(
+            match late.try_reserve_turn(true) {
+                PositiveSupportGlobalTurn::Deferred(nonce) => nonce,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("late live sibling unexpectedly became inactive")
+                }
+                PositiveSupportGlobalTurn::Reserved(_) => {
+                    panic!("late sibling crossed the packet admission horizon")
+                }
+            },
+            packet_nonce
+        );
+        assert_eq!(owner.live_shards(), 2);
+
+        assert!(packet.settle(1, false).closed_packet.is_some());
+        assert_eq!(late.live_shards(), 1);
+        assert_eq!(late.snapshot().lease, PositiveSupportServiceLease::Parked);
+        assert_eq!(
+            late.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Parked
+        );
+
+        drop(late);
+        assert_eq!(
+            owner.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Idle
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn exact_registration_count_is_idempotent_and_one_of_two_live_drops_stays_parked() {
+        let owner = PositiveSupportGlobalServiceRuntime::dormant();
+        let sibling = owner.parallel_sibling();
+        let observer = owner.parallel_sibling();
+
+        assert!(owner.demand_arrived());
+        assert!(!owner.demand_arrived());
+        owner.synchronize_local_live(true);
+        assert_eq!(
+            owner.live_shards(),
+            1,
+            "same-state true publications changed the exact live count"
+        );
+
+        assert!(!sibling.demand_arrived());
+        assert!(!sibling.demand_arrived());
+        sibling.synchronize_local_live(true);
+        assert_eq!(
+            owner.live_shards(),
+            2,
+            "same-state sibling publications changed the exact live count"
+        );
+        assert_eq!(
+            owner.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Parked
+        );
+
+        drop(sibling);
+        assert_eq!(owner.live_shards(), 1);
+        assert_eq!(
+            owner.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Parked,
+            "dropping one of two live shards idled surviving custody"
+        );
+
+        owner.synchronize_local_live(false);
+        owner.synchronize_local_live(false);
+        assert_eq!(
+            observer.live_shards(),
+            0,
+            "same-state false publications changed the exact live count"
+        );
+        assert_eq!(
+            observer.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Idle
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn final_settlement_liveness_boundaries_converge_in_both_mutex_orders() {
+        fn reserved(turn: PositiveSupportGlobalTurn) -> PositiveSupportGlobalPacketGuard {
+            match turn {
+                PositiveSupportGlobalTurn::Reserved(guard) => guard,
+                PositiveSupportGlobalTurn::Inactive => {
+                    panic!("live global-service shard failed to reserve a packet part")
+                }
+                PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                    panic!("live global-service shard was deferred on packet {packet_nonce}")
+                }
+            }
+        }
+
+        // Final settle(false) commutes with retirement of the other last-live
+        // shard. Exercise both possible mutex serializations deterministically.
+        for drop_first in [false, true] {
+            let owner = PositiveSupportGlobalServiceRuntime::dormant();
+            let sibling = owner.parallel_sibling();
+            let observer = owner.parallel_sibling();
+            assert!(owner.demand_arrived());
+            assert!(!sibling.demand_arrived());
+            let packet = reserved(owner.try_reserve_turn(true));
+
+            if drop_first {
+                drop(sibling);
+                assert_eq!(owner.live_shards(), 1);
+                assert!(packet.settle(1, false).closed_packet.is_some());
+            } else {
+                assert!(packet.settle(1, false).closed_packet.is_some());
+                assert_eq!(
+                    owner.published_phase(),
+                    PositiveSupportGlobalPublishedPhase::Parked
+                );
+                drop(sibling);
+            }
+
+            assert_eq!(observer.live_shards(), 0);
+            assert_eq!(observer.snapshot().lease, PositiveSupportServiceLease::Idle);
+            assert_eq!(
+                observer.published_phase(),
+                PositiveSupportGlobalPublishedPhase::Idle
+            );
+        }
+
+        // Final settle(false) also commutes with a false sibling becoming
+        // live. In both serializations the demand owns Parked custody until
+        // that sibling's exact registration retires.
+        for demand_first in [false, true] {
+            let owner = PositiveSupportGlobalServiceRuntime::dormant();
+            let sibling = owner.parallel_sibling();
+            assert!(owner.demand_arrived());
+            let packet = reserved(owner.try_reserve_turn(true));
+
+            if demand_first {
+                assert!(!sibling.demand_arrived());
+                assert!(packet.settle(1, false).closed_packet.is_some());
+            } else {
+                assert!(packet.settle(1, false).closed_packet.is_some());
+                assert_eq!(
+                    owner.published_phase(),
+                    PositiveSupportGlobalPublishedPhase::Idle
+                );
+                assert!(!sibling.demand_arrived());
+            }
+
+            assert_eq!(owner.live_shards(), 1);
+            assert_eq!(owner.snapshot().lease, PositiveSupportServiceLease::Parked);
+            assert_eq!(
+                owner.published_phase(),
+                PositiveSupportGlobalPublishedPhase::Parked
+            );
+            drop(sibling);
+            assert_eq!(owner.live_shards(), 0);
+            assert_eq!(
+                owner.published_phase(),
+                PositiveSupportGlobalPublishedPhase::Idle
+            );
+        }
     }
 
     #[cfg(feature = "parallel")]
@@ -12726,6 +13351,7 @@ mod tests {
 
         let left = PositiveSupportGlobalServiceRuntime::dormant();
         let right = left.parallel_sibling();
+        let abandoned_probe = left.parallel_sibling();
         assert!(left.demand_arrived());
         let left_part = reserved(left.try_reserve_turn(true));
         let right_part = reserved(right.try_reserve_turn(true));
@@ -12741,15 +13367,36 @@ mod tests {
         assert!(snapshot.attribution_tainted);
         assert!(snapshot.active_packet_nonce.is_none());
         assert_eq!(
-            left.global_live_scans(),
-            2,
-            "opening and abandoning are the two liveness boundaries"
+            left.published_phase(),
+            PositiveSupportGlobalPublishedPhase::Abandoned
         );
         assert!(
             !left.global_lane_is_active(),
             "an abandoned shared coordinator reopened attributable scheduling"
         );
         assert!(left.try_deep_clone_ledger(true).is_none());
+
+        let coordinator = left.lock();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let abandoned_thread = std::thread::spawn(move || {
+            result_tx
+                .send(abandoned_probe.global_lane_is_active())
+                .unwrap();
+        });
+        assert!(!result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Abandoned phase probe entered the coordinator mutex"));
+        abandoned_thread.join().unwrap();
+        drop(coordinator);
+
+        // A second outstanding guard observes the already-abandoned
+        // coordinator and must neither panic nor republish the old nonce.
+        drop(right_part);
+        assert_eq!(right.active_packet_nonce(), None);
+
+        // This deliberate fail-closed assertion poisons the coordinator, so
+        // keep it last: the normal idempotent abandonment path above must run
+        // against an unpoisoned mutex.
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = left.try_reserve_turn(true);
@@ -12757,11 +13404,6 @@ mod tests {
             .is_err(),
             "an abandoned shared packet admitted another turn"
         );
-
-        // A second outstanding guard observes the already-abandoned
-        // coordinator and must neither panic nor republish the old nonce.
-        drop(right_part);
-        assert_eq!(right.active_packet_nonce(), None);
     }
 
     #[cfg(feature = "parallel")]
