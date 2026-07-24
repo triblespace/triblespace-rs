@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Certified WholeRoot ANDs compile a recursive Ready quote.** Standard
+  intersections now expose an explicit child-minimum estimate proof. Across
+  the maximal root AND region, Ready uses the resulting preorder quote columns
+  both to reproduce the root's aggregate per-row estimate and to select the
+  first legal Formula child, stopping at OR/support boundaries. This removes
+  the root Formula planning pop and its duplicate descendant estimates while
+  preserving ordinary source eligibility, typed-Program execution receipts,
+  target validators, lower-occurrence ties, and exact-source discharge.
+  Custom exposed ANDs without the stronger estimate proof retain the direct
+  Stage-S root Formula path.
 - **Synthetic WholeRoot Formula proposals enter directly from Ready.** After
   Ready has preserved the root constraint's aggregate estimate, exact
   row-local variable choice, and singleton Formula occurrence, it now
