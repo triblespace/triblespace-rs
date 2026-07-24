@@ -4480,6 +4480,8 @@ struct FormulaReadyChoice(u64);
 impl FormulaReadyChoice {
     const EXACT: u64 = 1 << 32;
     const CHILD: u64 = u32::MAX as u64;
+    /// Disjoint from every legal choice, which occupies only bits 0..=32.
+    const UNSELECTED: Self = Self(u64::MAX);
 
     fn new(child: usize, exact: bool) -> Self {
         let child = u32::try_from(child).expect("too many quoted Formula children");
@@ -7593,13 +7595,9 @@ struct VariablePlan {
     proposers: Vec<usize>,
 }
 
-struct FormulaReadySelection {
-    choices: Vec<FormulaReadyChoice>,
-}
-
 struct QuotedVariablePlan {
     variable: VariableId,
-    selection: FormulaReadySelection,
+    choices: Vec<FormulaReadyChoice>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7612,7 +7610,7 @@ fn quote_formula_ready_and<'a>(
     view: &RowsView<'_>,
     aggregate: &mut [usize],
     stats: &mut ResidualStateStats,
-) -> Option<FormulaReadySelection> {
+) -> Option<Vec<FormulaReadyChoice>> {
     assert!(plan.certified_denotation);
     assert_eq!(aggregate.len(), view.len());
     #[cfg(not(test))]
@@ -7623,9 +7621,8 @@ fn quote_formula_ready_and<'a>(
         return None;
     }
 
-    let mut selected = vec![usize::MAX; view.len()];
+    let mut choices = vec![FormulaReadyChoice::UNSELECTED; view.len()];
     let mut selected_estimates = vec![usize::MAX; view.len()];
-    let mut selected_exact = vec![false; view.len()];
     let mut aggregate_source = false;
     let mut column = Vec::with_capacity(view.len());
 
@@ -7686,11 +7683,13 @@ fn quote_formula_ready_and<'a>(
             }
             // Strict improvement preserves flattened hierarchical preorder as
             // the stable tie break.
-            if selectable && (selected[row] == usize::MAX || column[row] < selected_estimates[row])
+            if selectable
+                && (choices[row] == FormulaReadyChoice::UNSELECTED
+                    || column[row] < selected_estimates[row])
             {
-                selected[row] = child;
+                choices[row] =
+                    FormulaReadyChoice::new(child, execution_coverage == ProposalCoverage::Exact);
                 selected_estimates[row] = column[row];
-                selected_exact[row] = execution_coverage == ProposalCoverage::Exact;
             }
         }
     }
@@ -7700,16 +7699,12 @@ fn quote_formula_ready_and<'a>(
         "a lawful quoted root AND lost its ordinary covering descendant"
     );
     assert!(
-        selected.iter().all(|&child| child != usize::MAX),
+        choices
+            .iter()
+            .all(|&choice| choice != FormulaReadyChoice::UNSELECTED),
         "an ordinary covering root-AND source was not a legal Formula source"
     );
-    Some(FormulaReadySelection {
-        choices: selected
-            .into_iter()
-            .zip(selected_exact)
-            .map(|(child, exact)| FormulaReadyChoice::new(child, exact))
-            .collect(),
-    })
+    Some(choices)
 }
 
 fn estimate_leaf<'a>(
@@ -8044,16 +8039,13 @@ fn ready_quoted_plan_transition<'a>(
         let estimate_start = estimate_matrix.len();
         estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
         let estimates = &mut estimate_matrix[estimate_start..];
-        let Some(selection) = quote_formula_ready_and(
+        let Some(choices) = quote_formula_ready_and(
             root, plan, quote, variable, desc.bound, &view, estimates, stats,
         ) else {
             estimate_matrix.truncate(estimate_start);
             continue;
         };
-        plans.push(QuotedVariablePlan {
-            variable,
-            selection,
-        });
+        plans.push(QuotedVariablePlan { variable, choices });
     }
 
     assert!(!plans.is_empty(), "{CERTIFIED_SOURCE_FRONTIER_ERROR}");
@@ -8087,19 +8079,15 @@ fn ready_quoted_plan_transition<'a>(
     // Child choice deliberately remains payload. Independent Ready histories
     // that selected the same variable therefore meet at one canonical outer
     // Formula state before materialization.
-    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (row, &variable_plan) in preferred.iter().enumerate() {
-        groups.entry(variable_plan).or_default().push(row);
-    }
-    stats.ready_proposal_groups += groups.len();
-
-    if groups.len() == 1 {
-        let (variable_plan, indices) = groups
-            .pop_first()
-            .expect("one quoted proposal group was observed");
-        debug_assert_eq!(indices.len(), rows.row_count);
+    if preferred_groups == 1 {
+        let variable_plan = preferred_counts
+            .iter()
+            .position(|&count| count > 0)
+            .expect("one preferred variable group was observed");
+        debug_assert_eq!(preferred_counts[variable_plan], rows.row_count);
+        stats.ready_proposal_groups += 1;
         let variable = plans[variable_plan].variable;
-        let choices = std::mem::take(&mut plans[variable_plan].selection.choices);
+        let choices = std::mem::take(&mut plans[variable_plan].choices);
         return file_with_plan(
             worklist,
             interner,
@@ -8114,15 +8102,18 @@ fn ready_quoted_plan_transition<'a>(
         .expect("quoted Ready planning filed an empty outer state");
     }
 
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (row, &variable_plan) in preferred.iter().enumerate() {
+        groups.entry(variable_plan).or_default().push(row);
+    }
+    debug_assert_eq!(groups.len(), preferred_groups);
+    stats.ready_proposal_groups += groups.len();
+
     let mut continuation = None;
     for (variable_plan, indices) in groups {
         let variable = plans[variable_plan].variable;
-        let selected = QuotedRowBatch::selected(
-            &rows,
-            &plans[variable_plan].selection.choices,
-            vars.len(),
-            &indices,
-        );
+        let selected =
+            QuotedRowBatch::selected(&rows, &plans[variable_plan].choices, vars.len(), &indices);
         prefer_continuation(
             &mut continuation,
             file_with_plan(
@@ -8182,24 +8173,23 @@ fn quoted_formula_propose_transition<'a>(
     );
     assert_eq!(batch.rows.row_count, batch.choices.len());
 
-    let mut groups: BTreeMap<FormulaReadyChoice, Vec<usize>> = BTreeMap::new();
-    for (row, &choice) in batch.choices.iter().enumerate() {
+    let first_choice = *batch
+        .choices
+        .first()
+        .expect("quoted Formula carrier is empty");
+    let mut uniform_choice = true;
+    let mut any_exact = false;
+    for &choice in &batch.choices {
         assert!(
             choice.child() < quote.children.len(),
             "quoted Formula choice named an unknown root child"
         );
-        groups.entry(choice).or_default().push(row);
+        uniform_choice &= choice == first_choice;
+        any_exact |= choice.exact();
     }
-    assert!(!groups.is_empty(), "quoted Formula carrier is empty");
-
-    // Reserve one affine identity range for the complete merged carrier, then
-    // partition those identities with the rows. Materialization happens only
-    // after equal outer states have coalesced and child groups are known.
-    let activations = allocate_activations(next_activation, batch.rows.row_count);
     #[cfg(test)]
     {
         stats.formula_outer_entry_pops += 1;
-        stats.formula_ready_quote_groups += groups.len();
         stats.formula_ready_quote_root_plan_filings_elided += 1;
     }
 
@@ -8225,11 +8215,24 @@ fn quoted_formula_propose_transition<'a>(
                     .skip_child(&plan.finite_formula, common_counter, child);
         }
     }
-    let exact_counter = batch
-        .choices
-        .iter()
-        .any(|choice| choice.exact())
-        .then(|| interner.formula_pcs.with_proposer_checked(common_counter));
+    let exact_counter =
+        any_exact.then(|| interner.formula_pcs.with_proposer_checked(common_counter));
+
+    let groups: Option<BTreeMap<FormulaReadyChoice, Vec<usize>>> = (!uniform_choice).then(|| {
+        let mut groups = BTreeMap::new();
+        for (row, &choice) in batch.choices.iter().enumerate() {
+            groups.entry(choice).or_insert_with(Vec::new).push(row);
+        }
+        debug_assert_eq!(
+            groups.values().map(Vec::len).sum::<usize>(),
+            batch.rows.row_count
+        );
+        groups
+    });
+    #[cfg(test)]
+    {
+        stats.formula_ready_quote_groups += groups.as_ref().map_or(1, BTreeMap::len);
+    }
 
     let mut file_choice =
         |choice: FormulaReadyChoice, rows: RowBatch, activations: Vec<ActivationId>| {
@@ -8268,23 +8271,17 @@ fn quoted_formula_propose_transition<'a>(
             )
         };
 
-    if groups.len() == 1 {
-        let (choice, indices) = groups
-            .pop_first()
-            .expect("one quoted child group was observed");
-        debug_assert_eq!(indices.len(), batch.rows.row_count);
-        return file_choice(choice, batch.rows, activations)
+    if uniform_choice {
+        let activations = allocate_activations(next_activation, batch.rows.row_count);
+        return file_choice(first_choice, batch.rows, activations)
             .expect("quoted Formula carrier filed an empty child continuation");
     }
 
     let mut continuation = None;
-    for (choice, indices) in groups {
+    for (choice, indices) in groups.expect("nonuniform carrier has child groups") {
         let rows = batch.rows.selected(desc.bound.count(), &indices);
-        let selected_activations = indices.iter().map(|&row| activations[row]).collect();
-        prefer_continuation(
-            &mut continuation,
-            file_choice(choice, rows, selected_activations),
-        );
+        let activations = allocate_activations(next_activation, indices.len());
+        prefer_continuation(&mut continuation, file_choice(choice, rows, activations));
     }
     continuation.expect("quoted Formula carrier filed no child continuation")
 }
@@ -19633,6 +19630,8 @@ mod tests {
         assert_eq!(max_exact.child(), u32::MAX as usize);
         assert!(max_exact.exact());
         assert_ne!(max_plain, max_exact);
+        assert_ne!(FormulaReadyChoice::UNSELECTED, max_plain);
+        assert_ne!(FormulaReadyChoice::UNSELECTED, max_exact);
         assert_eq!(std::mem::size_of::<FormulaReadyChoice>(), 8);
     }
 
@@ -19848,6 +19847,7 @@ mod tests {
         assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 1);
 
         let mut entered = Vec::new();
+        let mut activation_ids = std::collections::BTreeSet::new();
         for level in worklist.values() {
             for (&id, bucket) in level {
                 let ResidualPhase::Formula { counter } = interner.get(id).phase else {
@@ -19857,6 +19857,8 @@ mod tests {
                     panic!("quoted Formula child lost its materialized payload")
                 };
                 assert_eq!(batch.parents.row_count, 1);
+                assert_eq!(batch.activations.len(), batch.parents.row_count);
+                activation_ids.extend(batch.activations.iter().copied());
                 let marker = batch.parents.rows[0][0];
                 let FormulaFocus::Action {
                     node,
@@ -19896,6 +19898,11 @@ mod tests {
                 (1, quote.children[1], false)
             ],
             "stable preorder must win the tie and only Exact choice may discharge the outer proposer"
+        );
+        assert_eq!(
+            activation_ids.len(),
+            2,
+            "each carrier row must retain one unique affine activation"
         );
     }
 
@@ -19990,7 +19997,6 @@ mod tests {
         assert_eq!(aggregate, ordinary);
         assert_eq!(
             selection
-                .choices
                 .iter()
                 .map(|choice| (choice.child(), choice.exact()))
                 .collect::<Vec<_>>(),
@@ -20061,7 +20067,17 @@ mod tests {
         };
         assert_eq!(batch.parents.rows.as_ptr(), storage);
         assert_eq!(batch.parents.row_count, 2);
-        assert_eq!(batch.activations, [ActivationId(0), ActivationId(1)]);
+        assert_eq!(batch.activations.len(), batch.parents.row_count);
+        assert_eq!(
+            batch
+                .activations
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            batch.parents.row_count,
+            "each moved parent row must retain one unique affine activation"
+        );
         assert_eq!(next_activation, 2);
         assert_eq!(stats.formula_outer_entry_pops, 1);
         assert_eq!(stats.formula_ready_quote_groups, 1);
@@ -20107,8 +20123,8 @@ mod tests {
             [10],
             "typed-only source must not enter Ready's aggregate cost"
         );
-        assert_eq!(selection.choices[0].child(), 1);
-        assert!(selection.choices[0].exact());
+        assert_eq!(selection[0].child(), 1);
+        assert!(selection[0].exact());
 
         let x_calls = Arc::new(AtomicUsize::new(0));
         let y_calls = Arc::new(AtomicUsize::new(0));
