@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coordinator mutex. A single published phase lets Dormant, Idle, and Parked
   scheduling probes avoid that mutex while Reserved deliberately preserves
   the packet-coalescing contention window and nonce wake protocol.
+  Steady-state liveness and phase updates avoid redundant atomic writes, so
+  exact accounting does not tax packet traffic that changes neither value.
 - **Typed Program selection has an opt-in lane-pure packet seam.** A
   noncanonical scheduler fence can keep started PositiveSupport Exact,
   started Support, and neutral work in separate physical cohorts without

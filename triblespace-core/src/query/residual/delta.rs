@@ -1402,7 +1402,14 @@ impl PositiveSupportGlobalServiceCoordinator {
         registration: &PositiveSupportGlobalShardRegistration,
         live: bool,
     ) {
-        let was_live = registration.live.swap(live, Ordering::AcqRel);
+        let was_live = registration.live.load(Ordering::Acquire);
+        if was_live == live {
+            // The coordinator already serializes this registration. Avoid
+            // turning steady-state packet traffic into an atomic RMW stream.
+            self.assert_liveness_bound();
+            return;
+        }
+        registration.live.store(live, Ordering::Release);
         match (was_live, live) {
             (false, true) => {
                 self.live_shards = self
@@ -1734,10 +1741,14 @@ impl PositiveSupportGlobalServiceShared {
 
     fn publish_phase(&self, coordinator: &PositiveSupportGlobalServiceCoordinator) {
         coordinator.assert_global_state();
-        self.published_phase.store(
-            Self::authoritative_phase(coordinator) as u8,
-            Ordering::Release,
-        );
+        let phase = Self::authoritative_phase(coordinator) as u8;
+        if self.published_phase.load(Ordering::Relaxed) != phase {
+            // Writers are serialized by `coordinator`, and same-phase stores
+            // convey no new lock-free authority. Publish only real phase
+            // transitions so Reserved packet traffic does not bounce the
+            // cache line read by quiescent probes.
+            self.published_phase.store(phase, Ordering::Release);
+        }
     }
 
     fn load_phase(&self) -> PositiveSupportGlobalPublishedPhase {
