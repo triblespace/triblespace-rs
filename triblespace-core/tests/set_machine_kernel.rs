@@ -236,8 +236,10 @@ struct MachineStats {
 /// Row-major delta buffers grouped by relation.
 ///
 /// This is the physical boundary a scalar loop, SIMD loop, or accelerator can
-/// consume. The semantic store remains a set; batch width changes only how
-/// many identical `WorkItem::take` transactions are grouped together.
+/// consume. Every item in one transaction is taken against the same immutable
+/// relation snapshot; effects are committed only after the batch returns.
+/// The semantic store remains a set, so width changes physical scheduling
+/// without changing the least fixed point.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DeltaBatch {
     values: BTreeMap<Relation, Vec<Value>>,
@@ -313,12 +315,18 @@ impl Machine {
     /// effects in row-major relation buffers.
     fn transact(&mut self, limit: usize) -> DeltaBatch {
         assert!(limit > 0);
-        let mut delta = DeltaBatch::default();
+        let mut taken = Vec::with_capacity(limit);
         for _ in 0..limit {
             let Some(item) = self.work.pop_front() else {
                 break;
             };
-            let taken = item.take(self);
+            // All takes happen before any effect is committed. This is the
+            // snapshot boundary a parallel CPU or device kernel observes.
+            taken.push(item.take(self));
+        }
+
+        let mut delta = DeltaBatch::default();
+        for taken in taken {
             self.stats.takes += 1;
             if taken.materialized_outputs != 0 {
                 self.stats.joins_materialized += 1;
