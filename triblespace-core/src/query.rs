@@ -1804,6 +1804,32 @@ pub trait Constraint<'a> {
         ConstraintShape::Opaque
     }
 
+    /// Certifies the estimate algebra of an exposed residual AND.
+    ///
+    /// Returning `true` is legal only when [`Self::residual_shape`] is
+    /// [`ConstraintShape::And`] and, under a completely certified root,
+    /// this AND has proposal coverage of at least
+    /// [`ProposalCoverage::Covering`] exactly when at least one direct
+    /// target-containing child does.
+    /// `estimate_certified(variable, view)` must return `true` on exactly that
+    /// same condition, and its output is then the elementwise minimum of the
+    /// direct target-containing children whose
+    /// [`proposal_coverage`](Constraint::proposal_coverage) is at least
+    /// [`ProposalCoverage::Covering`]. A missing child quote contributes
+    /// `usize::MAX`; direct child order is the stable tie order. The claim must
+    /// hold for every variable, bound schema, and row block.
+    ///
+    /// This stronger, deliberately separate proof lets residual lowering
+    /// recursively quote a maximal AND region without first invoking each
+    /// enclosing composite estimator. Merely exposing associative shape does
+    /// not imply this estimate law: custom composites therefore retain the
+    /// conservative default even when their ordinary protocol can be
+    /// flattened safely.
+    #[doc(hidden)]
+    fn residual_and_estimate_is_child_minimum(&self) -> bool {
+        false
+    }
+
     /// Exposes the finite arms of an otherwise opaque logical union.
     ///
     /// [`residual::FormulaScope::OpaqueLeaves`] deliberately ignores this
@@ -2425,6 +2451,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_shape()
     }
 
+    fn residual_and_estimate_is_child_minimum(&self) -> bool {
+        let inner: &T = self;
+        inner.residual_and_estimate_is_child_minimum()
+    }
+
     fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
         let inner: &T = self;
         inner.residual_union_children()
@@ -2663,6 +2694,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         let inner: &T = self;
         inner.residual_shape()
+    }
+
+    fn residual_and_estimate_is_child_minimum(&self) -> bool {
+        let inner: &T = self;
+        inner.residual_and_estimate_is_child_minimum()
     }
 
     fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {

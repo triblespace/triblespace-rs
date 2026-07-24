@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Certified WholeRoot AND quotes can cross Ready as deferred affine
+  choices.** The experimental residual scheduler preserves its V3.1 outer
+  proposal shell while carrying each row's stable-preorder child ordinal and
+  Exact receipt beside the row. Equal outer states therefore coalesce before a
+  carrier pop partitions by child, allocates Formula activations once, skips
+  target-irrelevant children, and enters the selected child without repeating
+  root estimates or materializing the root Formula Plan. Arbitrary exposed
+  ANDs retain the ordinary path unless they explicitly certify the
+  child-minimum estimate law; OR remains a quote barrier. Plain Ready keys,
+  variable plans, canonical state descriptors, state buckets, and release
+  telemetry retain their V3.1 layouts.
 - **Shared PositiveSupport service liveness is exact and quiescent probes are
   lock-free.** Shard runtimes and in-flight packet guards now retain one
   counted registration whose final drop reconciles the global lease under the

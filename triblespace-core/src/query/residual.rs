@@ -1484,6 +1484,16 @@ struct ResidualLeaf {
     lowering: LeafLowering,
 }
 
+/// Compiled proof that one synthetic root AND can answer Ready's aggregate
+/// estimate and choose its first Formula child from the same descendant quote
+/// columns. `children` is the maximal exposed root-AND region in stable
+/// hierarchical preorder; OR nodes remain opaque barriers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FormulaReadyQuote {
+    root: FormulaNodeId,
+    children: Box<[FormulaNodeId]>,
+}
+
 #[cfg(test)]
 impl PartialEq<ConstraintPath> for ResidualLeaf {
     fn eq(&self, other: &ConstraintPath) -> bool {
@@ -1521,6 +1531,10 @@ struct ResidualPlan {
     /// The nontrivial exposed root is one formula occurrence. Whole-root
     /// identity shells around one opaque atom normalize to the flat plan.
     synthetic_root_formula: bool,
+    /// Certified recursive estimate quote for a maximal synthetic root AND.
+    /// Arbitrary exposed composites retain `None` unless every flattened AND
+    /// explicitly certifies the child-minimum estimate law.
+    formula_ready_quote: Option<FormulaReadyQuote>,
 }
 
 impl ResidualPlan {
@@ -1552,6 +1566,26 @@ impl ResidualPlan {
                 ConstraintShape::Opaque => constraint.residual_union_children().is_none(),
                 ConstraintShape::And(_) => false,
             }
+        }
+
+        /// Verify the stronger estimate law across exactly the maximal root
+        /// AND region that `FiniteFormulaProgram::compile_root` flattens.
+        /// Formula ORs are barriers: their composite quote remains one child
+        /// column and support machinery begins only after selection.
+        fn root_and_quote_is_lawful<'a>(constraint: &dyn Constraint<'a>) -> bool {
+            if constraint.residual_union_children().is_some() {
+                return true;
+            }
+            let ConstraintShape::And(children) = constraint.residual_shape() else {
+                return true;
+            };
+            constraint.residual_and_estimate_is_child_minimum()
+                && (0..children.len()).all(|child| {
+                    let child = children.child(child);
+                    child.residual_union_children().is_some()
+                        || !matches!(child.residual_shape(), ConstraintShape::And(_))
+                        || root_and_quote_is_lawful(child)
+                })
         }
 
         fn visit<'a>(
@@ -1635,14 +1669,33 @@ impl ResidualPlan {
         }
         let finite_formula =
             FiniteFormulaProgram::compile(root, &leaves, program_scope, synthetic_root_formula);
+        let certified_denotation = root.fixed_denotation();
+        let formula_ready_quote = (synthetic_root_formula
+            && certified_denotation
+            && root.residual_union_children().is_none()
+            && matches!(root.residual_shape(), ConstraintShape::And(_))
+            && root_and_quote_is_lawful(root))
+        .then(|| {
+            let root = finite_formula
+                .root(0)
+                .expect("a synthetic root formula has one compiled root");
+            let FiniteFormulaNodeKind::And { children } = &finite_formula.node(root).kind else {
+                panic!("a lawful root AND quote compiled a non-AND Formula root")
+            };
+            FormulaReadyQuote {
+                root,
+                children: children.clone(),
+            }
+        });
         Self {
-            certified_denotation: root.fixed_denotation(),
+            certified_denotation,
             leaves,
             finite_formula,
             page_local_confirms,
             program_scope,
             grouped_delta_confirm_requirements,
             synthetic_root_formula,
+            formula_ready_quote,
         }
     }
 
@@ -2362,6 +2415,20 @@ pub struct ResidualStateStats {
     /// Concrete `(preferred variable, exact proposer occurrence)` groups filed
     /// by Ready planning, summed across pops.
     pub ready_proposal_groups: usize,
+    /// Coalesced quoted-entry carrier chunks popped before Formula
+    /// materialization. This is planning control, not a protocol action.
+    #[cfg(test)]
+    pub formula_outer_entry_pops: usize,
+    /// Concrete first-child groups materialized from popped quoted carriers.
+    #[cfg(test)]
+    pub formula_ready_quote_groups: usize,
+    /// Root Formula Plan filings elided by quoted carrier pops.
+    #[cfg(test)]
+    pub formula_ready_quote_root_plan_filings_elided: usize,
+    /// Child-estimate row values computed by recursive root-AND quotes across
+    /// every variable considered by Ready.
+    #[cfg(test)]
+    pub formula_ready_quote_estimate_rows: usize,
     /// Candidate-state chunks that planned row-local confirmation actions (or
     /// committed a fully checked candidate frontier) without invoking a
     /// constraint verb.
@@ -3378,6 +3445,10 @@ impl UnionVerb {
 enum ResidualPhase {
     /// Plan one joint `(variable, proposing child)` action per row.
     Ready,
+    /// Deferred synthetic WholeRoot entry. Ready has already chosen both the
+    /// outer variable and each row's first root-AND child, but the choices
+    /// remain affine payload until this coalesced planning shell is popped.
+    QuotedFormulaPropose { variable: VariableId },
     /// Invoke one proposer over a row block whose action is uniform.
     Propose {
         variable: VariableId,
@@ -3470,6 +3541,13 @@ impl StateDesc {
 
         match &self.phase {
             ResidualPhase::Ready => {}
+            ResidualPhase::QuotedFormulaPropose { variable } => {
+                validate_variable(*variable);
+                assert_eq!(
+                    leaf_count, 1,
+                    "a quoted Formula proposal requires one synthetic outer occurrence"
+                );
+            }
             ResidualPhase::Propose {
                 variable,
                 relevant,
@@ -3566,7 +3644,7 @@ impl StateDesc {
             .expect("residual-state rank overflow");
         match &self.phase {
             ResidualPhase::Ready => base,
-            ResidualPhase::Propose { .. } => {
+            ResidualPhase::QuotedFormulaPropose { .. } | ResidualPhase::Propose { .. } => {
                 base.checked_add(1).expect("residual-state rank overflow")
             }
             ResidualPhase::Candidate { checked, .. } => checked
@@ -3619,7 +3697,9 @@ impl StateDesc {
             ResidualPhase::Formula { counter } => {
                 plan.interned_formula_uses_candidate_pages(formula_pcs, *counter, self.bound)
             }
-            ResidualPhase::Ready | ResidualPhase::Propose { .. } => false,
+            ResidualPhase::Ready
+            | ResidualPhase::QuotedFormulaPropose { .. }
+            | ResidualPhase::Propose { .. } => false,
         }
     }
 }
@@ -4386,6 +4466,106 @@ impl RowBatch {
     fn append(&mut self, mut other: Self) {
         self.rows.append(&mut other.rows);
         self.row_count += other.row_count;
+    }
+}
+
+/// Row-local first-child decision produced by a certified Ready quote.
+///
+/// Bits 0..=31 retain the complete compiled child ordinal. Bit 32 records
+/// whether the selected execution source is Exact, leaving the full `u32`
+/// ordinal space available instead of stealing its high bit.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FormulaReadyChoice(u64);
+
+impl FormulaReadyChoice {
+    const EXACT: u64 = 1 << 32;
+    const CHILD: u64 = u32::MAX as u64;
+
+    fn new(child: usize, exact: bool) -> Self {
+        let child = u32::try_from(child).expect("too many quoted Formula children");
+        Self(u64::from(child) | if exact { Self::EXACT } else { 0 })
+    }
+
+    fn child(self) -> usize {
+        (self.0 & Self::CHILD) as usize
+    }
+
+    fn exact(self) -> bool {
+        self.0 & Self::EXACT != 0
+    }
+}
+
+/// Affine quoted-entry payload. Choices are carried beside rows until the
+/// canonical outer Formula state has had a chance to merge independent Ready
+/// histories; every structural operation preserves positional alignment.
+#[derive(Clone, Debug)]
+struct QuotedRowBatch {
+    rows: RowBatch,
+    choices: Vec<FormulaReadyChoice>,
+}
+
+impl QuotedRowBatch {
+    fn new(rows: RowBatch, choices: Vec<FormulaReadyChoice>) -> Self {
+        assert_eq!(
+            rows.row_count,
+            choices.len(),
+            "quoted Formula choices must align with parent rows"
+        );
+        Self { rows, choices }
+    }
+
+    fn selected(
+        rows: &RowBatch,
+        choices: &[FormulaReadyChoice],
+        stride: usize,
+        indices: &[usize],
+    ) -> Self {
+        assert_eq!(
+            rows.row_count,
+            choices.len(),
+            "quoted Formula choices must align with source rows"
+        );
+        Self::new(
+            rows.selected(stride, indices),
+            indices.iter().map(|&row| choices[row]).collect(),
+        )
+    }
+
+    fn append(&mut self, mut other: Self) {
+        assert_eq!(self.rows.row_count, self.choices.len());
+        assert_eq!(other.rows.row_count, other.choices.len());
+        self.rows.append(other.rows);
+        self.choices.append(&mut other.choices);
+        assert_eq!(self.rows.row_count, self.choices.len());
+    }
+
+    fn take_tail(&mut self, stride: usize, width: usize) -> Self {
+        assert_eq!(self.rows.row_count, self.choices.len());
+        let take = self.rows.row_count.min(width.max(1));
+        debug_assert!(take > 0);
+        if take == self.rows.row_count {
+            return Self {
+                rows: std::mem::replace(
+                    &mut self.rows,
+                    RowBatch {
+                        rows: Vec::new(),
+                        row_count: 0,
+                    },
+                ),
+                choices: std::mem::take(&mut self.choices),
+            };
+        }
+        let first = self.rows.row_count - take;
+        let row_values = self.rows.rows.split_off(first * stride);
+        self.rows.row_count = first;
+        let choices = self.choices.split_off(first);
+        Self::new(
+            RowBatch {
+                rows: row_values,
+                row_count: take,
+            },
+            choices,
+        )
     }
 }
 
@@ -6876,6 +7056,7 @@ enum FormulaReducerSeed {
 #[derive(Clone, Debug)]
 enum StateBucket {
     Rows(RowBatch),
+    QuotedRows(QuotedRowBatch),
     Candidates(CandidateBatch),
     Formula(FormulaBatch),
 }
@@ -6884,6 +7065,7 @@ impl StateBucket {
     fn row_count(&self) -> usize {
         match self {
             StateBucket::Rows(rows) => rows.row_count,
+            StateBucket::QuotedRows(batch) => batch.rows.row_count,
             StateBucket::Candidates(batch) => batch.parents.row_count,
             StateBucket::Formula(batch) => batch.parents.row_count,
         }
@@ -6903,6 +7085,7 @@ impl StateBucket {
     fn append(&mut self, other: Self) {
         match (self, other) {
             (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
+            (StateBucket::QuotedRows(left), StateBucket::QuotedRows(right)) => left.append(right),
             (StateBucket::Candidates(left), StateBucket::Candidates(right)) => left.append(right),
             (StateBucket::Formula(left), StateBucket::Formula(right)) => left.append(right),
             _ => panic!("one canonical residual state received incompatible payloads"),
@@ -6923,6 +7106,10 @@ impl StateBucket {
                 let right_rows = batch.row_count / 2;
                 Some(self.take_tail(stride, right_rows, false))
             }
+            StateBucket::QuotedRows(batch) if batch.rows.row_count >= 2 => {
+                let right_rows = batch.rows.row_count / 2;
+                Some(self.take_tail(stride, right_rows, false))
+            }
             StateBucket::Candidates(batch) if candidate_pages && batch.candidate_count() >= 2 => {
                 let right_candidates = batch.candidate_count() / 2;
                 Some(self.take_tail(stride, right_candidates, true))
@@ -6939,7 +7126,10 @@ impl StateBucket {
                 let right_parents = batch.parents.row_count / 2;
                 Some(self.take_tail(stride, right_parents, false))
             }
-            StateBucket::Rows(_) | StateBucket::Candidates(_) | StateBucket::Formula(_) => None,
+            StateBucket::Rows(_)
+            | StateBucket::QuotedRows(_)
+            | StateBucket::Candidates(_)
+            | StateBucket::Formula(_) => None,
         }
     }
 
@@ -6965,6 +7155,13 @@ impl StateBucket {
                     rows,
                     row_count: take,
                 })
+            }
+            StateBucket::QuotedRows(batch) => {
+                assert!(
+                    !candidate_pages,
+                    "quoted Formula rows cannot be candidate-page split"
+                );
+                StateBucket::QuotedRows(batch.take_tail(stride, width))
             }
             StateBucket::Candidates(batch) if candidate_pages => {
                 StateBucket::Candidates(batch.take_candidate_tail(stride, width))
@@ -7072,7 +7269,9 @@ impl SelectedResidualTask {
                     FormulaFocus::Action { .. }
                 )
             }
-            ResidualPhase::Ready | ResidualPhase::Candidate { .. } => false,
+            ResidualPhase::Ready
+            | ResidualPhase::QuotedFormulaPropose { .. }
+            | ResidualPhase::Candidate { .. } => false,
         }
     }
 
@@ -7084,7 +7283,9 @@ impl SelectedResidualTask {
                 &interner.formula(*counter).focus,
                 FormulaFocus::Action { .. }
             ),
-            ResidualPhase::Ready | ResidualPhase::Candidate { .. } => false,
+            ResidualPhase::Ready
+            | ResidualPhase::QuotedFormulaPropose { .. }
+            | ResidualPhase::Candidate { .. } => false,
         }
     }
 
@@ -7154,7 +7355,12 @@ impl SelectedResidualTask {
                 };
                 (action, candidates)
             }
-            (ResidualPhase::Ready | ResidualPhase::Candidate { .. }, _) => return None,
+            (
+                ResidualPhase::Ready
+                | ResidualPhase::QuotedFormulaPropose { .. }
+                | ResidualPhase::Candidate { .. },
+                _,
+            ) => return None,
             (ResidualPhase::Propose { proposer, .. }, StateBucket::Rows(_))
                 if plan.has_finite_formula(*proposer) =>
             {
@@ -7316,7 +7522,7 @@ fn file_with_span(
         return None;
     }
     let candidates = match &bucket {
-        StateBucket::Rows(_) => 0,
+        StateBucket::Rows(_) | StateBucket::QuotedRows(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
         StateBucket::Formula(batch) => batch.page_candidate_count(),
     };
@@ -7385,6 +7591,125 @@ struct VariablePlan {
     relevant: ChildSet,
     /// Tightest flattened leaf occurrence per row.
     proposers: Vec<usize>,
+}
+
+struct FormulaReadySelection {
+    choices: Vec<FormulaReadyChoice>,
+}
+
+struct QuotedVariablePlan {
+    variable: VariableId,
+    selection: FormulaReadySelection,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quote_formula_ready_and<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    quote: &FormulaReadyQuote,
+    variable: VariableId,
+    bound: VariableSet,
+    view: &RowsView<'_>,
+    aggregate: &mut [usize],
+    stats: &mut ResidualStateStats,
+) -> Option<FormulaReadySelection> {
+    assert!(plan.certified_denotation);
+    assert_eq!(aggregate.len(), view.len());
+    #[cfg(not(test))]
+    let _ = stats;
+    if root.proposal_coverage(variable, bound) < ProposalCoverage::Covering {
+        // Preserve V3.1 Ready eligibility before considering stronger typed
+        // Program receipts available only inside Formula execution.
+        return None;
+    }
+
+    let mut selected = vec![usize::MAX; view.len()];
+    let mut selected_estimates = vec![usize::MAX; view.len()];
+    let mut selected_exact = vec![false; view.len()];
+    let mut aggregate_source = false;
+    let mut column = Vec::with_capacity(view.len());
+
+    for (child, &node) in quote.children.iter().enumerate() {
+        let constraint = plan.resolve_formula_node(root, 0, node);
+        if !constraint.variables().is_set(variable) {
+            continue;
+        }
+
+        // The aggregate Ready estimate remains identical to the ordinary
+        // certified root estimator. Formula execution may additionally admit
+        // a typed-only source, so first-child selection uses the stronger
+        // execution receipt while aggregation uses the ordinary one.
+        let ordinary_coverage = constraint.proposal_coverage(variable, bound);
+        let execution_coverage = plan.execution_proposal_coverage_from_ordinary(
+            constraint,
+            variable,
+            bound,
+            ordinary_coverage,
+        );
+        let contributes_to_aggregate = ordinary_coverage >= ProposalCoverage::Covering;
+        let selectable = execution_coverage >= ProposalCoverage::Covering;
+        if !contributes_to_aggregate && !selectable {
+            // A target validator without coverage remains unfinished and runs
+            // in the Confirm stage after the selected source returns.
+            continue;
+        }
+        aggregate_source |= contributes_to_aggregate;
+
+        column.clear();
+        if estimate_constraint(
+            constraint,
+            true,
+            variable,
+            view,
+            &mut EstimateSink::Column(&mut column),
+        ) {
+            assert_eq!(
+                column.len(),
+                view.len(),
+                "quoted AND child estimate must append one value per row"
+            );
+        } else {
+            assert!(
+                column.is_empty(),
+                "missing quoted AND child estimate must leave its sink untouched"
+            );
+            column.resize(view.len(), usize::MAX);
+        }
+        #[cfg(test)]
+        {
+            stats.formula_ready_quote_estimate_rows += view.len();
+        }
+
+        for row in 0..view.len() {
+            if contributes_to_aggregate {
+                aggregate[row] = aggregate[row].min(column[row]);
+            }
+            // Strict improvement preserves flattened hierarchical preorder as
+            // the stable tie break.
+            if selectable && (selected[row] == usize::MAX || column[row] < selected_estimates[row])
+            {
+                selected[row] = child;
+                selected_estimates[row] = column[row];
+                selected_exact[row] = execution_coverage == ProposalCoverage::Exact;
+            }
+        }
+    }
+
+    assert!(
+        aggregate_source,
+        "a lawful quoted root AND lost its ordinary covering descendant"
+    );
+    assert!(
+        selected.iter().all(|&child| child != usize::MAX),
+        "an ordinary covering root-AND source was not a legal Formula source"
+    );
+    Some(FormulaReadySelection {
+        choices: selected
+            .into_iter()
+            .zip(selected_exact)
+            .map(|(child, exact)| FormulaReadyChoice::new(child, exact))
+            .collect(),
+    })
 }
 
 fn estimate_leaf<'a>(
@@ -7460,6 +7785,22 @@ fn ready_plan_transition<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> ContinuationToken {
+    if let Some(quote) = &plan.formula_ready_quote {
+        return ready_quoted_plan_transition(
+            root,
+            plan,
+            quote,
+            desc,
+            rows,
+            full,
+            influences,
+            base_estimates,
+            worklist,
+            interner,
+            stats,
+        );
+    }
+
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -7670,6 +8011,282 @@ fn ready_plan_transition<'a>(
         }
         continuation.expect("Ready planning filed no action")
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ready_quoted_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    quote: &FormulaReadyQuote,
+    desc: &StateDesc,
+    rows: RowBatch,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> ContinuationToken {
+    assert!(plan.synthetic_root_formula);
+    assert_eq!(
+        plan.len(),
+        1,
+        "a compiled root-AND quote must own one outer Formula occurrence"
+    );
+
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let view = rows_view(&vars, &rows.rows, rows.row_count);
+    let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
+    let mut plans = Vec::with_capacity(unbound.len());
+    let mut estimate_matrix = Vec::with_capacity(unbound.len() * rows.row_count);
+
+    for &variable in &unbound {
+        let estimate_start = estimate_matrix.len();
+        estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
+        let estimates = &mut estimate_matrix[estimate_start..];
+        let Some(selection) = quote_formula_ready_and(
+            root, plan, quote, variable, desc.bound, &view, estimates, stats,
+        ) else {
+            estimate_matrix.truncate(estimate_start);
+            continue;
+        };
+        plans.push(QuotedVariablePlan {
+            variable,
+            selection,
+        });
+    }
+
+    assert!(!plans.is_empty(), "{CERTIFIED_SOURCE_FRONTIER_ERROR}");
+
+    let mut preferred = Vec::with_capacity(rows.row_count);
+    let mut preferred_counts = vec![0; plans.len()];
+    for row in 0..rows.row_count {
+        let mut best = None;
+        for (pi, variable_plan) in plans.iter().enumerate() {
+            let estimate = estimate_matrix[pi * rows.row_count + row];
+            let key = variable_choice_key(
+                variable_plan.variable,
+                estimate,
+                base_estimates[variable_plan.variable],
+                influences[variable_plan.variable].count(),
+            );
+            if best.is_none_or(|(_, best_key)| key > best_key) {
+                best = Some((pi, key));
+            }
+        }
+        let variable_plan = best
+            .expect("a non-full quoted Ready state has an enabled proposal")
+            .0;
+        preferred.push(variable_plan);
+        preferred_counts[variable_plan] += 1;
+    }
+
+    let preferred_groups = preferred_counts.iter().filter(|&&count| count > 0).count();
+    stats.ready_preferred_variable_groups += preferred_groups;
+
+    // Child choice deliberately remains payload. Independent Ready histories
+    // that selected the same variable therefore meet at one canonical outer
+    // Formula state before materialization.
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (row, &variable_plan) in preferred.iter().enumerate() {
+        groups.entry(variable_plan).or_default().push(row);
+    }
+    stats.ready_proposal_groups += groups.len();
+
+    if groups.len() == 1 {
+        let (variable_plan, indices) = groups
+            .pop_first()
+            .expect("one quoted proposal group was observed");
+        debug_assert_eq!(indices.len(), rows.row_count);
+        let variable = plans[variable_plan].variable;
+        let choices = std::mem::take(&mut plans[variable_plan].selection.choices);
+        return file_with_plan(
+            worklist,
+            interner,
+            plan,
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::QuotedFormulaPropose { variable },
+            },
+            StateBucket::QuotedRows(QuotedRowBatch::new(rows, choices)),
+            stats,
+        )
+        .expect("quoted Ready planning filed an empty outer state");
+    }
+
+    let mut continuation = None;
+    for (variable_plan, indices) in groups {
+        let variable = plans[variable_plan].variable;
+        let selected = QuotedRowBatch::selected(
+            &rows,
+            &plans[variable_plan].selection.choices,
+            vars.len(),
+            &indices,
+        );
+        prefer_continuation(
+            &mut continuation,
+            file_with_plan(
+                worklist,
+                interner,
+                plan,
+                StateDesc {
+                    bound: desc.bound,
+                    phase: ResidualPhase::QuotedFormulaPropose { variable },
+                },
+                StateBucket::QuotedRows(selected),
+                stats,
+            ),
+        );
+    }
+    continuation.expect("quoted Ready planning filed no outer state")
+}
+
+fn formula_ready_common_skips<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    quote: &FormulaReadyQuote,
+    variable: VariableId,
+) -> ChildSet {
+    let mut skipped = ChildSet::empty(quote.children.len());
+    for (child, &node) in quote.children.iter().enumerate() {
+        let constraint = plan.resolve_formula_node(root, 0, node);
+        if !constraint.variables().is_set(variable) {
+            skipped.insert(child);
+        }
+    }
+    skipped
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quoted_formula_propose_transition<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    batch: QuotedRowBatch,
+    next_activation: &mut u64,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> ContinuationToken {
+    assert!(plan.synthetic_root_formula);
+    assert_eq!(plan.len(), 1);
+    let quote = plan
+        .formula_ready_quote
+        .as_ref()
+        .expect("a quoted Formula carrier has no compiled root-AND quote");
+    assert_eq!(
+        plan.finite_formula.root(0),
+        Some(quote.root),
+        "quoted Formula carrier named a different root"
+    );
+    assert_eq!(batch.rows.row_count, batch.choices.len());
+
+    let mut groups: BTreeMap<FormulaReadyChoice, Vec<usize>> = BTreeMap::new();
+    for (row, &choice) in batch.choices.iter().enumerate() {
+        assert!(
+            choice.child() < quote.children.len(),
+            "quoted Formula choice named an unknown root child"
+        );
+        groups.entry(choice).or_default().push(row);
+    }
+    assert!(!groups.is_empty(), "quoted Formula carrier is empty");
+
+    // Reserve one affine identity range for the complete merged carrier, then
+    // partition those identities with the rows. Materialization happens only
+    // after equal outer states have coalesced and child groups are known.
+    let activations = allocate_activations(next_activation, batch.rows.row_count);
+    #[cfg(test)]
+    {
+        stats.formula_outer_entry_pops += 1;
+        stats.formula_ready_quote_groups += groups.len();
+        stats.formula_ready_quote_root_plan_filings_elided += 1;
+    }
+
+    let mut relevant = ChildSet::empty(1);
+    relevant.insert(0);
+    let mut common_counter = interner.start_formula_with_proposer_checked(
+        &plan.finite_formula,
+        variable,
+        0,
+        UnionVerb::Propose { relevant },
+        // The affine choice is the complete receipt evidence from immutable
+        // Ready selection. Start the common Covering continuation unchecked;
+        // the Exact derivative below discharges only rows that carried that
+        // stronger evidence, without walking proposal capabilities again.
+        false,
+    );
+    let skipped = formula_ready_common_skips(root, plan, quote, variable);
+    for child in 0..quote.children.len() {
+        if skipped.contains(child) {
+            common_counter =
+                interner
+                    .formula_pcs
+                    .skip_child(&plan.finite_formula, common_counter, child);
+        }
+    }
+    let exact_counter = batch
+        .choices
+        .iter()
+        .any(|choice| choice.exact())
+        .then(|| interner.formula_pcs.with_proposer_checked(common_counter));
+
+    let mut file_choice =
+        |choice: FormulaReadyChoice, rows: RowBatch, activations: Vec<ActivationId>| {
+            let counter = if choice.exact() {
+                exact_counter.expect("an Exact quoted choice has no checked root PC")
+            } else {
+                common_counter
+            };
+            let mut formula_batch = FormulaBatch::from_proposal(
+                rows,
+                activations,
+                &plan.finite_formula.node(quote.root).kind,
+            );
+            let selected = select_interned_formula_child(
+                &plan.finite_formula,
+                &mut interner.formula_pcs,
+                counter,
+                &quote.children,
+                choice.child(),
+            );
+            enter_selected_formula_frame(
+                &plan.finite_formula,
+                interner.formula(selected),
+                &mut formula_batch,
+            );
+            file_with_plan(
+                worklist,
+                interner,
+                plan,
+                StateDesc {
+                    bound: desc.bound,
+                    phase: ResidualPhase::Formula { counter: selected },
+                },
+                StateBucket::Formula(formula_batch),
+                stats,
+            )
+        };
+
+    if groups.len() == 1 {
+        let (choice, indices) = groups
+            .pop_first()
+            .expect("one quoted child group was observed");
+        debug_assert_eq!(indices.len(), batch.rows.row_count);
+        return file_choice(choice, batch.rows, activations)
+            .expect("quoted Formula carrier filed an empty child continuation");
+    }
+
+    let mut continuation = None;
+    for (choice, indices) in groups {
+        let rows = batch.rows.selected(desc.bound.count(), &indices);
+        let selected_activations = indices.iter().map(|&row| activations[row]).collect();
+        prefer_continuation(
+            &mut continuation,
+            file_choice(choice, rows, selected_activations),
+        );
+    }
+    continuation.expect("quoted Formula carrier filed no child continuation")
 }
 
 fn propose_action_transition<'a>(
@@ -9315,6 +9932,20 @@ fn execute_task<'a>(
                 full,
                 influences,
                 base_estimates,
+                worklist,
+                interner,
+                stats,
+            );
+            StepOutcome::Advanced(continuation)
+        }
+        (ResidualPhase::QuotedFormulaPropose { variable }, StateBucket::QuotedRows(batch)) => {
+            let continuation = quoted_formula_propose_transition(
+                root,
+                plan,
+                &desc,
+                *variable,
+                batch,
+                next_activation,
                 worklist,
                 interner,
                 stats,
@@ -12306,6 +12937,7 @@ impl ResidualStateMachine {
                         desc.uses_candidate_pages(plan, &self.interner.formula_pcs);
                     let can_split = match bucket {
                         StateBucket::Rows(batch) => batch.row_count >= 2,
+                        StateBucket::QuotedRows(batch) => batch.rows.row_count >= 2,
                         StateBucket::Candidates(batch) if candidate_pages => {
                             batch.candidate_count() >= 2
                         }
@@ -13965,6 +14597,325 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
+        }
+    }
+
+    #[derive(Clone)]
+    struct QuotedEstimateLeaf {
+        parent: Option<VariableId>,
+        variable: VariableId,
+        coverage: ProposalCoverage,
+        estimates: [usize; 2],
+        estimate_calls: Arc<AtomicUsize>,
+    }
+
+    impl Constraint<'static> for QuotedEstimateLeaf {
+        fn variables(&self) -> VariableSet {
+            self.parent.map_or_else(
+                || VariableSet::new_singleton(self.variable),
+                |parent| {
+                    VariableSet::new_singleton(parent)
+                        .union(VariableSet::new_singleton(self.variable))
+                },
+            )
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                self.coverage
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            self.estimate_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(parent) = self.parent {
+                let parent = view
+                    .col(parent)
+                    .expect("quoted row estimate requires its parent binding");
+                out.extend(
+                    view.iter()
+                        .map(|row| self.estimates[(row[parent][0] & 1) as usize]),
+                );
+            } else {
+                out.fill(self.estimates[0], view.len());
+            }
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            for parent in 0..view.len() {
+                candidates.push(parent as u32, raw(42));
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == self.variable {
+                candidates.retain(|_, candidate| *candidate == raw(42));
+            } else {
+                assert_eq!(Some(variable), self.parent);
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| row[column] == raw(42)))
+        }
+    }
+
+    struct TypedOnlyQuoteLeaf {
+        variable: VariableId,
+        estimate: usize,
+        estimate_calls: Arc<AtomicUsize>,
+    }
+
+    impl TypedProgramSpec for TypedOnlyQuoteLeaf {
+        type State = ();
+        type NoveltyKey = ();
+        type Rank = ();
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(request.action, ProgramAction::Propose(variable) if variable == self.variable)
+                .then_some(ProgramRoute {
+                    key: ProgramKey::new(0),
+                    variable: self.variable,
+                    stratum: ProgramStratum::Finite,
+                    grouping: ProgramGrouping::PageLocal,
+                    completion: ProgramCompletion::CompleteActionEquivalent,
+                    exposure: ProgramExposure::Explicit,
+                })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {}
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for parent in 0..batch.view.len() {
+                effects.finite_root(parent as u32, (), Some(raw(42)));
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: &mut Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for _ in states.drain(..) {
+                effects.page(1, None);
+            }
+        }
+
+        fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
+            for parent in 0..batch.view.len() {
+                effects.push(parent as u32, raw(42));
+            }
+        }
+    }
+
+    impl Constraint<'static> for TypedOnlyQuoteLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            true
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            self.estimate_calls.fetch_add(1, Ordering::Relaxed);
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            for parent in 0..view.len() {
+                candidates.push(parent as u32, raw(42));
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            candidates.retain(|_, candidate| *candidate == raw(42));
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| row[column] == raw(42)))
+        }
+
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
+        }
+
+        fn residual_program_proposal_coverage(
+            &self,
+            variable: VariableId,
+            bound: VariableSet,
+        ) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+    }
+
+    struct LawlessAnd<C>(IntersectionConstraint<C>);
+
+    impl<'a, C> ConstraintChildren<'a> for LawlessAnd<C>
+    where
+        C: Constraint<'a> + 'a,
+    {
+        fn len(&self) -> usize {
+            ConstraintChildren::len(&self.0)
+        }
+
+        fn child(&self, index: usize) -> &dyn Constraint<'a> {
+            ConstraintChildren::child(&self.0, index)
+        }
+    }
+
+    impl<'a, C> Constraint<'a> for LawlessAnd<C>
+    where
+        C: Constraint<'a> + 'a,
+    {
+        fn variables(&self) -> VariableSet {
+            self.0.variables()
+        }
+
+        fn fixed_denotation(&self) -> bool {
+            self.0.fixed_denotation()
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            self.0.proposal_coverage(variable, bound)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.0.estimate(variable, view, out)
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.propose(variable, view, candidates);
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.confirm(variable, view, candidates);
+        }
+
+        fn estimate_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.0.estimate_certified(variable, view, out)
+        }
+
+        fn propose_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.propose_certified(variable, view, candidates);
+        }
+
+        fn propose_certified_with_receipt(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) -> ProposalLayout {
+            self.0
+                .propose_certified_with_receipt(variable, view, candidates)
+        }
+
+        fn confirm_certified(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.0.confirm_certified(variable, view, candidates);
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            self.0.satisfied(view)
+        }
+
+        fn influence(&self, variable: VariableId) -> VariableSet {
+            self.0.influence(variable)
+        }
+
+        fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
+            ConstraintShape::And(self)
         }
     }
 
@@ -18626,6 +19577,863 @@ mod tests {
     }
 
     #[test]
+    fn deferred_ready_quote_preserves_v31_plain_layouts_and_full_child_ordinal() {
+        #[allow(dead_code)]
+        enum V31ResidualPhaseLayout {
+            Ready,
+            Propose {
+                variable: VariableId,
+                relevant: ChildSet,
+                proposer: usize,
+            },
+            Candidate {
+                variable: VariableId,
+                relevant: ChildSet,
+                checked: ChildSet,
+            },
+            Confirm {
+                variable: VariableId,
+                relevant: ChildSet,
+                checked: ChildSet,
+                confirmer: usize,
+            },
+            Formula {
+                counter: FormulaPcId,
+            },
+        }
+        #[allow(dead_code)]
+        struct V31StateDescLayout {
+            bound: VariableSet,
+            phase: V31ResidualPhaseLayout,
+        }
+        #[allow(dead_code)]
+        enum V31StateBucketLayout {
+            Rows(RowBatch),
+            Candidates(CandidateBatch),
+            Formula(FormulaBatch),
+        }
+
+        assert_eq!(std::mem::size_of::<ProposeAction>(), 16);
+        assert_eq!(std::mem::size_of::<VariablePlan>(), 56);
+        assert_eq!(
+            std::mem::size_of::<StateDesc>(),
+            std::mem::size_of::<V31StateDescLayout>(),
+            "quoted control must fit inside the V3.1 descriptor envelope"
+        );
+        assert_eq!(
+            std::mem::size_of::<StateBucket>(),
+            std::mem::size_of::<V31StateBucketLayout>(),
+            "quoted payload must fit inside the V3.1 bucket envelope"
+        );
+
+        let max_plain = FormulaReadyChoice::new(u32::MAX as usize, false);
+        let max_exact = FormulaReadyChoice::new(u32::MAX as usize, true);
+        assert_eq!(max_plain.child(), u32::MAX as usize);
+        assert!(!max_plain.exact());
+        assert_eq!(max_exact.child(), u32::MAX as usize);
+        assert!(max_exact.exact());
+        assert_ne!(max_plain, max_exact);
+        assert_eq!(std::mem::size_of::<FormulaReadyChoice>(), 8);
+    }
+
+    #[test]
+    fn quoted_row_batch_append_tail_and_parallel_split_preserve_alignment() {
+        let original_rows = vec![
+            raw(0),
+            raw(10),
+            raw(1),
+            raw(11),
+            raw(2),
+            raw(12),
+            raw(3),
+            raw(13),
+        ];
+        let original_choices = vec![
+            FormulaReadyChoice::new(7, false),
+            FormulaReadyChoice::new(8, true),
+            FormulaReadyChoice::new(9, false),
+            FormulaReadyChoice::new(10, true),
+        ];
+        let mut batch = QuotedRowBatch::new(
+            RowBatch {
+                rows: original_rows.clone(),
+                row_count: 4,
+            },
+            original_choices.clone(),
+        );
+        let tail = batch.take_tail(2, 2);
+        assert_eq!(batch.rows.rows, original_rows[..4]);
+        assert_eq!(batch.choices, original_choices[..2]);
+        assert_eq!(tail.rows.rows, original_rows[4..]);
+        assert_eq!(tail.choices, original_choices[2..]);
+        batch.append(tail);
+        assert_eq!(batch.rows.rows, original_rows);
+        assert_eq!(batch.choices, original_choices);
+
+        let mut bucket = StateBucket::QuotedRows(batch);
+        assert_eq!(bucket.row_count(), 4);
+        assert_eq!(bucket.occupancy(false), 4);
+        let tail = bucket.take_tail(2, 1, false);
+        let StateBucket::QuotedRows(left) = &bucket else {
+            panic!("quoted tail left the wrong bucket kind")
+        };
+        let StateBucket::QuotedRows(right) = &tail else {
+            panic!("quoted tail returned the wrong bucket kind")
+        };
+        assert_eq!(left.rows.rows, original_rows[..6]);
+        assert_eq!(left.choices, original_choices[..3]);
+        assert_eq!(right.rows.rows, original_rows[6..]);
+        assert_eq!(right.choices, original_choices[3..]);
+        bucket.append(tail);
+
+        #[cfg(feature = "parallel")]
+        {
+            let sibling = bucket
+                .split_for_parallel(2, false)
+                .expect("four quoted rows should split");
+            let StateBucket::QuotedRows(left) = &bucket else {
+                unreachable!()
+            };
+            let StateBucket::QuotedRows(right) = sibling else {
+                unreachable!()
+            };
+            assert_eq!(left.rows.rows, original_rows[..4]);
+            assert_eq!(left.choices, original_choices[..2]);
+            assert_eq!(right.rows.rows, original_rows[4..]);
+            assert_eq!(right.choices, original_choices[2..]);
+        }
+    }
+
+    #[test]
+    fn deferred_ready_quote_coalesces_outer_state_before_one_formula_materialization() {
+        const PARENT: VariableId = 0;
+        const TARGET: VariableId = 1;
+        let exact_calls = Arc::new(AtomicUsize::new(0));
+        let covering_calls = Arc::new(AtomicUsize::new(0));
+        let validator_calls = Arc::new(AtomicUsize::new(0));
+        let quoted = |coverage, estimates, calls: &Arc<AtomicUsize>| {
+            Box::new(QuotedEstimateLeaf {
+                parent: Some(PARENT),
+                variable: TARGET,
+                coverage,
+                estimates,
+                estimate_calls: Arc::clone(calls),
+            }) as ShapeConstraint
+        };
+        let root = IntersectionConstraint::new(vec![
+            quoted(ProposalCoverage::Exact, [1, 9], &exact_calls),
+            quoted(ProposalCoverage::Covering, [1, 1], &covering_calls),
+            quoted(ProposalCoverage::None, [0, 0], &validator_calls),
+            Box::new(ReceiptLeaf {
+                variable: PARENT,
+                coverage: ProposalCoverage::Exact,
+            }) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let quote = plan
+            .formula_ready_quote
+            .as_ref()
+            .expect("standard root intersection should certify a Ready quote");
+        assert_eq!(quote.children.len(), 4);
+
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(PARENT),
+            phase: ResidualPhase::Ready,
+        };
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        let first = ready_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            RowBatch {
+                rows: vec![raw(0)],
+                row_count: 1,
+            },
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        let second = ready_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            RowBatch {
+                rows: vec![raw(1)],
+                row_count: 1,
+            },
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        assert_eq!(first.state, second.state);
+        assert_eq!(first.rank, second.rank);
+        assert_eq!(worklist.len(), 1);
+        assert_eq!(worklist[&first.rank].len(), 1);
+        assert_eq!(stats.bucket_merges, 1);
+        assert_eq!(stats.ready_proposal_groups, 2);
+        assert_eq!(stats.formula_outer_entry_pops, 0);
+        assert_eq!(stats.formula_ready_quote_estimate_rows, 4);
+        assert_eq!(exact_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(covering_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(validator_calls.load(Ordering::Relaxed), 0);
+
+        let carrier_desc = interner.get(first.state).clone();
+        assert!(
+            matches!(
+                &carrier_desc.phase,
+                ResidualPhase::QuotedFormulaPropose { variable } if *variable == TARGET
+            ),
+            "quoted Ready histories did not meet at their outer Formula state"
+        );
+        let carrier = worklist
+            .get_mut(&first.rank)
+            .unwrap()
+            .remove(&first.state)
+            .unwrap();
+        let StateBucket::QuotedRows(carrier) = carrier else {
+            panic!("quoted outer state lost its affine choices")
+        };
+        assert_eq!(carrier.rows.rows, [raw(0), raw(1)]);
+        assert_eq!(
+            carrier.choices,
+            [
+                FormulaReadyChoice::new(0, true),
+                FormulaReadyChoice::new(1, false)
+            ]
+        );
+
+        let calls_before_pop = (
+            exact_calls.load(Ordering::Relaxed),
+            covering_calls.load(Ordering::Relaxed),
+            validator_calls.load(Ordering::Relaxed),
+        );
+        let mut next_activation = 0;
+        quoted_formula_propose_transition(
+            &root,
+            &plan,
+            &carrier_desc,
+            TARGET,
+            carrier,
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        assert_eq!(next_activation, 2);
+        assert_eq!(
+            calls_before_pop,
+            (
+                exact_calls.load(Ordering::Relaxed),
+                covering_calls.load(Ordering::Relaxed),
+                validator_calls.load(Ordering::Relaxed),
+            ),
+            "carrier pop must not re-estimate descendants"
+        );
+        assert_eq!(stats.formula_outer_entry_pops, 1);
+        assert_eq!(stats.formula_ready_quote_groups, 2);
+        assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 1);
+
+        let mut entered = Vec::new();
+        for level in worklist.values() {
+            for (&id, bucket) in level {
+                let ResidualPhase::Formula { counter } = interner.get(id).phase else {
+                    panic!("quoted carrier did not enter a Formula child")
+                };
+                let StateBucket::Formula(batch) = bucket else {
+                    panic!("quoted Formula child lost its materialized payload")
+                };
+                assert_eq!(batch.parents.row_count, 1);
+                let marker = batch.parents.rows[0][0];
+                let FormulaFocus::Action {
+                    node,
+                    stage: FormulaStage::Propose,
+                } = interner.formula(counter).focus
+                else {
+                    panic!("quoted source did not enter its proposal Action")
+                };
+                let return_to = interner
+                    .formula(counter)
+                    .return_to
+                    .expect("selected child should retain one root return edge");
+                let parent = interner.formula_pcs.return_by_id(return_to).parent;
+                let FormulaFocus::Plan { done, .. } = &interner.formula(parent).focus else {
+                    panic!("selected child did not retain its root AND continuation")
+                };
+                assert!(
+                    done.contains(3),
+                    "the target-irrelevant parent child was not skipped"
+                );
+                assert!(
+                    !done.contains(2),
+                    "a target validator without coverage was incorrectly discharged"
+                );
+                entered.push((
+                    marker,
+                    node,
+                    interner.formula_resume(counter).proposer_checked,
+                ));
+            }
+        }
+        entered.sort_unstable_by_key(|entry| entry.0);
+        assert_eq!(
+            entered,
+            [
+                (0, quote.children[0], true),
+                (1, quote.children[1], false)
+            ],
+            "stable preorder must win the tie and only Exact choice may discharge the outer proposer"
+        );
+    }
+
+    #[test]
+    fn deferred_ready_quote_matches_nested_and_aggregate_in_stable_preorder() {
+        const PARENT: VariableId = 0;
+        const TARGET: VariableId = 1;
+        let direct_calls = Arc::new(AtomicUsize::new(0));
+        let first_nested_calls = Arc::new(AtomicUsize::new(0));
+        let tied_nested_calls = Arc::new(AtomicUsize::new(0));
+        let validator_calls = Arc::new(AtomicUsize::new(0));
+        let quoted = |coverage, estimates, calls: &Arc<AtomicUsize>| {
+            Box::new(QuotedEstimateLeaf {
+                parent: Some(PARENT),
+                variable: TARGET,
+                coverage,
+                estimates,
+                estimate_calls: Arc::clone(calls),
+            }) as ShapeConstraint
+        };
+        let root = IntersectionConstraint::new(vec![
+            quoted(ProposalCoverage::Exact, [5, 2], &direct_calls),
+            shape_and(vec![
+                quoted(ProposalCoverage::Covering, [1, 4], &first_nested_calls),
+                shape_and(vec![quoted(
+                    ProposalCoverage::Exact,
+                    [1, 3],
+                    &tied_nested_calls,
+                )]),
+            ]),
+            quoted(ProposalCoverage::None, [0, 0], &validator_calls),
+            Box::new(ReceiptLeaf {
+                variable: PARENT,
+                coverage: ProposalCoverage::Exact,
+            }) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let quote = plan.formula_ready_quote.as_ref().unwrap();
+        assert_eq!(
+            quote
+                .children
+                .iter()
+                .map(|&node| plan.finite_formula.node(node).path.0.to_vec())
+                .collect::<Vec<_>>(),
+            [
+                vec![FormulaStep::And(0)],
+                vec![FormulaStep::And(1), FormulaStep::And(0)],
+                vec![
+                    FormulaStep::And(1),
+                    FormulaStep::And(1),
+                    FormulaStep::And(0)
+                ],
+                vec![FormulaStep::And(2)],
+                vec![FormulaStep::And(3)]
+            ]
+        );
+
+        let vars = [PARENT];
+        let rows = RowBatch {
+            rows: vec![raw(0), raw(1)],
+            row_count: 2,
+        };
+        let view = rows_view(&vars, &rows.rows, rows.row_count);
+        let mut ordinary = Vec::new();
+        assert!(root.estimate_certified(TARGET, &view, &mut EstimateSink::Column(&mut ordinary),));
+        assert_eq!(ordinary, [1, 2]);
+        for calls in [
+            &direct_calls,
+            &first_nested_calls,
+            &tied_nested_calls,
+            &validator_calls,
+        ] {
+            calls.store(0, Ordering::Relaxed);
+        }
+
+        let mut aggregate = vec![usize::MAX; rows.row_count];
+        let mut stats = ResidualStateStats::default();
+        let selection = quote_formula_ready_and(
+            &root,
+            &plan,
+            quote,
+            TARGET,
+            VariableSet::new_singleton(PARENT),
+            &view,
+            &mut aggregate,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(aggregate, ordinary);
+        assert_eq!(
+            selection
+                .choices
+                .iter()
+                .map(|choice| (choice.child(), choice.exact()))
+                .collect::<Vec<_>>(),
+            [(1, false), (0, true)],
+            "the first nested descendant wins the row-zero tie"
+        );
+        let skipped = formula_ready_common_skips(&root, &plan, quote, TARGET);
+        assert!(skipped.contains(4));
+        assert!(!skipped.contains(3));
+        assert_eq!(stats.formula_ready_quote_estimate_rows, 6);
+        assert_eq!(direct_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first_nested_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(tied_nested_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(validator_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deferred_ready_quote_single_choice_moves_parent_storage_without_copying() {
+        const PARENT: VariableId = 0;
+        const TARGET: VariableId = 1;
+        let root = IntersectionConstraint::new(vec![
+            Box::new(QuotedEstimateLeaf {
+                parent: Some(PARENT),
+                variable: TARGET,
+                coverage: ProposalCoverage::Exact,
+                estimates: [1, 1],
+                estimate_calls: Arc::new(AtomicUsize::new(0)),
+            }) as ShapeConstraint,
+            Box::new(ReceiptLeaf {
+                variable: PARENT,
+                coverage: ProposalCoverage::Exact,
+            }) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let rows = vec![raw(0), raw(1)];
+        let storage = rows.as_ptr();
+        let carrier = QuotedRowBatch::new(
+            RowBatch { rows, row_count: 2 },
+            vec![
+                FormulaReadyChoice::new(0, true),
+                FormulaReadyChoice::new(0, true),
+            ],
+        );
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(PARENT),
+            phase: ResidualPhase::QuotedFormulaPropose { variable: TARGET },
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let mut next_activation = 0;
+        let token = quoted_formula_propose_transition(
+            &root,
+            &plan,
+            &desc,
+            TARGET,
+            carrier,
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        let StateBucket::Formula(batch) = &worklist[&token.rank][&token.state] else {
+            panic!("single quoted choice did not materialize one Formula batch")
+        };
+        assert_eq!(batch.parents.rows.as_ptr(), storage);
+        assert_eq!(batch.parents.row_count, 2);
+        assert_eq!(batch.activations, [ActivationId(0), ActivationId(1)]);
+        assert_eq!(next_activation, 2);
+        assert_eq!(stats.formula_outer_entry_pops, 1);
+        assert_eq!(stats.formula_ready_quote_groups, 1);
+    }
+
+    #[test]
+    fn deferred_ready_quote_typed_only_source_can_win_but_not_create_eligibility() {
+        const X: VariableId = 0;
+        const Y: VariableId = 1;
+        let ordinary_calls = Arc::new(AtomicUsize::new(0));
+        let typed_calls = Arc::new(AtomicUsize::new(0));
+        let root = IntersectionConstraint::new(vec![
+            Box::new(QuotedEstimateLeaf {
+                parent: None,
+                variable: X,
+                coverage: ProposalCoverage::Exact,
+                estimates: [10, 10],
+                estimate_calls: Arc::clone(&ordinary_calls),
+            }) as ShapeConstraint,
+            Box::new(TypedOnlyQuoteLeaf {
+                variable: X,
+                estimate: 1,
+                estimate_calls: Arc::clone(&typed_calls),
+            }) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let quote = plan.formula_ready_quote.as_ref().unwrap();
+        let mut aggregate = vec![usize::MAX];
+        let mut stats = ResidualStateStats::default();
+        let selection = quote_formula_ready_and(
+            &root,
+            &plan,
+            quote,
+            X,
+            VariableSet::new_empty(),
+            &RowsView::EMPTY,
+            &mut aggregate,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(
+            aggregate,
+            [10],
+            "typed-only source must not enter Ready's aggregate cost"
+        );
+        assert_eq!(selection.choices[0].child(), 1);
+        assert!(selection.choices[0].exact());
+
+        let x_calls = Arc::new(AtomicUsize::new(0));
+        let y_calls = Arc::new(AtomicUsize::new(0));
+        let eligibility_root = IntersectionConstraint::new(vec![
+            Box::new(TypedOnlyQuoteLeaf {
+                variable: X,
+                estimate: 1,
+                estimate_calls: Arc::clone(&x_calls),
+            }) as ShapeConstraint,
+            Box::new(QuotedEstimateLeaf {
+                parent: None,
+                variable: Y,
+                coverage: ProposalCoverage::Exact,
+                estimates: [7, 7],
+                estimate_calls: Arc::clone(&y_calls),
+            }) as ShapeConstraint,
+        ]);
+        let eligibility_plan =
+            ResidualPlan::compile_lowering(&eligibility_root, ResidualLowering::FULL);
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Ready,
+        };
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut eligibility_stats = ResidualStateStats::default();
+        let token = ready_plan_transition(
+            &eligibility_root,
+            &eligibility_plan,
+            &desc,
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            eligibility_root.variables(),
+            &[VariableSet::new_empty(); 128],
+            &[1; 128],
+            &mut worklist,
+            &mut interner,
+            &mut eligibility_stats,
+        );
+        assert!(matches!(
+            interner.get(token.state).phase,
+            ResidualPhase::QuotedFormulaPropose { variable: Y }
+        ));
+        assert_eq!(
+            x_calls.load(Ordering::Relaxed),
+            0,
+            "typed-only X must stay outside Ready eligibility"
+        );
+        assert_eq!(y_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn delta_proposal_seeding_declines_quoted_planning_carrier() {
+        const TARGET: VariableId = 0;
+        let leaf = |estimate| QuotedEstimateLeaf {
+            parent: None,
+            variable: TARGET,
+            coverage: ProposalCoverage::Exact,
+            estimates: [estimate, estimate],
+            estimate_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let root = IntersectionConstraint::new(vec![leaf(1), leaf(2)]);
+        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        assert!(plan.program_scope.enabled());
+        assert!(plan.formula_ready_quote.is_some());
+        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
+        let task = SelectedResidualTask {
+            state: StateId(0),
+            desc: StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::QuotedFormulaPropose { variable: TARGET },
+            },
+            bucket: StateBucket::QuotedRows(QuotedRowBatch::new(
+                RowBatch {
+                    rows: Vec::new(),
+                    row_count: 1,
+                },
+                vec![FormulaReadyChoice::new(0, true)],
+            )),
+        };
+        let returned = machine
+            .seed_delta_proposal(&root, &plan, task)
+            .expect_err("quoted planning carrier is not a protocol proposal action");
+        assert!(matches!(
+            returned.desc.phase,
+            ResidualPhase::QuotedFormulaPropose { variable: TARGET }
+        ));
+        assert!(matches!(returned.bucket, StateBucket::QuotedRows(_)));
+    }
+
+    #[test]
+    fn lawless_exposed_and_retains_v31_outer_propose_path() {
+        const TARGET: VariableId = 0;
+        let left_calls = Arc::new(AtomicUsize::new(0));
+        let right_calls = Arc::new(AtomicUsize::new(0));
+        let leaf = |estimate, calls: &Arc<AtomicUsize>| QuotedEstimateLeaf {
+            parent: None,
+            variable: TARGET,
+            coverage: ProposalCoverage::Exact,
+            estimates: [estimate, estimate],
+            estimate_calls: Arc::clone(calls),
+        };
+        let root = IntersectionConstraint::new(vec![
+            Box::new(LawlessAnd(IntersectionConstraint::new(vec![leaf(
+                1,
+                &left_calls,
+            )]))) as ShapeConstraint,
+            Box::new(leaf(2, &right_calls)) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        assert!(plan.synthetic_root_formula);
+        assert!(
+            plan.formula_ready_quote.is_none(),
+            "shape exposure alone must not certify estimate decomposition"
+        );
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let token = ready_plan_transition(
+            &root,
+            &plan,
+            &StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Ready,
+            },
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            root.variables(),
+            &[VariableSet::new_empty(); 128],
+            &[1; 128],
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        assert!(matches!(
+            interner.get(token.state).phase,
+            ResidualPhase::Propose {
+                variable: TARGET,
+                proposer: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            worklist[&token.rank][&token.state],
+            StateBucket::Rows(_)
+        ));
+        assert_eq!(left_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(right_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.formula_outer_entry_pops, 0);
+        assert_eq!(stats.formula_ready_quote_groups, 0);
+        assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 0);
+        assert_eq!(stats.formula_ready_quote_estimate_rows, 0);
+    }
+
+    #[test]
+    fn deferred_ready_quote_stops_at_or_support_boundary() {
+        const TARGET: VariableId = 0;
+        let direct_calls = Arc::new(AtomicUsize::new(0));
+        let left_arm_calls = Arc::new(AtomicUsize::new(0));
+        let right_arm_calls = Arc::new(AtomicUsize::new(0));
+        let leaf = |estimate, calls: &Arc<AtomicUsize>| QuotedEstimateLeaf {
+            parent: None,
+            variable: TARGET,
+            coverage: ProposalCoverage::Exact,
+            estimates: [estimate, estimate],
+            estimate_calls: Arc::clone(calls),
+        };
+        let root = IntersectionConstraint::new(vec![
+            Box::new(leaf(10, &direct_calls)) as ShapeConstraint,
+            Box::new(UnionConstraint::new(vec![
+                leaf(2, &left_arm_calls),
+                leaf(3, &right_arm_calls),
+            ])) as ShapeConstraint,
+        ]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let quote = plan.formula_ready_quote.as_ref().unwrap();
+        assert_eq!(quote.children.len(), 2);
+        assert!(matches!(
+            plan.finite_formula.node(quote.children[1]).kind,
+            FiniteFormulaNodeKind::Or { .. }
+        ));
+
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let carrier = ready_plan_transition(
+            &root,
+            &plan,
+            &StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Ready,
+            },
+            RowBatch {
+                rows: Vec::new(),
+                row_count: 1,
+            },
+            root.variables(),
+            &[VariableSet::new_empty(); 128],
+            &[1; 128],
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        let carrier_desc = interner.get(carrier.state).clone();
+        let ResidualPhase::QuotedFormulaPropose { variable } = &carrier_desc.phase else {
+            panic!("quoted OR selection did not retain its outer carrier")
+        };
+        let variable = *variable;
+        let bucket = worklist
+            .get_mut(&carrier.rank)
+            .unwrap()
+            .remove(&carrier.state)
+            .unwrap();
+        let StateBucket::QuotedRows(batch) = bucket else {
+            panic!("quoted OR carrier lost its choice")
+        };
+        assert_eq!(batch.choices, [FormulaReadyChoice::new(1, true)]);
+        let calls_before_pop = (
+            direct_calls.load(Ordering::Relaxed),
+            left_arm_calls.load(Ordering::Relaxed),
+            right_arm_calls.load(Ordering::Relaxed),
+        );
+        let mut next_activation = 0;
+        let token = quoted_formula_propose_transition(
+            &root,
+            &plan,
+            &carrier_desc,
+            variable,
+            batch,
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        assert_eq!(
+            calls_before_pop,
+            (
+                direct_calls.load(Ordering::Relaxed),
+                left_arm_calls.load(Ordering::Relaxed),
+                right_arm_calls.load(Ordering::Relaxed),
+            )
+        );
+        let ResidualPhase::Formula { counter } = interner.get(token.state).phase else {
+            panic!("quoted OR carrier did not enter Formula")
+        };
+        let FormulaFocus::Plan {
+            node,
+            stage: FormulaStage::Propose,
+            ..
+        } = interner.formula(counter).focus
+        else {
+            panic!("quote crossed through the selected OR into one of its arms")
+        };
+        assert_eq!(node, quote.children[1]);
+    }
+
+    #[test]
+    fn deferred_ready_quote_matches_forced_v31_raw_set_and_closes_affine_debt() {
+        const TARGET: VariableId = 0;
+        let make_leaf = |coverage, estimate| QuotedEstimateLeaf {
+            parent: None,
+            variable: TARGET,
+            coverage,
+            estimates: [estimate, estimate],
+            estimate_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            make_leaf(ProposalCoverage::Exact, 2),
+            make_leaf(ProposalCoverage::Covering, 3),
+        ]));
+        let make = || {
+            Query::new(Arc::clone(&root), |binding: &Binding| {
+                binding.get(TARGET).copied()
+            })
+            .solve_residual_state_lazy_with(ResidualLowering::new(
+                FormulaScope::WholeRoot,
+                ProgramScope::Disabled,
+            ))
+        };
+
+        let quoted_epoch = ResidualShadowEpoch::new();
+        let quoted = make().shadow(quoted_epoch);
+        let quoted = quoted.collect_profiled();
+
+        let mut v31 = make();
+        assert!(v31.plan.formula_ready_quote.is_some());
+        v31.plan.formula_ready_quote = None;
+        v31.state =
+            ResidualStateMachine::new_for_plan(root.variables(), &v31.plan, Search::NextVariable);
+        let v31_epoch = ResidualShadowEpoch::new();
+        let v31 = v31.shadow(v31_epoch).collect_profiled();
+
+        let quoted_set: BTreeSet<_> = quoted.results.into_iter().collect();
+        let v31_set: BTreeSet<_> = v31.results.into_iter().collect();
+        assert_eq!(quoted_set, v31_set);
+        assert_eq!(quoted_set, BTreeSet::from([raw(42)]));
+        assert_eq!(quoted.shadow.status, ResidualShadowStatus::Closed);
+        assert_eq!(v31.shadow.status, ResidualShadowStatus::Closed);
+        assert!(
+            quoted
+                .shadow
+                .events
+                .iter()
+                .chain(&v31.shadow.events)
+                .all(|event| event.completion.is_some()),
+            "closed affine epochs must have no outstanding action debt"
+        );
+        assert_eq!(quoted.stats.formula_outer_entry_pops, 1);
+        assert_eq!(quoted.stats.formula_ready_quote_root_plan_filings_elided, 1);
+        assert_eq!(v31.stats.formula_outer_entry_pops, 0);
+        assert_eq!(v31.stats.formula_ready_quote_groups, 0);
+        assert_eq!(v31.stats.formula_ready_quote_estimate_rows, 0);
+    }
+
+    #[test]
     fn ready_directed_cost_keeps_q33_larger_archive_source_direction() {
         const VARIABLE: VariableId = 0;
         let actions = directed_ready_action_fixture(vec![
@@ -18704,6 +20512,10 @@ mod tests {
             &root,
             ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
         );
+        assert!(
+            plan.formula_ready_quote.is_none(),
+            "an uncertified root must retain the V3.1 plain grouping path"
+        );
         let desc = StateDesc {
             bound: VariableSet::new_singleton(PARENT),
             phase: ResidualPhase::Ready,
@@ -18745,6 +20557,10 @@ mod tests {
         actions.sort_unstable();
         assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 0, 1)]);
         assert_eq!(stats.ready_preferred_variable_groups, 2);
+        assert_eq!(stats.formula_outer_entry_pops, 0);
+        assert_eq!(stats.formula_ready_quote_groups, 0);
+        assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 0);
+        assert_eq!(stats.formula_ready_quote_estimate_rows, 0);
     }
 
     #[test]
@@ -18758,6 +20574,7 @@ mod tests {
             }
         };
         assert_eq!(boxed_children.len(), 1);
+        assert!(boxed.residual_and_estimate_is_child_minimum());
         assert_eq!(
             boxed_children.child(0).variables(),
             VariableSet::new_singleton(0)
@@ -18772,6 +20589,7 @@ mod tests {
             }
         };
         assert_eq!(arc_children.len(), 1);
+        assert!(arc.residual_and_estimate_is_child_minimum());
         assert_eq!(
             arc_children.child(0).variables(),
             VariableSet::new_singleton(1)
@@ -28617,7 +30435,7 @@ mod tests {
                 assert!(batch.candidates.is_values());
                 assert!(batch.candidates.iter().all(|(parent, _)| parent == 0));
             }
-            StateBucket::Rows(_) | StateBucket::Formula(_) => {
+            StateBucket::Rows(_) | StateBucket::QuotedRows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
@@ -28652,7 +30470,7 @@ mod tests {
                     Some(1)
                 );
             }
-            StateBucket::Rows(_) | StateBucket::Formula(_) => {
+            StateBucket::Rows(_) | StateBucket::QuotedRows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }

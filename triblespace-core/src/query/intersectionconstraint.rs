@@ -535,6 +535,10 @@ where
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         ConstraintShape::And(self)
     }
+
+    fn residual_and_estimate_is_child_minimum(&self) -> bool {
+        true
+    }
 }
 
 /// Combines constraints into an [`IntersectionConstraint`] (logical AND).
