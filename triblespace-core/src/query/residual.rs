@@ -922,6 +922,13 @@ impl FiniteFormulaProgram {
                 "a support traversal must return to a formula guard"
             );
             assert_eq!(self.root(self.owner(completed)), Some(completed));
+            if matches!(self.node(completed).kind, FiniteFormulaNodeKind::And { .. }) {
+                assert_eq!(
+                    completed_stage,
+                    FormulaStage::Confirm,
+                    "a root AND can complete only after entering its confirmation suffix"
+                );
+            }
             return FormulaSuccessor::Outer(counter.exit.clone());
         };
         let children = self
@@ -2011,6 +2018,11 @@ impl ResidualPlan {
         occurrence: usize,
         node: FormulaNodeId,
     ) -> &'r dyn Constraint<'a> {
+        assert_eq!(
+            self.finite_formula.owner(node),
+            occurrence,
+            "Formula node was resolved through a foreign outer occurrence"
+        );
         let mut constraint = self.resolve(root, occurrence);
         for step in self.finite_formula.node(node).path.0.iter() {
             constraint = match *step {
@@ -3731,18 +3743,22 @@ impl StateDesc {
                 .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
-            ResidualPhase::Formula { cursor } => formula_pcs
-                .candidate_exit(*cursor)
-                .checked
-                .count()
-                .checked_mul(action_span)
-                .and_then(|grade| grade.checked_add(1))
-                .and_then(|grade| {
-                    formula.expect("formula state rank requires its compiled program");
-                    formula_pcs.grade(cursor.pc).checked_add(grade)
-                })
-                .and_then(|grade| base.checked_add(grade))
-                .expect("residual-state rank overflow"),
+            ResidualPhase::Formula { cursor } => {
+                let formula = formula.expect("formula state rank requires its compiled program");
+                let exit = formula_pcs.candidate_exit(*cursor);
+                let owner = formula.owner(formula_pcs.get(cursor.pc).focus.node());
+                assert!(
+                    owner < leaf_count && exit.relevant.contains(owner),
+                    "Formula control disagrees with its Candidate exit owner"
+                );
+                exit.checked
+                    .count()
+                    .checked_mul(action_span)
+                    .and_then(|grade| grade.checked_add(1))
+                    .and_then(|grade| formula_pcs.grade(cursor.pc).checked_add(grade))
+                    .and_then(|grade| base.checked_add(grade))
+                    .expect("residual-state rank overflow")
+            }
         }
     }
 
@@ -3980,6 +3996,16 @@ impl FormulaPcInterner {
             program.root(occurrence),
             Some(record.focus.node()),
             "only a Formula root may discharge its outer proposer"
+        );
+        assert!(
+            matches!(
+                record.focus,
+                FormulaFocus::Plan {
+                    stage: FormulaStage::Propose,
+                    ..
+                }
+            ),
+            "only a root proposal Plan may discharge its outer proposer"
         );
         let mut exit = self.candidate_exit(cursor).clone();
         assert!(
