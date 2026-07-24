@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child-minimum estimate law; OR remains a quote barrier. Plain Ready keys,
   variable plans, canonical state descriptors, state buckets, and release
   telemetry retain their V3.1 layouts.
+- **Finite-Formula structural control is interned independently from its outer
+  WCO continuation.** Residual Formula state now carries an exact
+  `(program-counter, resume)` cursor: child selection, skipping, completion,
+  and the persistent return spine transform only the structural counter,
+  while proposer discharge replaces only the resume. Delta and private
+  reducer suspensions retain the full cursor, so equal Formula structure can
+  share arena records without merging distinct checked/confirm futures,
+  changing rank bands, or weakening affine payload and SET boundaries.
 - **Positive Support hedges now spend parent-local demand credit.** Each public
   pull may assign one demand unit to one parked semantic parent; only then may
   validated exact Confirm work mint additional allowance. Support Program
