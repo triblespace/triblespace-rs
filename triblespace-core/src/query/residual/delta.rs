@@ -984,15 +984,17 @@ enum PositiveSupportServiceLease {
     Reserved,
 }
 
-/// Non-cloneable authority for one lane-neutral global service packet part.
+/// Non-cloneable authority for one selected service packet part.
 ///
 /// `nonce` identifies the one coalesced query-global packet while
-/// `part_nonce` distinguishes overlapping shard receipts within it. The
-/// runtime guard abandons the entire packet if any part is dropped unsettled,
-/// so no later packet or deep clone can cross a missing charge.
+/// `part_nonce` distinguishes overlapping shard receipts within it. Shared
+/// reservations live in a runtime guard that abandons the entire packet when
+/// any part is dropped unsettled. A dropped Direct reservation instead leaves
+/// its ledger permanently `Reserved`: both modes fail closed, so no later
+/// packet, split, or deep clone can cross a missing charge.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
-#[must_use = "a global service packet part must be settled exactly once"]
+#[must_use = "a service packet part must be settled exactly once"]
 struct PositiveSupportPacketReservation {
     brand: RegistryBrand,
     nonce: u64,
@@ -1262,6 +1264,32 @@ impl PositiveSupportServiceDebtLedger {
             active_packet_nonce: None,
             attribution_tainted: self.attribution_tainted,
         })
+    }
+
+    /// Reconciles a quiescent affine ledger with the live custody owned by one
+    /// independent scheduler.
+    ///
+    /// This is used both when a semantic clone receives a fresh brand and when
+    /// the first real Rayon split promotes the direct ledger into a shared
+    /// coordinator. Neither boundary may cross an in-flight packet.
+    fn reconcile_quiescent_liveness(&mut self, live: bool) -> bool {
+        self.assert_affine_custody();
+        if self.active_packet_nonce.is_some() {
+            return false;
+        }
+        self.lease = match (self.lease, live) {
+            (PositiveSupportServiceLease::Dormant, false) => PositiveSupportServiceLease::Dormant,
+            (PositiveSupportServiceLease::Dormant, true) => return false,
+            (_, true) => PositiveSupportServiceLease::Parked,
+            (_, false) => PositiveSupportServiceLease::Idle,
+        };
+        self.assert_affine_custody();
+        true
+    }
+
+    fn try_deep_clone_for_liveness(&self, live: bool) -> Option<Self> {
+        let mut ledger = self.try_deep_clone()?;
+        ledger.reconcile_quiescent_liveness(live).then_some(ledger)
     }
 
     fn assert_affine_custody(&self) {
@@ -1563,26 +1591,54 @@ impl PositiveSupportGlobalServiceCoordinator {
     }
 }
 
-/// Clone policy is deliberately explicit:
+/// Shared phase of one query-run service account.
 ///
-/// - `parallel_sibling` shares the query-run coordinator and registers a new
-///   liveness slot;
-/// - `try_deep_clone` snapshots and rebrands an independent query branch.
+/// It exists only after a real Rayon split. `parallel_sibling` registers a new
+/// liveness slot in the same coordinator; semantic cloning extracts a fresh
+/// direct ledger instead of retaining this sharing topology.
 struct PositiveSupportGlobalServiceRuntime {
     coordinator: Arc<Mutex<PositiveSupportGlobalServiceCoordinator>>,
     local_live: Arc<AtomicBool>,
     shard_id: u64,
-    #[cfg(all(test, feature = "parallel"))]
-    dispatch_probe: Option<GlobalServiceDispatchTestProbe>,
 }
 
 #[cfg(all(test, feature = "parallel"))]
 pub(super) type GlobalServiceDispatchTestProbe = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
+/// One scheduler's service-debt account.
+///
+/// Serial and not-yet-split iterators stay in `Direct`, where every transition
+/// is an ordinary mutable ledger operation. The first proven affine Rayon
+/// split consumes that ledger into `Shared`; later siblings only register
+/// another liveness slot. This keeps synchronization out of the latency path
+/// without creating a second accounting epoch.
+struct PositiveSupportServiceDebtRuntime {
+    mode: PositiveSupportServiceDebtMode,
+    #[cfg(all(test, feature = "parallel"))]
+    dispatch_probe: Option<GlobalServiceDispatchTestProbe>,
+}
+
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+enum PositiveSupportServiceDebtMode {
+    Direct(PositiveSupportServiceDebtLedger),
+    Shared(PositiveSupportGlobalServiceRuntime),
+}
+
 enum PositiveSupportGlobalTurn {
     Inactive,
     Deferred(u64),
     Reserved(PositiveSupportGlobalPacketGuard),
+}
+
+enum PositiveSupportServiceTurn {
+    Inactive,
+    Deferred(u64),
+    Reserved(PositiveSupportServicePacketReservation),
+}
+
+enum PositiveSupportServicePacketReservation {
+    Direct(PositiveSupportPacketReservation),
+    Shared(PositiveSupportGlobalPacketGuard),
 }
 
 struct PositiveSupportGlobalPacketGuard {
@@ -1603,11 +1659,22 @@ struct PositiveSupportGlobalPacketClosure {
 }
 
 impl PositiveSupportGlobalServiceRuntime {
+    #[cfg(test)]
     fn dormant() -> Self {
         Self::from_ledger(PositiveSupportServiceDebtLedger::dormant(), false)
     }
 
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     fn from_ledger(ledger: PositiveSupportServiceDebtLedger, live: bool) -> Self {
+        assert!(
+            ledger.active_packet_nonce.is_none(),
+            "a shared service coordinator cannot inherit an in-flight direct packet"
+        );
+        assert_eq!(
+            matches!(ledger.lease, PositiveSupportServiceLease::Parked),
+            live,
+            "shared service liveness disagreed with its promoted affine lease"
+        );
         let local_live = Arc::new(AtomicBool::new(live));
         let coordinator = Arc::new(Mutex::new(PositiveSupportGlobalServiceCoordinator {
             ledger,
@@ -1620,8 +1687,6 @@ impl PositiveSupportGlobalServiceRuntime {
             coordinator,
             local_live,
             shard_id: 0,
-            #[cfg(all(test, feature = "parallel"))]
-            dispatch_probe: None,
         }
     }
 
@@ -1706,12 +1771,10 @@ impl PositiveSupportGlobalServiceRuntime {
             coordinator: Arc::clone(&self.coordinator),
             local_live,
             shard_id,
-            #[cfg(all(test, feature = "parallel"))]
-            dispatch_probe: self.dispatch_probe.clone(),
         }
     }
 
-    fn try_deep_clone(&self, local_live: bool) -> Option<Self> {
+    fn try_deep_clone_ledger(&self, local_live: bool) -> Option<PositiveSupportServiceDebtLedger> {
         let coordinator = self.lock();
         if coordinator.abandoned {
             return None;
@@ -1721,41 +1784,7 @@ impl PositiveSupportGlobalServiceRuntime {
             coordinator.ledger.active_packet_nonce.is_some(),
             "coalesced packet and affine ledger custody diverged"
         );
-        let mut ledger = coordinator.ledger.try_deep_clone()?;
-        ledger.lease = match (ledger.lease, local_live) {
-            (PositiveSupportServiceLease::Dormant, false) => PositiveSupportServiceLease::Dormant,
-            (PositiveSupportServiceLease::Dormant, true) => return None,
-            (_, true) => PositiveSupportServiceLease::Parked,
-            (_, false) => PositiveSupportServiceLease::Idle,
-        };
-        ledger.assert_affine_custody();
-        #[cfg(all(test, feature = "parallel"))]
-        {
-            let mut cloned = Self::from_ledger(ledger, local_live);
-            cloned.dispatch_probe = self.dispatch_probe.clone();
-            Some(cloned)
-        }
-        #[cfg(not(all(test, feature = "parallel")))]
-        {
-            Some(Self::from_ledger(ledger, local_live))
-        }
-    }
-
-    #[cfg(all(test, feature = "parallel"))]
-    fn install_dispatch_probe(&mut self, probe: GlobalServiceDispatchTestProbe) {
-        self.dispatch_probe = Some(probe);
-    }
-
-    #[cfg(all(test, feature = "parallel"))]
-    fn notify_dispatch_started(&self, guard: &PositiveSupportGlobalPacketGuard) {
-        let Some(probe) = &self.dispatch_probe else {
-            return;
-        };
-        let reservation = guard
-            .reservation
-            .as_ref()
-            .expect("dispatch probe observed a settled global service part");
-        probe(reservation.nonce, reservation.part_nonce);
+        coordinator.ledger.try_deep_clone_for_liveness(local_live)
     }
 
     #[cfg(test)]
@@ -1772,6 +1801,237 @@ impl PositiveSupportGlobalServiceRuntime {
     #[cfg(all(test, feature = "parallel"))]
     fn shares_liveness_slot_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.local_live, &other.local_live)
+    }
+}
+
+impl PositiveSupportServiceDebtRuntime {
+    fn dormant() -> Self {
+        Self {
+            mode: PositiveSupportServiceDebtMode::Direct(
+                PositiveSupportServiceDebtLedger::dormant(),
+            ),
+            #[cfg(all(test, feature = "parallel"))]
+            dispatch_probe: None,
+        }
+    }
+
+    fn demand_arrived(&mut self) -> bool {
+        match &mut self.mode {
+            PositiveSupportServiceDebtMode::Direct(ledger) => ledger.demand_arrived(),
+            PositiveSupportServiceDebtMode::Shared(runtime) => runtime.demand_arrived(),
+        }
+    }
+
+    fn global_lane_is_active(&self) -> bool {
+        match &self.mode {
+            PositiveSupportServiceDebtMode::Direct(ledger) => matches!(
+                ledger.lease,
+                PositiveSupportServiceLease::Parked | PositiveSupportServiceLease::Reserved
+            ),
+            PositiveSupportServiceDebtMode::Shared(runtime) => runtime.global_lane_is_active(),
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn active_packet_nonce(&self) -> Option<u64> {
+        match &self.mode {
+            // This is an executor wake/park signal, not an introspection API.
+            // A Direct reservation has no sibling owner that could close it.
+            PositiveSupportServiceDebtMode::Direct(_) => None,
+            PositiveSupportServiceDebtMode::Shared(runtime) => runtime.active_packet_nonce(),
+        }
+    }
+
+    fn try_reserve_turn(&mut self, local_live: bool) -> PositiveSupportServiceTurn {
+        match &mut self.mode {
+            PositiveSupportServiceDebtMode::Direct(ledger) => {
+                assert!(
+                    ledger.reconcile_quiescent_liveness(local_live),
+                    "direct service attribution was abandoned with a packet in flight"
+                );
+                if !local_live {
+                    return PositiveSupportServiceTurn::Inactive;
+                }
+                let lane = ledger
+                    .next_lane()
+                    .expect("a live direct service query had no attributable lane");
+                let reservation = match lane {
+                    ProgramServiceLane::Exact => ledger.reserve_exact(),
+                    ProgramServiceLane::Support => ledger.reserve_support(true),
+                    ProgramServiceLane::Neutral => unreachable!(),
+                }
+                .expect("selected direct service lane failed to reserve its affine packet");
+                PositiveSupportServiceTurn::Reserved(
+                    PositiveSupportServicePacketReservation::Direct(reservation),
+                )
+            }
+            PositiveSupportServiceDebtMode::Shared(runtime) => {
+                match runtime.try_reserve_turn(local_live) {
+                    PositiveSupportGlobalTurn::Inactive => PositiveSupportServiceTurn::Inactive,
+                    PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+                        PositiveSupportServiceTurn::Deferred(packet_nonce)
+                    }
+                    PositiveSupportGlobalTurn::Reserved(guard) => {
+                        PositiveSupportServiceTurn::Reserved(
+                            PositiveSupportServicePacketReservation::Shared(guard),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fn settle(
+        &mut self,
+        reservation: PositiveSupportServicePacketReservation,
+        service: u64,
+        local_live: bool,
+    ) -> PositiveSupportGlobalSettlement {
+        match (&mut self.mode, reservation) {
+            (
+                PositiveSupportServiceDebtMode::Direct(ledger),
+                PositiveSupportServicePacketReservation::Direct(reservation),
+            ) => {
+                let prior_max_packet = match reservation.lane {
+                    ProgramServiceLane::Exact => {
+                        let prior = ledger.max_exact_packet;
+                        ledger.settle_exact(&reservation, service, local_live);
+                        prior
+                    }
+                    ProgramServiceLane::Support => {
+                        let prior = ledger.max_support_packet;
+                        ledger.settle_support(&reservation, service, local_live);
+                        prior
+                    }
+                    ProgramServiceLane::Neutral => unreachable!(),
+                };
+                PositiveSupportGlobalSettlement {
+                    lane: reservation.lane,
+                    packet_nonce: reservation.nonce,
+                    closed_packet: Some(PositiveSupportGlobalPacketClosure {
+                        service,
+                        prior_max_packet,
+                    }),
+                }
+            }
+            (
+                PositiveSupportServiceDebtMode::Shared(_),
+                PositiveSupportServicePacketReservation::Shared(guard),
+            ) => guard.settle(service, local_live),
+            (PositiveSupportServiceDebtMode::Direct(_), _) => {
+                panic!("shared service receipt returned to a direct debt ledger")
+            }
+            (PositiveSupportServiceDebtMode::Shared(_), _) => {
+                panic!("direct service receipt crossed the first parallel split")
+            }
+        }
+    }
+
+    /// Consumes one scheduler runtime into the two runtimes created by a
+    /// successful affine split.
+    ///
+    /// Direct promotion is possible only while quiescent. The split caller has
+    /// already proved that a right affine payload exists, so failed split
+    /// negotiation never allocates or synchronizes this account.
+    #[cfg(feature = "parallel")]
+    fn into_parallel_pair(mut self, local_live: bool) -> (Self, Self) {
+        let shared = match self.mode {
+            PositiveSupportServiceDebtMode::Direct(mut ledger) => {
+                assert!(
+                    ledger.reconcile_quiescent_liveness(local_live),
+                    "cannot promote a direct ledger across an in-flight service packet"
+                );
+                PositiveSupportGlobalServiceRuntime::from_ledger(ledger, local_live)
+            }
+            PositiveSupportServiceDebtMode::Shared(runtime) => runtime,
+        };
+        let right_shared = shared.parallel_sibling();
+        #[cfg(all(test, feature = "parallel"))]
+        let right_probe = self.dispatch_probe.clone();
+        self.mode = PositiveSupportServiceDebtMode::Shared(shared);
+        let right = Self {
+            mode: PositiveSupportServiceDebtMode::Shared(right_shared),
+            #[cfg(all(test, feature = "parallel"))]
+            dispatch_probe: right_probe,
+        };
+        (self, right)
+    }
+
+    fn try_deep_clone(&self, local_live: bool) -> Option<Self> {
+        let ledger = match &self.mode {
+            PositiveSupportServiceDebtMode::Direct(ledger) => {
+                ledger.try_deep_clone_for_liveness(local_live)?
+            }
+            PositiveSupportServiceDebtMode::Shared(runtime) => {
+                runtime.try_deep_clone_ledger(local_live)?
+            }
+        };
+        Some(Self {
+            mode: PositiveSupportServiceDebtMode::Direct(ledger),
+            #[cfg(all(test, feature = "parallel"))]
+            dispatch_probe: self.dispatch_probe.clone(),
+        })
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn install_dispatch_probe(&mut self, probe: GlobalServiceDispatchTestProbe) {
+        self.dispatch_probe = Some(probe);
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn notify_dispatch_started(&self, reservation: &PositiveSupportServicePacketReservation) {
+        let Some(probe) = &self.dispatch_probe else {
+            return;
+        };
+        let reservation = match reservation {
+            PositiveSupportServicePacketReservation::Direct(reservation) => reservation,
+            PositiveSupportServicePacketReservation::Shared(guard) => guard
+                .reservation
+                .as_ref()
+                .expect("dispatch probe observed a settled global service part"),
+        };
+        probe(reservation.nonce, reservation.part_nonce);
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> PositiveSupportServiceDebtSnapshot {
+        match &self.mode {
+            PositiveSupportServiceDebtMode::Direct(ledger) => {
+                PositiveSupportServiceDebtSnapshot::from(ledger)
+            }
+            PositiveSupportServiceDebtMode::Shared(runtime) => runtime.snapshot(),
+        }
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn shares_coordinator_with(&self, other: &Self) -> bool {
+        match (&self.mode, &other.mode) {
+            (
+                PositiveSupportServiceDebtMode::Shared(left),
+                PositiveSupportServiceDebtMode::Shared(right),
+            ) => left.shares_coordinator_with(right),
+            _ => false,
+        }
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    fn shares_liveness_slot_with(&self, other: &Self) -> bool {
+        match (&self.mode, &other.mode) {
+            (
+                PositiveSupportServiceDebtMode::Shared(left),
+                PositiveSupportServiceDebtMode::Shared(right),
+            ) => left.shares_liveness_slot_with(right),
+            _ => false,
+        }
+    }
+}
+
+impl PositiveSupportServicePacketReservation {
+    fn lane(&self) -> ProgramServiceLane {
+        match self {
+            Self::Direct(reservation) => reservation.lane,
+            Self::Shared(guard) => guard.lane(),
+        }
     }
 }
 
@@ -7054,8 +7314,9 @@ pub(super) struct DeltaScheduler {
     positive_support_service_locator_boundary_probes: usize,
     /// Mutually exclusive PositiveSupport admission currency.
     positive_support_scheduling: PositiveSupportScheduling,
-    /// One aggregate affine query-run lease shared by parallel siblings.
-    positive_support_service_debt: Option<PositiveSupportGlobalServiceRuntime>,
+    /// One aggregate affine query-run lease, direct until the first real
+    /// parallel split and shared only between the resulting siblings.
+    positive_support_service_debt: Option<PositiveSupportServiceDebtRuntime>,
     /// One public pull may carry one demand token while the machine searches
     /// for a concrete parked Support parent. Assignment consumes the token
     /// permanently into that parent's conservation ledger, while retaining
@@ -7124,7 +7385,7 @@ impl DeltaScheduler {
         );
         self.positive_support_scheduling = PositiveSupportScheduling::GlobalServiceDebt;
         self.program_lane_selection = ProgramLaneSelection::LanePure;
-        self.positive_support_service_debt = Some(PositiveSupportGlobalServiceRuntime::dormant());
+        self.positive_support_service_debt = Some(PositiveSupportServiceDebtRuntime::dormant());
     }
 
     pub(super) fn global_service_lane_is_active(&self) -> bool {
@@ -7145,7 +7406,7 @@ impl DeltaScheduler {
     pub(super) fn global_service_active_packet_nonce(&self) -> Option<u64> {
         self.positive_support_service_debt
             .as_ref()
-            .and_then(PositiveSupportGlobalServiceRuntime::active_packet_nonce)
+            .and_then(PositiveSupportServiceDebtRuntime::active_packet_nonce)
     }
 
     #[cfg(all(test, feature = "parallel"))]
@@ -9208,7 +9469,7 @@ impl DeltaScheduler {
                 stats.delta_positive_support_service_parents_started += 1;
                 let epoch_started = self
                     .positive_support_service_debt
-                    .as_ref()
+                    .as_mut()
                     .expect("global service demand lost its query-run coordinator")
                     .demand_arrived();
                 if epoch_started {
@@ -9376,29 +9637,29 @@ impl DeltaScheduler {
         }
     }
 
-    fn reserve_global_service_packet(&mut self) -> PositiveSupportGlobalTurn {
+    fn reserve_global_service_packet(&mut self) -> PositiveSupportServiceTurn {
         if self.positive_support_scheduling != PositiveSupportScheduling::GlobalServiceDebt {
-            return PositiveSupportGlobalTurn::Inactive;
+            return PositiveSupportServiceTurn::Inactive;
         }
         let local_live = self.registry.has_live_started_positive_support();
         match self
             .positive_support_service_debt
-            .as_ref()
+            .as_mut()
             .expect("global service policy lost its query-run coordinator")
             .try_reserve_turn(local_live)
         {
-            PositiveSupportGlobalTurn::Inactive => {
+            PositiveSupportServiceTurn::Inactive => {
                 self.arm_global_service_lane(None);
-                PositiveSupportGlobalTurn::Inactive
+                PositiveSupportServiceTurn::Inactive
             }
-            PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+            PositiveSupportServiceTurn::Deferred(packet_nonce) => {
                 self.arm_global_service_lane(None);
-                PositiveSupportGlobalTurn::Deferred(packet_nonce)
+                PositiveSupportServiceTurn::Deferred(packet_nonce)
             }
-            PositiveSupportGlobalTurn::Reserved(turn) => {
+            PositiveSupportServiceTurn::Reserved(turn) => {
                 self.assert_local_global_service_pair();
                 self.arm_global_service_lane(Some(turn.lane()));
-                PositiveSupportGlobalTurn::Reserved(turn)
+                PositiveSupportServiceTurn::Reserved(turn)
             }
         }
     }
@@ -9406,7 +9667,7 @@ impl DeltaScheduler {
     fn settle_global_service_packet(
         &mut self,
         lane: ProgramServiceLane,
-        reservation: Option<PositiveSupportGlobalPacketGuard>,
+        reservation: Option<PositiveSupportServicePacketReservation>,
         examined: usize,
         stats: &mut ResidualStateStats,
     ) -> Option<GlobalServicePacketEvent> {
@@ -9425,9 +9686,20 @@ impl DeltaScheduler {
         // debt theorem rather than silently becoming free.
         let charged = examined.max(1);
         let service = u64::try_from(charged).expect("Program service does not fit u64");
-        let settlement = reservation
-            .expect("attributable service packet lost its global turn")
-            .settle(service, self.registry.has_live_started_positive_support());
+        let reservation = reservation.expect("attributable service packet lost its global turn");
+        let shared = matches!(
+            &reservation,
+            PositiveSupportServicePacketReservation::Shared(_)
+        );
+        let settlement = self
+            .positive_support_service_debt
+            .as_mut()
+            .expect("service settlement lost its query-run account")
+            .settle(
+                reservation,
+                service,
+                self.registry.has_live_started_positive_support(),
+            );
         assert_eq!(
             settlement.lane, lane,
             "global service packet part crossed its selected Program lane"
@@ -9496,7 +9768,7 @@ impl DeltaScheduler {
             }
             ProgramServiceLane::Neutral => unreachable!(),
         }
-        Some(if packet_closed {
+        shared.then_some(if packet_closed {
             GlobalServicePacketEvent::Closed
         } else {
             GlobalServicePacketEvent::StillOpen { packet_nonce }
@@ -10335,11 +10607,11 @@ impl DeltaScheduler {
         stats: &mut ResidualStateStats,
     ) -> DeltaSchedulerStep {
         let service_reservation = match self.reserve_global_service_packet() {
-            PositiveSupportGlobalTurn::Inactive => None,
-            PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+            PositiveSupportServiceTurn::Inactive => None,
+            PositiveSupportServiceTurn::Deferred(packet_nonce) => {
                 return DeltaSchedulerStep::Deferred { packet_nonce };
             }
-            PositiveSupportGlobalTurn::Reserved(turn) => Some(turn),
+            PositiveSupportServiceTurn::Reserved(turn) => Some(turn),
         };
         if !self.program_worklist.is_empty() {
             let (state, tasks, support_grants, dispatch) = self.pop_program_bounded(search_width);
@@ -11781,14 +12053,21 @@ impl DeltaScheduler {
     }
 
     #[cfg(feature = "parallel")]
-    pub(super) fn empty_parallel_sibling(&self) -> Self {
+    pub(super) fn empty_parallel_sibling(&mut self) -> Self {
         let mut sibling = Self::new();
         sibling.positive_support_scheduling = self.positive_support_scheduling;
         sibling.program_lane_selection = self.program_lane_selection;
-        sibling.positive_support_service_debt = self
-            .positive_support_service_debt
-            .as_ref()
-            .map(PositiveSupportGlobalServiceRuntime::parallel_sibling);
+        assert_eq!(
+            self.positive_support_service_debt.is_some(),
+            self.positive_support_scheduling == PositiveSupportScheduling::GlobalServiceDebt,
+            "PositiveSupport scheduling mode diverged from its service-debt account"
+        );
+        if let Some(service) = self.positive_support_service_debt.take() {
+            let local_live = self.registry.has_live_started_positive_support();
+            let (left, right) = service.into_parallel_pair(local_live);
+            self.positive_support_service_debt = Some(left);
+            sibling.positive_support_service_debt = Some(right);
+        }
         sibling
     }
 
@@ -11816,6 +12095,30 @@ impl DeltaScheduler {
                     .as_ref()
                     .expect("right scheduler lost its global service coordinator"),
             )
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    pub(super) fn global_service_debt_is_direct(&self) -> bool {
+        matches!(
+            &self
+                .positive_support_service_debt
+                .as_ref()
+                .expect("global service scheduler lost its debt account")
+                .mode,
+            PositiveSupportServiceDebtMode::Direct(_)
+        )
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    pub(super) fn global_service_debt_is_shared(&self) -> bool {
+        matches!(
+            &self
+                .positive_support_service_debt
+                .as_ref()
+                .expect("global service scheduler lost its debt account")
+                .mode,
+            PositiveSupportServiceDebtMode::Shared(_)
+        )
     }
 
     #[cfg(test)]
@@ -12140,6 +12443,106 @@ mod tests {
         assert_ne!(clone.brand, original_brand);
         assert_eq!(clone.lease, PositiveSupportServiceLease::Idle);
         assert_eq!(clone.support_service, ledger.support_service);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn positive_support_service_runtime_promotes_once_without_rebranding() {
+        let mut scheduler = DeltaScheduler::new();
+        scheduler.enable_positive_support_global_service_debt();
+        let service = scheduler
+            .positive_support_service_debt
+            .as_mut()
+            .expect("enabled scheduler lost its direct debt account");
+        assert!(matches!(
+            &service.mode,
+            PositiveSupportServiceDebtMode::Direct(_)
+        ));
+        assert!(service.demand_arrived());
+        let reservation = match service.try_reserve_turn(true) {
+            PositiveSupportServiceTurn::Reserved(reservation) => reservation,
+            PositiveSupportServiceTurn::Inactive => panic!("live direct ledger was inactive"),
+            PositiveSupportServiceTurn::Deferred(packet_nonce) => {
+                panic!("direct ledger deferred on packet {packet_nonce}")
+            }
+        };
+        let settlement = service.settle(reservation, 7, false);
+        assert!(settlement.closed_packet.is_some());
+        let before = scheduler.global_service_debt_snapshot();
+
+        let mut right = scheduler.empty_parallel_sibling();
+        assert!(scheduler.global_service_debt_is_shared());
+        assert!(right.global_service_debt_is_shared());
+        assert_eq!(scheduler.global_service_debt_snapshot(), before);
+        assert_eq!(right.global_service_debt_snapshot(), before);
+        assert!(scheduler.shares_global_service_coordinator_with(&right));
+        assert!(!scheduler.shares_global_service_liveness_slot_with(&right));
+
+        let third = right.empty_parallel_sibling();
+        assert!(scheduler.shares_global_service_coordinator_with(&right));
+        assert!(scheduler.shares_global_service_coordinator_with(&third));
+        assert!(right.shares_global_service_coordinator_with(&third));
+        assert!(!scheduler.shares_global_service_liveness_slot_with(&right));
+        assert!(!scheduler.shares_global_service_liveness_slot_with(&third));
+        assert!(!right.shares_global_service_liveness_slot_with(&third));
+        assert_eq!(third.global_service_debt_snapshot(), before);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn positive_support_shared_clone_returns_to_an_independent_direct_ledger() {
+        let mut source = DeltaScheduler::new();
+        source.enable_positive_support_global_service_debt();
+        let source_sibling = source.empty_parallel_sibling();
+        assert!(source.global_service_debt_is_shared());
+        assert!(source.shares_global_service_coordinator_with(&source_sibling));
+
+        let mut cloned = source.deep_clone();
+        assert!(cloned.global_service_debt_is_direct());
+        assert_ne!(
+            cloned.global_service_debt_snapshot().brand,
+            source.global_service_debt_snapshot().brand
+        );
+        assert!(!source.shares_global_service_coordinator_with(&cloned));
+
+        let cloned_sibling = cloned.empty_parallel_sibling();
+        assert!(cloned.global_service_debt_is_shared());
+        assert!(cloned.shares_global_service_coordinator_with(&cloned_sibling));
+        assert!(!source.shares_global_service_coordinator_with(&cloned));
+        assert!(!source_sibling.shares_global_service_coordinator_with(&cloned_sibling));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn abandoned_direct_packet_fails_closed_without_parking_the_executor() {
+        let mut service = PositiveSupportServiceDebtRuntime::dormant();
+        assert!(service.demand_arrived());
+        let reservation = match service.try_reserve_turn(true) {
+            PositiveSupportServiceTurn::Reserved(reservation) => reservation,
+            PositiveSupportServiceTurn::Inactive => panic!("live direct ledger was inactive"),
+            PositiveSupportServiceTurn::Deferred(packet_nonce) => {
+                panic!("direct ledger deferred on packet {packet_nonce}")
+            }
+        };
+        drop(reservation);
+
+        assert!(service.global_lane_is_active());
+        assert_eq!(
+            service.active_packet_nonce(),
+            None,
+            "a direct receipt has no sibling that could wake a parked executor"
+        );
+        assert!(
+            service.try_deep_clone(true).is_none(),
+            "a semantic clone crossed an abandoned direct receipt"
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = service.try_reserve_turn(true);
+            }))
+            .is_err(),
+            "an abandoned direct receipt reopened attributable scheduling"
+        );
     }
 
     #[test]
@@ -13250,11 +13653,11 @@ mod tests {
         );
 
         let _turn = match scheduler.reserve_global_service_packet() {
-            PositiveSupportGlobalTurn::Reserved(turn) => turn,
-            PositiveSupportGlobalTurn::Inactive => {
+            PositiveSupportServiceTurn::Reserved(turn) => turn,
+            PositiveSupportServiceTurn::Inactive => {
                 panic!("started service parent failed to activate the initial Support turn")
             }
-            PositiveSupportGlobalTurn::Deferred(packet_nonce) => {
+            PositiveSupportServiceTurn::Deferred(packet_nonce) => {
                 panic!("single scheduler was deferred on packet {packet_nonce}")
             }
         };
@@ -13403,7 +13806,7 @@ mod tests {
 
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
-        let outcome = scheduler.step_bounded(
+        let step = scheduler.try_step_bounded(
             &root,
             &plan,
             1,
@@ -13412,6 +13815,21 @@ mod tests {
             &mut stable_interner,
             &mut stats,
         );
+        let outcome = match step {
+            DeltaSchedulerStep::Completed {
+                outcome,
+                global_packet_event,
+            } => {
+                assert!(
+                    global_packet_event.is_none(),
+                    "a direct packet emitted a shared-executor wake boundary"
+                );
+                outcome
+            }
+            DeltaSchedulerStep::Deferred { packet_nonce } => {
+                panic!("direct scheduler deferred on packet {packet_nonce}")
+            }
+        };
         assert!(outcome.has_stable_effect());
         assert_eq!(stats.delta_positive_publication_support_wins, 1);
         assert_eq!(
@@ -13819,6 +14237,11 @@ mod tests {
         assert!(scheduler.begin_public_pull_demand(&mut stats).is_none());
 
         let mut cloned = scheduler.deep_clone();
+        #[cfg(feature = "parallel")]
+        {
+            assert!(scheduler.global_service_debt_is_direct());
+            assert!(cloned.global_service_debt_is_direct());
+        }
         assert_ne!(cloned.registry.brand, scheduler.registry.brand);
         let cloned_debt = cloned.global_service_debt_snapshot();
         let original_debt = scheduler.global_service_debt_snapshot();

@@ -12186,7 +12186,7 @@ impl ResidualStateMachine {
     /// allocate different records at the same later numeric ID, which is safe
     /// because Rayon folds each machine independently and combines only `R`;
     /// no descriptor or delta return crosses back between sibling worklists.
-    fn parallel_sibling(&self) -> Self {
+    fn parallel_sibling(&mut self) -> Self {
         Self {
             full: self.full,
             leaf_count: self.leaf_count,
@@ -26850,6 +26850,35 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
+    fn failed_parallel_split_leaves_global_service_debt_direct() {
+        let root = FanoutLeaf {
+            variable: 0,
+            values: Arc::new(Vec::new()),
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        machine.delta.enable_positive_support_global_service_debt();
+        assert!(machine.delta.global_service_debt_is_direct());
+
+        assert!(
+            machine
+                .split_for_parallel(
+                    &root,
+                    &plan,
+                    &[VariableSet::new_empty(); 128],
+                    &[usize::MAX; 128],
+                )
+                .is_none(),
+            "an empty affine machine unexpectedly split"
+        );
+        assert!(
+            machine.delta.global_service_debt_is_direct(),
+            "failed split negotiation promoted the direct debt ledger"
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
     fn global_service_debt_parallel_split_shares_coordinator_not_liveness() {
         let root = FanoutLeaf {
             variable: 0,
@@ -26858,11 +26887,12 @@ mod tests {
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         machine.delta.enable_positive_support_global_service_debt();
+        assert!(machine.delta.global_service_debt_is_direct());
         machine.emit_vars = vec![0];
         machine.emit_rows = (0..7).map(raw).collect();
         machine.emit_count = 7;
 
-        let right = machine
+        let mut right = machine
             .split_for_parallel(
                 &root,
                 &plan,
@@ -26870,6 +26900,8 @@ mod tests {
                 &[usize::MAX; 128],
             )
             .expect("global service debt must not suppress an affine split");
+        assert!(machine.delta.global_service_debt_is_shared());
+        assert!(right.delta.global_service_debt_is_shared());
         assert!(machine
             .delta
             .shares_global_service_coordinator_with(&right.delta));
@@ -26879,6 +26911,27 @@ mod tests {
         assert_eq!((machine.emit_count, right.emit_count), (4, 3));
         assert_eq!(machine.emit_rows, (0..4).map(raw).collect::<Vec<_>>());
         assert_eq!(right.emit_rows, (4..7).map(raw).collect::<Vec<_>>());
+
+        let third = right
+            .split_for_parallel(
+                &root,
+                &plan,
+                &[VariableSet::new_empty(); 128],
+                &[usize::MAX; 128],
+            )
+            .expect("the right staged remainder remained splittable");
+        assert!(machine
+            .delta
+            .shares_global_service_coordinator_with(&third.delta));
+        assert!(right
+            .delta
+            .shares_global_service_coordinator_with(&third.delta));
+        assert!(!machine
+            .delta
+            .shares_global_service_liveness_slot_with(&third.delta));
+        assert!(!right
+            .delta
+            .shares_global_service_liveness_slot_with(&third.delta));
     }
 
     #[cfg(feature = "parallel")]
