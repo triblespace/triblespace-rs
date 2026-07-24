@@ -12486,7 +12486,7 @@ mod tests {
     fn test_formula_cursor(pc: u32) -> FormulaCursor {
         FormulaCursor {
             pc: FormulaPcId(pc),
-            resume: FormulaResumeId(0),
+            exit: CandidateExitId(0),
         }
     }
 
@@ -25530,14 +25530,13 @@ mod tests {
     #[test]
     fn distinct_formula_return_masks_share_one_structural_delta_bucket() {
         let relevant = ChildSet::empty(1).with_inserted(0);
-        let resume = FormulaOuterResume {
+        let exit = CandidateExit {
             variable: 0,
-            occurrence: 3,
-            verb: UnionVerb::Propose { relevant },
-            proposer_checked: true,
+            relevant: relevant.clone(),
+            checked: relevant,
         };
         let mut formula_pcs = FormulaPcInterner::default();
-        let resume = formula_pcs.intern_resume(resume);
+        let exit = formula_pcs.intern_candidate_exit(exit);
         let focus = FormulaFocus::Action {
             node: FormulaNodeId(7),
             stage: FormulaStage::Propose,
@@ -25577,8 +25576,8 @@ mod tests {
 
         let mut scheduler = DeltaScheduler::new();
         let desc = DeltaDesc::formula(0, 3, FormulaNodeId(7));
-        let first = FormulaCursor { pc: first, resume };
-        let second = FormulaCursor { pc: second, resume };
+        let first = FormulaCursor { pc: first, exit };
+        let second = FormulaCursor { pc: second, exit };
         for (index, cursor) in [first, second].into_iter().enumerate() {
             let batch = FormulaBatch::from_proposal(
                 RowBatch {

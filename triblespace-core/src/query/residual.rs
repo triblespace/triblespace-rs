@@ -283,6 +283,12 @@ enum FiniteFormulaNodeKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FiniteFormulaNode {
     kind: FiniteFormulaNodeKind,
+    /// Outer residual leaf occurrence whose compiled tree owns this node.
+    ///
+    /// Formula cursors no longer repeat this value in their exit identity:
+    /// every node is allocated for exactly one outer occurrence, so the
+    /// structural program is the canonical source of ownership.
+    owner: usize,
     /// Exact structural route from the enclosing residual leaf. Composite
     /// nodes retain their route because an execution capability may choose to
     /// treat that whole subtree as one opaque action boundary.
@@ -386,6 +392,7 @@ impl FiniteFormulaProgram {
                 &mut self,
                 constraint: &dyn Constraint<'a>,
                 path: &mut Vec<FormulaStep>,
+                owner: usize,
             ) -> FormulaNodeId {
                 let id = self.reserve_node();
                 let node_path = FormulaPath(path.clone().into_boxed_slice());
@@ -402,7 +409,7 @@ impl FiniteFormulaProgram {
                         "a residual finite union must expose at least one arm"
                     );
                     let mut compiled = Vec::with_capacity(children.len());
-                    self.compile_or_children(constraint, path, &mut compiled);
+                    self.compile_or_children(constraint, path, owner, &mut compiled);
                     FiniteFormulaNodeKind::Or {
                         children: compiled.into_boxed_slice(),
                     }
@@ -412,7 +419,11 @@ impl FiniteFormulaProgram {
                             let mut compiled = Vec::with_capacity(children.len());
                             for child in 0..children.len() {
                                 path.push(FormulaStep::And(child));
-                                compiled.push(self.compile_node(children.child(child), path));
+                                compiled.push(self.compile_node(
+                                    children.child(child),
+                                    path,
+                                    owner,
+                                ));
                                 path.pop();
                             }
                             FiniteFormulaNodeKind::And {
@@ -425,6 +436,7 @@ impl FiniteFormulaProgram {
                 let (support_span, execution_span) = self.spans(&kind);
                 self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
                     kind,
+                    owner,
                     path: node_path,
                     capabilities,
                     support_span,
@@ -437,12 +449,16 @@ impl FiniteFormulaProgram {
             /// exposed AND region at the root is flattened: an AND below an
             /// OR remains inside that arm, preserving the union's private
             /// candidate reducer boundary.
-            fn compile_root<'a>(&mut self, root: &dyn Constraint<'a>) -> FormulaNodeId {
+            fn compile_root<'a>(
+                &mut self,
+                root: &dyn Constraint<'a>,
+                owner: usize,
+            ) -> FormulaNodeId {
                 if root.residual_union_children().is_some() {
-                    return self.compile_node(root, &mut Vec::new());
+                    return self.compile_node(root, &mut Vec::new(), owner);
                 }
                 let ConstraintShape::And(_) = root.residual_shape() else {
-                    return self.compile_node(root, &mut Vec::new());
+                    return self.compile_node(root, &mut Vec::new(), owner);
                 };
 
                 let id = self.reserve_node();
@@ -453,13 +469,14 @@ impl FiniteFormulaProgram {
                             compile_grouped_delta_confirm_requirements(root, self.program_scope),
                     };
                 let mut children = Vec::new();
-                self.compile_root_and_children(root, &mut Vec::new(), &mut children);
+                self.compile_root_and_children(root, &mut Vec::new(), owner, &mut children);
                 let kind = FiniteFormulaNodeKind::And {
                     children: children.into_boxed_slice(),
                 };
                 let (support_span, execution_span) = self.spans(&kind);
                 self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
                     kind,
+                    owner,
                     path: FormulaPath(Box::new([])),
                     capabilities,
                     support_span,
@@ -472,6 +489,7 @@ impl FiniteFormulaProgram {
                 &mut self,
                 conjunction: &dyn Constraint<'a>,
                 path: &mut Vec<FormulaStep>,
+                owner: usize,
                 compiled: &mut Vec<FormulaNodeId>,
             ) {
                 let ConstraintShape::And(children) = conjunction.residual_shape() else {
@@ -483,9 +501,9 @@ impl FiniteFormulaProgram {
                     if constraint.residual_union_children().is_none()
                         && matches!(constraint.residual_shape(), ConstraintShape::And(_))
                     {
-                        self.compile_root_and_children(constraint, path, compiled);
+                        self.compile_root_and_children(constraint, path, owner, compiled);
                     } else {
-                        compiled.push(self.compile_node(constraint, path));
+                        compiled.push(self.compile_node(constraint, path, owner));
                     }
                     path.pop();
                 }
@@ -499,6 +517,7 @@ impl FiniteFormulaProgram {
                 &mut self,
                 union: &dyn Constraint<'a>,
                 path: &mut Vec<FormulaStep>,
+                owner: usize,
                 compiled: &mut Vec<FormulaNodeId>,
             ) {
                 let children = union
@@ -512,9 +531,9 @@ impl FiniteFormulaProgram {
                     path.push(FormulaStep::Or(child));
                     let constraint = children.child(child);
                     if constraint.residual_union_children().is_some() {
-                        self.compile_or_children(constraint, path, compiled);
+                        self.compile_or_children(constraint, path, owner, compiled);
                     } else {
-                        compiled.push(self.compile_node(constraint, path));
+                        compiled.push(self.compile_node(constraint, path, owner));
                     }
                     path.pop();
                 }
@@ -547,7 +566,7 @@ impl FiniteFormulaProgram {
                 1,
                 "a synthetic residual formula has one outer occurrence"
             );
-            let root = builder.compile_root(root);
+            let root = builder.compile_root(root, 0);
             return Self {
                 nodes: builder
                     .nodes
@@ -567,7 +586,7 @@ impl FiniteFormulaProgram {
                 constraint.residual_union_children().is_some(),
                 "a finite-formula root stopped being a Union"
             );
-            roots[occurrence] = Some(builder.compile_node(constraint, &mut Vec::new()));
+            roots[occurrence] = Some(builder.compile_node(constraint, &mut Vec::new(), occurrence));
         }
         Self {
             nodes: builder
@@ -581,6 +600,10 @@ impl FiniteFormulaProgram {
 
     fn node(&self, id: FormulaNodeId) -> &FiniteFormulaNode {
         &self.nodes[id.0 as usize]
+    }
+
+    fn owner(&self, id: FormulaNodeId) -> usize {
+        self.node(id).owner
     }
 
     fn root(&self, occurrence: usize) -> Option<FormulaNodeId> {
@@ -685,12 +708,7 @@ impl FiniteFormulaProgram {
         FormulaProgramCounter {
             focus: self.entry_focus(root, stage),
             returns: Box::new([]),
-            resume: FormulaOuterResume {
-                variable,
-                occurrence,
-                verb,
-                proposer_checked: true,
-            },
+            exit: CandidateExit::from_formula(variable, self.roots.len(), occurrence, verb, true),
         }
     }
 
@@ -802,7 +820,7 @@ impl FiniteFormulaProgram {
         FormulaProgramCounter {
             focus: focus(self, children[child], child_stage),
             returns: returns.into_boxed_slice(),
-            resume: counter.resume.clone(),
+            exit: counter.exit.clone(),
         }
     }
 
@@ -826,7 +844,7 @@ impl FiniteFormulaProgram {
                 done: done.with_inserted(child),
             },
             returns: counter.returns.clone(),
-            resume: counter.resume.clone(),
+            exit: counter.exit.clone(),
         }
     }
 
@@ -853,7 +871,7 @@ impl FiniteFormulaProgram {
         FormulaProgramCounter {
             focus: FormulaFocus::Complete { node, stage },
             returns: counter.returns.clone(),
-            resume: counter.resume.clone(),
+            exit: counter.exit.clone(),
         }
     }
 
@@ -884,7 +902,7 @@ impl FiniteFormulaProgram {
                 stage: FormulaStage::Support,
             },
             returns: counter.returns.clone(),
-            resume: counter.resume.clone(),
+            exit: counter.exit.clone(),
         }
     }
 
@@ -903,16 +921,8 @@ impl FiniteFormulaProgram {
                 FormulaStage::Support,
                 "a support traversal must return to a formula guard"
             );
-            assert_eq!(self.root(counter.resume.occurrence), Some(completed));
-            let root_stage = match (&self.node(completed).kind, &counter.resume.verb) {
-                (FiniteFormulaNodeKind::And { .. }, UnionVerb::Propose { .. }) => {
-                    FormulaStage::Confirm
-                }
-                (_, UnionVerb::Propose { .. }) => FormulaStage::Propose,
-                (_, UnionVerb::Confirm { .. }) => FormulaStage::Confirm,
-            };
-            assert_eq!(completed_stage, root_stage);
-            return FormulaSuccessor::Outer(counter.resume.clone());
+            assert_eq!(self.root(self.owner(completed)), Some(completed));
+            return FormulaSuccessor::Outer(counter.exit.clone());
         };
         let children = self
             .node(site.parent)
@@ -934,7 +944,7 @@ impl FiniteFormulaProgram {
                         done: site.done.clone(),
                     },
                     returns: outer.to_vec().into_boxed_slice(),
-                    resume: counter.resume.clone(),
+                    exit: counter.exit.clone(),
                 },
                 child: site.child,
             };
@@ -951,7 +961,7 @@ impl FiniteFormulaProgram {
                 done,
             },
             returns: outer.to_vec().into_boxed_slice(),
-            resume: counter.resume.clone(),
+            exit: counter.exit.clone(),
         })
     }
 
@@ -961,7 +971,7 @@ impl FiniteFormulaProgram {
     #[cfg(test)]
     fn grade(&self, counter: &FormulaProgramCounter) -> usize {
         let root = self
-            .root(counter.resume.occurrence)
+            .root(self.owner(counter.focus.node()))
             .expect("a formula counter resumed an opaque residual leaf");
         let mut expected = root;
         let mut outer_grade = 0usize;
@@ -1035,7 +1045,7 @@ impl FiniteFormulaProgram {
         bound: VariableSet,
     ) -> bool {
         let root = self
-            .root(counter.resume.occurrence)
+            .root(self.owner(counter.focus.node()))
             .expect("a formula counter resumed an opaque residual leaf");
         let FiniteFormulaNodeKind::And { children } = &self.node(root).kind else {
             return false;
@@ -1074,7 +1084,7 @@ impl FiniteFormulaProgram {
                     && node.capabilities.confirm_page_local
                     && !node
                         .capabilities
-                        .grouped_delta_confirm(counter.resume.variable, bound)
+                        .grouped_delta_confirm(counter.exit.variable, bound)
             })
     }
 
@@ -1125,7 +1135,7 @@ impl FiniteFormulaProgram {
                     continue;
                 }
                 let streamability =
-                    self.confirm_subtree_streamability(node, counter.resume.variable, bound);
+                    self.confirm_subtree_streamability(node, counter.exit.variable, bound);
                 if streamability != FormulaProposalStreamability::Linear {
                     return streamability;
                 }
@@ -1133,7 +1143,7 @@ impl FiniteFormulaProgram {
             completed = site.parent;
         }
         assert_eq!(
-            self.root(counter.resume.occurrence),
+            self.root(self.owner(focused)),
             Some(completed),
             "formula proposal return stack did not reach its root"
         );
@@ -1184,15 +1194,14 @@ impl FiniteFormulaProgram {
         cursor: FormulaCursor,
         bound: VariableSet,
     ) -> bool {
-        let resume = formula_pcs.resume(cursor);
+        let record = formula_pcs.get(cursor.pc);
         let root = self
-            .root(resume.occurrence)
+            .root(self.owner(record.focus.node()))
             .expect("a formula counter resumed an opaque residual leaf");
         let FiniteFormulaNodeKind::And { children } = &self.node(root).kind else {
             return false;
         };
 
-        let record = formula_pcs.get(cursor.pc);
         let done = match &record.focus {
             FormulaFocus::Plan {
                 node,
@@ -1240,7 +1249,7 @@ impl FiniteFormulaProgram {
                     && node.capabilities.confirm_page_local
                     && !node
                         .capabilities
-                        .grouped_delta_confirm(resume.variable, bound)
+                        .grouped_delta_confirm(formula_pcs.candidate_exit(cursor).variable, bound)
             })
     }
 
@@ -1272,7 +1281,7 @@ impl FiniteFormulaProgram {
             );
         }
 
-        let resume = formula_pcs.resume(cursor);
+        let exit = formula_pcs.candidate_exit(cursor);
         let mut completed = focused;
         let mut current = cursor.pc;
         while let Some(return_to) = formula_pcs.get(current).return_to {
@@ -1304,8 +1313,7 @@ impl FiniteFormulaProgram {
                 if child == address.child || done.contains(child) {
                     continue;
                 }
-                let streamability =
-                    self.confirm_subtree_streamability(node, resume.variable, bound);
+                let streamability = self.confirm_subtree_streamability(node, exit.variable, bound);
                 if streamability != FormulaProposalStreamability::Linear {
                     return streamability;
                 }
@@ -1314,7 +1322,7 @@ impl FiniteFormulaProgram {
             current = address.parent;
         }
         assert_eq!(
-            self.root(resume.occurrence),
+            self.root(self.owner(focused)),
             Some(completed),
             "formula proposal return stack did not reach its root"
         );
@@ -1383,16 +1391,26 @@ enum FormulaFocus {
     },
 }
 
-/// Existing residual continuation to resume after the formula root completes.
+impl FormulaFocus {
+    fn node(&self) -> FormulaNodeId {
+        match self {
+            Self::Action { node, .. } | Self::Plan { node, .. } | Self::Complete { node, .. } => {
+                *node
+            }
+        }
+    }
+}
+
+/// Exact ordinary Candidate future after one Formula root completes.
+///
+/// This is the normal form of both proposal and confirmation entry histories:
+/// the variable, relevant occurrences, and already-checked occurrences are
+/// precisely the fields that the successor Candidate state will own.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct FormulaOuterResume {
+struct CandidateExit {
     variable: VariableId,
-    occurrence: usize,
-    verb: UnionVerb,
-    /// Whether a proposal action's outer occurrence is already discharged.
-    /// Exact sources set this; Covering sources must later run the same
-    /// occurrence as a confirmer. Ignored for `UnionVerb::Confirm`.
-    proposer_checked: bool,
+    relevant: ChildSet,
+    checked: ChildSet,
 }
 
 /// Defunctionalized structural continuation. Candidate values are deliberately
@@ -1403,7 +1421,7 @@ struct FormulaOuterResume {
 struct FormulaProgramCounter {
     focus: FormulaFocus,
     returns: Box<[FormulaReturnSite]>,
-    resume: FormulaOuterResume,
+    exit: CandidateExit,
 }
 
 /// Query-local canonical name for one immutable formula continuation.
@@ -1415,10 +1433,10 @@ struct FormulaProgramCounter {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct FormulaPcId(u32);
 
-/// Query-local canonical name for the outer WCO continuation shared by every
-/// formula state in one activation family.
+/// Query-local canonical name for the exact Candidate future shared by every
+/// Formula state in one activation family.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct FormulaResumeId(u32);
+struct CandidateExitId(u32);
 
 /// Exact Formula execution identity.
 ///
@@ -1428,7 +1446,7 @@ struct FormulaResumeId(u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct FormulaCursor {
     pc: FormulaPcId,
-    resume: FormulaResumeId,
+    exit: CandidateExitId,
 }
 
 impl FormulaCursor {
@@ -1500,7 +1518,7 @@ enum FormulaSuccessor {
         parent: FormulaProgramCounter,
         child: usize,
     },
-    Outer(FormulaOuterResume),
+    Outer(CandidateExit),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1745,13 +1763,13 @@ impl ResidualPlan {
         self.finite_formula.root(occurrence).is_some()
     }
 
-    fn formula_action_occurrence(&self, outer: usize, node: FormulaNodeId) -> usize {
+    fn formula_action_occurrence(&self, node: FormulaNodeId) -> usize {
         if self.synthetic_root_formula {
             self.len()
                 .checked_add(node.0 as usize)
                 .expect("formula action occurrence overflow")
         } else {
-            outer
+            self.finite_formula.owner(node)
         }
     }
 
@@ -1795,19 +1813,18 @@ impl ResidualPlan {
             return streamability;
         }
 
-        let UnionVerb::Propose { relevant } = &counter.resume.verb else {
-            return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::NotProposalAction,
-            );
-        };
-        if !counter.resume.proposer_checked {
+        let owner = self.finite_formula.owner(counter.focus.node());
+        if !counter.exit.checked.contains(owner) {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::OuterContinuation,
             );
         }
-        let checked = ChildSet::empty(self.len()).with_inserted(counter.resume.occurrence);
-        if !self.remaining_confirms_accept_pages(relevant, &checked, counter.resume.variable, bound)
-        {
+        if !self.remaining_confirms_accept_pages(
+            &counter.exit.relevant,
+            &counter.exit.checked,
+            counter.exit.variable,
+            bound,
+        ) {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::OuterContinuation,
             );
@@ -1833,19 +1850,21 @@ impl ResidualPlan {
             return streamability;
         }
 
-        let resume = formula_pcs.resume(cursor);
-        let UnionVerb::Propose { relevant } = &resume.verb else {
-            return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::NotProposalAction,
-            );
-        };
-        if !resume.proposer_checked {
+        let exit = formula_pcs.candidate_exit(cursor);
+        let owner = self
+            .finite_formula
+            .owner(formula_pcs.get(cursor.pc).focus.node());
+        if !exit.checked.contains(owner) {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::OuterContinuation,
             );
         }
-        let checked = ChildSet::empty(self.len()).with_inserted(resume.occurrence);
-        if !self.remaining_confirms_accept_pages(relevant, &checked, resume.variable, bound) {
+        if !self.remaining_confirms_accept_pages(
+            &exit.relevant,
+            &exit.checked,
+            exit.variable,
+            bound,
+        ) {
             return FormulaProposalStreamability::Barrier(
                 FormulaProposalStreamBarrier::OuterContinuation,
             );
@@ -3459,15 +3478,53 @@ enum UnionVerb {
     },
 }
 
-impl UnionVerb {
-    /// Outer protocol band enclosing this finite-formula continuation.
-    /// Proposal formulas live between `Propose` and the first `Candidate`;
-    /// confirmation formulas live between their `Confirm` and the next
-    /// `Candidate`, including the self-confirm band of a covering proposer.
-    fn rank_band(&self) -> usize {
-        match self {
-            UnionVerb::Propose { .. } => 0,
-            UnionVerb::Confirm { checked, .. } => 1 + checked.count(),
+impl CandidateExit {
+    fn from_formula(
+        variable: VariableId,
+        leaf_count: usize,
+        occurrence: usize,
+        verb: UnionVerb,
+        proposer_checked: bool,
+    ) -> Self {
+        assert!(
+            occurrence < leaf_count,
+            "Formula owner is not a leaf occurrence"
+        );
+        match verb {
+            UnionVerb::Propose { relevant } => {
+                assert!(
+                    relevant.is_valid_for(leaf_count) && relevant.contains(occurrence),
+                    "Formula proposer is not relevant"
+                );
+                let mut checked = ChildSet::empty(leaf_count);
+                if proposer_checked {
+                    checked.insert(occurrence);
+                }
+                Self {
+                    variable,
+                    relevant,
+                    checked,
+                }
+            }
+            UnionVerb::Confirm {
+                relevant,
+                mut checked,
+            } => {
+                assert!(
+                    relevant.is_valid_for(leaf_count)
+                        && checked.is_valid_for(leaf_count)
+                        && checked.is_subset_of(&relevant)
+                        && relevant.contains(occurrence)
+                        && !checked.contains(occurrence),
+                    "Formula confirmer is not an unchecked relevant occurrence"
+                );
+                checked.insert(occurrence);
+                Self {
+                    variable,
+                    relevant,
+                    checked,
+                }
+            }
         }
     }
 }
@@ -3619,26 +3676,9 @@ impl StateDesc {
                 );
             }
             ResidualPhase::Formula { cursor } => {
-                let resume = formula_pcs.resume(*cursor);
-                validate_variable(resume.variable);
-                assert!(
-                    resume.occurrence < leaf_count,
-                    "residual formula is not a leaf occurrence"
-                );
-                match &resume.verb {
-                    UnionVerb::Propose { relevant } => {
-                        assert!(relevant.is_valid_for(leaf_count));
-                        assert!(relevant.contains(resume.occurrence));
-                    }
-                    UnionVerb::Confirm { relevant, checked } => {
-                        validate_sets(relevant, checked);
-                        assert!(
-                            relevant.contains(resume.occurrence)
-                                && !checked.contains(resume.occurrence),
-                            "residual formula is not an unchecked relevant leaf"
-                        );
-                    }
-                }
+                let exit = formula_pcs.candidate_exit(*cursor);
+                validate_variable(exit.variable);
+                validate_sets(&exit.relevant, &exit.checked);
             }
         }
     }
@@ -3692,9 +3732,9 @@ impl StateDesc {
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
             ResidualPhase::Formula { cursor } => formula_pcs
-                .resume(*cursor)
-                .verb
-                .rank_band()
+                .candidate_exit(*cursor)
+                .checked
+                .count()
                 .checked_mul(action_span)
                 .and_then(|grade| grade.checked_add(1))
                 .and_then(|grade| {
@@ -3819,7 +3859,7 @@ struct StateId(u32);
 #[derive(Clone, Default)]
 struct FormulaPcInterner {
     // Insertion order, rather than a hash, determines stable query-local IDs.
-    resumes: IndexSet<FormulaOuterResume, ahash::RandomState>,
+    candidate_exits: IndexSet<CandidateExit, ahash::RandomState>,
     returns: IndexSet<FormulaReturnRecord, ahash::RandomState>,
     counters: IndexSet<FormulaPcRecord, ahash::RandomState>,
     // The compiler-derived grade is immutable with the exact PC. Successor
@@ -3829,15 +3869,15 @@ struct FormulaPcInterner {
 }
 
 impl FormulaPcInterner {
-    fn intern_resume(&mut self, resume: FormulaOuterResume) -> FormulaResumeId {
-        if self.resumes.len() > u32::MAX as usize {
-            if let Some(raw) = self.resumes.get_index_of(&resume) {
-                return FormulaResumeId(raw as u32);
+    fn intern_candidate_exit(&mut self, exit: CandidateExit) -> CandidateExitId {
+        if self.candidate_exits.len() > u32::MAX as usize {
+            if let Some(raw) = self.candidate_exits.get_index_of(&exit) {
+                return CandidateExitId(raw as u32);
             }
-            panic!("too many residual formula outer continuations");
+            panic!("too many residual formula Candidate exits");
         }
-        let (raw, _) = self.resumes.insert_full(resume);
-        FormulaResumeId(u32::try_from(raw).expect("too many residual formula outer continuations"))
+        let (raw, _) = self.candidate_exits.insert_full(exit);
+        CandidateExitId(u32::try_from(raw).expect("too many residual formula Candidate exits"))
     }
 
     fn intern_return(&mut self, address: FormulaReturnRecord) -> FormulaReturnId {
@@ -3901,12 +3941,13 @@ impl FormulaPcInterner {
             UnionVerb::Propose { .. } => FormulaStage::Propose,
             UnionVerb::Confirm { .. } => FormulaStage::Confirm,
         };
-        let resume = self.intern_resume(FormulaOuterResume {
+        let exit = self.intern_candidate_exit(CandidateExit::from_formula(
             variable,
+            program.roots.len(),
             occurrence,
             verb,
             proposer_checked,
-        });
+        ));
         let pc = self.intern_record(
             FormulaPcRecord {
                 focus: program.entry_focus(root, stage),
@@ -3914,7 +3955,7 @@ impl FormulaPcInterner {
             },
             1,
         );
-        FormulaCursor { pc, resume }
+        FormulaCursor { pc, exit }
     }
 
     /// Re-interns a root continuation with an exact-source discharge proof.
@@ -3924,20 +3965,34 @@ impl FormulaPcInterner {
     /// an Exact child as the proposer, the formula's confirmation suffix
     /// validates every remaining target-containing child. That partition can
     /// therefore return to the outer WCO continuation as already checked.
-    fn with_proposer_checked(&mut self, cursor: FormulaCursor) -> FormulaCursor {
+    fn with_proposer_checked(
+        &mut self,
+        program: &FiniteFormulaProgram,
+        cursor: FormulaCursor,
+    ) -> FormulaCursor {
         let record = self.get(cursor.pc);
         assert!(
             record.return_to.is_none(),
             "only a formula root may discharge its outer proposer"
         );
-        let mut resume = self.resume_by_id(cursor.resume).clone();
-        if resume.proposer_checked {
+        let occurrence = program.owner(record.focus.node());
+        assert_eq!(
+            program.root(occurrence),
+            Some(record.focus.node()),
+            "only a Formula root may discharge its outer proposer"
+        );
+        let mut exit = self.candidate_exit(cursor).clone();
+        assert!(
+            exit.relevant.contains(occurrence),
+            "Formula proposer is absent from its Candidate exit"
+        );
+        if exit.checked.contains(occurrence) {
             return cursor;
         }
-        resume.proposer_checked = true;
+        exit.checked.insert(occurrence);
         FormulaCursor {
             pc: cursor.pc,
-            resume: self.intern_resume(resume),
+            exit: self.intern_candidate_exit(exit),
         }
     }
 
@@ -4229,7 +4284,7 @@ impl FormulaPcInterner {
         &mut self,
         program: &FiniteFormulaProgram,
         cursor: FormulaCursor,
-    ) -> Result<InternedFormulaSuccessor, FormulaOuterResume> {
+    ) -> Result<InternedFormulaSuccessor, CandidateExitId> {
         let (completed, completed_stage, return_to, grade) = {
             let counter_record = self.get(cursor.pc);
             let FormulaFocus::Complete { node, stage } = counter_record.focus else {
@@ -4238,22 +4293,23 @@ impl FormulaPcInterner {
             (node, stage, counter_record.return_to, self.grade(cursor.pc))
         };
         let Some(return_to) = return_to else {
-            let resume = self.resume_by_id(cursor.resume);
             assert_ne!(
                 completed_stage,
                 FormulaStage::Support,
                 "a support traversal must return to a formula guard"
             );
-            assert_eq!(program.root(resume.occurrence), Some(completed));
-            let root_stage = match (&program.node(completed).kind, &resume.verb) {
-                (FiniteFormulaNodeKind::And { .. }, UnionVerb::Propose { .. }) => {
-                    FormulaStage::Confirm
-                }
-                (_, UnionVerb::Propose { .. }) => FormulaStage::Propose,
-                (_, UnionVerb::Confirm { .. }) => FormulaStage::Confirm,
-            };
-            assert_eq!(completed_stage, root_stage);
-            return Err(resume.clone());
+            assert_eq!(program.root(program.owner(completed)), Some(completed));
+            if matches!(
+                program.node(completed).kind,
+                FiniteFormulaNodeKind::And { .. }
+            ) {
+                assert_eq!(
+                    completed_stage,
+                    FormulaStage::Confirm,
+                    "a root AND can complete only after entering its confirmation suffix"
+                );
+            }
+            return Err(cursor.exit);
         };
         let address = *self.return_by_id(return_to);
         let (parent_node, parent_stage, parent_done, parent_return) = {
@@ -4278,7 +4334,7 @@ impl FormulaPcInterner {
             return Ok(InternedFormulaSuccessor::Guard {
                 parent: FormulaCursor {
                     pc: address.parent,
-                    resume: cursor.resume,
+                    exit: cursor.exit,
                 },
                 child: address.child,
             });
@@ -4302,7 +4358,7 @@ impl FormulaPcInterner {
         );
         Ok(InternedFormulaSuccessor::Formula(FormulaCursor {
             pc: parent,
-            resume: cursor.resume,
+            exit: cursor.exit,
         }))
     }
 
@@ -4312,14 +4368,14 @@ impl FormulaPcInterner {
             .expect("interned residual formula program counter exists")
     }
 
-    fn resume_by_id(&self, id: FormulaResumeId) -> &FormulaOuterResume {
-        self.resumes
+    fn candidate_exit_by_id(&self, id: CandidateExitId) -> &CandidateExit {
+        self.candidate_exits
             .get_index(id.0 as usize)
-            .expect("interned residual formula outer continuation exists")
+            .expect("interned residual formula Candidate exit exists")
     }
 
-    fn resume(&self, cursor: FormulaCursor) -> &FormulaOuterResume {
-        self.resume_by_id(cursor.resume)
+    fn candidate_exit(&self, cursor: FormulaCursor) -> &CandidateExit {
+        self.candidate_exit_by_id(cursor.exit)
     }
 
     fn return_by_id(&self, id: FormulaReturnId) -> &FormulaReturnRecord {
@@ -4358,8 +4414,8 @@ impl FormulaPcInterner {
     }
 
     #[cfg(test)]
-    fn resume_len(&self) -> usize {
-        self.resumes.len()
+    fn candidate_exit_len(&self) -> usize {
+        self.candidate_exits.len()
     }
 
     #[cfg(test)]
@@ -4393,7 +4449,7 @@ impl FormulaPcInterner {
         FormulaProgramCounter {
             focus: record.focus.clone(),
             returns: returns.into_boxed_slice(),
-            resume: self.resume(cursor).clone(),
+            exit: self.candidate_exit(cursor).clone(),
         }
     }
 }
@@ -4441,8 +4497,8 @@ impl StateInterner {
         self.formula_pcs.get(cursor.pc)
     }
 
-    fn formula_resume(&self, cursor: FormulaCursor) -> &FormulaOuterResume {
-        self.formula_pcs.resume(cursor)
+    fn formula_candidate_exit(&self, cursor: FormulaCursor) -> &CandidateExit {
+        self.formula_pcs.candidate_exit(cursor)
     }
 
     /// Returns the exact ID and whether the descriptor was already interned.
@@ -7337,26 +7393,26 @@ impl SelectedResidualTask {
                 let FormulaFocus::Action { node, stage } = &record.focus else {
                     return None;
                 };
-                let resume = interner.formula_resume(*cursor);
-                let occurrence = plan.formula_action_occurrence(resume.occurrence, *node);
+                let exit = interner.formula_candidate_exit(*cursor);
+                let occurrence = plan.formula_action_occurrence(*node);
                 let (action, candidates) = match stage {
                     FormulaStage::Support => (
                         ResidualAction::Support {
-                            variable: resume.variable,
+                            variable: exit.variable,
                             leaf: occurrence,
                         },
                         0,
                     ),
                     FormulaStage::Propose => (
                         ResidualAction::Propose {
-                            variable: resume.variable,
+                            variable: exit.variable,
                             leaf: occurrence,
                         },
                         0,
                     ),
                     FormulaStage::Confirm => (
                         ResidualAction::Confirm {
-                            variable: resume.variable,
+                            variable: exit.variable,
                             leaf: occurrence,
                         },
                         batch.action_candidate_count(*stage),
@@ -8224,7 +8280,11 @@ fn quoted_formula_propose_transition<'a>(
             ));
         }
     }
-    let exact_cursor = any_exact.then(|| interner.formula_pcs.with_proposer_checked(common_cursor));
+    let exact_cursor = any_exact.then(|| {
+        interner
+            .formula_pcs
+            .with_proposer_checked(&plan.finite_formula, common_cursor)
+    });
 
     let groups: Option<BTreeMap<FormulaReadyChoice, Vec<usize>>> = (!uniform_choice).then(|| {
         let mut groups = BTreeMap::new();
@@ -8707,7 +8767,7 @@ fn confirm_action_transition<'a>(
 fn finish_formula_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    resume: &FormulaOuterResume,
+    exit: CandidateExitId,
     batch: FormulaBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
@@ -8718,7 +8778,7 @@ fn finish_formula_transition(
     finish_formula_candidate_transition(
         plan,
         desc,
-        resume,
+        exit,
         candidate,
         worklist,
         interner,
@@ -8730,32 +8790,20 @@ fn finish_formula_transition(
 fn finish_formula_candidate_transition(
     plan: &ResidualPlan,
     desc: &StateDesc,
-    resume: &FormulaOuterResume,
+    exit: CandidateExitId,
     mut candidate: CandidateBatch,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
     reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
-    let leaf_count = plan.len();
-    let (relevant, checked) = match &resume.verb {
-        UnionVerb::Propose { relevant } => {
-            let mut checked = ChildSet::empty(leaf_count);
-            if resume.proposer_checked {
-                checked.insert(resume.occurrence);
-            }
-            (relevant.clone(), checked)
-        }
-        UnionVerb::Confirm { relevant, checked } => {
-            (relevant.clone(), checked.with_inserted(resume.occurrence))
-        }
-    };
+    let exit = interner.formula_pcs.candidate_exit_by_id(exit).clone();
     let successor = StateDesc {
         bound: desc.bound,
         phase: ResidualPhase::Candidate {
-            variable: resume.variable,
-            relevant,
-            checked,
+            variable: exit.variable,
+            relevant: exit.relevant,
+            checked: exit.checked,
         },
     };
     if crosses_candidate_set_boundary(desc, &successor, plan, &interner.formula_pcs) {
@@ -9118,10 +9166,10 @@ fn continue_formula_transition(
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("ordinary formula completion returned through a support guard")
         }
-        Err(resume) if destination == FormulaResultDestination::Root => finish_formula_transition(
+        Err(exit) if destination == FormulaResultDestination::Root => finish_formula_transition(
             plan,
             desc,
-            &resume,
+            exit,
             batch,
             worklist,
             interner,
@@ -9181,10 +9229,10 @@ fn finish_formula_or_admission(
                 Ok(InternedFormulaSuccessor::Guard { .. }) => {
                     unreachable!("candidate reducer returned through a support guard")
                 }
-                Err(resume) => finish_formula_transition(
+                Err(exit) => finish_formula_transition(
                     plan,
                     &desc,
-                    &resume,
+                    exit,
                     batch,
                     worklist,
                     interner,
@@ -9266,12 +9314,12 @@ fn finish_formula_or_emission(
             }));
             None
         }
-        (Err(resume), FormulaResultDestination::Root) => {
+        (Err(exit), FormulaResultDestination::Root) => {
             let candidate = batch.finish();
             finish_formula_candidate_transition(
                 plan,
                 &desc,
-                &resume,
+                exit,
                 candidate,
                 worklist,
                 interner,
@@ -9452,11 +9500,12 @@ fn formula_or_plan_transition<'a>(
     stats: &mut ResidualStateStats,
     reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
-    let resume = interner.formula_resume(cursor);
-    let (done, occurrence, variable) = match &interner.formula(cursor).focus {
-        FormulaFocus::Plan { done, .. } => (done.clone(), resume.occurrence, resume.variable),
+    let variable = interner.formula_candidate_exit(cursor).variable;
+    let (node, done) = match &interner.formula(cursor).focus {
+        FormulaFocus::Plan { node, done, .. } => (*node, done.clone()),
         _ => unreachable!("OR planning received an action continuation"),
     };
+    let occurrence = plan.finite_formula.owner(node);
     assert!(
         batch.or_count() > 0,
         "a Formula OR Plan lost its reducer cell"
@@ -9543,13 +9592,14 @@ fn formula_and_plan_transition<'a>(
     stats: &mut ResidualStateStats,
     reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
-    let resume = interner.formula_resume(cursor);
-    let (stage, done, occurrence, variable) = match &interner.formula(cursor).focus {
-        FormulaFocus::Plan { stage, done, .. } => {
-            (*stage, done.clone(), resume.occurrence, resume.variable)
-        }
+    let variable = interner.formula_candidate_exit(cursor).variable;
+    let (node, stage, done) = match &interner.formula(cursor).focus {
+        FormulaFocus::Plan {
+            node, stage, done, ..
+        } => (*node, *stage, done.clone()),
         _ => unreachable!("AND planning received an action continuation"),
     };
+    let occurrence = plan.finite_formula.owner(node);
     assert!(done.is_valid_for(children.len()));
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -9679,7 +9729,9 @@ fn formula_and_plan_transition<'a>(
                 desc.bound,
             ) == ProposalCoverage::Exact
         {
-            interner.formula_pcs.with_proposer_checked(next)
+            interner
+                .formula_pcs
+                .with_proposer_checked(&plan.finite_formula, next)
         } else {
             next
         };
@@ -9774,10 +9826,10 @@ fn finish_formula_action_result(
         Ok(InternedFormulaSuccessor::Guard { .. }) => {
             unreachable!("candidate action returned through a support guard")
         }
-        Err(resume) if destination == FormulaResultDestination::Root => finish_formula_transition(
+        Err(exit) if destination == FormulaResultDestination::Root => finish_formula_transition(
             plan,
             &desc,
-            &resume,
+            exit,
             batch,
             worklist,
             interner,
@@ -9802,11 +9854,12 @@ fn formula_action_transition<'a>(
     stats: &mut ResidualStateStats,
     reducer_seeds: &mut Vec<FormulaReducerSeed>,
 ) -> Option<ContinuationToken> {
-    let resume = interner.formula_resume(cursor);
-    let (node, stage, occurrence, variable) = match &interner.formula(cursor).focus {
-        FormulaFocus::Action { node, stage } => (*node, *stage, resume.occurrence, resume.variable),
+    let variable = interner.formula_candidate_exit(cursor).variable;
+    let (node, stage) = match &interner.formula(cursor).focus {
+        FormulaFocus::Action { node, stage } => (*node, *stage),
         _ => panic!("formula action received a planning continuation"),
     };
+    let occurrence = plan.finite_formula.owner(node);
     assert_eq!(batch.activations.len(), batch.parents.row_count);
 
     // Take the affine AND/arm stream before the parent-row view borrows the
@@ -11785,16 +11838,15 @@ impl ResidualStateMachine {
             return Err(task);
         };
         let cursor = *cursor;
-        let resume = self.interner.formula_resume(cursor);
-        let (node, stage, occurrence, outer_variable) = {
+        let outer_variable = self.interner.formula_candidate_exit(cursor).variable;
+        let (node, stage) = {
             let counter = self.interner.formula(cursor);
             match &counter.focus {
-                FormulaFocus::Action { node, stage } => {
-                    (*node, *stage, resume.occurrence, resume.variable)
-                }
+                FormulaFocus::Action { node, stage } => (*node, *stage),
                 _ => return Err(task),
             }
         };
+        let occurrence = plan.finite_formula.owner(node);
         let formula_node = plan.finite_formula.node(node);
         if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom) {
             return Err(task);
@@ -19419,11 +19471,10 @@ mod tests {
 
         let mut arena = FormulaPcInterner::default();
         let relevant = ChildSet::empty(2).with_inserted(0);
-        let _resume = arena.intern_resume(FormulaOuterResume {
+        let _exit = arena.intern_candidate_exit(CandidateExit {
             variable: 0,
-            occurrence: 0,
-            verb: UnionVerb::Propose { relevant },
-            proposer_checked: true,
+            relevant: relevant.clone(),
+            checked: relevant,
         });
         let parent = arena.intern_record(
             FormulaPcRecord {
@@ -19461,7 +19512,7 @@ mod tests {
         let second_id = arena.intern_record(second.clone(), 13);
         assert_ne!(first_id, second_id);
         assert_eq!(arena.len(), 3);
-        assert_eq!(arena.resume_len(), 1);
+        assert_eq!(arena.candidate_exit_len(), 1);
         assert_eq!(arena.return_len(), 1);
         assert_eq!(arena.get(first_id), &first);
         assert_eq!(arena.get(second_id), &second);
@@ -19507,13 +19558,10 @@ mod tests {
                 done: ChildSet::empty(2),
             }]
             .into_boxed_slice(),
-            resume: FormulaOuterResume {
+            exit: CandidateExit {
                 variable: 0,
-                occurrence: 0,
-                verb: UnionVerb::Propose {
-                    relevant: ChildSet::empty(2).with_inserted(0),
-                },
-                proposer_checked: true,
+                relevant: ChildSet::empty(2).with_inserted(0),
+                checked: ChildSet::empty(2).with_inserted(0),
             },
         };
 
@@ -19529,21 +19577,21 @@ mod tests {
             "a compact PC ID should reduce the owning descriptor layout"
         );
         eprintln!(
-            "formula_pc={} formula_record={} formula_pc_id={} formula_cursor={} state_desc={} legacy_state_desc={} resumes={} returns={} records={}",
+            "formula_pc={} formula_record={} formula_pc_id={} formula_cursor={} state_desc={} legacy_state_desc={} candidate_exits={} returns={} records={}",
             std::mem::size_of::<FormulaProgramCounter>(),
             std::mem::size_of::<FormulaPcRecord>(),
             std::mem::size_of::<FormulaPcId>(),
             std::mem::size_of::<FormulaCursor>(),
             std::mem::size_of::<StateDesc>(),
             std::mem::size_of::<LegacyStateDescLayout>(),
-            arena.resume_len(),
+            arena.candidate_exit_len(),
             arena.return_len(),
             arena.len(),
         );
     }
 
     #[test]
-    fn formula_cursor_quotients_structure_without_quotienting_outer_future() {
+    fn formula_cursor_quotients_structure_without_quotienting_candidate_future() {
         let root = IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
         let plan = ResidualPlan::compile_lowering(
             &root,
@@ -19570,14 +19618,16 @@ mod tests {
         );
 
         assert_eq!(unchecked.pc, checked.pc);
-        assert_ne!(unchecked.resume, checked.resume);
+        assert_ne!(unchecked.exit, checked.exit);
         assert_eq!(interner.formula_pcs.len(), 1);
-        assert_eq!(interner.formula_pcs.resume_len(), 2);
+        assert_eq!(interner.formula_pcs.candidate_exit_len(), 2);
         let structural_records = interner.formula_pcs.len();
         assert_eq!(
-            interner.formula_pcs.with_proposer_checked(unchecked),
+            interner
+                .formula_pcs
+                .with_proposer_checked(program, unchecked),
             checked,
-            "discharging the proposer must swap only the outer resume"
+            "discharging the proposer must swap only the Candidate exit"
         );
         assert_eq!(interner.formula_pcs.len(), structural_records);
 
@@ -19606,14 +19656,11 @@ mod tests {
             Some(program),
             &interner.formula_pcs,
         );
-        assert_eq!(
-            unchecked_rank, checked_rank,
-            "proposer discharge changes the future, not its structural grade or verb band"
-        );
+        assert_eq!(checked_rank - unchecked_rank, plan.action_span());
         let expected_rank = interner
-            .formula_resume(unchecked)
-            .verb
-            .rank_band()
+            .formula_candidate_exit(unchecked)
+            .checked
+            .count()
             .checked_mul(plan.action_span())
             .and_then(|rank| rank.checked_add(1))
             .and_then(|rank| rank.checked_add(interner.formula_pcs.grade(unchecked.pc)))
@@ -19624,8 +19671,8 @@ mod tests {
         let materialized_checked = interner.formula_pcs.materialize(checked);
         assert_eq!(materialized_unchecked.focus, materialized_checked.focus);
         assert_eq!(materialized_unchecked.returns, materialized_checked.returns);
-        assert!(!materialized_unchecked.resume.proposer_checked);
-        assert!(materialized_checked.resume.proposer_checked);
+        assert!(!materialized_unchecked.exit.checked.contains(0));
+        assert!(materialized_checked.exit.checked.contains(0));
 
         let advance_child = |interner: &mut StateInterner, cursor: FormulaCursor, child: usize| {
             let action = cursor.with_pc(
@@ -19651,13 +19698,13 @@ mod tests {
         assert_eq!(unchecked_action.pc, checked_action.pc);
         assert_eq!(unchecked_complete.pc, checked_complete.pc);
         assert_eq!(unchecked_parent.pc, checked_parent.pc);
-        assert_ne!(unchecked_parent.resume, checked_parent.resume);
+        assert_ne!(unchecked_parent.exit, checked_parent.exit);
         assert_eq!(interner.formula_pcs.len(), records_after_first_child);
         assert_eq!(interner.formula_pcs.return_len(), returns_after_first_child);
 
         let complete_root = |interner: &mut StateInterner,
                              cursor: FormulaCursor|
-         -> FormulaOuterResume {
+         -> CandidateExitId {
             let (_, _, parent) = advance_child(interner, cursor, 1);
             let root_complete = parent.with_pc(interner.formula_pcs.complete(program, parent.pc));
             interner
@@ -19669,10 +19716,136 @@ mod tests {
         let records_after_unchecked = interner.formula_pcs.len();
         let returns_after_unchecked = interner.formula_pcs.return_len();
         let checked_outer = complete_root(&mut interner, checked_parent);
-        assert!(!unchecked_outer.proposer_checked);
-        assert!(checked_outer.proposer_checked);
+        assert!(!interner
+            .formula_pcs
+            .candidate_exit_by_id(unchecked_outer)
+            .checked
+            .contains(0));
+        assert!(interner
+            .formula_pcs
+            .candidate_exit_by_id(checked_outer)
+            .checked
+            .contains(0));
         assert_eq!(interner.formula_pcs.len(), records_after_unchecked);
         assert_eq!(interner.formula_pcs.return_len(), returns_after_unchecked);
+    }
+
+    #[test]
+    fn exact_proposal_and_confirm_converge_on_one_formula_candidate_exit() {
+        let root = IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let program = &plan.finite_formula;
+        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
+        let mut formula_pcs = FormulaPcInterner::default();
+        let proposal = formula_pcs.start_with_proposer_checked(
+            program,
+            0,
+            0,
+            UnionVerb::Propose {
+                relevant: relevant.clone(),
+            },
+            true,
+        );
+        let confirm = formula_pcs.start(
+            program,
+            0,
+            0,
+            UnionVerb::Confirm {
+                relevant: relevant.clone(),
+                checked: ChildSet::empty(plan.len()),
+            },
+        );
+
+        let advance_first = |formula_pcs: &mut FormulaPcInterner, cursor: FormulaCursor| {
+            let action = cursor.with_pc(formula_pcs.select_child_as_action(program, cursor.pc, 0));
+            let complete = action.with_pc(formula_pcs.complete(program, action.pc));
+            let Ok(InternedFormulaSuccessor::Formula(parent)) =
+                formula_pcs.resume_completed(program, complete)
+            else {
+                panic!("first AND child escaped its Formula root")
+            };
+            (action, parent)
+        };
+        let (proposal_action, proposal_parent) = advance_first(&mut formula_pcs, proposal);
+        let (confirm_action, confirm_parent) = advance_first(&mut formula_pcs, confirm);
+
+        assert_ne!(
+            proposal_action.pc, confirm_action.pc,
+            "entry verbs must remain distinct while their actions differ"
+        );
+        assert_eq!(proposal_parent, confirm_parent);
+        let FormulaFocus::Plan {
+            stage: FormulaStage::Confirm,
+            done,
+            ..
+        } = &formula_pcs.get(proposal_parent.pc).focus
+        else {
+            panic!("converged AND did not enter confirmation planning")
+        };
+        assert_eq!(done, &ChildSet::empty(2).with_inserted(0));
+        assert_eq!(formula_pcs.grade(proposal_parent.pc), 5);
+
+        let proposal_desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula {
+                cursor: proposal_parent,
+            },
+        };
+        let confirm_desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Formula {
+                cursor: confirm_parent,
+            },
+        };
+        assert_eq!(
+            proposal_desc.rank_with_span(
+                plan.len(),
+                plan.action_span(),
+                Some(program),
+                &formula_pcs,
+            ),
+            confirm_desc.rank_with_span(
+                plan.len(),
+                plan.action_span(),
+                Some(program),
+                &formula_pcs,
+            )
+        );
+
+        let finish = |formula_pcs: &mut FormulaPcInterner, cursor: FormulaCursor| {
+            let action = cursor.with_pc(formula_pcs.select_child_as_action(program, cursor.pc, 1));
+            let complete = action.with_pc(formula_pcs.complete(program, action.pc));
+            let Ok(InternedFormulaSuccessor::Formula(parent)) =
+                formula_pcs.resume_completed(program, complete)
+            else {
+                panic!("second AND child escaped before its root completed")
+            };
+            let complete_root = parent.with_pc(formula_pcs.complete(program, parent.pc));
+            formula_pcs
+                .resume_completed(program, complete_root)
+                .expect_err("complete root did not expose its Candidate exit")
+        };
+        let proposal_exit = finish(&mut formula_pcs, proposal_parent);
+        let confirm_exit = finish(&mut formula_pcs, confirm_parent);
+        assert_eq!(proposal_exit, confirm_exit);
+        let inline_candidate = |exit: CandidateExitId| {
+            let exit = formula_pcs.candidate_exit_by_id(exit);
+            StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Candidate {
+                    variable: exit.variable,
+                    relevant: exit.relevant.clone(),
+                    checked: exit.checked.clone(),
+                },
+            }
+        };
+        assert_eq!(
+            inline_candidate(proposal_exit),
+            inline_candidate(confirm_exit)
+        );
     }
 
     fn candidate_payload(parent_count: usize, candidates: Candidates) -> CandidatePayload {
@@ -20238,7 +20411,7 @@ mod tests {
                 entered.push((
                     marker,
                     node,
-                    interner.formula_resume(cursor).proposer_checked,
+                    interner.formula_candidate_exit(cursor).checked.contains(0),
                 ));
             }
         }
@@ -20367,7 +20540,7 @@ mod tests {
                     rank,
                     cursor,
                     cursor.with_pc(parent),
-                    interner.formula_resume(cursor).proposer_checked,
+                    interner.formula_candidate_exit(cursor).checked.contains(0),
                 ));
             }
         }
@@ -20376,16 +20549,13 @@ mod tests {
         let exact = partitions[0];
         let covering = partitions[1];
         assert_ne!(exact.1, covering.1, "row-local partitions became one state");
-        assert_eq!(
-            exact.2, covering.2,
-            "receipt strength must not perturb the structural rank band"
-        );
+        assert_eq!(exact.2 - covering.2, plan.action_span());
         assert_eq!(
             exact.4.pc, covering.4.pc,
-            "checked and unchecked outer resumes duplicated the root PC"
+            "checked and unchecked Candidate exits duplicated the root PC"
         );
         assert_ne!(
-            exact.4.resume, covering.4.resume,
+            exact.4.exit, covering.4.exit,
             "row-local discharge receipts were quotiented with structure"
         );
         assert!(exact.5);
@@ -20399,10 +20569,10 @@ mod tests {
                 bound: desc.bound,
                 phase: ResidualPhase::Formula { cursor: covering.4 },
             },
-            "equal structural roots must retain distinct outer futures"
+            "equal structural roots must retain distinct Candidate futures"
         );
 
-        assert_eq!(interner.formula_pcs.resume_len(), 2);
+        assert_eq!(interner.formula_pcs.candidate_exit_len(), 2);
         assert_eq!(
             interner.formula_pcs.len(),
             3,
@@ -20603,7 +20773,7 @@ mod tests {
             panic!("quoted carrier did not enter its selected Formula child")
         };
         assert!(
-            interner.formula_resume(cursor).proposer_checked,
+            interner.formula_candidate_exit(cursor).checked.contains(0),
             "carrier entry lost the Exact root receipt and would self-confirm"
         );
     }
@@ -21642,8 +21812,8 @@ mod tests {
         };
         assert_ne!(children[0], children[1]);
         assert_ne!(
-            plan.formula_action_occurrence(0, children[0]),
-            plan.formula_action_occurrence(0, children[1])
+            plan.formula_action_occurrence(children[0]),
+            plan.formula_action_occurrence(children[1])
         );
         assert_ne!(
             program.node(children[0]).path,
@@ -21714,7 +21884,7 @@ mod tests {
         let ResidualPhase::Formula { cursor } = &interner.get(token.state).phase else {
             panic!("a finite formula proposal did not enter its compiled program")
         };
-        assert!(interner.formula_resume(*cursor).proposer_checked);
+        assert!(interner.formula_candidate_exit(*cursor).checked.contains(0));
 
         let covering_root = UnionConstraint::new(vec![
             arm(ProposalCoverage::Exact, ProposalCoverage::Exact),
@@ -23172,9 +23342,9 @@ mod tests {
                 | (_, Ok(InternedFormulaSuccessor::Guard { .. })) => {
                     panic!("ordinary compiler walk unexpectedly entered a guard")
                 }
-                (FormulaSuccessor::Outer(resume), Err(compact_resume)) => {
-                    assert_eq!(resume, counter.resume);
-                    assert_eq!(compact_resume, resume);
+                (FormulaSuccessor::Outer(exit), Err(compact_exit)) => {
+                    assert_eq!(exit, counter.exit);
+                    assert_eq!(formula_pcs.candidate_exit_by_id(compact_exit), &exit);
                     assert!(matches!(counter.focus, FormulaFocus::Complete { .. }));
                     break;
                 }
@@ -23218,13 +23388,14 @@ mod tests {
                 proposer: 1,
             },
         );
-        let start = formula_pcs.start(
+        let start = formula_pcs.start_with_proposer_checked(
             program,
             0,
             1,
             UnionVerb::Propose {
                 relevant: relevant.clone(),
             },
+            false,
         );
         let action = start.with_pc(formula_pcs.select_child_as_action(program, start.pc, 0));
         let child_complete = action.with_pc(formula_pcs.complete(program, action.pc));
@@ -23270,6 +23441,36 @@ mod tests {
         );
         assert_eq!(proposal_candidate, action_span);
         assert!(formula_ranks.last().unwrap() < &proposal_candidate);
+
+        // An Exact proposal already names the next checked Candidate band.
+        // Its Formula control follows Candidate{} but remains strictly before
+        // the exact Candidate{owner} future it will materialize.
+        let exact_start = formula_pcs.start_with_proposer_checked(
+            program,
+            0,
+            1,
+            UnionVerb::Propose {
+                relevant: relevant.clone(),
+            },
+            true,
+        );
+        let exact_start_rank = rank(
+            &formula_pcs,
+            ResidualPhase::Formula {
+                cursor: exact_start,
+            },
+        );
+        let exact_checked = ChildSet::empty(plan.len()).with_inserted(1);
+        let exact_candidate = rank(
+            &formula_pcs,
+            ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: exact_checked,
+            },
+        );
+        assert!(exact_start_rank > proposal_candidate);
+        assert!(exact_start_rank < exact_candidate);
 
         let checked = ChildSet::empty(plan.len());
         let outer_confirm = rank(
@@ -24857,7 +25058,7 @@ mod tests {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Formula { cursor: confirmer },
         };
-        let resume = interner.formula_resume(confirmer).clone();
+        let exit = confirmer.exit;
         let outer = StateDesc {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Candidate {
@@ -24899,7 +25100,7 @@ mod tests {
         let continuation = finish_formula_candidate_transition(
             &plan,
             &previous,
-            &resume,
+            exit,
             candidate,
             &mut worklist,
             &mut interner,
@@ -24941,7 +25142,7 @@ mod tests {
         assert!(finish_formula_candidate_transition(
             &plan,
             &previous,
-            &resume,
+            exit,
             deferred,
             &mut deferred_worklist,
             &mut interner,
