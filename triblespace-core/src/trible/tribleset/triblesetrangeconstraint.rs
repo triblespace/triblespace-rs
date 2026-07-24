@@ -12,7 +12,6 @@ use crate::query::ProgramRequest;
 use crate::query::ProgramRoute;
 use crate::query::ProgramSeedBatch;
 use crate::query::ProposalCoverage;
-use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
@@ -81,6 +80,17 @@ impl TribleSetRangeConstraint {
     fn contains(&self, value: &RawInline) -> bool {
         *value >= self.min && *value <= self.max && self.set.vea.has_prefix(value)
     }
+
+    fn proposal_page(
+        &self,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        direct_source_page(cursor, limit, accepted, |after| {
+            next_inline_source_in_range(&self.set.vea, &[], &self.min, &self.max, after)
+        })
+    }
 }
 
 impl TypedProgramSpec for TribleSetRangeConstraint {
@@ -123,11 +133,7 @@ impl TypedProgramSpec for TribleSetRangeConstraint {
             states,
             batch,
             effects,
-            |_input, cursor, limit, accepted| {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source_in_range(&self.set.vea, &[], &self.min, &self.max, after)
-                })
-            },
+            |_input, cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
             |_input, value| self.contains(value),
         )
     }
@@ -196,32 +202,6 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         Some(ProgramRef::new(self))
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        variable == self.variable_v && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if variable != self.variable_v
-            || view.len() != 1
-            || view.col(variable).is_some()
-            || candidates.is_some()
-        {
-            return None;
-        }
-        Some(direct_source_page(cursor, limit, accepted, |after| {
-            next_inline_source_in_range(&self.set.vea, &[], &self.min, &self.max, after)
-        }))
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_v) {
             Some(col) => view.iter().all(|row| self.contains(&row[col])),
@@ -242,6 +222,7 @@ mod tests {
     use crate::query::Constraint;
     use crate::query::ProgramAction;
     use crate::query::ProgramCompletion;
+    use crate::query::ProgramExposure;
     use crate::query::ProgramGrouping;
     use crate::query::ProgramRequest;
     use crate::query::ProgramStratum;
@@ -413,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn value_range_pages_are_strict_distinct_and_lazy() {
+    fn value_range_production_program_is_strict_distinct_and_lazy() {
         let v10: Inline<R256BE> = 10i128.to_inline();
         let v50: Inline<R256BE> = 50i128.to_inline();
         let v90: Inline<R256BE> = 90i128.to_inline();
@@ -428,7 +409,6 @@ mod tests {
         let mut context = VariableContext::new();
         let variable = context.next_variable::<R256BE>();
         let constraint = data.value_in_range(variable, v10, v90);
-        assert!(constraint.residual_proposal_source_is_paged(variable.index, &RowsView::EMPTY));
         let route = constraint
             .residual_program()
             .expect("value ranges expose a typed Program")
@@ -440,6 +420,7 @@ mod tests {
         assert_eq!(route.stratum, ProgramStratum::Finite);
         assert_eq!(route.grouping, ProgramGrouping::PageLocal);
         assert_eq!(route.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(route.exposure, ProgramExposure::Production);
         assert!(
             constraint.progress(
                 &crate::query::finiteunaryprogram::FiniteUnaryProgramState::Propose {
@@ -452,35 +433,13 @@ mod tests {
             )
         );
 
-        let mut roots = Vec::new();
         let mut direct = Vec::new();
-        let first = constraint
-            .residual_delta_source_page(
-                variable.index,
-                &RowsView::EMPTY,
-                None,
-                ResidualDeltaSourceCursor::Start,
-                1,
-                &mut roots,
-                &mut direct,
-            )
-            .expect("value ranges expose their PATCH frontier directly");
-        assert!(roots.is_empty());
+        let first = constraint.proposal_page(ResidualDeltaSourceCursor::Start, 1, &mut direct);
         assert_eq!(direct, [v10.raw]);
         assert_eq!(first.examined, 1);
         assert_eq!(first.next, Some(ResidualDeltaSourceCursor::After(v10.raw)));
 
-        let second = constraint
-            .residual_delta_source_page(
-                variable.index,
-                &RowsView::EMPTY,
-                None,
-                first.next.unwrap(),
-                2,
-                &mut roots,
-                &mut direct,
-            )
-            .expect("the strict cursor resumes the same immutable range");
+        let second = constraint.proposal_page(first.next.unwrap(), 2, &mut direct);
         assert_eq!(direct, [v10.raw, v50.raw, v90.raw]);
         assert_eq!(second.examined, 2);
         assert_eq!(second.next, None);
@@ -597,22 +556,10 @@ mod tests {
         assert_eq!(after, [v10.raw, v50.raw, v70.raw, v90.raw]);
 
         let inverted = grown.value_in_range(value, v90, v10);
-        let mut roots = Vec::new();
         let mut direct = Vec::new();
-        let empty = inverted
-            .residual_delta_source_page(
-                value.index,
-                &RowsView::EMPTY,
-                None,
-                ResidualDeltaSourceCursor::Start,
-                1,
-                &mut roots,
-                &mut direct,
-            )
-            .expect("an inverted immutable range is an exact empty frontier");
+        let empty = inverted.proposal_page(ResidualDeltaSourceCursor::Start, 1, &mut direct);
         assert_eq!(empty.examined, 0);
         assert_eq!(empty.next, None);
         assert!(direct.is_empty());
-        assert!(roots.is_empty());
     }
 }

@@ -35,9 +35,9 @@ use crate::query::{
     ProgramAction, ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote,
     ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
     ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm,
-    ResidualDeltaOutput, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
-    TriblePattern, TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink, TypedProgramBatch,
-    TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
+    ResidualDeltaSourceCursor, RowsView, Term, TriblePattern, TypedCompleteArbiter,
+    TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
+    TypedSeedSink, VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1379,15 +1379,14 @@ fn take_union_complete_walk_counts() -> UnionCompleteWalkCounts {
 /// per-row set-union semantics. Confirmation instead treats shard union as a
 /// physical representation detail: it filters the original candidate bag by
 /// OR-membership, preserving every surviving occurrence's tag, order, and
-/// multiplicity. The normalized proposal-page capability preserves a globally
-/// ordered, duplicate-free stream by merging one head per shard. The typed
-/// Program instead drains each shard's ordered cursor in attachment order and
-/// emits raw occurrences: the residual engine's activation-local SET boundary
-/// removes cross-shard duplicates before stable publication. Keeping the
-/// shard index in typed continuation state avoids reprobing every shard for
-/// every emitted value without weakening the logical union. The constraint
-/// deliberately stays structurally opaque so formula lowering cannot split
-/// the normalized source back into independently materialized union arms.
+/// multiplicity. The typed Program drains each shard's ordered cursor in
+/// attachment order and emits raw occurrences: the residual engine's
+/// activation-local SET boundary removes cross-shard duplicates before stable
+/// publication. Keeping the shard index in typed continuation state avoids
+/// reprobing every shard for every emitted value without weakening the logical
+/// union. The constraint deliberately stays structurally opaque so formula
+/// lowering cannot split the normalized source back into independently
+/// materialized union arms.
 pub struct UnionArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -1529,90 +1528,6 @@ where
                     "an unbounded complete Succinct walk retained a continuation"
                 );
             }
-        }
-    }
-
-    /// One exact page of the globally ordered, duplicate-free shard union.
-    /// Every shard contributes at most its first value after `cursor`; the
-    /// minimum head is emitted once and becomes the next value cursor.
-    fn proposal_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        mut cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
-        assert_eq!(view.len(), 1, "UnionArchive source pages have one parent");
-        assert!(
-            view.col(variable).is_none(),
-            "UnionArchive proposal target is already bound"
-        );
-        assert_eq!(
-            self.variable_position_mask(variable).count_ones(),
-            1,
-            "UnionArchive proposal target must occupy exactly one position"
-        );
-        assert!(
-            limit > 0,
-            "UnionArchive source pages require positive demand"
-        );
-        if matches!(cursor, ResidualDeltaSourceCursor::Offset(_)) {
-            panic!("UnionArchive source received an ordinal cursor");
-        }
-
-        let accepted_base = accepted.len();
-        let mut next = None;
-        let mut heads = Vec::with_capacity(self.shards.len());
-        let mut shard_accepted = Vec::new();
-        while accepted.len() - accepted_base < limit {
-            heads.clear();
-            for shard in &self.shards {
-                shard_accepted.clear();
-                let page = shard.proposal_source_page_single(
-                    variable,
-                    view,
-                    cursor,
-                    1,
-                    &mut shard_accepted,
-                );
-                assert_eq!(
-                    shard_accepted.len(),
-                    page.examined,
-                    "a Succinct proposal source rejected its own candidate"
-                );
-                assert!(
-                    shard_accepted.len() <= 1,
-                    "a Succinct shard exceeded one-head demand"
-                );
-                if let Some(value) = shard_accepted.pop() {
-                    heads.push((value, page.next.is_some()));
-                } else {
-                    assert!(
-                        page.next.is_none(),
-                        "an empty Succinct shard page retained hidden work"
-                    );
-                }
-            }
-
-            let Some(value) = heads.iter().map(|(value, _)| *value).min() else {
-                next = None;
-                break;
-            };
-            accepted.push(value);
-            cursor = ResidualDeltaSourceCursor::After(value);
-            let has_more = heads
-                .iter()
-                .any(|(head, local_more)| *head > value || (*head == value && *local_more));
-            next = has_more.then_some(cursor);
-            if !has_more {
-                break;
-            }
-        }
-
-        ResidualDeltaSourcePage {
-            next,
-            examined: accepted.len() - accepted_base,
         }
     }
 }
@@ -2224,42 +2139,6 @@ where
 
     fn influence(&self, variable: VariableId) -> VariableSet {
         self.union.influence(variable)
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        view.col(variable).is_none()
-            // The shard merge consumes one emitted head per examined value.
-            // Repeated-position Succinct sources may reject driver values, so
-            // they need a different bounded per-shard head-discovery proof.
-            && self
-                .terms
-                .iter()
-                .filter(|term| term.is_var(variable))
-                .count()
-                == 1
-            && self
-                .shards
-                .iter()
-                .all(|shard| shard.residual_proposal_source_is_paged(variable, view))
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if candidates.is_some()
-            || view.len() != 1
-            || !self.residual_proposal_source_is_paged(variable, view)
-        {
-            return None;
-        }
-        Some(self.proposal_source_page(variable, view, cursor, limit, accepted))
     }
 
     fn residual_program(&self) -> Option<ProgramRef<'_>> {

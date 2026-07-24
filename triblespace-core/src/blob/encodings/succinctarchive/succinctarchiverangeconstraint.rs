@@ -12,9 +12,6 @@ use crate::query::ProgramRequest;
 use crate::query::ProgramRoute;
 use crate::query::ProgramSeedBatch;
 use crate::query::ProposalCoverage;
-use crate::query::ResidualDeltaOutput;
-use crate::query::ResidualDeltaSourceCursor;
-use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::TypedEffectSink;
 use crate::query::TypedProgramBatch;
@@ -223,36 +220,6 @@ where
 
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        variable == self.variable_v && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if candidates.is_some()
-            || view.len() != 1
-            || !self.residual_proposal_source_is_paged(variable, view)
-        {
-            return None;
-        }
-        Some(super::succinctarchiveconstraint::page_domain(
-            self.archive,
-            &self.archive.v_a,
-            self.archive.domain.search_range(&self.min, &self.max),
-            cursor,
-            limit,
-            accepted,
-        ))
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {

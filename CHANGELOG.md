@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Built-in finite proposal sources now use one Production typed Program
+  pager.** PATCH value/ID membership, sorted slices, SuccinctArchive and
+  TribleSet patterns and ranges, and UnionArchive no longer duplicate paging
+  through the legacy residual hooks. Custom legacy constraints remain
+  supported.
 - **Breaking: ordinary queries now have one fixed residual compiler policy.**
   Serial iteration, ordinary Rayon iteration, saturated parallel iteration,
   and private RPQ subframes all compile native AND regions with finite

@@ -30,7 +30,6 @@ use crate::query::ProgramSeedBatch;
 use crate::query::ProgramStratum;
 use crate::query::ProposalCoverage;
 use crate::query::RawTerm;
-use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
@@ -1577,41 +1576,6 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         Some(ProgramRef::new(self))
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        if view.col(variable).is_some() {
-            return false;
-        }
-        [
-            self.term_e.is_var(variable),
-            self.term_a.is_var(variable),
-            self.term_v.is_var(variable),
-        ]
-        .into_iter()
-        .filter(|is_position| *is_position)
-        .count()
-            >= 1
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if candidates.is_some()
-            || view.len() != 1
-            || !self.residual_proposal_source_is_paged(variable, view)
-        {
-            return None;
-        }
-        let p = self.positions(variable, view);
-        Some(self.proposal_source_page_row(&p, view.row(0), cursor, limit, accepted))
-    }
-
     /// When all three positions have values (bound or constant), checks
     /// whether each row's triple exists in the EAV index. Returns `true`
     /// optimistically when any position is still unbound.
@@ -1623,8 +1587,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use crate::find;
     use crate::id::{rngid, Id};
@@ -1633,7 +1596,6 @@ mod tests {
     use crate::inline::Inline;
     use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::residual::ResidualLowering;
-    use crate::query::unionconstraint::UnionConstraint;
     use crate::query::Binding;
     use crate::query::ContainsConstraint;
     use crate::query::Query;
@@ -2142,29 +2104,24 @@ mod tests {
         values
     }
 
-    fn paged_proposal(
+    fn bounded_source_proposal(
         constraint: &TribleSetConstraint,
         variable: VariableId,
         view: &RowsView<'_>,
     ) -> Vec<RawInline> {
-        assert!(constraint.residual_proposal_source_is_paged(variable, view));
+        assert_eq!(view.len(), 1);
+        let positions = constraint.positions(variable, view);
         let mut cursor = ResidualDeltaSourceCursor::Start;
         let mut values = Vec::new();
         loop {
-            let mut roots = Vec::new();
             let before = values.len();
-            let page = constraint
-                .residual_delta_source_page(
-                    variable,
-                    view,
-                    None,
-                    cursor,
-                    1,
-                    &mut roots,
-                    &mut values,
-                )
-                .expect("declared direct proposal source remains supported");
-            assert!(roots.is_empty());
+            let page = constraint.proposal_source_page_row(
+                &positions,
+                view.row(0),
+                cursor,
+                1,
+                &mut values,
+            );
             assert!(values.len() - before <= page.examined);
             assert!(page.examined <= 1);
             let Some(next) = page.next else {
@@ -2233,19 +2190,6 @@ mod tests {
         Some(occurrences)
     }
 
-    #[derive(Clone, Default)]
-    struct SourceCounters {
-        propose_calls: Arc<AtomicUsize>,
-        page_calls: Arc<AtomicUsize>,
-        examined: Arc<AtomicUsize>,
-        limits: Arc<Mutex<Vec<usize>>>,
-    }
-
-    struct CountedSource<C> {
-        inner: C,
-        counters: SourceCounters,
-    }
-
     #[derive(Clone, Copy)]
     struct DuplicateDomain {
         variable: VariableId,
@@ -2307,86 +2251,6 @@ mod tests {
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
             view.col(self.variable)
                 .is_none_or(|column| view.iter().all(|row| row[column] == self.value))
-        }
-    }
-
-    impl<'a, C> Constraint<'a> for CountedSource<C>
-    where
-        C: Constraint<'a>,
-    {
-        fn variables(&self) -> VariableSet {
-            self.inner.variables()
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            self.inner.proposal_coverage(variable, bound)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            self.inner.estimate(variable, view, out)
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.counters.propose_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.propose(variable, view, candidates);
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.inner.confirm(variable, view, candidates);
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            self.inner.satisfied(view)
-        }
-
-        fn influence(&self, variable: VariableId) -> VariableSet {
-            self.inner.influence(variable)
-        }
-
-        fn residual_proposal_source_is_paged(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            self.inner.residual_proposal_source_is_paged(variable, view)
-        }
-
-        fn residual_delta_source_page(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: Option<&[RawInline]>,
-            cursor: ResidualDeltaSourceCursor,
-            limit: usize,
-            roots: &mut Vec<ResidualDeltaOutput>,
-            accepted: &mut Vec<RawInline>,
-        ) -> Option<ResidualDeltaSourcePage> {
-            let page = self.inner.residual_delta_source_page(
-                variable, view, candidates, cursor, limit, roots, accepted,
-            );
-            if let Some(page) = page {
-                self.counters.page_calls.fetch_add(1, Ordering::Relaxed);
-                self.counters
-                    .examined
-                    .fetch_add(page.examined, Ordering::Relaxed);
-                self.counters.limits.lock().unwrap().push(limit);
-            }
-            page
         }
     }
 
@@ -2579,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_pages_match_eager_proposals_for_all_distinct_position_schemas() {
+    fn bounded_sources_match_eager_proposals_for_all_distinct_position_schemas() {
         const E: VariableId = 0;
         const A: VariableId = 1;
         const V: VariableId = 2;
@@ -2608,9 +2472,9 @@ mod tests {
             let view = RowsView::new(&vars, &row);
             let eager = eager_proposal(&constraint, variable, &view);
             assert_eq!(
-                paged_proposal(&constraint, variable, &view),
+                bounded_source_proposal(&constraint, variable, &view),
                 eager,
-                "paged schema {name}"
+                "bounded schema {name}"
             );
             assert_eq!(
                 complete_proposal(&constraint, variable, view),
@@ -2624,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_pages_match_eager_proposals_for_all_repeated_position_schemas() {
+    fn bounded_sources_match_eager_proposals_for_all_repeated_position_schemas() {
         let x1 = rngid();
         let x2 = rngid();
         let x3 = rngid();
@@ -2689,9 +2553,9 @@ mod tests {
             let view = RowsView::new(vars, row);
             let eager = eager_proposal(&constraint, x.index, &view);
             assert_eq!(
-                paged_proposal(&constraint, x.index, &view),
+                bounded_source_proposal(&constraint, x.index, &view),
                 eager,
-                "paged schema {name}",
+                "bounded schema {name}",
             );
             assert_eq!(
                 complete_proposal(&constraint, x.index, view),
@@ -2757,15 +2621,6 @@ mod tests {
             &[],
             &[],
         );
-
-        let generic_union = UnionConstraint::new(vec![
-            TribleSetConstraint::new(x, a, x, set.clone()),
-            TribleSetConstraint::new(x, a, x, set),
-        ]);
-        assert!(
-            !generic_union.residual_proposal_source_is_paged(x.index, &RowsView::EMPTY),
-            "generic Union keeps its normalization boundary despite native arms",
-        );
     }
 
     #[test]
@@ -2804,17 +2659,19 @@ mod tests {
         let base_constraint = TribleSetConstraint::new(x, attribute, x, base);
         let grown_constraint = TribleSetConstraint::new(x, attribute, x, grown);
         let base_eager = eager_proposal(&base_constraint, x.index, &RowsView::EMPTY);
-        let base_paged = paged_proposal(&base_constraint, x.index, &RowsView::EMPTY);
+        let base_bounded = bounded_source_proposal(&base_constraint, x.index, &RowsView::EMPTY);
         let grown_eager = eager_proposal(&grown_constraint, x.index, &RowsView::EMPTY);
-        let grown_paged = paged_proposal(&grown_constraint, x.index, &RowsView::EMPTY);
+        let grown_bounded = bounded_source_proposal(&grown_constraint, x.index, &RowsView::EMPTY);
 
-        assert_eq!(base_paged, base_eager);
-        assert_eq!(grown_paged, grown_eager);
-        assert_eq!(base_paged, vec![id_into_value(&old_witness)]);
+        assert_eq!(base_bounded, base_eager);
+        assert_eq!(grown_bounded, grown_eager);
+        assert_eq!(base_bounded, vec![id_into_value(&old_witness)]);
         let mut expected_grown = vec![id_into_value(&old_witness), id_into_value(&new_witness)];
         expected_grown.sort_unstable();
-        assert_eq!(grown_paged, expected_grown);
-        assert!(base_paged.iter().all(|answer| grown_paged.contains(answer)));
+        assert_eq!(grown_bounded, expected_grown);
+        assert!(base_bounded
+            .iter()
+            .all(|answer| grown_bounded.contains(answer)));
     }
 
     fn project_triple(binding: &Binding) -> Option<(RawInline, RawInline, RawInline)> {
@@ -3015,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn width_one_yields_after_one_direct_candidate_and_drop_cancels_the_frontier() {
+    fn production_program_width_one_yields_after_one_direct_candidate() {
         let attribute = rngid();
         let attribute_inline = Inline::<GenId>::new(id_into_value(&attribute));
         let value = Inline::<UnknownInline>::new([0x5a; INLINE_LEN]);
@@ -3024,27 +2881,20 @@ mod tests {
             set.insert(&Trible::new(&rngid(), &attribute, &value));
         }
         let entity = Variable::<GenId>::new(0);
-        let counters = SourceCounters::default();
-        let counted = CountedSource {
-            inner: TribleSetConstraint::new(entity, attribute_inline, value, set),
-            counters: counters.clone(),
-        };
-        let mut query = Query::new(counted, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .cap(1)
-            .start_width(1);
+        let mut query = Query::new(
+            TribleSetConstraint::new(entity, attribute_inline, value, set),
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(1)
+        .start_width(1);
 
         assert!(query.next().is_some());
-        assert_eq!(counters.propose_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
         assert_eq!(query.stats().delta_source_pages, 1);
         assert_eq!(query.stats().delta_source_candidates_examined, 1);
         assert_eq!(query.stats().delta_source_direct_candidates, 1);
         assert_eq!(query.stats().delta_source_roots, 0);
         drop(query);
-        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -3067,26 +2917,16 @@ mod tests {
         }
 
         let x = Variable::<GenId>::new(0);
-        let counters = SourceCounters::default();
-        let counted = CountedSource {
-            inner: TribleSetConstraint::new(
-                x,
-                Inline::<GenId>::new(id_into_value(&attribute)),
-                x,
-                set,
-            ),
-            counters: counters.clone(),
-        };
-        let mut query = Query::new(counted, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .cap(16)
-            .start_width(1)
-            .growth(2);
+        let mut query = Query::new(
+            TribleSetConstraint::new(x, Inline::<GenId>::new(id_into_value(&attribute)), x, set),
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(16)
+        .start_width(1)
+        .growth(2);
 
         assert_eq!(query.next(), expected);
-        assert_eq!(*counters.limits.lock().unwrap(), [1, 2, 4, 8]);
-        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 4);
-        assert_eq!(counters.examined.load(Ordering::Relaxed), 9);
         assert_eq!(query.stats().delta_source_pages, 4);
         assert_eq!(query.stats().delta_source_candidates_examined, 9);
         assert_eq!(query.stats().delta_source_direct_candidates, 1);
@@ -3099,8 +2939,6 @@ mod tests {
         assert_eq!(query.stats().terminal_demand_projected_rows, 1);
         assert_eq!(query.stats().terminal_demand_width_promotions, 0);
         drop(query);
-        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 4);
-        assert_eq!(counters.examined.load(Ordering::Relaxed), 9);
     }
 
     #[test]

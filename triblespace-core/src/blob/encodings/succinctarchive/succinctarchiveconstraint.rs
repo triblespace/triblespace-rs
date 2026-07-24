@@ -1823,36 +1823,6 @@ where
         Some(ProgramRef::new(self))
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        if view.col(variable).is_some() {
-            return false;
-        }
-        usize::from(self.term_e.is_var(variable))
-            + usize::from(self.term_a.is_var(variable))
-            + usize::from(self.term_v.is_var(variable))
-            >= 1
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if candidates.is_some()
-            || view.len() != 1
-            || !self.residual_proposal_source_is_paged(variable, view)
-        {
-            return None;
-        }
-        let p = self.positions(variable, view);
-        Some(self.proposal_source_page_row(&p, view.row(0), cursor, limit, accepted))
-    }
-
     /// Exact when entity, attribute, and value all have values (bound or
     /// constant): checks whether the archive contains that exact triple
     /// (E→A→V range restriction, mirroring `TribleSetConstraint`'s

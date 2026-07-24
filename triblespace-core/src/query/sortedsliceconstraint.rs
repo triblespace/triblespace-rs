@@ -385,39 +385,6 @@ where
         }
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.variable.index == variable && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if self.variable.index != variable
-            || view.len() != 1
-            || view.col(variable).is_some()
-            || candidates.is_some()
-        {
-            return None;
-        }
-        let begin = match cursor {
-            ResidualDeltaSourceCursor::Start => 0,
-            ResidualDeltaSourceCursor::Offset(index) => {
-                usize::try_from(index).expect("sorted-slice source cursor exceeds usize")
-            }
-            ResidualDeltaSourceCursor::After(_) => {
-                panic!("sorted-slice source received a raw-value cursor")
-            }
-        };
-        Some(self.proposal_page_from_offset(begin, limit, accepted))
-    }
-
     /// Exact when the variable is bound: binary-searches the slice for
     /// every row's bound value. Returns `true` optimistically while the
     /// variable is unbound.
@@ -504,12 +471,11 @@ mod tests {
     }
 
     #[test]
-    fn ordinal_pages_preserve_occurrences_before_set_projection() {
+    fn ordinal_program_pages_preserve_occurrences_before_set_projection() {
         let values = [value(1), value(1), value(2), value(3)];
         let slice = SortedSlice::new(&values).unwrap();
         let variable = Variable::<UnknownInline>::new(0);
         let constraint = SortedSliceConstraint::new(variable, slice);
-        assert!(constraint.residual_proposal_source_is_paged(variable.index, &RowsView::EMPTY));
         let program = constraint.residual_program().unwrap();
         let route = program
             .route(ProgramRequest {
@@ -520,41 +486,20 @@ mod tests {
         assert_eq!(route.stratum, ProgramStratum::Finite);
         assert_eq!(route.grouping, ProgramGrouping::PageLocal);
         assert_eq!(route.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(route.exposure, ProgramExposure::Production);
         assert!(
             constraint.progress(&SortedSliceProgramState::Propose { offset: 0 })
                 > constraint.progress(&SortedSliceProgramState::Propose { offset: 1 })
         );
 
-        let mut roots = Vec::new();
         let mut direct = Vec::new();
-        let first = constraint
-            .residual_delta_source_page(
-                variable.index,
-                &RowsView::EMPTY,
-                None,
-                ResidualDeltaSourceCursor::Start,
-                1,
-                &mut roots,
-                &mut direct,
-            )
-            .expect("sorted slices expose an ordinal proposal frontier");
-        assert!(roots.is_empty());
+        let first = constraint.proposal_page_from_offset(0, 1, &mut direct);
         assert_eq!(direct, [value(1).raw]);
         assert_eq!(first.examined, 1);
         assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(1)));
 
         direct.clear();
-        let second = constraint
-            .residual_delta_source_page(
-                variable.index,
-                &RowsView::EMPTY,
-                None,
-                first.next.unwrap(),
-                2,
-                &mut roots,
-                &mut direct,
-            )
-            .expect("the ordinal cursor resumes without raw-order assumptions");
+        let second = constraint.proposal_page_from_offset(1, 2, &mut direct);
         assert_eq!(direct, [value(1).raw, value(2).raw]);
         assert_eq!(second.examined, 2);
         assert_eq!(second.next, Some(ResidualDeltaSourceCursor::Offset(3)));

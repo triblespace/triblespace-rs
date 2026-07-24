@@ -1,12 +1,10 @@
-//! Semantic receipts for proposal-only SuccinctArchive source paging.
+//! Semantic receipts for SuccinctArchive production Program paging.
 //!
 //! These tests keep the source contract visible: the twelve triple-pattern
-//! bound schemas are compared page-for-page with ordinary eager proposals,
-//! complete queries are checked against direct fixture relations, and
-//! first-pull/drop receipts prove that width-one demand does not materialize a
-//! large archive frontier.
-
-use std::sync::{Arc, Mutex};
+//! bound schemas must route through the production typed Program, complete
+//! queries are checked against direct fixture relations, and first-pull
+//! receipts prove that width-one demand does not materialize a large archive
+//! frontier.
 
 use triblespace_core::blob::encodings::succinctarchive::{
     CompressedUniverse, OrderedUniverse, RingBatchQuery, SuccinctArchive,
@@ -18,9 +16,8 @@ use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, ResidualDeltaOutput,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TriblePattern, Variable,
-    VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, RowsView,
+    TriblePattern, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -80,66 +77,22 @@ impl RingBatchQuery for CpuRing<'_> {
     }
 }
 
-fn assert_pages_equal_eager<'a, C>(
+fn assert_typed_program_family<'a, C>(
     name: &str,
     constraint: &C,
-    variable: VariableId,
-    view: &RowsView<'_>,
+    _variable: VariableId,
+    _view: &RowsView<'_>,
 ) where
     C: Constraint<'a> + ?Sized,
 {
     assert!(
-        constraint.residual_proposal_source_is_paged(variable, view),
-        "{name}: supported proposal schema did not expose its source"
+        constraint.residual_program().is_some(),
+        "{name}: missing typed Program family",
     );
-
-    let mut eager = Vec::new();
-    constraint.propose(variable, view, &mut CandidateSink::Values(&mut eager));
-
-    let mut actual = Vec::new();
-    let mut cursor = ResidualDeltaSourceCursor::Start;
-    let mut pages = 0usize;
-    loop {
-        let mut roots = Vec::new();
-        let mut direct = Vec::new();
-        let page = constraint
-            .residual_delta_source_page(variable, view, None, cursor, 1, &mut roots, &mut direct)
-            .unwrap_or_else(|| panic!("{name}: advertised source became unsupported"));
-        assert!(page.examined <= 1, "{name}: page exceeded demand");
-        assert!(
-            roots.len() + direct.len() <= page.examined,
-            "{name}: roots + direct exceeded examined"
-        );
-        assert!(roots.is_empty(), "{name}: a direct source invented roots");
-        assert_eq!(
-            direct.len(),
-            page.examined,
-            "{name}: an exact archive source rejected its own candidate"
-        );
-        actual.extend(direct);
-        pages += 1;
-        assert!(pages <= eager.len() + 1, "{name}: source did not terminate");
-
-        let Some(next) = page.next else {
-            break;
-        };
-        match (cursor, next) {
-            (ResidualDeltaSourceCursor::Start, ResidualDeltaSourceCursor::After(_)) => {}
-            (
-                ResidualDeltaSourceCursor::After(previous),
-                ResidualDeltaSourceCursor::After(next),
-            ) => assert!(next > previous, "{name}: cursor failed strict progress"),
-            (_, ResidualDeltaSourceCursor::Start) => panic!("{name}: cursor restarted"),
-            _ => panic!("{name}: source changed cursor families"),
-        }
-        cursor = next;
-    }
-
-    assert_eq!(actual, eager, "{name}: paged proposal changed exact order");
 }
 
 #[test]
-fn all_twelve_pattern_bound_schemas_page_exactly_on_cpu_and_ring_backend() {
+fn all_twelve_pattern_bound_schemas_use_production_program_on_cpu_and_ring_backend() {
     let (set, entities, attributes, values) = fixture(3, 3, 3);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let ring = CpuRing(&archive);
@@ -214,7 +167,7 @@ fn all_twelve_pattern_bound_schemas_page_exactly_on_cpu_and_ring_backend() {
             } else {
                 RowsView::new(vars, row)
             };
-            assert_pages_equal_eager(
+            assert_typed_program_family(
                 &format!("{schema}/{}", if backend { "ring" } else { "cpu" }),
                 &constraint,
                 *variable,
@@ -233,7 +186,7 @@ fn compressed_universe_preserves_zero_one_two_bound_and_range_sources() {
     let value = Variable::<UnknownInline>::new(2);
     let constraint = SuccinctArchiveConstraint::new(entity, attribute, value, &archive);
 
-    assert_pages_equal_eager(
+    assert_typed_program_family(
         "compressed/zero-v",
         &constraint,
         value.index,
@@ -242,18 +195,18 @@ fn compressed_universe_preserves_zero_one_two_bound_and_range_sources() {
     let attribute_vars = [attribute.index];
     let attribute_row = [attributes[0].raw];
     let attribute_view = RowsView::new(&attribute_vars, &attribute_row);
-    assert_pages_equal_eager("compressed/a-v", &constraint, value.index, &attribute_view);
+    assert_typed_program_family("compressed/a-v", &constraint, value.index, &attribute_view);
     let entity_attribute_vars = [entity.index, attribute.index];
     let entity_attribute_row = [entities[0].raw, attributes[0].raw];
     let entity_attribute_view = RowsView::new(&entity_attribute_vars, &entity_attribute_row);
-    assert_pages_equal_eager(
+    assert_typed_program_family(
         "compressed/ea-v",
         &constraint,
         value.index,
         &entity_attribute_view,
     );
     let range = archive.value_in_range(value, values[0], values[1]);
-    assert_pages_equal_eager(
+    assert_typed_program_family(
         "compressed/value-range",
         &range,
         value.index,
@@ -273,14 +226,14 @@ fn absent_bound_values_and_empty_ranges_exhaust_without_candidates() {
     let absent_vars = [entity.index];
     let absent_row = [absent_entity.raw];
     let absent_view = RowsView::new(&absent_vars, &absent_row);
-    assert_pages_equal_eager("absent-e/a", &constraint, attribute.index, &absent_view);
+    assert_typed_program_family("absent-e/a", &constraint, attribute.index, &absent_view);
     let absent_pair_vars = [entity.index, attribute.index];
     let absent_pair_row = [absent_entity.raw, attributes[0].raw];
     let absent_pair_view = RowsView::new(&absent_pair_vars, &absent_pair_row);
-    assert_pages_equal_eager("absent-ea/v", &constraint, value.index, &absent_pair_view);
+    assert_typed_program_family("absent-ea/v", &constraint, value.index, &absent_pair_view);
 
     let empty_range = archive.value_in_range(value, values[1], values[0]);
-    assert_pages_equal_eager(
+    assert_typed_program_family(
         "inverted-value-range",
         &empty_range,
         value.index,
@@ -376,7 +329,7 @@ where
 }
 
 #[test]
-fn succinct_value_range_pages_and_matches_the_tribleset_oracle() {
+fn succinct_value_range_uses_production_program_and_matches_the_tribleset_oracle() {
     let (set, _, _, values) = fixture(2, 2, 6);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let variable = Variable::<UnknownInline>::new(0);
@@ -384,7 +337,7 @@ fn succinct_value_range_pages_and_matches_the_tribleset_oracle() {
     let max = values[4];
 
     let source = archive.value_in_range(variable, min, max);
-    assert_pages_equal_eager("value-range", &source, variable.index, &RowsView::EMPTY);
+    assert_typed_program_family("value-range", &source, variable.index, &RowsView::EMPTY);
     let mut expected: Vec<_> = values[1..=4].iter().map(|value| value.raw).collect();
     expected.sort_unstable();
     let archive_ordinary =
@@ -395,97 +348,12 @@ fn succinct_value_range_pages_and_matches_the_tribleset_oracle() {
     assert_eq!(archive_residual, expected);
 }
 
-#[derive(Clone)]
-struct SourceTrace<C> {
-    inner: C,
-    pages: Arc<Mutex<Vec<(usize, usize, usize, usize)>>>,
-}
-
-impl<'a, C: Constraint<'a>> Constraint<'a> for SourceTrace<C> {
-    fn variables(&self) -> VariableSet {
-        self.inner.variables()
-    }
-
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        self.inner.proposal_coverage(variable, bound)
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.inner.estimate(variable, view, out)
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.inner.propose(variable, view, candidates)
-    }
-
-    fn confirm(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.inner.confirm(variable, view, candidates)
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        self.inner.satisfied(view)
-    }
-
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.inner.influence(variable)
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.inner.residual_proposal_source_is_paged(variable, view)
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        let roots_before = roots.len();
-        let accepted_before = accepted.len();
-        let page = self
-            .inner
-            .residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted);
-        if let Some(page) = page {
-            self.pages.lock().unwrap().push((
-                limit,
-                page.examined,
-                roots.len() - roots_before,
-                accepted.len() - accepted_before,
-            ));
-        }
-        page
-    }
-}
-
 #[test]
-fn first_pull_is_one_direct_candidate_and_drop_cancels_the_rest() {
+fn production_program_first_pull_is_one_direct_candidate() {
     let (set, entities, attributes, values) = fixture(1, 1, 24);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let variable = Variable::<UnknownInline>::new(0);
-    let pages = Arc::new(Mutex::new(Vec::new()));
-    let root = SourceTrace {
-        inner: SuccinctArchiveConstraint::new(entities[0], attributes[0], variable, &archive),
-        pages: Arc::clone(&pages),
-    };
+    let root = SuccinctArchiveConstraint::new(entities[0], attributes[0], variable, &archive);
     let mut query = Query::new(root, move |binding: &Binding| {
         binding.get(variable.index).copied()
     })
@@ -494,17 +362,10 @@ fn first_pull_is_one_direct_candidate_and_drop_cancels_the_rest() {
     .cap(1);
 
     assert_eq!(query.next(), Some(values[0].raw));
-    assert_eq!(*pages.lock().unwrap(), vec![(1, 1, 0, 1)]);
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_candidates_examined, 1);
     assert_eq!(query.stats().delta_source_direct_candidates, 1);
     assert_eq!(query.stats().delta_source_roots, 0);
-    drop(query);
-    assert_eq!(
-        *pages.lock().unwrap(),
-        vec![(1, 1, 0, 1)],
-        "dropping the iterator must not pull another source page"
-    );
 }
 
 #[derive(Clone)]

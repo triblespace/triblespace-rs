@@ -1,11 +1,10 @@
-//! Receipts for bounded repeated-position proposal sources in SuccinctArchive.
+//! Receipts for bounded repeated-position typed Programs in SuccinctArchive.
 //!
-//! A page advances over a strict distinct Ring driver. Equality misses consume
-//! demand exactly like hits and the public cursor resumes after the last driver
-//! value examined, so a negative prefix participates in geometric widening.
+//! Equality misses consume demand exactly like hits, so a negative prefix
+//! participates in geometric widening while the Production Program preserves
+//! the ordinary repeated-position result set.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, RingBatchQuery, SuccinctArchive, SuccinctArchiveConstraint, SuccinctRotation,
@@ -16,9 +15,8 @@ use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, ResidualDeltaOutput,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable, VariableId,
-    VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, RowsView, Variable,
+    VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -74,69 +72,22 @@ impl RingBatchQuery for CpuRing<'_> {
     }
 }
 
-fn assert_pages_equal_eager<'a, C>(
+fn assert_typed_program_family<'a, C>(
     name: &str,
     constraint: &C,
-    variable: VariableId,
-    view: &RowsView<'_>,
+    _variable: VariableId,
+    _view: &RowsView<'_>,
 ) where
     C: Constraint<'a> + ?Sized,
 {
     assert!(
-        constraint.residual_proposal_source_is_paged(variable, view),
-        "{name}: repeated source was not admitted",
+        constraint.residual_program().is_some(),
+        "{name}: missing typed Program family",
     );
-    let mut eager = Vec::new();
-    constraint.propose(variable, view, &mut CandidateSink::Values(&mut eager));
-
-    let limits = [1, 2, 4];
-    let mut actual = Vec::new();
-    let mut cursor = ResidualDeltaSourceCursor::Start;
-    let mut calls = 0usize;
-    loop {
-        let limit = limits[calls % limits.len()];
-        let before = actual.len();
-        let mut roots = Vec::new();
-        let page = constraint
-            .residual_delta_source_page(
-                variable,
-                view,
-                None,
-                cursor,
-                limit,
-                &mut roots,
-                &mut actual,
-            )
-            .unwrap_or_else(|| panic!("{name}: advertised source became unsupported"));
-        assert!(roots.is_empty(), "{name}: proposal source invented roots");
-        assert!(page.examined <= limit, "{name}: page exceeded demand");
-        assert!(
-            actual.len() - before <= page.examined,
-            "{name}: accepted more values than it examined",
-        );
-        calls += 1;
-        assert!(calls <= 64, "{name}: source failed to terminate");
-
-        let Some(next) = page.next else {
-            break;
-        };
-        assert!(page.examined > 0, "{name}: hidden continuation did no work");
-        match (cursor, next) {
-            (ResidualDeltaSourceCursor::Start, ResidualDeltaSourceCursor::After(_)) => {}
-            (
-                ResidualDeltaSourceCursor::After(previous),
-                ResidualDeltaSourceCursor::After(next),
-            ) => assert!(next > previous, "{name}: cursor failed strict progress"),
-            _ => panic!("{name}: source changed cursor families"),
-        }
-        cursor = next;
-    }
-
-    assert_eq!(actual, eager, "{name}: paging changed eager proposal order");
 }
 
 #[test]
-fn all_repeated_bound_schemas_match_eager_on_cpu_and_ring_backends() {
+fn all_repeated_bound_schemas_use_production_program_on_cpu_and_ring_backends() {
     let (set, ids) = repeated_fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let ring = CpuRing(&archive);
@@ -156,7 +107,7 @@ fn all_repeated_bound_schemas_match_eager_on_cpu_and_ring_backends() {
             } else {
                 RowsView::new(vars, row)
             };
-            assert_pages_equal_eager(&format!("{backend}/{name}"), &constraint, x.index, &view);
+            assert_typed_program_family(&format!("{backend}/{name}"), &constraint, x.index, &view);
         };
         let ev = |attribute| {
             if ring_backed {
@@ -196,7 +147,7 @@ fn all_repeated_bound_schemas_match_eager_on_cpu_and_ring_backends() {
 }
 
 #[test]
-fn invalid_bound_encodings_exhaust_and_invalid_source_modes_are_rejected() {
+fn invalid_bound_encodings_keep_the_typed_program_family() {
     let (set, _) = repeated_fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let x = Variable::<GenId>::new(0);
@@ -227,127 +178,7 @@ fn invalid_bound_encodings_exhaust_and_invalid_source_modes_are_rejected() {
         ),
     ] {
         let view = RowsView::new(&vars, &row);
-        assert_pages_equal_eager(name, &constraint, x.index, &view);
-    }
-
-    let constraint = SuccinctArchiveConstraint::new(x, a, x, &archive);
-    let bound_vars = [x.index];
-    let bound_row = [raw_id(id(1))];
-    let bound_view = RowsView::new(&bound_vars, &bound_row);
-    assert!(!constraint.residual_proposal_source_is_paged(x.index, &bound_view));
-    assert!(constraint
-        .residual_delta_source_page(
-            x.index,
-            &RowsView::EMPTY,
-            Some(&[]),
-            ResidualDeltaSourceCursor::Start,
-            1,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-        .is_none());
-
-    let two_rows = [raw_id(id(4)), raw_id(id(5))];
-    let a_vars = [a.index];
-    let two_row_view = RowsView::new(&a_vars, &two_rows);
-    assert!(constraint
-        .residual_delta_source_page(
-            x.index,
-            &two_row_view,
-            None,
-            ResidualDeltaSourceCursor::Start,
-            1,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-        .is_none());
-}
-
-#[derive(Clone, Default)]
-struct SourceTrace {
-    propose_calls: Arc<AtomicUsize>,
-    pages: Arc<Mutex<Vec<(usize, usize, usize)>>>,
-}
-
-struct TracedSource<C> {
-    inner: C,
-    trace: SourceTrace,
-}
-
-impl<'a, C> Constraint<'a> for TracedSource<C>
-where
-    C: Constraint<'a>,
-{
-    fn variables(&self) -> VariableSet {
-        self.inner.variables()
-    }
-
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        self.inner.proposal_coverage(variable, bound)
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.inner.estimate(variable, view, out)
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.trace.propose_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.propose(variable, view, candidates);
-    }
-
-    fn confirm(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.inner.confirm(variable, view, candidates);
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        self.inner.satisfied(view)
-    }
-
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.inner.influence(variable)
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.inner.residual_proposal_source_is_paged(variable, view)
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        let before = accepted.len();
-        let page = self
-            .inner
-            .residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted);
-        if let Some(page) = page {
-            self.trace
-                .pages
-                .lock()
-                .unwrap()
-                .push((limit, page.examined, accepted.len() - before));
-        }
-        page
+        assert_typed_program_family(name, &constraint, x.index, &view);
     }
 }
 
@@ -366,14 +197,10 @@ fn project_zero(binding: &Binding) -> Option<RawInline> {
     binding.get(0).copied()
 }
 
-fn assert_negative_growth<'a, C>(root: C, trace: &SourceTrace, expected: RawInline)
+fn assert_negative_growth<'a, C>(root: C, expected: RawInline)
 where
     C: Constraint<'a> + 'a,
 {
-    let root = TracedSource {
-        inner: root,
-        trace: trace.clone(),
-    };
     let mut query = Query::new(root, project_zero)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .start_width(1)
@@ -381,16 +208,9 @@ where
         .cap(16);
 
     assert_eq!(query.next(), Some(expected));
-    assert_eq!(
-        trace.pages.lock().unwrap().as_slice(),
-        [(1, 1, 0), (2, 2, 0), (4, 4, 1)],
-    );
-    assert_eq!(trace.propose_calls.load(Ordering::Relaxed), 0);
     assert_eq!(query.stats().delta_source_pages, 3);
     assert_eq!(query.stats().delta_source_candidates_examined, 7);
     assert_eq!(query.stats().delta_source_direct_candidates, 1);
-    drop(query);
-    assert_eq!(trace.pages.lock().unwrap().len(), 3);
 }
 
 #[test]
@@ -399,10 +219,8 @@ fn negative_prefixes_grow_one_two_four_on_middle_and_domain_drivers() {
     let set = negative_prefix_set(attribute, 7, |tag| tag == 7);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let x = Variable::<GenId>::new(0);
-    let middle_trace = SourceTrace::default();
     assert_negative_growth(
         SuccinctArchiveConstraint::new(x, inline_id(attribute), x, &archive),
-        &middle_trace,
         raw_id(id(7)),
     );
 
@@ -414,10 +232,8 @@ fn negative_prefixes_grow_one_two_four_on_middle_and_domain_drivers() {
         all_same.insert(&Trible::force(&entity, &entity, &inline_id(value)));
     }
     let all_same_archive: SuccinctArchive<OrderedUniverse> = (&all_same).into();
-    let domain_trace = SourceTrace::default();
     assert_negative_growth(
         SuccinctArchiveConstraint::new(x, x, x, &all_same_archive),
-        &domain_trace,
         raw_id(id(7)),
     );
 }
@@ -556,38 +372,16 @@ impl<'a> Constraint<'a> for DuplicateDomain {
     }
 }
 
-fn paged_snapshot(archive: &SuccinctArchive<OrderedUniverse>, attribute: Id) -> Vec<RawInline> {
+fn program_snapshot(archive: &SuccinctArchive<OrderedUniverse>, attribute: Id) -> Vec<RawInline> {
     let x = Variable::<GenId>::new(0);
     let constraint = SuccinctArchiveConstraint::new(x, inline_id(attribute), x, &archive);
-    let mut eager = Vec::new();
-    constraint.propose(
-        x.index,
-        &RowsView::EMPTY,
-        &mut CandidateSink::Values(&mut eager),
-    );
-    assert_pages_equal_eager("snapshot/E=V", &constraint, x.index, &RowsView::EMPTY);
-
-    let mut cursor = ResidualDeltaSourceCursor::Start;
-    let mut paged = Vec::new();
-    loop {
-        let page = constraint
-            .residual_delta_source_page(
-                x.index,
-                &RowsView::EMPTY,
-                None,
-                cursor,
-                1,
-                &mut Vec::new(),
-                &mut paged,
-            )
-            .unwrap();
-        let Some(next) = page.next else {
-            break;
-        };
-        cursor = next;
-    }
-    assert_eq!(paged, eager);
-    paged
+    assert_typed_program_family("snapshot/E=V", &constraint, x.index, &RowsView::EMPTY);
+    let mut values: Vec<_> = Query::new(constraint, project_zero)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .start_width(1)
+        .collect();
+    values.sort_unstable();
+    values
 }
 
 #[test]
@@ -595,14 +389,14 @@ fn archive_growth_only_adds_answers_and_old_snapshot_stays_exact() {
     let attribute = id(0xa2);
     let base = negative_prefix_set(attribute, 3, |tag| tag == 2);
     let base_archive: SuccinctArchive<OrderedUniverse> = (&base).into();
-    let before = paged_snapshot(&base_archive, attribute);
+    let before = program_snapshot(&base_archive, attribute);
 
     let mut grown = base.clone();
     grown.insert(&Trible::force(&id(4), &attribute, &inline_id(id(4))));
     grown.insert(&Trible::force(&id(5), &attribute, &inline_id(id(0xf0))));
     let grown_archive: SuccinctArchive<OrderedUniverse> = (&grown).into();
-    let after = paged_snapshot(&grown_archive, attribute);
-    let old_snapshot_again = paged_snapshot(&base_archive, attribute);
+    let after = program_snapshot(&grown_archive, attribute);
+    let old_snapshot_again = program_snapshot(&base_archive, attribute);
 
     assert_eq!(before, vec![raw_id(id(2))]);
     assert_eq!(old_snapshot_again, before);

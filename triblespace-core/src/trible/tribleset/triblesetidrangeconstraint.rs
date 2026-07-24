@@ -15,7 +15,6 @@ use crate::query::ProgramRequest;
 use crate::query::ProgramRoute;
 use crate::query::ProgramSeedBatch;
 use crate::query::ProposalCoverage;
-use crate::query::ResidualDeltaOutput;
 use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
@@ -66,6 +65,17 @@ impl EntityRangeConstraint {
         id_from_value(value)
             .is_some_and(|id| id >= self.min && id <= self.max && self.set.eav.has_prefix(&id))
     }
+
+    fn proposal_page(
+        &self,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        direct_source_page(cursor, limit, accepted, |after| {
+            next_id_source_in_range(&self.set.eav, &[], &self.min, &self.max, after)
+        })
+    }
 }
 
 impl TypedProgramSpec for EntityRangeConstraint {
@@ -108,11 +118,7 @@ impl TypedProgramSpec for EntityRangeConstraint {
             states,
             batch,
             effects,
-            |_input, cursor, limit, accepted| {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source_in_range(&self.set.eav, &[], &self.min, &self.max, after)
-                })
-            },
+            |_input, cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
             |_input, value| self.contains(value),
         )
     }
@@ -181,32 +187,6 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         Some(ProgramRef::new(self))
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        variable == self.variable_e && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if variable != self.variable_e
-            || view.len() != 1
-            || view.col(variable).is_some()
-            || candidates.is_some()
-        {
-            return None;
-        }
-        Some(direct_source_page(cursor, limit, accepted, |after| {
-            next_id_source_in_range(&self.set.eav, &[], &self.min, &self.max, after)
-        }))
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_e) {
             Some(col) => view.iter().all(|row| self.contains(&row[col])),
@@ -250,6 +230,17 @@ impl AttributeRangeConstraint {
         id_from_value(value)
             .is_some_and(|id| id >= self.min && id <= self.max && self.set.aev.has_prefix(&id))
     }
+
+    fn proposal_page(
+        &self,
+        cursor: ResidualDeltaSourceCursor,
+        limit: usize,
+        accepted: &mut Vec<RawInline>,
+    ) -> ResidualDeltaSourcePage {
+        direct_source_page(cursor, limit, accepted, |after| {
+            next_id_source_in_range(&self.set.aev, &[], &self.min, &self.max, after)
+        })
+    }
 }
 
 impl TypedProgramSpec for AttributeRangeConstraint {
@@ -292,11 +283,7 @@ impl TypedProgramSpec for AttributeRangeConstraint {
             states,
             batch,
             effects,
-            |_input, cursor, limit, accepted| {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source_in_range(&self.set.aev, &[], &self.min, &self.max, after)
-                })
-            },
+            |_input, cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
             |_input, value| self.contains(value),
         )
     }
@@ -365,32 +352,6 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         Some(ProgramRef::new(self))
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        variable == self.variable_a && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if variable != self.variable_a
-            || view.len() != 1
-            || view.col(variable).is_some()
-            || candidates.is_some()
-        {
-            return None;
-        }
-        Some(direct_source_page(cursor, limit, accepted, |after| {
-            next_id_source_in_range(&self.set.aev, &[], &self.min, &self.max, after)
-        }))
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_a) {
             Some(col) => view.iter().all(|row| self.contains(&row[col])),
@@ -409,11 +370,14 @@ mod tests {
     use crate::query::residual::ResidualLowering;
     use crate::query::Binding;
     use crate::query::Constraint;
+    use crate::query::ProgramAction;
+    use crate::query::ProgramExposure;
+    use crate::query::ProgramRequest;
     use crate::query::Query;
     use crate::query::ResidualDeltaSourceCursor;
-    use crate::query::RowsView;
     use crate::query::VariableContext;
     use crate::query::VariableId;
+    use crate::query::VariableSet;
 
     attributes! {
         "CC00000000000000CC00000000000000" as id_range_test_score: R256BE;
@@ -572,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn entity_and_attribute_ranges_page_strict_patch_frontiers() {
+    fn entity_and_attribute_ranges_use_production_program_strict_frontiers() {
         let entity_ids = [
             deterministic_id(1),
             deterministic_id(2),
@@ -605,65 +569,61 @@ mod tests {
         let entity_range = data.entity_in_range(entity, entity_ids[1], entity_ids[2]);
         let attribute_range = data.attribute_in_range(attribute, attributes[1], attributes[2]);
 
-        for (variable, constraint, expected) in [
-            (
-                entity.index,
-                &entity_range as &dyn Constraint<'_>,
-                [
-                    id_into_value(&entity_ids[1].raw()),
-                    id_into_value(&entity_ids[2].raw()),
-                ],
-            ),
-            (
-                attribute.index,
-                &attribute_range as &dyn Constraint<'_>,
-                [
-                    id_into_value(&attributes[1].raw()),
-                    id_into_value(&attributes[2].raw()),
-                ],
-            ),
+        for (variable, constraint) in [
+            (entity.index, &entity_range as &dyn Constraint<'_>),
+            (attribute.index, &attribute_range as &dyn Constraint<'_>),
         ] {
-            assert!(constraint.residual_proposal_source_is_paged(variable, &RowsView::EMPTY));
-            assert!(
-                constraint.residual_program().is_some(),
-                "id ranges expose their ordered frontier as a typed Program"
-            );
-            let mut roots = Vec::new();
-            let mut direct = Vec::new();
-            let first = constraint
-                .residual_delta_source_page(
-                    variable,
-                    &RowsView::EMPTY,
-                    None,
-                    ResidualDeltaSourceCursor::Start,
-                    1,
-                    &mut roots,
-                    &mut direct,
-                )
-                .expect("id ranges expose their PATCH frontier directly");
-            assert!(roots.is_empty());
-            assert_eq!(direct, expected[..1]);
-            assert_eq!(first.examined, 1);
-            assert_eq!(
-                first.next,
-                Some(ResidualDeltaSourceCursor::After(expected[0]))
-            );
-
-            let second = constraint
-                .residual_delta_source_page(
-                    variable,
-                    &RowsView::EMPTY,
-                    None,
-                    first.next.unwrap(),
-                    1,
-                    &mut roots,
-                    &mut direct,
-                )
-                .expect("the strict id cursor resumes the same range");
-            assert_eq!(direct, expected);
-            assert_eq!(second.examined, 1);
-            assert_eq!(second.next, None);
+            let route = constraint
+                .residual_program()
+                .expect("id ranges expose their ordered frontier as a typed Program")
+                .route(ProgramRequest {
+                    action: ProgramAction::Propose(variable),
+                    bound: VariableSet::new_empty(),
+                })
+                .expect("the unbound id range has a Program route");
+            assert_eq!(route.exposure, ProgramExposure::Production);
         }
+
+        let entity_expected = [
+            id_into_value(&entity_ids[1].raw()),
+            id_into_value(&entity_ids[2].raw()),
+        ];
+        let mut entity_direct = Vec::new();
+        let entity_first =
+            entity_range.proposal_page(ResidualDeltaSourceCursor::Start, 1, &mut entity_direct);
+        assert_eq!(entity_direct, entity_expected[..1]);
+        assert_eq!(entity_first.examined, 1);
+        assert_eq!(
+            entity_first.next,
+            Some(ResidualDeltaSourceCursor::After(entity_expected[0])),
+        );
+        let entity_second =
+            entity_range.proposal_page(entity_first.next.unwrap(), 1, &mut entity_direct);
+        assert_eq!(entity_direct, entity_expected);
+        assert_eq!(entity_second.examined, 1);
+        assert_eq!(entity_second.next, None);
+
+        let attribute_expected = [
+            id_into_value(&attributes[1].raw()),
+            id_into_value(&attributes[2].raw()),
+        ];
+        let mut attribute_direct = Vec::new();
+        let attribute_first = attribute_range.proposal_page(
+            ResidualDeltaSourceCursor::Start,
+            1,
+            &mut attribute_direct,
+        );
+        assert_eq!(attribute_direct, attribute_expected[..1]);
+        assert_eq!(attribute_first.examined, 1);
+        assert_eq!(
+            attribute_first.next,
+            Some(ResidualDeltaSourceCursor::After(attribute_expected[0])),
+        );
+        let attribute_second =
+            attribute_range.proposal_page(attribute_first.next.unwrap(), 1, &mut attribute_direct);
+        assert_eq!(attribute_direct, attribute_expected);
+        assert_eq!(attribute_second.examined, 1);
+        assert_eq!(attribute_second.next, None);
 
         let mut entity_query = Query::new(
             data.entity_in_range(entity, entity_ids[1], entity_ids[2]),

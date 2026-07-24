@@ -12,7 +12,6 @@ use super::Constraint;
 use super::ContainsConstraint;
 use super::EstimateSink;
 use super::ProposalCoverage;
-use super::ResidualDeltaOutput;
 use super::ResidualDeltaSourceCursor;
 use super::ResidualDeltaSourcePage;
 use super::RowsView;
@@ -417,30 +416,6 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.variable.index == variable && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if self.variable.index != variable
-            || view.len() != 1
-            || view.col(variable).is_some()
-            || candidates.is_some()
-        {
-            return None;
-        }
-        Some(self.proposal_page(cursor, limit, accepted))
-    }
-
     /// Exact when the variable is bound: checks whether every row's bound
     /// value is present in the patch. Returns `true` optimistically while
     /// the variable is unbound.
@@ -616,30 +591,6 @@ where
         }
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.variable.index == variable && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if self.variable.index != variable
-            || view.len() != 1
-            || view.col(variable).is_some()
-            || candidates.is_some()
-        {
-            return None;
-        }
-        Some(self.proposal_page(cursor, limit, accepted))
-    }
-
     /// Exact when the variable is bound: checks whether every row's bound
     /// value is an ID present in the patch. Returns `true` optimistically
     /// while the variable is unbound.
@@ -665,9 +616,6 @@ impl<'a, S: InlineEncoding> ContainsConstraint<'a, S> for PATCH<ID_LEN, Identity
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
     use crate::id::RawId;
     use crate::inline::encodings::genid::GenId;
     use crate::inline::encodings::UnknownInline;
@@ -675,8 +623,8 @@ mod tests {
     use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::residual::ResidualLowering;
     use crate::query::{
-        Binding, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramRequest, ProgramStratum,
-        Query, TypedProgramSpec,
+        Binding, ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping,
+        ProgramRequest, ProgramStratum, Query, TypedProgramSpec,
     };
 
     use super::*;
@@ -720,32 +668,21 @@ mod tests {
         values
     }
 
-    fn paged_proposal<'a, C: Constraint<'a>>(
-        constraint: &C,
-        variable: VariableId,
-        view: &RowsView<'_>,
+    fn bounded_proposal(
+        mut page: impl FnMut(
+            ResidualDeltaSourceCursor,
+            usize,
+            &mut Vec<RawInline>,
+        ) -> ResidualDeltaSourcePage,
     ) -> Vec<RawInline> {
-        assert!(constraint.residual_proposal_source_is_paged(variable, view));
         let mut cursor = ResidualDeltaSourceCursor::Start;
         let mut values = Vec::new();
         loop {
             let before = values.len();
-            let mut roots = Vec::new();
-            let page = constraint
-                .residual_delta_source_page(
-                    variable,
-                    view,
-                    None,
-                    cursor,
-                    2,
-                    &mut roots,
-                    &mut values,
-                )
-                .expect("declared PATCH source remains supported");
-            assert!(roots.is_empty());
-            assert_eq!(values.len() - before, page.examined);
-            assert!(page.examined <= 2);
-            let Some(next) = page.next else {
+            let receipt = page(cursor, 2, &mut values);
+            assert_eq!(values.len() - before, receipt.examined);
+            assert!(receipt.examined <= 2);
+            let Some(next) = receipt.next else {
                 break;
             };
             match (cursor, next) {
@@ -763,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn value_pages_match_eager_and_all_residual_entry_paths() {
+    fn value_program_pages_match_eager_and_all_residual_entry_paths() {
         // Repeated insertion is set-idempotent: the direct frontier must not
         // manufacture a second occurrence for the duplicate stored key.
         let patch = value_patch(&[3, 1, 2, 2]);
@@ -779,6 +716,7 @@ mod tests {
         assert_eq!(route.stratum, ProgramStratum::Finite);
         assert_eq!(route.grouping, ProgramGrouping::PageLocal);
         assert_eq!(route.completion, ProgramCompletion::PageableOnly);
+        assert_eq!(route.exposure, ProgramExposure::Production);
         assert!(
             constraint.progress(&PatchProgramState::Propose {
                 cursor: ResidualDeltaSourceCursor::Start,
@@ -786,7 +724,9 @@ mod tests {
                 cursor: ResidualDeltaSourceCursor::After(raw(1)),
             })
         );
-        let direct = paged_proposal(&constraint, variable.index, &RowsView::EMPTY);
+        let direct = bounded_proposal(|cursor, limit, values| {
+            constraint.proposal_page(cursor, limit, values)
+        });
         assert_eq!(direct, [raw(1), raw(2), raw(3)]);
         assert_eq!(
             direct,
@@ -822,11 +762,22 @@ mod tests {
     }
 
     #[test]
-    fn id_pages_match_eager_and_all_residual_entry_paths() {
+    fn id_program_pages_match_eager_and_all_residual_entry_paths() {
         let patch = id_patch(&[0xf0, 0x10, 0x80, 0x10]);
         let variable = Variable::<GenId>::new(0);
         let constraint = PatchIdConstraint::new(variable, patch.clone());
-        let direct = paged_proposal(&constraint, variable.index, &RowsView::EMPTY);
+        let route = constraint
+            .residual_program()
+            .unwrap()
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(variable.index),
+                bound: VariableSet::new_empty(),
+            })
+            .unwrap();
+        assert_eq!(route.exposure, ProgramExposure::Production);
+        let direct = bounded_proposal(|cursor, limit, values| {
+            constraint.proposal_page(cursor, limit, values)
+        });
         assert_eq!(
             direct,
             [
@@ -857,56 +808,13 @@ mod tests {
     }
 
     #[test]
-    fn bound_and_confirmation_shapes_keep_the_eager_fallback() {
-        let patch = value_patch(&[1, 2]);
-        let variable = Variable::<UnknownInline>::new(0);
-        let constraint = PatchValueConstraint::new(variable, &patch);
-        let bound = [raw(1)];
-        let bound_vars = [variable.index];
-        let bound_view = RowsView::new(&bound_vars, &bound);
-        assert!(!constraint.residual_proposal_source_is_paged(variable.index, &bound_view));
-        assert!(!constraint.residual_proposal_source_is_paged(1, &RowsView::EMPTY));
-
-        let mut roots = Vec::new();
-        let mut accepted = Vec::new();
-        assert!(constraint
-            .residual_delta_source_page(
-                variable.index,
-                &bound_view,
-                None,
-                ResidualDeltaSourceCursor::Start,
-                1,
-                &mut roots,
-                &mut accepted,
-            )
-            .is_none());
-        assert!(constraint
-            .residual_delta_source_page(
-                variable.index,
-                &RowsView::EMPTY,
-                Some(&[]),
-                ResidualDeltaSourceCursor::Start,
-                1,
-                &mut roots,
-                &mut accepted,
-            )
-            .is_none());
-        assert!(roots.is_empty());
-        assert!(accepted.is_empty());
-    }
-
-    #[test]
     #[should_panic(expected = "ordinal cursor crossed into a PATCH source frontier")]
-    fn patch_frontiers_reject_ordinal_cursors() {
+    fn patch_program_source_rejects_ordinal_cursors() {
         let patch = value_patch(&[1]);
         let variable = Variable::<UnknownInline>::new(0);
-        PatchValueConstraint::new(variable, &patch).residual_delta_source_page(
-            variable.index,
-            &RowsView::EMPTY,
-            None,
+        PatchValueConstraint::new(variable, &patch).proposal_page(
             ResidualDeltaSourceCursor::Offset(1),
             1,
-            &mut Vec::new(),
             &mut Vec::new(),
         );
     }
@@ -1070,120 +978,6 @@ mod tests {
             "the Formula boundary admits byte-identical semantic parents before direct source work",
         );
         assert_eq!(full_query.stats().delta_source_roots, 0);
-    }
-
-    #[derive(Clone, Default)]
-    struct SourceCounters {
-        propose_calls: Arc<AtomicUsize>,
-        page_calls: Arc<AtomicUsize>,
-        examined: Arc<AtomicUsize>,
-    }
-
-    struct CountedSource<C> {
-        inner: C,
-        counters: SourceCounters,
-    }
-
-    impl<'a, C: Constraint<'a>> Constraint<'a> for CountedSource<C> {
-        fn variables(&self) -> VariableSet {
-            self.inner.variables()
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            self.inner.proposal_coverage(variable, bound)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            self.inner.estimate(variable, view, out)
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.counters.propose_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.propose(variable, view, candidates);
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.inner.confirm(variable, view, candidates);
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            self.inner.satisfied(view)
-        }
-
-        fn influence(&self, variable: VariableId) -> VariableSet {
-            self.inner.influence(variable)
-        }
-
-        fn residual_proposal_source_is_paged(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            self.inner.residual_proposal_source_is_paged(variable, view)
-        }
-
-        fn residual_delta_source_page(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: Option<&[RawInline]>,
-            cursor: ResidualDeltaSourceCursor,
-            limit: usize,
-            roots: &mut Vec<ResidualDeltaOutput>,
-            accepted: &mut Vec<RawInline>,
-        ) -> Option<ResidualDeltaSourcePage> {
-            let page = self.inner.residual_delta_source_page(
-                variable, view, candidates, cursor, limit, roots, accepted,
-            );
-            if let Some(page) = page {
-                self.counters.page_calls.fetch_add(1, Ordering::Relaxed);
-                self.counters
-                    .examined
-                    .fetch_add(page.examined, Ordering::Relaxed);
-            }
-            page
-        }
-    }
-
-    #[test]
-    fn width_one_yields_after_one_key_and_drop_cancels_the_frontier() {
-        let patch = value_patch(&(0..64).collect::<Vec<_>>());
-        let variable = Variable::<UnknownInline>::new(0);
-        let counters = SourceCounters::default();
-        let counted = CountedSource {
-            inner: PatchValueConstraint::new(variable, &patch),
-            counters: counters.clone(),
-        };
-        let mut query = Query::new(counted, project_value)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .cap(1)
-            .start_width(1);
-
-        assert_eq!(query.next(), Some(raw(0)));
-        assert_eq!(counters.propose_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
-        assert_eq!(query.stats().delta_source_pages, 1);
-        assert_eq!(query.stats().delta_source_candidates_examined, 1);
-        assert_eq!(query.stats().delta_source_direct_candidates, 1);
-        drop(query);
-        assert_eq!(counters.page_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.examined.load(Ordering::Relaxed), 1);
     }
 
     #[test]
