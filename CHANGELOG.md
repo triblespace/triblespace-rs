@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An executable set-machine kernel now bounds query-engine simplification.**
+  A test-local, backend-neutral positive-Datalog model uses one monotone fact
+  worklist for unordered propose-confirm conjunction, same-head union, and
+  recursive fixed points. Each work item transaction owns its exact opaque
+  remainder, raw-head projection claims tuple keys across hidden witnesses,
+  and exhaustive finite-domain tests compare scalar and row-buffered batch
+  widths under divergent enumeration. The model also names its remaining
+  activation-materialization boundary rather than mistaking demand-one
+  publication for demand-one physical work.
 - **Certified WholeRoot AND quotes can cross Ready as deferred affine
   choices.** The experimental residual scheduler preserves its V3.1 outer
   proposal shell while carrying each row's stable-preorder child ordinal and

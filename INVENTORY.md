@@ -28,6 +28,11 @@
     future releases.
 
 ## Desired Functionality
+- Turn the set-machine experiment's per-activation materialization boundary
+  into a backend-owned opaque resume capsule over finite SET fibers. Preserve
+  arbitrary enumeration and propose-confirm semantics in the API; sorted seek
+  may be an optional backend optimization but must not become a requirement
+  for storage, recursion, paging, or correctness.
 - Reconcile the residual branch's workspace-wide rustfmt baseline (or pin the
   intended formatter toolchain): `cargo fmt --all` currently rewrites many
   unrelated files, obscuring focused query-engine diffs.
