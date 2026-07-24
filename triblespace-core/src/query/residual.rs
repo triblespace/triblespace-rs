@@ -8195,16 +8195,17 @@ fn quoted_formula_propose_transition<'a>(
 
     let mut relevant = ChildSet::empty(1);
     relevant.insert(0);
+    let root_checked =
+        plan.formula_proposer_starts_checked(root, 0, quote.root, variable, desc.bound);
     let mut common_counter = interner.start_formula_with_proposer_checked(
         &plan.finite_formula,
         variable,
         0,
         UnionVerb::Propose { relevant },
-        // The affine choice is the complete receipt evidence from immutable
-        // Ready selection. Start the common Covering continuation unchecked;
-        // the Exact derivative below discharges only rows that carried that
-        // stronger evidence, without walking proposal capabilities again.
-        false,
+        // Preserve the compiled root route's compositional receipt. A child
+        // can be only Covering as an opaque constraint while the recursively
+        // lowered Formula route through it is Exact.
+        root_checked,
     );
     let skipped = formula_ready_common_skips(root, plan, quote, variable);
     for child in 0..quote.children.len() {
@@ -20011,6 +20012,94 @@ mod tests {
         assert_eq!(first_nested_calls.load(Ordering::Relaxed), 1);
         assert_eq!(tied_nested_calls.load(Ordering::Relaxed), 1);
         assert_eq!(validator_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deferred_ready_quote_preserves_exact_root_receipt_for_covering_child() {
+        const TARGET: VariableId = 0;
+        let exact = || {
+            Box::new(ReceiptLeaf {
+                variable: TARGET,
+                coverage: ProposalCoverage::Exact,
+            }) as ShapeConstraint
+        };
+        let arm = || shape_and(vec![exact(), exact()]);
+        let root = IntersectionConstraint::new(vec![Box::new(UnionConstraint::new(vec![
+            arm(),
+            arm(),
+        ])) as ShapeConstraint]);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let quote = plan.formula_ready_quote.as_ref().unwrap();
+        assert_eq!(
+            root.proposal_coverage(TARGET, VariableSet::new_empty()),
+            ProposalCoverage::Covering
+        );
+        assert!(
+            plan.formula_proposer_starts_checked(
+                &root,
+                0,
+                quote.root,
+                TARGET,
+                VariableSet::new_empty(),
+            ),
+            "the recursively lowered root route is Exact"
+        );
+
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+        let carrier = ready_plan_transition(
+            &root,
+            &plan,
+            &StateDesc {
+                bound: VariableSet::new_empty(),
+                phase: ResidualPhase::Ready,
+            },
+            RowBatch::seed(),
+            root.variables(),
+            &[VariableSet::new_empty(); 128],
+            &[1; 128],
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        let carrier_desc = interner.get(carrier.state).clone();
+        let bucket = worklist
+            .get_mut(&carrier.rank)
+            .unwrap()
+            .remove(&carrier.state)
+            .unwrap();
+        let StateBucket::QuotedRows(batch) = bucket else {
+            panic!("quoted Ready selection did not enter its carrier")
+        };
+        assert_eq!(batch.choices.len(), 1);
+        assert!(
+            !batch.choices[0].exact(),
+            "the selected composite child is only Covering as an opaque constraint"
+        );
+
+        let mut next_activation = 0;
+        let entered = quoted_formula_propose_transition(
+            &root,
+            &plan,
+            &carrier_desc,
+            TARGET,
+            batch,
+            &mut next_activation,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        );
+        let ResidualPhase::Formula { counter } = interner.get(entered.state).phase else {
+            panic!("quoted carrier did not enter its selected Formula child")
+        };
+        assert!(
+            interner.formula_resume(counter).proposer_checked,
+            "carrier entry lost the Exact root receipt and would self-confirm"
+        );
     }
 
     #[test]
