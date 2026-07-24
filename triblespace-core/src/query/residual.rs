@@ -11277,7 +11277,7 @@ impl ResidualStateMachine {
                 route.completion == ProgramCompletion::CompleteActionEquivalent
             });
         let complete_wide_candidate = !terminal_streaming
-            && self.terminal_demand_width > 1
+            && self.width > 1
             && program.is_some_and(|(_, route)| {
                 route.completion == ProgramCompletion::CompleteActionEquivalent
             });
@@ -16283,7 +16283,7 @@ mod tests {
         };
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         machine.width = 2;
-        machine.terminal_demand_width = 4;
+        machine.terminal_demand_width = 1;
         let (family, _) = machine
             .interner
             .intern_with_status(desc.clone(), &mut machine.stats);
