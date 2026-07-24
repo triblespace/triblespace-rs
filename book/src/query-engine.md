@@ -259,13 +259,14 @@ The ordinary [`Query`](triblespace::core::query::Query) uses this engine wheneve
 exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
 disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
 truths therefore all exercise the same residual substrate. A seed-rejected
-query starts no worklist at all. Production lowering flattens exposed
-associative AND regions, keeps other finite logical composites such as Union as
-fused constraint kernels inside that substrate, and enables
-production-qualified typed Programs for RPQs and other heterogeneous actions.
+query starts no worklist at all. Ordinary whole-root production lowering
+absorbs the maximal certified AND/OR root into one canonical Formula while
+leaving uncertified custom boundaries opaque. It admits
+production-qualified typed Programs for RPQs and other heterogeneous actions;
+Explicit routes remain on their ordinary constraint actions.
 Canonical single-shard SuccinctArchive Propose, Confirm, and Support routes are
-production-qualified, so their pageable typed form participates in ordinary
-hybrid lowering. Program retirement validates a wider activation receipt with
+production-qualified, so their pageable typed form participates in the
+ordinary policy. Program retirement validates a wider activation receipt with
 one arena membership pass, avoiding the previous activation-count by arena-size
 multiplier while retaining cheap singleton and fully drained paths.
 UnionArchive Propose and Support routes are `Production`; Confirm remains
@@ -281,7 +282,8 @@ the comparison path.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 selects the residual cursor for any root while preserving the query's chosen
-lowering (`HYBRID` by default; `Query::residual_lowering` may change it).
+lowering (`WHOLE_ROOT_PRODUCTION` by default; `Query::residual_lowering` may
+change it).
 `solve_residual_state_lazy` is the separate conservative-lowering capability
 control and exposes its width policy;
 `solve_residual_state` is the eager saturated form, and
@@ -444,8 +446,8 @@ Every shard retains canonical state merging locally. As with the DAG splitter,
 cross-shard reconvergence is traded for concurrency, state is moved rather
 than duplicated, and the constraint/postprocessor pair is cloned only when a
 real sibling shard is created. This entry point preserves the query's selected
-residual lowering: fresh queries use hybrid lowering, which keeps formula
-kernels fused and enables transition Programs, while an explicit
+residual lowering: fresh queries lower the whole certified root while
+admitting only production Programs, while an explicit
 `Query::residual_lowering` override remains in force.
 
 ### Opt-in residual action observation

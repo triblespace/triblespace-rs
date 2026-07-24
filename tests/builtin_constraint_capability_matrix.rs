@@ -24,6 +24,7 @@ use triblespace::prelude::*;
 #[derive(Debug)]
 struct MatrixProfiles {
     conservative_geometric: ResidualStateStats,
+    whole_root_production_geometric: ResidualStateStats,
     full_geometric: ResidualStateStats,
 }
 
@@ -55,7 +56,10 @@ where
 
     assert_engine("sequential oracle", make_query().sequential().collect());
     assert_engine("eager DAG oracle", make_query().solve_dag());
-    assert_engine("ordinary production selection", make_query().collect());
+    assert_engine(
+        "ordinary WholeRoot production selection",
+        make_query().collect(),
+    );
 
     let conservative_eager = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
@@ -72,6 +76,17 @@ where
         .growth(1)
         .collect_profiled();
     assert_engine("FULL eager residual", full_eager.results);
+
+    let whole_root_production_eager = make_query()
+        .solve_residual_state_lazy_with(ResidualLowering::WHOLE_ROOT_PRODUCTION)
+        .cap(usize::MAX)
+        .start_width(usize::MAX)
+        .growth(1)
+        .collect_profiled();
+    assert_engine(
+        "WholeRoot production eager residual",
+        whole_root_production_eager.results,
+    );
 
     let conservative_width_one = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
@@ -92,6 +107,17 @@ where
         .collect_profiled();
     assert_engine("FULL fixed width one", full_width_one.results);
 
+    let whole_root_production_width_one = make_query()
+        .solve_residual_state_lazy_with(ResidualLowering::WHOLE_ROOT_PRODUCTION)
+        .cap(1)
+        .start_width(1)
+        .growth(1)
+        .collect_profiled();
+    assert_engine(
+        "WholeRoot production fixed width one",
+        whole_root_production_width_one.results,
+    );
+
     let conservative_geometric = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .cap(16)
@@ -108,8 +134,19 @@ where
         .collect_profiled();
     assert_engine("FULL geometric", full_geometric.results);
 
+    let whole_root_production_geometric = make_query()
+        .solve_residual_state_lazy_with(ResidualLowering::WHOLE_ROOT_PRODUCTION)
+        .cap(16)
+        .start_width(1)
+        .growth(2)
+        .collect_profiled();
+    assert_engine(
+        "WholeRoot production geometric",
+        whole_root_production_geometric.results,
+    );
+
     let mut original = make_query()
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy_with(ResidualLowering::WHOLE_ROOT_PRODUCTION)
         .cap(16)
         .start_width(1)
         .growth(2);
@@ -122,15 +159,16 @@ where
     assert_eq!(
         sorted_rows(original_remainder.clone()),
         sorted_rows(cloned_remainder),
-        "{label}: cloned exact remainder"
+        "{label}: cloned exact WholeRoot production remainder"
     );
     assert_engine(
-        "first pull plus cloned remainder",
+        "WholeRoot production first pull plus cloned remainder",
         std::iter::once(first).chain(original_remainder).collect(),
     );
 
     MatrixProfiles {
         conservative_geometric: conservative_geometric.stats,
+        whole_root_production_geometric: whole_root_production_geometric.stats,
         full_geometric: full_geometric.stats,
     }
 }
@@ -316,6 +354,10 @@ fn atomic_constraints_have_exact_sets_across_residual_widths() {
         || find!(x: Inline<UnknownInline>, Arc::new(x.is(a))),
     );
     assert_eq!(constant.conservative_geometric.delta_source_pages, 0);
+    assert_eq!(
+        constant.whole_root_production_geometric.delta_source_pages,
+        1
+    );
     assert_eq!(constant.full_geometric.delta_source_pages, 1);
     assert_eq!(constant.full_geometric.delta_source_candidates_examined, 1);
     assert_eq!(constant.full_geometric.delta_source_direct_candidates, 1);
@@ -333,6 +375,10 @@ fn atomic_constraints_have_exact_sets_across_residual_widths() {
         )
     });
     assert_eq!(equality.conservative_geometric.delta_source_pages, 0);
+    assert_eq!(
+        equality.whole_root_production_geometric.delta_source_pages, 0,
+        "WholeRoot production must defer explicit equality Programs"
+    );
     assert!(
         equality.full_geometric.delta_source_pages > 0,
         "FULL lowering must route peer-bound equality through its typed proposal Program"
@@ -370,6 +416,13 @@ fn membership_constraints_record_native_and_fallback_execution() {
         "conservative lowering keeps the atom on the opaque protocol"
     );
     assert!(
+        sorted_profiles
+            .whole_root_production_geometric
+            .delta_source_pages
+            > 0,
+        "WholeRoot production must retain SortedSlice's production proposal Program"
+    );
+    assert!(
         sorted_profiles.full_geometric.delta_source_pages > 0,
         "FULL lowering must exercise SortedSlice's bounded native proposal source"
     );
@@ -388,6 +441,13 @@ fn membership_constraints_record_native_and_fallback_execution() {
         )
     });
     assert_eq!(set_profiles.conservative_geometric.delta_source_pages, 0);
+    assert_eq!(
+        set_profiles
+            .whole_root_production_geometric
+            .delta_source_pages,
+        0,
+        "WholeRoot production must defer explicit HashSet Programs"
+    );
     assert_eq!(
         set_profiles.full_geometric.delta_source_pages, 0,
         "HashSet has no honest budgeted proposal cursor"
@@ -431,6 +491,13 @@ fn membership_constraints_record_native_and_fallback_execution() {
         )
     });
     assert_eq!(map_profiles.conservative_geometric.delta_source_pages, 0);
+    assert_eq!(
+        map_profiles
+            .whole_root_production_geometric
+            .delta_source_pages,
+        0,
+        "WholeRoot production must defer explicit HashMap Programs"
+    );
     assert_eq!(
         map_profiles.full_geometric.delta_source_pages, 0,
         "HashMap has no honest budgeted proposal cursor"
@@ -476,6 +543,10 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
         });
     assert_eq!(union_profiles.conservative_geometric.support_calls, 0);
     assert!(
+        union_profiles.whole_root_production_geometric.support_calls > 0,
+        "WholeRoot production must execute exposed finite Formula arms"
+    );
+    assert!(
         union_profiles.full_geometric.support_calls > 0,
         "FULL lowering must execute the exposed finite formula arms"
     );
@@ -509,6 +580,13 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
     assert_eq!(
         estimate_profiles.conservative_geometric.delta_source_pages,
         0
+    );
+    assert!(
+        estimate_profiles
+            .whole_root_production_geometric
+            .delta_source_pages
+            > 0,
+        "WholeRoot production must preserve the forwarded production proposal Program"
     );
     assert_eq!(
         estimate_profiles
@@ -579,6 +657,13 @@ fn estimate_override_forwards_transition_programs_without_opening_its_shape() {
         },
     );
     assert_eq!(profiles.conservative_geometric.delta_transition_pages, 0);
+    assert!(
+        profiles
+            .whole_root_production_geometric
+            .delta_transition_pages
+            > 0,
+        "WholeRoot production must reach the wrapped path's production transition Program"
+    );
     assert!(
         profiles.full_geometric.delta_transition_pages > 0,
         "FULL lowering must reach the wrapped path's native transition frontier"

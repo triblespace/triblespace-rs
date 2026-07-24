@@ -2844,13 +2844,13 @@ enum QueryScheduler {
 /// Every live fresh ordinary iterator uses canonical
 /// residual states. It starts with narrow, depth-first action cohorts and
 /// widens as the consumer keeps pulling, while histories with identical future
-/// computation can reconverge under one state identity. The production
-/// lowering flattens exposed associative AND regions, preserves other finite
-/// composites such as Union as fused constraint kernels, and executes
+/// computation can reconverge under one state identity. The ordinary lowering
+/// exposes the maximal certified root as one finite Formula and executes
 /// production-qualified regular-path Programs as heterogeneous state actions.
 /// Explicit routes deferred by policy use the ordinary constraint action. A
 /// structurally absent route may instead retain the constraint's legacy pager
-/// or seed hooks. Seed-rejected queries start no runtime. Use
+/// or seed hooks. Uncertified custom boundaries remain opaque, and
+/// seed-rejected queries start no runtime. Use
 /// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
 /// [`Query::sequential`] for the scalar depth-first specialization. The
 /// Scheduler selection and structural lowering are independent controls; use
@@ -3172,9 +3172,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 
     /// Select structural lowering independently from the physical scheduler.
     ///
-    /// Ordinary live queries start with [`residual::ResidualLowering::HYBRID`].
-    /// Explicit scheduler comparisons can request
-    /// [`residual::ResidualLowering::CONSERVATIVE`] or any intermediate form
+    /// Ordinary live queries start with
+    /// [`residual::ResidualLowering::WHOLE_ROOT_PRODUCTION`]. Explicit
+    /// scheduler comparisons can request
+    /// [`residual::ResidualLowering::CONSERVATIVE`],
+    /// [`residual::ResidualLowering::HYBRID`], or any other canonical form
     /// without changing their scheduler.
     ///
     /// # Panics
@@ -3338,7 +3340,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             postprocessing,
             projection,
             scheduler,
-            residual_lowering: residual::ResidualLowering::HYBRID,
+            residual_lowering: residual::ResidualLowering::WHOLE_ROOT_PRODUCTION,
             certified_denotation,
             mode,
             iteration_started: false,
@@ -5048,6 +5050,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
         f.debug_struct("Query")
             .field("constraint", &std::any::type_name::<C>())
             .field("scheduler", &self.scheduler)
+            .field("residual_lowering", &self.residual_lowering)
             .field("mode", &self.mode)
             .field("iteration_started", &self.iteration_started)
             .field("dag_started", &self.dag.is_some())
@@ -5845,7 +5848,14 @@ mod tests {
         assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
         assert_eq!(
             ordinary.residual_lowering,
-            residual::ResidualLowering::HYBRID
+            residual::ResidualLowering::WHOLE_ROOT_PRODUCTION
+        );
+        assert!(
+            format!("{ordinary:?}").contains(
+                "residual_lowering: ResidualLowering { formula_scope: WholeRoot, \
+                 program_scope: Production }"
+            ),
+            "Query diagnostics must expose the selected residual lowering"
         );
 
         let conservative = ordinary

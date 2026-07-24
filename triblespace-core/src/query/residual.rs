@@ -2341,7 +2341,7 @@ impl ProgramScope {
 /// Formula scope and Program scope are independent three-element chains,
 /// giving exactly nine canonical lowering forms. `Default` is
 /// [`ResidualLowering::CONSERVATIVE`]; fresh [`Query`] values explicitly use
-/// [`ResidualLowering::HYBRID`] instead.
+/// [`ResidualLowering::WHOLE_ROOT_PRODUCTION`] instead.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[must_use]
 pub struct ResidualLowering {
@@ -2427,9 +2427,15 @@ pub(super) fn seed_survives<'a>(
 impl ResidualLowering {
     /// Conservative residual lowering used by explicit probe solvers.
     pub const CONSERVATIVE: Self = Self::new(FormulaScope::OpaqueLeaves, ProgramScope::Disabled);
-    /// Production lowering: retain fused formula kernels while enabling
+    /// Hybrid lowering: retain fused formula kernels while enabling
     /// production-qualified heterogeneous transition programs.
     pub const HYBRID: Self = Self::new(FormulaScope::OpaqueLeaves, ProgramScope::Production);
+    /// Whole-root formula lowering with only production-qualified Programs.
+    ///
+    /// This is the ordinary [`Query`] policy. Explicit Program routes remain
+    /// on their bounded ordinary constraint actions.
+    pub const WHOLE_ROOT_PRODUCTION: Self =
+        Self::new(FormulaScope::WholeRoot, ProgramScope::Production);
     /// Maximally exposed formula and transition-program lowering.
     pub const FULL: Self = Self::new(FormulaScope::WholeRoot, ProgramScope::All);
 
@@ -13708,8 +13714,9 @@ mod parallel {
         /// independent shard atoms.
         ///
         /// The iterator preserves the query's selected [`ResidualLowering`].
-        /// Fresh queries use [`ResidualLowering::HYBRID`] by default; an explicit
-        /// [`Query::residual_lowering`] override remains in force.
+        /// Fresh queries use [`ResidualLowering::WHOLE_ROOT_PRODUCTION`] by
+        /// default; an explicit [`Query::residual_lowering`] override remains
+        /// in force.
         ///
         /// # Panics
         ///
@@ -14095,6 +14102,10 @@ mod tests {
         assert_eq!(
             ResidualLowering::HYBRID,
             ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::Production)
+        );
+        assert_eq!(
+            ResidualLowering::WHOLE_ROOT_PRODUCTION,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Production)
         );
         assert_eq!(
             ResidualLowering::FULL,
