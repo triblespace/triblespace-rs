@@ -14851,9 +14851,13 @@ mod tests {
     }
 
     struct TypedOnlyQuoteLeaf {
+        parent: Option<VariableId>,
         variable: VariableId,
-        estimate: usize,
+        ordinary_coverage: ProposalCoverage,
+        estimates: [usize; 2],
         estimate_calls: Arc<AtomicUsize>,
+        typed_seed_rows: Arc<AtomicUsize>,
+        ordinary_propose_rows: Arc<AtomicUsize>,
     }
 
     impl TypedProgramSpec for TypedOnlyQuoteLeaf {
@@ -14862,15 +14866,18 @@ mod tests {
         type Rank = ();
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            matches!(request.action, ProgramAction::Propose(variable) if variable == self.variable)
-                .then_some(ProgramRoute {
-                    key: ProgramKey::new(0),
-                    variable: self.variable,
-                    stratum: ProgramStratum::Finite,
-                    grouping: ProgramGrouping::PageLocal,
-                    completion: ProgramCompletion::CompleteActionEquivalent,
-                    exposure: ProgramExposure::Explicit,
-                })
+            (matches!(request.action, ProgramAction::Propose(variable) if variable == self.variable)
+                && self
+                    .parent
+                    .is_none_or(|parent| request.bound.is_set(parent)))
+            .then_some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: self.variable,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::CompleteActionEquivalent,
+                exposure: ProgramExposure::Explicit,
+            })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -14884,6 +14891,8 @@ mod tests {
             batch: ProgramSeedBatch<'_>,
             effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
         ) {
+            self.typed_seed_rows
+                .fetch_add(batch.view.len(), Ordering::Relaxed);
             for parent in 0..batch.view.len() {
                 effects.finite_root(parent as u32, (), Some(raw(42)));
             }
@@ -14909,11 +14918,28 @@ mod tests {
 
     impl Constraint<'static> for TypedOnlyQuoteLeaf {
         fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(self.variable)
+            self.parent.map_or_else(
+                || VariableSet::new_singleton(self.variable),
+                |parent| {
+                    VariableSet::new_singleton(parent)
+                        .union(VariableSet::new_singleton(self.variable))
+                },
+            )
         }
 
         fn fixed_denotation(&self) -> bool {
             true
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable
+                && !bound.is_set(variable)
+                && self.parent.is_none_or(|parent| bound.is_set(parent))
+            {
+                self.ordinary_coverage
+            } else {
+                ProposalCoverage::None
+            }
         }
 
         fn estimate(
@@ -14926,7 +14952,17 @@ mod tests {
                 return false;
             }
             self.estimate_calls.fetch_add(1, Ordering::Relaxed);
-            out.fill(self.estimate, view.len());
+            let Some(parent) = self.parent else {
+                out.fill(self.estimates[0], view.len());
+                return true;
+            };
+            let Some(parent) = view.col(parent) else {
+                return false;
+            };
+            out.extend(
+                view.iter()
+                    .map(|row| self.estimates[(row[parent][0] & 1) as usize]),
+            );
             true
         }
 
@@ -14937,6 +14973,8 @@ mod tests {
             candidates: &mut CandidateSink<'_>,
         ) {
             assert_eq!(variable, self.variable);
+            self.ordinary_propose_rows
+                .fetch_add(view.len(), Ordering::Relaxed);
             for parent in 0..view.len() {
                 candidates.push(parent as u32, raw(42));
             }
@@ -14948,8 +14986,11 @@ mod tests {
             _view: &RowsView<'_>,
             candidates: &mut CandidateSink<'_>,
         ) {
-            assert_eq!(variable, self.variable);
-            candidates.retain(|_, candidate| *candidate == raw(42));
+            if variable == self.variable {
+                candidates.retain(|_, candidate| *candidate == raw(42));
+            } else {
+                assert_eq!(Some(variable), self.parent);
+            }
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -14966,7 +15007,10 @@ mod tests {
             variable: VariableId,
             bound: VariableSet,
         ) -> ProposalCoverage {
-            if variable == self.variable && !bound.is_set(variable) {
+            if variable == self.variable
+                && !bound.is_set(variable)
+                && self.parent.is_none_or(|parent| bound.is_set(parent))
+            {
                 ProposalCoverage::Exact
             } else {
                 ProposalCoverage::None
@@ -20644,9 +20688,13 @@ mod tests {
                 estimate_calls: Arc::clone(&ordinary_calls),
             }) as ShapeConstraint,
             Box::new(TypedOnlyQuoteLeaf {
+                parent: None,
                 variable: X,
-                estimate: 1,
+                ordinary_coverage: ProposalCoverage::None,
+                estimates: [1, 1],
                 estimate_calls: Arc::clone(&typed_calls),
+                typed_seed_rows: Arc::new(AtomicUsize::new(0)),
+                ordinary_propose_rows: Arc::new(AtomicUsize::new(0)),
             }) as ShapeConstraint,
         ]);
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
@@ -20676,9 +20724,13 @@ mod tests {
         let y_calls = Arc::new(AtomicUsize::new(0));
         let eligibility_root = IntersectionConstraint::new(vec![
             Box::new(TypedOnlyQuoteLeaf {
+                parent: None,
                 variable: X,
-                estimate: 1,
+                ordinary_coverage: ProposalCoverage::None,
+                estimates: [1, 1],
                 estimate_calls: Arc::clone(&x_calls),
+                typed_seed_rows: Arc::new(AtomicUsize::new(0)),
+                ordinary_propose_rows: Arc::new(AtomicUsize::new(0)),
             }) as ShapeConstraint,
             Box::new(QuotedEstimateLeaf {
                 parent: None,
@@ -21090,6 +21142,165 @@ mod tests {
             assert!(
                 shadow.events.iter().all(|event| event.completion.is_some()),
                 "a fully drained affine epoch retained packet/action debt"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_ready_quote_heterogeneous_nested_formula_drains_typed_delta_ownership() {
+        const PARENT: VariableId = 0;
+        const TARGET: VariableId = 1;
+
+        let fixture = || {
+            let parent_rows = Arc::new(AtomicUsize::new(0));
+            let direct_rows = Arc::new(AtomicUsize::new(0));
+            let typed_estimates = Arc::new(AtomicUsize::new(0));
+            let typed_seed_rows = Arc::new(AtomicUsize::new(0));
+            let ordinary_typed_rows = Arc::new(AtomicUsize::new(0));
+            let arm = || {
+                Box::new(IntersectionConstraint::new(vec![
+                    Box::new(TypedOnlyQuoteLeaf {
+                        parent: Some(PARENT),
+                        variable: TARGET,
+                        ordinary_coverage: ProposalCoverage::Exact,
+                        estimates: [9, 1],
+                        estimate_calls: Arc::clone(&typed_estimates),
+                        typed_seed_rows: Arc::clone(&typed_seed_rows),
+                        ordinary_propose_rows: Arc::clone(&ordinary_typed_rows),
+                    }) as ShapeConstraint,
+                ])) as ShapeConstraint
+            };
+            let nested_or = Box::new(UnionConstraint::new(vec![arm(), arm()])) as ShapeConstraint;
+            let root = Arc::new(IntersectionConstraint::new(vec![
+                Box::new(CertifiedAdaptiveSource {
+                    parent: None,
+                    variable: PARENT,
+                    coverage: ProposalCoverage::Exact,
+                    estimates: [2, 2],
+                    values: Arc::new(vec![raw(0), raw(1)]),
+                    proposed_rows: Arc::clone(&parent_rows),
+                }) as ShapeConstraint,
+                Box::new(CertifiedAdaptiveSource {
+                    parent: Some(PARENT),
+                    variable: TARGET,
+                    coverage: ProposalCoverage::Exact,
+                    estimates: [1, 9],
+                    values: Arc::new(vec![raw(42)]),
+                    proposed_rows: Arc::clone(&direct_rows),
+                }) as ShapeConstraint,
+                nested_or,
+            ]));
+            (
+                root,
+                parent_rows,
+                direct_rows,
+                typed_estimates,
+                typed_seed_rows,
+                ordinary_typed_rows,
+            )
+        };
+        let query = |root| {
+            Query::new(root, |binding: &Binding| {
+                Some((binding.get(PARENT).copied()?, binding.get(TARGET).copied()?))
+            })
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        };
+
+        let (
+            quoted_root,
+            quoted_parent,
+            quoted_direct,
+            quoted_estimates,
+            quoted_typed,
+            quoted_ordinary,
+        ) = fixture();
+        let quoted_epoch = ResidualShadowEpoch::new();
+        let quoted = query(Arc::clone(&quoted_root))
+            .shadow(quoted_epoch)
+            .collect_profiled();
+
+        let (v31_root, v31_parent, v31_direct, v31_estimates, v31_typed, v31_ordinary) = fixture();
+        let mut v31 = query(Arc::clone(&v31_root));
+        assert!(v31.plan.formula_ready_quote.is_some());
+        v31.plan.formula_ready_quote = None;
+        v31.state = ResidualStateMachine::new_for_plan(
+            v31_root.variables(),
+            &v31.plan,
+            Search::NextVariable,
+        );
+        let v31_epoch = ResidualShadowEpoch::new();
+        let v31 = v31.shadow(v31_epoch).collect_profiled();
+
+        for (parent, direct, estimates, typed, ordinary) in [
+            (
+                &quoted_parent,
+                &quoted_direct,
+                &quoted_estimates,
+                &quoted_typed,
+                &quoted_ordinary,
+            ),
+            (
+                &v31_parent,
+                &v31_direct,
+                &v31_estimates,
+                &v31_typed,
+                &v31_ordinary,
+            ),
+        ] {
+            assert_eq!(parent.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                direct.load(Ordering::Relaxed),
+                1,
+                "exactly one heterogeneous parent must choose the direct source"
+            );
+            assert!(
+                estimates.load(Ordering::Relaxed) >= 2,
+                "both nested OR arms must participate in adaptive planning"
+            );
+            assert!(
+                typed.load(Ordering::Relaxed) >= 2,
+                "the selected nested OR must transfer each arm through typed delta ownership"
+            );
+            assert_eq!(
+                ordinary.load(Ordering::Relaxed),
+                0,
+                "ordinary proposal bypassed the admitted typed Program route"
+            );
+        }
+        assert_eq!(
+            quoted_typed.load(Ordering::Relaxed),
+            v31_typed.load(Ordering::Relaxed),
+            "deferred Ready changed typed Program proposal multiplicity"
+        );
+
+        let quoted_len = quoted.results.len();
+        let v31_len = v31.results.len();
+        let quoted_set: BTreeSet<_> = quoted.results.into_iter().collect();
+        let v31_set: BTreeSet<_> = v31.results.into_iter().collect();
+        let expected = BTreeSet::from([(raw(0), raw(42)), (raw(1), raw(42))]);
+        assert_eq!(quoted_len, quoted_set.len());
+        assert_eq!(v31_len, v31_set.len());
+        assert_eq!(quoted_set, expected);
+        assert_eq!(quoted_set, v31_set);
+
+        assert!(
+            quoted.stats.formula_ready_quote_groups > 1,
+            "the deferred carrier did not split heterogeneous Ready receipts"
+        );
+        assert!(
+            quoted.stats.delta_activations_completed > 0,
+            "the typed source never entered delta ownership"
+        );
+        assert_eq!(
+            quoted.stats.delta_activations_completed, v31.stats.delta_activations_completed,
+            "deferred Ready changed typed/delta protocol ownership"
+        );
+        for shadow in [&quoted.shadow, &v31.shadow] {
+            assert_eq!(shadow.status, ResidualShadowStatus::Closed);
+            assert!(!shadow.events.is_empty());
+            assert!(
+                shadow.events.iter().all(|event| event.completion.is_some()),
+                "nested Formula typed/delta ownership retained affine debt"
             );
         }
     }
