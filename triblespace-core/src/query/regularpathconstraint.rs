@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use ahash::AHashSet;
 use smallvec::SmallVec;
 
 use crate::id::id_into_value;
@@ -2287,15 +2288,15 @@ impl RegularPathConstraint {
         program: &DeltaProgram,
         source: RawInline,
         budget: ProgramCompleteWorkQuote,
-    ) -> Option<(HashSet<RawInline>, ProgramCompleteWorkQuote)> {
+    ) -> Option<(AHashSet<RawInline>, ProgramCompleteWorkQuote)> {
         let root = RpqNode {
             source: None,
             value: source,
             pc: program.encode(program.start),
         };
-        let mut seen = HashSet::new();
+        let mut seen = AHashSet::new();
         let mut pending = VecDeque::new();
-        let mut accepted = HashSet::new();
+        let mut accepted = AHashSet::new();
         let mut examined = 0usize;
 
         seen.insert((root.value, root.pc));
