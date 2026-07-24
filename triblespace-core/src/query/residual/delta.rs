@@ -19358,7 +19358,7 @@ mod tests {
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         machine.width = 4;
         machine.cap = 64;
-        machine.accept_delta_step(&plan, outcome);
+        machine.accept_delta_step(outcome);
         assert_eq!(
             machine.width, 8,
             "the earlier seed receipt must not hide a later dead source page"
