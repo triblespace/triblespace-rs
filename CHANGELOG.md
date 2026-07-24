@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Finite-Formula structural control is interned independently from its outer
+  WCO continuation.** Residual Formula state now carries an exact
+  `(program-counter, resume)` cursor: child selection, skipping, completion,
+  and the persistent return spine transform only the structural counter,
+  while proposer discharge replaces only the resume. Delta and private
+  reducer suspensions retain the full cursor, so equal Formula structure can
+  share arena records without merging distinct checked/confirm futures,
+  changing rank bands, or weakening affine payload and SET boundaries.
 - **Shared PositiveSupport service liveness is exact and quiescent probes are
   lock-free.** Shard runtimes and in-flight packet guards now retain one
   counted registration whose final drop reconciles the global lease under the
