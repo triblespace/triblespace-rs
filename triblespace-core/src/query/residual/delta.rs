@@ -7724,7 +7724,7 @@ mod tests {
             matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Finite,
+                stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
             })
@@ -7744,7 +7744,7 @@ mod tests {
             effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
         ) {
             for parent in 0..batch.view.len() {
-                effects.finite_root(parent as u32, ZeroProgressState(1), None);
+                effects.fixpoint_root(parent as u32, ZeroProgressState(1), 0, None);
             }
         }
 
