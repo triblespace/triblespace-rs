@@ -2130,6 +2130,81 @@ fn production_union_leaf_streams_first_exact_or_value_before_fixpoint() {
 }
 
 #[test]
+fn production_online_or_crosses_a_completed_single_child_and_path() {
+    let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let cyclic = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        start,
+        end,
+        &repeated(graph.attribute, false),
+    )) as DynConstraint;
+    let transparent_arm = Box::new(IntersectionConstraint::new(vec![cyclic])) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![transparent_arm])) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy()
+        .cap(1)
+        .start_width(1);
+
+    assert_eq!(query.next(), Some(graph.value(1).raw));
+    assert_eq!(
+        query.stats().delta_transition_candidates_examined,
+        1,
+        "a completed AND path delayed its exact OR child until fixpoint"
+    );
+    let mut remainder: Vec<_> = query.collect();
+    remainder.sort_unstable();
+    let mut expected = (2..5).map(|node| graph.value(node).raw).collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(remainder, expected);
+}
+
+#[test]
+fn production_online_or_does_not_skip_an_unfinished_and_sibling() {
+    let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let accepted = graph.value(3).raw;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let guarded_arm = Box::new(IntersectionConstraint::new(vec![
+        Box::new(RegularPathConstraint::new(
+            graph.set.clone(),
+            start,
+            end,
+            &repeated(graph.attribute, false),
+        )) as DynConstraint,
+        Box::new(CandidateValueTraceFilter {
+            variable: END,
+            accepted,
+            calls: Arc::clone(&calls),
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start.is(graph.value(0))) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![guarded_arm])) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy()
+        .cap(1)
+        .start_width(1);
+
+    assert_eq!(query.next(), Some(accepted));
+    assert_eq!(query.next(), None);
+    let observed = calls.lock().expect("candidate trace poisoned");
+    assert!(
+        observed
+            .iter()
+            .flatten()
+            .any(|value| *value == graph.value(1).raw),
+        "the unfinished sibling was not applied to the proposer's raw candidates"
+    );
+}
+
+#[test]
 fn production_online_or_promotes_pending_finite_duplicates_without_final_replay() {
     let graph = Graph::new(4, &[(0, 1), (1, 2)]);
     let first_cyclic = graph.value(1).raw;
