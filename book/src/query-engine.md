@@ -164,11 +164,10 @@ Exposed AND/OR progress then becomes canonical formula state, and eligible
 cyclic regular paths run through the delta submachine. `ProgramScope` is an
 orthogonal three-level policy: `Disabled` admits no typed Programs,
 `Production` admits production-qualified routes, and `All` also admits
-explicit routes. A structurally absent route may still use older transition
-hooks. A route deferred by policy instead uses the stable ordinary
-`Constraint` action; it never falls through to an older pager or strengthens
-an ordinary proposal receipt. The formula and Program scope chains therefore
-form nine structural lowering combinations.
+explicit routes. A structurally absent route and a route deferred by policy
+both use the stable ordinary `Constraint` action; neither strengthens an
+ordinary proposal receipt. The formula and Program scope chains therefore form
+nine structural lowering combinations.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:
@@ -221,43 +220,37 @@ the activation-private cursor or relying on fixpoint deduplication. A
 transition page that produces no novel child, accepted endpoint, or stable
 continuation contributes negative feedback, so a rejected prefix grows from
 one to two to four destinations instead of remaining a width-one serial scan.
-An accepting initial product root is settled one step earlier. Activation
-creation records its endpoint in the same distinct accepted set used by later
-transition witnesses and returns a one-shot seed-effect receipt to the delta
-scheduler. A streaming proposal or fully-bound Boolean Support reducer files
-that receipt into the stable machine immediately, while the root's affine
-traversal credit remains live for non-epsilon paths. Activation-reuse
-confirmation and non-linear formula proposal retain their existing quiescence barriers: seed
-acceptance is private reducer state there, not an illegally streamed result.
-This mechanism is generic to `ResidualDeltaOutput::accepted`, not an RPQ
-branch in the scheduler. It preserves NODES(G) gating, same-variable paths,
-duplicate outer parent bags, and clone/drop remainders. Seed publication
-consumes neither transition width nor a transition-page statistic, and the
-first later expansion cannot replay it. Conversely, an independently dead
-source or transition page still supplies geometric negative feedback even if
-the activation published an earlier seed effect.
+An accepting initial product root is settled one step earlier. Typed Program
+seeding records its endpoint in the same distinct accepted set used by later
+pages and returns a one-shot effect receipt to the scheduler. A streaming
+proposal or fully-bound Boolean Support reducer files that receipt into the
+stable machine immediately, while the root's affine Program credit remains
+live for non-epsilon paths. Activation-reuse confirmation and non-linear
+formula proposal retain their quiescence barriers: seed acceptance is private
+reducer state there, not an illegally streamed result. This is the generic
+`ProgramSeedWork::accepted` law, not an RPQ branch in the scheduler. It
+preserves NODES(G) gating, same-variable paths, duplicate outer parent bags,
+and clone/drop remainders. Seed publication consumes no later page budget, and
+the first resumed state cannot replay it. Conversely, an independently dead
+Program page still supplies geometric negative feedback even if the activation
+published an earlier seed effect.
 
-Paged product nodes under the same structural transition operator cross one
-block-native cohort seam. The batch carries row-aligned nodes, affine cursors,
-and ragged limits whose sum is the current global width; successors return with
-input-node tags. A constraint may page some rows while leaving other `Start`
-rows to the existing eager block expansion, so one negated fallback does not
-erase bounded positive work. The default lowers the cohort to one-node page
-calls, while storage or accelerator constraints can fuse it without changing
-canonical state or producer-credit semantics.
+Paged product states cross one block-native typed Program seam. The erased
+batch carries row-aligned opaque work handles, immutable parent context, and
+ragged limits whose sum is the current global width; typed effects return with
+input tags. Storage and accelerator implementations may fuse a cohort without
+changing canonical state, novelty, rank, or producer-credit semantics.
 
-Final-variable streaming activations use a second physical policy on that same
-seam. A directed hot continuation still advances exactly one activation: its
-source pager receives global search width `S`, while its transition pager
-receives the activation-local sparse quantum `t_a`, capped by `S`. Cold global
-harvesting may instead cohort compatible terminal activations. Source rows
-share one budget `B=S`; transition rows share
-`B=min(S, sum_a t_a)`, with ragged task limits that never spend more than one
-activation's `t_a` on its behalf. The backend call is shared, but feedback is
-not: an activation that publishes resets to one independently of a sibling
-whose live transition miss doubles its own quantum. Source misses leave every
-transition quantum unchanged. A negative transition cohort reaches outer
-search-width growth only after it saturates `S` and leaves terminal work live.
+Final-variable streaming activations use a terminal physical policy on that
+same seam. A directed hot continuation advances exactly one affine activation
+with its activation-local sparse quantum `t_a`, capped by global search width
+`S`. Cold global harvesting may instead cohort compatible terminal
+activations under `B=min(S, sum_a t_a)`, with ragged task limits that never
+spend more than one activation's `t_a` on its behalf. The backend call is
+shared, but feedback is not: an activation that publishes resets to one
+independently of a sibling whose live miss doubles its own quantum. A negative
+terminal cohort reaches outer search-width growth only after it saturates `S`
+and leaves work live.
 
 The ordinary [`Query`](triblespace::core::query::Query) uses this engine whenever
 exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,

@@ -76,11 +76,9 @@ use triblespace_core::query::{
     CandidateSink, Constraint, ConstraintChildren, ConstraintShape, DispatchClass, EstimateSink,
     PreferredProgram, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing,
     ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
-    ProgramStratum, ProposalCoverage, ProposalLayout, RawTerm, ResidualDeltaExpandBatch,
-    ResidualDeltaExpandCursor, ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput,
-    ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, Term, TriblePattern, TypedEffectSink, TypedProgramBatch,
-    TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
+    ProgramStratum, ProposalCoverage, ProposalLayout, RawTerm, RowsView, Term, TriblePattern,
+    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId,
+    VariableSet,
 };
 
 use crate::budgeted::CohortGrants;
@@ -1541,113 +1539,6 @@ where
         self.program
             .canonical()
             .residual_program_proposal_coverage(variable, bound)
-    }
-
-    fn residual_delta_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.program
-            .canonical()
-            .residual_delta_source_is_paged(variable, view)
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        self.program
-            .canonical()
-            .residual_proposal_source_is_paged(variable, view)
-    }
-
-    fn residual_proposal_source_has_transition_roots(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> bool {
-        self.program
-            .canonical()
-            .residual_proposal_source_has_transition_roots(variable, view)
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        self.program
-            .canonical()
-            .residual_delta_source_page(variable, view, candidates, cursor, limit, roots, accepted)
-    }
-
-    fn residual_delta_source_pages(
-        &self,
-        variable: VariableId,
-        batch: ResidualDeltaSourceBatch<'_>,
-        pages: &mut Vec<ResidualDeltaSourcePage>,
-        roots: &mut Vec<(u32, ResidualDeltaOutput)>,
-        accepted: &mut Vec<(u32, RawInline)>,
-    ) -> bool {
-        self.program
-            .canonical()
-            .residual_delta_source_pages(variable, batch, pages, roots, accepted)
-    }
-
-    fn residual_delta_seeds(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaSeed>,
-    ) -> bool {
-        self.program
-            .canonical()
-            .residual_delta_seeds(variable, view, seeds)
-    }
-
-    fn residual_delta_support_seeds(
-        &self,
-        view: &RowsView<'_>,
-        seeds: &mut Vec<ResidualDeltaSeed>,
-    ) -> Option<VariableId> {
-        self.program
-            .canonical()
-            .residual_delta_support_seeds(view, seeds)
-    }
-
-    fn residual_delta_expand_page(
-        &self,
-        variable: VariableId,
-        node: ResidualDeltaNode,
-        cursor: ResidualDeltaExpandCursor,
-        limit: usize,
-        successors: &mut Vec<ResidualDeltaOutput>,
-    ) -> Option<ResidualDeltaExpandPage> {
-        self.program
-            .canonical()
-            .residual_delta_expand_page(variable, node, cursor, limit, successors)
-    }
-
-    fn residual_delta_expand_pages(
-        &self,
-        variable: VariableId,
-        batch: ResidualDeltaExpandBatch<'_>,
-        pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) {
-        self.program
-            .canonical()
-            .residual_delta_expand_pages(variable, batch, pages, successors)
-    }
-
-    fn residual_delta_expand(
-        &self,
-        variable: VariableId,
-        nodes: &[ResidualDeltaNode],
-        successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-    ) -> bool {
-        self.program
-            .canonical()
-            .residual_delta_expand(variable, nodes, successors)
     }
 }
 

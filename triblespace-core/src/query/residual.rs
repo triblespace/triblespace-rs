@@ -133,11 +133,10 @@ struct FormulaNodeCapabilities {
 
 /// Policy result for one structurally available typed Program route.
 ///
-/// `Absent` alone leaves the legacy transition hooks eligible. `Deferred`
-/// records that a route exists but the selected [`ProgramScope`] deliberately
-/// keeps this action on the stable ordinary protocol. Treating those states as
-/// distinct prevents an exposure policy from accidentally selecting a legacy
-/// pager or strengthening a receipt merely because it declined a Program.
+/// `Deferred` records that a route exists but the selected [`ProgramScope`]
+/// deliberately keeps this action on the stable ordinary protocol. `Absent`
+/// does the same because no typed route exists; the distinction remains useful
+/// to compiler probes but no longer selects a second runtime.
 #[derive(Clone, Copy)]
 enum ProgramOffer<'a> {
     Absent,
@@ -1572,8 +1571,8 @@ struct ResidualPlan {
     /// substrate.
     program_scope: ProgramScope,
     /// Per-variable bound-schema prerequisites under which a selected typed
-    /// Program confirmation reuses one complete parent activation until
-    /// traversal quiescence.
+    /// Program confirmation reuses one complete parent activation until that
+    /// Program quiesces.
     parent_atomic_program_confirms: Vec<Box<[(VariableId, VariableSet)]>>,
     /// The nontrivial exposed root is one formula occurrence. Whole-root
     /// identity shells around one opaque atom normalize to the flat plan.
@@ -2100,94 +2099,6 @@ impl ResidualPlan {
         self.formula_proposal_discharges_outer_self_confirm(root, occurrence, node, variable, bound)
     }
 
-    /// Whether any concrete leaf in this plan owns a true transition source
-    /// for the current variable and bound-row schema. Proposal-only paging can
-    /// be materialized eagerly behind a quiescent formula barrier when the
-    /// whole frontier is finite. A heterogeneous transition sibling keeps the
-    /// direct source on the same bounded substrate so the scheduler can
-    /// interleave their work.
-    fn has_paged_transition_source<'a>(
-        &self,
-        root: &dyn Constraint<'a>,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> bool {
-        fn bound_variables(view: &RowsView<'_>) -> VariableSet {
-            view.vars
-                .iter()
-                .copied()
-                .fold(VariableSet::new_empty(), |mut bound, variable| {
-                    bound.set(variable);
-                    bound
-                })
-        }
-        let action_has_source = |constraint: &dyn Constraint<'a>| {
-            let bound = bound_variables(view);
-            match select_program(
-                constraint,
-                self.program_scope,
-                ProgramRequest {
-                    action: ProgramAction::Propose(variable),
-                    bound,
-                },
-            ) {
-                ProgramOffer::Selected(_, _) => true,
-                ProgramOffer::Deferred => false,
-                ProgramOffer::Absent => {
-                    constraint.residual_delta_source_is_paged(variable, view)
-                        || constraint.residual_proposal_source_has_transition_roots(variable, view)
-                }
-            }
-        };
-        fn formula_has_source<'a>(
-            plan: &ResidualPlan,
-            root: &dyn Constraint<'a>,
-            occurrence: usize,
-            node: FormulaNodeId,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            match &plan.finite_formula.node(node).kind {
-                FiniteFormulaNodeKind::Atom => {
-                    let constraint = plan.resolve_formula_node(root, occurrence, node);
-                    let bound = bound_variables(view);
-                    match select_program(
-                        constraint,
-                        plan.program_scope,
-                        ProgramRequest {
-                            action: ProgramAction::Propose(variable),
-                            bound,
-                        },
-                    ) {
-                        ProgramOffer::Selected(_, _) => true,
-                        ProgramOffer::Deferred => false,
-                        ProgramOffer::Absent => {
-                            constraint.residual_delta_source_is_paged(variable, view)
-                                || constraint
-                                    .residual_proposal_source_has_transition_roots(variable, view)
-                        }
-                    }
-                }
-                FiniteFormulaNodeKind::And { children }
-                | FiniteFormulaNodeKind::Or { children } => children.iter().any(|&child| {
-                    formula_has_source(plan, root, occurrence, child, variable, view)
-                }),
-            }
-        }
-
-        (0..self.len()).any(|occurrence| {
-            self.finite_formula.root(occurrence).map_or_else(
-                || {
-                    let constraint = self.resolve(root, occurrence);
-                    action_has_source(constraint)
-                },
-                |formula_root| {
-                    formula_has_source(self, root, occurrence, formula_root, variable, view)
-                },
-            )
-        })
-    }
-
     /// Whether candidate occurrences may be consumed as independent pages.
     /// Ordinary weak support refinement is relational over SET-admitted
     /// `(parent, value)` occurrences. Only a selected typed Program route that
@@ -2236,9 +2147,8 @@ pub enum FormulaScope {
 #[must_use]
 pub enum ProgramScope {
     /// Admit no typed Program routes.
-    ///
-    /// A structurally absent route may still leave legacy pager or seed hooks
-    /// eligible; a route deferred by this policy uses the ordinary protocol.
+    /// Both structurally absent and policy-deferred routes use the ordinary
+    /// constraint protocol.
     #[default]
     Disabled,
     /// Admit routes marked [`ProgramExposure::Production`].
@@ -2349,7 +2259,7 @@ impl ResidualLowering {
     /// Conservative residual lowering used by explicit probe solvers.
     pub const CONSERVATIVE: Self = Self::new(FormulaScope::OpaqueLeaves, ProgramScope::Disabled);
     /// Production lowering: retain fused formula kernels while enabling
-    /// production-qualified heterogeneous transition programs.
+    /// production-qualified heterogeneous typed Programs.
     pub const HYBRID: Self = Self::new(FormulaScope::OpaqueLeaves, ProgramScope::Production);
     /// Maximally exposed formula and transition-program lowering.
     pub const FULL: Self = Self::new(FormulaScope::WholeRoot, ProgramScope::All);
@@ -6500,19 +6410,17 @@ impl FormulaBatch {
         self.install_current(result);
     }
 
-    /// Freezes the exact candidate occurrence bag at the cyclic action-opening
-    /// boundary and returns a shared reducer copy. Legacy graph expansion can
-    /// retain a segmented input; the later affine finalizer always walks the
-    /// shared root with a structural cursor.
+    /// Freezes the exact candidate occurrence bag at typed action opening.
+    /// The later affine finalizer walks the shared root with a structural
+    /// cursor.
     fn take_confirm_original(&mut self) -> CandidatePayload {
         self.input_mut().defer_for_shared_activation(1);
         self.take_current()
     }
 
-    /// Freezes a Confirm input that must also cross the old slice-based graph
-    /// seam. Typed Programs and delta sources borrow the complete input
-    /// from `source_context`; a preceding pageable Confirm may have left it as
-    /// a segmented rope, so their action opening explicitly recoalesces it.
+    /// Freezes a Confirm input for a typed Program that borrows the complete
+    /// input from `source_context`. A preceding pageable Confirm may have left
+    /// it as a segmented rope, so action opening explicitly recoalesces it.
     fn take_contiguous_confirm_original(&mut self) -> CandidatePayload {
         let input = self.input_mut();
         input.materialize_for_planning_or_action_opening();
@@ -11261,13 +11169,10 @@ impl ResidualStateMachine {
             action: ProgramAction::Propose(variable),
             bound: task.desc.bound,
         };
-        // A missing action route leaves the legacy transition hooks eligible.
-        // A policy-deferred route instead selects the stable ordinary action;
-        // it must never fall through to a legacy pager or seed adapter.
-        let program = match select_program(constraint, plan.program_scope, program_request) {
-            ProgramOffer::Absent => None,
-            ProgramOffer::Deferred => return Err(task),
-            ProgramOffer::Selected(spec, route) => Some((spec, route)),
+        let ProgramOffer::Selected(spec, route) =
+            select_program(constraint, plan.program_scope, program_request)
+        else {
+            return Err(task);
         };
         let selected_parent_count = rows.row_count;
         let admitted_parent_count = if terminal_streaming {
@@ -11278,32 +11183,14 @@ impl ResidualStateMachine {
         let complete_terminal_candidate = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
-            && program.is_some_and(|(_, route)| {
-                route.completion == ProgramCompletion::CompleteActionEquivalent
-            });
+            && route.completion == ProgramCompletion::CompleteActionEquivalent;
         let complete_wide_candidate = !terminal_streaming
             && self.width > 1
-            && program.is_some_and(|(_, route)| {
-                route.completion == ProgramCompletion::CompleteActionEquivalent
-            });
+            && self.terminal_demand_width > 1
+            && route.completion == ProgramCompletion::CompleteActionEquivalent;
         // A semantic Program certificate and independent physical evidence
         // jointly select this phase. Do not open sparse roots for the fresh
         // admitted suffix when both agree.
-        let mut paged = false;
-        let mut seeds = Vec::new();
-        if program.is_none() {
-            let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
-            let view = rows_view(&vars, &rows.rows, rows.row_count);
-            paged = constraint.residual_delta_source_is_paged(variable, &view)
-                || constraint.residual_proposal_source_is_paged(variable, &view);
-            if !paged && !constraint.residual_delta_seeds(variable, &view, &mut seeds) {
-                assert!(
-                    seeds.is_empty(),
-                    "unsupported delta seed hook mutated its output"
-                );
-                return Err(task);
-            }
-        }
         let SelectedResidualTask {
             state,
             desc,
@@ -11339,100 +11226,55 @@ impl ResidualStateMachine {
             debug_assert_eq!(receipt.state, state);
             bucket = admitted;
             self.stats.delta_terminal_admission_remainders += remainder_rows;
-            if program.is_none() && !paged {
-                seeds.retain(|seed| seed.parent as usize >= first_admitted);
-                for seed in &mut seeds {
-                    seed.parent = u32::try_from(seed.parent as usize - first_admitted)
-                        .expect("rebased terminal seed parent exceeds u32");
-                }
-            }
         }
         let StateBucket::Rows(rows) = bucket else {
             unreachable!("terminal admission preserved proposal rows")
         };
         let direct_terminal_publication_full = self.direct_terminal_publication_full();
-        if let Some((spec, route)) = program {
-            if complete_terminal_candidate {
-                return Ok(self.seed_complete_terminal_program_candidate(
-                    spec,
-                    program_request,
-                    route,
-                    state,
-                    desc,
-                    DeltaDesc::leaf(variable, proposer),
-                    successor,
-                    rows,
-                    direct_terminal_publication_full,
-                    plan,
-                ));
-            }
-            if complete_wide_candidate {
-                let capacity = self.width.max(1);
-                let completion = {
-                    let affinity = ProgramCompleteAffinity::new(&rows);
-                    let vars: Vec<VariableId> = program_request.bound.into_iter().collect();
-                    let batch = ProgramCompleteBatch {
-                        request: program_request,
-                        route,
-                        view: rows_view(&vars, &rows.rows, rows.row_count),
-                    };
-                    spec.try_complete_bounded(batch, capacity, &affinity)
-                        .map(|completion| completion.into_parts_for(batch, &affinity, &rows))
-                };
-                if let Some(completion) = completion {
-                    return Ok(self.finish_complete_program_candidate(
-                        state, desc, successor, rows, completion, plan,
-                    ));
-                }
-            }
-            self.stats.propose_action_pops += 1;
-            self.stats.propose_calls += 1;
-            self.stats.propose_rows += rows.row_count;
-            self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
-            let mut outcome = self.delta.seed_program_proposals_with_full(
+        if complete_terminal_candidate {
+            return Ok(self.seed_complete_terminal_program_candidate(
                 spec,
-                DeltaDesc::leaf(variable, proposer),
                 program_request,
                 route,
+                state,
+                desc,
+                DeltaDesc::leaf(variable, proposer),
                 successor,
                 rows,
-                self.full,
                 direct_terminal_publication_full,
                 plan,
-                &mut self.worklist,
-                &mut self.interner,
-                &mut self.stats,
-            );
-            if terminal_streaming && self.uses_direct_terminal_publication() {
-                outcome.terminal_family = Some(state);
-            } else {
-                outcome.terminal_activations.clear();
+            ));
+        }
+        if complete_wide_candidate {
+            let capacity = self.width.max(1);
+            let completion = {
+                let affinity = ProgramCompleteAffinity::new(&rows);
+                let vars: Vec<VariableId> = program_request.bound.into_iter().collect();
+                let batch = ProgramCompleteBatch {
+                    request: program_request,
+                    route,
+                    view: rows_view(&vars, &rows.rows, rows.row_count),
+                };
+                spec.try_complete_bounded(batch, capacity, &affinity)
+                    .map(|completion| completion.into_parts_for(batch, &affinity, &rows))
+            };
+            if let Some(completion) = completion {
+                return Ok(self.finish_complete_program_candidate(
+                    state, desc, successor, rows, completion, plan,
+                ));
             }
-            return Ok(outcome);
         }
         self.stats.propose_action_pops += 1;
         self.stats.propose_calls += 1;
         self.stats.propose_rows += rows.row_count;
         self.stats.max_propose_rows = self.stats.max_propose_rows.max(rows.row_count);
-        if paged {
-            let mut outcome = self.delta.seed_source_proposals_with_full_receipt(
-                DeltaDesc::leaf(variable, proposer),
-                successor,
-                rows,
-                self.full,
-            );
-            if terminal_streaming && self.uses_direct_terminal_publication() {
-                outcome.terminal_family = Some(state);
-            } else {
-                outcome.terminal_activations.clear();
-            }
-            return Ok(outcome);
-        }
-        let mut outcome = self.delta.seed_proposals_with_full(
+        let mut outcome = self.delta.seed_program_proposals_with_full(
+            spec,
             DeltaDesc::leaf(variable, proposer),
+            program_request,
+            route,
             successor,
             rows,
-            seeds,
             self.full,
             direct_terminal_publication_full,
             plan,
@@ -11448,11 +11290,11 @@ impl ResidualStateMachine {
         Ok(outcome)
     }
 
-    /// Converts one eligible confirmer into one transition activation per
-    /// parent candidate batch. The reducer retains its admitted source
-    /// relation and filters it only after traversal quiesces. Ordinary typed
+    /// Converts one eligible confirmer into one typed Program activation per
+    /// parent candidate batch. The reducer retains its admitted input relation
+    /// and filters it only after the Program quiesces. Ordinary typed
     /// confirmations may receive one disjoint page; repeated RPQ routes retain
-    /// one complete parent activation to reuse graph-product traversal.
+    /// one complete parent activation to reuse graph-product work.
     fn seed_delta_confirm<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -11469,14 +11311,14 @@ impl ResidualStateMachine {
                 checked,
                 confirmer,
             },
-            StateBucket::Candidates(batch),
+            StateBucket::Candidates(_batch),
         ) = (&task.desc.phase, &task.bucket)
         else {
             return Err(task);
         };
         // Lowered finite formulas own their own action reducer. Any ordinary
-        // opaque confirmer may offer a transition program; unsupported hooks
-        // fall back to the ordinary protocol below.
+        // opaque confirmer may offer a typed Program; absence or deferral
+        // falls back to the ordinary protocol below.
         if plan.has_finite_formula(*confirmer) {
             return Err(task);
         }
@@ -11497,175 +11339,31 @@ impl ResidualStateMachine {
         let confirmer = *confirmer;
         let relevant = relevant.clone();
         let checked = checked.clone();
-        let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
-        let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
         let constraint = plan.resolve(root, confirmer);
         let program_request = ProgramRequest {
             action: ProgramAction::Confirm(variable),
             bound: task.desc.bound,
         };
-        let program = match select_program(constraint, plan.program_scope, program_request) {
-            ProgramOffer::Absent => None,
-            ProgramOffer::Deferred => return Err(task),
-            ProgramOffer::Selected(spec, route) => Some((spec, route)),
-        };
-        if let Some((spec, route)) = program {
-            if route.grouping == ProgramGrouping::ParentAtomic {
-                assert!(
-                    !task
-                        .desc
-                        .uses_candidate_pages(plan, &self.interner.formula_pcs),
-                    "parent-atomic typed confirmation was split into candidate pages"
-                );
-            }
-            let SelectedResidualTask {
-                state,
-                desc,
-                bucket,
-            } = task;
-            let StateBucket::Candidates(batch) = bucket else {
-                unreachable!("typed program confirmer was checked above")
-            };
-            let candidates_before = batch.candidate_count();
-            self.stats.confirm_action_pops += 1;
-            self.stats.confirm_calls += 1;
-            self.stats.confirm_rows += batch.parents.row_count;
-            self.stats.max_confirm_rows = self.stats.max_confirm_rows.max(batch.parents.row_count);
-            self.stats.candidates_confirmed += candidates_before;
-            self.stats.max_confirm_candidates =
-                self.stats.max_confirm_candidates.max(candidates_before);
-            let successor = StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Candidate {
-                    variable,
-                    relevant,
-                    checked: checked.with_inserted(confirmer),
-                },
-            };
-            let set_admit_result =
-                crosses_candidate_set_boundary(&desc, &successor, plan, &self.interner.formula_pcs);
-            let mut support_bound = desc.bound;
-            support_bound.set(variable);
-            let support_variables = constraint.variables();
-            let positive_publication = PositivePublicationSeed::exact_confirm_tap(
-                state,
-                &desc,
-                &successor,
-                self.full,
-                plan,
-                &self.interner.formula_pcs,
-            )
-            .map(|publication| {
-                if !support_variables.is_subset_of(&support_bound) {
-                    return publication;
-                }
-                let support_request = ProgramRequest {
-                    action: ProgramAction::Support,
-                    bound: support_bound,
-                };
-                let ProgramOffer::Selected(support_spec, support_route) =
-                    select_program(constraint, plan.program_scope, support_request)
-                else {
-                    return publication;
-                };
-                // V1 asks one implementation object to certify the cumulative
-                // work theorem for both routes. This pointer-identity guard is
-                // a conservative admission limitation, not part of the
-                // observable dominance theorem; future cross-implementation
-                // receipts may remove it without changing publication safety.
-                if spec.same_implementation(support_spec)
-                    && spec.certifies_confirm_dominates_support_positive_prefix(
-                        program_request,
-                        route,
-                        support_request,
-                        support_route,
-                    )
-                {
-                    publication
-                } else {
-                    publication.with_support_hedge(
-                        support_spec,
-                        DeltaDesc::leaf(support_route.variable, confirmer),
-                        support_request,
-                        support_route,
-                        support_variables,
-                        self.direct_terminal_publication_full(),
-                    )
-                }
-            });
-            let outcome = self.delta.seed_program_confirms(
-                spec,
-                DeltaDesc::leaf(variable, confirmer),
-                program_request,
-                route,
-                successor,
-                set_admit_result,
-                batch,
-                positive_publication,
-                &mut self.stats,
-            );
-            return Ok(outcome);
-        }
-        if constraint.residual_delta_source_is_paged(variable, &view) {
-            let SelectedResidualTask {
-                state: _,
-                desc,
-                bucket,
-            } = task;
-            let StateBucket::Candidates(batch) = bucket else {
-                unreachable!("delta confirmer was checked above")
-            };
-            let candidates_before = batch.candidate_count();
-            self.stats.confirm_action_pops += 1;
-            self.stats.confirm_calls += 1;
-            self.stats.confirm_rows += batch.parents.row_count;
-            self.stats.max_confirm_rows = self.stats.max_confirm_rows.max(batch.parents.row_count);
-            self.stats.candidates_confirmed += candidates_before;
-            self.stats.max_confirm_candidates =
-                self.stats.max_confirm_candidates.max(candidates_before);
-            let successor = StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Candidate {
-                    variable,
-                    relevant,
-                    checked: checked.with_inserted(confirmer),
-                },
-            };
-            let set_admit_result =
-                crosses_candidate_set_boundary(&desc, &successor, plan, &self.interner.formula_pcs);
-            let seeded_parents = batch.parents.row_count;
-            let active = self.delta.seed_source_confirms(
-                DeltaDesc::leaf(variable, confirmer),
-                successor,
-                set_admit_result,
-                batch,
-            );
-            return Ok(DeltaSeedOutcome {
-                continuation: None,
-                publication: None,
-                active,
-                terminal_activations: Vec::new(),
-                completed_activation_ids: Vec::new(),
-                terminal_family: None,
-                seeded_parents,
-            });
-        }
-        let mut seeds = Vec::new();
-        let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
-        if !supported {
-            assert!(
-                seeds.is_empty(),
-                "unsupported delta seed hook mutated its output"
-            );
+        let ProgramOffer::Selected(spec, route) =
+            select_program(constraint, plan.program_scope, program_request)
+        else {
             return Err(task);
+        };
+        if route.grouping == ProgramGrouping::ParentAtomic {
+            assert!(
+                !task
+                    .desc
+                    .uses_candidate_pages(plan, &self.interner.formula_pcs),
+                "parent-atomic typed confirmation was split into candidate pages"
+            );
         }
         let SelectedResidualTask {
-            state: _,
+            state,
             desc,
             bucket,
         } = task;
         let StateBucket::Candidates(batch) = bucket else {
-            unreachable!("delta confirmer was checked above")
+            unreachable!("typed program confirmer was checked above")
         };
         let candidates_before = batch.candidate_count();
         self.stats.confirm_action_pops += 1;
@@ -11685,32 +11383,75 @@ impl ResidualStateMachine {
         };
         let set_admit_result =
             crosses_candidate_set_boundary(&desc, &successor, plan, &self.interner.formula_pcs);
-        let seeded_parents = batch.parents.row_count;
-        let active = self.delta.seed_confirms(
+        let mut support_bound = desc.bound;
+        support_bound.set(variable);
+        let support_variables = constraint.variables();
+        let positive_publication = PositivePublicationSeed::exact_confirm_tap(
+            state,
+            &desc,
+            &successor,
+            self.full,
+            plan,
+            &self.interner.formula_pcs,
+        )
+        .map(|publication| {
+            if !support_variables.is_subset_of(&support_bound) {
+                return publication;
+            }
+            let support_request = ProgramRequest {
+                action: ProgramAction::Support,
+                bound: support_bound,
+            };
+            let ProgramOffer::Selected(support_spec, support_route) =
+                select_program(constraint, plan.program_scope, support_request)
+            else {
+                return publication;
+            };
+            // V1 asks one implementation object to certify the cumulative
+            // work theorem for both routes. This pointer-identity guard is
+            // a conservative admission limitation, not part of the
+            // observable dominance theorem; future cross-implementation
+            // receipts may remove it without changing publication safety.
+            if spec.same_implementation(support_spec)
+                && spec.certifies_confirm_dominates_support_positive_prefix(
+                    program_request,
+                    route,
+                    support_request,
+                    support_route,
+                )
+            {
+                publication
+            } else {
+                publication.with_support_hedge(
+                    support_spec,
+                    DeltaDesc::leaf(support_route.variable, confirmer),
+                    support_request,
+                    support_route,
+                    support_variables,
+                    self.direct_terminal_publication_full(),
+                )
+            }
+        });
+        Ok(self.delta.seed_program_confirms(
+            spec,
             DeltaDesc::leaf(variable, confirmer),
+            program_request,
+            route,
             successor,
             set_admit_result,
             batch,
-            seeds,
-        );
-        Ok(DeltaSeedOutcome {
-            continuation: None,
-            publication: None,
-            active,
-            terminal_activations: Vec::new(),
-            completed_activation_ids: Vec::new(),
-            terminal_family: None,
-            seeded_parents,
-        })
+            positive_publication,
+            &mut self.stats,
+        ))
     }
 
-    /// Suspends a currently focused formula Atom behind one transition reducer
-    /// activation per affine parent. The exact Action cursor and live payload
-    /// cells remain activation data; [`DeltaDesc`] names only the common
-    /// structural expansion kernel. Pageable finite confirmations retain the
+    /// Suspends a currently focused formula Atom behind one typed Program
+    /// reducer activation per affine parent. The exact Action cursor and live
+    /// payload cells remain activation data; [`DeltaDesc`] names only the
+    /// common Program kernel. Pageable finite confirmations retain the
     /// formula's geometric split over admitted candidate occurrences; repeated
     /// confirmations may keep one complete parent activation to reuse their
-    /// traversal.
+    /// work.
     fn seed_delta_formula<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -11751,8 +11492,6 @@ impl ResidualStateMachine {
                 "a relational linear formula proposal carried an OR reducer cell"
             );
         }
-        let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
-        let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
         let constraint = plan.resolve_formula_node(root, occurrence, node);
         let program_request = ProgramRequest {
             action: match stage {
@@ -11762,68 +11501,20 @@ impl ResidualStateMachine {
             },
             bound: task.desc.bound,
         };
-        let program = match select_program(constraint, plan.program_scope, program_request) {
-            ProgramOffer::Absent => None,
-            ProgramOffer::Deferred => return Err(task),
-            ProgramOffer::Selected(spec, route) => {
-                if stage == FormulaStage::Confirm && route.grouping == ProgramGrouping::ParentAtomic
-                {
-                    assert!(
-                        !task
-                            .desc
-                            .uses_candidate_pages(plan, &self.interner.formula_pcs),
-                        "parent-atomic typed formula confirmation was split into candidate pages"
-                    );
-                }
-                Some((spec, route))
-            }
+        let ProgramOffer::Selected(spec, route) =
+            select_program(constraint, plan.program_scope, program_request)
+        else {
+            return Err(task);
         };
-        let mut seeds = Vec::new();
-        let (variable, paged) = if let Some((_, route)) = program {
-            (route.variable, false)
-        } else if stage == FormulaStage::Support {
-            let Some(route) = constraint.residual_delta_support_seeds(&view, &mut seeds) else {
-                assert!(
-                    seeds.is_empty(),
-                    "unsupported formula support seed hook mutated its output"
-                );
-                return Err(task);
-            };
-            (route, false)
-        } else {
-            let variable = outer_variable;
-            let transition_paged = constraint.residual_delta_source_is_paged(variable, &view);
-            let proposal_paged = stage == FormulaStage::Propose
-                && constraint.residual_proposal_source_is_paged(variable, &view);
-            let proposal_has_transition_roots = proposal_paged
-                && constraint.residual_proposal_source_has_transition_roots(variable, &view);
-            if proposal_paged
-                && !transition_paged
-                && !proposal_has_transition_roots
-                && !stream_proposal
-                && !plan.has_paged_transition_source(root, variable, &view)
-            {
-                // A quiescent formula reducer cannot publish direct proposal
-                // pages before the finite frontier settles. Eager proposal
-                // materializes the same row-local bag without affine source
-                // machinery. When any sibling owns a true transition source,
-                // keep the heterogeneous frontier uniformly pageable so its
-                // work can still be interleaved.
-                return Err(task);
-            }
-            let paged = transition_paged || proposal_paged;
-            if !paged {
-                let supported = constraint.residual_delta_seeds(variable, &view, &mut seeds);
-                if !supported {
-                    assert!(
-                        seeds.is_empty(),
-                        "unsupported formula delta seed hook mutated its output"
-                    );
-                    return Err(task);
-                }
-            }
-            (variable, paged)
-        };
+        if stage == FormulaStage::Confirm && route.grouping == ProgramGrouping::ParentAtomic {
+            assert!(
+                !task
+                    .desc
+                    .uses_candidate_pages(plan, &self.interner.formula_pcs),
+                "parent-atomic typed formula confirmation was split into candidate pages"
+            );
+        }
+        let variable = route.variable;
 
         let SelectedResidualTask {
             state: _,
@@ -11860,50 +11551,15 @@ impl ResidualStateMachine {
                     self.stats.max_confirm_candidates.max(candidates_before);
             }
         }
-        if let Some((spec, route)) = program {
-            return Ok(self.delta.seed_program_formula(
-                spec,
-                DeltaDesc::formula(variable, occurrence, node),
-                program_request,
-                route,
-                desc.bound,
-                cursor,
-                stage,
-                batch,
-                stream_proposal,
-                plan,
-                &mut self.worklist,
-                &mut self.interner,
-                &mut self.stats,
-            ));
-        }
-        if paged {
-            let seeded_parents = batch.parents.row_count;
-            let active = self.delta.seed_source_formula(
-                DeltaDesc::formula(variable, occurrence, node),
-                desc.bound,
-                cursor,
-                stage,
-                batch,
-                stream_proposal,
-            );
-            return Ok(DeltaSeedOutcome {
-                continuation: None,
-                publication: None,
-                active,
-                terminal_activations: Vec::new(),
-                completed_activation_ids: Vec::new(),
-                terminal_family: None,
-                seeded_parents,
-            });
-        }
-        Ok(self.delta.seed_formula(
+        Ok(self.delta.seed_program_formula(
+            spec,
             DeltaDesc::formula(variable, occurrence, node),
+            program_request,
+            route,
             desc.bound,
             cursor,
             stage,
             batch,
-            seeds,
             stream_proposal,
             plan,
             &mut self.worklist,
@@ -12435,7 +12091,7 @@ impl ResidualStateMachine {
             // the cyclic analogue of `ActiveContinuation`: follow that exact
             // affine lineage before any cold stable cohort. It owns no work;
             // dropping the token merely returns scheduling to the global
-            // source/transition worklists.
+            // typed Program worklist.
             if self.continuation.is_none() {
                 if let Some(active) = self.active_delta.take() {
                     self.stats.delta_active_lease_steps += 1;
@@ -15173,7 +14829,6 @@ mod tests {
     struct PagedProposalLeaf {
         variable: VariableId,
         values: Arc<Vec<RawInline>>,
-        transition_source: bool,
         proposes: Arc<AtomicUsize>,
         pages: Arc<AtomicUsize>,
         action_log: Option<(usize, Arc<Mutex<Vec<LoggedAction>>>)>,
@@ -15188,6 +14843,68 @@ mod tests {
                     parent_rows,
                     candidate_occurrences: 0,
                 });
+            }
+        }
+    }
+
+    impl TypedProgramSpec for PagedProposalLeaf {
+        type State = usize;
+        type NoveltyKey = ();
+        type Rank = usize;
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(
+                request.action,
+                ProgramAction::Propose(variable)
+                    if variable == self.variable && !request.bound.is_set(variable)
+            )
+            .then_some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: self.variable,
+                stratum: ProgramStratum::Finite,
+                grouping: ProgramGrouping::PageLocal,
+                completion: ProgramCompletion::PageableOnly,
+                exposure: ProgramExposure::Production,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(0)
+        }
+
+        fn progress(&self, remaining: &Self::State) -> Self::Rank {
+            *remaining
+        }
+
+        fn seed_typed(
+            &self,
+            batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            self.record_propose(batch.view.len());
+            for parent in 0..batch.view.len() {
+                effects.finite_root(parent as u32, self.values.len(), None);
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: &mut Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            for (input, remaining) in states.drain(..).enumerate() {
+                self.pages.fetch_add(1, Ordering::Relaxed);
+                let limit = _batch.limits[input];
+                let examined = remaining.min(limit);
+                let offset = self.values.len() - remaining;
+                let end = offset + examined;
+                for value in self.values[offset..end].iter().copied() {
+                    effects.accept(input as u32, value);
+                }
+                effects.account_source(examined, 0);
+                let next = remaining - examined;
+                effects.page(examined, (next > 0).then_some(TypedResume::Immediate(next)));
             }
         }
     }
@@ -15248,74 +14965,53 @@ mod tests {
                 .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
         }
 
-        fn residual_delta_source_is_paged(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-        ) -> bool {
-            false
-        }
-
-        fn residual_proposal_source_is_paged(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-        ) -> bool {
-            variable == self.variable
-        }
-
-        fn residual_proposal_source_has_transition_roots(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-        ) -> bool {
-            variable == self.variable && self.transition_source
-        }
-
-        fn residual_delta_source_page(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: Option<&[RawInline]>,
-            cursor: ResidualDeltaSourceCursor,
-            limit: usize,
-            roots: &mut Vec<ResidualDeltaOutput>,
-            accepted: &mut Vec<RawInline>,
-        ) -> Option<ResidualDeltaSourcePage> {
-            assert_eq!(variable, self.variable);
-            assert!(candidates.is_none());
-            assert!(roots.is_empty());
-            self.record_propose(view.len());
-            self.pages.fetch_add(1, Ordering::Relaxed);
-            let offset = match cursor {
-                ResidualDeltaSourceCursor::Start => 0,
-                ResidualDeltaSourceCursor::Offset(offset) => {
-                    usize::try_from(offset).expect("test proposal cursor exceeds usize")
-                }
-                ResidualDeltaSourceCursor::After(_) => {
-                    panic!("test proposal source uses ordinal cursors")
-                }
-            };
-            let end = offset.saturating_add(limit).min(self.values.len());
-            accepted.extend_from_slice(&self.values[offset..end]);
-            Some(ResidualDeltaSourcePage {
-                next: (end < self.values.len()).then_some(ResidualDeltaSourceCursor::Offset(
-                    u64::try_from(end).expect("test proposal cursor exceeds u64"),
-                )),
-                examined: end - offset,
-            })
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
         }
     }
 
-    /// One explicit typed route with an intentionally still-advertised legacy
-    /// pager. This fixture falsifies the tempting but incorrect
-    /// `deferred == absent` implementation of Program policy.
+    fn seed_test_program_proposal(
+        program: &PagedProposalLeaf,
+        machine: &mut ResidualStateMachine,
+        plan: &ResidualPlan,
+        full: VariableSet,
+    ) -> delta::ActiveDeltaContinuation {
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(program.variable),
+            bound: VariableSet::new_empty(),
+        };
+        let spec = program.residual_program().unwrap();
+        let route = spec.route(request).unwrap();
+        machine
+            .delta
+            .seed_program_proposals_with_full(
+                spec,
+                DeltaDesc::leaf(0, 0),
+                request,
+                route,
+                StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Ready,
+                },
+                RowBatch::seed(),
+                full,
+                None,
+                plan,
+                &mut machine.worklist,
+                &mut machine.interner,
+                &mut machine.stats,
+            )
+            .active
+            .expect("one typed Program proposal was filed")
+    }
+
+    /// One explicit typed route whose ordinary implementation records when
+    /// policy defers the route.
     #[derive(Clone)]
     struct ExplicitProgramPagedProposalLeaf {
         variable: VariableId,
         value: RawInline,
         ordinary_proposes: Arc<AtomicUsize>,
-        legacy_pages: Arc<AtomicUsize>,
         program_seeds: Arc<AtomicUsize>,
     }
 
@@ -15414,38 +15110,6 @@ mod tests {
 
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             Some(ProgramRef::new(self))
-        }
-
-        fn residual_proposal_source_is_paged(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-        ) -> bool {
-            variable == self.variable
-        }
-
-        fn residual_delta_source_page(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-            candidates: Option<&[RawInline]>,
-            cursor: ResidualDeltaSourceCursor,
-            _limit: usize,
-            roots: &mut Vec<ResidualDeltaOutput>,
-            accepted: &mut Vec<RawInline>,
-        ) -> Option<ResidualDeltaSourcePage> {
-            assert_eq!(variable, self.variable);
-            assert!(candidates.is_none());
-            assert!(roots.is_empty());
-            self.legacy_pages.fetch_add(1, Ordering::Relaxed);
-            let examined = usize::from(matches!(cursor, ResidualDeltaSourceCursor::Start));
-            if examined == 1 {
-                accepted.push(self.value);
-            }
-            Some(ResidualDeltaSourcePage {
-                next: None,
-                examined,
-            })
         }
     }
 
@@ -15571,46 +15235,6 @@ mod tests {
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             Some(ProgramRef::new(&DECLINING_PROGRAM))
         }
-
-        fn residual_delta_source_is_paged(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            self.0.residual_delta_source_is_paged(variable, view)
-        }
-
-        fn residual_proposal_source_is_paged(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            self.0.residual_proposal_source_is_paged(variable, view)
-        }
-
-        fn residual_proposal_source_has_transition_roots(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-        ) -> bool {
-            self.0
-                .residual_proposal_source_has_transition_roots(variable, view)
-        }
-
-        fn residual_delta_source_page(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: Option<&[RawInline]>,
-            cursor: ResidualDeltaSourceCursor,
-            limit: usize,
-            roots: &mut Vec<ResidualDeltaOutput>,
-            accepted: &mut Vec<RawInline>,
-        ) -> Option<ResidualDeltaSourcePage> {
-            self.0.residual_delta_source_page(
-                variable, view, candidates, cursor, limit, roots, accepted,
-            )
-        }
     }
 
     #[derive(Clone)]
@@ -15618,7 +15242,6 @@ mod tests {
         variable: VariableId,
         accepted: RawInline,
         ordinary_confirms: Arc<AtomicUsize>,
-        pages: Arc<AtomicUsize>,
     }
 
     impl Constraint<'static> for DecliningProgramPagedConfirmLeaf {
@@ -15663,89 +15286,15 @@ mod tests {
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             Some(ProgramRef::new(&DECLINING_PROGRAM))
         }
-
-        fn residual_delta_source_is_paged(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-        ) -> bool {
-            variable == self.variable
-        }
-
-        fn residual_delta_source_page(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-            candidates: Option<&[RawInline]>,
-            cursor: ResidualDeltaSourceCursor,
-            limit: usize,
-            roots: &mut Vec<ResidualDeltaOutput>,
-            accepted: &mut Vec<RawInline>,
-        ) -> Option<ResidualDeltaSourcePage> {
-            assert_eq!(variable, self.variable);
-            assert!(roots.is_empty());
-            let candidates = candidates.expect("a paged confirmer lost its candidate set");
-            self.pages.fetch_add(1, Ordering::Relaxed);
-            let offset = match cursor {
-                ResidualDeltaSourceCursor::Start => 0,
-                ResidualDeltaSourceCursor::Offset(offset) => {
-                    usize::try_from(offset).expect("test confirmer cursor exceeds usize")
-                }
-                ResidualDeltaSourceCursor::After(_) => {
-                    panic!("test confirmer uses ordinal cursors")
-                }
-            };
-            let end = offset.saturating_add(limit).min(candidates.len());
-            assert!(accepted.is_empty());
-            roots.extend(
-                candidates[offset..end]
-                    .iter()
-                    .copied()
-                    .filter(|value| *value == self.accepted)
-                    .map(|value| ResidualDeltaOutput {
-                        node: ResidualDeltaNode {
-                            source: None,
-                            value,
-                            continuation: 0,
-                        },
-                        accepted: true,
-                    }),
-            );
-            Some(ResidualDeltaSourcePage {
-                next: (end < candidates.len()).then_some(ResidualDeltaSourceCursor::Offset(
-                    u64::try_from(end).expect("test confirmer cursor exceeds u64"),
-                )),
-                examined: end - offset,
-            })
-        }
-
-        fn residual_delta_expand_page(
-            &self,
-            variable: VariableId,
-            node: ResidualDeltaNode,
-            cursor: ResidualDeltaExpandCursor,
-            _limit: usize,
-            successors: &mut Vec<ResidualDeltaOutput>,
-        ) -> Option<ResidualDeltaExpandPage> {
-            assert_eq!(variable, self.variable);
-            assert_eq!(node.continuation, 0);
-            assert_eq!(cursor, ResidualDeltaExpandCursor::Start);
-            assert!(successors.is_empty());
-            Some(ResidualDeltaExpandPage {
-                next: None,
-                examined: 0,
-            })
-        }
     }
 
     #[test]
-    fn declined_program_route_preserves_opaque_paged_proposals() {
+    fn declined_program_route_uses_the_ordinary_proposal() {
         let proposes = Arc::new(AtomicUsize::new(0));
         let pages = Arc::new(AtomicUsize::new(0));
         let leaf = DecliningProgramPagedProposalLeaf(PagedProposalLeaf {
             variable: 0,
             values: Arc::new((1..=8).map(raw).collect()),
-            transition_source: false,
             proposes: Arc::clone(&proposes),
             pages: Arc::clone(&pages),
             action_log: None,
@@ -15759,32 +15308,30 @@ mod tests {
             .start_width(1)
             .growth(2);
 
-        assert_eq!(solve.next(), Some(raw(1)));
-        assert_eq!(proposes.load(Ordering::Relaxed), 0);
-        assert!(pages.load(Ordering::Relaxed) > 0);
+        let first = solve.next().expect("ordinary proposal returned no values");
+        assert!(proposes.load(Ordering::Relaxed) > 0);
+        assert_eq!(pages.load(Ordering::Relaxed), 0);
 
-        let mut actual = vec![raw(1)];
+        let mut actual = vec![first];
         actual.extend(solve);
         actual.sort_unstable();
         assert_eq!(actual, (1..=8).map(raw).collect::<Vec<_>>());
         assert_eq!(
-            proposes.load(Ordering::Relaxed),
+            pages.load(Ordering::Relaxed),
             0,
-            "declining the Program route must not discard source paging"
+            "a declined Program route must not enter typed paging"
         );
     }
 
     #[test]
-    fn deferred_explicit_program_uses_ordinary_action_not_legacy_pager() {
-        fn run(lowering: ResidualLowering) -> (Vec<RawInline>, usize, usize, usize) {
+    fn deferred_explicit_program_uses_its_ordinary_action() {
+        fn run(lowering: ResidualLowering) -> (Vec<RawInline>, usize, usize) {
             let ordinary_proposes = Arc::new(AtomicUsize::new(0));
-            let legacy_pages = Arc::new(AtomicUsize::new(0));
             let program_seeds = Arc::new(AtomicUsize::new(0));
             let leaf = ExplicitProgramPagedProposalLeaf {
                 variable: 0,
                 value: raw(42),
                 ordinary_proposes: Arc::clone(&ordinary_proposes),
-                legacy_pages: Arc::clone(&legacy_pages),
                 program_seeds: Arc::clone(&program_seeds),
             };
             let results = Query::new(leaf, |binding: &Binding| binding.get(0).copied())
@@ -15793,22 +15340,20 @@ mod tests {
             (
                 results,
                 ordinary_proposes.load(Ordering::Relaxed),
-                legacy_pages.load(Ordering::Relaxed),
                 program_seeds.load(Ordering::Relaxed),
             )
         }
 
         let hybrid = run(ResidualLowering::HYBRID);
-        assert_eq!(hybrid, (vec![raw(42)], 1, 0, 0));
+        assert_eq!(hybrid, (vec![raw(42)], 1, 0));
 
         let full = run(ResidualLowering::FULL);
-        assert_eq!(full, (vec![raw(42)], 0, 0, 1));
+        assert_eq!(full, (vec![raw(42)], 0, 1));
     }
 
     #[test]
-    fn declined_program_route_preserves_paged_confirmation() {
+    fn declined_program_route_uses_the_ordinary_confirmation() {
         let ordinary_confirms = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(AtomicUsize::new(0));
         let root = IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
                 variable: 0,
@@ -15818,7 +15363,6 @@ mod tests {
                 variable: 0,
                 accepted: raw(5),
                 ordinary_confirms: Arc::clone(&ordinary_confirms),
-                pages: Arc::clone(&pages),
             }) as ShapeConstraint,
         ]);
         let profiled = Query::new(root, |binding: &Binding| binding.get(0).copied())
@@ -15832,24 +15376,19 @@ mod tests {
             .collect_profiled();
 
         assert_eq!(profiled.results, [raw(5)]);
-        assert_eq!(ordinary_confirms.load(Ordering::Relaxed), 0);
-        assert!(pages.load(Ordering::Relaxed) > 0);
+        assert!(ordinary_confirms.load(Ordering::Relaxed) > 0);
         assert!(profiled.stats.confirm_action_pops > 0);
-        assert!(profiled.stats.delta_source_pages > 0);
+        assert_eq!(profiled.stats.delta_source_pages, 0);
     }
 
     #[test]
-    fn declined_program_route_preserves_formula_source_paging() {
+    fn declined_program_route_uses_ordinary_formula_leaves() {
         let proposes = Arc::new(AtomicUsize::new(0));
         let pages = Arc::new(AtomicUsize::new(0));
         let leaf = |values| {
             DecliningProgramPagedProposalLeaf(PagedProposalLeaf {
                 variable: 0,
                 values: Arc::new(values),
-                // A root-producing source cannot be eagerly replaced by the
-                // formula reducer, so this pins the Program-decline -> legacy
-                // paged-source edge inside seed_delta_formula itself.
-                transition_source: true,
                 proposes: Arc::clone(&proposes),
                 pages: Arc::clone(&pages),
                 action_log: None,
@@ -15868,9 +15407,9 @@ mod tests {
 
         profiled.results.sort_unstable();
         assert_eq!(profiled.results, [raw(1), raw(2), raw(3)]);
-        assert_eq!(proposes.load(Ordering::Relaxed), 0);
-        assert!(pages.load(Ordering::Relaxed) > 0);
-        assert!(profiled.stats.delta_source_pages > 0);
+        assert!(proposes.load(Ordering::Relaxed) > 0);
+        assert_eq!(pages.load(Ordering::Relaxed), 0);
+        assert_eq!(profiled.stats.delta_source_pages, 0);
     }
 
     #[test]
@@ -16221,7 +15760,6 @@ mod tests {
             Box::new(PagedProposalLeaf {
                 variable: 1,
                 values: Arc::new((32..48).map(raw).collect()),
-                transition_source: false,
                 proposes: Arc::new(AtomicUsize::new(0)),
                 pages: Arc::new(AtomicUsize::new(0)),
                 action_log: None,
@@ -16326,7 +15864,7 @@ mod tests {
         };
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         machine.width = 2;
-        machine.terminal_demand_width = 1;
+        machine.terminal_demand_width = 2;
         let (family, _) = machine
             .interner
             .intern_with_status(desc.clone(), &mut machine.stats);
@@ -17244,7 +16782,6 @@ mod tests {
             Box::new(PagedProposalLeaf {
                 variable: 1,
                 values,
-                transition_source: false,
                 proposes,
                 pages,
                 action_log: None,
@@ -17290,7 +16827,7 @@ mod tests {
                     }),
                 },
             )
-            .expect("the paged proposal action seeded its delta source");
+            .expect("the paged proposal action seeded its typed Program");
         assert!(seeded.continuation.is_none());
         assert!(seeded.publication.is_none());
         let DeltaSeedOutcome {
@@ -17315,52 +16852,6 @@ mod tests {
         );
         assert_eq!(iter.state.active_delta, Some(active));
         iter
-    }
-
-    fn empty_head_direct_terminal_paged_iter<P, R>(
-        postprocessing: P,
-    ) -> ResidualStateIter<IntersectionConstraint<ShapeConstraint>, P, R>
-    where
-        P: Fn(&Binding) -> Option<R>,
-    {
-        let mut iter = direct_terminal_paged_iter(
-            Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]),
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicUsize::new(0)),
-            postprocessing,
-        );
-        iter.projection = ProjectionGate::new([], iter.root.variables());
-        // Read the complete four-occurrence raw page. Activation-local SET
-        // admission stages three rows, whose receipts singleton projection
-        // must still retire even when it stops after its first raw head.
-        iter.state.width = 4;
-        iter
-    }
-
-    fn assert_empty_head_terminal_receipts_retired<C, P, R>(
-        iter: &ResidualStateIter<C, P, R>,
-        projected: usize,
-    ) where
-        P: Fn(&Binding) -> Option<R>,
-    {
-        assert_eq!(iter.state.emit_next, iter.state.emit_count);
-        assert_eq!(iter.state.emit_count, 3);
-        assert!(iter
-            .state
-            .terminal_yield
-            .samples
-            .iter()
-            .all(Option::is_none));
-        let family = &iter.state.terminal_yield.families[&StateId(u32::MAX)];
-        assert_eq!(
-            (
-                family.admitted,
-                family.live,
-                family.completed,
-                family.projected,
-            ),
-            (1, 0, 1, projected)
-        );
     }
 
     #[test]
@@ -17409,8 +16900,8 @@ mod tests {
         let expected = [(raw(9), raw(3)), (raw(9), raw(1)), (raw(9), raw(2))];
         assert_eq!(direct_results, expected);
         assert_eq!(control_results, expected);
-        assert_eq!(direct_pages.load(Ordering::Relaxed), 3);
-        assert_eq!(control_pages.load(Ordering::Relaxed), 3);
+        assert_eq!(direct_pages.load(Ordering::Relaxed), 4);
+        assert_eq!(control_pages.load(Ordering::Relaxed), 4);
         assert_eq!(direct_proposes.load(Ordering::Relaxed), 0);
         assert_eq!(control_proposes.load(Ordering::Relaxed), 0);
 
@@ -17418,10 +16909,10 @@ mod tests {
         assert_eq!(direct_stats.delta_direct_terminal_publication_rows, 3);
         assert_eq!(control_stats.delta_direct_terminal_publication_batches, 0);
         assert_eq!(control_stats.delta_direct_terminal_publication_rows, 0);
-        assert_eq!(direct_stats.delta_active_lease_steps, 3);
-        assert_eq!(direct_stats.delta_source_pages, 3);
+        assert_eq!(direct_stats.delta_active_lease_steps, 4);
+        assert_eq!(direct_stats.delta_source_pages, 4);
         assert_eq!(direct_stats.max_delta_source_cohort, 1);
-        assert_eq!(direct_stats.delta_source_direct_candidates, 4);
+        assert_eq!(direct_stats.delta_source_direct_candidates, 0);
         assert_eq!(
             (
                 direct_stats.propose_action_pops,
@@ -17430,7 +16921,7 @@ mod tests {
                 direct_stats.candidates_proposed,
                 direct_stats.max_propose_candidates,
             ),
-            (1, 1, 1, 4, 2)
+            (1, 1, 1, 4, 1)
         );
         assert_eq!(
             direct_stats.candidates_proposed,
@@ -17506,7 +16997,7 @@ mod tests {
             results,
             [(raw(9), raw(3)), (raw(9), raw(1)), (raw(9), raw(2)),]
         );
-        assert_eq!(pages.load(Ordering::Relaxed), 3);
+        assert_eq!(pages.load(Ordering::Relaxed), 4);
         assert_eq!(cold.stats().delta_active_lease_steps, 0);
         assert_eq!(cold.stats().delta_direct_terminal_publication_batches, 3);
         assert_eq!(cold.stats().delta_direct_terminal_publication_rows, 3);
@@ -17595,39 +17086,6 @@ mod tests {
             (1, 0, 1, 2),
             "the unwound row and its later duplicate are consumed but contribute no projected yield"
         );
-    }
-
-    #[test]
-    fn empty_head_completion_retires_staged_terminal_origin_receipts() {
-        let mut yielded = empty_head_direct_terminal_paged_iter(|_| Some(()));
-        assert_eq!(yielded.next(), Some(()));
-        assert_empty_head_terminal_receipts_retired(&yielded, 1);
-        assert_eq!(yielded.next(), None);
-        assert_eq!(yielded.stats().terminal_demand_width_promotions, 0);
-
-        let mut filtered = empty_head_direct_terminal_paged_iter(|_| None::<()>);
-        assert_eq!(filtered.next(), None);
-        assert_empty_head_terminal_receipts_retired(&filtered, 0);
-
-        let mut panicking = empty_head_direct_terminal_paged_iter(|_| -> Option<()> {
-            panic!("intentional empty-head projection panic")
-        });
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panicking.next()));
-        assert!(unwind.is_err());
-        assert_eq!(panicking.state.emit_next, 1);
-        assert_eq!(
-            panicking
-                .state
-                .terminal_yield
-                .samples
-                .iter()
-                .flatten()
-                .map(|sample| sample.pending_rows)
-                .sum::<usize>(),
-            2
-        );
-        assert_eq!(panicking.next(), None);
-        assert_empty_head_terminal_receipts_retired(&panicking, 0);
     }
 
     #[derive(Clone, Copy)]
@@ -17958,65 +17416,6 @@ mod tests {
             .expect("a fully bound true seed emits exactly once");
         assert_eq!(binding.get(0), Some(&value));
         assert!(frame.next_binding().is_none());
-    }
-
-    #[derive(Clone)]
-    struct DeltaSeedTrap {
-        variable: VariableId,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl Constraint<'static> for DeltaSeedTrap {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(self.variable)
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            if variable == self.variable && !bound.is_set(variable) {
-                ProposalCoverage::Exact
-            } else {
-                ProposalCoverage::None
-            }
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != self.variable {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn residual_delta_seeds(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _seeds: &mut Vec<ResidualDeltaSeed>,
-        ) -> bool {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            true
-        }
     }
 
     /// A concrete root whose manual `Clone` records only the copies paid for
@@ -21741,12 +21140,8 @@ mod tests {
     }
 
     #[test]
-    fn finite_formula_support_falls_back_when_support_hook_is_unsupported() {
-        let delta_calls = Arc::new(AtomicUsize::new(0));
-        let root = UnionConstraint::new(vec![DeltaSeedTrap {
-            variable: 0,
-            calls: Arc::clone(&delta_calls),
-        }]);
+    fn finite_formula_support_without_a_program_remains_ordinary() {
+        let root = UnionConstraint::new(vec![CapabilityLeaf { variable: 0 }]);
         let plan = ResidualPlan::compile_lowering(
             &root,
             ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All),
@@ -21786,7 +21181,6 @@ mod tests {
             ResidualPhase::Formula { cursor: support }
         );
         assert_eq!(returned.bucket.row_count(), 1);
-        assert_eq!(delta_calls.load(Ordering::Relaxed), 0);
         assert_eq!(machine.stats, ResidualStateStats::default());
     }
 
@@ -24558,7 +23952,6 @@ mod tests {
             Box::new(PagedProposalLeaf {
                 variable: 1,
                 values: Arc::new(vec![raw(3), raw(1), raw(3), raw(2)]),
-                transition_source: false,
                 proposes: Arc::new(AtomicUsize::new(0)),
                 pages,
                 action_log: Some((1, log)),
@@ -24774,11 +24167,11 @@ mod tests {
         assert_eq!(shadow.stats, direct.stats);
         assert_eq!(shadow.shadow.status, ResidualShadowStatus::Closed);
         assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
-        assert_eq!(direct_pages.load(Ordering::Relaxed), 1);
-        assert_eq!(shadow_pages.load(Ordering::Relaxed), 1);
+        assert_eq!(direct_pages.load(Ordering::Relaxed), 4);
+        assert_eq!(shadow_pages.load(Ordering::Relaxed), 4);
         assert_eq!(direct_attempts.load(Ordering::Relaxed), 3);
         assert_eq!(shadow_attempts.load(Ordering::Relaxed), 3);
-        assert_eq!(direct.stats.delta_direct_terminal_publication_batches, 1);
+        assert_eq!(direct.stats.delta_direct_terminal_publication_batches, 3);
         assert_eq!(direct.stats.delta_direct_terminal_publication_rows, 3);
         assert_eq!(direct.stats.terminal_demand_projected_rows, 0);
         assert_eq!(direct.stats.width_increases, 1);
@@ -27652,73 +27045,29 @@ mod tests {
     }
 
     #[test]
-    fn quiescent_formula_eagerly_materializes_only_proposal_paging() {
-        let run = |transition_source| {
-            let proposes = Arc::new(AtomicUsize::new(0));
-            let pages = Arc::new(AtomicUsize::new(0));
-            let leaf = |values| PagedProposalLeaf {
-                variable: 0,
-                values: Arc::new(values),
-                transition_source,
-                proposes: Arc::clone(&proposes),
-                pages: Arc::clone(&pages),
-                action_log: None,
-            };
-            let root = UnionConstraint::new(vec![
-                leaf(vec![raw(1), raw(2), raw(2)]),
-                leaf(vec![raw(2), raw(3)]),
-            ]);
-            let mut solve = Query::new(root, |binding: &Binding| binding.get(0).copied())
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
-                .collect_profiled();
-            solve.results.sort_unstable();
-            (solve, proposes, pages)
+    fn quiescent_formula_uses_typed_proposal_programs() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(AtomicUsize::new(0));
+        let leaf = |values| PagedProposalLeaf {
+            variable: 0,
+            values: Arc::new(values),
+            proposes: Arc::clone(&proposes),
+            pages: Arc::clone(&pages),
+            action_log: None,
         };
+        let root = UnionConstraint::new(vec![
+            leaf(vec![raw(1), raw(2), raw(2)]),
+            leaf(vec![raw(2), raw(3)]),
+        ]);
+        let mut profiled = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect_profiled();
+        profiled.results.sort_unstable();
 
-        let (proposal_only, proposes, pages) = run(false);
-        assert_eq!(proposal_only.results, [raw(1), raw(2), raw(3)]);
-        assert_eq!(proposes.load(Ordering::Relaxed), 2);
-        assert_eq!(pages.load(Ordering::Relaxed), 0);
-        assert_eq!(proposal_only.stats.delta_source_pages, 0);
-
-        let (transition, proposes, pages) = run(true);
-        assert_eq!(transition.results, proposal_only.results);
+        assert_eq!(profiled.results, [raw(1), raw(2), raw(3)]);
         assert_eq!(proposes.load(Ordering::Relaxed), 0);
         assert!(pages.load(Ordering::Relaxed) > 0);
-        assert!(transition.stats.delta_source_pages > 0);
-
-        let finite_proposes = Arc::new(AtomicUsize::new(0));
-        let finite_pages = Arc::new(AtomicUsize::new(0));
-        let transition_proposes = Arc::new(AtomicUsize::new(0));
-        let transition_pages = Arc::new(AtomicUsize::new(0));
-        let root = UnionConstraint::new(vec![
-            PagedProposalLeaf {
-                variable: 0,
-                values: Arc::new(vec![raw(1), raw(2)]),
-                transition_source: false,
-                proposes: Arc::clone(&finite_proposes),
-                pages: Arc::clone(&finite_pages),
-                action_log: None,
-            },
-            PagedProposalLeaf {
-                variable: 0,
-                values: Arc::new(vec![raw(2), raw(3)]),
-                transition_source: true,
-                proposes: Arc::clone(&transition_proposes),
-                pages: Arc::clone(&transition_pages),
-                action_log: None,
-            },
-        ]);
-        let mut heterogeneous: Vec<_> =
-            Query::new(root, |binding: &Binding| binding.get(0).copied())
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
-                .collect();
-        heterogeneous.sort_unstable();
-        assert_eq!(heterogeneous, [raw(1), raw(2), raw(3)]);
-        assert_eq!(finite_proposes.load(Ordering::Relaxed), 0);
-        assert!(finite_pages.load(Ordering::Relaxed) > 0);
-        assert_eq!(transition_proposes.load(Ordering::Relaxed), 0);
-        assert!(transition_pages.load(Ordering::Relaxed) > 0);
+        assert!(profiled.stats.delta_source_pages > 0);
     }
 
     #[test]
@@ -28862,17 +28211,14 @@ mod tests {
             }),
             &mut machine.stats,
         );
-        let active = machine
-            .delta
-            .seed_source_proposals(
-                DeltaDesc::leaf(0, 0),
-                StateDesc {
-                    bound: VariableSet::new_empty(),
-                    phase: ResidualPhase::Ready,
-                },
-                RowBatch::seed(),
-            )
-            .expect("one physical delta preference was filed");
+        let program = PagedProposalLeaf {
+            variable: 0,
+            values: Arc::new(vec![raw(9)]),
+            proposes: Arc::new(AtomicUsize::new(0)),
+            pages: Arc::new(AtomicUsize::new(0)),
+            action_log: None,
+        };
+        let active = seed_test_program_proposal(&program, &mut machine, &plan, root.variables());
         machine.active_delta = Some(active);
 
         let right = machine
@@ -29884,17 +29230,14 @@ mod tests {
         let root = CapabilityLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
-        let active = machine
-            .delta
-            .seed_source_proposals(
-                DeltaDesc::leaf(0, 0),
-                StateDesc {
-                    bound: VariableSet::new_empty(),
-                    phase: ResidualPhase::Ready,
-                },
-                RowBatch::seed(),
-            )
-            .expect("one cyclic source activation was filed");
+        let program = PagedProposalLeaf {
+            variable: 0,
+            values: Arc::new(vec![raw(9)]),
+            proposes: Arc::new(AtomicUsize::new(0)),
+            pages: Arc::new(AtomicUsize::new(0)),
+            action_log: None,
+        };
+        let active = seed_test_program_proposal(&program, &mut machine, &plan, root.variables());
 
         machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());

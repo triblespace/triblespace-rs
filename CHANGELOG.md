@@ -9,11 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: cyclic constraint execution now has one typed Program runtime.**
+  The ten never-shipped residual pager, seed, and expansion hooks are removed
+  from `Constraint`, together with their source/transition queues, descriptor
+  registry lane, and forwarding adapters. A selected typed Program enters the
+  affine scheduler; a policy-deferred or structurally absent route uses the
+  ordinary constraint action. Custom constraints that need resumable work
+  implement a typed Program instead of a second residual protocol.
 - **Built-in finite proposal sources now use one Production typed Program
   pager.** PATCH value/ID membership, sorted slices, SuccinctArchive and
-  TribleSet patterns and ranges, and UnionArchive no longer duplicate paging
-  through the legacy residual hooks. Custom legacy constraints remain
-  supported.
+  TribleSet patterns and ranges, and UnionArchive use the same typed paging
+  substrate.
 - **Breaking: ordinary queries now have one fixed residual compiler policy.**
   Serial iteration, ordinary Rayon iteration, saturated parallel iteration,
   and private RPQ subframes all compile native AND regions with finite
@@ -194,9 +200,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is `Production` or `Explicit`, and the residual lowering's `ProgramScope`
   independently selects `Disabled`, `Production`, or `All`. The centralized
   selector distinguishes an absent route from a policy-deferred route: absence
-  may still use legacy transition hooks, while deferral uses the stable
-  ordinary action and never its legacy pager, seeds, grouping, or stronger
-  Program receipt.
+  and deferral both use the stable ordinary action and never inherit typed
+  grouping or a stronger Program receipt.
   `ResidualLowering::new` now takes a `ProgramScope` instead of a boolean
   (`false` maps to `Disabled`, `true` to `All`), and `program_scope()` replaces
   the old `transition_programs()` getter. Custom typed Program specs must also
@@ -402,7 +407,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   novelty keys and finite ranks, and receipt-local `AfterChildren` joins.
   Every RPQ Propose, Confirm, and Support shape—including inverse products,
   same-variable duplicate bags, nullable graph-gated identities, and cyclic
-  fixpoints—uses this route without legacy transition-hook fallback. Generic
+  fixpoints—uses this single route. Generic
   Search/Activation pacing keeps physical grants independent of family
   telemetry; terminal cohorts allocate and advance sparse grants per affine
   activation, so aggregate or truncated cohorts cannot manufacture widening.

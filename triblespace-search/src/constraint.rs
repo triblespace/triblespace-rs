@@ -32,10 +32,9 @@ use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
     finiteunaryprogram, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
     ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, ResidualDeltaOutput,
-    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
-    VariableSet,
+    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, ResidualDeltaSourceCursor,
+    ResidualDeltaSourcePage, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
 };
 
 use crate::bm25::BM25Index;
@@ -471,35 +470,6 @@ where
             return;
         }
         candidates.retain(|_, raw| self.contains_raw(raw));
-    }
-
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        variable == self.doc.index && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if variable != self.doc.index
-            || view.len() != 1
-            || view.col(variable).is_some()
-            || candidates.is_some()
-        {
-            return None;
-        }
-        Some(cached_candidate_page(
-            &self.entries,
-            cursor,
-            limit,
-            accepted,
-        ))
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -1095,35 +1065,6 @@ impl<'a> Constraint<'a> for SimilarTo {
         candidates.retain(|_, raw| self.contains_raw(raw));
     }
 
-    fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
-        variable == self.var.index && view.col(variable).is_none()
-    }
-
-    fn residual_delta_source_page(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: Option<&[RawInline]>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        _roots: &mut Vec<ResidualDeltaOutput>,
-        accepted: &mut Vec<RawInline>,
-    ) -> Option<ResidualDeltaSourcePage> {
-        if variable != self.var.index
-            || view.len() != 1
-            || view.col(variable).is_some()
-            || candidates.is_some()
-        {
-            return None;
-        }
-        Some(cached_candidate_page(
-            &self.candidates,
-            cursor,
-            limit,
-            accepted,
-        ))
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.var.index) {
             Some(col) => view.iter().all(|row| self.contains_raw(&row[col])),
@@ -1509,8 +1450,8 @@ mod tests {
         let parent = Variable::<GenId>::new(0);
         let doc = Variable::<GenId>::new(1);
         // The repeated doc is deliberate: `from_entries` is public, and the
-        // direct-source contract must preserve proposal occurrences even
-        // though confirmation membership is set-like.
+        // typed Program must preserve proposal occurrences even though
+        // confirmation membership is set-like.
         let entries = [
             id_to_raw_value(id(3)),
             id_to_raw_value(id(1)),
@@ -1518,38 +1459,15 @@ mod tests {
             id_to_raw_value(id(2)),
         ];
         let constraint = BM25Filter::from_entries(doc, entries);
-        assert!(constraint.residual_proposal_source_is_paged(doc.index, &RowsView::EMPTY));
-
-        let mut roots = Vec::new();
         let mut direct = Vec::new();
-        let first = constraint
-            .residual_delta_source_page(
-                doc.index,
-                &RowsView::EMPTY,
-                None,
-                ResidualDeltaSourceCursor::Start,
-                2,
-                &mut roots,
-                &mut direct,
-            )
-            .expect("a cached BM25 answer is an immutable ordinal frontier");
-        assert!(roots.is_empty());
+        let first =
+            cached_candidate_page(&entries, ResidualDeltaSourceCursor::Start, 2, &mut direct);
         assert_eq!(direct, entries[..2]);
         assert_eq!(first.examined, 2);
         assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(2)));
 
         direct.clear();
-        let second = constraint
-            .residual_delta_source_page(
-                doc.index,
-                &RowsView::EMPTY,
-                None,
-                first.next.unwrap(),
-                2,
-                &mut roots,
-                &mut direct,
-            )
-            .expect("the cursor resumes in cached aggregation order");
+        let second = cached_candidate_page(&entries, first.next.unwrap(), 2, &mut direct);
         assert_eq!(direct, entries[2..]);
         assert_eq!(second.examined, 2);
         assert_eq!(second.next, None);
@@ -1696,19 +1614,21 @@ mod tests {
 
     #[test]
     fn exact_cosine_is_a_program_confirmer_but_never_a_paged_source() {
-        let (flat, hnsw, mut store, handles) = sample_sim();
+        let (flat, hnsw, mut store, _handles) = sample_sim();
         let reader = store.reader().unwrap();
         let a = Variable::<Handle<Embedding>>::new(0);
         let b = Variable::<Handle<Embedding>>::new(1);
-        let vars = [a.index];
-        let row = [handles[0].raw];
-        let bound_pivot = RowsView::new(&vars, &row);
+        let bound_pivot = VariableSet::new_singleton(a.index);
+        let proposal_request = ProgramRequest {
+            action: ProgramAction::Propose(b.index),
+            bound: bound_pivot,
+        };
 
         let flat_view = flat.attach(&reader);
         let flat_constraint = flat_view.cosine_at_least(a, b, 0.8);
         assert!(
-            !flat_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
-            "exact cosine is deliberately filter-only",
+            flat_constraint.route(proposal_request).is_none(),
+            "exact cosine offers no proposal Program",
         );
         assert!(
             flat_constraint.residual_program().is_some(),
@@ -1718,7 +1638,7 @@ mod tests {
         let hnsw_view = hnsw.attach(&reader);
         let hnsw_constraint = hnsw_view.cosine_at_least(a, b, 0.8);
         assert!(
-            !hnsw_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
+            hnsw_constraint.route(proposal_request).is_none(),
             "an attached HNSW view does not turn exact cosine into ANN expansion",
         );
         assert!(
@@ -1732,7 +1652,7 @@ mod tests {
             let succinct_view = succinct.attach(&reader);
             let succinct_constraint = succinct_view.cosine_at_least(a, b, 0.8);
             assert!(
-                !succinct_constraint.residual_proposal_source_is_paged(b.index, &bound_pivot),
+                succinct_constraint.route(proposal_request).is_none(),
                 "succinct attachment keeps retrieval and exact filtering separate",
             );
             assert!(
@@ -1753,38 +1673,24 @@ mod tests {
             embedding_raw(2),
         ];
         let constraint = SimilarTo::from_candidates(neighbour, candidates.clone());
-        assert!(constraint.residual_proposal_source_is_paged(neighbour.index, &RowsView::EMPTY));
-
-        let mut roots = Vec::new();
         let mut direct = Vec::new();
-        let first = constraint
-            .residual_delta_source_page(
-                neighbour.index,
-                &RowsView::EMPTY,
-                None,
-                ResidualDeltaSourceCursor::Start,
-                1,
-                &mut roots,
-                &mut direct,
-            )
-            .expect("a cached similarity answer is an immutable ordinal frontier");
-        assert!(roots.is_empty());
+        let first = cached_candidate_page(
+            &candidates,
+            ResidualDeltaSourceCursor::Start,
+            1,
+            &mut direct,
+        );
         assert_eq!(direct, candidates[..1]);
         assert_eq!(first.examined, 1);
         assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(1)));
 
         direct.clear();
-        let rest = constraint
-            .residual_delta_source_page(
-                neighbour.index,
-                &RowsView::EMPTY,
-                None,
-                first.next.unwrap(),
-                candidates.len(),
-                &mut roots,
-                &mut direct,
-            )
-            .expect("the cursor resumes in the cached HNSW/flat result order");
+        let rest = cached_candidate_page(
+            &candidates,
+            first.next.unwrap(),
+            candidates.len(),
+            &mut direct,
+        );
         assert_eq!(direct, candidates[1..]);
         assert_eq!(rest.examined, candidates.len() - 1);
         assert_eq!(rest.next, None);

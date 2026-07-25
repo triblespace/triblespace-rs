@@ -528,54 +528,25 @@ pub(super) struct ActiveDeltaContinuation {
     activation: ActivationId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DeltaStateEntry {
-    Legacy(DeltaDesc),
-    Program(ProgramAddress),
-}
-
 #[derive(Clone, Default)]
 struct DeltaInterner {
-    by_desc: AHashMap<DeltaDesc, DeltaStateId>,
     by_program: AHashMap<ProgramAddress, DeltaStateId>,
-    entries: Vec<DeltaStateEntry>,
+    entries: Vec<ProgramAddress>,
 }
 
 impl DeltaInterner {
-    fn intern(&mut self, desc: DeltaDesc) -> DeltaStateId {
-        if let Some(&id) = self.by_desc.get(&desc) {
-            return id;
-        }
-        let id = DeltaStateId(u32::try_from(self.entries.len()).expect("too many delta states"));
-        self.entries.push(DeltaStateEntry::Legacy(desc.clone()));
-        self.by_desc.insert(desc, id);
-        id
-    }
-
     fn intern_program(&mut self, address: ProgramAddress) -> DeltaStateId {
         if let Some(&id) = self.by_program.get(&address) {
             return id;
         }
         let id = DeltaStateId(u32::try_from(self.entries.len()).expect("too many program states"));
-        self.entries.push(DeltaStateEntry::Program(address.clone()));
+        self.entries.push(address.clone());
         self.by_program.insert(address, id);
         id
     }
 
-    fn get(&self, id: DeltaStateId) -> &DeltaDesc {
-        match &self.entries[id.0 as usize] {
-            DeltaStateEntry::Legacy(desc) => desc,
-            DeltaStateEntry::Program(_) => {
-                panic!("typed Program state was resolved as a legacy delta descriptor")
-            }
-        }
-    }
-
     fn program(&self, id: DeltaStateId) -> Option<&ProgramAddress> {
-        match &self.entries[id.0 as usize] {
-            DeltaStateEntry::Legacy(_) => None,
-            DeltaStateEntry::Program(address) => Some(address),
-        }
+        self.entries.get(id.0 as usize)
     }
 }
 
@@ -1036,8 +1007,6 @@ struct ProgramJoinId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreditKind {
-    Generator,
-    Traversal,
     Program { join: Option<ProgramJoinId> },
 }
 
@@ -1228,15 +1197,6 @@ fn positive_support_child_context(
         .then(|| (bound, rows.rows.into_boxed_slice()))
 }
 
-#[derive(Clone)]
-struct SuspendedSourcePage {
-    next: Option<ResidualDeltaSourceCursor>,
-    /// Only an effect already filed into the stable acyclic machine keeps a
-    /// page from being scheduler-negative. Formula proposals and grouped
-    /// confirmations remain private until the complete action quiesces.
-    had_stable_effect: bool,
-}
-
 /// Receipt-local structured join for an opaque typed continuation.
 ///
 /// Child credits drain independently. Only this join's final child releases
@@ -1282,15 +1242,11 @@ struct Activation {
     /// publication resets it to one, while the independent search width
     /// supplies only the hard cap.
     terminal_sparse_quantum: usize,
-    /// Sorted distinct source relation retained by a confirmation activation.
+    /// Sorted distinct input relation retained by a confirmation activation.
     /// Proposals own a constraint-generated graph frontier and therefore store
     /// `None`.
     source_candidates: Option<Box<[RawInline]>>,
-    /// The continuation cursor is suspended while every traversal lineage
-    /// rooted in the current page owns the activation's affine credits.
-    suspended_source_page: Option<SuspendedSourcePage>,
     program_joins: AHashMap<ProgramJoinId, ProgramJoin>,
-    seen: AHashMap<ResidualDeltaNode, bool>,
     accepted: AHashSet<RawInline>,
     /// The complete affine producer ledger for this activation. Presence
     /// proves that the nonce is live; the value distinguishes generator and
@@ -1317,43 +1273,6 @@ struct ProducerRegistry {
 #[derive(Debug)]
 struct QuiescenceProof {
     activation: ActivationId,
-}
-
-#[derive(Debug)]
-struct ReplaceOutcome {
-    children: Vec<(ResidualDeltaNode, ProducerCredit)>,
-    accepted: Vec<RawInline>,
-    resumed_traversal: Option<(ResidualDeltaExpandCursor, ProducerCredit)>,
-    resumed_source: Option<(ResidualDeltaSourceCursor, ProducerCredit)>,
-    retired_source_page: Option<RetiredSourcePage>,
-    quiescence: Option<QuiescenceProof>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RetiredSourcePage {
-    had_stable_effect: bool,
-}
-
-#[derive(Debug)]
-struct SourcePageOutcome {
-    roots: Vec<(ResidualDeltaNode, ProducerCredit)>,
-    /// Raw direct and accepting-root proposal occurrences before
-    /// activation-local SET admission. Non-streaming reducers report zero.
-    raw_proposal_occurrences: usize,
-    accepted: Vec<RawInline>,
-    resumed_source: Option<(ResidualDeltaSourceCursor, ProducerCredit)>,
-    retired_source_page: Option<RetiredSourcePage>,
-    quiescence: Option<QuiescenceProof>,
-}
-
-struct StartOutcome {
-    activation: ActivationId,
-    roots: Vec<(ResidualDeltaNode, ProducerCredit)>,
-    /// Distinct accepting seed endpoints in constraint order. The registry
-    /// records them before issuing this receipt, so reducers that cannot
-    /// stream may simply retain them until quiescence.
-    initial_accepted: Vec<RawInline>,
-    quiescence: Option<QuiescenceProof>,
 }
 
 struct ProgramInstallOutcome {
@@ -1727,9 +1646,7 @@ impl ProducerRegistry {
                         },
                         terminal_sparse_quantum: 1,
                         source_candidates: None,
-                        suspended_source_page: None,
                         program_joins: AHashMap::new(),
-                        seen: AHashMap::new(),
                         accepted: AHashSet::new(),
                         live: AHashMap::new(),
                         status: ActivationStatus::Open,
@@ -2392,168 +2309,6 @@ impl ProducerRegistry {
         receipts
     }
 
-    /// Starts one parent-scoped activation with one affine credit per root.
-    fn start_many(
-        &mut self,
-        reducer: DeltaReducer,
-        return_to: DeltaReturn,
-        seeds: impl IntoIterator<Item = ResidualDeltaOutput>,
-    ) -> StartOutcome {
-        self.start_many_classified(reducer, return_to, seeds, None)
-    }
-
-    fn start_many_terminal(
-        &mut self,
-        reducer: DeltaReducer,
-        return_to: DeltaReturn,
-        seeds: impl IntoIterator<Item = ResidualDeltaOutput>,
-        full: VariableSet,
-    ) -> StartOutcome {
-        self.start_many_classified(reducer, return_to, seeds, Some(full))
-    }
-
-    fn start_many_classified(
-        &mut self,
-        mut reducer: DeltaReducer,
-        return_to: DeltaReturn,
-        seeds: impl IntoIterator<Item = ResidualDeltaOutput>,
-        terminal_full: Option<VariableSet>,
-    ) -> StartOutcome {
-        debug_assert!(
-            matches!(
-                &return_to,
-                DeltaReturn::Formula { batch, .. } if batch.parents.row_count == 1
-            ) || !matches!(&return_to, DeltaReturn::Formula { .. })
-        );
-        let physical_class = Self::physical_class(&reducer, &return_to, terminal_full);
-        let seeds = seeds.into_iter();
-        let activation = ActivationId(take_monotonic(
-            &mut self.state.next_activation,
-            "activation",
-        ));
-        let mut live = AHashMap::new();
-        let mut accepted = AHashSet::new();
-        let mut initial_accepted = Vec::new();
-        let mut roots = Vec::with_capacity(seeds.size_hint().0);
-        for seed in seeds {
-            let nonce = CreditNonce(take_monotonic(&mut self.state.next_credit, "credit"));
-            assert!(live.insert(nonce, CreditKind::Traversal).is_none());
-            if seed.accepted && accepted.insert(seed.node.value) {
-                initial_accepted.push(seed.node.value);
-            }
-            roots.push((
-                seed.node,
-                ProducerCredit {
-                    brand: self.brand,
-                    key: CreditKey { activation, nonce },
-                },
-            ));
-        }
-        reducer.retain_quiescent_proposal_page(initial_accepted.clone());
-        let status = if live.is_empty() {
-            ActivationStatus::Quiescent
-        } else {
-            ActivationStatus::Open
-        };
-        assert!(
-            self.state
-                .activations
-                .insert(
-                    activation,
-                    Activation {
-                        reducer,
-                        return_to,
-                        positive_publication: None,
-                        physical_class,
-                        terminal_sparse_quantum: 1,
-                        source_candidates: None,
-                        suspended_source_page: None,
-                        program_joins: AHashMap::new(),
-                        seen: AHashMap::new(),
-                        accepted,
-                        live,
-                        status,
-                    },
-                )
-                .is_none(),
-            "delta activation identifier was reused"
-        );
-        StartOutcome {
-            activation,
-            roots,
-            initial_accepted,
-            quiescence: (status == ActivationStatus::Quiescent)
-                .then_some(QuiescenceProof { activation }),
-        }
-    }
-
-    /// Starts one activation with a single affine generator credit. The
-    /// generator is replaced by one bounded source page; its continuation is
-    /// not reissued until every traversal rooted in that page retires.
-    fn start_source(
-        &mut self,
-        reducer: DeltaReducer,
-        return_to: DeltaReturn,
-        source_candidates: Option<Box<[RawInline]>>,
-    ) -> (ActivationId, ProducerCredit) {
-        self.start_source_classified(reducer, return_to, source_candidates, None)
-    }
-
-    fn start_source_terminal(
-        &mut self,
-        reducer: DeltaReducer,
-        return_to: DeltaReturn,
-        source_candidates: Option<Box<[RawInline]>>,
-        full: VariableSet,
-    ) -> (ActivationId, ProducerCredit) {
-        self.start_source_classified(reducer, return_to, source_candidates, Some(full))
-    }
-
-    fn start_source_classified(
-        &mut self,
-        reducer: DeltaReducer,
-        return_to: DeltaReturn,
-        source_candidates: Option<Box<[RawInline]>>,
-        terminal_full: Option<VariableSet>,
-    ) -> (ActivationId, ProducerCredit) {
-        debug_assert!(
-            matches!(
-                &return_to,
-                DeltaReturn::Formula { batch, .. } if batch.parents.row_count == 1
-            ) || !matches!(&return_to, DeltaReturn::Formula { .. })
-        );
-        let physical_class = Self::physical_class(&reducer, &return_to, terminal_full);
-        let activation = ActivationId(take_monotonic(
-            &mut self.state.next_activation,
-            "activation",
-        ));
-        assert!(
-            self.state
-                .activations
-                .insert(
-                    activation,
-                    Activation {
-                        reducer,
-                        return_to,
-                        positive_publication: None,
-                        physical_class,
-                        terminal_sparse_quantum: 1,
-                        source_candidates,
-                        suspended_source_page: None,
-                        program_joins: AHashMap::new(),
-                        seen: AHashMap::new(),
-                        accepted: AHashSet::new(),
-                        live: AHashMap::new(),
-                        status: ActivationStatus::Open,
-                    },
-                )
-                .is_none(),
-            "delta activation identifier was reused"
-        );
-        let credit = self.issue_credit(activation, CreditKind::Generator);
-        (activation, credit)
-    }
-
     /// Creates one reducer activation before typed seed states are installed.
     /// The engine-created identity is passed into the typed adapter so every
     /// arena slot is owned from birth by its affine parent.
@@ -2581,9 +2336,7 @@ impl ProducerRegistry {
                         physical_class,
                         terminal_sparse_quantum: 1,
                         source_candidates,
-                        suspended_source_page: None,
                         program_joins: AHashMap::new(),
-                        seen: AHashMap::new(),
                         accepted: AHashSet::new(),
                         live: AHashMap::new(),
                         status: ActivationStatus::Open,
@@ -2701,247 +2454,6 @@ impl ProducerRegistry {
         ProducerCredit {
             brand: self.brand,
             key: CreditKey { activation, nonce },
-        }
-    }
-
-    #[cfg(test)]
-    fn replace_traversal(
-        &mut self,
-        parent: ProducerCredit,
-        successors: impl IntoIterator<Item = ResidualDeltaOutput>,
-    ) -> ReplaceOutcome {
-        self.replace_traversal_page(parent, successors, None)
-    }
-
-    fn replace_traversal_page(
-        &mut self,
-        parent: ProducerCredit,
-        successors: impl IntoIterator<Item = ResidualDeltaOutput>,
-        next: Option<ResidualDeltaExpandCursor>,
-    ) -> ReplaceOutcome {
-        assert_eq!(parent.brand, self.brand, "delta credit crossed registries");
-        let activation = self
-            .state
-            .activations
-            .get_mut(&parent.key.activation)
-            .expect("unknown delta activation");
-        assert_eq!(activation.status, ActivationStatus::Open);
-        assert_eq!(
-            activation.live.get(&parent.key.nonce),
-            Some(&CreditKind::Traversal),
-            "unknown, replayed, or wrong-kind delta traversal credit"
-        );
-
-        let mut novel = Vec::new();
-        let mut accepted = Vec::new();
-        for successor in successors {
-            if let Some(&previous) = activation.seen.get(&successor.node) {
-                assert_eq!(
-                    previous, successor.accepted,
-                    "one delta node changed its endpoint effect"
-                );
-                continue;
-            }
-            assert!(activation
-                .seen
-                .insert(successor.node, successor.accepted)
-                .is_none());
-            novel.push(successor.node);
-            if successor.accepted && activation.accepted.insert(successor.node.value) {
-                accepted.push(successor.node.value);
-            }
-        }
-
-        // Insert every child before retiring the parent. A 1 -> N replacement
-        // therefore cannot transiently advertise zero live producers.
-        let mut children = Vec::with_capacity(novel.len());
-        for successor in novel {
-            children.push((
-                successor,
-                self.issue_credit(parent.key.activation, CreditKind::Traversal),
-            ));
-        }
-        let resumed_traversal = next.map(|cursor| {
-            (
-                cursor,
-                self.issue_credit(parent.key.activation, CreditKind::Traversal),
-            )
-        });
-
-        let activation = self
-            .state
-            .activations
-            .get_mut(&parent.key.activation)
-            .expect("unknown delta activation");
-        activation
-            .reducer
-            .retain_quiescent_proposal_page(accepted.clone());
-        assert_eq!(
-            activation.live.remove(&parent.key.nonce),
-            Some(CreditKind::Traversal)
-        );
-        if !accepted.is_empty() && activation.reducer.streams() {
-            if let Some(page) = &mut activation.suspended_source_page {
-                page.had_stable_effect = true;
-            }
-        }
-        let page_finished = activation.live.is_empty();
-        let (resumed_source, retired_source_page, quiescence) = if page_finished {
-            self.finish_source_page_or_activation(parent.key.activation)
-        } else {
-            (None, None, None)
-        };
-        ReplaceOutcome {
-            children,
-            accepted,
-            resumed_traversal,
-            resumed_source,
-            retired_source_page,
-            quiescence,
-        }
-    }
-
-    fn replace_source(
-        &mut self,
-        generator: ProducerCredit,
-        roots: impl IntoIterator<Item = ResidualDeltaOutput>,
-        direct: impl IntoIterator<Item = RawInline>,
-        next: Option<ResidualDeltaSourceCursor>,
-    ) -> SourcePageOutcome {
-        assert_eq!(
-            generator.brand, self.brand,
-            "delta credit crossed registries"
-        );
-        let activation = self
-            .state
-            .activations
-            .get(&generator.key.activation)
-            .expect("unknown delta activation");
-        assert_eq!(activation.status, ActivationStatus::Open);
-        assert_eq!(
-            activation.live.get(&generator.key.nonce),
-            Some(&CreditKind::Generator),
-            "unknown, replayed, or wrong-kind delta generator credit"
-        );
-
-        let roots: Vec<_> = roots.into_iter().collect();
-        let direct: Vec<_> = direct.into_iter().collect();
-        let mut distinct_nodes = AHashSet::with_capacity(roots.len());
-        assert!(
-            roots
-                .iter()
-                .all(|output| distinct_nodes.insert(output.node)),
-            "one residual source page repeated a root node"
-        );
-
-        // Direct proposal effects and accepting roots share one affine SET
-        // lifetime for streaming reducers. Quiescent proposals deliberately
-        // retain their raw direct bag until their later bounded boundary.
-        let raw_stream_occurrences = {
-            let activation = self
-                .state
-                .activations
-                .get(&generator.key.activation)
-                .expect("unknown delta activation");
-            if activation.reducer.streams() {
-                direct
-                    .len()
-                    .checked_add(roots.iter().filter(|root| root.accepted).count())
-                    .expect("source proposal occurrence count overflow")
-            } else {
-                0
-            }
-        };
-        let mut accepted = Vec::new();
-        let had_stable_effect;
-        {
-            let activation = self
-                .state
-                .activations
-                .get_mut(&generator.key.activation)
-                .expect("unknown delta activation");
-            assert_eq!(activation.status, ActivationStatus::Open);
-            assert_eq!(activation.live.len(), 1);
-            assert_eq!(
-                activation.live.get(&generator.key.nonce),
-                Some(&CreditKind::Generator)
-            );
-            assert!(activation.suspended_source_page.is_none());
-            match &activation.reducer {
-                DeltaReducer::QuiescentProposal { .. }
-                | DeltaReducer::StreamProposal
-                | DeltaReducer::StreamFormulaProposal => {}
-                DeltaReducer::Support { .. }
-                | DeltaReducer::PositiveSupport { .. }
-                | DeltaReducer::Confirm { .. }
-                | DeltaReducer::FinalizingConfirm { .. }
-                | DeltaReducer::FinalizingProposal { .. }
-                | DeltaReducer::SetAdmit { .. }
-                | DeltaReducer::FormulaOrAdmit
-                | DeltaReducer::FormulaOrEmit { .. } => assert!(
-                    direct.is_empty(),
-                    "a non-proposal reducer received direct source candidates"
-                ),
-            }
-            if activation.reducer.streams() {
-                for value in direct {
-                    if activation.accepted.insert(value) {
-                        accepted.push(value);
-                    }
-                }
-            } else {
-                accepted = direct;
-            }
-            for value in roots
-                .iter()
-                .filter(|output| output.accepted)
-                .map(|output| output.node.value)
-            {
-                if activation.accepted.insert(value) {
-                    accepted.push(value);
-                }
-            }
-            activation
-                .reducer
-                .retain_quiescent_proposal_page(accepted.clone());
-            had_stable_effect = activation.reducer.streams() && !accepted.is_empty();
-            activation.suspended_source_page = Some(SuspendedSourcePage {
-                next,
-                had_stable_effect,
-            });
-        }
-
-        let mut issued_roots = Vec::with_capacity(roots.len());
-        for output in roots {
-            issued_roots.push((
-                output.node,
-                self.issue_credit(generator.key.activation, CreditKind::Traversal),
-            ));
-        }
-        let page_finished = {
-            let activation = self
-                .state
-                .activations
-                .get_mut(&generator.key.activation)
-                .expect("unknown delta activation");
-            assert_eq!(
-                activation.live.remove(&generator.key.nonce),
-                Some(CreditKind::Generator)
-            );
-            activation.live.is_empty()
-        };
-        let (resumed_source, retired_source_page, quiescence) = if page_finished {
-            self.finish_source_page_or_activation(generator.key.activation)
-        } else {
-            (None, None, None)
-        };
-        SourcePageOutcome {
-            roots: issued_roots,
-            raw_proposal_occurrences: raw_stream_occurrences,
-            accepted,
-            resumed_source,
-            retired_source_page,
-            quiescence,
         }
     }
 
@@ -3539,64 +3051,6 @@ impl ProducerRegistry {
         }
     }
 
-    /// Complete either one suspended page or one eager activation. When a
-    /// source cursor remains, the page's N traversal lineages join back into
-    /// exactly one fresh affine generator credit.
-    fn finish_source_page_or_activation(
-        &mut self,
-        activation_id: ActivationId,
-    ) -> (
-        Option<(ResidualDeltaSourceCursor, ProducerCredit)>,
-        Option<RetiredSourcePage>,
-        Option<QuiescenceProof>,
-    ) {
-        let page = {
-            let activation = self
-                .state
-                .activations
-                .get_mut(&activation_id)
-                .expect("unknown delta activation");
-            assert_eq!(activation.status, ActivationStatus::Open);
-            assert!(activation.live.is_empty());
-            activation.suspended_source_page.take()
-        };
-        let Some(page) = page else {
-            self.state
-                .activations
-                .get_mut(&activation_id)
-                .expect("unknown delta activation")
-                .status = ActivationStatus::Quiescent;
-            return (
-                None,
-                None,
-                Some(QuiescenceProof {
-                    activation: activation_id,
-                }),
-            );
-        };
-
-        let retired = Some(RetiredSourcePage {
-            had_stable_effect: page.had_stable_effect,
-        });
-        if let Some(cursor) = page.next {
-            let credit = self.issue_credit(activation_id, CreditKind::Generator);
-            (Some((cursor, credit)), retired, None)
-        } else {
-            self.state
-                .activations
-                .get_mut(&activation_id)
-                .expect("unknown delta activation")
-                .status = ActivationStatus::Quiescent;
-            (
-                None,
-                retired,
-                Some(QuiescenceProof {
-                    activation: activation_id,
-                }),
-            )
-        }
-    }
-
     fn source_context(
         &self,
         activation: ActivationId,
@@ -3738,10 +3192,7 @@ impl ProducerRegistry {
         let before = activation.terminal_sparse_quantum;
         if published {
             activation.terminal_sparse_quantum = 1;
-        } else if matches!(
-            kind,
-            PhysicalDispatchKind::Transition | PhysicalDispatchKind::Program
-        ) {
+        } else if matches!(kind, PhysicalDispatchKind::Program) {
             activation.terminal_sparse_quantum =
                 before.saturating_mul(2).min(search_width.max(1)).max(1);
         }
@@ -4031,10 +3482,6 @@ impl ProducerRegistry {
                         activation.program_joins.is_empty(),
                         "proposal graph quiesced behind a live Program join"
                     );
-                    assert!(
-                        activation.suspended_source_page.is_none(),
-                        "proposal graph quiesced with a suspended source page"
-                    );
                     let reducer = std::mem::replace(
                         &mut activation.reducer,
                         DeltaReducer::FinalizingProposal {
@@ -4047,7 +3494,6 @@ impl ProducerRegistry {
                     let state = ProposalMaterializerState::start(occurrences)
                         .expect("nonempty proposal failed to open its materializer");
                     activation.accepted = AHashSet::new();
-                    activation.seen = AHashMap::new();
                     activation.program_joins = AHashMap::new();
                     activation.source_candidates = None;
                     activation.status = ActivationStatus::Open;
@@ -4081,10 +3527,6 @@ impl ProducerRegistry {
                     assert!(
                         activation.program_joins.is_empty(),
                         "Confirm graph quiesced behind a live Program join"
-                    );
-                    assert!(
-                        activation.suspended_source_page.is_none(),
-                        "Confirm graph quiesced with a suspended source page"
                     );
                     if let Some(published) = published {
                         assert!(
@@ -4122,10 +3564,6 @@ impl ProducerRegistry {
                     };
                     let original = original.shared_one_parent_cursor();
                     let accepted = Arc::new(std::mem::take(&mut activation.accepted));
-                    // Drop graph-only allocation capacity at the handoff,
-                    // rather than merely making it unreachable behind the
-                    // finalizer state.
-                    activation.seen = AHashMap::new();
                     activation.program_joins = AHashMap::new();
                     activation.source_candidates = None;
                     activation.status = ActivationStatus::Open;
@@ -4174,40 +3612,6 @@ fn shared_one_parent_candidates(values: Vec<RawInline>) -> CandidatePayload {
     payload
 }
 
-fn validate_seed_tags(seeds: &[ResidualDeltaSeed], parent_count: usize) {
-    let mut previous = 0u32;
-    for (index, seed) in seeds.iter().enumerate() {
-        assert!(
-            (seed.parent as usize) < parent_count,
-            "delta seed parent tag out of range"
-        );
-        assert!(
-            index == 0 || seed.parent >= previous,
-            "delta seed parent tags are not grouped in ascending order"
-        );
-        previous = seed.parent;
-    }
-}
-
-fn seed_ranges(seeds: &[ResidualDeltaSeed], parent_count: usize) -> Vec<std::ops::Range<usize>> {
-    validate_seed_tags(seeds, parent_count);
-    let mut ranges = Vec::with_capacity(parent_count);
-    let mut cursor = 0usize;
-    for parent in 0..parent_count {
-        let begin = cursor;
-        while cursor < seeds.len() && seeds[cursor].parent as usize == parent {
-            cursor += 1;
-        }
-        ranges.push(begin..cursor);
-    }
-    assert_eq!(
-        cursor,
-        seeds.len(),
-        "delta seed parent tags skipped a range"
-    );
-    ranges
-}
-
 fn program_seed_ranges(
     seeds: &[ProgramSeedWork],
     parent_count: usize,
@@ -4251,16 +3655,6 @@ fn program_child_ranges_into(
     );
 }
 
-fn tagged_ranges<T>(
-    values: &[(u32, T)],
-    parent_count: usize,
-    kind: &str,
-) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::with_capacity(parent_count);
-    tagged_ranges_into(values, parent_count, kind, &mut ranges);
-    ranges
-}
-
 fn tagged_ranges_into<T>(
     values: &[(u32, T)],
     parent_count: usize,
@@ -4282,45 +3676,6 @@ fn tagged_ranges_into<T>(
         values.len(),
         "residual {kind} tags are out of range or not grouped in ascending order"
     );
-}
-
-#[derive(Debug)]
-struct DeltaTask {
-    activation: ActivationId,
-    credit: ProducerCredit,
-    node: ResidualDeltaNode,
-    cursor: ResidualDeltaExpandCursor,
-}
-
-/// Physical transition cohort compatible with one publication boundary.
-///
-/// Streaming activations may share a block because every accepted endpoint is
-/// immediately visible to the stable machine. A quiescent reducer must finish
-/// its own fixpoint before it can publish, so mixing independent activations
-/// would turn geometric width into breadth and postpone every first result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TransitionDispatchKey {
-    /// Terminal streams share one physical class while retaining independent
-    /// affine reducers and sparse-search quanta as activation payload.
-    TerminalStreaming,
-    Streaming,
-    Quiescent(ActivationId),
-}
-
-impl TransitionDispatchKey {
-    fn for_activation(registry: &ProducerRegistry, activation: ActivationId) -> Self {
-        if registry.physical_activation_class(activation) == DeltaPhysicalClass::TerminalStreaming {
-            Self::TerminalStreaming
-        } else if registry.activation_streams(activation) {
-            Self::Streaming
-        } else {
-            Self::Quiescent(activation)
-        }
-    }
-
-    fn of(registry: &ProducerRegistry, task: &DeltaTask) -> Self {
-        Self::for_activation(registry, task.activation)
-    }
 }
 
 #[derive(Debug)]
@@ -4694,7 +4049,7 @@ impl ProgramBucket {
     /// Directed latency selection remains activation-affine. Search pages use
     /// their established LIFO cursor order; transition-like Activation pages
     /// return the selected suffix in append order so geometric feedback sees
-    /// the same progression as the legacy delta queue.
+    /// the same progression as the typed activation frontier.
     fn take_active(
         &mut self,
         registry: &ProducerRegistry,
@@ -4809,7 +4164,6 @@ impl ProgramBucket {
                 .min(remaining);
             let slot = terminal_selections.len();
             terminal_selections.push(TerminalActivationSelection {
-                activation: task.activation,
                 budget,
                 selected: 0,
                 ordinal: 0,
@@ -4859,126 +4213,6 @@ impl ProgramBucket {
 }
 
 #[derive(Debug)]
-struct SourceTask {
-    activation: ActivationId,
-    credit: ProducerCredit,
-    cursor: ResidualDeltaSourceCursor,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceCursorFamily {
-    Start,
-    After,
-    Offset,
-}
-
-impl SourceCursorFamily {
-    fn of(cursor: ResidualDeltaSourceCursor) -> Self {
-        match cursor {
-            ResidualDeltaSourceCursor::Start => Self::Start,
-            ResidualDeltaSourceCursor::After(_) => Self::After,
-            ResidualDeltaSourceCursor::Offset(_) => Self::Offset,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SourceDispatchKey {
-    bound: VariableSet,
-    has_candidates: bool,
-    cursor_family: SourceCursorFamily,
-    /// Physical latency class is payload-only, but source calls must not mix
-    /// terminal demand feedback with ordinary cyclic work.
-    physical_class: DeltaPhysicalClass,
-}
-
-impl SourceDispatchKey {
-    fn of(registry: &ProducerRegistry, task: &SourceTask) -> Self {
-        let (bound, has_candidates) = registry.source_dispatch_shape(task.activation);
-        Self {
-            bound,
-            has_candidates,
-            cursor_family: SourceCursorFamily::of(task.cursor),
-            physical_class: registry.physical_activation_class(task.activation),
-        }
-    }
-}
-
-fn validate_source_cursor(
-    current: ResidualDeltaSourceCursor,
-    next: Option<ResidualDeltaSourceCursor>,
-) {
-    let Some(next) = next else {
-        return;
-    };
-    match (current, next) {
-        (
-            ResidualDeltaSourceCursor::Start,
-            ResidualDeltaSourceCursor::After(_) | ResidualDeltaSourceCursor::Offset(1..),
-        ) => {}
-        (ResidualDeltaSourceCursor::After(previous), ResidualDeltaSourceCursor::After(next)) => {
-            assert!(next > previous, "residual source cursor did not advance")
-        }
-        (ResidualDeltaSourceCursor::Offset(previous), ResidualDeltaSourceCursor::Offset(next)) => {
-            assert!(next > previous, "residual source cursor did not advance")
-        }
-        (_, ResidualDeltaSourceCursor::Start) => {
-            panic!("residual source page restarted its cursor")
-        }
-        _ => panic!("residual source page changed cursor families"),
-    }
-}
-
-enum DeltaBucket {
-    /// The ordinary representation keeps small, nonterminal, and formula
-    /// buckets on the original contiguous-vector path.
-    Plain(Vec<DeltaTask>),
-    /// Terminal activation-affine extraction promotes a bucket once mixed
-    /// work would otherwise require repeated whole-vector partitions.
-    Indexed(IndexedDeltaBucket),
-}
-
-impl Default for DeltaBucket {
-    fn default() -> Self {
-        Self::Plain(Vec::new())
-    }
-}
-
-#[derive(Default)]
-struct IndexedDeltaBucket {
-    /// Append-order task arena. Removed tasks become tombstones until dead
-    /// slots exceed the live payload.
-    tasks: Vec<Option<DeltaTask>>,
-    /// Live arena slots for each affine activation, in append order.
-    activation_slots: AHashMap<ActivationId, Vec<usize>>,
-    /// The latest live slot for every activation. Ordering these tails is
-    /// equivalent to discovering activations during the old reverse scan.
-    activation_tails: BTreeMap<usize, ActivationId>,
-    live_tasks: usize,
-}
-
-enum DeltaBucketIter<'a> {
-    Plain(std::slice::Iter<'a, DeltaTask>),
-    Indexed(std::slice::Iter<'a, Option<DeltaTask>>),
-}
-
-impl<'a> Iterator for DeltaBucketIter<'a> {
-    type Item = &'a DeltaTask;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Plain(tasks) => tasks.next(),
-            Self::Indexed(tasks) => tasks.find_map(Option::as_ref),
-        }
-    }
-}
-
-#[derive(Default)]
-struct SourceBucket {
-    tasks: Vec<SourceTask>,
-}
-
-#[derive(Debug)]
 struct PhysicalDispatch {
     terminal_activations: OrderedActivationSet,
     /// Assigned work and the activation-local quantum in force before this
@@ -5021,7 +4255,7 @@ impl PhysicalDispatch {
                     PhysicalDispatchKind::Source => {
                         registry.source_dispatch_width(*activation, search_width)
                     }
-                    PhysicalDispatchKind::Transition | PhysicalDispatchKind::Program => {
+                    PhysicalDispatchKind::Program => {
                         registry.transition_dispatch_width(*activation, search_width)
                     }
                 };
@@ -5204,11 +4438,6 @@ impl OrderedActivationSet {
         self.values.is_empty()
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.values.len()
-    }
-
     fn iter(&self) -> impl Iterator<Item = &ActivationId> {
         self.values.iter()
     }
@@ -5232,7 +4461,6 @@ impl FromIterator<ActivationId> for OrderedActivationSet {
 
 #[derive(Debug)]
 struct TerminalActivationSelection {
-    activation: ActivationId,
     budget: usize,
     selected: usize,
     ordinal: usize,
@@ -5283,7 +4511,6 @@ fn validated_program_examined(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhysicalDispatchKind {
     Source,
-    Transition,
     Program,
 }
 
@@ -5372,7 +4599,7 @@ pub(super) struct DeltaSeedOutcome {
 pub(super) enum ActiveDeltaStatus {
     /// The activation filed stable work; the ordinary continuation takes over.
     Yielded,
-    /// The activation still owns a scheduled source or transition credit.
+    /// The activation still owns scheduled typed Program work.
     Pending,
     /// The activation remains live, but all of its affine work is deliberately
     /// parked outside the runnable scheduler frontier.
@@ -5389,420 +4616,9 @@ pub(super) struct ActiveDeltaStepOutcome {
     pub(super) outcome: DeltaStepOutcome,
     pub(super) status: ActiveDeltaStatus,
     /// Exact canonical state to install whenever the affine activation stays
-    /// live. Most steps retain their input state; a graph-quiescence handoff
+    /// live. Most steps retain their input state; a Program-quiescence handoff
     /// carries the explicitly settled engine-Program state instead.
     pub(super) resume: Option<ActiveDeltaContinuation>,
-}
-
-impl IndexedDeltaBucket {
-    fn last(&self) -> Option<&DeltaTask> {
-        let (&slot, _) = self.activation_tails.last_key_value()?;
-        self.tasks[slot].as_ref()
-    }
-
-    fn iter(&self) -> DeltaBucketIter<'_> {
-        DeltaBucketIter::Indexed(self.tasks.iter())
-    }
-
-    fn extend(&mut self, tasks: impl IntoIterator<Item = DeltaTask>) {
-        // Removing the old tail marks an activation as touched. We defer the
-        // replacement until the whole append finishes, so one activation
-        // costs one ordered-index update even when it contributes a run.
-        let mut touched = Vec::new();
-        for task in tasks {
-            let activation = task.activation;
-            let slot = self.tasks.len();
-            let slots = self.activation_slots.entry(activation).or_default();
-            if let Some(&old_tail) = slots.last() {
-                if self.activation_tails.remove(&old_tail).is_some() {
-                    touched.push(activation);
-                }
-            } else {
-                touched.push(activation);
-            }
-            slots.push(slot);
-            self.tasks.push(Some(task));
-            self.live_tasks += 1;
-        }
-        for activation in touched {
-            let tail = *self.activation_slots[&activation]
-                .last()
-                .expect("touched activation has one live task");
-            assert_eq!(self.activation_tails.insert(tail, activation), None);
-        }
-    }
-
-    /// Removes newest tasks from one activation and returns their arena slots
-    /// in descending order. The caller may combine several activations and
-    /// restore global append order by sorting on the slot.
-    fn take_activation_slots(
-        &mut self,
-        activation: ActivationId,
-        width: usize,
-    ) -> Vec<(usize, DeltaTask)> {
-        let width = width.max(1);
-        let slots = self
-            .activation_slots
-            .get_mut(&activation)
-            .expect("indexed activation has live tasks");
-        let old_tail = *slots.last().expect("indexed activation is nonempty");
-        assert_eq!(self.activation_tails.remove(&old_tail), Some(activation));
-
-        let take = width.min(slots.len());
-        let selected_slots = slots.split_off(slots.len() - take);
-        let new_tail = slots.last().copied();
-        if let Some(new_tail) = new_tail {
-            assert_eq!(self.activation_tails.insert(new_tail, activation), None);
-        } else {
-            self.activation_slots.remove(&activation);
-        }
-
-        self.live_tasks -= selected_slots.len();
-        selected_slots
-            .into_iter()
-            .rev()
-            .map(|slot| {
-                let task = self.tasks[slot]
-                    .take()
-                    .expect("activation index referenced a tombstone");
-                debug_assert_eq!(task.activation, activation);
-                (slot, task)
-            })
-            .collect()
-    }
-
-    fn drain_live(&mut self) -> Vec<DeltaTask> {
-        let tasks = std::mem::take(&mut self.tasks)
-            .into_iter()
-            .flatten()
-            .collect();
-        self.activation_slots.clear();
-        self.activation_tails.clear();
-        self.live_tasks = 0;
-        tasks
-    }
-
-    fn take_terminal_tail(
-        &mut self,
-        registry: &ProducerRegistry,
-        width: usize,
-        terminal_selection_slots: &mut AHashMap<ActivationId, usize>,
-        terminal_selections: &mut Vec<TerminalActivationSelection>,
-    ) -> (Vec<DeltaTask>, Vec<usize>) {
-        let hot_activation = self
-            .last()
-            .expect("live delta bucket is nonempty")
-            .activation;
-        if registry.transition_dispatch_width(hot_activation, width) == width {
-            // The hot activation alone exhausts the shared budget, so no
-            // sibling can enter this physical cohort.
-            let mut selected: Vec<_> = self
-                .take_activation_slots(hot_activation, width)
-                .into_iter()
-                .map(|(_, task)| task)
-                .collect();
-            selected.reverse();
-            let limits = even_limits(width, selected.len());
-            return (selected, limits);
-        }
-
-        let mut remaining = width;
-        terminal_selection_slots.clear();
-        terminal_selections.clear();
-        // An activation's latest slot is exactly where the old reverse scan
-        // first encountered it. Selecting ordered activation tails therefore
-        // preserves physical cohort and budget order without walking rows.
-        for (_, &activation) in self.activation_tails.iter().rev() {
-            if registry.physical_activation_class(activation)
-                != DeltaPhysicalClass::TerminalStreaming
-            {
-                continue;
-            }
-            let budget = registry
-                .transition_dispatch_width(activation, width)
-                .min(remaining);
-            debug_assert!(budget > 0);
-            remaining -= budget;
-            let slot = terminal_selections.len();
-            terminal_selections.push(TerminalActivationSelection {
-                activation,
-                budget,
-                selected: 0,
-                ordinal: 0,
-            });
-            terminal_selection_slots.insert(activation, slot);
-            if remaining == 0 {
-                break;
-            }
-        }
-
-        let mut selected_with_slots = Vec::with_capacity(width.min(self.live_tasks));
-        for selection in terminal_selections.iter_mut() {
-            let tasks = self.take_activation_slots(selection.activation, selection.budget);
-            selection.selected = tasks.len();
-            selected_with_slots.extend(tasks);
-        }
-        selected_with_slots.sort_unstable_by_key(|(slot, _)| *slot);
-
-        let mut selected = Vec::with_capacity(selected_with_slots.len());
-        let mut limits = Vec::with_capacity(selected_with_slots.len());
-        for (_, task) in selected_with_slots {
-            let selection = &mut terminal_selections[terminal_selection_slots[&task.activation]];
-            let quotient = selection.budget / selection.selected;
-            let remainder = selection.budget % selection.selected;
-            limits.push(quotient + usize::from(selection.ordinal < remainder));
-            selection.ordinal += 1;
-            selected.push(task);
-        }
-        debug_assert!(limits.iter().all(|&limit| limit > 0));
-        debug_assert_eq!(
-            limits.iter().sum::<usize>(),
-            terminal_selections
-                .iter()
-                .map(|selection| selection.budget)
-                .sum::<usize>()
-        );
-        (selected, limits)
-    }
-}
-
-impl DeltaBucket {
-    fn len(&self) -> usize {
-        match self {
-            Self::Plain(tasks) => tasks.len(),
-            Self::Indexed(bucket) => bucket.live_tasks,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn last(&self) -> Option<&DeltaTask> {
-        match self {
-            Self::Plain(tasks) => tasks.last(),
-            Self::Indexed(bucket) => bucket.last(),
-        }
-    }
-
-    fn iter(&self) -> DeltaBucketIter<'_> {
-        match self {
-            Self::Plain(tasks) => DeltaBucketIter::Plain(tasks.iter()),
-            Self::Indexed(bucket) => bucket.iter(),
-        }
-    }
-
-    fn contains_activation(&self, activation: ActivationId) -> bool {
-        match self {
-            Self::Plain(tasks) => tasks.iter().any(|task| task.activation == activation),
-            Self::Indexed(bucket) => bucket
-                .activation_slots
-                .get(&activation)
-                .is_some_and(|slots| !slots.is_empty()),
-        }
-    }
-
-    fn extend(&mut self, tasks: impl IntoIterator<Item = DeltaTask>) {
-        match self {
-            Self::Plain(current) => current.extend(tasks),
-            Self::Indexed(bucket) => bucket.extend(tasks),
-        }
-    }
-
-    fn promote(&mut self) {
-        if matches!(self, Self::Indexed(_)) {
-            return;
-        }
-        let Self::Plain(tasks) = std::mem::take(self) else {
-            unreachable!()
-        };
-        let mut indexed = IndexedDeltaBucket::default();
-        indexed.extend(tasks);
-        *self = Self::Indexed(indexed);
-    }
-
-    fn drain_live(&mut self) -> Vec<DeltaTask> {
-        match std::mem::take(self) {
-            Self::Plain(tasks) => tasks,
-            Self::Indexed(mut bucket) => bucket.drain_live(),
-        }
-    }
-
-    fn compact_if_sparse(&mut self) {
-        let compact = matches!(
-            self,
-            Self::Indexed(bucket)
-                if bucket.tasks.len() > bucket.live_tasks.saturating_mul(2)
-        );
-        if compact {
-            let tasks = self.drain_live();
-            *self = Self::Plain(tasks);
-        }
-    }
-
-    #[cfg(test)]
-    fn arena_len(&self) -> usize {
-        match self {
-            Self::Plain(tasks) => tasks.len(),
-            Self::Indexed(bucket) => bucket.tasks.len(),
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_index_consistent(&self) {
-        match self {
-            Self::Plain(tasks) => assert_eq!(self.iter().count(), tasks.len()),
-            Self::Indexed(bucket) => {
-                assert_eq!(self.iter().count(), bucket.live_tasks);
-                assert!(bucket.tasks.len() <= bucket.live_tasks.saturating_mul(2));
-                let indexed_tasks: usize = bucket.activation_slots.values().map(Vec::len).sum();
-                assert_eq!(indexed_tasks, bucket.live_tasks);
-                assert_eq!(bucket.activation_tails.len(), bucket.activation_slots.len());
-                for (&activation, slots) in &bucket.activation_slots {
-                    assert!(!slots.is_empty());
-                    for &slot in slots {
-                        assert_eq!(bucket.tasks[slot].as_ref().unwrap().activation, activation);
-                    }
-                    assert_eq!(
-                        bucket.activation_tails.get(slots.last().unwrap()),
-                        Some(&activation)
-                    );
-                }
-            }
-        }
-    }
-
-    /// Removes at most `width` tasks owned by one exact activation while
-    /// preserving the relative order of both the selected and retained
-    /// subsequences.
-    fn take_activation(&mut self, activation: ActivationId, width: usize) -> Vec<DeltaTask> {
-        let width = width.max(1);
-        let selected = match self {
-            Self::Plain(tasks) => {
-                let mut selected = Vec::with_capacity(width.min(tasks.len()));
-                let mut retained = Vec::with_capacity(tasks.len());
-                for task in std::mem::take(tasks).into_iter().rev() {
-                    if task.activation == activation && selected.len() < width {
-                        selected.push(task);
-                    } else {
-                        retained.push(task);
-                    }
-                }
-                selected.reverse();
-                retained.reverse();
-                *tasks = retained;
-                selected
-            }
-            Self::Indexed(bucket) => {
-                let mut selected: Vec<_> = bucket
-                    .take_activation_slots(activation, width)
-                    .into_iter()
-                    .map(|(_, task)| task)
-                    .collect();
-                selected.reverse();
-                selected
-            }
-        };
-        self.compact_if_sparse();
-        selected
-    }
-
-    #[cfg(test)]
-    fn take_activation_indexed(
-        &mut self,
-        activation: ActivationId,
-        width: usize,
-    ) -> Vec<DeltaTask> {
-        self.promote();
-        self.take_activation(activation, width)
-    }
-
-    fn take_tail(
-        &mut self,
-        registry: &ProducerRegistry,
-        width: usize,
-        activation_width: usize,
-        terminal_selection_slots: &mut AHashMap<ActivationId, usize>,
-        terminal_selections: &mut Vec<TerminalActivationSelection>,
-    ) -> (Vec<DeltaTask>, Vec<usize>) {
-        let width = width.max(1);
-        let activation_width = activation_width.max(1);
-        let key = TransitionDispatchKey::of(
-            registry,
-            self.last().expect("live delta bucket is nonempty"),
-        );
-        if key == TransitionDispatchKey::TerminalStreaming {
-            // Admit terminal activations from the hot tail until their local
-            // sparse quanta fill the one shared global budget. Promotion is
-            // terminal-only, leaving ordinary and formula buckets on Vec.
-            self.promote();
-            let Self::Indexed(bucket) = self else {
-                unreachable!()
-            };
-            let result = bucket.take_terminal_tail(
-                registry,
-                width,
-                terminal_selection_slots,
-                terminal_selections,
-            );
-            self.compact_if_sparse();
-            return result;
-        }
-
-        let mut activations = BTreeSet::new();
-        let tasks = self.drain_live();
-        let mut selected = Vec::with_capacity(width.min(tasks.len()));
-        let mut retained = Vec::with_capacity(tasks.len());
-        for task in tasks.into_iter().rev() {
-            let compatible = match (key, TransitionDispatchKey::of(registry, &task)) {
-                (TransitionDispatchKey::Streaming, TransitionDispatchKey::Streaming) => true,
-                (
-                    TransitionDispatchKey::Quiescent(_),
-                    TransitionDispatchKey::Quiescent(activation),
-                ) => {
-                    activations.contains(&activation)
-                        || (activations.len() < activation_width && {
-                            activations.insert(activation);
-                            true
-                        })
-                }
-                _ => false,
-            };
-            if selected.len() < width && compatible {
-                selected.push(task);
-            } else {
-                retained.push(task);
-            }
-        }
-        selected.reverse();
-        retained.reverse();
-        self.extend(retained);
-        let limits = even_limits(width, selected.len());
-        (selected, limits)
-    }
-}
-
-impl SourceBucket {
-    /// Source credits are activation-affine just like transition credits. A
-    /// directed latency step must not absorb compatible generators from cold
-    /// sibling activations merely because they share one canonical state. The
-    /// selected tasks retain the global source pop's LIFO dispatch order;
-    /// retained cold tasks keep their storage order.
-    fn take_activation(&mut self, activation: ActivationId, width: usize) -> Vec<SourceTask> {
-        let width = width.max(1);
-        let mut selected = Vec::with_capacity(width.min(self.tasks.len()));
-        let mut retained = Vec::with_capacity(self.tasks.len());
-        for task in std::mem::take(&mut self.tasks).into_iter().rev() {
-            if task.activation == activation && selected.len() < width {
-                selected.push(task);
-            } else {
-                retained.push(task);
-            }
-        }
-        retained.reverse();
-        self.tasks = retained;
-        selected
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5816,8 +4632,6 @@ enum PublicPullDemandState {
 pub(super) struct DeltaScheduler {
     registry: ProducerRegistry,
     interner: DeltaInterner,
-    worklist: BTreeMap<DeltaStateId, DeltaBucket>,
-    source_worklist: BTreeMap<DeltaStateId, SourceBucket>,
     /// One unified queue of opaque typed continuations. Source generation and
     /// product expansion are family-private states distinguished only by
     /// opaque physical dispatch classes.
@@ -5840,9 +4654,9 @@ pub(super) struct DeltaScheduler {
     /// baseline scheduler footprint. One allocation is amortized across all
     /// Program steps in the query.
     program_scratch: Option<Box<ProgramSchedulerScratch>>,
-    /// Number of independent quiescent activations that may share one
-    /// transition cohort. This grows only when activations complete; `width`
-    /// remains the separate intra-activation page/work budget.
+    /// Number of independent quiescent activations that may share one Program
+    /// cohort. This grows only when activations complete; `width` remains the
+    /// separate intra-activation page/work budget.
     activation_width: usize,
     /// Query-local scratch for the exact terminal cohort partition. Keeping
     /// it beside the scheduler amortizes hash-table and record allocation
@@ -5856,8 +4670,6 @@ impl DeltaScheduler {
         Self {
             registry: ProducerRegistry::new(),
             interner: DeltaInterner::default(),
-            worklist: BTreeMap::new(),
-            source_worklist: BTreeMap::new(),
             program_worklist: ProgramWorklist::default(),
             parked_positive_support_worklist: ProgramWorklist::default(),
             public_pull_demand: PublicPullDemandState::Closed,
@@ -5869,8 +4681,8 @@ impl DeltaScheduler {
         }
     }
 
-    /// Mints exact per-parent terminal receipts without filing sparse source
-    /// or transition work. The caller returns each identity as both an
+    /// Mints exact per-parent terminal receipts without filing sparse Program
+    /// work. The caller returns each identity as both an
     /// admission registration and an immediate completion receipt.
     pub(super) fn reserve_terminal_receipts(&mut self, count: usize) -> Vec<ActivationId> {
         self.registry.reserve_terminal_receipts(count)
@@ -5899,9 +4711,7 @@ impl DeltaScheduler {
         // PositiveSupport is a latency hedge, never a completeness owner.
         // Parked custody therefore cannot keep the semantic scheduler alive;
         // every live hedge has an exact Confirm parent on the runnable path.
-        self.worklist.is_empty()
-            && self.source_worklist.is_empty()
-            && self.program_worklist.is_empty()
+        self.program_worklist.is_empty()
     }
 
     fn prepare_program(
@@ -6516,431 +5326,6 @@ impl DeltaScheduler {
             terminal_family: None,
             seeded_parents,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn seed_proposals(
-        &mut self,
-        desc: DeltaDesc,
-        successor: StateDesc,
-        parents: RowBatch,
-        seeds: Vec<ResidualDeltaSeed>,
-        plan: &ResidualPlan,
-        stable: &mut Worklist,
-        stable_interner: &mut StateInterner,
-        stats: &mut ResidualStateStats,
-    ) -> DeltaSeedOutcome {
-        self.seed_proposals_with_full(
-            desc,
-            successor,
-            parents,
-            seeds,
-            VariableSet::new_empty(),
-            None,
-            plan,
-            stable,
-            stable_interner,
-            stats,
-        )
-    }
-
-    pub(super) fn seed_proposals_with_full(
-        &mut self,
-        desc: DeltaDesc,
-        successor: StateDesc,
-        parents: RowBatch,
-        seeds: Vec<ResidualDeltaSeed>,
-        full: VariableSet,
-        direct_terminal_publication_full: Option<VariableSet>,
-        plan: &ResidualPlan,
-        stable: &mut Worklist,
-        stable_interner: &mut StateInterner,
-        stats: &mut ResidualStateStats,
-    ) -> DeltaSeedOutcome {
-        let seeded_parents = parents.row_count;
-        let ranges = seed_ranges(&seeds, parents.row_count);
-        let stride = successor.bound.count();
-        let mut tasks = Vec::with_capacity(seeds.len());
-        let mut effects = DeltaStableEffects::default();
-        let mut completed_activation_ids = Vec::new();
-        let mut terminal_activations = Vec::with_capacity(parents.row_count);
-        for (row, range) in ranges.into_iter().enumerate() {
-            let start = row * stride;
-            let parent = parents.rows[start..start + stride]
-                .to_vec()
-                .into_boxed_slice();
-            let started = self.registry.start_many_terminal(
-                DeltaReducer::StreamProposal,
-                DeltaReturn::Stable {
-                    desc: successor.clone(),
-                    parent,
-                    set_admit_result: false,
-                },
-                seeds[range].iter().map(|seed| seed.output),
-                full,
-            );
-            if self.registry.physical_activation_class(started.activation)
-                == DeltaPhysicalClass::TerminalStreaming
-            {
-                terminal_activations.push(started.activation);
-            }
-            if !started.initial_accepted.is_empty() {
-                let direct_terminal = direct_terminal_publication_full.filter(|_| {
-                    self.registry.physical_activation_class(started.activation)
-                        == DeltaPhysicalClass::TerminalStreaming
-                });
-                let streamed = self
-                    .registry
-                    .take_streaming_return(started.activation)
-                    .expect("a streaming proposal rejected its accepting seed receipt");
-                let released = self.release_streaming(
-                    started.activation,
-                    streamed,
-                    started.initial_accepted,
-                    direct_terminal,
-                    plan,
-                    stable,
-                    stable_interner,
-                    stats,
-                );
-                assert!(
-                    released.active.is_none(),
-                    "ordinary proposal seed opened a Formula reducer"
-                );
-                effects.absorb(released.stable);
-            }
-            tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
-                activation: started.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            }));
-            if let Some(proof) = started.quiescence {
-                let completed = self.registry.finish(proof);
-                assert_eq!(completed.effect, DeltaCompletion::Cleanup);
-                assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
-                completed_activation_ids.push(completed.activation);
-            }
-        }
-        let active = self.file(desc, tasks);
-        DeltaSeedOutcome {
-            continuation: effects.continuation,
-            publication: effects.publication,
-            active,
-            terminal_activations,
-            completed_activation_ids,
-            terminal_family: None,
-            seeded_parents,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn seed_source_proposals(
-        &mut self,
-        desc: DeltaDesc,
-        successor: StateDesc,
-        parents: RowBatch,
-    ) -> Option<ActiveDeltaContinuation> {
-        self.seed_source_proposals_with_full_receipt(
-            desc,
-            successor,
-            parents,
-            VariableSet::new_empty(),
-        )
-        .active
-    }
-
-    pub(super) fn seed_source_proposals_with_full_receipt(
-        &mut self,
-        desc: DeltaDesc,
-        successor: StateDesc,
-        parents: RowBatch,
-        full: VariableSet,
-    ) -> DeltaSeedOutcome {
-        let seeded_parents = parents.row_count;
-        let stride = successor.bound.count();
-        let mut tasks = Vec::with_capacity(parents.row_count);
-        let mut terminal_activations = Vec::with_capacity(parents.row_count);
-        for row in 0..parents.row_count {
-            let start = row * stride;
-            let parent = parents.rows[start..start + stride]
-                .to_vec()
-                .into_boxed_slice();
-            let (activation, credit) = self.registry.start_source_terminal(
-                DeltaReducer::StreamProposal,
-                DeltaReturn::Stable {
-                    desc: successor.clone(),
-                    parent,
-                    set_admit_result: false,
-                },
-                None,
-                full,
-            );
-            if self.registry.physical_activation_class(activation)
-                == DeltaPhysicalClass::TerminalStreaming
-            {
-                terminal_activations.push(activation);
-            }
-            tasks.push(SourceTask {
-                activation,
-                credit,
-                cursor: ResidualDeltaSourceCursor::Start,
-            });
-        }
-        DeltaSeedOutcome {
-            continuation: None,
-            publication: None,
-            active: self.file_source(desc, tasks),
-            terminal_activations,
-            completed_activation_ids: Vec::new(),
-            terminal_family: None,
-            seeded_parents,
-        }
-    }
-
-    pub(super) fn seed_confirms(
-        &mut self,
-        desc: DeltaDesc,
-        successor: StateDesc,
-        set_admit_result: bool,
-        batch: CandidateBatch,
-        seeds: Vec<ResidualDeltaSeed>,
-    ) -> Option<ActiveDeltaContinuation> {
-        let seed_ranges = seed_ranges(&seeds, batch.parents.row_count);
-        let stride = successor.bound.count();
-        let (parents, candidate_groups) = batch.into_parent_candidates();
-
-        let mut tasks = Vec::with_capacity(seeds.len());
-        let mut finalizer_active = None;
-        for ((row, seed_range), original) in
-            seed_ranges.into_iter().enumerate().zip(candidate_groups)
-        {
-            let start = row * stride;
-            let parent = parents.rows[start..start + stride]
-                .to_vec()
-                .into_boxed_slice();
-            let original = shared_one_parent_candidates(original);
-            let started = self.registry.start_many(
-                DeltaReducer::Confirm { original },
-                DeltaReturn::Stable {
-                    desc: successor.clone(),
-                    parent,
-                    set_admit_result,
-                },
-                seeds[seed_range].iter().map(|seed| seed.output),
-            );
-            tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
-                activation: started.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            }));
-            if let Some(proof) = started.quiescence {
-                match self.settle_quiescence(proof) {
-                    DeltaSettlement::Completed(completed) => {
-                        assert!(matches!(completed.return_to, DeltaReturn::Stable { .. }));
-                        assert!(matches!(
-                            completed.effect,
-                            DeltaCompletion::Candidates(ref candidates) if candidates.is_empty()
-                        ));
-                    }
-                    DeltaSettlement::Retargeted(active) => finalizer_active = Some(active),
-                }
-            }
-        }
-        let graph_active = self.file(desc, tasks);
-        finalizer_active.or(graph_active)
-    }
-
-    pub(super) fn seed_source_confirms(
-        &mut self,
-        desc: DeltaDesc,
-        successor: StateDesc,
-        set_admit_result: bool,
-        batch: CandidateBatch,
-    ) -> Option<ActiveDeltaContinuation> {
-        let stride = successor.bound.count();
-        let parent_count = batch.parents.row_count;
-        let (parents, candidate_groups) = batch.into_parent_candidates();
-
-        let mut tasks = Vec::with_capacity(parent_count);
-        for (row, original) in candidate_groups.into_iter().enumerate() {
-            let start = row * stride;
-            let parent = parents.rows[start..start + stride]
-                .to_vec()
-                .into_boxed_slice();
-            let mut source_candidates = original.clone();
-            source_candidates.sort_unstable();
-            source_candidates.dedup();
-            let original = shared_one_parent_candidates(original);
-            let (activation, credit) = self.registry.start_source(
-                DeltaReducer::Confirm { original },
-                DeltaReturn::Stable {
-                    desc: successor.clone(),
-                    parent,
-                    set_admit_result,
-                },
-                Some(source_candidates.into_boxed_slice()),
-            );
-            tasks.push(SourceTask {
-                activation,
-                credit,
-                cursor: ResidualDeltaSourceCursor::Start,
-            });
-        }
-        self.file_source(desc, tasks)
-    }
-
-    /// Suspends each affine formula parent behind one activation-local reducer.
-    /// Empty seed ranges complete immediately with an empty action result, so
-    /// an empty RPQ arm can still return through its exact Formula continuation.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn seed_formula(
-        &mut self,
-        desc: DeltaDesc,
-        bound: VariableSet,
-        cursor: FormulaCursor,
-        stage: FormulaStage,
-        batch: FormulaBatch,
-        seeds: Vec<ResidualDeltaSeed>,
-        stream_proposal: bool,
-        plan: &ResidualPlan,
-        stable: &mut Worklist,
-        stable_interner: &mut StateInterner,
-        stats: &mut ResidualStateStats,
-    ) -> DeltaSeedOutcome {
-        let seeded_parents = batch.parents.row_count;
-        let ranges = seed_ranges(&seeds, batch.parents.row_count);
-        let singletons = batch.into_singletons(bound.count());
-        assert_eq!(singletons.len(), ranges.len());
-
-        let mut tasks = Vec::with_capacity(seeds.len());
-        let mut completed = Vec::new();
-        let mut continuation = None;
-        let mut finalizer_active = None;
-        for (mut batch, range) in singletons.into_iter().zip(ranges) {
-            let reducer = match stage {
-                FormulaStage::Support => DeltaReducer::Support { published: false },
-                FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
-                FormulaStage::Propose => DeltaReducer::quiescent_proposal(),
-                FormulaStage::Confirm => DeltaReducer::Confirm {
-                    original: batch.take_confirm_original(),
-                },
-            };
-            let started = self.registry.start_many(
-                reducer,
-                DeltaReturn::Formula {
-                    bound,
-                    cursor,
-                    batch,
-                },
-                seeds[range].iter().map(|seed| seed.output),
-            );
-            if !started.initial_accepted.is_empty() {
-                if let Some(streamed) = self.registry.take_streaming_return(started.activation) {
-                    let released = self.release_streaming(
-                        started.activation,
-                        streamed,
-                        started.initial_accepted,
-                        None,
-                        plan,
-                        stable,
-                        stable_interner,
-                        stats,
-                    );
-                    debug_assert!(released.stable.publication.is_none());
-                    prefer_continuation(&mut continuation, released.stable.continuation);
-                    if released.active.is_some() {
-                        finalizer_active = released.active;
-                    }
-                }
-            }
-            tasks.extend(started.roots.into_iter().map(|(node, credit)| DeltaTask {
-                activation: started.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            }));
-            if let Some(proof) = started.quiescence {
-                match self.settle_quiescence(proof) {
-                    DeltaSettlement::Completed(completed_activation) => {
-                        completed.push(completed_activation)
-                    }
-                    DeltaSettlement::Retargeted(active) => finalizer_active = Some(active),
-                }
-            }
-        }
-        let graph_active = self.file(desc, tasks);
-        let mut active = finalizer_active.or(graph_active);
-
-        for completed in completed {
-            let released = self.release_completion(completed, plan, stable, stable_interner, stats);
-            prefer_continuation(&mut continuation, released.continuation);
-            if released.active.is_some() {
-                active = released.active;
-            }
-        }
-        DeltaSeedOutcome {
-            continuation,
-            publication: None,
-            active,
-            terminal_activations: Vec::new(),
-            completed_activation_ids: Vec::new(),
-            terminal_family: None,
-            seeded_parents,
-        }
-    }
-
-    /// Suspends one bounded source generator per affine formula parent. The
-    /// exact Action PC and live payload cells remain activation payload; the
-    /// structural descriptor names only the shared expansion kernel.
-    pub(super) fn seed_source_formula(
-        &mut self,
-        desc: DeltaDesc,
-        bound: VariableSet,
-        cursor: FormulaCursor,
-        stage: FormulaStage,
-        batch: FormulaBatch,
-        stream_proposal: bool,
-    ) -> Option<ActiveDeltaContinuation> {
-        let singletons = batch.into_singletons(bound.count());
-        let mut tasks = Vec::with_capacity(singletons.len());
-        for mut batch in singletons {
-            let (reducer, source_candidates) = match stage {
-                FormulaStage::Support => {
-                    unreachable!("support has no delta source reducer")
-                }
-                FormulaStage::Propose if stream_proposal => {
-                    (DeltaReducer::StreamFormulaProposal, None)
-                }
-                FormulaStage::Propose => (DeltaReducer::quiescent_proposal(), None),
-                FormulaStage::Confirm => {
-                    let original = batch.take_contiguous_confirm_original();
-                    let mut source_candidates = original.one_parent_values().to_vec();
-                    source_candidates.sort_unstable();
-                    source_candidates.dedup();
-                    (
-                        DeltaReducer::Confirm { original },
-                        Some(source_candidates.into_boxed_slice()),
-                    )
-                }
-            };
-            let (activation, credit) = self.registry.start_source(
-                reducer,
-                DeltaReturn::Formula {
-                    bound,
-                    cursor,
-                    batch,
-                },
-                source_candidates,
-            );
-            tasks.push(SourceTask {
-                activation,
-                credit,
-                cursor: ResidualDeltaSourceCursor::Start,
-            });
-        }
-        self.file_source(desc, tasks)
     }
 
     /// Drains engine-owned Formula reducer seeds without manufacturing a
@@ -7678,34 +6063,6 @@ impl DeltaScheduler {
         drained
     }
 
-    fn file(&mut self, desc: DeltaDesc, tasks: Vec<DeltaTask>) -> Option<ActiveDeltaContinuation> {
-        let activation = tasks.last()?.activation;
-        let id = self.interner.intern(desc);
-        self.worklist.entry(id).or_default().extend(tasks);
-        Some(ActiveDeltaContinuation {
-            state: id,
-            activation,
-        })
-    }
-
-    fn file_source(
-        &mut self,
-        desc: DeltaDesc,
-        mut tasks: Vec<SourceTask>,
-    ) -> Option<ActiveDeltaContinuation> {
-        let activation = tasks.last()?.activation;
-        let id = self.interner.intern(desc);
-        self.source_worklist
-            .entry(id)
-            .or_default()
-            .tasks
-            .append(&mut tasks);
-        Some(ActiveDeltaContinuation {
-            state: id,
-            activation,
-        })
-    }
-
     fn file_program_state(
         &mut self,
         state: DeltaStateId,
@@ -7714,7 +6071,7 @@ impl DeltaScheduler {
         let activation = tasks.last()?.activation;
         assert!(
             self.interner.program(state).is_some(),
-            "typed program task was filed under a legacy delta state"
+            "typed program task was filed under an unknown state"
         );
         self.program_worklist.append(state, &mut tasks);
         Some(ActiveDeltaContinuation { state, activation })
@@ -7730,7 +6087,7 @@ impl DeltaScheduler {
         let activation = tasks.last()?.activation;
         assert!(
             self.interner.program(state).is_some(),
-            "parked positive Support task was filed under a legacy delta state"
+            "parked positive Support task was filed under an unknown state"
         );
         assert!(
             tasks.iter().all(|task| {
@@ -7914,7 +6271,7 @@ impl DeltaScheduler {
                 .interner
                 .program(state)
                 .cloned()
-                .expect("cancelled PositiveSupport work occupied a legacy delta state");
+                .expect("cancelled PositiveSupport work occupied an unknown state");
             let spec = address.resolve(root, plan);
             let key = address.key();
             let mut retired = Vec::new();
@@ -7974,23 +6331,6 @@ impl DeltaScheduler {
             .map(|parent| self.registry.retire_orphaned_positive_support_work(parent))
             .sum();
         (completed, retired)
-    }
-
-    fn has_active_source(&self, active: ActiveDeltaContinuation) -> bool {
-        self.source_worklist
-            .get(&active.state)
-            .is_some_and(|bucket| {
-                bucket
-                    .tasks
-                    .iter()
-                    .any(|task| task.activation == active.activation)
-            })
-    }
-
-    fn has_active_transition(&self, active: ActiveDeltaContinuation) -> bool {
-        self.worklist
-            .get(&active.state)
-            .is_some_and(|bucket| bucket.contains_activation(active.activation))
     }
 
     fn has_active_program(&self, active: ActiveDeltaContinuation) -> bool {
@@ -8073,52 +6413,6 @@ impl DeltaScheduler {
             stats.delta_terminal_sparse_widenings += usize::from(widened);
         }
         self.allows_global_width_growth(&dispatch, search_width, terminal_publications)
-    }
-
-    fn pop_active_transition(
-        &mut self,
-        active: ActiveDeltaContinuation,
-        width: usize,
-    ) -> (DeltaDesc, Vec<DeltaTask>) {
-        let (tasks, empty) = {
-            let bucket = self
-                .worklist
-                .get_mut(&active.state)
-                .expect("active delta transition state remains live");
-            let tasks = bucket.take_activation(active.activation, width);
-            (tasks, bucket.is_empty())
-        };
-        assert!(
-            !tasks.is_empty(),
-            "active delta transition lost its affine task"
-        );
-        if empty {
-            self.worklist.remove(&active.state);
-        }
-        (self.interner.get(active.state).clone(), tasks)
-    }
-
-    fn pop_active_source(
-        &mut self,
-        active: ActiveDeltaContinuation,
-        width: usize,
-    ) -> (DeltaDesc, Vec<SourceTask>) {
-        let (tasks, empty) = {
-            let bucket = self
-                .source_worklist
-                .get_mut(&active.state)
-                .expect("active delta source state remains live");
-            let tasks = bucket.take_activation(active.activation, width);
-            (tasks, bucket.tasks.is_empty())
-        };
-        assert!(
-            !tasks.is_empty(),
-            "active delta source lost its affine task"
-        );
-        if empty {
-            self.source_worklist.remove(&active.state);
-        }
-        (self.interner.get(active.state).clone(), tasks)
     }
 
     fn pop_active_program(
@@ -8244,128 +6538,8 @@ impl DeltaScheduler {
         grants
     }
 
-    #[cfg(test)]
-    fn pop(&mut self, width: usize) -> (DeltaDesc, Vec<DeltaTask>) {
-        let (desc, tasks, _) = self.pop_bounded(width);
-        (desc, tasks)
-    }
-
-    fn pop_bounded(
-        &mut self,
-        search_width: usize,
-    ) -> (DeltaDesc, Vec<DeltaTask>, PhysicalDispatch) {
-        let full = self.worklist.iter().rev().find_map(|(&id, bucket)| {
-            let activation = bucket.last()?.activation;
-            let width = self
-                .registry
-                .transition_dispatch_width(activation, search_width);
-            (bucket.len() >= width).then_some(id)
-        });
-        let id = full.unwrap_or_else(|| {
-            *self
-                .worklist
-                .last_key_value()
-                .expect("delta pop requires live work")
-                .0
-        });
-        let (tasks, task_limits, empty, remainder_tasks) = {
-            let registry = &self.registry;
-            let activation_width = self.activation_width;
-            let terminal_selection_slots = &mut self.terminal_selection_slots;
-            let terminal_selections = &mut self.terminal_selections;
-            let bucket = self.worklist.get_mut(&id).expect("selected delta state");
-            let (tasks, task_limits) = bucket.take_tail(
-                registry,
-                search_width,
-                activation_width,
-                terminal_selection_slots,
-                terminal_selections,
-            );
-            let remainder_tasks = bucket.len();
-            (tasks, task_limits, bucket.is_empty(), remainder_tasks)
-        };
-        if empty {
-            self.worklist.remove(&id);
-        }
-        let dispatch = PhysicalDispatch::new(
-            &self.registry,
-            PhysicalDispatchKind::Transition,
-            search_width,
-            tasks.iter().map(|task| task.activation),
-            task_limits,
-            remainder_tasks,
-        );
-        (self.interner.get(id).clone(), tasks, dispatch)
-    }
-
-    #[cfg(test)]
-    fn pop_source(&mut self, width: usize) -> (DeltaDesc, Vec<SourceTask>) {
-        let (desc, tasks, _) = self.pop_source_bounded(width);
-        (desc, tasks)
-    }
-
-    fn pop_source_bounded(
-        &mut self,
-        search_width: usize,
-    ) -> (DeltaDesc, Vec<SourceTask>, PhysicalDispatch) {
-        let id = *self
-            .source_worklist
-            .last_key_value()
-            .expect("source pop requires live work")
-            .0;
-        let activation = self
-            .source_worklist
-            .get(&id)
-            .and_then(|bucket| bucket.tasks.last())
-            .expect("selected source state has live work")
-            .activation;
-        let width = self
-            .registry
-            .source_dispatch_width(activation, search_width);
-        let (tasks, empty, remainder_tasks) = {
-            let registry = &self.registry;
-            let bucket = self
-                .source_worklist
-                .get_mut(&id)
-                .expect("selected source state");
-            let key = SourceDispatchKey::of(
-                registry,
-                bucket.tasks.last().expect("live source bucket is nonempty"),
-            );
-            let mut selected = Vec::with_capacity(width.min(bucket.tasks.len()));
-            let mut retained = Vec::with_capacity(bucket.tasks.len());
-            for task in std::mem::take(&mut bucket.tasks).into_iter().rev() {
-                if selected.len() < width && SourceDispatchKey::of(registry, &task) == key {
-                    selected.push(task);
-                } else {
-                    retained.push(task);
-                }
-            }
-            retained.reverse();
-            bucket.tasks = retained;
-            let remainder_tasks = bucket.tasks.len();
-            (selected, bucket.tasks.is_empty(), remainder_tasks)
-        };
-        if empty {
-            self.source_worklist.remove(&id);
-        }
-        let dispatch = PhysicalDispatch::new(
-            &self.registry,
-            PhysicalDispatchKind::Source,
-            search_width,
-            tasks.iter().map(|task| task.activation),
-            even_limits(width, tasks.len()),
-            remainder_tasks,
-        );
-        (self.interner.get(id).clone(), tasks, dispatch)
-    }
-
-    /// Advances only the affine activation named by a physical continuation.
-    ///
-    /// A suspended source generator wins over unrelated transition work. At
-    /// scheduler boundaries one activation cannot own both kinds at once, but
-    /// checking source first makes the intended source -> transition -> source
-    /// cycle explicit and prevents a cold global bucket from preempting it.
+    /// Advances only the affine typed Program activation named by a physical
+    /// continuation.
     #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
     pub(super) fn step_active<'a>(
@@ -8401,13 +6575,11 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> ActiveDeltaStepOutcome {
-        let has_source = self.has_active_source(active);
-        let has_transition = self.has_active_transition(active);
         let has_program = self.has_active_program(active);
         let has_parked_program = self.has_active_parked_positive_support(active);
         if has_parked_program {
             assert!(
-                !has_source && !has_transition && !has_program,
+                !has_program,
                 "parked PositiveSupport activation remained runnable"
             );
             assert!(
@@ -8421,12 +6593,8 @@ impl DeltaScheduler {
             };
         }
         assert!(
-            has_source || has_transition || has_program,
-            "active delta continuation has no scheduled affine task"
-        );
-        debug_assert!(
-            usize::from(has_source) + usize::from(has_transition) + usize::from(has_program) == 1,
-            "one delta activation owns incompatible scheduler queue kinds simultaneously"
+            has_program,
+            "active Program continuation has no scheduled affine task"
         );
 
         // Keep the raw semantic full-result receipt alive through dispatch.
@@ -8437,108 +6605,32 @@ impl DeltaScheduler {
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
-        let outcome = if has_program {
-            let (state, tasks, support_grants, dispatch) =
-                self.pop_active_program(active, search_width);
-            let physical = self.step_program(
-                root,
-                plan,
-                state,
-                tasks,
-                support_grants,
-                &dispatch.task_limits,
-                true,
-                direct_terminal_full,
-                stable,
-                stable_interner,
-                stats,
-            );
-            let retired_search_receipt = physical.retired_search_receipt;
-            let mut outcome = physical.outcome;
-            let physical_allows_global_width_growth = self.account_physical_dispatch(
-                dispatch,
-                search_width,
-                examined_before,
-                &physical.terminal_publications,
-                stats,
-            );
-            outcome.allows_global_width_growth =
-                retired_search_receipt || physical_allows_global_width_growth;
-            outcome
-        } else if has_source {
-            let width = self
-                .registry
-                .source_dispatch_width(active.activation, search_width);
-            let (desc, tasks) = self.pop_active_source(active, width);
-            let task_count = tasks.len();
-            let remainder_tasks = self
-                .source_worklist
-                .get(&active.state)
-                .map_or(0, |bucket| bucket.tasks.len());
-            let dispatch = PhysicalDispatch::new(
-                &self.registry,
-                PhysicalDispatchKind::Source,
-                search_width,
-                tasks.iter().map(|task| task.activation),
-                even_limits(width, task_count),
-                remainder_tasks,
-            );
-            let physical = self.step_sources(
-                root,
-                plan,
-                desc,
-                tasks,
-                &dispatch.task_limits,
-                direct_terminal_full,
-                stable,
-                stable_interner,
-                stats,
-            );
-            let mut outcome = physical.outcome;
-            outcome.allows_global_width_growth = self.account_physical_dispatch(
-                dispatch,
-                search_width,
-                examined_before,
-                &physical.terminal_publications,
-                stats,
-            );
-            outcome
-        } else {
-            let width = self
-                .registry
-                .transition_dispatch_width(active.activation, search_width);
-            let (desc, tasks) = self.pop_active_transition(active, width);
-            let task_count = tasks.len();
-            let remainder_tasks = self.worklist.get(&active.state).map_or(0, DeltaBucket::len);
-            let dispatch = PhysicalDispatch::new(
-                &self.registry,
-                PhysicalDispatchKind::Transition,
-                search_width,
-                tasks.iter().map(|task| task.activation),
-                even_limits(width, task_count),
-                remainder_tasks,
-            );
-            let physical = self.step_transitions(
-                root,
-                plan,
-                desc,
-                tasks,
-                &dispatch.task_limits,
-                direct_terminal_full,
-                stable,
-                stable_interner,
-                stats,
-            );
-            let mut outcome = physical.outcome;
-            outcome.allows_global_width_growth = self.account_physical_dispatch(
-                dispatch,
-                search_width,
-                examined_before,
-                &physical.terminal_publications,
-                stats,
-            );
-            outcome
-        };
+        let (state, tasks, support_grants, dispatch) =
+            self.pop_active_program(active, search_width);
+        let physical = self.step_program(
+            root,
+            plan,
+            state,
+            tasks,
+            support_grants,
+            &dispatch.task_limits,
+            true,
+            direct_terminal_full,
+            stable,
+            stable_interner,
+            stats,
+        );
+        let retired_search_receipt = physical.retired_search_receipt;
+        let mut outcome = physical.outcome;
+        let physical_allows_global_width_growth = self.account_physical_dispatch(
+            dispatch,
+            search_width,
+            examined_before,
+            &physical.terminal_publications,
+            stats,
+        );
+        outcome.allows_global_width_growth =
+            retired_search_receipt || physical_allows_global_width_growth;
         let yielded = outcome.has_stable_effect();
         let live = self.registry.is_live(active.activation);
         let settled = outcome.retargeted.get(&active.activation).copied();
@@ -8547,9 +6639,7 @@ impl DeltaScheduler {
         // receipt remains authoritative even though the old registry entry
         // has already been removed; queue liveness must not be used to infer
         // or discard that handoff.
-        let runnable = self.has_active_source(active)
-            || self.has_active_transition(active)
-            || self.has_active_program(active);
+        let runnable = self.has_active_program(active);
         let parked = self.has_active_parked_positive_support(active);
         debug_assert!(
             !runnable || !parked,
@@ -8585,9 +6675,7 @@ impl DeltaScheduler {
         }
     }
 
-    /// Executes one structural product-state cohort and files accepted
-    /// proposal endpoints or quiescent confirmation reductions back into the
-    /// ordinary acyclic Candidate continuation.
+    /// Executes one typed Program cohort.
     #[cfg(test)]
     pub(super) fn step<'a>(
         &mut self,
@@ -8611,335 +6699,39 @@ impl DeltaScheduler {
         stable_interner: &mut StateInterner,
         stats: &mut ResidualStateStats,
     ) -> DeltaStepOutcome {
-        if !self.program_worklist.is_empty() {
-            let (state, tasks, support_grants, dispatch) = self.pop_program_bounded(search_width);
-            let examined_before = stats
-                .delta_source_candidates_examined
-                .saturating_add(stats.delta_transition_candidates_examined);
-            let physical = self.step_program(
-                root,
-                plan,
-                state,
-                tasks,
-                support_grants,
-                &dispatch.task_limits,
-                false,
-                direct_terminal_publication_full,
-                stable,
-                stable_interner,
-                stats,
-            );
-            let retired_search_receipt = physical.retired_search_receipt;
-            let mut outcome = physical.outcome;
-            let physical_allows_global_width_growth = self.account_physical_dispatch(
-                dispatch,
-                search_width,
-                examined_before,
-                &physical.terminal_publications,
-                stats,
-            );
-            outcome.allows_global_width_growth =
-                retired_search_receipt || physical_allows_global_width_growth;
-            return outcome;
-        }
-        if self.worklist.is_empty() {
-            return self.step_source(
-                root,
-                plan,
-                search_width,
-                direct_terminal_publication_full,
-                stable,
-                stable_interner,
-                stats,
-            );
-        }
-
-        let (desc, tasks, dispatch) = self.pop_bounded(search_width);
+        assert!(
+            !self.program_worklist.is_empty(),
+            "Program scheduler stepped without runnable work"
+        );
+        let (state, tasks, support_grants, dispatch) = self.pop_program_bounded(search_width);
         let examined_before = stats
             .delta_source_candidates_examined
             .saturating_add(stats.delta_transition_candidates_examined);
-        let physical = self.step_transitions(
+        let physical = self.step_program(
             root,
             plan,
-            desc,
+            state,
             tasks,
+            support_grants,
             &dispatch.task_limits,
+            false,
             direct_terminal_publication_full,
             stable,
             stable_interner,
             stats,
         );
+        let retired_search_receipt = physical.retired_search_receipt;
         let mut outcome = physical.outcome;
-        outcome.allows_global_width_growth = self.account_physical_dispatch(
+        let physical_allows_global_width_growth = self.account_physical_dispatch(
             dispatch,
             search_width,
             examined_before,
             &physical.terminal_publications,
             stats,
         );
+        outcome.allows_global_width_growth =
+            retired_search_receipt || physical_allows_global_width_growth;
         outcome
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn step_transitions<'a>(
-        &mut self,
-        root: &dyn Constraint<'a>,
-        plan: &ResidualPlan,
-        desc: DeltaDesc,
-        tasks: Vec<DeltaTask>,
-        limits: &[usize],
-        direct_terminal_full: Option<VariableSet>,
-        stable: &mut Worklist,
-        stable_interner: &mut StateInterner,
-        stats: &mut ResidualStateStats,
-    ) -> DeltaPhysicalOutcome {
-        let constraint = desc.resolve(root, plan);
-        let task_count = tasks.len();
-        assert_eq!(limits.len(), task_count);
-        assert!(limits.iter().all(|&limit| limit > 0));
-        let nodes: Vec<_> = tasks.iter().map(|task| task.node).collect();
-        let cursors: Vec<_> = tasks.iter().map(|task| task.cursor).collect();
-        let batch = ResidualDeltaExpandBatch {
-            nodes: &nodes,
-            cursors: &cursors,
-            limits,
-        };
-        let mut pages = Vec::with_capacity(task_count);
-        let mut tagged_successors = Vec::new();
-        constraint.residual_delta_expand_pages(
-            desc.variable,
-            batch,
-            &mut pages,
-            &mut tagged_successors,
-        );
-        assert_eq!(
-            pages.len(),
-            task_count,
-            "delta transition cohort returned the wrong page count"
-        );
-        let successor_ranges =
-            tagged_ranges(&tagged_successors, task_count, "transition successor");
-        let mut next_cursors = vec![None; task_count];
-        let mut paged = vec![false; task_count];
-        let mut legacy_indices = Vec::new();
-        let mut legacy_nodes = Vec::new();
-        let mut paged_count = 0usize;
-        for (index, (((task, page), range), &limit)) in tasks
-            .iter()
-            .zip(pages)
-            .zip(&successor_ranges)
-            .zip(limits)
-            .enumerate()
-        {
-            let Some(page) = page else {
-                assert_eq!(
-                    task.cursor,
-                    ResidualDeltaExpandCursor::Start,
-                    "paged delta expansion became unsupported after suspension"
-                );
-                assert!(
-                    range.is_empty(),
-                    "unsupported delta expansion page mutated its output"
-                );
-                legacy_indices.push(index);
-                legacy_nodes.push(task.node);
-                continue;
-            };
-            paged_count += 1;
-            assert!(page.examined <= limit);
-            assert!(range.len() <= page.examined);
-            if let Some(next) = page.next {
-                assert!(
-                    page.examined > 0,
-                    "a delta expansion cursor made no progress"
-                );
-                match (task.cursor, next) {
-                    (ResidualDeltaExpandCursor::Start, ResidualDeltaExpandCursor::After { .. }) => {
-                    }
-                    (
-                        ResidualDeltaExpandCursor::After { .. },
-                        ResidualDeltaExpandCursor::After { .. },
-                    ) => assert!(next > task.cursor, "delta expansion cursor did not advance"),
-                    (_, ResidualDeltaExpandCursor::Start) => {
-                        panic!("delta expansion page restarted its cursor")
-                    }
-                }
-            }
-            stats.delta_transition_pages += 1;
-            stats.delta_transition_candidates_examined += page.examined;
-            next_cursors[index] = page.next;
-            paged[index] = true;
-        }
-        if paged_count > 0 {
-            stats.delta_transition_cohorts += 1;
-            stats.max_delta_transition_cohort = stats.max_delta_transition_cohort.max(paged_count);
-        }
-
-        let mut legacy_successors = vec![Vec::new(); legacy_nodes.len()];
-        if !legacy_nodes.is_empty() {
-            let mut tagged = Vec::new();
-            assert!(
-                constraint.residual_delta_expand(desc.variable, &legacy_nodes, &mut tagged),
-                "delta expansion became unsupported after seeding"
-            );
-            let mut previous = 0u32;
-            for (position, (tag, output)) in tagged.into_iter().enumerate() {
-                assert!(
-                    (tag as usize) < legacy_nodes.len(),
-                    "delta successor tag out of range"
-                );
-                assert!(
-                    position == 0 || tag >= previous,
-                    "delta successor tags are not grouped in ascending order"
-                );
-                previous = tag;
-                legacy_successors[tag as usize].push(output);
-            }
-        }
-
-        let mut next_tasks = Vec::new();
-        let mut resumed_sources = Vec::new();
-        let mut effects = DeltaStableEffects::default();
-        let mut completed_activation_ids = Vec::new();
-        let mut retargeted = RetargetedActivations::default();
-        let mut dead_pages = 0usize;
-        let mut source_dead_pages = 0usize;
-        let mut transition_dead_pages = 0usize;
-        let mut completed_activations = 0usize;
-        let mut terminal_publications = OrderedActivationSet::default();
-        for (task_index, task) in tasks.into_iter().enumerate() {
-            assert_eq!(task.activation, task.credit.key.activation);
-            let terminal = self.registry.physical_activation_class(task.activation)
-                == DeltaPhysicalClass::TerminalStreaming;
-            let outcome = if paged[task_index] {
-                self.registry.replace_traversal_page(
-                    task.credit,
-                    tagged_successors[successor_ranges[task_index].clone()]
-                        .iter()
-                        .map(|(_, output)| *output),
-                    next_cursors[task_index],
-                )
-            } else {
-                let legacy_index = legacy_indices
-                    .binary_search(&task_index)
-                    .expect("unsupported transition task lost its legacy result slot");
-                self.registry.replace_traversal_page(
-                    task.credit,
-                    legacy_successors[legacy_index].iter().copied(),
-                    None,
-                )
-            };
-            let retired_source_page = outcome.retired_source_page;
-            let transition_page_had_effect =
-                !outcome.children.is_empty() || !outcome.accepted.is_empty();
-            let mut task_effects = DeltaStableEffects::default();
-            if let Some((cursor, credit)) = outcome.resumed_traversal {
-                next_tasks.push(DeltaTask {
-                    activation: task.activation,
-                    credit,
-                    node: task.node,
-                    cursor,
-                });
-            }
-            for (node, credit) in outcome.children {
-                next_tasks.push(DeltaTask {
-                    activation: task.activation,
-                    credit,
-                    node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                });
-            }
-            if let Some((source_cursor, credit)) = outcome.resumed_source {
-                resumed_sources.push(SourceTask {
-                    activation: task.activation,
-                    credit,
-                    cursor: source_cursor,
-                });
-            }
-            if !outcome.accepted.is_empty() {
-                let direct_terminal = direct_terminal_full.filter(|_| {
-                    self.registry.physical_activation_class(task.activation)
-                        == DeltaPhysicalClass::TerminalStreaming
-                });
-                if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
-                    let released = self.release_streaming(
-                        task.activation,
-                        streamed,
-                        outcome.accepted,
-                        direct_terminal,
-                        plan,
-                        stable,
-                        stable_interner,
-                        stats,
-                    );
-                    task_effects.absorb(released.stable);
-                    if let Some(active) = released.active {
-                        assert!(retargeted.insert(task.activation, active).is_none());
-                    }
-                }
-            }
-            if let Some(proof) = outcome.quiescence {
-                assert_eq!(proof.activation, task.activation);
-                match self.settle_quiescence(proof) {
-                    DeltaSettlement::Retargeted(active) => {
-                        assert_eq!(active.activation, task.activation);
-                        assert!(retargeted.insert(task.activation, active).is_none());
-                    }
-                    DeltaSettlement::Completed(completed) => {
-                        let old_activation = completed.activation;
-                        let released = self.release_completion(
-                            completed,
-                            plan,
-                            stable,
-                            stable_interner,
-                            stats,
-                        );
-                        prefer_continuation(&mut task_effects.continuation, released.continuation);
-                        if let Some(active) = released.active {
-                            assert!(retargeted.insert(old_activation, active).is_none());
-                        } else if !retargeted.contains_key(&old_activation) {
-                            completed_activations += 1;
-                            completed_activation_ids.push(old_activation);
-                        }
-                    }
-                }
-            }
-            let source_page_dead = retired_source_page.is_some_and(|page| !page.had_stable_effect)
-                && !task_effects.has_effect();
-            let transition_page_dead =
-                paged[task_index] && !transition_page_had_effect && !task_effects.has_effect();
-            if source_page_dead || transition_page_dead {
-                dead_pages += 1;
-            }
-            source_dead_pages += usize::from(source_page_dead);
-            transition_dead_pages += usize::from(transition_page_dead);
-            if terminal && task_effects.has_effect() {
-                let _ = terminal_publications.insert(task.activation);
-            }
-            effects.absorb(task_effects);
-        }
-        let _ = self.file(desc.clone(), next_tasks);
-        let _ = self.file_source(desc, resumed_sources);
-        stats.delta_source_dead_pages += source_dead_pages;
-        stats.delta_transition_dead_pages += transition_dead_pages;
-        DeltaPhysicalOutcome {
-            outcome: DeltaStepOutcome {
-                continuation: effects.continuation,
-                publication: effects.publication,
-                completed_activation_ids,
-                retargeted,
-                dead_pages,
-                source_dead_pages,
-                transition_dead_pages,
-                completed_activations,
-                completed_transition_cohort: completed_activations > 1,
-                allows_global_width_growth: true,
-                release_directed_lease: false,
-                demand_preference: None,
-            },
-            terminal_publications,
-            retired_search_receipt: false,
-        }
     }
 
     /// Executes one physically compatible cohort of opaque typed
@@ -8972,7 +6764,7 @@ impl DeltaScheduler {
             .interner
             .program(state)
             .cloned()
-            .expect("typed program task was scheduled under a legacy delta state");
+            .expect("typed program task was scheduled under an unknown state");
         let address_key = address.key();
         let spec = address.resolve(root, plan);
         let private_direct = address.has_private_direct_effects();
@@ -9611,285 +7403,8 @@ impl DeltaScheduler {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn step_source<'a>(
-        &mut self,
-        root: &dyn Constraint<'a>,
-        plan: &ResidualPlan,
-        search_width: usize,
-        direct_terminal_publication_full: Option<VariableSet>,
-        stable: &mut Worklist,
-        stable_interner: &mut StateInterner,
-        stats: &mut ResidualStateStats,
-    ) -> DeltaStepOutcome {
-        let (desc, tasks, dispatch) = self.pop_source_bounded(search_width);
-        let examined_before = stats
-            .delta_source_candidates_examined
-            .saturating_add(stats.delta_transition_candidates_examined);
-        let physical = self.step_sources(
-            root,
-            plan,
-            desc,
-            tasks,
-            &dispatch.task_limits,
-            direct_terminal_publication_full,
-            stable,
-            stable_interner,
-            stats,
-        );
-        let mut outcome = physical.outcome;
-        outcome.allows_global_width_growth = self.account_physical_dispatch(
-            dispatch,
-            search_width,
-            examined_before,
-            &physical.terminal_publications,
-            stats,
-        );
-        outcome
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn step_sources<'a>(
-        &mut self,
-        root: &dyn Constraint<'a>,
-        plan: &ResidualPlan,
-        desc: DeltaDesc,
-        tasks: Vec<SourceTask>,
-        limits: &[usize],
-        direct_terminal_full: Option<VariableSet>,
-        stable: &mut Worklist,
-        stable_interner: &mut StateInterner,
-        stats: &mut ResidualStateStats,
-    ) -> DeltaPhysicalOutcome {
-        assert!(!tasks.is_empty());
-        assert_eq!(tasks.len(), limits.len());
-        assert!(limits.iter().all(|&limit| limit > 0));
-        let dispatch_key = SourceDispatchKey::of(&self.registry, &tasks[0]);
-        assert!(
-            tasks
-                .iter()
-                .all(|task| SourceDispatchKey::of(&self.registry, task) == dispatch_key),
-            "one residual source cohort mixed incompatible physical dispatch shapes"
-        );
-
-        let row_count = tasks.len();
-
-        let mut parents = Vec::new();
-        let mut candidate_sets = Vec::with_capacity(row_count);
-        for task in &tasks {
-            assert_eq!(task.activation, task.credit.key.activation);
-            let (bound, parent, candidates) = self.registry.source_context(task.activation);
-            assert_eq!(bound, dispatch_key.bound);
-            assert_eq!(candidates.is_some(), dispatch_key.has_candidates);
-            parents.extend_from_slice(parent);
-            candidate_sets.push(candidates);
-        }
-        let vars: Vec<VariableId> = dispatch_key.bound.into_iter().collect();
-        let view = rows_view(&vars, &parents, row_count);
-        let cursors: Vec<_> = tasks.iter().map(|task| task.cursor).collect();
-        let batch = ResidualDeltaSourceBatch {
-            view,
-            candidate_sets: &candidate_sets,
-            cursors: &cursors,
-            limits,
-        };
-        let mut pages = Vec::with_capacity(row_count);
-        let mut roots = Vec::new();
-        let mut direct = Vec::new();
-        assert!(
-            desc.resolve(root, plan).residual_delta_source_pages(
-                desc.variable,
-                batch,
-                &mut pages,
-                &mut roots,
-                &mut direct,
-            ),
-            "paged delta source became unsupported after seeding"
-        );
-        drop(candidate_sets);
-        assert_eq!(pages.len(), row_count);
-        let root_ranges = tagged_ranges(&roots, row_count, "root");
-        let direct_ranges = tagged_ranges(&direct, row_count, "direct candidate");
-
-        stats.delta_source_cohorts += 1;
-        stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(row_count);
-        stats.delta_source_pages += row_count;
-        let mut effects = DeltaStableEffects::default();
-        let mut completed_activation_ids = Vec::new();
-        let mut retargeted = RetargetedActivations::default();
-        let mut traversal = Vec::new();
-        let mut resumed_sources = Vec::new();
-        let mut dead_pages = 0usize;
-        let mut completed_activations = 0usize;
-        let mut terminal_publications = OrderedActivationSet::default();
-        for (row, (((task, page), root_range), direct_range)) in tasks
-            .into_iter()
-            .zip(pages)
-            .zip(root_ranges)
-            .zip(direct_ranges)
-            .enumerate()
-        {
-            let terminal = self.registry.physical_activation_class(task.activation)
-                == DeltaPhysicalClass::TerminalStreaming;
-            let row_roots = &roots[root_range];
-            let row_direct = &direct[direct_range];
-            assert!(page.examined <= limits[row]);
-            assert!(row_roots.len() + row_direct.len() <= page.examined);
-            validate_source_cursor(task.cursor, page.next);
-            stats.delta_source_candidates_examined += page.examined;
-            stats.delta_source_roots += row_roots.len();
-            stats.delta_source_direct_candidates += row_direct.len();
-
-            let outcome = self.registry.replace_source(
-                task.credit,
-                row_roots.iter().map(|(_, output)| *output),
-                row_direct.iter().map(|(_, value)| *value),
-                page.next,
-            );
-            if outcome.raw_proposal_occurrences != 0 {
-                assert!(
-                    outcome.raw_proposal_occurrences >= outcome.accepted.len(),
-                    "source SET admission manufactured proposal occurrences"
-                );
-                stats.candidates_proposed +=
-                    outcome.raw_proposal_occurrences - outcome.accepted.len();
-                stats.max_propose_candidates = stats
-                    .max_propose_candidates
-                    .max(outcome.raw_proposal_occurrences);
-            }
-            for (node, credit) in outcome.roots {
-                traversal.push(DeltaTask {
-                    activation: task.activation,
-                    credit,
-                    node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                });
-            }
-            if let Some((cursor, credit)) = outcome.resumed_source {
-                resumed_sources.push(SourceTask {
-                    activation: task.activation,
-                    credit,
-                    cursor,
-                });
-            }
-            let retired_source_page = outcome.retired_source_page;
-            let mut task_effects = DeltaStableEffects::default();
-            if !outcome.accepted.is_empty() {
-                let direct_terminal = direct_terminal_full.filter(|_| {
-                    self.registry.physical_activation_class(task.activation)
-                        == DeltaPhysicalClass::TerminalStreaming
-                });
-                if let Some(streamed) = self.registry.take_streaming_return(task.activation) {
-                    let released = self.release_streaming(
-                        task.activation,
-                        streamed,
-                        outcome.accepted,
-                        direct_terminal,
-                        plan,
-                        stable,
-                        stable_interner,
-                        stats,
-                    );
-                    task_effects.absorb(released.stable);
-                    if let Some(active) = released.active {
-                        assert!(retargeted.insert(task.activation, active).is_none());
-                    }
-                }
-            }
-            if let Some(proof) = outcome.quiescence {
-                assert_eq!(proof.activation, task.activation);
-                match self.settle_quiescence(proof) {
-                    DeltaSettlement::Retargeted(active) => {
-                        assert_eq!(active.activation, task.activation);
-                        assert!(retargeted.insert(task.activation, active).is_none());
-                    }
-                    DeltaSettlement::Completed(completed) => {
-                        let old_activation = completed.activation;
-                        let released = self.release_completion(
-                            completed,
-                            plan,
-                            stable,
-                            stable_interner,
-                            stats,
-                        );
-                        prefer_continuation(&mut task_effects.continuation, released.continuation);
-                        if let Some(active) = released.active {
-                            assert!(retargeted.insert(old_activation, active).is_none());
-                        } else if !retargeted.contains_key(&old_activation) {
-                            completed_activations += 1;
-                            completed_activation_ids.push(old_activation);
-                        }
-                    }
-                }
-            }
-            if retired_source_page.is_some_and(|page| !page.had_stable_effect)
-                && !task_effects.has_effect()
-            {
-                dead_pages += 1;
-            }
-            if terminal && task_effects.has_effect() {
-                let _ = terminal_publications.insert(task.activation);
-            }
-            effects.absorb(task_effects);
-        }
-        let _ = self.file(desc.clone(), traversal);
-        let _ = self.file_source(desc, resumed_sources);
-        stats.delta_source_dead_pages += dead_pages;
-        DeltaPhysicalOutcome {
-            outcome: DeltaStepOutcome {
-                continuation: effects.continuation,
-                publication: effects.publication,
-                completed_activation_ids,
-                retargeted,
-                dead_pages,
-                source_dead_pages: dead_pages,
-                transition_dead_pages: 0,
-                completed_activations,
-                completed_transition_cohort: false,
-                allows_global_width_growth: true,
-                release_directed_lease: false,
-                demand_preference: None,
-            },
-            terminal_publications,
-            retired_search_receipt: false,
-        }
-    }
-
     fn deep_clone(&self) -> Self {
         let (registry, mut remap) = self.registry.deep_clone();
-        let mut worklist = BTreeMap::new();
-        for (&id, bucket) in &self.worklist {
-            let mut tasks = Vec::with_capacity(bucket.len());
-            for task in bucket.iter() {
-                let credit = remap
-                    .remove(&task.credit.key)
-                    .expect("delta clone omitted one live credit");
-                tasks.push(DeltaTask {
-                    activation: task.activation,
-                    credit,
-                    node: task.node,
-                    cursor: task.cursor,
-                });
-            }
-            let mut cloned_bucket = DeltaBucket::default();
-            cloned_bucket.extend(tasks);
-            worklist.insert(id, cloned_bucket);
-        }
-        let mut source_worklist = BTreeMap::new();
-        for (&id, bucket) in &self.source_worklist {
-            let mut tasks = Vec::with_capacity(bucket.tasks.len());
-            for task in &bucket.tasks {
-                let credit = remap
-                    .remove(&task.credit.key)
-                    .expect("delta clone omitted one live source credit");
-                tasks.push(SourceTask {
-                    activation: task.activation,
-                    credit,
-                    cursor: task.cursor,
-                });
-            }
-            source_worklist.insert(id, SourceBucket { tasks });
-        }
         let mut program_worklist = ProgramWorklist::default();
         for (id, bucket) in self.program_worklist.iter() {
             let mut tasks = Vec::with_capacity(bucket.tasks.len());
@@ -9927,8 +7442,6 @@ impl DeltaScheduler {
         Self {
             registry,
             interner: self.interner.clone(),
-            worklist,
-            source_worklist,
             program_worklist,
             parked_positive_support_worklist,
             public_pull_demand: self.public_pull_demand,
@@ -9950,8 +7463,6 @@ impl Clone for DeltaScheduler {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
-
-    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     use crate::query::{
         intersectionconstraint::IntersectionConstraint, unionconstraint::UnionConstraint,
@@ -11861,427 +9372,10 @@ mod tests {
             _candidates: &mut CandidateSink<'_>,
         ) {
         }
-
-        fn residual_delta_expand(
-            &self,
-            _variable: VariableId,
-            nodes: &[ResidualDeltaNode],
-            successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-        ) -> bool {
-            for (tag, node) in nodes.iter().enumerate() {
-                if node.value == value(2) {
-                    successors.push((
-                        u32::try_from(tag).unwrap(),
-                        output(3, node.continuation + 1, true),
-                    ));
-                }
-            }
-            true
-        }
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct TransitionBatchTrace {
-        nodes: Vec<ResidualDeltaNode>,
-        cursors: Vec<ResidualDeltaExpandCursor>,
-        limits: Vec<usize>,
-    }
-
-    struct BatchedPagedExpansion {
-        trace: Arc<Mutex<Option<TransitionBatchTrace>>>,
-        scalar_page_calls: Arc<AtomicUsize>,
-        eager_nodes: Arc<AtomicUsize>,
-    }
-
-    impl Constraint<'static> for BatchedPagedExpansion {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(0)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != 0 {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn residual_delta_expand_page(
-            &self,
-            _variable: VariableId,
-            _node: ResidualDeltaNode,
-            _cursor: ResidualDeltaExpandCursor,
-            _limit: usize,
-            _successors: &mut Vec<ResidualDeltaOutput>,
-        ) -> Option<ResidualDeltaExpandPage> {
-            self.scalar_page_calls.fetch_add(1, Ordering::Relaxed);
-            panic!("native transition cohort was scalarized")
-        }
-
-        fn residual_delta_expand_pages(
-            &self,
-            variable: VariableId,
-            batch: ResidualDeltaExpandBatch<'_>,
-            pages: &mut Vec<Option<ResidualDeltaExpandPage>>,
-            successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-        ) {
-            assert_eq!(variable, 0);
-            assert!(pages.is_empty());
-            assert!(successors.is_empty());
-            *self.trace.lock().expect("transition batch trace poisoned") =
-                Some(TransitionBatchTrace {
-                    nodes: batch.nodes.to_vec(),
-                    cursors: batch.cursors.to_vec(),
-                    limits: batch.limits.to_vec(),
-                });
-            for (row, node) in batch.nodes.iter().enumerate() {
-                if node.value == value(2) {
-                    pages.push(None);
-                    continue;
-                }
-                assert_eq!(batch.cursors[row], ResidualDeltaExpandCursor::Start);
-                assert_eq!(batch.limits[row], 1);
-                pages.push(Some(ResidualDeltaExpandPage {
-                    next: None,
-                    examined: 1,
-                }));
-                successors.push((
-                    u32::try_from(row).expect("too many native transition rows"),
-                    output(node.value[0] + 10, node.continuation + 1, false),
-                ));
-            }
-        }
-
-        fn residual_delta_expand(
-            &self,
-            _variable: VariableId,
-            nodes: &[ResidualDeltaNode],
-            successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-        ) -> bool {
-            self.eager_nodes.fetch_add(nodes.len(), Ordering::Relaxed);
-            for (tag, node) in nodes.iter().enumerate() {
-                assert_eq!(node.value, value(2));
-                successors.push((
-                    u32::try_from(tag).expect("too many eager transition rows"),
-                    output(12, node.continuation + 1, false),
-                ));
-            }
-            true
-        }
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct ZeroColumnBatchTrace {
-        row_count: usize,
-        vars: Vec<VariableId>,
-        candidate_modes: Vec<bool>,
-        cursors: Vec<ResidualDeltaSourceCursor>,
-        limits: Vec<usize>,
-    }
-
-    struct ZeroColumnSource {
-        trace: Arc<Mutex<Option<ZeroColumnBatchTrace>>>,
-    }
-
-    impl Constraint<'static> for ZeroColumnSource {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(0)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != 0 {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn residual_delta_source_pages(
-            &self,
-            variable: VariableId,
-            batch: ResidualDeltaSourceBatch<'_>,
-            pages: &mut Vec<ResidualDeltaSourcePage>,
-            roots: &mut Vec<(u32, ResidualDeltaOutput)>,
-            accepted: &mut Vec<(u32, RawInline)>,
-        ) -> bool {
-            assert_eq!(variable, 0);
-            assert!(pages.is_empty());
-            assert!(roots.is_empty());
-            assert!(accepted.is_empty());
-            *self.trace.lock().expect("zero-column trace poisoned") = Some(ZeroColumnBatchTrace {
-                row_count: batch.view.len(),
-                vars: batch.view.vars.to_vec(),
-                candidate_modes: batch
-                    .candidate_sets
-                    .iter()
-                    .map(|candidates| candidates.is_some())
-                    .collect(),
-                cursors: batch.cursors.to_vec(),
-                limits: batch.limits.to_vec(),
-            });
-            pages.extend((0..batch.view.len()).map(|_| ResidualDeltaSourcePage {
-                next: None,
-                examined: 0,
-            }));
-            true
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct DirectTerminalSource;
-
-    impl Constraint<'static> for DirectTerminalSource {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(0)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != 0 {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn residual_delta_source_pages(
-            &self,
-            variable: VariableId,
-            batch: ResidualDeltaSourceBatch<'_>,
-            pages: &mut Vec<ResidualDeltaSourcePage>,
-            roots: &mut Vec<(u32, ResidualDeltaOutput)>,
-            accepted: &mut Vec<(u32, RawInline)>,
-        ) -> bool {
-            assert_eq!(variable, 0);
-            assert!(pages.is_empty());
-            assert!(roots.is_empty());
-            assert!(accepted.is_empty());
-            for row in 0..batch.view.len() {
-                assert!(batch.limits[row] >= 1);
-                pages.push(ResidualDeltaSourcePage {
-                    next: None,
-                    examined: 1,
-                });
-                accepted.push((
-                    u32::try_from(row).expect("too many direct terminal rows"),
-                    value(10 + u8::try_from(row).expect("too many direct terminal rows")),
-                ));
-            }
-            true
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct SourceTransitionCycle;
-
-    impl Constraint<'static> for SourceTransitionCycle {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(0)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != 0 {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn residual_delta_source_pages(
-            &self,
-            variable: VariableId,
-            batch: ResidualDeltaSourceBatch<'_>,
-            pages: &mut Vec<ResidualDeltaSourcePage>,
-            roots: &mut Vec<(u32, ResidualDeltaOutput)>,
-            accepted: &mut Vec<(u32, RawInline)>,
-        ) -> bool {
-            assert_eq!(variable, 0);
-            assert!(pages.is_empty());
-            assert!(roots.is_empty());
-            assert!(accepted.is_empty());
-            for (row, cursor) in batch.cursors.iter().copied().enumerate() {
-                let row = u32::try_from(row).expect("too many cycle rows");
-                match cursor {
-                    ResidualDeltaSourceCursor::Start => {
-                        roots.push((row, output(1, 0, false)));
-                        pages.push(ResidualDeltaSourcePage {
-                            next: Some(ResidualDeltaSourceCursor::Offset(1)),
-                            examined: 1,
-                        });
-                    }
-                    ResidualDeltaSourceCursor::Offset(1) => {
-                        pages.push(ResidualDeltaSourcePage {
-                            next: None,
-                            examined: 0,
-                        });
-                    }
-                    _ => panic!("cycle source received an unexpected cursor"),
-                }
-            }
-            true
-        }
-
-        fn residual_delta_expand(
-            &self,
-            _variable: VariableId,
-            _nodes: &[ResidualDeltaNode],
-            _successors: &mut Vec<(u32, ResidualDeltaOutput)>,
-        ) -> bool {
-            true
-        }
     }
 
     fn value(byte: u8) -> RawInline {
         [byte; 32]
-    }
-
-    fn output(byte: u8, continuation: u32, accepted: bool) -> ResidualDeltaOutput {
-        ResidualDeltaOutput {
-            node: ResidualDeltaNode {
-                source: None,
-                value: value(byte),
-                continuation,
-            },
-            accepted,
-        }
-    }
-
-    fn finish_registry_proposal(
-        registry: &mut ProducerRegistry,
-        proof: QuiescenceProof,
-    ) -> CompletedActivation {
-        let RegistrySettlement::ProposalMaterializer(seed) = registry.settle_quiescence(proof)
-        else {
-            panic!("nonempty proposal did not open its materializer")
-        };
-        let mut state = seed.state;
-        let mut emitted = Vec::new();
-        loop {
-            let page = state.advance(1);
-            emitted.extend(page.emitted);
-            let Some(next) = page.next else {
-                break;
-            };
-            state = next;
-        }
-        let retired = registry.replace_program(
-            seed.credit,
-            DeltaStateId(0),
-            &[],
-            std::iter::empty(),
-            std::iter::empty(),
-            emitted,
-            false,
-            true,
-            false,
-            None,
-        );
-        let proof = retired
-            .quiescence
-            .expect("proposal materializer retired its sole credit");
-        let RegistrySettlement::Completed(completed) = registry.settle_quiescence(proof) else {
-            panic!("completed proposal materializer reopened engine work")
-        };
-        completed
-    }
-
-    fn sourced_output(
-        source: u8,
-        current: u8,
-        continuation: u32,
-        accepted: bool,
-    ) -> ResidualDeltaOutput {
-        ResidualDeltaOutput {
-            node: ResidualDeltaNode {
-                source: Some(value(source)),
-                value: value(current),
-                continuation,
-            },
-            accepted,
-        }
     }
 
     fn stable_return(parent: Vec<RawInline>) -> DeltaReturn {
@@ -13096,14 +10190,17 @@ mod tests {
     #[test]
     fn empty_quiescent_proposal_completes_without_engine_work() {
         let mut scheduler = DeltaScheduler::new();
-        let started = scheduler.registry.start_many(
+        let activation = scheduler.registry.open_program_activation(
             DeltaReducer::quiescent_proposal(),
             candidate_return(Vec::new()),
-            [],
+            None,
+            None,
         );
-        let activation = started.activation;
+        let installed = scheduler
+            .registry
+            .install_program_roots(activation, std::iter::empty::<ProgramSeedWork>());
         let DeltaSettlement::Completed(completed) = scheduler.settle_quiescence(
-            started
+            installed
                 .quiescence
                 .expect("empty proposal is synchronously quiescent"),
         ) else {
@@ -13158,18 +10255,37 @@ mod tests {
             vec![super::super::ActivationId(11)],
             &plan.finite_formula.node(formula_root).kind,
         );
-        let started = scheduler.registry.start_many(
+        let old_activation = scheduler.registry.open_program_activation(
             DeltaReducer::quiescent_proposal(),
             DeltaReturn::Formula {
                 bound: VariableSet::new_empty(),
                 cursor: action,
                 batch,
             },
-            [output(7, 0, true)],
+            None,
+            None,
         );
-        let old_activation = started.activation;
-        let (_, root_credit) = started.roots.into_iter().next().expect("one formula root");
-        let retired = scheduler.registry.replace_traversal(root_credit, []);
+        let mut installed = scheduler.registry.install_program_roots(
+            old_activation,
+            [ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(0),
+                accepted: Some(value(7)),
+            }],
+        );
+        let (_, root_credit) = installed.roots.pop().expect("one typed formula root");
+        let retired = scheduler.registry.replace_program(
+            root_credit,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
         let DeltaSettlement::Retargeted(active) = scheduler.settle_quiescence(
             retired
                 .quiescence
@@ -13652,74 +10768,46 @@ mod tests {
     fn terminal_streaming_is_activation_payload_not_delta_state_identity() {
         let mut scheduler = DeltaScheduler::new();
         let full = VariableSet::new_singleton(0);
-        let terminal = scheduler.registry.start_many_terminal(
+        let terminal = scheduler.registry.open_program_activation(
             DeltaReducer::StreamProposal,
             candidate_return(Vec::new()),
-            [output(1, 0, false)],
-            full,
+            None,
+            Some(full),
         );
-        let ordinary = scheduler.registry.start_many(
+        let ordinary = scheduler.registry.open_program_activation(
             DeltaReducer::StreamProposal,
             candidate_return(Vec::new()),
-            [output(2, 0, false)],
+            None,
+            None,
         );
-        let wrong_full = scheduler.registry.start_many_terminal(
+        let wrong_full = scheduler.registry.open_program_activation(
             DeltaReducer::StreamProposal,
             candidate_return(Vec::new()),
-            [output(3, 0, false)],
-            VariableSet::new_empty(),
+            None,
+            Some(VariableSet::new_empty()),
         );
-        let wrong_reducer = scheduler.registry.start_many_terminal(
+        let wrong_reducer = scheduler.registry.open_program_activation(
             DeltaReducer::quiescent_proposal(),
             candidate_return(Vec::new()),
-            [output(4, 0, false)],
-            full,
+            None,
+            Some(full),
         );
         assert_eq!(
-            scheduler
-                .registry
-                .physical_activation_class(terminal.activation),
+            scheduler.registry.physical_activation_class(terminal),
             DeltaPhysicalClass::TerminalStreaming
         );
         assert_eq!(
-            scheduler
-                .registry
-                .physical_activation_class(ordinary.activation),
+            scheduler.registry.physical_activation_class(ordinary),
             DeltaPhysicalClass::General
         );
         assert_eq!(
-            scheduler
-                .registry
-                .physical_activation_class(wrong_full.activation),
+            scheduler.registry.physical_activation_class(wrong_full),
             DeltaPhysicalClass::General
         );
         assert_eq!(
-            scheduler
-                .registry
-                .physical_activation_class(wrong_reducer.activation),
+            scheduler.registry.physical_activation_class(wrong_reducer),
             DeltaPhysicalClass::General
         );
-
-        let desc = DeltaDesc::leaf(0, 0);
-        let tasks = terminal
-            .roots
-            .into_iter()
-            .map(|(node, credit)| DeltaTask {
-                activation: terminal.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            })
-            .chain(ordinary.roots.into_iter().map(|(node, credit)| DeltaTask {
-                activation: ordinary.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            }))
-            .collect();
-        let _ = scheduler.file(desc.clone(), tasks);
-        assert_eq!(scheduler.interner.entries, [DeltaStateEntry::Legacy(desc)]);
-        assert_eq!(scheduler.worklist.len(), 1);
     }
 
     #[test]
@@ -13742,13 +10830,23 @@ mod tests {
             "eager receipts must not manufacture sparse registry state"
         );
 
-        let sparse = registry.start_many(
+        let sparse = registry.open_program_activation(
             DeltaReducer::StreamProposal,
             stable_return(Vec::new()),
-            [output(9, 0, false)],
+            None,
+            None,
         );
-        assert_eq!(sparse.activation, ActivationId::test(3));
-        assert!(registry.state.activations.contains_key(&sparse.activation));
+        let installed = registry.install_program_roots(
+            sparse,
+            [ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(0),
+                accepted: None,
+            }],
+        );
+        assert!(installed.quiescence.is_none());
+        assert_eq!(sparse, ActivationId::test(3));
+        assert!(registry.state.activations.contains_key(&sparse));
         assert!(receipts
             .iter()
             .all(|receipt| !registry.state.activations.contains_key(receipt)));
@@ -15245,16 +12343,23 @@ mod tests {
             published_two,
             remainder,
         ]);
-        let started = registry.start_many(
+        let activation = registry.open_program_activation(
             DeltaReducer::Confirm { original },
             terminal_positive_return(Vec::new()),
-            [
-                output(31, 0, true),
-                output(32, 1, true),
-                output(33, 2, true),
-            ],
+            None,
+            None,
         );
-        let activation = started.activation;
+        let installed = registry.install_program_roots(
+            activation,
+            [published_one, published_two, remainder]
+                .into_iter()
+                .enumerate()
+                .map(|(slot, accepted)| ProgramSeedWork {
+                    parent: 0,
+                    work: positive_test_work(u32::try_from(slot).unwrap()),
+                    accepted: Some(accepted),
+                }),
+        );
         let parent = registry
             .open_exact_and_support_publication(
                 activation,
@@ -15269,8 +12374,20 @@ mod tests {
         }
 
         let mut proof = None;
-        for (_, credit) in started.roots {
-            if let Some(quiescence) = registry.replace_traversal(credit, []).quiescence {
+        for (_, credit) in installed.roots {
+            let retired = registry.replace_program(
+                credit,
+                DeltaStateId(0),
+                &[],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                false,
+                false,
+                false,
+                None,
+            );
+            if let Some(quiescence) = retired.quiescence {
                 assert!(
                     proof.replace(quiescence).is_none(),
                     "one affine activation produced two quiescence receipts"
@@ -15467,598 +12584,6 @@ mod tests {
             )
             .is_none());
     }
-
-    #[test]
-    fn terminal_source_search_and_transition_effort_are_independent() {
-        let mut registry = ProducerRegistry::new();
-        let full = VariableSet::new_singleton(0);
-        let started = registry.start_many_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            [output(1, 0, false)],
-            full,
-        );
-
-        assert_eq!(registry.source_dispatch_width(started.activation, 64), 64);
-        assert_eq!(
-            registry.transition_dispatch_width(started.activation, 64),
-            1
-        );
-        assert_eq!(
-            registry.finish_dispatch(started.activation, 64, PhysicalDispatchKind::Source, false,),
-            (false, false)
-        );
-        assert_eq!(
-            registry.transition_dispatch_width(started.activation, 64),
-            1
-        );
-        assert_eq!(
-            registry.finish_dispatch(
-                started.activation,
-                64,
-                PhysicalDispatchKind::Transition,
-                false,
-            ),
-            (false, true)
-        );
-        assert_eq!(
-            registry.transition_dispatch_width(started.activation, 64),
-            2
-        );
-        assert_eq!(
-            registry.finish_dispatch(
-                started.activation,
-                64,
-                PhysicalDispatchKind::Transition,
-                false,
-            ),
-            (false, true)
-        );
-        assert_eq!(registry.transition_dispatch_width(started.activation, 3), 3);
-        assert_eq!(
-            registry.finish_dispatch(started.activation, 64, PhysicalDispatchKind::Source, true,),
-            (true, false)
-        );
-        assert_eq!(
-            registry.transition_dispatch_width(started.activation, 64),
-            1
-        );
-    }
-
-    #[test]
-    fn terminal_global_feedback_waits_for_live_local_saturation() {
-        let mut scheduler = DeltaScheduler::new();
-        let started = scheduler.registry.start_many_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            [output(1, 0, false)],
-            VariableSet::new_singleton(0),
-        );
-        let activation = started.activation;
-
-        assert!(scheduler.allows_global_width_growth(
-            &PhysicalDispatch::new(
-                &scheduler.registry,
-                PhysicalDispatchKind::Source,
-                64,
-                [activation],
-                vec![1],
-                0,
-            ),
-            64,
-            &OrderedActivationSet::default(),
-        ));
-        for expected in [2, 4, 8, 16, 32] {
-            let _ = scheduler.registry.finish_dispatch(
-                activation,
-                64,
-                PhysicalDispatchKind::Transition,
-                false,
-            );
-            assert_eq!(
-                scheduler.registry.transition_dispatch_width(activation, 64),
-                expected
-            );
-        }
-        assert!(!scheduler.allows_global_width_growth(
-            &PhysicalDispatch::new(
-                &scheduler.registry,
-                PhysicalDispatchKind::Transition,
-                64,
-                [activation],
-                vec![32],
-                0,
-            ),
-            64,
-            &OrderedActivationSet::default(),
-        ));
-        let _ = scheduler.registry.finish_dispatch(
-            activation,
-            64,
-            PhysicalDispatchKind::Transition,
-            false,
-        );
-        let saturated = PhysicalDispatch::new(
-            &scheduler.registry,
-            PhysicalDispatchKind::Transition,
-            64,
-            [activation],
-            vec![64],
-            0,
-        );
-        assert!(scheduler.allows_global_width_growth(
-            &saturated,
-            64,
-            &OrderedActivationSet::default()
-        ));
-        assert!(!scheduler.allows_global_width_growth(
-            &saturated,
-            64,
-            &OrderedActivationSet::from(vec![activation])
-        ));
-
-        let (_, credit) = started.roots.into_iter().next().unwrap();
-        let replaced = scheduler
-            .registry
-            .replace_traversal(credit, std::iter::empty());
-        let proof = replaced.quiescence.expect("empty traversal quiesces");
-        let _ = scheduler.registry.finish(proof);
-        assert!(!scheduler.allows_global_width_growth(
-            &saturated,
-            64,
-            &OrderedActivationSet::default()
-        ));
-    }
-
-    #[test]
-    fn terminal_transition_cohort_shares_one_budget_across_local_quanta() {
-        let mut scheduler = DeltaScheduler::new();
-        let full = VariableSet::new_singleton(0);
-        let first = scheduler.registry.start_many_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            [output(1, 0, false), output(2, 0, false)],
-            full,
-        );
-        let second = scheduler.registry.start_many_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            [output(3, 0, false), output(4, 0, false)],
-            full,
-        );
-        assert_eq!(
-            scheduler.registry.finish_dispatch(
-                first.activation,
-                8,
-                PhysicalDispatchKind::Transition,
-                false,
-            ),
-            (false, true)
-        );
-        for expected in [2, 4] {
-            let _ = scheduler.registry.finish_dispatch(
-                second.activation,
-                8,
-                PhysicalDispatchKind::Transition,
-                false,
-            );
-            assert_eq!(
-                scheduler
-                    .registry
-                    .transition_dispatch_width(second.activation, 8),
-                expected
-            );
-        }
-
-        let tasks = first
-            .roots
-            .into_iter()
-            .map(|(node, credit)| DeltaTask {
-                activation: first.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            })
-            .chain(second.roots.into_iter().map(|(node, credit)| DeltaTask {
-                activation: second.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            }))
-            .collect();
-        let _ = scheduler.file(DeltaDesc::leaf(0, 0), tasks);
-
-        let (_, tasks, dispatch) = scheduler.pop_bounded(5);
-        assert_eq!(dispatch.work_budget(), 5);
-        assert_eq!(dispatch.task_limits, [1, 2, 2]);
-        assert_eq!(dispatch.remainder_tasks, 1);
-        assert_eq!(dispatch.terminal_activations.len(), 2);
-        assert_eq!(
-            tasks.iter().map(|task| task.node.value).collect::<Vec<_>>(),
-            [value(2), value(3), value(4)]
-        );
-
-        let mut activation_work = BTreeMap::new();
-        for (task, limit) in tasks.iter().zip(&dispatch.task_limits) {
-            *activation_work.entry(task.activation).or_insert(0usize) += limit;
-        }
-        assert_eq!(activation_work[&first.activation], 1);
-        assert_eq!(activation_work[&second.activation], 4);
-        assert!(activation_work.iter().all(|(&activation, &work)| {
-            work <= scheduler.registry.transition_dispatch_width(activation, 5)
-        }));
-        assert_eq!(
-            dispatch.terminal_budgets,
-            [
-                TerminalActivationBudget {
-                    activation: first.activation,
-                    assigned: 1,
-                    quantum: 2,
-                },
-                TerminalActivationBudget {
-                    activation: second.activation,
-                    assigned: 4,
-                    quantum: 4,
-                },
-            ]
-        );
-        let mut stats = ResidualStateStats::default();
-        assert!(!scheduler.account_physical_dispatch(
-            dispatch,
-            5,
-            0,
-            &OrderedActivationSet::default(),
-            &mut stats,
-        ));
-        assert_eq!(
-            scheduler
-                .registry
-                .transition_dispatch_width(first.activation, 5),
-            2,
-            "the truncated activation did not spend its complete local quantum"
-        );
-        assert_eq!(
-            scheduler
-                .registry
-                .transition_dispatch_width(second.activation, 5),
-            5
-        );
-        assert_eq!(stats.delta_terminal_sparse_widenings, 1);
-    }
-
-    #[test]
-    fn terminal_cohort_feedback_is_activation_local() {
-        let mut scheduler = DeltaScheduler::new();
-        let full = VariableSet::new_singleton(0);
-        let first = scheduler.registry.start_many_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            [output(1, 0, false)],
-            full,
-        );
-        let second = scheduler.registry.start_many_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            [output(2, 0, false)],
-            full,
-        );
-        for activation in [first.activation, second.activation] {
-            let _ = scheduler.registry.finish_dispatch(
-                activation,
-                8,
-                PhysicalDispatchKind::Transition,
-                false,
-            );
-        }
-        let mut stats = ResidualStateStats::default();
-        let published = OrderedActivationSet::from(vec![first.activation]);
-        assert!(!scheduler.account_physical_dispatch(
-            PhysicalDispatch::new(
-                &scheduler.registry,
-                PhysicalDispatchKind::Transition,
-                8,
-                [first.activation, second.activation],
-                vec![2, 2],
-                0,
-            ),
-            8,
-            0,
-            &published,
-            &mut stats,
-        ));
-        assert_eq!(
-            scheduler
-                .registry
-                .transition_dispatch_width(first.activation, 8),
-            1
-        );
-        assert_eq!(
-            scheduler
-                .registry
-                .transition_dispatch_width(second.activation, 8),
-            4
-        );
-        assert_eq!(stats.delta_terminal_publications, 1);
-        assert_eq!(stats.delta_terminal_sparse_resets, 1);
-        assert_eq!(stats.delta_terminal_sparse_widenings, 1);
-
-        assert!(scheduler.account_physical_dispatch(
-            PhysicalDispatch::new(
-                &scheduler.registry,
-                PhysicalDispatchKind::Source,
-                8,
-                [first.activation, second.activation],
-                vec![4, 4],
-                0,
-            ),
-            8,
-            0,
-            &OrderedActivationSet::default(),
-            &mut stats,
-        ));
-        assert_eq!(
-            scheduler
-                .registry
-                .transition_dispatch_width(first.activation, 8),
-            1
-        );
-        assert_eq!(
-            scheduler
-                .registry
-                .transition_dispatch_width(second.activation, 8),
-            4
-        );
-        assert_eq!(stats.delta_terminal_sparse_widenings, 1);
-    }
-
-    #[test]
-    fn terminal_sources_share_s_without_mixing_physical_classes() {
-        let mut scheduler = DeltaScheduler::new();
-        let full = VariableSet::new_singleton(0);
-        let (first_activation, first_credit) = scheduler.registry.start_source_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            None,
-            full,
-        );
-        let (ordinary_activation, ordinary_credit) = scheduler.registry.start_source(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            None,
-        );
-        let (second_activation, second_credit) = scheduler.registry.start_source_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            None,
-            full,
-        );
-        let desc = DeltaDesc::leaf(0, 0);
-        let _ = scheduler.file_source(
-            desc,
-            vec![
-                SourceTask {
-                    activation: first_activation,
-                    credit: first_credit,
-                    cursor: ResidualDeltaSourceCursor::Start,
-                },
-                SourceTask {
-                    activation: ordinary_activation,
-                    credit: ordinary_credit,
-                    cursor: ResidualDeltaSourceCursor::Start,
-                },
-                SourceTask {
-                    activation: second_activation,
-                    credit: second_credit,
-                    cursor: ResidualDeltaSourceCursor::Start,
-                },
-            ],
-        );
-
-        let (_, terminal, dispatch) = scheduler.pop_source_bounded(8);
-        assert_eq!(
-            terminal
-                .iter()
-                .map(|task| task.activation)
-                .collect::<Vec<_>>(),
-            [second_activation, first_activation]
-        );
-        assert_eq!(dispatch.terminal_activations.len(), 2);
-        assert_eq!(dispatch.task_limits, [4, 4]);
-        assert_eq!(dispatch.work_budget(), 8);
-        assert_eq!(dispatch.remainder_tasks, 1);
-        assert!(terminal.iter().all(|task| {
-            SourceDispatchKey::of(&scheduler.registry, task).physical_class
-                == DeltaPhysicalClass::TerminalStreaming
-        }));
-
-        let (_, ordinary, dispatch) = scheduler.pop_source_bounded(8);
-        assert_eq!(ordinary.len(), 1);
-        assert_eq!(ordinary[0].activation, ordinary_activation);
-        assert!(dispatch.terminal_activations.is_empty());
-        assert_eq!(dispatch.task_limits, [8]);
-    }
-
-    #[test]
-    fn terminal_source_cohort_preserves_origins_and_completion_receipts() {
-        let root = DirectTerminalSource;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let full = VariableSet::new_singleton(0);
-        let mut scheduler = DeltaScheduler::new();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-
-        let (first_activation, first_credit) = scheduler.registry.start_source_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            None,
-            full,
-        );
-        let (second_activation, second_credit) = scheduler.registry.start_source_terminal(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            None,
-            full,
-        );
-        let _ = scheduler.file_source(
-            DeltaDesc::leaf(0, 0),
-            vec![
-                SourceTask {
-                    activation: first_activation,
-                    credit: first_credit,
-                    cursor: ResidualDeltaSourceCursor::Start,
-                },
-                SourceTask {
-                    activation: second_activation,
-                    credit: second_credit,
-                    cursor: ResidualDeltaSourceCursor::Start,
-                },
-            ],
-        );
-
-        let outcome = scheduler.step_bounded(
-            &root,
-            &plan,
-            4,
-            Some(full),
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        let publication = outcome
-            .publication
-            .expect("the terminal cohort publishes both affine rows directly");
-        assert_eq!(publication.rows.row_count, 2);
-        assert_eq!(publication.rows.rows, [value(10), value(11)]);
-        assert_eq!(
-            publication.origins.as_slice(),
-            [second_activation, first_activation],
-            "cohort batching must not collapse projected-yield origins"
-        );
-        assert_eq!(
-            outcome.completed_activation_ids,
-            [second_activation, first_activation],
-            "completion remains an exact per-activation ledger receipt"
-        );
-        assert!(!outcome.completed_transition_cohort);
-        assert!(stable.is_empty());
-        assert_eq!(stats.delta_terminal_calls, 1);
-        assert_eq!(stats.max_delta_terminal_task_cohort, 2);
-    }
-
-    #[test]
-    fn proven_terminal_accepting_seed_publishes_rows_and_retains_its_credit() {
-        let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let successor = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Candidate {
-                variable: 0,
-                relevant: relevant.clone(),
-                checked: relevant,
-            },
-        };
-        let full = VariableSet::new_singleton(0);
-        let mut scheduler = DeltaScheduler::new();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-
-        let seeded = scheduler.seed_proposals_with_full(
-            DeltaDesc::leaf(0, 0),
-            successor,
-            RowBatch::seed(),
-            vec![ResidualDeltaSeed {
-                parent: 0,
-                output: output(7, 0, true),
-            }],
-            full,
-            Some(full),
-            &plan,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-
-        assert!(seeded.continuation.is_none());
-        let publication = seeded
-            .publication
-            .expect("the proven terminal accepting seed published directly");
-        assert_eq!(
-            (publication.rows.row_count, publication.rows.rows.as_slice(),),
-            (1, &[value(7)][..])
-        );
-        assert_eq!(publication.origins.len(), 1);
-        assert!(stable.is_empty());
-        assert_eq!(
-            (stats.candidates_proposed, stats.max_propose_candidates),
-            (1, 1)
-        );
-        let active = seeded
-            .active
-            .expect("the accepted seed retained its independent traversal root");
-        assert_eq!(
-            scheduler
-                .registry
-                .physical_activation_class(active.activation),
-            DeltaPhysicalClass::TerminalStreaming
-        );
-        assert!(scheduler.registry.is_live(active.activation));
-    }
-
-    fn streaming_formula_return(
-        plan: &ResidualPlan,
-        stable_interner: &mut StateInterner,
-    ) -> DeltaReturn {
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let counter = stable_interner.start_formula(
-            &plan.finite_formula,
-            0,
-            0,
-            UnionVerb::Propose { relevant },
-        );
-        let root = plan
-            .finite_formula
-            .root(0)
-            .expect("the synthetic root has a formula program");
-        let FiniteFormulaNodeKind::And { children } = &plan.finite_formula.node(root).kind else {
-            panic!("the streaming fixture requires a linear AND root")
-        };
-        assert_eq!(children.len(), 2);
-        let counter = counter.with_pc(stable_interner.formula_pcs.skip_child(
-            &plan.finite_formula,
-            counter.pc,
-            1,
-        ));
-        let counter = counter.with_pc(stable_interner.formula_pcs.select_child_as_action(
-            &plan.finite_formula,
-            counter.pc,
-            0,
-        ));
-        assert_eq!(
-            plan.interned_formula_proposal_streamability(
-                &stable_interner.formula_pcs,
-                counter,
-                VariableSet::new_empty(),
-            ),
-            FormulaProposalStreamability::Linear,
-            "the streaming fixture constructed an impossible production state"
-        );
-        DeltaReturn::Formula {
-            bound: VariableSet::new_empty(),
-            cursor: counter,
-            batch: FormulaBatch::from_proposal(
-                RowBatch {
-                    rows: Vec::new(),
-                    row_count: 1,
-                },
-                vec![super::super::ActivationId(11)],
-                &plan.finite_formula.node(root).kind,
-            ),
-        }
-    }
-
     fn support_formula_return() -> DeltaReturn {
         DeltaReturn::Formula {
             bound: VariableSet::new_empty(),
@@ -17548,15 +14073,25 @@ mod tests {
         let b = value(2);
         let rejected = value(9);
 
-        let mut original = shared_one_parent_candidates(vec![b, a]);
-        original.extend_same_domain(shared_one_parent_candidates(vec![rejected, a, b]), 1);
+        let original = shared_one_parent_candidates(vec![b, a, rejected, a, b]);
         let mut scheduler = DeltaScheduler::new();
-        let started = scheduler.registry.start_many(
+        let activation = scheduler.registry.open_program_activation(
             DeltaReducer::Confirm { original },
             candidate_return(Vec::new()),
-            [output(1, 0, true), output(2, 0, true)],
+            Some(vec![a, b, rejected].into_boxed_slice()),
+            None,
         );
-        let activation = started.activation;
+        let installed = scheduler.registry.install_program_roots(
+            activation,
+            [a, b]
+                .into_iter()
+                .enumerate()
+                .map(|(slot, accepted)| ProgramSeedWork {
+                    parent: 0,
+                    work: positive_test_work(u32::try_from(slot).unwrap()),
+                    accepted: Some(accepted),
+                }),
+        );
         {
             let graph = scheduler
                 .registry
@@ -17564,20 +14099,23 @@ mod tests {
                 .activations
                 .get_mut(&activation)
                 .expect("live Confirm graph activation");
-            graph.seen.insert(
-                ResidualDeltaNode {
-                    source: None,
-                    value: value(42),
-                    continuation: 7,
-                },
-                false,
-            );
             graph.program_joins.reserve(8);
-            graph.source_candidates = Some(vec![a, b, rejected].into_boxed_slice());
         }
         let mut proof = None;
-        for (_, credit) in started.roots {
-            if let Some(quiescence) = scheduler.registry.replace_traversal(credit, []).quiescence {
+        for (_, credit) in installed.roots {
+            let retired = scheduler.registry.replace_program(
+                credit,
+                DeltaStateId(0),
+                &[],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                false,
+                false,
+                false,
+                None,
+            );
+            if let Some(quiescence) = retired.quiescence {
                 assert!(proof.replace(quiescence).is_none());
             }
         }
@@ -17599,8 +14137,6 @@ mod tests {
                 .get(&activation)
                 .expect("Confirm finalizer retained its activation");
             assert_eq!(finalizing.status, ActivationStatus::Open);
-            assert!(finalizing.seen.is_empty());
-            assert_eq!(finalizing.seen.capacity(), 0);
             assert!(finalizing.program_joins.is_empty());
             assert_eq!(finalizing.program_joins.capacity(), 0);
             assert!(finalizing.source_candidates.is_none());
@@ -17797,15 +14333,19 @@ mod tests {
     #[test]
     fn confirm_finalizer_keeps_empty_original_eager_and_all_rejected_pageable() {
         let mut empty = DeltaScheduler::new();
-        let started = empty.registry.start_many(
+        let empty_activation = empty.registry.open_program_activation(
             DeltaReducer::Confirm {
                 original: shared_one_parent_candidates(Vec::new()),
             },
             candidate_return(Vec::new()),
-            std::iter::empty::<ResidualDeltaOutput>(),
+            None,
+            None,
         );
+        let installed = empty
+            .registry
+            .install_program_roots(empty_activation, std::iter::empty::<ProgramSeedWork>());
         let DeltaSettlement::Completed(completed) =
-            empty.settle_quiescence(started.quiescence.unwrap())
+            empty.settle_quiescence(installed.quiescence.unwrap())
         else {
             panic!("empty Confirm opened a finalizer task")
         };
@@ -17814,20 +14354,24 @@ mod tests {
             DeltaCompletion::Candidates(ref candidates) if candidates.is_empty()
         ));
         assert!(empty.program_worklist.is_empty());
-        assert!(!empty.registry.is_live(started.activation));
+        assert!(!empty.registry.is_live(empty_activation));
 
         let root = MixedExpansion;
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let mut rejected = DeltaScheduler::new();
-        let started = rejected.registry.start_many(
+        let rejected_activation = rejected.registry.open_program_activation(
             DeltaReducer::Confirm {
                 original: shared_one_parent_candidates(vec![value(1), value(2)]),
             },
             candidate_return(Vec::new()),
-            std::iter::empty::<ResidualDeltaOutput>(),
+            None,
+            None,
         );
+        let installed = rejected
+            .registry
+            .install_program_roots(rejected_activation, std::iter::empty::<ProgramSeedWork>());
         let DeltaSettlement::Retargeted(active) =
-            rejected.settle_quiescence(started.quiescence.unwrap())
+            rejected.settle_quiescence(installed.quiescence.unwrap())
         else {
             panic!("nonempty rejected bag was not scheduled for scanning")
         };
@@ -17845,7 +14389,7 @@ mod tests {
         );
         assert_eq!(eof.status, ActiveDeltaStatus::Quiescent);
         assert!(eof.resume.is_none());
-        assert_eq!(eof.outcome.completed_activation_ids, [started.activation]);
+        assert_eq!(eof.outcome.completed_activation_ids, [rejected_activation]);
         assert_eq!(eof.outcome.dead_pages, 1);
         assert!(eof.outcome.continuation.is_none());
         assert!(stable.is_empty());
@@ -17876,18 +14420,38 @@ mod tests {
             with_or: bool,
         ) -> QuiescenceProof {
             let batch = formula_batch(&original, with_or);
-            let started = registry.start_many(
+            let activation = registry.open_program_activation(
                 DeltaReducer::Confirm { original },
                 DeltaReturn::Formula {
                     bound: VariableSet::new_empty(),
                     cursor: test_formula_cursor(0),
                     batch,
                 },
-                [output(7, 0, true)],
+                None,
+                None,
             );
-            let (_, credit) = started.roots.into_iter().next().unwrap();
+            let mut installed = registry.install_program_roots(
+                activation,
+                [ProgramSeedWork {
+                    parent: 0,
+                    work: positive_test_work(0),
+                    accepted: Some(value(7)),
+                }],
+            );
+            let (_, credit) = installed.roots.pop().unwrap();
             registry
-                .replace_traversal(credit, [])
+                .replace_program(
+                    credit,
+                    DeltaStateId(0),
+                    &[],
+                    std::iter::empty(),
+                    std::iter::empty(),
+                    std::iter::empty(),
+                    false,
+                    false,
+                    false,
+                    None,
+                )
                 .quiescence
                 .expect("one-root Formula Confirm quiesced")
         }
@@ -17914,7 +14478,7 @@ mod tests {
         let empty_original = shared_one_parent_candidates(Vec::new());
         let empty_batch = formula_batch(&empty_original, false);
         let mut empty = ProducerRegistry::new();
-        let started = empty.start_many(
+        let activation = empty.open_program_activation(
             DeltaReducer::Confirm {
                 original: empty_original,
             },
@@ -17923,10 +14487,13 @@ mod tests {
                 cursor: test_formula_cursor(0),
                 batch: empty_batch,
             },
-            std::iter::empty::<ResidualDeltaOutput>(),
+            None,
+            None,
         );
+        let installed =
+            empty.install_program_roots(activation, std::iter::empty::<ProgramSeedWork>());
         let RegistrySettlement::Completed(completed) =
-            empty.settle_quiescence(started.quiescence.unwrap())
+            empty.settle_quiescence(installed.quiescence.unwrap())
         else {
             panic!("empty all-AND Formula Confirm opened a finalizer task")
         };
@@ -18312,14 +14879,17 @@ mod tests {
     #[test]
     fn empty_support_roots_prove_false_only_at_quiescence() {
         let mut registry = ProducerRegistry::new();
-        let started = registry.start_many(
+        let activation = registry.open_program_activation(
             DeltaReducer::Support { published: false },
             support_formula_return(),
-            [],
+            None,
+            None,
         );
+        let installed =
+            registry.install_program_roots(activation, std::iter::empty::<ProgramSeedWork>());
 
         let completed = registry.finish(
-            started
+            installed
                 .quiescence
                 .expect("an empty support frontier is immediately quiescent"),
         );
@@ -18330,25 +14900,45 @@ mod tests {
     #[test]
     fn accepting_seed_is_an_immediate_effect_receipt_not_an_expansion_side_effect() {
         let mut registry = ProducerRegistry::new();
-        let started = registry.start_many(
+        let activation = registry.open_program_activation(
             DeltaReducer::StreamProposal,
             stable_return(Vec::new()),
-            [output(7, 0, true)],
+            None,
+            None,
         );
-        assert_eq!(started.initial_accepted, [value(7)]);
+        let mut installed = registry.install_program_roots(
+            activation,
+            [ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(0),
+                accepted: Some(value(7)),
+            }],
+        );
+        assert_eq!(installed.initial_accepted, [value(7)]);
         assert_eq!(
             registry
-                .take_streaming_return(started.activation)
+                .take_streaming_return(activation)
                 .expect("the accepting seed has a streaming return")
                 .effect,
             DeltaStreamingEffect::Candidates
         );
-        let (_, root) = started.roots.into_iter().next().expect("one seed root");
+        let (_, root) = installed.roots.pop().expect("one typed seed root");
 
-        let expanded = registry.replace_traversal(root, []);
+        let expanded = registry.replace_program(
+            root,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
         assert!(
             expanded.accepted.is_empty(),
-            "the first adjacency expansion replayed seed acceptance"
+            "the first typed page replayed seed acceptance"
         );
         let completed = registry.finish(expanded.quiescence.expect("the root quiesces"));
         assert_eq!(completed.effect, DeltaCompletion::Cleanup);
@@ -18357,32 +14947,89 @@ mod tests {
     #[test]
     fn support_reducer_publishes_only_the_first_distinct_witness() {
         let mut registry = ProducerRegistry::new();
-        let started = registry.start_many(
+        let activation = registry.open_program_activation(
             DeltaReducer::Support { published: false },
             support_formula_return(),
-            [output(1, 0, false), output(2, 0, false)],
+            None,
+            None,
         );
-        let activation = started.activation;
-        let mut roots = started.roots.into_iter();
+        let installed = registry.install_program_roots(
+            activation,
+            [0, 1].map(|slot| ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(slot),
+                accepted: None,
+            }),
+        );
+        let mut roots = installed.roots.into_iter();
         let (_, first_root) = roots.next().unwrap();
         let (_, second_root) = roots.next().unwrap();
 
-        let first = registry.replace_traversal(first_root, [output(7, 1, true)]);
-        assert_eq!(first.accepted, [value(7)]);
+        let first_children = [ProgramChild {
+            input: 0,
+            work: positive_test_work(2),
+            accepted: Some(value(7)),
+        }];
+        let first = registry.replace_program(
+            first_root,
+            DeltaStateId(0),
+            &first_children,
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(first.accepted.as_slice(), [value(7)]);
         let streamed = registry
             .take_streaming_return(activation)
             .expect("the first witness publishes support");
         assert_eq!(streamed.effect, DeltaStreamingEffect::Support);
         assert!(matches!(streamed.return_to, DeltaReturn::Formula { .. }));
 
-        let second =
-            registry.replace_traversal(second_root, [output(7, 2, true), output(8, 2, true)]);
-        assert_eq!(second.accepted, [value(8)]);
+        let second_children = [
+            ProgramChild {
+                input: 0,
+                work: positive_test_work(3),
+                accepted: Some(value(7)),
+            },
+            ProgramChild {
+                input: 0,
+                work: positive_test_work(4),
+                accepted: Some(value(8)),
+            },
+        ];
+        let second = registry.replace_program(
+            second_root,
+            DeltaStateId(0),
+            &second_children,
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(second.accepted.as_slice(), [value(8)]);
         assert!(registry.take_streaming_return(activation).is_none());
 
         let mut proof = None;
-        for (_, child) in first.children.into_iter().chain(second.children) {
-            let retired = registry.replace_traversal(child, []);
+        for (_, _, child) in first.scheduled.into_iter().chain(second.scheduled) {
+            let retired = registry.replace_program(
+                child,
+                DeltaStateId(0),
+                &[],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                false,
+                false,
+                false,
+                None,
+            );
             if let Some(quiescence) = retired.quiescence {
                 assert!(proof.replace(quiescence).is_none());
             }
@@ -18394,19 +15041,38 @@ mod tests {
     #[test]
     fn support_publication_state_is_preserved_across_deep_clone() {
         let mut original = ProducerRegistry::new();
-        let started = original.start_many(
+        let activation = original.open_program_activation(
             DeltaReducer::Support { published: false },
             support_formula_return(),
-            [output(1, 0, false), output(2, 0, false)],
+            None,
+            None,
         );
-        let activation = started.activation;
-        let mut roots = started.roots.into_iter();
+        let installed = original.install_program_roots(
+            activation,
+            [0, 1].map(|slot| ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(slot),
+                accepted: None,
+            }),
+        );
+        let mut roots = installed.roots.into_iter();
         let (_, witness_root) = roots.next().unwrap();
         let (_, remaining_root) = roots.next().unwrap();
         let remaining_key = remaining_root.key;
 
-        let first = original.replace_traversal(witness_root, [output(7, 1, true)]);
-        assert_eq!(first.accepted, [value(7)]);
+        let first = original.replace_program(
+            witness_root,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            [value(7)],
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(first.accepted.as_slice(), [value(7)]);
         assert_eq!(
             original
                 .take_streaming_return(activation)
@@ -18419,2144 +15085,33 @@ mod tests {
         let cloned_remaining = remap
             .remove(&remaining_key)
             .expect("the clone remapped the still-live root");
-        let original_second = original.replace_traversal(remaining_root, [output(8, 2, true)]);
-        let cloned_second = cloned.replace_traversal(cloned_remaining, [output(8, 2, true)]);
-        assert_eq!(original_second.accepted, [value(8)]);
-        assert_eq!(cloned_second.accepted, [value(8)]);
+        let original_second = original.replace_program(
+            remaining_root,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            [value(8)],
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        let cloned_second = cloned.replace_program(
+            cloned_remaining,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            [value(8)],
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(original_second.accepted.as_slice(), [value(8)]);
+        assert_eq!(cloned_second.accepted.as_slice(), [value(8)]);
         assert!(original.take_streaming_return(activation).is_none());
         assert!(cloned.take_streaming_return(activation).is_none());
-    }
-
-    #[test]
-    fn transition_pop_keeps_quiescent_activations_coherent() {
-        let mut scheduler = DeltaScheduler::new();
-        let desc = DeltaDesc::leaf(0, 0);
-
-        let mut first = scheduler.registry.start_many(
-            DeltaReducer::quiescent_proposal(),
-            candidate_return(Vec::new()),
-            [output(1, 0, false), output(2, 0, false)],
-        );
-        let first_activation = first.activation;
-        let (first_node, first_credit) = first.roots.remove(0);
-        let (last_node, last_credit) = first.roots.remove(0);
-
-        let mut second = scheduler.registry.start_many(
-            DeltaReducer::quiescent_proposal(),
-            candidate_return(Vec::new()),
-            [output(3, 0, false)],
-        );
-        let second_activation = second.activation;
-        let (second_node, second_credit) = second.roots.remove(0);
-
-        let _ = scheduler.file(
-            desc,
-            vec![
-                DeltaTask {
-                    activation: first_activation,
-                    credit: first_credit,
-                    node: first_node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                },
-                DeltaTask {
-                    activation: second_activation,
-                    credit: second_credit,
-                    node: second_node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                },
-                DeltaTask {
-                    activation: first_activation,
-                    credit: last_credit,
-                    node: last_node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                },
-            ],
-        );
-
-        let (_, selected) = scheduler.pop(usize::MAX);
-        assert_eq!(selected.len(), 2);
-        assert!(
-            selected
-                .iter()
-                .all(|task| task.activation == first_activation),
-            "one quiescent fixpoint must consume width internally"
-        );
-        let retained = scheduler
-            .worklist
-            .values()
-            .next()
-            .expect("the independent activation remains queued");
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained.last().unwrap().activation, second_activation);
-    }
-
-    #[test]
-    fn active_transition_pop_is_exact_and_preserves_global_task_order() {
-        let mut scheduler = DeltaScheduler::new();
-        let desc = DeltaDesc::leaf(0, 0);
-        let mut first = scheduler.registry.start_many(
-            DeltaReducer::quiescent_proposal(),
-            candidate_return(Vec::new()),
-            [
-                output(1, 0, false),
-                output(2, 0, false),
-                output(3, 0, false),
-            ],
-        );
-        let first_activation = first.activation;
-        let mut second = scheduler.registry.start_many(
-            DeltaReducer::quiescent_proposal(),
-            candidate_return(Vec::new()),
-            [output(4, 0, false), output(5, 0, false)],
-        );
-        let second_activation = second.activation;
-        let task = |started: &mut StartOutcome| {
-            let (node, credit) = started.roots.remove(0);
-            DeltaTask {
-                activation: started.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            }
-        };
-        let tasks = vec![
-            task(&mut first),
-            task(&mut second),
-            task(&mut first),
-            task(&mut second),
-            task(&mut first),
-        ];
-        let active = scheduler
-            .file(desc.clone(), tasks)
-            .expect("the interleaved bucket is live");
-        assert_eq!(active.activation, first_activation);
-        assert_eq!(scheduler.interner.get(active.state), &desc);
-        assert!(scheduler.file(desc, Vec::new()).is_none());
-        assert_eq!(scheduler.interner.entries.len(), 1);
-
-        let (_, selected) = scheduler.pop_active_transition(active, 2);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|task| (task.activation, task.node.value))
-                .collect::<Vec<_>>(),
-            [(first_activation, value(2)), (first_activation, value(3))]
-        );
-        let retained = scheduler
-            .worklist
-            .get(&active.state)
-            .expect("cold tasks remain");
-        assert_eq!(
-            retained
-                .iter()
-                .map(|task| (task.activation, task.node.value))
-                .collect::<Vec<_>>(),
-            [
-                (first_activation, value(1)),
-                (second_activation, value(4)),
-                (second_activation, value(5)),
-            ]
-        );
-        retained.assert_index_consistent();
-    }
-
-    #[test]
-    fn activation_index_compacts_geometrically_without_reordering_survivors() {
-        let mut scheduler = DeltaScheduler::new();
-        let desc = DeltaDesc::leaf(0, 0);
-        let mut first = scheduler.registry.start_many(
-            DeltaReducer::quiescent_proposal(),
-            candidate_return(Vec::new()),
-            (1..=4).map(|value| output(value, 0, false)),
-        );
-        let first_activation = first.activation;
-        let mut second = scheduler.registry.start_many(
-            DeltaReducer::quiescent_proposal(),
-            candidate_return(Vec::new()),
-            (5..=8).map(|value| output(value, 0, false)),
-        );
-        let task = |started: &mut StartOutcome| {
-            let (node, credit) = started.roots.remove(0);
-            DeltaTask {
-                activation: started.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            }
-        };
-        let tasks = vec![
-            task(&mut first),
-            task(&mut second),
-            task(&mut first),
-            task(&mut second),
-            task(&mut first),
-            task(&mut second),
-            task(&mut first),
-            task(&mut second),
-        ];
-        let active = scheduler.file(desc, tasks).unwrap();
-        let bucket = scheduler.worklist.get_mut(&active.state).unwrap();
-
-        let selected = bucket.take_activation_indexed(first_activation, 3);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|task| task.node.value)
-                .collect::<Vec<_>>(),
-            [value(2), value(3), value(4)]
-        );
-        assert_eq!((bucket.arena_len(), bucket.len()), (8, 5));
-        bucket.assert_index_consistent();
-
-        let selected = bucket.take_activation(second.activation, 3);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|task| task.node.value)
-                .collect::<Vec<_>>(),
-            [value(6), value(7), value(8)]
-        );
-        assert_eq!((bucket.arena_len(), bucket.len()), (2, 2));
-        assert_eq!(
-            bucket
-                .iter()
-                .map(|task| (task.activation, task.node.value))
-                .collect::<Vec<_>>(),
-            [(first_activation, value(1)), (second.activation, value(5))]
-        );
-        bucket.assert_index_consistent();
-    }
-
-    #[test]
-    fn indexed_terminal_selection_matches_literal_reverse_scan_under_churn() {
-        type TaskKey = (ActivationId, ResidualDeltaNode, ResidualDeltaExpandCursor);
-
-        fn key(task: &DeltaTask) -> TaskKey {
-            (task.activation, task.node, task.cursor)
-        }
-
-        fn literal_take_activation(
-            tasks: &mut Vec<DeltaTask>,
-            activation: ActivationId,
-            width: usize,
-        ) -> Vec<DeltaTask> {
-            let width = width.max(1);
-            let mut selected = Vec::with_capacity(width.min(tasks.len()));
-            let mut retained = Vec::with_capacity(tasks.len());
-            for task in std::mem::take(tasks).into_iter().rev() {
-                if task.activation == activation && selected.len() < width {
-                    selected.push(task);
-                } else {
-                    retained.push(task);
-                }
-            }
-            selected.reverse();
-            retained.reverse();
-            *tasks = retained;
-            selected
-        }
-
-        fn literal_take_tail(
-            tasks: &mut Vec<DeltaTask>,
-            registry: &ProducerRegistry,
-            width: usize,
-            activation_width: usize,
-        ) -> (Vec<DeltaTask>, Vec<usize>) {
-            let width = width.max(1);
-            let activation_width = activation_width.max(1);
-            let key = TransitionDispatchKey::of(
-                registry,
-                tasks.last().expect("literal bucket is nonempty"),
-            );
-            if key == TransitionDispatchKey::TerminalStreaming {
-                let hot_activation = tasks.last().unwrap().activation;
-                if registry.transition_dispatch_width(hot_activation, width) == width {
-                    let selected = literal_take_activation(tasks, hot_activation, width);
-                    let limits = even_limits(width, selected.len());
-                    return (selected, limits);
-                }
-
-                #[derive(Debug)]
-                struct Selection {
-                    budget: usize,
-                    selected: usize,
-                    ordinal: usize,
-                }
-
-                let mut remaining = width;
-                let mut slots = AHashMap::new();
-                let mut selections = Vec::new();
-                let mut selected = Vec::with_capacity(width.min(tasks.len()));
-                let mut limits = Vec::with_capacity(width.min(tasks.len()));
-                let mut retained = Vec::with_capacity(tasks.len());
-                for task in std::mem::take(tasks).into_iter().rev() {
-                    if TransitionDispatchKey::of(registry, &task) == key {
-                        let selection_slot = if let Some(&slot) = slots.get(&task.activation) {
-                            Some(slot)
-                        } else if remaining > 0 {
-                            let budget = registry
-                                .transition_dispatch_width(task.activation, width)
-                                .min(remaining);
-                            remaining -= budget;
-                            let slot = selections.len();
-                            selections.push(Selection {
-                                budget,
-                                selected: 0,
-                                ordinal: 0,
-                            });
-                            slots.insert(task.activation, slot);
-                            Some(slot)
-                        } else {
-                            None
-                        };
-                        if let Some((slot, selection)) = selection_slot
-                            .map(|slot| (slot, &mut selections[slot]))
-                            .filter(|(_, selection)| selection.selected < selection.budget)
-                        {
-                            selection.selected += 1;
-                            limits.push(slot);
-                            selected.push(task);
-                            continue;
-                        }
-                    }
-                    retained.push(task);
-                }
-                selected.reverse();
-                limits.reverse();
-                retained.reverse();
-                *tasks = retained;
-                for slot_or_limit in &mut limits {
-                    let selection = &mut selections[*slot_or_limit];
-                    let quotient = selection.budget / selection.selected;
-                    let remainder = selection.budget % selection.selected;
-                    *slot_or_limit = quotient + usize::from(selection.ordinal < remainder);
-                    selection.ordinal += 1;
-                }
-                return (selected, limits);
-            }
-
-            let mut activations = BTreeSet::new();
-            let mut selected = Vec::with_capacity(width.min(tasks.len()));
-            let mut retained = Vec::with_capacity(tasks.len());
-            for task in std::mem::take(tasks).into_iter().rev() {
-                let compatible = match (key, TransitionDispatchKey::of(registry, &task)) {
-                    (TransitionDispatchKey::Streaming, TransitionDispatchKey::Streaming) => true,
-                    (
-                        TransitionDispatchKey::Quiescent(_),
-                        TransitionDispatchKey::Quiescent(activation),
-                    ) => {
-                        activations.contains(&activation)
-                            || (activations.len() < activation_width && {
-                                activations.insert(activation);
-                                true
-                            })
-                    }
-                    _ => false,
-                };
-                if selected.len() < width && compatible {
-                    selected.push(task);
-                } else {
-                    retained.push(task);
-                }
-            }
-            selected.reverse();
-            retained.reverse();
-            *tasks = retained;
-            let limits = even_limits(width, selected.len());
-            (selected, limits)
-        }
-
-        let mut rng = StdRng::seed_from_u64(0x5eed_1ade_7a11_2026);
-        for case in 0..32 {
-            let mut scheduler = DeltaScheduler::new();
-            let mut starts = Vec::new();
-            let mut terminal = Vec::new();
-            let mut next_value = 0u8;
-            for activation_index in 0..8 {
-                let outputs: Vec<_> = (0..8)
-                    .map(|_| {
-                        let current = next_value;
-                        next_value += 1;
-                        output(current, activation_index, false)
-                    })
-                    .collect();
-                let started = if activation_index % 3 == 0 {
-                    scheduler.registry.start_many(
-                        DeltaReducer::StreamProposal,
-                        candidate_return(Vec::new()),
-                        outputs,
-                    )
-                } else {
-                    let started = scheduler.registry.start_many_terminal(
-                        DeltaReducer::StreamProposal,
-                        candidate_return(Vec::new()),
-                        outputs,
-                        VariableSet::new_singleton(0),
-                    );
-                    terminal.push(started.activation);
-                    started
-                };
-                starts.push(started);
-            }
-            for &activation in &terminal {
-                for _ in 0..rng.gen_range(0..=5) {
-                    let _ = scheduler.registry.finish_dispatch(
-                        activation,
-                        64,
-                        PhysicalDispatchKind::Transition,
-                        false,
-                    );
-                }
-            }
-
-            let mut tasks = Vec::with_capacity(64);
-            while starts.iter().any(|started| !started.roots.is_empty()) {
-                let live: Vec<_> = starts
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, started)| (!started.roots.is_empty()).then_some(index))
-                    .collect();
-                let index = live[rng.gen_range(0..live.len())];
-                let (node, credit) = starts[index].roots.remove(0);
-                tasks.push(DeltaTask {
-                    activation: starts[index].activation,
-                    credit,
-                    node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                });
-            }
-            let terminal_tail = tasks
-                .iter()
-                .rposition(|task| terminal.contains(&task.activation))
-                .unwrap();
-            let tail = tasks.remove(terminal_tail);
-            tasks.push(tail);
-
-            let active = scheduler
-                .file(DeltaDesc::leaf(0, 0), tasks)
-                .expect("random bucket is live");
-            let churn_activation = terminal[0];
-            let churned = scheduler
-                .worklist
-                .get_mut(&active.state)
-                .unwrap()
-                .take_activation_indexed(churn_activation, 2);
-            scheduler
-                .worklist
-                .get_mut(&active.state)
-                .unwrap()
-                .extend(churned);
-
-            // Cloning an indexed arena with tombstones must produce an
-            // independent, append-order-equivalent plain sibling.
-            let mut oracle_scheduler = scheduler.deep_clone();
-            let mut indexed = scheduler.worklist.remove(&active.state).unwrap();
-            let mut oracle = oracle_scheduler
-                .worklist
-                .remove(&active.state)
-                .unwrap()
-                .drain_live();
-            let mut indexed_stash = Vec::new();
-            let mut oracle_stash = Vec::new();
-            let mut selection_slots = AHashMap::new();
-            let mut selections = Vec::new();
-
-            for step in 0..400 {
-                if !indexed_stash.is_empty() && (indexed.is_empty() || rng.gen_bool(0.2)) {
-                    let count = rng.gen_range(1..=indexed_stash.len());
-                    let indexed_append = indexed_stash.split_off(indexed_stash.len() - count);
-                    let oracle_append = oracle_stash.split_off(oracle_stash.len() - count);
-                    indexed.extend(indexed_append);
-                    oracle.extend(oracle_append);
-                } else {
-                    let widths = [0usize, 1, 2, 3, 5, 8, 13, 64, usize::MAX];
-                    let width = widths[rng.gen_range(0..widths.len())];
-                    let activation_width = rng.gen_range(0..=8);
-                    let exact = rng.gen_bool(0.35);
-                    let (indexed_selected, indexed_limits, oracle_selected, oracle_limits) =
-                        if exact {
-                            let live: Vec<_> = oracle.iter().map(|task| task.activation).collect();
-                            let activation = live[rng.gen_range(0..live.len())];
-                            (
-                                indexed.take_activation(activation, width),
-                                None,
-                                literal_take_activation(&mut oracle, activation, width),
-                                None,
-                            )
-                        } else {
-                            let (selected, limits) = indexed.take_tail(
-                                &scheduler.registry,
-                                width,
-                                activation_width,
-                                &mut selection_slots,
-                                &mut selections,
-                            );
-                            let (oracle_selected, oracle_limits) = literal_take_tail(
-                                &mut oracle,
-                                &oracle_scheduler.registry,
-                                width,
-                                activation_width,
-                            );
-                            (selected, Some(limits), oracle_selected, Some(oracle_limits))
-                        };
-                    assert_eq!(
-                        indexed_selected.iter().map(key).collect::<Vec<_>>(),
-                        oracle_selected.iter().map(key).collect::<Vec<_>>(),
-                        "selected order diverged in case {case}, step {step}"
-                    );
-                    assert_eq!(
-                        indexed_limits, oracle_limits,
-                        "budget allocation diverged in case {case}, step {step}"
-                    );
-                    if rng.gen_bool(0.45) {
-                        indexed.extend(indexed_selected);
-                        oracle.extend(oracle_selected);
-                    } else {
-                        indexed_stash.extend(indexed_selected);
-                        oracle_stash.extend(oracle_selected);
-                    }
-                }
-
-                assert_eq!(
-                    indexed.iter().map(key).collect::<Vec<_>>(),
-                    oracle.iter().map(key).collect::<Vec<_>>(),
-                    "retained order diverged in case {case}, step {step}"
-                );
-                assert_eq!(
-                    indexed_stash.iter().map(key).collect::<Vec<_>>(),
-                    oracle_stash.iter().map(key).collect::<Vec<_>>(),
-                    "stashed order diverged in case {case}, step {step}"
-                );
-                indexed.assert_index_consistent();
-            }
-        }
-    }
-
-    #[test]
-    fn seed_token_names_last_filed_live_activation_not_last_created_parent() {
-        let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let successor = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Candidate {
-                variable: 0,
-                relevant: relevant.clone(),
-                checked: relevant,
-            },
-        };
-        let mut scheduler = DeltaScheduler::new();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let seeded = scheduler.seed_proposals(
-            DeltaDesc::leaf(0, 0),
-            successor.clone(),
-            RowBatch {
-                rows: Vec::new(),
-                row_count: 2,
-            },
-            vec![ResidualDeltaSeed {
-                parent: 0,
-                output: output(1, 0, false),
-            }],
-            &plan,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        let active = seeded.active.expect("the first parent filed one root");
-        assert_eq!(active.activation, ActivationId(0));
-        assert!(scheduler.registry.is_live(active.activation));
-        assert_eq!(
-            scheduler.registry.state.next_activation, 2,
-            "the later empty parent was created and immediately retired"
-        );
-        assert!(seeded.continuation.is_none());
-
-        let empty = scheduler.seed_proposals(
-            DeltaDesc::leaf(0, 0),
-            successor,
-            RowBatch {
-                rows: Vec::new(),
-                row_count: 1,
-            },
-            Vec::new(),
-            &plan,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert!(empty.active.is_none());
-        assert!(empty.continuation.is_none());
-    }
-
-    #[test]
-    fn active_source_cycles_through_transition_before_unrelated_work() {
-        let root = SourceTransitionCycle;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let desc = DeltaDesc::leaf(0, 0);
-        let mut scheduler = DeltaScheduler::new();
-        let active = scheduler
-            .seed_source_proposals(
-                desc.clone(),
-                StateDesc {
-                    bound: VariableSet::new_empty(),
-                    phase: ResidualPhase::Ready,
-                },
-                RowBatch {
-                    rows: Vec::new(),
-                    row_count: 1,
-                },
-            )
-            .expect("the source generator was filed");
-
-        let mut cloned = scheduler.clone();
-        let mut clone_stable = Worklist::new();
-        let mut clone_interner = StateInterner::default();
-        let mut clone_stats = ResidualStateStats::default();
-        assert_eq!(
-            cloned
-                .step_active(
-                    &root,
-                    &plan,
-                    active,
-                    1,
-                    &mut clone_stable,
-                    &mut clone_interner,
-                    &mut clone_stats,
-                )
-                .status,
-            ActiveDeltaStatus::Pending,
-            "deep clone must preserve state and activation identities named by the token"
-        );
-
-        let mut unrelated = scheduler.registry.start_many(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            [output(9, 0, false)],
-        );
-        let unrelated_activation = unrelated.activation;
-        let (node, credit) = unrelated.roots.pop().expect("one unrelated root");
-        let _ = scheduler.file(
-            desc,
-            vec![DeltaTask {
-                activation: unrelated_activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            }],
-        );
-
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let source = scheduler.step_active(
-            &root,
-            &plan,
-            active,
-            1,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert_eq!(source.status, ActiveDeltaStatus::Pending);
-        assert_eq!(source.resume, Some(active));
-        assert_eq!(stats.delta_source_pages, 1);
-        assert!(scheduler.has_active_transition(active));
-
-        let transition = scheduler.step_active(
-            &root,
-            &plan,
-            active,
-            1,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert_eq!(transition.status, ActiveDeltaStatus::Pending);
-        assert_eq!(transition.resume, Some(active));
-        assert!(scheduler.has_active_source(active));
-
-        let terminal_source = scheduler.step_active(
-            &root,
-            &plan,
-            active,
-            1,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert_eq!(terminal_source.status, ActiveDeltaStatus::Quiescent);
-        assert!(terminal_source.resume.is_none());
-        assert_eq!(stats.delta_source_pages, 2);
-        assert!(stable.is_empty());
-        let retained = scheduler
-            .worklist
-            .get(&active.state)
-            .expect("unrelated transition remains cold");
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained.last().unwrap().activation, unrelated_activation);
-    }
-
-    #[test]
-    fn active_transition_yield_is_classified_before_registry_liveness() {
-        let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let desc = DeltaDesc::leaf(0, 0);
-        let mut scheduler = DeltaScheduler::new();
-        let mut started = scheduler.registry.start_many(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            [output(2, 0, false)],
-        );
-        let activation = started.activation;
-        let (node, credit) = started.roots.pop().expect("one accepting lineage");
-        let active = scheduler
-            .file(
-                desc,
-                vec![DeltaTask {
-                    activation,
-                    credit,
-                    node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                }],
-            )
-            .unwrap();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-
-        let yielded = scheduler.step_active(
-            &root,
-            &plan,
-            active,
-            1,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert_eq!(yielded.status, ActiveDeltaStatus::Yielded);
-        assert!(yielded.outcome.continuation.is_some());
-        assert_eq!(yielded.resume, Some(active));
-        assert!(scheduler.registry.is_live(activation));
-        assert!(scheduler.has_active_transition(active));
-    }
-
-    #[test]
-    fn transition_pages_dispatch_as_one_affine_cohort_with_mixed_eager_fallback() {
-        let trace = Arc::new(Mutex::new(None));
-        let scalar_page_calls = Arc::new(AtomicUsize::new(0));
-        let eager_nodes = Arc::new(AtomicUsize::new(0));
-        let root = BatchedPagedExpansion {
-            trace: Arc::clone(&trace),
-            scalar_page_calls: Arc::clone(&scalar_page_calls),
-            eager_nodes: Arc::clone(&eager_nodes),
-        };
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let desc = DeltaDesc::leaf(0, 0);
-        let mut scheduler = DeltaScheduler::new();
-        let mut tasks = Vec::new();
-        let mut activations = Vec::new();
-        for byte in [1, 3, 2] {
-            let mut started = scheduler.registry.start_many(
-                DeltaReducer::StreamProposal,
-                candidate_return(Vec::new()),
-                [output(byte, 0, false)],
-            );
-            activations.push(started.activation);
-            let (node, credit) = started.roots.pop().expect("one transition root");
-            assert!(started.quiescence.is_none());
-            tasks.push(DeltaTask {
-                activation: started.activation,
-                credit,
-                node,
-                cursor: ResidualDeltaExpandCursor::Start,
-            });
-        }
-        let _ = scheduler.file(desc.clone(), tasks);
-
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let outcome = scheduler.step(
-            &root,
-            &plan,
-            3,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-
-        assert!(outcome.continuation.is_none());
-        assert_eq!(outcome.dead_pages, 0);
-        assert!(stable.is_empty());
-        assert_eq!(scalar_page_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(eager_nodes.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.delta_transition_pages, 2);
-        assert_eq!(stats.delta_transition_cohorts, 1);
-        assert_eq!(stats.max_delta_transition_cohort, 2);
-        assert_eq!(stats.delta_transition_candidates_examined, 2);
-        assert_eq!(
-            *trace.lock().expect("transition batch trace poisoned"),
-            Some(TransitionBatchTrace {
-                nodes: vec![
-                    output(1, 0, false).node,
-                    output(3, 0, false).node,
-                    output(2, 0, false).node
-                ],
-                cursors: vec![ResidualDeltaExpandCursor::Start; 3],
-                limits: vec![1; 3],
-            })
-        );
-
-        let bucket = scheduler
-            .worklist
-            .values()
-            .next()
-            .expect("transition children were refiled");
-        let actual: Vec<_> = bucket
-            .iter()
-            .map(|task| (task.activation, task.node.value, task.node.continuation))
-            .collect();
-        assert_eq!(
-            actual,
-            vec![
-                (activations[0], value(11), 1),
-                (activations[1], value(13), 1),
-                (activations[2], value(12), 1),
-            ],
-            "tagged native and eager successors crossed affine activations"
-        );
-    }
-
-    #[test]
-    fn batched_delta_step_keeps_dead_page_and_seeded_formula_handoff_independent() {
-        // Keep a real, streamable formula boundary in this white-box fixture.
-        // A lone opaque root is deliberately normalized to the flat action
-        // plan, while an OR reducer cell is a streaming barrier by construction.
-        let root = IntersectionConstraint::new(vec![MixedExpansion, MixedExpansion]);
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let formula_root = plan
-            .finite_formula
-            .root(0)
-            .expect("the intersection root has a formula program");
-        let FiniteFormulaNodeKind::And { children } = &plan.finite_formula.node(formula_root).kind
-        else {
-            panic!("the intersection root did not compile as AND")
-        };
-        let desc = DeltaDesc::formula(0, 0, children[0]);
-        let mut scheduler = DeltaScheduler::new();
-
-        let (dead_activation, dead_generator) = scheduler.registry.start_source(
-            DeltaReducer::StreamProposal,
-            candidate_return(Vec::new()),
-            None,
-        );
-        let dead_page = scheduler.registry.replace_source(
-            dead_generator,
-            [output(1, 0, false)],
-            [],
-            Some(ResidualDeltaSourceCursor::After(value(1))),
-        );
-        let (dead_node, dead_credit) = dead_page.roots.into_iter().next().unwrap();
-
-        // The accepting seed publishes before this scheduler step, while its
-        // independent traversal credit proves quiescence during the step.
-        // Cleanup must not replay the activation-local return template.
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut live = scheduler.registry.start_many(
-            DeltaReducer::StreamFormulaProposal,
-            streaming_formula_return(&plan, &mut stable_interner),
-            [output(3, 0, true)],
-        );
-        let live_activation = live.activation;
-        let (live_node, live_credit) = live.roots.pop().expect("one live formula root");
-        assert!(live.quiescence.is_none());
-
-        let mut stats = ResidualStateStats::default();
-        let streamed = scheduler
-            .registry
-            .take_streaming_return(live_activation)
-            .expect("an accepting formula seed has a streaming return");
-        let seed_continuation = scheduler.release_streaming(
-            live_activation,
-            streamed,
-            live.initial_accepted,
-            None,
-            &plan,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert!(seed_continuation.stable.continuation.is_some());
-        assert!(seed_continuation.stable.publication.is_none());
-        assert!(seed_continuation.active.is_none());
-
-        let _ = scheduler.file(
-            desc,
-            vec![
-                DeltaTask {
-                    activation: dead_activation,
-                    credit: dead_credit,
-                    node: dead_node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                },
-                DeltaTask {
-                    activation: live_activation,
-                    credit: live_credit,
-                    node: live_node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                },
-            ],
-        );
-
-        let outcome = scheduler.step(
-            &root,
-            &plan,
-            2,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-
-        assert_eq!(outcome.dead_pages, 1);
-        assert!(outcome.continuation.is_none());
-        assert_eq!(stats.delta_source_dead_pages, 1);
-        assert_eq!(stats.candidates_proposed, 1);
-        let mut stable_buckets = stable.values().flat_map(BTreeMap::values);
-        let StateBucket::Candidates(batch) = stable_buckets.next().expect("one stable handoff")
-        else {
-            panic!("streamed formula handoff changed payload shape")
-        };
-        assert!(stable_buckets.next().is_none());
-        assert_eq!(batch.parents.row_count, 1);
-        assert!(batch.parents.rows.is_empty());
-        assert!(batch.candidates.is_values());
-        assert_eq!(batch.candidates.one_parent_values(), [value(3)]);
-        assert!(
-            !scheduler
-                .registry
-                .state
-                .activations
-                .contains_key(&live_activation),
-            "formula quiescence must retire the streamed activation"
-        );
-        assert!(scheduler.worklist.is_empty());
-        assert_eq!(
-            scheduler
-                .source_worklist
-                .values()
-                .next()
-                .unwrap()
-                .tasks
-                .len(),
-            1
-        );
-
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
-        machine.width = 4;
-        machine.cap = 64;
-        machine.accept_delta_step(outcome);
-        assert_eq!(
-            machine.width, 8,
-            "the earlier seed receipt must not hide a later dead source page"
-        );
-        assert_eq!(machine.stats.delta_source_negative_steps, 1);
-        assert!(machine.continuation.is_none());
-    }
-
-    #[test]
-    fn source_is_part_of_activation_local_novelty() {
-        let mut registry = ProducerRegistry::new();
-        let started = registry.start_many(
-            DeltaReducer::StreamProposal,
-            stable_return(Vec::new()),
-            [
-                sourced_output(1, 1, 0, false),
-                sourced_output(2, 2, 0, false),
-            ],
-        );
-        assert!(started.quiescence.is_none());
-        let activation = started.activation;
-        let roots = started.roots;
-
-        let mut children = Vec::new();
-        for ((_, root), successor) in roots.into_iter().zip([
-            sourced_output(1, 3, 1, false),
-            sourced_output(2, 3, 1, false),
-        ]) {
-            children.extend(registry.replace_traversal(root, [successor]).children);
-        }
-        assert_eq!(
-            children.len(),
-            2,
-            "one source suppressed the other's C state"
-        );
-        assert_eq!(
-            registry
-                .state
-                .activations
-                .get(&activation)
-                .expect("live activation")
-                .seen
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn duplicate_accepted_roots_filter_one_original_confirm_sequence() {
-        let candidate = value(7);
-        let mut registry = ProducerRegistry::new();
-        let started = registry.start_many(
-            DeltaReducer::Confirm {
-                original: shared_one_parent_candidates(vec![candidate, candidate]),
-            },
-            stable_return(Vec::new()),
-            [output(7, 0, true), output(7, 0, true)],
-        );
-        assert!(started.quiescence.is_none());
-        let activation = started.activation;
-        let roots = started.roots;
-        let mut proof = None;
-        for (_, root) in roots {
-            let outcome = registry.replace_traversal(root, []);
-            if let Some(quiescence) = outcome.quiescence {
-                assert!(proof.replace(quiescence).is_none());
-            }
-        }
-
-        let proof = proof.expect("all root credits quiesced");
-        assert_eq!(proof.activation, activation);
-        let completed = registry.finish(proof);
-        assert_eq!(
-            completed.effect,
-            DeltaCompletion::Candidates(CandidatePayload::Values(vec![candidate, candidate]))
-        );
-    }
-
-    fn confirm_boundary_descs(plan: &ResidualPlan) -> (StateDesc, StateDesc) {
-        assert_eq!(plan.len(), 1);
-        let relevant = ChildSet::empty(1).with_inserted(0);
-        (
-            StateDesc {
-                bound: VariableSet::new_empty(),
-                phase: ResidualPhase::Confirm {
-                    variable: 0,
-                    relevant: relevant.clone(),
-                    checked: ChildSet::empty(1),
-                    confirmer: 0,
-                },
-            },
-            StateDesc {
-                bound: VariableSet::new_empty(),
-                phase: ResidualPhase::Candidate {
-                    variable: 0,
-                    relevant: relevant.clone(),
-                    checked: relevant,
-                },
-            },
-        )
-    }
-
-    #[test]
-    fn cyclic_confirm_reuses_the_pre_admitted_affine_relation() {
-        let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let (previous, successor) = confirm_boundary_descs(&plan);
-        let formula_pcs = FormulaPcInterner::default();
-        let set_admit_result =
-            crosses_candidate_set_boundary(&previous, &successor, &plan, &formula_pcs);
-        assert!(
-            !set_admit_result,
-            "ordinary Confirm input crossed the SET boundary before it was split"
-        );
-
-        let mut scheduler = DeltaScheduler::new();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats {
-            candidates_confirmed: 3,
-            ..ResidualStateStats::default()
-        };
-        for (activation, candidates) in [(1, vec![value(1), value(2)]), (2, vec![value(1)])] {
-            let released = scheduler.release_completion(
-                CompletedActivation {
-                    activation: ActivationId(activation),
-                    return_to: DeltaReturn::Stable {
-                        desc: successor.clone(),
-                        parent: Vec::new().into_boxed_slice(),
-                        set_admit_result,
-                    },
-                    effect: DeltaCompletion::Candidates(CandidatePayload::Values(candidates)),
-                },
-                &plan,
-                &mut stable,
-                &mut stable_interner,
-                &mut stats,
-            );
-            assert!(released.continuation.is_some());
-            assert!(released.active.is_none());
-        }
-
-        let StateBucket::Candidates(batch) = stable
-            .values()
-            .flat_map(BTreeMap::values)
-            .next()
-            .expect("both affine parents rejoined one candidate state")
-        else {
-            panic!("cyclic Confirm returned a non-candidate payload")
-        };
-        assert_eq!(batch.parents.row_count, 2);
-        assert_eq!(
-            batch.candidates.iter().collect::<Vec<_>>(),
-            vec![(0, value(1)), (0, value(2)), (1, value(1))]
-        );
-        assert_eq!(
-            stats.candidates_confirmed, 3,
-            "the completion path must not rewrite raw Confirm telemetry"
-        );
-    }
-
-    #[test]
-    fn cyclic_confirm_keeps_a_nonboundary_internal_result_as_an_occurrence_bag() {
-        let root = IntersectionConstraint::new(vec![MixedExpansion; 3]);
-        let plan = ResidualPlan::compile(&root);
-        assert_eq!(plan.len(), 3);
-        let relevant = (0..3).fold(ChildSet::empty(3), |set, leaf| set.with_inserted(leaf));
-        let previous = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Confirm {
-                variable: 0,
-                relevant: relevant.clone(),
-                checked: ChildSet::empty(3).with_inserted(0),
-                confirmer: 1,
-            },
-        };
-        let successor = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Candidate {
-                variable: 0,
-                relevant,
-                checked: ChildSet::empty(3).with_inserted(0).with_inserted(1),
-            },
-        };
-        let formula_pcs = FormulaPcInterner::default();
-        let set_admit_result =
-            crosses_candidate_set_boundary(&previous, &successor, &plan, &formula_pcs);
-        assert!(!set_admit_result);
-
-        let mut scheduler = DeltaScheduler::new();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let released = scheduler.release_completion(
-            CompletedActivation {
-                activation: ActivationId(1),
-                return_to: DeltaReturn::Stable {
-                    desc: successor,
-                    parent: Vec::new().into_boxed_slice(),
-                    set_admit_result,
-                },
-                effect: DeltaCompletion::Candidates(CandidatePayload::Values(vec![
-                    value(1),
-                    value(2),
-                    value(1),
-                ])),
-            },
-            &plan,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert!(released.continuation.is_some());
-        assert!(released.active.is_none());
-        let StateBucket::Candidates(batch) =
-            stable.values().flat_map(BTreeMap::values).next().unwrap()
-        else {
-            panic!("internal Confirm returned a non-candidate payload")
-        };
-        assert_eq!(
-            batch.candidates.iter().collect::<Vec<_>>(),
-            vec![(0, value(1)), (0, value(2)), (0, value(1))]
-        );
-    }
-
-    #[test]
-    fn formula_set_admission_owns_current_until_eof_then_reinstalls_the_exact_set() {
-        let root = IntersectionConstraint::new(vec![MixedExpansion; 3]);
-        let plan = ResidualPlan::compile_lowering(
-            &root,
-            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
-        );
-        let program = &plan.finite_formula;
-        let formula_root = program.root(0).expect("synthetic formula has a root");
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-
-        let mut scheduler = DeltaScheduler::new();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats {
-            candidates_proposed: 3,
-            ..ResidualStateStats::default()
-        };
-        let start = stable_interner.start_formula(program, 0, 0, UnionVerb::Propose { relevant });
-        let action = start.with_pc(
-            stable_interner
-                .formula_pcs
-                .select_child_as_action(program, start.pc, 0),
-        );
-        let completed = action.with_pc(stable_interner.formula_pcs.complete(program, action.pc));
-        let Ok(InternedFormulaSuccessor::Formula(next)) = stable_interner
-            .formula_pcs
-            .resume_completed(program, completed)
-        else {
-            panic!("the root proposer did not return to its AND suffix")
-        };
-        let successor = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula { cursor: next },
-        };
-
-        let mut input = CandidatePayload::Values(vec![value(1), value(2), value(1)]);
-        input.defer_for_shared_activation(1);
-        let mut batch = FormulaBatch::from_proposal(
-            RowBatch::seed(),
-            vec![super::super::ActivationId(11)],
-            &program.node(formula_root).kind,
-        );
-        batch.apply_action_result(FormulaStage::Propose, input);
-        assert!(matches!(
-            batch.cells.as_slice(),
-            [FormulaLiveCell::Current(CandidatePayload::Deferred(_))]
-        ));
-
-        let seeded = scheduler.seed_formula_reducers(
-            vec![FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
-                successor,
-                destination: SetAdmissionDestination::Formula(batch),
-            })],
-            &plan,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        let mut active = seeded
-            .active
-            .expect("nonempty Formula SET admission opened one Program");
-        assert!(
-            stable.is_empty(),
-            "Formula re-entered stable before SET EOF"
-        );
-        let activation = scheduler
-            .registry
-            .state
-            .activations
-            .get(&active.activation)
-            .expect("Formula SET-admission activation remains live");
-        assert!(matches!(
-            &activation.reducer,
-            DeltaReducer::SetAdmit {
-                output: CandidatePayload::Deferred(_)
-            }
-        ));
-        let DeltaReturn::SetAdmission { destination, .. } = &activation.return_to else {
-            panic!("SET admission lost its Formula destination")
-        };
-        let SetAdmissionDestination::Formula(destination) = destination else {
-            panic!("Formula SET admission retained a Candidate destination")
-        };
-        assert!(
-            !destination.has_current(),
-            "the saved Formula return retained a dummy Current during admission"
-        );
-        assert!(
-            destination.cells.is_empty(),
-            "AND-only Formula ancestry left non-live payload during admission"
-        );
-
-        for _ in 0..16 {
-            let step = scheduler.step_active(
-                &root,
-                &plan,
-                active,
-                1,
-                &mut stable,
-                &mut stable_interner,
-                &mut stats,
-            );
-            if let Some(resume) = step.resume {
-                active = resume;
-                continue;
-            }
-            assert_eq!(step.status, ActiveDeltaStatus::Yielded);
-            break;
-        }
-        assert!(
-            !stable.is_empty(),
-            "Formula SET admission did not reach EOF"
-        );
-        let StateBucket::Formula(batch) =
-            stable.values().flat_map(BTreeMap::values).next().unwrap()
-        else {
-            panic!("SET admission returned a non-Formula payload")
-        };
-        assert!(matches!(
-            batch.cells.as_slice(),
-            [FormulaLiveCell::Current(CandidatePayload::Deferred(_))]
-        ));
-        assert_eq!(
-            batch.input().iter().collect::<Vec<_>>(),
-            vec![(0, value(2)), (0, value(1))],
-            "bounded SET admission changed tail-stable affine semantics"
-        );
-        assert_eq!(
-            stats.candidates_proposed, 3,
-            "SET admission rewrote raw Formula action telemetry"
-        );
-    }
-
-    #[test]
-    fn deferred_cyclic_confirm_refiles_an_already_admitted_relation_without_rescanning() {
-        let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let (previous, successor) = confirm_boundary_descs(&plan);
-        let set_admit_result = crosses_candidate_set_boundary(
-            &previous,
-            &successor,
-            &plan,
-            &FormulaPcInterner::default(),
-        );
-        assert!(!set_admit_result);
-        let mut result = CandidatePayload::Values(vec![value(1), value(2)]);
-        result.defer_for_shared_activation(1);
-        assert!(matches!(result, CandidatePayload::Deferred(_)));
-
-        let mut scheduler = DeltaScheduler::new();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats {
-            candidates_confirmed: 2,
-            ..ResidualStateStats::default()
-        };
-        let released = scheduler.release_completion(
-            CompletedActivation {
-                activation: ActivationId(1),
-                return_to: DeltaReturn::Stable {
-                    desc: successor,
-                    parent: Vec::new().into_boxed_slice(),
-                    set_admit_result,
-                },
-                effect: DeltaCompletion::Candidates(result),
-            },
-            &plan,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert!(released.continuation.is_some());
-        assert!(released.active.is_none());
-        let StateBucket::Candidates(batch) =
-            stable.values().flat_map(BTreeMap::values).next().unwrap()
-        else {
-            panic!("cyclic Confirm returned a non-candidate payload")
-        };
-        assert!(matches!(batch.candidates, CandidatePayload::Deferred(_)));
-        assert_eq!(
-            batch.candidates.iter().collect::<Vec<_>>(),
-            vec![(0, value(1)), (0, value(2))]
-        );
-        assert_eq!(stats.candidates_confirmed, 2);
-        assert!(scheduler.is_empty());
-    }
-
-    #[test]
-    fn bounded_set_admission_structurally_splits_multi_parent_deferred_payload() {
-        let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let (_, mut successor) = confirm_boundary_descs(&plan);
-        successor.bound = VariableSet::new_singleton(1);
-        let mut candidates = CandidatePayload::Tagged(vec![
-            (0, value(1)),
-            (0, value(2)),
-            (0, value(1)),
-            (1, value(1)),
-            (1, value(1)),
-        ]);
-        candidates.defer_for_shared_activation(2);
-        let mut scheduler = DeltaScheduler::new();
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats {
-            candidates_confirmed: 5,
-            ..ResidualStateStats::default()
-        };
-        let seeded = scheduler.seed_formula_reducers(
-            vec![FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
-                successor,
-                destination: SetAdmissionDestination::Candidate(CandidateBatch {
-                    parents: RowBatch {
-                        rows: vec![value(10), value(11)],
-                        row_count: 2,
-                    },
-                    candidates,
-                }),
-            })],
-            &plan,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        let active = seeded
-            .active
-            .expect("SET admission opened a Program cohort");
-        let tasks = &scheduler.program_worklist[&active.state].tasks;
-        assert_eq!(tasks.len(), 2);
-        assert_ne!(tasks[0].activation, tasks[1].activation);
-        for task in tasks {
-            let activation = &scheduler.registry.state.activations[&task.activation];
-            let DeltaReturn::SetAdmission { destination, .. } = &activation.return_to else {
-                panic!("SET admission lost its saved destination")
-            };
-            assert_eq!(destination.parent_count(), 1);
-        }
-
-        for _ in 0..32 {
-            if scheduler.is_empty() {
-                break;
-            }
-            let _ = scheduler.step(
-                &root,
-                &plan,
-                1,
-                &mut stable,
-                &mut stable_interner,
-                &mut stats,
-            );
-        }
-        assert!(
-            scheduler.is_empty(),
-            "unit grants did not drain SET admission"
-        );
-        let StateBucket::Candidates(batch) = stable
-            .values()
-            .flat_map(BTreeMap::values)
-            .next()
-            .expect("admitted parents rejoined their saved successor")
-        else {
-            panic!("SET admission returned a non-candidate payload")
-        };
-        assert_eq!(batch.parents.row_count, 2);
-        let mut by_parent: BTreeMap<RawInline, Vec<RawInline>> = BTreeMap::new();
-        for (parent, candidate) in batch.candidates.iter() {
-            by_parent
-                .entry(batch.parents.rows[parent as usize])
-                .or_default()
-                .push(candidate);
-        }
-        assert_eq!(by_parent[&value(10)], vec![value(2), value(1)]);
-        assert_eq!(by_parent[&value(11)], vec![value(1)]);
-        assert_eq!(stats.candidates_confirmed, 5);
-    }
-
-    #[test]
-    fn confirm_reducer_joins_multiple_roots_before_filtering_the_sequence() {
-        let seed = value(1);
-        let first = value(2);
-        let second = value(3);
-        let rejected = value(4);
-        let mut registry = ProducerRegistry::new();
-        let started = registry.start_many(
-            DeltaReducer::Confirm {
-                original: shared_one_parent_candidates(vec![second, seed, first, rejected, second]),
-            },
-            stable_return(vec![value(9)]),
-            [output(1, 0, false), output(5, 0, false)],
-        );
-        assert!(started.quiescence.is_none());
-        let activation = started.activation;
-        let roots = started.roots;
-        assert_eq!(roots.len(), 2);
-
-        let mut children = Vec::new();
-        for ((_, root), successor) in roots
-            .into_iter()
-            .zip([output(2, 1, true), output(3, 1, true)])
-        {
-            assert_eq!(root.key.activation, activation);
-            let outcome = registry.replace_traversal(root, [successor]);
-            assert!(outcome.quiescence.is_none());
-            children.extend(outcome.children);
-        }
-        let mut proof = None;
-        for (_, child) in children {
-            let outcome = registry.replace_traversal(child, []);
-            assert!(outcome.accepted.is_empty());
-            if let Some(quiescence) = outcome.quiescence {
-                assert!(proof.replace(quiescence).is_none());
-            }
-        }
-
-        let proof = proof.expect("last producer must prove quiescence");
-        assert_eq!(proof.activation, activation);
-        let completed = registry.finish(proof);
-        let DeltaReturn::Stable { parent, .. } = completed.return_to else {
-            panic!("confirm returned to a formula continuation")
-        };
-        assert_eq!(parent.as_ref(), &[value(9)]);
-        assert_eq!(
-            completed.effect,
-            DeltaCompletion::Candidates(CandidatePayload::Values(vec![second, first, second]))
-        );
-    }
-
-    #[test]
-    fn source_cursor_resumes_only_after_every_page_root_retires() {
-        let mut registry = ProducerRegistry::new();
-        let (activation, generator) = registry.start_source(
-            DeltaReducer::StreamProposal,
-            stable_return(Vec::new()),
-            None,
-        );
-        let next = ResidualDeltaSourceCursor::After(value(9));
-        let page = registry.replace_source(
-            generator,
-            [
-                sourced_output(1, 1, 0, false),
-                sourced_output(2, 2, 0, false),
-            ],
-            [],
-            Some(next),
-        );
-        assert_eq!(page.roots.len(), 2);
-        assert!(page.resumed_source.is_none());
-        assert!(page.retired_source_page.is_none());
-        assert!(page.quiescence.is_none());
-
-        let mut roots = page.roots.into_iter();
-        let (_, first) = roots.next().expect("first page root");
-        let (_, second) = roots.next().expect("second page root");
-        let first = registry.replace_traversal(first, []);
-        assert!(first.resumed_source.is_none());
-        assert!(first.retired_source_page.is_none());
-        assert!(first.quiescence.is_none());
-
-        let second = registry.replace_traversal(second, []);
-        let (resumed, credit) = second
-            .resumed_source
-            .expect("the last root rejoins into one generator");
-        assert_eq!(resumed, next);
-        assert_eq!(credit.key.activation, activation);
-        assert!(second.retired_source_page.is_some());
-        assert!(second.quiescence.is_none());
-        let state = registry
-            .state
-            .activations
-            .get(&activation)
-            .expect("live source activation");
-        assert!(state.suspended_source_page.is_none());
-        assert_eq!(state.live.len(), 1);
-        assert_eq!(
-            state.live.get(&credit.key.nonce),
-            Some(&CreditKind::Generator)
-        );
-    }
-
-    #[test]
-    fn direct_source_effect_resumes_without_a_fake_traversal_credit() {
-        let mut registry = ProducerRegistry::new();
-        let (activation, generator) = registry.start_source(
-            DeltaReducer::StreamProposal,
-            stable_return(Vec::new()),
-            None,
-        );
-        let next = ResidualDeltaSourceCursor::After(value(9));
-        let first = registry.replace_source(generator, [], [value(1), value(1)], Some(next));
-        assert!(first.roots.is_empty());
-        assert_eq!(first.raw_proposal_occurrences, 2);
-        assert_eq!(first.accepted, [value(1)]);
-        assert_eq!(
-            first
-                .retired_source_page
-                .expect("the rootless page retires immediately")
-                .had_stable_effect,
-            true
-        );
-        let (cursor, generator) = first
-            .resumed_source
-            .expect("the next direct page resumes immediately");
-        assert_eq!(cursor, next);
-        assert!(first.quiescence.is_none());
-        assert_eq!(
-            registry
-                .take_streaming_return(activation)
-                .expect("the direct candidate has a streaming return")
-                .effect,
-            DeltaStreamingEffect::Candidates
-        );
-
-        let last = registry.replace_source(generator, [], [value(1), value(2), value(2)], None);
-        assert!(last.roots.is_empty());
-        assert_eq!(last.raw_proposal_occurrences, 3);
-        assert_eq!(last.accepted, [value(2)]);
-        assert!(last.resumed_source.is_none());
-        assert!(
-            last.retired_source_page
-                .expect("the terminal direct page retires immediately")
-                .had_stable_effect
-        );
-        assert_eq!(
-            registry
-                .take_streaming_return(activation)
-                .expect("the terminal candidate has a streaming return")
-                .effect,
-            DeltaStreamingEffect::Candidates
-        );
-        assert_eq!(
-            registry
-                .finish(last.quiescence.expect("the last page quiesces"))
-                .effect,
-            DeltaCompletion::Cleanup
-        );
-    }
-
-    #[test]
-    fn streaming_source_set_admission_unifies_direct_and_accepting_roots_per_activation() {
-        let mut registry = ProducerRegistry::new();
-        let (activation, generator) = registry.start_source(
-            DeltaReducer::StreamProposal,
-            stable_return(Vec::new()),
-            None,
-        );
-        let page = registry.replace_source(
-            generator,
-            [sourced_output(7, 7, 0, true)],
-            [value(7), value(7), value(8)],
-            None,
-        );
-        assert_eq!(page.raw_proposal_occurrences, 4);
-        assert_eq!(page.accepted, [value(7), value(8)]);
-        let (_, root) = page.roots.into_iter().next().expect("one accepting root");
-        let retired = registry.replace_traversal(root, []);
-        assert!(retired.accepted.is_empty());
-        assert_eq!(retired.quiescence.unwrap().activation, activation);
-
-        let (sibling, sibling_generator) = registry.start_source(
-            DeltaReducer::StreamProposal,
-            stable_return(Vec::new()),
-            None,
-        );
-        let sibling_page = registry.replace_source(sibling_generator, [], [value(7)], None);
-        assert_eq!(sibling_page.raw_proposal_occurrences, 1);
-        assert_eq!(sibling_page.accepted, [value(7)]);
-        assert_eq!(sibling_page.quiescence.unwrap().activation, sibling);
-    }
-
-    #[test]
-    fn grouped_confirm_waits_for_all_source_pages_before_reducing() {
-        let first = value(1);
-        let second = value(2);
-        let rejected = value(3);
-        let mut registry = ProducerRegistry::new();
-        let (activation, generator) = registry.start_source(
-            DeltaReducer::Confirm {
-                original: shared_one_parent_candidates(vec![second, first, rejected, first]),
-            },
-            stable_return(Vec::new()),
-            Some(vec![first, second, rejected].into_boxed_slice()),
-        );
-        let first_page = registry.replace_source(
-            generator,
-            [sourced_output(1, 1, 0, true)],
-            [],
-            Some(ResidualDeltaSourceCursor::After(first)),
-        );
-        assert_eq!(first_page.accepted, vec![first]);
-        let (_, first_root) = first_page.roots.into_iter().next().expect("first root");
-        let first_retired = registry.replace_traversal(first_root, []);
-        assert!(first_retired.quiescence.is_none());
-        assert!(
-            !first_retired
-                .retired_source_page
-                .expect("first page retired")
-                .had_stable_effect,
-            "grouped membership is not stable before the reducer quiesces"
-        );
-        let (_, generator) = first_retired
-            .resumed_source
-            .expect("second page cursor resumed");
-
-        let second_page =
-            registry.replace_source(generator, [sourced_output(2, 2, 0, true)], [], None);
-        assert!(second_page.quiescence.is_none());
-        let (_, second_root) = second_page.roots.into_iter().next().expect("second root");
-        let second_retired = registry.replace_traversal(second_root, []);
-        let proof = second_retired
-            .quiescence
-            .expect("the terminal page proves reducer quiescence");
-        assert_eq!(proof.activation, activation);
-        assert_eq!(
-            registry.finish(proof).effect,
-            DeltaCompletion::Candidates(CandidatePayload::Values(vec![second, first, first]))
-        );
-    }
-
-    #[test]
-    fn different_activation_cursors_share_one_canonical_source_bucket() {
-        let mut scheduler = DeltaScheduler::new();
-        let desc = DeltaDesc::leaf(0, 0);
-        let (first_activation, first_credit) = scheduler.registry.start_source(
-            DeltaReducer::StreamProposal,
-            stable_return(Vec::new()),
-            None,
-        );
-        let (second_activation, second_credit) = scheduler.registry.start_source(
-            DeltaReducer::StreamProposal,
-            stable_return(Vec::new()),
-            None,
-        );
-        let _ = scheduler.file_source(
-            desc.clone(),
-            vec![SourceTask {
-                activation: first_activation,
-                credit: first_credit,
-                cursor: ResidualDeltaSourceCursor::Start,
-            }],
-        );
-        let _ = scheduler.file_source(
-            desc,
-            vec![SourceTask {
-                activation: second_activation,
-                credit: second_credit,
-                cursor: ResidualDeltaSourceCursor::After(value(7)),
-            }],
-        );
-
-        assert_eq!(scheduler.interner.entries.len(), 1);
-        assert_eq!(scheduler.source_worklist.len(), 1);
-        let tasks = &scheduler
-            .source_worklist
-            .first_key_value()
-            .expect("one canonical source bucket")
-            .1
-            .tasks;
-        assert_eq!(tasks.len(), 2);
-        assert_ne!(tasks[0].activation, tasks[1].activation);
-        assert_eq!(tasks[0].cursor, ResidualDeltaSourceCursor::Start);
-        assert_eq!(tasks[1].cursor, ResidualDeltaSourceCursor::After(value(7)));
-    }
-
-    #[test]
-    fn source_cohort_preserves_multiple_zero_column_affine_rows() {
-        let trace = Arc::new(Mutex::new(None));
-        let root = ZeroColumnSource {
-            trace: Arc::clone(&trace),
-        };
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
-        let mut scheduler = DeltaScheduler::new();
-        scheduler.seed_source_proposals(
-            DeltaDesc::leaf(0, 0),
-            StateDesc {
-                bound: VariableSet::new_empty(),
-                phase: ResidualPhase::Ready,
-            },
-            RowBatch {
-                rows: Vec::new(),
-                row_count: 2,
-            },
-        );
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-
-        let outcome = scheduler.step(
-            &root,
-            &plan,
-            2,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-
-        assert_eq!(
-            *trace.lock().expect("zero-column trace poisoned"),
-            Some(ZeroColumnBatchTrace {
-                row_count: 2,
-                vars: Vec::new(),
-                candidate_modes: vec![false, false],
-                cursors: vec![
-                    ResidualDeltaSourceCursor::Start,
-                    ResidualDeltaSourceCursor::Start,
-                ],
-                limits: vec![1, 1],
-            })
-        );
-        assert_eq!(outcome.dead_pages, 2);
-        assert!(outcome.continuation.is_none());
-        assert_eq!(stats.delta_source_cohorts, 1);
-        assert_eq!(stats.max_delta_source_cohort, 2);
-        assert_eq!(stats.delta_source_pages, 2);
-        assert_eq!(stats.delta_source_candidates_examined, 0);
-        assert!(scheduler.is_empty());
-        assert!(stable.is_empty());
-    }
-
-    #[test]
-    fn source_pop_cohorts_by_physical_shape_without_refining_delta_identity() {
-        fn return_with_bound(bound: VariableSet, parent: RawInline) -> DeltaReturn {
-            DeltaReturn::Stable {
-                desc: StateDesc {
-                    bound,
-                    phase: ResidualPhase::Ready,
-                },
-                parent: vec![parent].into_boxed_slice(),
-                set_admit_result: false,
-            }
-        }
-
-        let mut scheduler = DeltaScheduler::new();
-        let desc = DeltaDesc::leaf(0, 0);
-        let schema_a = VariableSet::new_singleton(0);
-        let schema_b = VariableSet::new_singleton(1);
-        let mut source_task = |bound: VariableSet,
-                               candidates: Option<Box<[RawInline]>>,
-                               cursor: ResidualDeltaSourceCursor,
-                               parent: RawInline| {
-            let reducer = if candidates.is_some() {
-                DeltaReducer::Confirm {
-                    original: shared_one_parent_candidates(Vec::new()),
-                }
-            } else {
-                DeltaReducer::StreamProposal
-            };
-            let (activation, credit) = scheduler.registry.start_source(
-                reducer,
-                return_with_bound(bound, parent),
-                candidates,
-            );
-            SourceTask {
-                activation,
-                credit,
-                cursor,
-            }
-        };
-
-        // All five activations retain one canonical DeltaDesc bucket. The two
-        // final tasks alone share schema, candidate mode, and cursor family.
-        let tasks = vec![
-            source_task(schema_b, None, ResidualDeltaSourceCursor::Start, value(1)),
-            source_task(
-                schema_a,
-                Some(vec![value(9)].into_boxed_slice()),
-                ResidualDeltaSourceCursor::Start,
-                value(2),
-            ),
-            source_task(
-                schema_a,
-                None,
-                ResidualDeltaSourceCursor::After(value(3)),
-                value(3),
-            ),
-            source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(4)),
-            source_task(schema_a, None, ResidualDeltaSourceCursor::Start, value(5)),
-        ];
-        let _ = scheduler.file_source(desc.clone(), tasks);
-        assert_eq!(scheduler.interner.entries, [DeltaStateEntry::Legacy(desc)]);
-        assert_eq!(scheduler.source_worklist.len(), 1);
-
-        let (_, compatible) = scheduler.pop_source(8);
-        assert_eq!(compatible.len(), 2);
-        assert!(compatible.iter().all(|task| {
-            SourceDispatchKey::of(&scheduler.registry, task)
-                == SourceDispatchKey {
-                    bound: schema_a,
-                    has_candidates: false,
-                    cursor_family: SourceCursorFamily::Start,
-                    physical_class: DeltaPhysicalClass::General,
-                }
-        }));
-
-        let (_, after) = scheduler.pop_source(8);
-        assert_eq!(after.len(), 1);
-        assert_eq!(
-            SourceDispatchKey::of(&scheduler.registry, &after[0]).cursor_family,
-            SourceCursorFamily::After
-        );
-        let (_, candidate) = scheduler.pop_source(8);
-        assert_eq!(candidate.len(), 1);
-        assert!(SourceDispatchKey::of(&scheduler.registry, &candidate[0]).has_candidates);
-        let (_, other_schema) = scheduler.pop_source(8);
-        assert_eq!(other_schema.len(), 1);
-        assert_eq!(
-            SourceDispatchKey::of(&scheduler.registry, &other_schema[0]).bound,
-            schema_b
-        );
-        assert!(scheduler.source_worklist.is_empty());
-        assert_eq!(scheduler.interner.entries.len(), 1);
-    }
-
-    #[test]
-    fn cloning_live_formula_activation_remaps_credit_and_preserves_return_payload() {
-        let cursor = test_formula_cursor(7);
-        let bound = VariableSet::new_singleton(0);
-        let batch = FormulaBatch::from_proposal(
-            RowBatch {
-                rows: vec![value(9)],
-                row_count: 1,
-            },
-            vec![super::super::ActivationId(11)],
-            &FiniteFormulaNodeKind::Or {
-                children: Box::new([]),
-            },
-        );
-        let mut original = ProducerRegistry::new();
-        let mut started = original.start_many(
-            DeltaReducer::quiescent_proposal(),
-            DeltaReturn::Formula {
-                bound,
-                cursor,
-                batch,
-            },
-            [output(7, 0, true)],
-        );
-        let (_, original_credit) = started.roots.pop().expect("one live root");
-        let key = original_credit.key;
-
-        let (mut cloned, mut remap) = original.deep_clone();
-        let cloned_credit = remap.remove(&key).expect("clone remapped live credit");
-        assert!(remap.is_empty());
-
-        let original_proof = original
-            .replace_traversal(original_credit, [])
-            .quiescence
-            .expect("original quiesced independently");
-        let cloned_proof = cloned
-            .replace_traversal(cloned_credit, [])
-            .quiescence
-            .expect("clone quiesced independently");
-        for completed in [
-            finish_registry_proposal(&mut original, original_proof),
-            finish_registry_proposal(&mut cloned, cloned_proof),
-        ] {
-            assert_eq!(
-                completed.effect,
-                DeltaCompletion::Candidates(CandidatePayload::Values(vec![value(7)]))
-            );
-            let DeltaReturn::Formula {
-                bound: returned_bound,
-                cursor: returned_cursor,
-                batch: returned_batch,
-            } = completed.return_to
-            else {
-                panic!("formula activation returned to a stable continuation")
-            };
-            assert_eq!(returned_bound, bound);
-            assert_eq!(returned_cursor, cursor);
-            assert_eq!(returned_batch.parents.rows, [value(9)]);
-            assert_eq!(returned_batch.parents.row_count, 1);
-        }
-    }
-
-    #[test]
-    fn cloning_suspended_formula_source_preserves_cursor_and_return_payload() {
-        fn complete(
-            registry: &mut ProducerRegistry,
-            traversal: ProducerCredit,
-        ) -> CompletedActivation {
-            let retired = registry.replace_traversal(traversal, []);
-            let (cursor, generator) = retired
-                .resumed_source
-                .expect("retiring the page root resumes its generator");
-            assert_eq!(cursor, ResidualDeltaSourceCursor::After(value(9)));
-            let terminal = registry.replace_source(generator, [], [], None);
-            assert!(terminal.roots.is_empty());
-            let proof = terminal
-                .quiescence
-                .expect("the zero-root terminal page resumes the formula return");
-            finish_registry_proposal(registry, proof)
-        }
-
-        let cursor = test_formula_cursor(7);
-        let bound = VariableSet::new_singleton(0);
-        let batch = FormulaBatch::from_proposal(
-            RowBatch {
-                rows: vec![value(9)],
-                row_count: 1,
-            },
-            vec![super::super::ActivationId(11)],
-            &FiniteFormulaNodeKind::Or {
-                children: Box::new([]),
-            },
-        );
-        let mut original = ProducerRegistry::new();
-        let (activation, generator) = original.start_source(
-            DeltaReducer::quiescent_proposal(),
-            DeltaReturn::Formula {
-                bound,
-                cursor,
-                batch,
-            },
-            None,
-        );
-        let page = original.replace_source(
-            generator,
-            [output(7, 0, true)],
-            [value(3), value(3)],
-            Some(ResidualDeltaSourceCursor::After(value(9))),
-        );
-        assert_eq!(page.roots.len(), 1);
-        assert!(page.resumed_source.is_none());
-        assert!(original
-            .state
-            .activations
-            .get(&activation)
-            .expect("live formula source activation")
-            .suspended_source_page
-            .is_some());
-        let (_, original_credit) = page.roots.into_iter().next().expect("one page root");
-        let key = original_credit.key;
-
-        let (mut cloned, mut remap) = original.deep_clone();
-        let cloned_credit = remap
-            .remove(&key)
-            .expect("clone remapped the suspended page root");
-        assert!(remap.is_empty());
-
-        for completed in [
-            complete(&mut original, original_credit),
-            complete(&mut cloned, cloned_credit),
-        ] {
-            assert_eq!(
-                completed.effect,
-                DeltaCompletion::Candidates(CandidatePayload::Values(vec![
-                    value(3),
-                    value(3),
-                    value(7),
-                ]))
-            );
-            let DeltaReturn::Formula {
-                bound: returned_bound,
-                cursor: returned_cursor,
-                batch: returned_batch,
-            } = completed.return_to
-            else {
-                panic!("formula source returned to a stable continuation")
-            };
-            assert_eq!(returned_bound, bound);
-            assert_eq!(returned_cursor, cursor);
-            assert_eq!(returned_batch.parents.rows, [value(9)]);
-            assert_eq!(returned_batch.parents.row_count, 1);
-        }
-    }
-
-    #[test]
-    fn distinct_formula_return_masks_share_one_structural_delta_bucket() {
-        let relevant = ChildSet::empty(1).with_inserted(0);
-        let exit = CandidateExit {
-            variable: 0,
-            relevant: relevant.clone(),
-            checked: relevant,
-        };
-        let mut formula_pcs = FormulaPcInterner::default();
-        let exit = formula_pcs.intern_candidate_exit(exit);
-        let focus = FormulaFocus::Action {
-            node: FormulaNodeId(7),
-            stage: FormulaStage::Propose,
-        };
-        let first = formula_pcs.intern_record(
-            FormulaPcRecord {
-                focus: focus.clone(),
-                return_to: None,
-            },
-            1,
-        );
-        let parent = formula_pcs.intern_record(
-            FormulaPcRecord {
-                focus: FormulaFocus::Plan {
-                    node: FormulaNodeId(5),
-                    stage: FormulaStage::Propose,
-                    done: ChildSet::empty(2).with_inserted(0),
-                },
-                return_to: None,
-            },
-            1,
-        );
-        let return_to = formula_pcs.intern_return(FormulaReturnRecord {
-            kind: FormulaReturnKind::Child,
-            parent,
-            child: 1,
-            destination: Some(FormulaResultDestination::ParentAnd),
-        });
-        let second = formula_pcs.intern_record(
-            FormulaPcRecord {
-                focus,
-                return_to: Some(return_to),
-            },
-            3,
-        );
-        assert_ne!(first, second);
-
-        let mut scheduler = DeltaScheduler::new();
-        let desc = DeltaDesc::formula(0, 3, FormulaNodeId(7));
-        let first = FormulaCursor { pc: first, exit };
-        let second = FormulaCursor { pc: second, exit };
-        for (index, cursor) in [first, second].into_iter().enumerate() {
-            let batch = FormulaBatch::from_proposal(
-                RowBatch {
-                    rows: vec![value(index as u8)],
-                    row_count: 1,
-                },
-                vec![super::super::ActivationId(index as u64)],
-                &FiniteFormulaNodeKind::Or {
-                    children: Box::new([]),
-                },
-            );
-            let started = scheduler.registry.start_many(
-                DeltaReducer::quiescent_proposal(),
-                DeltaReturn::Formula {
-                    bound: VariableSet::new_singleton(0),
-                    cursor,
-                    batch,
-                },
-                [output(index as u8, 0, false)],
-            );
-            let tasks = started
-                .roots
-                .into_iter()
-                .map(|(node, credit)| DeltaTask {
-                    activation: started.activation,
-                    credit,
-                    node,
-                    cursor: ResidualDeltaExpandCursor::Start,
-                })
-                .collect();
-            let _ = scheduler.file(desc.clone(), tasks);
-        }
-
-        assert_eq!(
-            scheduler.interner.entries,
-            vec![DeltaStateEntry::Legacy(desc)]
-        );
-        assert_eq!(scheduler.worklist.len(), 1);
-        let bucket = scheduler.worklist.values().next().unwrap();
-        assert_eq!(bucket.len(), 2);
-        let cursors: Vec<_> = bucket
-            .iter()
-            .map(|task| {
-                let activation = scheduler
-                    .registry
-                    .state
-                    .activations
-                    .get(&task.activation)
-                    .unwrap();
-                let DeltaReturn::Formula { cursor, .. } = &activation.return_to else {
-                    panic!("formula task lost its formula continuation")
-                };
-                *cursor
-            })
-            .collect();
-        assert_eq!(cursors, [first, second]);
     }
 }

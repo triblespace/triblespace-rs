@@ -16,7 +16,7 @@ use triblespace::core::query::equalityconstraint::EqualityConstraint;
 use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
 use triblespace::core::query::{
     Binding, Constraint, ConstraintShape, ProgramAction, ProgramExposure, ProgramRequest, Query,
-    RowsView, TypedProgramSpec, Variable, VariableId, VariableSet,
+    TypedProgramSpec, Variable, VariableSet,
 };
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -136,21 +136,15 @@ where
 struct CapabilityReceipt {
     opaque_shape: bool,
     finite_union_arms: Option<usize>,
-    direct_proposal_source: bool,
     typed_program: bool,
 }
 
-fn capability_receipt<'a, C: Constraint<'a>>(
-    constraint: &C,
-    variable: VariableId,
-) -> CapabilityReceipt {
+fn capability_receipt<'a, C: Constraint<'a>>(constraint: &C) -> CapabilityReceipt {
     CapabilityReceipt {
         opaque_shape: matches!(constraint.residual_shape(), ConstraintShape::Opaque),
         finite_union_arms: constraint
             .residual_union_children()
             .map(|children| children.len()),
-        direct_proposal_source: constraint
-            .residual_proposal_source_is_paged(variable, &RowsView::EMPTY),
         typed_program: constraint.residual_program().is_some(),
     }
 }
@@ -184,61 +178,55 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
     let map = HashMap::from([(a, 1_u8), (b, 2_u8)]);
 
     assert_eq!(
-        capability_receipt(&x.is(a), x.index),
+        capability_receipt(&x.is(a)),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            direct_proposal_source: false,
             typed_program: true,
         },
         "ConstantConstraint"
     );
     assert_eq!(
-        capability_receipt(&EqualityConstraint::new(x.index, y.index), x.index),
+        capability_receipt(&EqualityConstraint::new(x.index, y.index)),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            direct_proposal_source: false,
             typed_program: true,
         },
         "EqualityConstraint"
     );
     assert_eq!(
-        capability_receipt(&value_range(x, a, c), x.index),
+        capability_receipt(&value_range(x, a, c)),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            direct_proposal_source: false,
             typed_program: true,
         },
         "InlineRange"
     );
     assert_eq!(
-        capability_receipt(&sorted.has(x), x.index),
+        capability_receipt(&sorted.has(x)),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            direct_proposal_source: true,
             typed_program: true,
         },
         "SortedSliceConstraint"
     );
     assert_eq!(
-        capability_receipt(&(&set).has(x), x.index),
+        capability_receipt(&(&set).has(x)),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            direct_proposal_source: false,
             typed_program: true,
         },
         "HashSet SetConstraint"
     );
     assert_eq!(
-        capability_receipt(&(&map).has(x), x.index),
+        capability_receipt(&(&map).has(x)),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            direct_proposal_source: false,
             typed_program: true,
         },
         "HashMap KeysConstraint"
@@ -246,11 +234,10 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
 
     let union = or!(x.is(a), x.is(b), x.is(a));
     assert_eq!(
-        capability_receipt(&union, x.index),
+        capability_receipt(&union),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: Some(3),
-            direct_proposal_source: false,
             typed_program: false,
         },
         "UnionConstraint exposes finite formula arms but keeps group-global confirm"
@@ -258,22 +245,20 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
 
     let debug = DebugConstraint::new(sorted.has(x), Rc::new(RefCell::new(Vec::new())));
     assert_eq!(
-        capability_receipt(&debug, x.index),
+        capability_receipt(&debug),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            direct_proposal_source: false,
             typed_program: false,
         },
         "DebugConstraint honestly stays on the instrumented opaque protocol"
     );
     let estimate = EstimateOverrideConstraint::new(sorted.has(x));
     assert_eq!(
-        capability_receipt(&estimate, x.index),
+        capability_receipt(&estimate),
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            direct_proposal_source: true,
             typed_program: true,
         },
         "EstimateOverrideConstraint keeps shape opaque but forwards exact execution capabilities"
