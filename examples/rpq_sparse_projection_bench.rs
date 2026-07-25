@@ -10,7 +10,7 @@
 //! paging profile that explains either result.
 //!
 //! ```text
-//! cargo run --release --example rpq_bounded_completion_bench -- 31
+//! cargo run --release --example rpq_sparse_projection_bench -- 31
 //! ```
 //!
 //! Set `ENGINE_REVISION` while compiling to put the exact revision in the
