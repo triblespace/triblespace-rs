@@ -58,18 +58,13 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 
-pub(crate) use program::ProgramCompleteAffinity;
-#[cfg(test)]
-pub use program::ProgramCompleteEffects;
 #[doc(hidden)]
 pub use program::{
     DispatchClass, ProgramAction, ProgramActivation, ProgramBatch, ProgramBatchEffects,
-    ProgramChild, ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote,
-    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage, ProgramRef,
+    ProgramChild, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage, ProgramRef,
     ProgramRequest, ProgramResume, ProgramRoute, ProgramRuntime, ProgramSeedBatch,
     ProgramSeedEffects, ProgramSeedWork, ProgramStratum, ProgramWork, ProgramWorkHandle,
-    TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink,
+    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
 };
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -1243,8 +1238,8 @@ pub trait ConstraintChildren<'a> {
 /// # Fixed relational semantics
 ///
 /// Every constraint occurrence denotes one fixed raw-inline SET relation over
-/// [`variables`](Constraint::variables). Its ordinary, paged, typed-Program,
-/// and complete-equivalent routes MUST agree on that relation.
+/// [`variables`](Constraint::variables). Its ordinary and typed-Program routes
+/// MUST agree on that relation.
 /// Across positive snapshots, data growth is monotone: if `D` is a subset of
 /// `D'`, then the relation at `D` is a subset of the relation at `D'`.
 /// Fixed-per-solve denotation alone is not enough to establish this substrate
@@ -1372,7 +1367,7 @@ pub trait Constraint<'a> {
     /// they neither strengthen proposal coverage nor enter canonical state,
     /// route, or action identity. The flattened residual Ready planner uses
     /// directed pricing only when every relevant occurrence opts in;
-    /// otherwise the complete action falls back atomically to plain
+    /// otherwise source selection falls back atomically to plain
     /// cardinality-estimate ordering. Directed prices select a source only
     /// within one variable; cross-variable ordering continues to compare raw
     /// source counts. The count promise above means an opted-in source cannot

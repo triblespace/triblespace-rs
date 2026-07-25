@@ -11,10 +11,10 @@ use triblespace_core::query::residual::{ResidualShadowEpoch, ResidualShadowStatu
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RowsView,
-    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable,
-    VariableId, VariableSet,
+    ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute,
+    ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RowsView, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
+    VariableSet,
 };
 
 const START: VariableId = 0;
@@ -269,7 +269,6 @@ impl TypedProgramSpec for AlternatingClosure {
             variable: END,
             stratum: ProgramStratum::Fixpoint,
             grouping,
-            completion: ProgramCompletion::PageableOnly,
         })
     }
 

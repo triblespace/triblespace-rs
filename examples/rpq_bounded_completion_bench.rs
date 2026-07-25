@@ -1,27 +1,20 @@
-//! Measures the bounded whole-action RPQ completion phase against its sparse
-//! traversal ablation.
+//! Measures the recurrent RPQ Machine path under a demand-wide parent cohort.
 //!
 //! The fixture is the production regression shape reduced to one 16-node
 //! component: eight distinct hidden parents carry the same bound path source
 //! through `(p | q)+`. Projecting only `(source, target)` must collapse those
 //! witnesses to the 16 reachable endpoints. The workload is deliberately
 //! small enough to preserve TTFR sensitivity while still forcing a
-//! demand-wide admission (`max_admission_parents > 1`).
-//!
-//! The completion switch is intentionally not public engine policy. The first
-//! argument states which checkout is being measured and validates its profile:
+//! demand-wide admission (`max_admission_parents > 1`). It reports both
+//! first-result latency and full-drain latency, plus the sparse activation and
+//! paging profile that explains either result.
 //!
 //! ```text
-//! # production implementation
-//! cargo run --release --example rpq_bounded_completion_bench -- present 31
-//!
-//! # checkout with terminal bounded completion removed
-//! cargo run --release --example rpq_bounded_completion_bench -- absent 31
+//! cargo run --release --example rpq_bounded_completion_bench -- 31
 //! ```
 //!
-//! `RPQ_COMPLETION_EXPECT=present|absent` provides the same selection when the
-//! first argument is omitted. Set `ENGINE_REVISION` while compiling to put the
-//! exact revision in the emitted TSV.
+//! Set `ENGINE_REVISION` while compiling to put the exact revision in the
+//! emitted TSV.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -32,7 +25,7 @@ use triblespace::core::id::{ExclusiveId, Id, ID_LEN};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::{Inline, IntoInline, RawInline};
 use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace::core::query::residual::{ResidualStateIter, ResidualStateStats};
+use triblespace::core::query::residual::ResidualStateIter;
 use triblespace::core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProposalCoverage, Query,
     RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
@@ -287,57 +280,14 @@ fn benchmark_drain(fixture: &Fixture, expected_rows: usize, reps: usize) -> f64 
     median(&samples)
 }
 
-#[derive(Clone, Copy)]
-enum ExpectedCompletion {
-    Present,
-    Absent,
-}
-
-impl ExpectedCompletion {
-    fn parse() -> Self {
-        let value = std::env::args()
-            .nth(1)
-            .or_else(|| std::env::var("RPQ_COMPLETION_EXPECT").ok())
-            .unwrap_or_else(|| "present".to_owned());
-        match value.as_str() {
-            "present" => Self::Present,
-            "absent" => Self::Absent,
-            _ => panic!(
-                "expected first argument/RPQ_COMPLETION_EXPECT to be `present` or `absent`, got {value:?}"
-            ),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Present => "present",
-            Self::Absent => "absent",
-        }
-    }
-
-    fn validate(self, stats: &ResidualStateStats) {
-        match self {
-            Self::Present => assert!(
-                stats.delta_terminal_eager_cohort_admissions > 0,
-                "checkout never entered bounded whole-action completion: {stats:#?}"
-            ),
-            Self::Absent => assert_eq!(
-                stats.delta_terminal_eager_cohort_admissions, 0,
-                "checkout still entered bounded whole-action completion"
-            ),
-        }
-    }
-}
-
 fn parse_reps() -> usize {
     std::env::args()
-        .nth(2)
+        .nth(1)
         .and_then(|value| value.parse().ok())
         .unwrap_or(31)
 }
 
 fn main() {
-    let expected_completion = ExpectedCompletion::parse();
     let reps = parse_reps();
     assert!(reps > 0 && reps % 2 == 1, "reps must be positive and odd");
 
@@ -357,34 +307,29 @@ fn main() {
         "fixture failed to admit multiple RPQ parents: {:#?}",
         profiled.stats
     );
-    expected_completion.validate(&profiled.stats);
-
     let ttfr_us = benchmark_ttfr(&fixture, reps);
     let drain_us = benchmark_drain(&fixture, oracle.rows, reps);
     let stats = &profiled.stats;
 
     println!(
-        "revision\texpect_completion\tring\thidden_parents\treps\trows\tdigest16\t\
+        "revision\tring\thidden_parents\treps\trows\tdigest16\t\
          ttfr_p50_us\tdrain_p50_us\twide_admissions\tmax_admission_parents\t\
-         complete_admissions\tcomplete_parents\tcomplete_rows\tterminal_calls\t\
-         terminal_tasks\tactivations_completed\tactive_lease_steps\ttransition_pages\t\
-         transition_candidates"
+         terminal_calls\tterminal_tasks\tactivations_completed\tactive_lease_steps\t\
+         source_pages\tsource_candidates\ttransition_pages\ttransition_candidates"
     );
     println!(
-        "{REVISION}\t{}\t{RING_SIZE}\t{HIDDEN_PARENTS}\t{reps}\t{}\t{}\t\
-         {ttfr_us:.3}\t{drain_us:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        expected_completion.label(),
+        "{REVISION}\t{RING_SIZE}\t{HIDDEN_PARENTS}\t{reps}\t{}\t{}\t\
+         {ttfr_us:.3}\t{drain_us:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         oracle.rows,
         digest_prefix(&oracle.digest),
         stats.delta_terminal_demand_wide_admissions,
         stats.max_delta_terminal_admission_parents,
-        stats.delta_terminal_eager_cohort_admissions,
-        stats.delta_terminal_eager_cohort_parents,
-        stats.delta_terminal_eager_cohort_rows,
         stats.delta_terminal_calls,
         stats.delta_terminal_tasks,
         stats.delta_activations_completed,
         stats.delta_active_lease_steps,
+        stats.delta_source_pages,
+        stats.delta_source_candidates_examined,
         stats.delta_transition_pages,
         stats.delta_transition_candidates_examined,
     );

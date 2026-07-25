@@ -16,10 +16,10 @@ use triblespace_core::query::rangeconstraint::InlineRange;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, DispatchClass, EstimateSink, PathOp,
-    ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RegularPathConstraint,
-    RowsView, TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedSeedSink,
-    Variable, VariableId, VariableSet,
+    ProgramAction, ProgramGrouping, ProgramKey, ProgramRef, ProgramRequest, ProgramRoute,
+    ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RegularPathConstraint, RowsView,
+    TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedSeedSink, Variable,
+    VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -941,7 +941,6 @@ impl TypedProgramSpec for CoveringProposalWithFiniteExactProgram {
             variable: X,
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
         })
     }
 

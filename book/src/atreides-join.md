@@ -20,9 +20,9 @@ whose five operational methods shape the search:
 5. **`satisfied`** – returns `false` when all variables are bound but the
    constraint is unsatisfied. Used by `UnionConstraint` to prune dead variants.
 
-Every constraint occurrence denotes one fixed raw-inline SET relation, and all
-of its ordinary, paged, typed-Program, and complete-equivalent routes must
-implement that same relation. `proposal_coverage` identifies sound proposal
+Every constraint occurrence denotes one fixed raw-inline SET relation, and its
+ordinary and typed-Program routes must implement that same relation.
+`proposal_coverage` identifies sound proposal
 sources independently of estimates: Covering proposals contain the complete
 existential fiber and are self-confirmed, while Exact proposals equal it.
 Confirmation-only occurrences may publish no source claim. A proposal's
