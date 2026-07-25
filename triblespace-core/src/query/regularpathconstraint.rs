@@ -26,7 +26,6 @@ use crate::query::ProgramRef;
 use crate::query::ProgramRequest;
 use crate::query::ProgramRoute;
 use crate::query::ProgramSeedBatch;
-use crate::query::ProgramStratum;
 use crate::query::ProposalCoverage;
 use crate::query::RowsView;
 use crate::query::TriblePattern;
@@ -2381,7 +2380,6 @@ impl TypedProgramSpec for RegularPathConstraint {
                         RPQ_BOUND_FORWARD
                     },
                     variable: self.end,
-                    stratum: ProgramStratum::Fixpoint,
                     // Support has no candidate relation to reuse.
                     grouping: ProgramGrouping::PageLocal,
                 }
@@ -2398,7 +2396,6 @@ impl TypedProgramSpec for RegularPathConstraint {
                     ProgramRoute {
                         key: RPQ_SAME_VARIABLE,
                         variable,
-                        stratum: ProgramStratum::Fixpoint,
                         grouping: if confirming {
                             ProgramGrouping::ParentAtomic
                         } else {
@@ -2417,7 +2414,6 @@ impl TypedProgramSpec for RegularPathConstraint {
                     ProgramRoute {
                         key,
                         variable,
-                        stratum: ProgramStratum::Fixpoint,
                         grouping: if confirming {
                             ProgramGrouping::ParentAtomic
                         } else {
@@ -2585,7 +2581,6 @@ impl TypedProgramSpec for RegularPathConstraint {
             let parent = u32::try_from(parent).expect("too many RPQ program parents");
             let state = RpqState::transition(batch.route.variable, node, RpqExpandCursor::Start);
             let accepted = accepted.then_some(value);
-            debug_assert_eq!(batch.route.stratum, ProgramStratum::Fixpoint);
             effects.fixpoint_root(
                 parent,
                 state,
@@ -2606,7 +2601,6 @@ impl TypedProgramSpec for RegularPathConstraint {
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         assert_eq!(states.len(), batch.view.len());
-        debug_assert_eq!(batch.stratum, ProgramStratum::Fixpoint);
         if states
             .first()
             .is_some_and(|state| matches!(state.kind(), RpqStateKind::Source { .. }))
@@ -2970,13 +2964,12 @@ mod delta_program_tests {
             &[PathOp::Attr([1; ID_LEN]), PathOp::Plus],
         );
         let program = repeated.residual_program().unwrap();
-        let bound_propose = program
+        assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(end.index),
                 bound: VariableSet::new_singleton(start.index),
             })
-            .unwrap();
-        assert_eq!(bound_propose.stratum, ProgramStratum::Fixpoint);
+            .is_some());
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(end.index),
@@ -3486,7 +3479,6 @@ mod seeded_frame_tests {
             })
             .unwrap();
         assert_eq!(start_route.grouping, ProgramGrouping::ParentAtomic);
-        assert_eq!(start_route.stratum, ProgramStratum::Fixpoint);
         let end_route = program
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(end.index),
@@ -3526,7 +3518,6 @@ mod seeded_frame_tests {
             })
             .unwrap();
         assert_eq!(same_route.grouping, ProgramGrouping::ParentAtomic);
-        assert_eq!(same_route.stratum, ProgramStratum::Fixpoint);
     }
 
     #[test]
@@ -3623,7 +3614,6 @@ mod seeded_frame_tests {
         program.step_batch(
             &mut runtime,
             ProgramBatch {
-                stratum: route.stratum,
                 view,
                 candidate_sets: &candidate_sets,
                 activations: &activations,
@@ -3882,15 +3872,14 @@ mod seeded_frame_tests {
         );
         assert!(repeated.progress(&transition_start) > repeated.progress(&transition_low));
         assert!(repeated.progress(&transition_low) > repeated.progress(&transition_high));
-        let repeated_route = repeated
+        assert!(repeated
             .residual_program()
             .unwrap()
             .route(ProgramRequest {
                 action: ProgramAction::Propose(variable.index),
                 bound: VariableSet::new_empty(),
             })
-            .unwrap();
-        assert_eq!(repeated_route.stratum, ProgramStratum::Fixpoint);
+            .is_some());
     }
 
     struct GraphFixture {

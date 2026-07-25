@@ -12,9 +12,8 @@ use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
     ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute,
-    ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RowsView, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
-    VariableSet,
+    ProgramSeedBatch, ProposalCoverage, Query, RowsView, TypedEffectSink, TypedProgramBatch,
+    TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
 };
 
 const START: VariableId = 0;
@@ -267,7 +266,6 @@ impl TypedProgramSpec for AlternatingClosure {
         Some(ProgramRoute {
             key,
             variable: END,
-            stratum: ProgramStratum::Fixpoint,
             grouping,
         })
     }

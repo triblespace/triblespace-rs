@@ -74,7 +74,9 @@ at `None`.
 
 Five laws are load-bearing for correctness:
 
-1. Ordinary and typed-Program routes must agree on the same relation.
+1. Returning a typed-Program route certifies a recurrent Machine for that
+   action; finite actions expose no route and remain ordinary constraints.
+   Ordinary and typed-Program routes must agree on the same relation.
    Activation-local novelty keys exposed by an accelerated route must be
    congruent for future outputs: equal keys cannot hide states with different
    relational futures.
@@ -257,7 +259,7 @@ truths therefore all exercise the same residual substrate. A seed-rejected
 query starts no worklist at all. Production lowering flattens exposed
 associative AND regions, lowers finite Union leaves and their recursive
 AND/OR descendants into continuations, and admits the typed Program route
-returned for each exact action.
+returned for each exact recurrent action.
 Finite storage relations, including SuccinctArchive and UnionArchive, remain
 on the ordinary constraint protocol; backend-specific rank kernels may still
 accelerate those ordinary actions. Repeated RPQ Propose, Confirm, and Support

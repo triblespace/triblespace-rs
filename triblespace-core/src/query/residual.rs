@@ -138,19 +138,17 @@ struct FormulaNodeCapabilities {
     parent_atomic_program_confirms: Box<[(VariableId, VariableSet)]>,
 }
 
-/// Selects the typed Machine route for a recurrent action.
+/// Selects the recurrent typed Machine route for one action.
 ///
-/// Finite actions stay on the ordinary unordered constraint protocol. Only a
-/// route whose continuation genuinely computes a least fixpoint needs the
-/// stateful Program machinery; structurally absent and finite routes are both
-/// indivisible ordinary actions.
+/// Returning a Program route is the family-owned recurrence certificate.
+/// Finite actions expose no route and stay on the ordinary unordered
+/// constraint protocol.
 fn select_program<'r, 'a>(
     constraint: &'r dyn Constraint<'a>,
     request: ProgramRequest,
 ) -> Option<(ProgramRef<'r>, ProgramRoute)> {
     let program = constraint.residual_program()?;
     let route = program.route(request)?;
-    (route.stratum == ProgramStratum::Fixpoint).then_some(())?;
     Some((program, route))
 }
 
@@ -12091,7 +12089,6 @@ mod tests {
                 .then_some(ProgramRoute {
                     key: ProgramKey::new(0),
                     variable: self.0.variable,
-                    stratum: ProgramStratum::Fixpoint,
                     grouping: ProgramGrouping::ParentAtomic,
                 })
         }
@@ -12221,73 +12218,13 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct PagedProposalLeaf {
+    struct OrdinaryProposalLeaf {
         variable: VariableId,
         values: Arc<Vec<RawInline>>,
         proposes: Arc<AtomicUsize>,
-        pages: Arc<AtomicUsize>,
     }
 
-    impl TypedProgramSpec for PagedProposalLeaf {
-        type State = usize;
-        type NoveltyKey = ();
-        type Rank = usize;
-
-        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            matches!(
-                request.action,
-                ProgramAction::Propose(variable)
-                    if variable == self.variable && !request.bound.is_set(variable)
-            )
-            .then_some(ProgramRoute {
-                key: ProgramKey::new(0),
-                variable: self.variable,
-                stratum: ProgramStratum::Finite,
-                grouping: ProgramGrouping::PageLocal,
-            })
-        }
-
-        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-            DispatchClass::new(0)
-        }
-
-        fn progress(&self, remaining: &Self::State) -> Self::Rank {
-            *remaining
-        }
-
-        fn seed_typed(
-            &self,
-            batch: ProgramSeedBatch<'_>,
-            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-        ) {
-            for parent in 0..batch.view.len() {
-                effects.finite_root(parent as u32, self.values.len(), None);
-            }
-        }
-
-        fn step_typed(
-            &self,
-            states: &mut Vec<Self::State>,
-            _batch: TypedProgramBatch<'_>,
-            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) {
-            for (input, remaining) in states.drain(..).enumerate() {
-                self.pages.fetch_add(1, Ordering::Relaxed);
-                let limit = _batch.limits[input];
-                let examined = remaining.min(limit);
-                let offset = self.values.len() - remaining;
-                let end = offset + examined;
-                for value in self.values[offset..end].iter().copied() {
-                    effects.accept(input as u32, value);
-                }
-                effects.account_source(examined, 0);
-                let next = remaining - examined;
-                effects.page(examined, (next > 0).then_some(TypedResume::Immediate(next)));
-            }
-        }
-    }
-
-    impl Constraint<'static> for PagedProposalLeaf {
+    impl Constraint<'static> for OrdinaryProposalLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
         }
@@ -12340,10 +12277,6 @@ mod tests {
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
             view.col(self.variable)
                 .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
-        }
-
-        fn residual_program(&self) -> Option<ProgramRef<'_>> {
-            Some(ProgramRef::new(self))
         }
     }
 
@@ -12428,9 +12361,9 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct DecliningProgramPagedProposalLeaf(PagedProposalLeaf);
+    struct DecliningProgramProposalLeaf(OrdinaryProposalLeaf);
 
-    impl Constraint<'static> for DecliningProgramPagedProposalLeaf {
+    impl Constraint<'static> for DecliningProgramProposalLeaf {
         fn variables(&self) -> VariableSet {
             self.0.variables()
         }
@@ -12523,69 +12456,23 @@ mod tests {
     }
 
     #[test]
-    fn finite_program_route_is_an_ordinary_indivisible_action() {
-        let proposes = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(AtomicUsize::new(0));
-        let leaf = PagedProposalLeaf {
-            variable: 0,
-            values: Arc::new((1..=8).map(raw).collect()),
-            proposes: Arc::clone(&proposes),
-            pages: Arc::clone(&pages),
-        };
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(leaf.variable),
-            bound: VariableSet::new_empty(),
-        };
-
-        assert!(
-            leaf.residual_program()
-                .and_then(|program| program.route(request))
-                .is_some_and(|route| route.stratum == ProgramStratum::Finite),
-            "the fixture must expose a structurally valid finite Program route"
-        );
-        assert!(
-            select_program(&leaf, request).is_none(),
-            "finite work is not a stateful Machine activation"
-        );
-
-        let mut actual =
-            Query::new(leaf, |binding: &Binding| binding.get(0).copied()).collect::<Vec<_>>();
-        actual.sort_unstable();
-        assert_eq!(actual, (1..=8).map(raw).collect::<Vec<_>>());
-        assert!(proposes.load(Ordering::Relaxed) > 0);
-        assert_eq!(
-            pages.load(Ordering::Relaxed),
-            0,
-            "the finite Program implementation must not be entered"
-        );
-    }
-
-    #[test]
     fn declined_program_route_uses_the_ordinary_proposal() {
         let proposes = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(AtomicUsize::new(0));
-        let leaf = DecliningProgramPagedProposalLeaf(PagedProposalLeaf {
+        let leaf = DecliningProgramProposalLeaf(OrdinaryProposalLeaf {
             variable: 0,
             values: Arc::new((1..=8).map(raw).collect()),
             proposes: Arc::clone(&proposes),
-            pages: Arc::clone(&pages),
         });
         let mut solve = Query::new(leaf, |binding: &Binding| binding.get(0).copied())
             .solve_residual_state_lazy();
 
         let first = solve.next().expect("ordinary proposal returned no values");
         assert!(proposes.load(Ordering::Relaxed) > 0);
-        assert_eq!(pages.load(Ordering::Relaxed), 0);
 
         let mut actual = vec![first];
         actual.extend(solve);
         actual.sort_unstable();
         assert_eq!(actual, (1..=8).map(raw).collect::<Vec<_>>());
-        assert_eq!(
-            pages.load(Ordering::Relaxed),
-            0,
-            "a declined Program route must not enter typed paging"
-        );
     }
 
     #[test]
@@ -12615,13 +12502,11 @@ mod tests {
     #[test]
     fn declined_program_route_uses_ordinary_formula_leaves() {
         let proposes = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(AtomicUsize::new(0));
         let leaf = |values| {
-            DecliningProgramPagedProposalLeaf(PagedProposalLeaf {
+            DecliningProgramProposalLeaf(OrdinaryProposalLeaf {
                 variable: 0,
                 values: Arc::new(values),
                 proposes: Arc::clone(&proposes),
-                pages: Arc::clone(&pages),
             })
         };
         let root = UnionConstraint::new(vec![
@@ -12635,7 +12520,6 @@ mod tests {
         profiled.results.sort_unstable();
         assert_eq!(profiled.results, [raw(1), raw(2), raw(3)]);
         assert!(proposes.load(Ordering::Relaxed) > 0);
-        assert_eq!(pages.load(Ordering::Relaxed), 0);
         assert_eq!(profiled.stats.delta_source_pages, 0);
     }
 
@@ -12978,17 +12862,15 @@ mod tests {
     #[test]
     fn wide_finite_relation_uses_ordinary_actions_and_preserves_its_set() {
         let proposes = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(AtomicUsize::new(0));
         let root = IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
                 variable: 0,
                 values: Arc::new((0..4).map(raw).collect()),
             }) as ShapeConstraint,
-            Box::new(PagedProposalLeaf {
+            Box::new(OrdinaryProposalLeaf {
                 variable: 1,
                 values: Arc::new((32..48).map(raw).collect()),
                 proposes: Arc::clone(&proposes),
-                pages: Arc::clone(&pages),
             }) as ShapeConstraint,
         ]);
         let profiled = Query::new(root, |binding: &Binding| {
@@ -13007,11 +12889,6 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(actual, expected);
         assert!(proposes.load(Ordering::Relaxed) > 0);
-        assert_eq!(
-            pages.load(Ordering::Relaxed),
-            0,
-            "the finite Program adapter must remain outside the Machine scheduler"
-        );
         assert_eq!(profiled.stats.delta_source_pages, 0);
         assert_eq!(profiled.stats.delta_transition_pages, 0);
     }
@@ -19583,7 +19460,7 @@ mod tests {
                 assert_eq!(
                     actual.len(),
                     if repeated { 3 } else { 2 },
-                    "the distinct two-hop-only candidate did not follow the route stratum"
+                    "the distinct two-hop-only candidate did not follow recurrent routing"
                 );
                 assert!(
                     query.stats().confirm_action_pops > 0,
@@ -20262,12 +20139,10 @@ mod tests {
     #[test]
     fn online_formula_uses_ordinary_finite_proposals() {
         let proposes = Arc::new(AtomicUsize::new(0));
-        let pages = Arc::new(AtomicUsize::new(0));
-        let leaf = |values| PagedProposalLeaf {
+        let leaf = |values| OrdinaryProposalLeaf {
             variable: 0,
             values: Arc::new(values),
             proposes: Arc::clone(&proposes),
-            pages: Arc::clone(&pages),
         };
         let root = UnionConstraint::new(vec![
             leaf(vec![raw(1), raw(2), raw(2)]),
@@ -20280,7 +20155,6 @@ mod tests {
 
         assert_eq!(profiled.results, [raw(1), raw(2), raw(3)]);
         assert!(proposes.load(Ordering::Relaxed) > 0);
-        assert_eq!(pages.load(Ordering::Relaxed), 0);
         assert_eq!(profiled.stats.delta_source_pages, 0);
         assert_eq!(profiled.stats.delta_transition_pages, 0);
     }
