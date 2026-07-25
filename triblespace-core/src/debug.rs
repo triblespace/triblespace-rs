@@ -1,12 +1,19 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
+    #[cfg(feature = "residual")]
     use crate::query::CandidateSink;
+    #[cfg(feature = "residual")]
     use crate::query::Constraint;
+    #[cfg(feature = "residual")]
     use crate::query::EstimateSink;
+    #[cfg(feature = "residual")]
     use crate::query::ProgramRef;
+    #[cfg(feature = "residual")]
     use crate::query::ProposalCoverage;
+    #[cfg(feature = "residual")]
     use crate::query::RowsView;
     use crate::query::VariableId;
+    #[cfg(feature = "residual")]
     use crate::query::VariableSet;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -26,6 +33,7 @@ pub mod query {
         }
     }
 
+    #[cfg(feature = "residual")]
     impl<'a, C: Constraint<'a>> Constraint<'a> for DebugConstraint<C> {
         fn variables(&self) -> VariableSet {
             self.constraint.variables()
@@ -104,6 +112,7 @@ pub mod query {
         }
     }
 
+    #[cfg(feature = "residual")]
     impl<'a, C: Constraint<'a>> Constraint<'a> for EstimateOverrideConstraint<C> {
         fn variables(&self) -> VariableSet {
             self.constraint.variables()

@@ -17,6 +17,8 @@
 //! "Query Engine" and "Atreides Join" chapters.
 /// [`ConstantConstraint`] — pins a variable to a single value.
 pub mod constantconstraint;
+/// Scalar protocol implementations for diagnostic wrappers.
+pub mod debug;
 /// [`EqualityConstraint`](equalityconstraint::EqualityConstraint) — constrains two variables to have the same value.
 pub mod equalityconstraint;
 /// [`KeysConstraint`](hashmapconstraint::KeysConstraint) — constrains a variable to HashMap keys.
@@ -33,6 +35,8 @@ pub mod rangeconstraint;
 pub mod regularpathconstraint;
 /// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
 pub mod sortedsliceconstraint;
+/// [`UnionArchiveConstraint`] — scalar logical union over Succinct shards.
+pub mod unionarchiveconstraint;
 /// [`UnionConstraint`](unionconstraint::UnionConstraint) — logical OR.
 pub mod unionconstraint;
 mod variableset;
@@ -59,6 +63,8 @@ use crate::inline::RawInline;
 pub use regularpathconstraint::PathOp;
 /// Re-export of [`RegularPathConstraint`].
 pub use regularpathconstraint::RegularPathConstraint;
+/// Re-export of [`UnionArchiveConstraint`](unionarchiveconstraint::UnionArchiveConstraint).
+pub use unionarchiveconstraint::UnionArchiveConstraint;
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
 

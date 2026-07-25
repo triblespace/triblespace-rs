@@ -30,6 +30,11 @@ pub mod patch;
 /// Commonly used re-exports for convenient glob imports.
 pub mod prelude;
 /// Query engine: constraints, variables, and the Atreides join algorithm.
+#[cfg(feature = "residual")]
+pub mod query;
+/// Query engine: constraints, variables, and the classic binding solver.
+#[cfg(not(feature = "residual"))]
+#[path = "query_classic/mod.rs"]
 pub mod query;
 /// Repository layer: blob stores, branch stores, commits, and workspaces.
 pub mod repo;
