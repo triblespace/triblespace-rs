@@ -1,5 +1,3 @@
-use core::panic;
-
 use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::RawId;
@@ -8,42 +6,16 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 use crate::inline::INLINE_LEN;
-use crate::patch::KeySchema;
-use crate::patch::PATCH;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
-use crate::query::DispatchClass;
 use crate::query::EstimateSink;
-use crate::query::ProgramAction;
-use crate::query::ProgramCompleteBatch;
-use crate::query::ProgramCompleteWorkEvidence;
-use crate::query::ProgramCompleteWorkQuote;
-use crate::query::ProgramCompletion;
-use crate::query::ProgramGrouping;
-use crate::query::ProgramKey;
-use crate::query::ProgramPacing;
-use crate::query::ProgramRef;
-use crate::query::ProgramRequest;
-use crate::query::ProgramRoute;
-use crate::query::ProgramSeedBatch;
-use crate::query::ProgramStratum;
 use crate::query::ProposalCoverage;
 use crate::query::RawTerm;
-use crate::query::ResidualDeltaSourceCursor;
-use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::Term;
-use crate::query::TypedCompleteArbiter;
-use crate::query::TypedCompleteSink;
-use crate::query::TypedEffectSink;
-use crate::query::TypedProgramBatch;
-use crate::query::TypedProgramSpec;
-use crate::query::TypedResume;
-use crate::query::TypedSeedSink;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::trible::TRIBLE_LEN;
 
 /// A triple-pattern lookup against a [`TribleSet`].
 ///
@@ -115,154 +87,6 @@ fn term_src(term: &RawTerm, view: &RowsView<'_>) -> Option<Src> {
     }
 }
 
-/// Strict successor in one id-sized PATCH segment, expressed in the raw
-/// inline value space used by residual source cursors.
-pub(super) fn next_id_source_in_range<const PREFIX_LEN: usize, O>(
-    index: &PATCH<TRIBLE_LEN, O, ()>,
-    prefix: &[u8; PREFIX_LEN],
-    min: &RawId,
-    max: &RawId,
-    after: Option<&RawInline>,
-) -> Option<RawInline>
-where
-    O: KeySchema<TRIBLE_LEN>,
-{
-    let id = match after {
-        None => index.first_infix_range(prefix, min, max),
-        Some(value) => {
-            let id = id_from_value(value)?;
-            index.next_infix_after(prefix, &id, max)
-        }
-    }?;
-    Some(id_into_value(&id))
-}
-
-fn next_id_source<const PREFIX_LEN: usize, O>(
-    index: &PATCH<TRIBLE_LEN, O, ()>,
-    prefix: &[u8; PREFIX_LEN],
-    after: Option<&RawInline>,
-) -> Option<RawInline>
-where
-    O: KeySchema<TRIBLE_LEN>,
-{
-    next_id_source_in_range(index, prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN], after)
-}
-
-/// Strict successor in one inline-sized PATCH segment.
-pub(super) fn next_inline_source_in_range<const PREFIX_LEN: usize, O>(
-    index: &PATCH<TRIBLE_LEN, O, ()>,
-    prefix: &[u8; PREFIX_LEN],
-    min: &RawInline,
-    max: &RawInline,
-    after: Option<&RawInline>,
-) -> Option<RawInline>
-where
-    O: KeySchema<TRIBLE_LEN>,
-{
-    match after {
-        None => index.first_infix_range(prefix, min, max),
-        Some(value) => index.next_infix_after(prefix, value, max),
-    }
-}
-
-fn next_inline_source<const PREFIX_LEN: usize, O>(
-    index: &PATCH<TRIBLE_LEN, O, ()>,
-    prefix: &[u8; PREFIX_LEN],
-    after: Option<&RawInline>,
-) -> Option<RawInline>
-where
-    O: KeySchema<TRIBLE_LEN>,
-{
-    next_inline_source_in_range(
-        index,
-        prefix,
-        &[u8::MIN; INLINE_LEN],
-        &[u8::MAX; INLINE_LEN],
-        after,
-    )
-}
-
-/// Consume a bounded page from a strict raw-inline successor function.
-///
-/// The one-entry lookahead only decides whether a cursor remains; it is not a
-/// consumed source candidate and therefore does not contribute to `examined`.
-pub(super) fn direct_source_page(
-    cursor: ResidualDeltaSourceCursor,
-    limit: usize,
-    accepted: &mut Vec<RawInline>,
-    mut next: impl FnMut(Option<&RawInline>) -> Option<RawInline>,
-) -> ResidualDeltaSourcePage {
-    assert!(limit > 0, "residual source pages require positive demand");
-    // This frontier exclusively emits value cursors.
-    let mut current = match cursor {
-        ResidualDeltaSourceCursor::Start => None,
-        ResidualDeltaSourceCursor::After(value) => Some(value),
-        ResidualDeltaSourceCursor::Offset(_) => {
-            panic!("ordinal cursor crossed into a TribleSet source frontier")
-        }
-    };
-    let mut examined = 0usize;
-    while examined < limit {
-        let Some(value) = next(current.as_ref()) else {
-            return ResidualDeltaSourcePage {
-                next: None,
-                examined,
-            };
-        };
-        current = Some(value);
-        accepted.push(value);
-        examined += 1;
-    }
-    let last_examined = current.expect("a full positive page examined a source");
-    ResidualDeltaSourcePage {
-        next: next(Some(&last_examined)).map(|_| ResidualDeltaSourceCursor::After(last_examined)),
-        examined,
-    }
-}
-
-/// Consume a bounded page from one strict ordered driver while applying an
-/// exact secondary predicate.
-///
-/// Rejected driver values still consume demand and advance the cursor. This
-/// is what keeps a long negative equality prefix under the residual
-/// scheduler's geometric work budget: the cursor resumes after the last
-/// value examined, never after the last value accepted.
-fn filtered_direct_source_page(
-    cursor: ResidualDeltaSourceCursor,
-    limit: usize,
-    accepted: &mut Vec<RawInline>,
-    mut next: impl FnMut(Option<&RawInline>) -> Option<RawInline>,
-    mut accept: impl FnMut(&RawInline) -> bool,
-) -> ResidualDeltaSourcePage {
-    assert!(limit > 0, "residual source pages require positive demand");
-    let mut current = match cursor {
-        ResidualDeltaSourceCursor::Start => None,
-        ResidualDeltaSourceCursor::After(value) => Some(value),
-        ResidualDeltaSourceCursor::Offset(_) => {
-            panic!("ordinal cursor crossed into a filtered TribleSet source frontier")
-        }
-    };
-    let mut examined = 0usize;
-    while examined < limit {
-        let Some(value) = next(current.as_ref()) else {
-            return ResidualDeltaSourcePage {
-                next: None,
-                examined,
-            };
-        };
-        current = Some(value);
-        examined += 1;
-        if accept(&value) {
-            accepted.push(value);
-        }
-    }
-    let last_examined = current.expect("a full positive page examined a source");
-    ResidualDeltaSourcePage {
-        next: next(Some(&last_examined)).map(|_| ResidualDeltaSourceCursor::After(last_examined)),
-        examined,
-    }
-}
-
 /// The hoisted per-row context of one [`TribleSetConstraint`] call: which
 /// positions hold the queried variable (`*_var` — never true for a
 /// constant term) and where the other positions' values come from (`p*`:
@@ -275,17 +99,6 @@ struct Positions {
     pe: Option<Src>,
     pa: Option<Src>,
     pv: Option<Src>,
-}
-
-const TRIBLESET_PROPOSE_ROUTE: u32 = 1 << 8;
-
-const TRIBLESET_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
-
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TribleSetProgramState {
-    variable: VariableId,
-    cursor: ResidualDeltaSourceCursor,
 }
 
 impl Positions {
@@ -826,192 +639,6 @@ impl TribleSetConstraint {
         }
     }
 
-    fn variable_position_mask(&self, variable: VariableId) -> u32 {
-        u32::from(self.term_e.is_var(variable))
-            | (u32::from(self.term_a.is_var(variable)) << 1)
-            | (u32::from(self.term_v.is_var(variable)) << 2)
-    }
-
-    fn bound_position_mask(&self, bound: VariableSet) -> u32 {
-        fn term_is_bound(term: &RawTerm, bound: VariableSet) -> bool {
-            match term {
-                RawTerm::Var(variable) => bound.is_set(*variable),
-                RawTerm::Const(_) => true,
-            }
-        }
-
-        u32::from(term_is_bound(&self.term_e, bound))
-            | (u32::from(term_is_bound(&self.term_a, bound)) << 1)
-            | (u32::from(term_is_bound(&self.term_v, bound)) << 2)
-    }
-
-    /// Pages the same ordered proposal source used by ordinary `propose`, but
-    /// for one already-selected parent row. Keeping this kernel on the family
-    /// preserves the six-index and repeated-position semantics; the typed
-    /// Program contributes only affine continuation state.
-    fn proposal_source_page_row(
-        &self,
-        p: &Positions,
-        row: &[RawInline],
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
-        let e_bound = match p.e(row) {
-            Some(value) => match id_from_value(value) {
-                Some(id) => Some(id),
-                None => {
-                    return ResidualDeltaSourcePage {
-                        next: None,
-                        examined: 0,
-                    };
-                }
-            },
-            None => None,
-        };
-        let a_bound = match p.a(row) {
-            Some(value) => match id_from_value(value) {
-                Some(id) => Some(id),
-                None => {
-                    return ResidualDeltaSourcePage {
-                        next: None,
-                        examined: 0,
-                    };
-                }
-            },
-            None => None,
-        };
-        let v_bound = p.v(row);
-
-        if p.e_var as usize + p.a_var as usize + p.v_var as usize > 1 {
-            return match (e_bound, a_bound, v_bound, p.e_var, p.a_var, p.v_var) {
-                (_, Some(a), _, true, false, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.aev, &a, after),
-                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (_, None, _, true, false, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.eav, &[0; 0], after),
-                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (_, _, Some(v), true, true, false) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.vae, v, after),
-                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (_, _, None, true, true, false) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.aev, &[0; 0], after),
-                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (Some(e), _, _, false, true, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.eav, &e, after),
-                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (None, _, _, false, true, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.aev, &[0; 0], after),
-                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                (_, _, _, true, true, true) => filtered_direct_source_page(
-                    cursor,
-                    limit,
-                    accepted,
-                    |after| next_id_source(&self.set.eav, &[0; 0], after),
-                    |value| self.confirm_value(p, e_bound, a_bound, v_bound.copied(), value),
-                ),
-                _ => unreachable!("invalid repeated-position proposal source state"),
-            };
-        }
-
-        match (e_bound, a_bound, v_bound, p.e_var, p.a_var, p.v_var) {
-            (None, None, None, true, false, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.eav, &[], after)
-                })
-            }
-            (None, None, None, false, true, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.aev, &[], after)
-                })
-            }
-            (None, None, None, false, false, true) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source(&self.set.vea, &[], after)
-                })
-            }
-            (Some(e), None, None, false, true, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.eav, &e, after)
-                })
-            }
-            (Some(e), None, None, false, false, true) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source(&self.set.eva, &e, after)
-                })
-            }
-            (None, Some(a), None, true, false, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.aev, &a, after)
-                })
-            }
-            (None, Some(a), None, false, false, true) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source(&self.set.ave, &a, after)
-                })
-            }
-            (None, None, Some(v), true, false, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.vea, v, after)
-                })
-            }
-            (None, None, Some(v), false, true, false) => {
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.vae, v, after)
-                })
-            }
-            (None, Some(a), Some(v), true, false, false) => {
-                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
-                prefix[..ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN..].copy_from_slice(v);
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.ave, &prefix, after)
-                })
-            }
-            (Some(e), None, Some(v), false, true, false) => {
-                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
-                prefix[..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..].copy_from_slice(v);
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_id_source(&self.set.eva, &prefix, after)
-                })
-            }
-            (Some(e), Some(a), None, false, false, true) => {
-                let mut prefix = [0u8; ID_LEN + ID_LEN];
-                prefix[..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..].copy_from_slice(&a);
-                direct_source_page(cursor, limit, accepted, |after| {
-                    next_inline_source(&self.set.eav, &prefix, after)
-                })
-            }
-            _ => unreachable!("a distinct-position proposal has one of twelve bound schemas"),
-        }
-    }
-
     fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
         let (Some(se), Some(sa), Some(sv)) = (
             term_src(&self.term_e, view),
@@ -1031,249 +658,6 @@ impl TribleSetConstraint {
         prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
         prefix[ID_LEN + ID_LEN..].copy_from_slice(sv.get(row));
         self.set.eav.has_prefix(&prefix)
-    }
-}
-
-impl TypedProgramSpec for TribleSetConstraint {
-    type State = TribleSetProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let ProgramAction::Propose(variable) = request.action else {
-            return None;
-        };
-        let bound_positions = self.bound_position_mask(request.bound);
-        let target_positions = self.variable_position_mask(variable);
-        if request.bound.is_set(variable) || target_positions == 0 {
-            return None;
-        }
-        debug_assert_eq!(bound_positions & target_positions, 0);
-        Some(ProgramRoute {
-            key: ProgramKey::new(
-                TRIBLESET_PROPOSE_ROUTE | (target_positions << 3) | bound_positions,
-            ),
-            variable,
-            stratum: ProgramStratum::Finite,
-            grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::CompleteActionEquivalent,
-        })
-    }
-
-    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-        TRIBLESET_PROPOSE_DISPATCH
-    }
-
-    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
-        ProgramPacing::Search
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        fn complemented_value_words(value: &RawInline) -> [u64; 4] {
-            std::array::from_fn(|word| {
-                let begin = word * 8;
-                !u64::from_be_bytes(value[begin..begin + 8].try_into().unwrap())
-            })
-        }
-
-        let mut rank = [0u64; 6];
-        rank[0] = 3;
-        match &state.cursor {
-            ResidualDeltaSourceCursor::Start => rank[1] = u64::MAX,
-            ResidualDeltaSourceCursor::After(value) => {
-                rank[1] = u64::MAX - 1;
-                rank[2..].copy_from_slice(&complemented_value_words(value));
-            }
-            ResidualDeltaSourceCursor::Offset(_) => {
-                panic!("ordinal cursor crossed into a typed TribleSet source")
-            }
-        }
-        rank
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
-        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            panic!("typed TribleSet route admitted a non-proposal action")
-        };
-        assert_eq!(
-            batch.route.completion,
-            ProgramCompletion::CompleteActionEquivalent
-        );
-        assert_eq!(batch.route.variable, variable);
-        assert!(!batch.request.bound.is_set(variable));
-        assert_ne!(self.variable_position_mask(variable), 0);
-        let state = TribleSetProgramState {
-            variable,
-            cursor: ResidualDeltaSourceCursor::Start,
-        };
-        for parent in 0..batch.view.len() {
-            effects.finite_root(
-                u32::try_from(parent).expect("too many typed TribleSet parents"),
-                state.clone(),
-                None,
-            );
-        }
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(states.len(), batch.view.len());
-        assert_eq!(states.len(), batch.candidate_sets.len());
-        assert_eq!(states.len(), batch.limits.len());
-        let Some(variable) = states.first().map(|state| state.variable) else {
-            return;
-        };
-        let positions = self.positions(variable, &batch.view);
-        for (input, state) in states.drain(..).enumerate() {
-            assert_eq!(state.variable, variable);
-            assert!(
-                batch.candidate_sets[input].is_none(),
-                "typed TribleSet proposal received a candidate group"
-            );
-            let mut direct = Vec::new();
-            let page = self.proposal_source_page_row(
-                &positions,
-                batch.view.row(input),
-                state.cursor,
-                batch.limits[input],
-                &mut direct,
-            );
-            let input =
-                u32::try_from(input).expect("too many typed TribleSet inputs in one cohort");
-            for value in direct {
-                effects.direct(input, value);
-            }
-            assert!(
-                page.next.is_none() || page.examined > 0,
-                "typed TribleSet proposal resumed without examining its source"
-            );
-            let resume = page
-                .next
-                .map(|cursor| TypedResume::Immediate(TribleSetProgramState { variable, cursor }));
-            effects.account_source(page.examined, 0);
-            effects.page(page.examined, resume);
-        }
-    }
-
-    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            panic!("TribleSet complete actions support only proposals")
-        };
-        assert_eq!(variable, batch.route.variable);
-        let positions = self.positions(variable, &batch.view);
-        for (parent, row) in batch.view.iter().enumerate() {
-            let parent = u32::try_from(parent).expect("too many TribleSet complete-action parents");
-            self.propose_row(&positions, row, &mut |value| effects.push(parent, value));
-        }
-    }
-
-    fn quote_complete_typed(&self, batch: ProgramCompleteBatch<'_>) -> ProgramCompleteWorkEvidence {
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            return ProgramCompleteWorkEvidence::Declined;
-        };
-        assert_eq!(variable, batch.route.variable);
-        let positions = self.positions(variable, &batch.view);
-        if [positions.e_var, positions.a_var, positions.v_var]
-            .into_iter()
-            .filter(|position| *position)
-            .count()
-            != 1
-        {
-            // Repeated-position proposals filter a covering-index driver.
-            // Counting their accepted values would perform the very
-            // potentially-unbounded scan that this quote must gate.
-            return ProgramCompleteWorkEvidence::Declined;
-        }
-        ProgramCompleteWorkEvidence::Quoted(
-            batch
-                .view
-                .iter()
-                .map(|row| {
-                    let occurrences = self.proposal_driver_len_row(&positions, row);
-                    ProgramCompleteWorkQuote {
-                        drain_work_units: occurrences,
-                        raw_occurrences: occurrences,
-                    }
-                })
-                .collect(),
-        )
-    }
-
-    fn complete_bounded_typed(
-        &self,
-        batch: ProgramCompleteBatch<'_>,
-        arbiter: &mut TypedCompleteArbiter,
-    ) {
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            panic!("TribleSet complete actions support only proposals")
-        };
-        assert_eq!(variable, batch.route.variable);
-        let positions = self.positions(variable, &batch.view);
-        let mut retained = Vec::new();
-        for parent in (0..batch.view.len()).rev() {
-            let drain_work_units = self.proposal_driver_len_row(&positions, batch.view.row(parent));
-            let remaining = arbiter.remaining_tail_capacity(parent);
-            if drain_work_units > remaining.drain_work_units {
-                arbiter.reject_tail_parent(parent);
-                break;
-            }
-
-            let mut values = Vec::with_capacity(drain_work_units);
-            if drain_work_units > 0 {
-                let page = self.proposal_source_page_row(
-                    &positions,
-                    batch.view.row(parent),
-                    ResidualDeltaSourceCursor::Start,
-                    drain_work_units,
-                    &mut values,
-                );
-                assert_eq!(
-                    page.examined, drain_work_units,
-                    "bounded TribleSet completion disagreed with its exact driver length"
-                );
-                assert!(
-                    page.next.is_none(),
-                    "bounded TribleSet completion left an exact driver continuation"
-                );
-            }
-            let raw_occurrences = values.len();
-            if raw_occurrences > remaining.raw_occurrences {
-                arbiter.reject_tail_parent(parent);
-                break;
-            }
-            if !arbiter.try_admit_tail_parent(
-                parent,
-                ProgramCompleteWorkQuote {
-                    drain_work_units,
-                    raw_occurrences,
-                },
-            ) {
-                break;
-            }
-            retained.push(values);
-        }
-
-        let Some(selection) = arbiter.seal_tail_admission() else {
-            return;
-        };
-        debug_assert_eq!(retained.len(), batch.view.len() - selection.first_parent());
-        let effects = arbiter.effects_mut();
-        for (parent, values) in retained.into_iter().rev().enumerate() {
-            effects.extend_parent(
-                u32::try_from(parent).expect("too many TribleSet complete-action parents"),
-                values,
-            );
-        }
     }
 }
 
@@ -1395,10 +779,6 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         });
     }
 
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
-    }
-
     /// When all three positions have values (bound or constant), checks
     /// whether each row's triple exists in the EAV index. Returns `true`
     /// optimistically when any position is still unbound.
@@ -1458,267 +838,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn typed_routes_are_action_and_relevant_schema_specific() {
-        let (set, _, _, _) = direct_fixture();
-        let e = Variable::<GenId>::new(0);
-        let a = Variable::<GenId>::new(1);
-        let v = Variable::<UnknownInline>::new(2);
-        let constraint = TribleSetConstraint::new(e, a, v, set);
-        let program = constraint.residual_program().unwrap();
-        let empty = VariableSet::new_empty();
-        let propose = program
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(0),
-                bound: empty,
-            })
-            .unwrap();
-        let mut attribute_bound = empty;
-        attribute_bound.set(1);
-        let bound_propose = program
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(0),
-                bound: attribute_bound,
-            })
-            .unwrap();
-
-        assert_ne!(propose.key, bound_propose.key);
-        assert_eq!(propose.stratum, ProgramStratum::Finite);
-        assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(
-            propose.completion,
-            ProgramCompletion::CompleteActionEquivalent
-        );
-        assert_eq!(
-            bound_propose.completion,
-            ProgramCompletion::CompleteActionEquivalent
-        );
-        assert!(program
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(0),
-                bound: empty,
-            })
-            .is_none());
-        assert!(program
-            .route(ProgramRequest {
-                action: ProgramAction::Support,
-                bound: empty,
-            })
-            .is_none());
-        assert!(program
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(0),
-                bound: VariableSet::new_singleton(0),
-            })
-            .is_none());
-        assert!(program
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(9),
-                bound: empty,
-            })
-            .is_none());
-    }
-
-    #[test]
-    fn typed_complete_proposal_matches_the_ordinary_occurrence_bag() {
-        let (set, entities, attributes, _) = direct_fixture();
-        let e = Variable::<GenId>::new(0);
-        let v = Variable::<UnknownInline>::new(1);
-        let constraint = TribleSetConstraint::new(e, Inline::<GenId>::new(attributes[0]), v, set);
-        let variables = [e.index];
-        let rows = [entities[0], entities[0], entities[1]];
-        let view = RowsView::new(&variables, &rows);
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(v.index),
-            bound: VariableSet::new_singleton(e.index),
-        };
-        let program = constraint.residual_program().unwrap();
-        let route = program.route(request).unwrap();
-
-        let mut ordinary = Vec::new();
-        constraint.propose(v.index, &view, &mut CandidateSink::Tagged(&mut ordinary));
-        let mut complete = crate::query::ProgramCompleteEffects::default();
-        program.complete_batch(
-            ProgramCompleteBatch {
-                request,
-                route,
-                view,
-            },
-            &mut complete,
-        );
-
-        assert_eq!(complete.raw_occurrence_count, ordinary.len());
-        assert_eq!(complete.occurrences, ordinary);
-        let first_parent_values: Vec<_> = complete
-            .occurrences
-            .iter()
-            .filter_map(|&(parent, value)| (parent == 0).then_some(value))
-            .collect();
-        let identical_parent_values: Vec<_> = complete
-            .occurrences
-            .iter()
-            .filter_map(|&(parent, value)| (parent == 1).then_some(value))
-            .collect();
-        assert_eq!(first_parent_values, identical_parent_values);
-    }
-
-    #[test]
-    fn bounded_repeated_position_completion_quotes_driver_work_and_filtered_output() {
-        let attribute = rngid();
-        let witness = rngid();
-        let rejected_a = rngid();
-        let rejected_b = rngid();
-        let mut set = TribleSet::new();
-        for entity in [&witness, &rejected_a, &rejected_b] {
-            set.insert(&Trible::new(
-                entity,
-                &attribute,
-                &Inline::<GenId>::new(id_into_value(&witness)),
-            ));
-        }
-        let x = Variable::<GenId>::new(0);
-        let constraint =
-            TribleSetConstraint::new(x, Inline::<GenId>::new(id_into_value(&attribute)), x, set);
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(x.index),
-            bound: VariableSet::new_empty(),
-        };
-        let program = constraint.residual_program().unwrap();
-        let batch = ProgramCompleteBatch {
-            request,
-            route: program.route(request).unwrap(),
-            view: RowsView::new_with_row_count(&[], &[], 2),
-        };
-        let owner = batch;
-        let affinity = crate::query::ProgramCompleteAffinity::new(&owner);
-        let completion = program
-            .try_complete_bounded(batch, 3, &affinity)
-            .expect("one repeated-position driver fits exactly");
-        let (first_parent, work, raw_occurrence_count, occurrences) =
-            completion.into_parts_for(batch, &affinity, &owner);
-        assert_eq!(first_parent, 1);
-        assert_eq!(
-            work,
-            ProgramCompleteWorkQuote {
-                drain_work_units: 3,
-                raw_occurrences: 1,
-            }
-        );
-        assert_eq!(raw_occurrence_count, 1);
-        assert_eq!(occurrences, [(0, id_into_value(&witness))]);
-
-        assert!(program.try_complete_bounded(batch, 2, &affinity).is_none());
-    }
-
-    #[test]
-    fn bounded_tribleset_completion_selects_an_exact_tail_down_to_one_parent() {
-        let attribute = rngid();
-        let entities = [rngid(), rngid(), rngid()];
-        let values = [
-            Inline::<UnknownInline>::new([0x11; INLINE_LEN]),
-            Inline::<UnknownInline>::new([0x22; INLINE_LEN]),
-            Inline::<UnknownInline>::new([0x33; INLINE_LEN]),
-            Inline::<UnknownInline>::new([0x44; INLINE_LEN]),
-        ];
-        let mut set = TribleSet::new();
-        for (entity, fanout) in entities.iter().zip([4, 2, 1]) {
-            for value in &values[..fanout] {
-                set.insert(&Trible::new(entity, &attribute, value));
-            }
-        }
-        let entity = Variable::<GenId>::new(0);
-        let value = Variable::<UnknownInline>::new(1);
-        let constraint = TribleSetConstraint::new(
-            entity,
-            Inline::<GenId>::new(id_into_value(&attribute)),
-            value,
-            set,
-        );
-        let rows = entities.each_ref().map(|entity| id_into_value(entity));
-        let vars = [entity.index];
-        let view = RowsView::new(&vars, &rows);
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(value.index),
-            bound: VariableSet::new_singleton(entity.index),
-        };
-        let program = constraint.residual_program().unwrap();
-        let batch = ProgramCompleteBatch {
-            request,
-            route: program.route(request).unwrap(),
-            view,
-        };
-        let owner = batch;
-        let affinity = crate::query::ProgramCompleteAffinity::new(&owner);
-
-        let completion = program
-            .try_complete_bounded(batch, 3, &affinity)
-            .expect("the final two parent fanouts fit");
-        let (first_parent, work, raw_occurrence_count, occurrences) =
-            completion.into_parts_for(batch, &affinity, &owner);
-        assert_eq!(first_parent, 1);
-        assert_eq!(
-            work,
-            ProgramCompleteWorkQuote {
-                drain_work_units: 3,
-                raw_occurrences: 3,
-            }
-        );
-        assert_eq!(raw_occurrence_count, 3);
-        assert_eq!(
-            occurrences,
-            [(0, values[0].raw), (0, values[1].raw), (1, values[0].raw)]
-        );
-
-        let completion = program
-            .try_complete_bounded(batch, 1, &affinity)
-            .expect("the final singleton parent is a valid exact tail");
-        let (first_parent, work, raw_occurrence_count, occurrences) =
-            completion.into_parts_for(batch, &affinity, &owner);
-        assert_eq!(first_parent, 2);
-        assert_eq!(
-            work,
-            ProgramCompleteWorkQuote {
-                drain_work_units: 1,
-                raw_occurrences: 1,
-            }
-        );
-        assert_eq!(raw_occurrence_count, 1);
-        assert_eq!(occurrences, [(0, values[0].raw)]);
-
-        assert!(program.try_complete_bounded(batch, 0, &affinity).is_none());
-    }
-
-    #[test]
-    fn typed_complete_certificate_keeps_single_parent_proposals_pageable() {
-        let attribute = rngid();
-        let value = Inline::<UnknownInline>::new([0x5b; INLINE_LEN]);
-        let mut set = TribleSet::new();
-        for _ in 0..64 {
-            set.insert(&Trible::new(&rngid(), &attribute, &value));
-        }
-        let entity = Variable::<GenId>::new(0);
-        let constraint = Arc::new(TribleSetConstraint::new(
-            entity,
-            Inline::<GenId>::new(id_into_value(&attribute)),
-            value,
-            set,
-        ));
-        let mut query = Query::new(constraint, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy();
-
-        let first = query.next().unwrap();
-        assert_eq!(query.stats().delta_source_pages, 1);
-        assert_eq!(query.stats().delta_source_candidates_examined, 1);
-        assert_eq!(query.stats().delta_terminal_eager_cohort_admissions, 0);
-        let mut mirror = query.clone();
-        let second = query.next().unwrap();
-        assert_ne!(second, first);
-        assert_eq!(mirror.next(), Some(second));
-        assert!(query.stats().delta_source_pages > 1);
-        assert!(query.stats().delta_source_candidates_examined >= 2);
-        assert_eq!(query.stats().delta_terminal_eager_cohort_admissions, 0);
-    }
-
     fn eager_proposal(
         constraint: &TribleSetConstraint,
         variable: VariableId,
@@ -1728,92 +847,6 @@ mod tests {
         constraint.propose(variable, view, &mut CandidateSink::Values(&mut values));
         values.sort_unstable();
         values
-    }
-
-    fn bounded_source_proposal(
-        constraint: &TribleSetConstraint,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> Vec<RawInline> {
-        assert_eq!(view.len(), 1);
-        let positions = constraint.positions(variable, view);
-        let mut cursor = ResidualDeltaSourceCursor::Start;
-        let mut values = Vec::new();
-        loop {
-            let before = values.len();
-            let page = constraint.proposal_source_page_row(
-                &positions,
-                view.row(0),
-                cursor,
-                1,
-                &mut values,
-            );
-            assert!(values.len() - before <= page.examined);
-            assert!(page.examined <= 1);
-            let Some(next) = page.next else {
-                break;
-            };
-            match (cursor, next) {
-                (ResidualDeltaSourceCursor::Start, ResidualDeltaSourceCursor::After(_)) => {}
-                (
-                    ResidualDeltaSourceCursor::After(previous),
-                    ResidualDeltaSourceCursor::After(next),
-                ) => assert!(next > previous),
-                (_, ResidualDeltaSourceCursor::Start) => unreachable!("source cursor restarted"),
-                (_, ResidualDeltaSourceCursor::Offset(_)) => {
-                    unreachable!("ordinal cursor crossed the TribleSet test frontier")
-                }
-                (ResidualDeltaSourceCursor::Offset(_), _) => {
-                    unreachable!("ordinal cursor resumed the TribleSet test frontier")
-                }
-            }
-            cursor = next;
-        }
-        values.sort_unstable();
-        values
-    }
-
-    fn complete_proposal(
-        constraint: &TribleSetConstraint,
-        variable: VariableId,
-        view: RowsView<'_>,
-    ) -> Vec<(u32, RawInline)> {
-        try_complete_proposal(constraint, variable, view)
-            .expect("TribleSet proposal has an exact bounded completion")
-    }
-
-    fn try_complete_proposal(
-        constraint: &TribleSetConstraint,
-        variable: VariableId,
-        view: RowsView<'_>,
-    ) -> Option<Vec<(u32, RawInline)>> {
-        let mut bound = VariableSet::new_empty();
-        for &variable in view.vars {
-            bound.set(variable);
-        }
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(variable),
-            bound,
-        };
-        let program = constraint.residual_program().unwrap();
-        let route = program.route(request).unwrap();
-        assert_eq!(
-            route.completion,
-            ProgramCompletion::CompleteActionEquivalent
-        );
-        let batch = ProgramCompleteBatch {
-            request,
-            route,
-            view,
-        };
-        let owner = batch;
-        let affinity = crate::query::ProgramCompleteAffinity::new(&owner);
-        let completion = program.try_complete_bounded(batch, usize::MAX, &affinity)?;
-        let (_, quote, raw_occurrence_count, mut occurrences) =
-            completion.into_parts_for(batch, &affinity, &owner);
-        assert_eq!(quote.raw_occurrences, raw_occurrence_count);
-        occurrences.sort_unstable();
-        Some(occurrences)
     }
 
     #[derive(Clone, Copy)]
@@ -2069,187 +1102,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_sources_match_eager_proposals_for_all_distinct_position_schemas() {
-        const E: VariableId = 0;
-        const A: VariableId = 1;
-        const V: VariableId = 2;
-
-        let (set, entities, attributes, values) = direct_fixture();
-        let e = Variable::<GenId>::new(E);
-        let a = Variable::<GenId>::new(A);
-        let v = Variable::<UnknownInline>::new(V);
-        let constraint = TribleSetConstraint::new(e, a, v, set);
-        let schemas = [
-            ("E|___", E, vec![], vec![]),
-            ("E|A__", E, vec![A], vec![attributes[0]]),
-            ("E|__V", E, vec![V], vec![values[0].raw]),
-            ("E|A_V", E, vec![A, V], vec![attributes[0], values[0].raw]),
-            ("A|___", A, vec![], vec![]),
-            ("A|E__", A, vec![E], vec![entities[0]]),
-            ("A|__V", A, vec![V], vec![values[0].raw]),
-            ("A|E_V", A, vec![E, V], vec![entities[0], values[0].raw]),
-            ("V|___", V, vec![], vec![]),
-            ("V|E__", V, vec![E], vec![entities[0]]),
-            ("V|A__", V, vec![A], vec![attributes[0]]),
-            ("V|EA_", V, vec![E, A], vec![entities[0], attributes[0]]),
-        ];
-
-        for (name, variable, vars, row) in schemas {
-            let view = RowsView::new(&vars, &row);
-            let eager = eager_proposal(&constraint, variable, &view);
-            assert_eq!(
-                bounded_source_proposal(&constraint, variable, &view),
-                eager,
-                "bounded schema {name}"
-            );
-            assert_eq!(
-                complete_proposal(&constraint, variable, view),
-                eager
-                    .into_iter()
-                    .map(|value| (0, value))
-                    .collect::<Vec<_>>(),
-                "complete schema {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn bounded_sources_match_eager_proposals_for_all_repeated_position_schemas() {
-        let x1 = rngid();
-        let x2 = rngid();
-        let x3 = rngid();
-        let entity = rngid();
-        let attribute = rngid();
-        let other = rngid();
-        let value = Inline::<UnknownInline>::new([0x71; INLINE_LEN]);
-        let other_value = Inline::<UnknownInline>::new([0x82; INLINE_LEN]);
-        let mut set = TribleSet::new();
-
-        // Exact witnesses for every repeated-position family.
-        set.insert(&Trible::new(
-            &x1,
-            &attribute,
-            &Inline::<GenId>::new(id_into_value(&x1)),
-        ));
-        set.insert(&Trible::new(
-            &x2,
-            &other,
-            &Inline::<GenId>::new(id_into_value(&x2)),
-        ));
-        set.insert(&Trible::new(&x1, &x1, &value));
-        set.insert(&Trible::new(&x2, &x2, &other_value));
-        set.insert(&Trible::new(
-            &entity,
-            &x1,
-            &Inline::<GenId>::new(id_into_value(&x1)),
-        ));
-        set.insert(&Trible::new(
-            &other,
-            &x2,
-            &Inline::<GenId>::new(id_into_value(&x2)),
-        ));
-        set.insert(&Trible::new(
-            &x3,
-            &x3,
-            &Inline::<GenId>::new(id_into_value(&x3)),
-        ));
-
-        // Near misses force the filtered source to reject driver values.
-        set.insert(&Trible::new(
-            &other,
-            &attribute,
-            &Inline::<GenId>::new(id_into_value(&x1)),
-        ));
-        set.insert(&Trible::new(&other, &x1, &other_value));
-        set.insert(&Trible::new(
-            &entity,
-            &other,
-            &Inline::<GenId>::new(id_into_value(&x1)),
-        ));
-
-        let x = Variable::<GenId>::new(0);
-        let a = Variable::<GenId>::new(1);
-        let v = Variable::<UnknownInline>::new(1);
-        let e = Variable::<GenId>::new(1);
-
-        let assert_schema = |name: &str,
-                             constraint: TribleSetConstraint,
-                             vars: &[VariableId],
-                             row: &[RawInline]| {
-            let view = RowsView::new(vars, row);
-            let eager = eager_proposal(&constraint, x.index, &view);
-            assert_eq!(
-                bounded_source_proposal(&constraint, x.index, &view),
-                eager,
-                "bounded schema {name}",
-            );
-            assert_eq!(
-                complete_proposal(&constraint, x.index, view),
-                eager
-                    .into_iter()
-                    .map(|value| (0, value))
-                    .collect::<Vec<_>>(),
-                "complete schema {name}",
-            );
-        };
-
-        assert_schema(
-            "E=V/free-A",
-            TribleSetConstraint::new(x, a, x, set.clone()),
-            &[],
-            &[],
-        );
-        assert_schema(
-            "E=V/bound-A",
-            TribleSetConstraint::new(x, a, x, set.clone()),
-            &[a.index],
-            &[id_into_value(&attribute)],
-        );
-        assert_schema(
-            "E=V/invalid-bound-A",
-            TribleSetConstraint::new(x, a, x, set.clone()),
-            &[a.index],
-            &[[0xee; INLINE_LEN]],
-        );
-        assert_schema(
-            "E=A/free-V",
-            TribleSetConstraint::new(x, x, v, set.clone()),
-            &[],
-            &[],
-        );
-        assert_schema(
-            "E=A/bound-V",
-            TribleSetConstraint::new(x, x, v, set.clone()),
-            &[v.index],
-            &[value.raw],
-        );
-        assert_schema(
-            "A=V/free-E",
-            TribleSetConstraint::new(e, x, x, set.clone()),
-            &[],
-            &[],
-        );
-        assert_schema(
-            "A=V/bound-E",
-            TribleSetConstraint::new(e, x, x, set.clone()),
-            &[e.index],
-            &[id_into_value(&entity)],
-        );
-        assert_schema(
-            "A=V/invalid-bound-E",
-            TribleSetConstraint::new(e, x, x, set.clone()),
-            &[e.index],
-            &[[0xee; INLINE_LEN]],
-        );
-        assert_schema(
-            "E=A=V",
-            TribleSetConstraint::new(x, x, x, set.clone()),
-            &[],
-            &[],
-        );
-    }
-
-    #[test]
     fn repeated_source_answers_are_monotone_across_set_growth() {
         let attribute = rngid();
         let old_witness = rngid();
@@ -2282,22 +1134,31 @@ mod tests {
 
         let x = Variable::<GenId>::new(0);
         let attribute = Inline::<GenId>::new(id_into_value(&attribute));
-        let base_constraint = TribleSetConstraint::new(x, attribute, x, base);
-        let grown_constraint = TribleSetConstraint::new(x, attribute, x, grown);
+        let base_constraint = TribleSetConstraint::new(x, attribute, x, base.clone());
+        let grown_constraint = TribleSetConstraint::new(x, attribute, x, grown.clone());
         let base_eager = eager_proposal(&base_constraint, x.index, &RowsView::EMPTY);
-        let base_bounded = bounded_source_proposal(&base_constraint, x.index, &RowsView::EMPTY);
         let grown_eager = eager_proposal(&grown_constraint, x.index, &RowsView::EMPTY);
-        let grown_bounded = bounded_source_proposal(&grown_constraint, x.index, &RowsView::EMPTY);
+        let project = |binding: &Binding| binding.get(x.index).copied();
+        let mut base_residual: Vec<_> =
+            Query::new(TribleSetConstraint::new(x, attribute, x, base), project)
+                .solve_residual_state_lazy()
+                .collect();
+        let mut grown_residual: Vec<_> =
+            Query::new(TribleSetConstraint::new(x, attribute, x, grown), project)
+                .solve_residual_state_lazy()
+                .collect();
+        base_residual.sort_unstable();
+        grown_residual.sort_unstable();
 
-        assert_eq!(base_bounded, base_eager);
-        assert_eq!(grown_bounded, grown_eager);
-        assert_eq!(base_bounded, vec![id_into_value(&old_witness)]);
+        assert_eq!(base_residual, base_eager);
+        assert_eq!(grown_residual, grown_eager);
+        assert_eq!(base_residual, vec![id_into_value(&old_witness)]);
         let mut expected_grown = vec![id_into_value(&old_witness), id_into_value(&new_witness)];
         expected_grown.sort_unstable();
-        assert_eq!(grown_bounded, expected_grown);
-        assert!(base_bounded
+        assert_eq!(grown_residual, expected_grown);
+        assert!(base_residual
             .iter()
-            .all(|answer| grown_bounded.contains(answer)));
+            .all(|answer| grown_residual.contains(answer)));
     }
 
     fn project_triple(binding: &Binding) -> Option<(RawInline, RawInline, RawInline)> {
@@ -2336,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn q51_shaped_hashset_to_tribleset_query_uses_terminal_complete_cohorts() {
+    fn q51_shaped_hashset_to_tribleset_query_matches_the_ordinary_oracle() {
         const ENTITY: VariableId = 0;
         const VALUE: VariableId = 1;
 
@@ -2378,24 +1239,15 @@ mod tests {
         let project = |binding: &Binding| Some((*binding.get(ENTITY)?, *binding.get(VALUE)?));
 
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
-        let mut query = Query::new(make(), project).solve_residual_state_lazy();
-        let mut residual: Vec<_> = query.by_ref().collect();
+        let mut residual: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .collect();
         expected.sort_unstable();
         ordinary.sort_unstable();
         residual.sort_unstable();
 
         assert_eq!(ordinary, expected);
         assert_eq!(residual, expected);
-        assert!(
-            query.stats().delta_terminal_eager_cohort_admissions > 0,
-            "{:#?}",
-            query.stats()
-        );
-        assert!(query.stats().delta_terminal_eager_cohort_parents > 1);
-        assert_eq!(
-            query.stats().delta_terminal_eager_cohort_rows,
-            query.stats().delta_terminal_eager_cohort_parents
-        );
     }
 
     #[test]
@@ -2487,71 +1339,6 @@ mod tests {
         assert_eq!(ordinary, expected);
         assert!(ordinary.iter().all(|(parent, _)| *parent == parent_value));
         assert_eq!(residual, expected);
-    }
-
-    #[test]
-    fn production_program_width_one_yields_after_one_direct_candidate() {
-        let attribute = rngid();
-        let attribute_inline = Inline::<GenId>::new(id_into_value(&attribute));
-        let value = Inline::<UnknownInline>::new([0x5a; INLINE_LEN]);
-        let mut set = TribleSet::new();
-        for _ in 0..64 {
-            set.insert(&Trible::new(&rngid(), &attribute, &value));
-        }
-        let entity = Variable::<GenId>::new(0);
-        let mut query = Query::new(
-            TribleSetConstraint::new(entity, attribute_inline, value, set),
-            |binding: &Binding| binding.get(0).copied(),
-        )
-        .solve_residual_state_lazy();
-
-        assert!(query.next().is_some());
-        assert_eq!(query.stats().delta_source_pages, 1);
-        assert_eq!(query.stats().delta_source_candidates_examined, 1);
-        assert_eq!(query.stats().delta_source_direct_candidates, 1);
-        assert_eq!(query.stats().delta_source_roots, 0);
-        drop(query);
-    }
-
-    #[test]
-    fn repeated_source_negative_pages_keep_publication_and_search_width_separate() {
-        let attribute = Id::new([0xa0; ID_LEN]).unwrap();
-        let other = Id::new([0xf0; ID_LEN]).unwrap();
-        let mut set = TribleSet::new();
-        let mut expected = None;
-        for tag in 1..=9 {
-            let entity = Id::new([tag; ID_LEN]).unwrap();
-            let target = if tag == 9 { entity } else { other };
-            if tag == 9 {
-                expected = Some(id_into_value(&entity));
-            }
-            set.insert(&Trible::force(
-                &entity,
-                &attribute,
-                &Inline::<GenId>::new(id_into_value(&target)),
-            ));
-        }
-
-        let x = Variable::<GenId>::new(0);
-        let mut query = Query::new(
-            TribleSetConstraint::new(x, Inline::<GenId>::new(id_into_value(&attribute)), x, set),
-            |binding: &Binding| binding.get(0).copied(),
-        )
-        .solve_residual_state_lazy();
-
-        assert_eq!(query.next(), expected);
-        assert_eq!(query.stats().delta_source_pages, 4);
-        assert_eq!(query.stats().delta_source_candidates_examined, 9);
-        assert_eq!(query.stats().delta_source_direct_candidates, 1);
-        assert_eq!(query.stats().delta_terminal_calls, 4);
-        assert_eq!(query.stats().delta_nonterminal_calls, 0);
-        assert_eq!(query.stats().delta_terminal_candidates_examined, 9);
-        assert_eq!(query.stats().max_delta_terminal_work_budget, 8);
-        assert_eq!(query.stats().max_delta_terminal_task_cohort, 1);
-        assert_eq!(query.stats().delta_terminal_sparse_widenings, 0);
-        assert_eq!(query.stats().terminal_demand_projected_rows, 1);
-        assert_eq!(query.stats().terminal_demand_width_promotions, 0);
-        drop(query);
     }
 
     #[test]
