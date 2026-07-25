@@ -1,4 +1,12 @@
+#[cfg(feature = "residual")]
 mod succinctarchiveconstraint;
+#[cfg(not(feature = "residual"))]
+#[path = "../../query_classic/succinctarchiveconstraint.rs"]
+mod succinctarchiveconstraint;
+#[cfg(feature = "residual")]
+mod succinctarchiverangeconstraint;
+#[cfg(not(feature = "residual"))]
+#[path = "../../query_classic/succinctarchiverangeconstraint.rs"]
 mod succinctarchiverangeconstraint;
 mod universe;
 
@@ -3137,15 +3145,19 @@ where
 #[cfg(test)]
 mod tests {
     use std::convert::TryInto;
+    #[cfg(feature = "residual")]
     use std::sync::Mutex;
 
     use crate::blob::IntoBlob;
     use crate::id::fucid;
+    #[cfg(feature = "residual")]
     use crate::inline::encodings::genid::GenId;
     use crate::inline::IntoInline;
     use crate::inline::TryToInline;
     use crate::prelude::*;
-    use crate::query::{find, CandidateSink, Candidates, Constraint, RowsView, VariableContext};
+    use crate::query::find;
+    #[cfg(feature = "residual")]
+    use crate::query::{CandidateSink, Candidates, Constraint, RowsView, VariableContext};
     use crate::trible::Trible;
 
     use super::*;
@@ -3155,6 +3167,7 @@ mod tests {
 
     struct ReferencePackedFreeze;
 
+    #[cfg(feature = "residual")]
     struct RecordingRingBatch<'a, U>
     where
         U: Universe,
@@ -3163,6 +3176,7 @@ mod tests {
         calls: Mutex<Vec<(SuccinctRotation, Vec<usize>, Vec<usize>)>>,
     }
 
+    #[cfg(feature = "residual")]
     impl<U> RingBatchQuery for RecordingRingBatch<'_, U>
     where
         U: Universe + Send + Sync,
@@ -3227,6 +3241,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "residual")]
     #[test]
     fn external_ring_batch_preserves_confirm_results() {
         fn make_trible(entity: u8, attribute: u8, value: u8) -> Trible {
@@ -3677,6 +3692,54 @@ mod tests {
         assert_eq!(
             vec![((&juliet).to_inline(), "Juliet".try_to_inline().unwrap(),)],
             r
+        );
+    }
+
+    #[test]
+    fn archive_pattern_repeated_positions_match_the_same_relation() {
+        let self_edge = fucid();
+        let non_self = fucid();
+        let attribute = fucid();
+        let self_value: Inline<GenId> = (&self_edge).to_inline();
+        let non_self_value: Inline<GenId> = (&non_self).to_inline();
+
+        let set: TribleSet = [
+            Trible::new(&self_edge, &attribute, &self_value),
+            Trible::new(&non_self, &attribute, &self_value),
+            Trible::new(&self_edge, &attribute, &non_self_value),
+        ]
+        .into_iter()
+        .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+
+        let actual: Vec<Inline<GenId>> = find!(
+            x: Inline<GenId>,
+            archive.pattern(x, (&attribute).to_inline(), x)
+        )
+        .collect();
+        assert_eq!(actual, vec![self_value]);
+    }
+
+    #[test]
+    fn archive_fully_constant_pattern_is_exact_at_the_seed() {
+        let entity = fucid();
+        let attribute = fucid();
+        let value: Inline<GenId> = fucid().to_inline();
+        let missing: Inline<GenId> = fucid().to_inline();
+        let set: TribleSet = [Trible::new(&entity, &attribute, &value)]
+            .into_iter()
+            .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let entity: Inline<GenId> = (&entity).to_inline();
+        let attribute: Inline<GenId> = (&attribute).to_inline();
+
+        assert_eq!(
+            find!((), archive.pattern(entity, attribute, value)).count(),
+            1
+        );
+        assert_eq!(
+            find!((), archive.pattern(entity, attribute, missing)).count(),
+            0
         );
     }
 

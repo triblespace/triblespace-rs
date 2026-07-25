@@ -69,6 +69,7 @@ rustversion = "1.0"
 
 [features]
 default = ["proptest", "object-store", "parallel"]
+residual = []
 proptest = ["dep:proptest"]
 object-store = ["dep:object_store", "dep:tokio", "dep:futures", "dep:url"]
 kani = []

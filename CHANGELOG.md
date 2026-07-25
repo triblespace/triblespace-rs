@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: the query subsystem is now a whole-module choice.** Without the
+  `residual` feature, `triblespace-core` exposes the classic mutable-Binding
+  solver and native scalar constraints; enabling `residual` selects the current
+  block/residual module. TribleSet and SuccinctArchive patterns and range
+  constraints are selected with the module, so neither design adapts through
+  the other protocol. Pattern constants remain pre-bound terms and fully
+  constant patterns are settled exactly.
 - **Whole query-module alternatives own native UnionArchive and diagnostic
   constraints.** The classic arm constructs a scalar `Binding`/`Vec` union
   directly over the current Succinct shards and implements the scalar protocol

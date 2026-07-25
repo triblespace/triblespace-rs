@@ -1,5 +1,17 @@
+#[cfg(feature = "residual")]
 mod triblesetconstraint;
+#[cfg(not(feature = "residual"))]
+#[path = "../query_classic/triblesetconstraint.rs"]
+mod triblesetconstraint;
+#[cfg(feature = "residual")]
 pub mod triblesetidrangeconstraint;
+#[cfg(not(feature = "residual"))]
+#[path = "../query_classic/triblesetidrangeconstraint.rs"]
+pub mod triblesetidrangeconstraint;
+#[cfg(feature = "residual")]
+pub mod triblesetrangeconstraint;
+#[cfg(not(feature = "residual"))]
+#[path = "../query_classic/triblesetrangeconstraint.rs"]
 pub mod triblesetrangeconstraint;
 
 use triblesetconstraint::*;

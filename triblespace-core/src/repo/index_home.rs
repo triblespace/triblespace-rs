@@ -11,25 +11,31 @@ use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "residual"))]
 use std::cell::Cell;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
-    SuccinctArchiveBlob, SuccinctArchiveConstraint, SuccinctArchiveRank9IndexBlob, Universe,
-    WaveletMatrixFreezeBackend,
+    SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob, WaveletMatrixFreezeBackend,
 };
+#[cfg(feature = "residual")]
+use crate::blob::encodings::succinctarchive::{SuccinctArchiveConstraint, Universe};
 use crate::blob::Blob;
 use crate::find;
 use crate::id::{ExclusiveId, Id};
+#[cfg(feature = "residual")]
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::iu256::U256BE;
-use crate::inline::{Inline, InlineEncoding, RawInline};
+use crate::inline::Inline;
+#[cfg(feature = "residual")]
+use crate::inline::{InlineEncoding, RawInline};
 use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
+#[cfg(feature = "residual")]
 use crate::query::unionconstraint::UnionConstraint;
+#[cfg(feature = "residual")]
 use crate::query::{
     ActionUnitClasses, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
     ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote, ProgramCompletion,
@@ -1301,11 +1307,13 @@ impl<'a, U> UnionArchive<'a, U> {
     /// The storage view owns no query protocol. Whole query-module
     /// alternatives use this crate-private seam to construct their native
     /// constraints without adapting one protocol through another.
+    #[cfg(not(feature = "residual"))]
     pub(crate) fn segments(&self) -> &'a [SuccinctArchive<U>] {
         self.segments
     }
 }
 
+#[cfg(feature = "residual")]
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnionArchiveProgramState {
@@ -1317,27 +1325,31 @@ pub enum UnionArchiveProgramState {
     Support,
 }
 
+#[cfg(feature = "residual")]
 const UNION_ARCHIVE_PROPOSE_ROUTE: u32 = 1 << 8;
+#[cfg(feature = "residual")]
 const UNION_ARCHIVE_SUPPORT_ROUTE: u32 = 3 << 8;
 
+#[cfg(feature = "residual")]
 const UNION_ARCHIVE_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
+#[cfg(feature = "residual")]
 const UNION_ARCHIVE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "residual"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct UnionCompleteWalkCounts {
     located: usize,
     consumed: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "residual"))]
 thread_local! {
     static UNION_COMPLETE_WALK_COUNTS: Cell<Option<UnionCompleteWalkCounts>> = const {
         Cell::new(None)
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "residual"))]
 fn arm_union_complete_walk_counts() {
     UNION_COMPLETE_WALK_COUNTS.with(|counts| {
         assert!(counts
@@ -1346,7 +1358,7 @@ fn arm_union_complete_walk_counts() {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "residual"))]
 fn record_union_complete_walk_located() {
     UNION_COMPLETE_WALK_COUNTS.with(|counts| {
         if let Some(mut count) = counts.get() {
@@ -1356,7 +1368,7 @@ fn record_union_complete_walk_located() {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "residual"))]
 fn record_union_complete_walk_consumed() {
     UNION_COMPLETE_WALK_COUNTS.with(|counts| {
         if let Some(mut count) = counts.get() {
@@ -1366,7 +1378,7 @@ fn record_union_complete_walk_consumed() {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "residual"))]
 fn take_union_complete_walk_counts() -> UnionCompleteWalkCounts {
     UNION_COMPLETE_WALK_COUNTS.with(|counts| {
         counts
@@ -1389,6 +1401,7 @@ fn take_union_complete_walk_counts() -> UnionCompleteWalkCounts {
 /// union. The constraint deliberately stays structurally opaque so formula
 /// lowering cannot split the normalized source back into independently
 /// materialized union arms.
+#[cfg(feature = "residual")]
 pub struct UnionArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -1398,6 +1411,7 @@ where
     terms: [RawTerm; 3],
 }
 
+#[cfg(feature = "residual")]
 impl<'a, U> UnionArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -1534,6 +1548,7 @@ where
     }
 }
 
+#[cfg(feature = "residual")]
 impl<U> TypedProgramSpec for UnionArchiveConstraint<'_, U>
 where
     U: Universe,
@@ -1922,6 +1937,7 @@ where
     }
 }
 
+#[cfg(feature = "residual")]
 impl<'a, U> Constraint<'a> for UnionArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -2065,6 +2081,7 @@ where
     }
 }
 
+#[cfg(feature = "residual")]
 impl<'a, U> TriblePattern for UnionArchive<'a, U>
 where
     U: Universe + Send + Sync,
@@ -2095,7 +2112,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "residual"))]
 mod tests {
     use super::*;
     use crate::blob::encodings::succinctarchive::{RingBatchQuery, SuccinctRotation};
