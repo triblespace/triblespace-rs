@@ -1208,9 +1208,10 @@ mod parallel {
 /// | `name?` | inferred type, yield `Result<T, E>` (no filter) |
 /// | `name: Type?` | explicit type, yield `Result<T, E>` (no filter) |
 ///
-/// The unit form `find!((), constraint)` projects no variables and yields one
-/// `()` for every matching row. This is useful when you only care about
-/// existence, counting, or composing the query without returning values.
+/// The unit form `find!((), constraint)` projects no variables and therefore
+/// has one possible SET result: it yields at most one `()`, exactly when a
+/// complete assignment exists. Use it for existence or composition, not for
+/// counting hidden witnesses.
 ///
 /// **Filter semantics (default):** when a variable's conversion fails the
 /// entire row is silently skipped — like a constraint that doesn't match.
@@ -1728,6 +1729,81 @@ mod classic_tests {
 
         let query = Query::new_projected(ZeroVariable(true), [], |_| None::<Rc<()>>);
         assert_send(&query);
+    }
+
+    #[test]
+    fn mapper_panic_claims_nonempty_and_empty_projection_keys_before_unwind() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let rows = vec![(raw(1), raw(10)), (raw(2), raw(20)), (raw(3), raw(30))].into_boxed_slice();
+        let mut query = Query::new(
+            FinitePairs {
+                left: 0,
+                right: 1,
+                rows: rows.into(),
+            },
+            move |binding| {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("intentional mapper unwind");
+                }
+                Some((
+                    *binding.get(0).expect("left is bound"),
+                    *binding.get(1).expect("right is bound"),
+                ))
+            },
+        );
+
+        assert!(catch_unwind(AssertUnwindSafe(|| query.next())).is_err());
+        assert_eq!(query.collect::<Vec<_>>().len(), 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the raw key claimed before panic must not revisit the mapper"
+        );
+
+        let empty_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&empty_calls);
+        let mut empty = Query::new_projected(ZeroVariable(true), [], move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            panic!("intentional empty-head mapper unwind");
+            #[allow(unreachable_code)]
+            Some(())
+        });
+        assert!(catch_unwind(AssertUnwindSafe(|| empty.next())).is_err());
+        assert!(empty.next().is_none());
+        assert_eq!(empty_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn ordinary_started_clones_snapshot_claims_and_exact_dfs_remainder() {
+        let rows = vec![
+            (raw(1), raw(10)),
+            (raw(1), raw(11)),
+            (raw(2), raw(20)),
+            (raw(2), raw(21)),
+            (raw(3), raw(30)),
+        ]
+        .into_boxed_slice();
+        let mut query = Query::new_projected(
+            FinitePairs {
+                left: 0,
+                right: 1,
+                rows: rows.into(),
+            },
+            [0],
+            |binding| binding.get(0).copied(),
+        );
+
+        assert!(query.next().is_some());
+        let snapshot = query.clone();
+        assert_eq!(
+            query.collect::<Vec<_>>(),
+            snapshot.collect::<Vec<_>>(),
+            "ordinary clones must not share a claim domain or steal remainder rows"
+        );
     }
 
     #[cfg(feature = "parallel")]
