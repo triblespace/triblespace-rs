@@ -138,15 +138,19 @@ struct FormulaNodeCapabilities {
     parent_atomic_program_confirms: Box<[(VariableId, VariableSet)]>,
 }
 
-/// Selects the typed Program route for an action.
+/// Selects the typed Machine route for a recurrent action.
 ///
-/// Structurally absent routes use the ordinary constraint protocol.
+/// Finite actions stay on the ordinary unordered constraint protocol. Only a
+/// route whose continuation genuinely computes a least fixpoint needs the
+/// stateful Program machinery; structurally absent and finite routes are both
+/// indivisible ordinary actions.
 fn select_program<'r, 'a>(
     constraint: &'r dyn Constraint<'a>,
     request: ProgramRequest,
 ) -> Option<(ProgramRef<'r>, ProgramRoute)> {
     let program = constraint.residual_program()?;
     let route = program.route(request)?;
+    (route.stratum == ProgramStratum::Fixpoint).then_some(())?;
     Some((program, route))
 }
 
@@ -13359,6 +13363,45 @@ mod tests {
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             Some(ProgramRef::new(&DECLINING_PROGRAM))
         }
+    }
+
+    #[test]
+    fn finite_program_route_is_an_ordinary_indivisible_action() {
+        let proposes = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(AtomicUsize::new(0));
+        let leaf = PagedProposalLeaf {
+            variable: 0,
+            values: Arc::new((1..=8).map(raw).collect()),
+            proposes: Arc::clone(&proposes),
+            pages: Arc::clone(&pages),
+            action_log: None,
+        };
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(leaf.variable),
+            bound: VariableSet::new_empty(),
+        };
+
+        assert!(
+            leaf.residual_program()
+                .and_then(|program| program.route(request))
+                .is_some_and(|route| route.stratum == ProgramStratum::Finite),
+            "the fixture must expose a structurally valid finite Program route"
+        );
+        assert!(
+            select_program(&leaf, request).is_none(),
+            "finite work is not a stateful Machine activation"
+        );
+
+        let mut actual =
+            Query::new(leaf, |binding: &Binding| binding.get(0).copied()).collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, (1..=8).map(raw).collect::<Vec<_>>());
+        assert!(proposes.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            pages.load(Ordering::Relaxed),
+            0,
+            "the finite Program implementation must not be entered"
+        );
     }
 
     #[test]
