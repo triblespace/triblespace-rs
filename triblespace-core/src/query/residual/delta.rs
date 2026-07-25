@@ -1072,6 +1072,11 @@ enum DeltaReducer {
     /// Emission inherits the ordinary streaming proposal's discovery order;
     /// only bag equality with the sorted quiescent formula result is promised.
     StreamFormulaProposal,
+    /// Accepted values first enter the master OR accumulator, then novel
+    /// admissions may leave through this effect-only completed OR Plan. The
+    /// master action itself advances exactly once when the producer reaches
+    /// EOF.
+    StreamFormulaOrProposal { exit: FormulaPcId },
     /// Accepted values remain private until the enclosing formula action has
     /// proved quiescence. Every direct occurrence and newly accepted endpoint
     /// is appended as it is discovered, so the quiescence handoff performs no
@@ -1125,7 +1130,22 @@ impl DeltaReducer {
     }
 
     fn streams(&self) -> bool {
-        matches!(self, Self::StreamProposal | Self::StreamFormulaProposal)
+        matches!(
+            self,
+            Self::StreamProposal
+                | Self::StreamFormulaProposal
+                | Self::StreamFormulaOrProposal { .. }
+        )
+    }
+
+    fn formula_proposal(streaming: FormulaProposalStreaming) -> Self {
+        match streaming {
+            FormulaProposalStreaming::Quiescent => Self::quiescent_proposal(),
+            FormulaProposalStreaming::Linear => Self::StreamFormulaProposal,
+            FormulaProposalStreaming::OnlineDirectOr { exit } => {
+                Self::StreamFormulaOrProposal { exit }
+            }
+        }
     }
 
     fn retain_quiescent_proposal_page(&mut self, values: Vec<RawInline>) {
@@ -1436,11 +1456,15 @@ impl Eq for DeltaCompletion {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeltaStreamingEffect {
     Candidates,
+    FormulaOrCandidates { exit: FormulaPcId },
     Support,
 }
 
 struct DeltaStreamingReturn {
-    return_to: DeltaReturn,
+    /// Online OR effects intentionally carry no pre-admission payload clone;
+    /// their exact return is cloned from the master only after first
+    /// admission succeeds.
+    return_to: Option<DeltaReturn>,
     effect: DeltaStreamingEffect,
 }
 
@@ -2870,7 +2894,8 @@ impl ProducerRegistry {
             match &activation.reducer {
                 DeltaReducer::QuiescentProposal { .. }
                 | DeltaReducer::StreamProposal
-                | DeltaReducer::StreamFormulaProposal => {}
+                | DeltaReducer::StreamFormulaProposal
+                | DeltaReducer::StreamFormulaOrProposal { .. } => {}
                 DeltaReducer::Support { .. }
                 | DeltaReducer::PositiveSupport { .. }
                 | DeltaReducer::Confirm { .. }
@@ -3238,7 +3263,12 @@ impl ProducerRegistry {
                 .expect("unknown program activation");
             match (&mut activation.reducer, &mut activation.return_to) {
                 (DeltaReducer::QuiescentProposal { .. }, _) => {}
-                (DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal, _) => {
+                (
+                    DeltaReducer::StreamProposal
+                    | DeltaReducer::StreamFormulaProposal
+                    | DeltaReducer::StreamFormulaOrProposal { .. },
+                    _,
+                ) => {
                     for value in prior_observed.drain(..).chain(direct.drain(..)) {
                         if activation.accepted.insert(value) {
                             accepted.push(value);
@@ -3358,9 +3388,9 @@ impl ProducerRegistry {
                 .get(&activation_id)
                 .expect("unknown program activation");
             match &activation.reducer {
-                DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
-                    !accepted.is_empty()
-                }
+                DeltaReducer::StreamProposal
+                | DeltaReducer::StreamFormulaProposal
+                | DeltaReducer::StreamFormulaOrProposal { .. } => !accepted.is_empty(),
                 DeltaReducer::Support { published } => {
                     !*published && (reported_support || !accepted.is_empty())
                 }
@@ -3782,6 +3812,10 @@ impl ProducerRegistry {
                 assert!(matches!(&activation.return_to, DeltaReturn::Formula { .. }));
                 DeltaStreamingEffect::Candidates
             }
+            DeltaReducer::StreamFormulaOrProposal { exit } => {
+                assert!(matches!(&activation.return_to, DeltaReturn::Formula { .. }));
+                DeltaStreamingEffect::FormulaOrCandidates { exit: *exit }
+            }
             DeltaReducer::Support { published } if !*published => {
                 assert!(matches!(&activation.return_to, DeltaReturn::Formula { .. }));
                 *published = true;
@@ -3797,10 +3831,38 @@ impl ProducerRegistry {
             | DeltaReducer::FormulaOrAdmit
             | DeltaReducer::FormulaOrEmit { .. } => return None,
         };
-        Some(DeltaStreamingReturn {
-            return_to: activation.return_to.clone(),
-            effect,
-        })
+        let return_to = (!matches!(effect, DeltaStreamingEffect::FormulaOrCandidates { .. }))
+            .then(|| activation.return_to.clone());
+        Some(DeltaStreamingReturn { return_to, effect })
+    }
+
+    /// Filters one accepted endpoint page through the live master OR frame
+    /// before any effect clone can observe it. The returned payload clone is
+    /// taken only after mutation, so later arms and the EOF continuation share
+    /// the same first-admission history without mutable aliases.
+    fn publish_formula_or_candidates(
+        &mut self,
+        activation: ActivationId,
+        accepted: &mut Vec<RawInline>,
+    ) -> Option<DeltaReturn> {
+        let activation = self
+            .state
+            .activations
+            .get_mut(&activation)
+            .expect("unknown delta activation");
+        assert!(matches!(
+            activation.reducer,
+            DeltaReducer::StreamFormulaOrProposal { .. }
+        ));
+        let DeltaReturn::Formula { batch, .. } = &mut activation.return_to else {
+            panic!("an online Formula OR reducer lost its Formula return")
+        };
+        assert_eq!(
+            batch.parents.row_count, 1,
+            "an online Formula OR reducer must own exactly one affine parent"
+        );
+        accepted.retain(|&value| batch.publish_current_or_value(0, value));
+        (!accepted.is_empty()).then(|| activation.return_to.clone())
     }
 
     /// Observes an idempotent typed Boolean support effect.
@@ -3825,7 +3887,7 @@ impl ProducerRegistry {
         }
         *published = true;
         Some(DeltaStreamingReturn {
-            return_to: activation.return_to.clone(),
+            return_to: Some(activation.return_to.clone()),
             effect: DeltaStreamingEffect::Support,
         })
     }
@@ -3845,6 +3907,9 @@ impl ProducerRegistry {
         let effect = match activation.reducer {
             DeltaReducer::StreamProposal | DeltaReducer::StreamFormulaProposal => {
                 DeltaCompletion::Cleanup
+            }
+            DeltaReducer::StreamFormulaOrProposal { .. } => {
+                DeltaCompletion::Candidates(CandidatePayload::empty(1))
             }
             DeltaReducer::QuiescentProposal { occurrences } => {
                 assert!(
@@ -6390,7 +6455,7 @@ impl DeltaScheduler {
         cursor: FormulaCursor,
         stage: FormulaStage,
         batch: FormulaBatch,
-        stream_proposal: bool,
+        proposal_streaming: FormulaProposalStreaming,
         plan: &ResidualPlan,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -6404,8 +6469,7 @@ impl DeltaScheduler {
         for mut batch in singletons {
             let reducer = match stage {
                 FormulaStage::Support => DeltaReducer::Support { published: false },
-                FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
-                FormulaStage::Propose => DeltaReducer::quiescent_proposal(),
+                FormulaStage::Propose => DeltaReducer::formula_proposal(proposal_streaming),
                 FormulaStage::Confirm => DeltaReducer::Confirm {
                     original: batch.take_contiguous_confirm_original(),
                 },
@@ -6803,7 +6867,7 @@ impl DeltaScheduler {
         stage: FormulaStage,
         batch: FormulaBatch,
         seeds: Vec<ResidualDeltaSeed>,
-        stream_proposal: bool,
+        proposal_streaming: FormulaProposalStreaming,
         plan: &ResidualPlan,
         stable: &mut Worklist,
         stable_interner: &mut StateInterner,
@@ -6821,8 +6885,7 @@ impl DeltaScheduler {
         for (mut batch, range) in singletons.into_iter().zip(ranges) {
             let reducer = match stage {
                 FormulaStage::Support => DeltaReducer::Support { published: false },
-                FormulaStage::Propose if stream_proposal => DeltaReducer::StreamFormulaProposal,
-                FormulaStage::Propose => DeltaReducer::quiescent_proposal(),
+                FormulaStage::Propose => DeltaReducer::formula_proposal(proposal_streaming),
                 FormulaStage::Confirm => DeltaReducer::Confirm {
                     original: batch.take_confirm_original(),
                 },
@@ -6901,7 +6964,7 @@ impl DeltaScheduler {
         cursor: FormulaCursor,
         stage: FormulaStage,
         batch: FormulaBatch,
-        stream_proposal: bool,
+        proposal_streaming: FormulaProposalStreaming,
     ) -> Option<ActiveDeltaContinuation> {
         let singletons = batch.into_singletons(bound.count());
         let mut tasks = Vec::with_capacity(singletons.len());
@@ -6910,10 +6973,7 @@ impl DeltaScheduler {
                 FormulaStage::Support => {
                     unreachable!("support has no delta source reducer")
                 }
-                FormulaStage::Propose if stream_proposal => {
-                    (DeltaReducer::StreamFormulaProposal, None)
-                }
-                FormulaStage::Propose => (DeltaReducer::quiescent_proposal(), None),
+                FormulaStage::Propose => (DeltaReducer::formula_proposal(proposal_streaming), None),
                 FormulaStage::Confirm => {
                     let original = batch.take_contiguous_confirm_original();
                     let mut source_candidates = original.one_parent_values().to_vec();
@@ -7508,7 +7568,7 @@ impl DeltaScheduler {
         &mut self,
         activation: ActivationId,
         streamed: DeltaStreamingReturn,
-        accepted: Vec<RawInline>,
+        mut accepted: Vec<RawInline>,
         direct_terminal_full: Option<VariableSet>,
         plan: &ResidualPlan,
         stable: &mut Worklist,
@@ -7517,7 +7577,9 @@ impl DeltaScheduler {
     ) -> DeltaStreamingRelease {
         if streamed.effect == DeltaStreamingEffect::Support {
             let released = self.release_support(
-                streamed.return_to,
+                streamed
+                    .return_to
+                    .expect("a streaming support effect lost its exact return"),
                 true,
                 plan,
                 stable,
@@ -7533,11 +7595,32 @@ impl DeltaScheduler {
             };
         }
         debug_assert!(!accepted.is_empty());
+        // Callers account raw occurrences minus activation-local Accepted;
+        // preserve that identity even when master OR admission suppresses an
+        // endpoint already published by another arm.
         stats.candidates_proposed += accepted.len();
         stats.max_propose_candidates = stats.max_propose_candidates.max(accepted.len());
+        let effect = streamed.effect;
+        let return_to = if matches!(effect, DeltaStreamingEffect::FormulaOrCandidates { .. }) {
+            let Some(return_to) = self
+                .registry
+                .publish_formula_or_candidates(activation, &mut accepted)
+            else {
+                return DeltaStreamingRelease {
+                    stable: DeltaStableEffects::default(),
+                    active: None,
+                };
+            };
+            return_to
+        } else {
+            streamed
+                .return_to
+                .expect("an ordinary streaming effect lost its exact return")
+        };
+        debug_assert!(!accepted.is_empty());
         let candidates = CandidatePayload::Values(accepted);
         if let Some(full) = direct_terminal_full {
-            let DeltaReturn::Stable { desc, parent, .. } = streamed.return_to else {
+            let DeltaReturn::Stable { desc, parent, .. } = return_to else {
                 panic!("a direct-terminal publication returned through a formula")
             };
             let ResidualPhase::Candidate {
@@ -7575,8 +7658,45 @@ impl DeltaScheduler {
                 active: None,
             };
         }
+        if let DeltaStreamingEffect::FormulaOrCandidates { exit } = effect {
+            let DeltaReturn::Formula {
+                bound,
+                cursor,
+                batch,
+            } = return_to
+            else {
+                panic!("an online Formula OR effect lost its Formula return")
+            };
+            let mut reducer_seeds = Vec::new();
+            let continuation = finish_formula_or_emission(
+                plan,
+                bound,
+                cursor.with_pc(exit),
+                batch,
+                candidates,
+                stable,
+                stable_interner,
+                stats,
+                &mut reducer_seeds,
+            );
+            let mut drained = self.drain_formula_reducer_seeds(
+                reducer_seeds,
+                plan,
+                stable,
+                stable_interner,
+                stats,
+            );
+            prefer_continuation(&mut drained.continuation, continuation);
+            return DeltaStreamingRelease {
+                stable: DeltaStableEffects {
+                    continuation: drained.continuation,
+                    publication: None,
+                },
+                active: drained.active,
+            };
+        }
         let mut reducer_seeds = Vec::new();
-        let continuation = match streamed.return_to {
+        let continuation = match return_to {
             DeltaReturn::Stable { desc, parent, .. } => file_with_plan(
                 stable,
                 stable_interner,
@@ -18355,6 +18475,59 @@ mod tests {
     }
 
     #[test]
+    fn online_or_direct_source_publishes_before_same_receipt_quiescence() {
+        let exit = FormulaPcId(13);
+        let mut registry = ProducerRegistry::new();
+        let (activation, generator) = registry.start_source(
+            DeltaReducer::StreamFormulaOrProposal { exit },
+            support_formula_return(),
+            None,
+        );
+        let outcome = registry.replace_source(generator, std::iter::empty(), [value(7)], None);
+        assert_eq!(outcome.accepted, [value(7)]);
+        let proof = outcome
+            .quiescence
+            .expect("the accepting direct source page also reached EOF");
+
+        let streamed = registry
+            .take_streaming_return(activation)
+            .expect("same-step acceptance lost its online effect receipt");
+        assert_eq!(
+            streamed.effect,
+            DeltaStreamingEffect::FormulaOrCandidates { exit }
+        );
+        assert!(
+            streamed.return_to.is_none(),
+            "online receipt cloned its Formula payload before master admission"
+        );
+        let mut accepted = outcome.accepted;
+        let admitted = registry
+            .publish_formula_or_candidates(activation, &mut accepted)
+            .expect("the first endpoint was not admitted");
+        assert_eq!(accepted, [value(7)]);
+        let DeltaReturn::Formula { batch, .. } = admitted else {
+            panic!("online admission returned the wrong continuation shape")
+        };
+        let (_, accumulator) = batch.last_or().expect("online admission lost its OR cell");
+        assert_eq!(accumulator.sets[0].len(), 1);
+        assert_eq!(accumulator.pending_len(), 0);
+
+        let RegistrySettlement::Completed(completed) = registry.settle_quiescence(proof) else {
+            panic!("online OR EOF manufactured finalizer work")
+        };
+        assert!(matches!(
+            completed.effect,
+            DeltaCompletion::Candidates(ref candidates) if candidates.is_empty()
+        ));
+        let DeltaReturn::Formula { batch, .. } = completed.return_to else {
+            panic!("online OR EOF lost its master Formula return")
+        };
+        let (_, accumulator) = batch.last_or().expect("online EOF lost its OR cell");
+        assert_eq!(accumulator.sets[0].len(), 1);
+        assert_eq!(accumulator.pending_len(), 0);
+    }
+
+    #[test]
     fn support_reducer_publishes_only_the_first_distinct_witness() {
         let mut registry = ProducerRegistry::new();
         let started = registry.start_many(
@@ -18373,7 +18546,10 @@ mod tests {
             .take_streaming_return(activation)
             .expect("the first witness publishes support");
         assert_eq!(streamed.effect, DeltaStreamingEffect::Support);
-        assert!(matches!(streamed.return_to, DeltaReturn::Formula { .. }));
+        assert!(matches!(
+            streamed.return_to,
+            Some(DeltaReturn::Formula { .. })
+        ));
 
         let second =
             registry.replace_traversal(second_root, [output(7, 2, true), output(8, 2, true)]);

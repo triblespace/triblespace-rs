@@ -813,6 +813,32 @@ fn formula_bound_start_root(set: TribleSet, start: Inline<GenId>, ops: &[PathOp]
     ]))
 }
 
+fn prefixed_formula_bound_start_root(
+    set: TribleSet,
+    start: Inline<GenId>,
+    prefix: Vec<RawInline>,
+    ops: &[PathOp],
+) -> Root {
+    let start_var = Variable::<GenId>::new(START);
+    let end_var = Variable::<GenId>::new(END);
+    let cyclic =
+        Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint;
+    let mut arms: Vec<DynConstraint> = prefix
+        .into_iter()
+        .map(|value| {
+            Box::new(IntersectionConstraint::new(vec![
+                Box::new(start_var.is(start)) as DynConstraint,
+                Box::new(end_var.is(Inline::<GenId>::new(value))) as DynConstraint,
+            ])) as DynConstraint
+        })
+        .collect();
+    arms.push(cyclic);
+    Arc::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(start)) as DynConstraint,
+        Box::new(UnionConstraint::new(arms)) as DynConstraint,
+    ]))
+}
+
 fn bound_end_root(set: TribleSet, end: Inline<GenId>, ops: &[PathOp]) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
@@ -2060,27 +2086,169 @@ fn ordinary_shape_selected_query_composes_root_formula_union_and_cyclic_rpq() {
 }
 
 #[test]
-fn finite_or_keeps_cyclic_proposals_private_until_fixpoint_quiescence() {
+fn production_union_leaf_streams_first_exact_or_value_before_fixpoint() {
     let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let ops = repeated(graph.attribute, false);
     let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(combined_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
 
-    assert!(query.next().is_some());
+    let first = query.next().expect("the exact OR arm has one endpoint");
+    assert_eq!(first, graph.value(1).raw);
     assert_eq!(
         query.stats().delta_transition_pages,
-        8,
-        "the finite OR waits for the complete cyclic arm"
+        1,
+        "the production Union leaf crossed an EOF barrier before first output"
     );
     assert_eq!(
         query.stats().delta_transition_candidates_examined,
-        7,
-        "an OR arm must not publish a partial cyclic proposal"
+        1,
+        "the production Union leaf drained the cyclic fixpoint before first output"
     );
-    drop(query);
+    assert_eq!(query.current_width(), 1);
+    assert_eq!(query.stats().width_increases, 0);
+
+    let exact_clone = query.clone();
+    let cancelled = query.clone();
+    drop(cancelled);
+    let mut actual = vec![first];
+    actual.extend(query);
+    let mut cloned = vec![first];
+    cloned.extend(exact_clone);
+    actual.sort_unstable();
+    cloned.sort_unstable();
+    assert_eq!(cloned, actual);
+    let mut expected = (1..8).map(|node| graph.value(node).raw).collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn production_online_or_promotes_pending_finite_duplicates_without_final_replay() {
+    let graph = Graph::new(4, &[(0, 1), (1, 2)]);
+    let first_cyclic = graph.value(1).raw;
+    let pending_only = graph.value(3).raw;
+    let root = prefixed_formula_bound_start_root(
+        graph.set.clone(),
+        graph.value(0),
+        vec![first_cyclic, pending_only],
+        &repeated(graph.attribute, false),
+    );
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy()
+        .cap(1)
+        .start_width(1);
+
+    let first = query
+        .next()
+        .expect("the cyclic arm did not promote its pending duplicate");
+    assert_eq!(first, first_cyclic);
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
+    let mut actual = vec![first];
+    actual.extend(query);
+    actual.sort_unstable();
+    let mut expected = vec![first_cyclic, graph.value(2).raw, pending_only];
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn empty_online_or_arm_advances_its_finite_sibling_once() {
+    let graph = Graph::new(1, &[]);
+    let node = Variable::<GenId>::new(START);
+    let survivor = graph.value(0).raw;
+    let cyclic = Box::new(RegularPathConstraint::new(
+        graph.set.clone(),
+        node,
+        node,
+        &repeated(graph.attribute, false),
+    )) as DynConstraint;
+    let sibling = Box::new(OrderedDomain {
+        variable: START,
+        gate: START,
+        unbound_estimate: 10,
+        values: vec![survivor],
+    }) as DynConstraint;
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(UnionConstraint::new(vec![cyclic, sibling])) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_start)
+        .solve_residual_state_lazy()
+        .cap(1)
+        .start_width(1);
+
+    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![survivor]);
+    assert_eq!(query.stats().delta_source_pages, 1);
+    assert_eq!(
+        query.stats().candidates_proposed,
+        1,
+        "empty-arm EOF replayed the finite sibling"
+    );
+}
+
+#[test]
+fn production_online_or_keeps_admission_affine_across_parent_splits() {
+    let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
+    let start = Variable::<GenId>::new(START);
+    let end = Variable::<GenId>::new(END);
+    let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(DuplicateParents {
+            outer_values,
+            start: graph.value(0).raw,
+        }) as DynConstraint,
+        Box::new(UnionConstraint::new(vec![
+            Box::new(RegularPathConstraint::new(
+                graph.set.clone(),
+                start,
+                end,
+                &repeated(graph.attribute, false),
+            )) as DynConstraint,
+        ])) as DynConstraint,
+    ]));
+    let project =
+        |binding: &Binding| Some((binding.get(OUTER).copied()?, binding.get(END).copied()?));
+
+    let mut query = Query::new(Arc::clone(&root), project)
+        .solve_residual_state_lazy()
+        .cap(1)
+        .start_width(1);
+    let first = query
+        .next()
+        .expect("neither affine parent published its first endpoint");
+    assert_eq!(query.stats().delta_transition_candidates_examined, 1);
+    let mut actual = vec![first];
+    actual.extend(query);
+    actual.sort_unstable();
+
+    let endpoints = (1..8).map(|node| graph.value(node).raw);
+    let mut expected = outer_values
+        .into_iter()
+        .flat_map(|parent| endpoints.clone().map(move |endpoint| (parent, endpoint)))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(actual.windows(2).all(|pair| pair[0] != pair[1]));
+
+    #[cfg(feature = "parallel")]
+    for workers in [1, 4] {
+        let mut parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap()
+            .install(|| {
+                Query::new(Arc::clone(&root), project)
+                    .solve_residual_state_lazy()
+                    .cap(1)
+                    .start_width(1)
+                    .into_par_iter()
+                    .collect::<Vec<_>>()
+            });
+        parallel.sort_unstable();
+        assert_eq!(parallel, expected, "workers={workers}");
+    }
 }
 
 #[test]

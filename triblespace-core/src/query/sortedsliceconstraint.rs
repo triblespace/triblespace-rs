@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn quiescent_union_program_pages_keep_occurrences_private_until_normalization() {
+    fn online_union_program_pages_publish_novel_values_without_replaying_occurrences() {
         let left = [value(1), value(1), value(2)];
         let right = [value(2), value(3)];
         let left = SortedSlice::new(&left).unwrap();
@@ -604,9 +604,9 @@ mod tests {
         assert_eq!(query.stats().delta_source_direct_candidates, 5);
         assert_eq!(query.stats().delta_source_roots, 0);
         assert_eq!(query.stats().delta_source_pages, 5);
-        // Each typed source page stays private to its Union arm;
-        // normalization emits the three distinct values only after both arms
-        // reach quiescence.
-        assert_eq!(query.stats().max_propose_candidates, 3);
+        // Exact direct-Union admission publishes each novel value online. The
+        // duplicate source occurrences are still examined, but no normalized
+        // three-value replay page is required after both arms quiesce.
+        assert_eq!(query.stats().max_propose_candidates, 1);
     }
 }

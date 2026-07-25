@@ -92,7 +92,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use ahash::{AHashMap, AHashSet};
-use im::{OrdSet, Vector};
+use im::{OrdMap, OrdSet, Vector};
 use indexmap::IndexSet;
 use smallvec::SmallVec;
 
@@ -233,7 +233,31 @@ fn parent_atomic_program_confirm_is_active(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaProposalStreamability {
     Linear,
+    /// The focused Atom is a direct child of this OR Plan. Each novel
+    /// endpoint may leave through a completed clone of that Plan while the
+    /// master activation retains the original arm continuation until EOF.
+    OnlineDirectOr {
+        parent: FormulaPcId,
+    },
     Barrier(FormulaProposalStreamBarrier),
+}
+
+/// Reducer policy obtained from the structural streamability proof.
+///
+/// The effect-only exit is deliberately a PC rather than a Boolean flag: a
+/// streaming reducer can only publish through the exact continuation whose
+/// skipped OR siblings have already been accounted for in the formula grade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormulaProposalStreaming {
+    Quiescent,
+    Linear,
+    OnlineDirectOr { exit: FormulaPcId },
+}
+
+impl FormulaProposalStreaming {
+    fn streams(self) -> bool {
+        !matches!(self, Self::Quiescent)
+    }
 }
 
 /// Whether one value accepted by an exact Confirm transition may enter its
@@ -253,7 +277,6 @@ enum ContinuationPublicationReceipt {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaProposalStreamBarrier {
-    NotSyntheticRoot,
     NotProposalAction,
     OrFrame,
     ActivationReuse,
@@ -1289,6 +1312,7 @@ impl FiniteFormulaProgram {
         let exit = formula_pcs.candidate_exit(cursor);
         let mut completed = focused;
         let mut current = cursor.pc;
+        let mut direct_or = None;
         while let Some(return_to) = formula_pcs.get(current).return_to {
             let address = formula_pcs.return_by_id(return_to);
             if address.kind != FormulaReturnKind::Child {
@@ -1308,19 +1332,30 @@ impl FiniteFormulaProgram {
                 );
             };
             let parent = self.node(*parent_node);
-            let FiniteFormulaNodeKind::And { children } = &parent.kind else {
-                return FormulaProposalStreamability::Barrier(
-                    FormulaProposalStreamBarrier::OrFrame,
-                );
-            };
-            assert_eq!(children[address.child], completed);
-            for (child, &node) in children.iter().enumerate() {
-                if child == address.child || done.contains(child) {
-                    continue;
+            match &parent.kind {
+                FiniteFormulaNodeKind::And { children } => {
+                    assert_eq!(children[address.child], completed);
+                    for (child, &node) in children.iter().enumerate() {
+                        if child == address.child || done.contains(child) {
+                            continue;
+                        }
+                        let streamability =
+                            self.confirm_subtree_streamability(node, exit.variable, bound);
+                        if streamability != FormulaProposalStreamability::Linear {
+                            return streamability;
+                        }
+                    }
                 }
-                let streamability = self.confirm_subtree_streamability(node, exit.variable, bound);
-                if streamability != FormulaProposalStreamability::Linear {
-                    return streamability;
+                FiniteFormulaNodeKind::Or { children }
+                    if current == cursor.pc && direct_or.is_none() =>
+                {
+                    assert_eq!(children[address.child], completed);
+                    direct_or = Some(address.parent);
+                }
+                FiniteFormulaNodeKind::Or { .. } | FiniteFormulaNodeKind::Atom => {
+                    return FormulaProposalStreamability::Barrier(
+                        FormulaProposalStreamBarrier::OrFrame,
+                    );
                 }
             }
             completed = *parent_node;
@@ -1331,7 +1366,9 @@ impl FiniteFormulaProgram {
             Some(completed),
             "formula proposal return stack did not reach its root"
         );
-        FormulaProposalStreamability::Linear
+        direct_or.map_or(FormulaProposalStreamability::Linear, |parent| {
+            FormulaProposalStreamability::OnlineDirectOr { parent }
+        })
     }
 }
 
@@ -1794,13 +1831,8 @@ impl ResidualPlan {
         counter: &FormulaProgramCounter,
         bound: VariableSet,
     ) -> FormulaProposalStreamability {
-        if !self.synthetic_root_formula {
-            return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::NotSyntheticRoot,
-            );
-        }
         let streamability = self.finite_formula.proposal_streamability(counter, bound);
-        if streamability != FormulaProposalStreamability::Linear {
+        if matches!(streamability, FormulaProposalStreamability::Barrier(_)) {
             return streamability;
         }
 
@@ -1820,7 +1852,7 @@ impl ResidualPlan {
                 FormulaProposalStreamBarrier::OuterContinuation,
             );
         }
-        FormulaProposalStreamability::Linear
+        streamability
     }
 
     fn interned_formula_proposal_streamability(
@@ -1829,15 +1861,10 @@ impl ResidualPlan {
         cursor: FormulaCursor,
         bound: VariableSet,
     ) -> FormulaProposalStreamability {
-        if !self.synthetic_root_formula {
-            return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::NotSyntheticRoot,
-            );
-        }
         let streamability =
             self.finite_formula
                 .interned_proposal_streamability(formula_pcs, cursor, bound);
-        if streamability != FormulaProposalStreamability::Linear {
+        if matches!(streamability, FormulaProposalStreamability::Barrier(_)) {
             return streamability;
         }
 
@@ -1860,7 +1887,7 @@ impl ResidualPlan {
                 FormulaProposalStreamBarrier::OuterContinuation,
             );
         }
-        FormulaProposalStreamability::Linear
+        streamability
     }
 
     fn resolve<'r, 'a>(
@@ -4117,6 +4144,37 @@ impl FormulaPcInterner {
         )
     }
 
+    /// Builds the effect-only exit for a streamable OR arm.
+    ///
+    /// The master activation keeps its original Action/Plan lineage. An early
+    /// endpoint resumes through this clone, whose unfinished siblings are
+    /// represented as structurally skipped work so normal completion and
+    /// grade accounting can be reused unchanged.
+    fn skip_remaining_children(
+        &mut self,
+        program: &FiniteFormulaProgram,
+        mut counter: FormulaPcId,
+    ) -> FormulaPcId {
+        let (node, done) = {
+            let record = self.get(counter);
+            let FormulaFocus::Plan { node, done, .. } = &record.focus else {
+                panic!("only a residual formula Plan can skip its remaining children")
+            };
+            (*node, done.clone())
+        };
+        let child_count = program
+            .node(node)
+            .children()
+            .expect("a residual formula Plan named an Atom")
+            .len();
+        for child in 0..child_count {
+            if !done.contains(child) {
+                counter = self.skip_child(program, counter, child);
+            }
+        }
+        counter
+    }
+
     fn complete(&mut self, program: &FiniteFormulaProgram, counter: FormulaPcId) -> FormulaPcId {
         let (node, stage, return_to, grade) = {
             let counter_record = self.get(counter);
@@ -6162,23 +6220,30 @@ fn debug_assert_candidates_grouped(candidates: &CandidatePayload, parent_count: 
 /// Persistent set-valued output owned by one live Formula OR reducer cell.
 ///
 /// The outer vector follows affine parent order.  Each parent owns an
-/// independent ordered set, so equal values in different parents remain
+/// independent ordered map, so equal values in different parents remain
 /// distinct while clones, planning partitions, and bucket reconvergence share
-/// the immutable tree roots.  `unique_len` is a scheduling/empty fast path;
-/// neither it nor the set roots participate in Formula PC identity.
+/// the immutable tree roots. The one-bit admission state keeps the complete
+/// seen set and the final-emission pending subset in one persistent tree;
+/// neither it nor the tree roots participate in Formula PC identity.
 #[derive(Clone, Debug)]
 struct FormulaOrAccumulator {
-    sets: Vector<OrdSet<RawInline>>,
-    unique_len: usize,
+    /// Every admitted value, tagged by whether final OR emission still owes
+    /// it to downstream computation.
+    sets: Vector<OrdMap<RawInline, FormulaOrAdmission>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormulaOrAdmission {
+    Pending,
+    Published,
 }
 
 impl FormulaOrAccumulator {
     fn empty(parent_count: usize) -> Self {
         Self {
-            sets: std::iter::repeat_with(OrdSet::new)
+            sets: std::iter::repeat_with(OrdMap::new)
                 .take(parent_count)
                 .collect(),
-            unique_len: 0,
         }
     }
 
@@ -6188,44 +6253,76 @@ impl FormulaOrAccumulator {
             .sets
             .get_mut(parent)
             .expect("Formula OR admission named an unknown parent");
-        if set.insert(value).is_none() {
-            self.unique_len = self
-                .unique_len
-                .checked_add(1)
-                .expect("Formula OR unique candidate count overflow");
+        if !set.contains_key(&value) {
+            assert!(
+                set.insert(value, FormulaOrAdmission::Pending).is_none(),
+                "new Formula OR value unexpectedly replaced an admission"
+            );
+        }
+    }
+
+    /// Performs master-accumulator first admission for an online arm.
+    ///
+    /// A value first seen by this arm is published immediately. A duplicate
+    /// of a value retained by an earlier finite arm promotes that pending
+    /// value into the online channel exactly once. Values already published
+    /// by another online arm are suppressed.
+    fn publish(&mut self, parent: u32, value: RawInline) -> bool {
+        let parent = parent as usize;
+        let set = self
+            .sets
+            .get_mut(parent)
+            .expect("Formula OR publication named an unknown parent");
+        match set.get(&value).copied() {
+            None => {
+                assert!(
+                    set.insert(value, FormulaOrAdmission::Published).is_none(),
+                    "new Formula OR publication unexpectedly replaced an admission"
+                );
+                true
+            }
+            Some(FormulaOrAdmission::Pending) => {
+                assert_eq!(
+                    set.insert(value, FormulaOrAdmission::Published),
+                    Some(FormulaOrAdmission::Pending)
+                );
+                true
+            }
+            Some(FormulaOrAdmission::Published) => false,
         }
     }
 
     fn append(&mut self, other: Self) {
-        self.unique_len = self
-            .unique_len
-            .checked_add(other.unique_len)
-            .expect("Formula OR unique candidate count overflow");
         self.sets.append(other.sets);
     }
 
     fn take_tail(&mut self, first: usize) -> Self {
         assert!(first > 0 && first < self.sets.len());
         let sets = self.sets.split_off(first);
-        let unique_len = sets.iter().map(OrdSet::len).sum();
-        self.unique_len = self
-            .unique_len
-            .checked_sub(unique_len)
-            .expect("Formula OR tail contained too many unique values");
-        Self { sets, unique_len }
+        Self { sets }
     }
 
-    fn push_parent_set(&mut self, set: OrdSet<RawInline>) {
-        self.unique_len = self
-            .unique_len
-            .checked_add(set.len())
-            .expect("Formula OR unique candidate count overflow");
+    fn push_parent_set(&mut self, set: OrdMap<RawInline, FormulaOrAdmission>) {
         self.sets.push_back(set);
     }
 
-    fn singleton_set(&self) -> OrdSet<RawInline> {
+    fn singleton_pending_set(&self) -> OrdSet<RawInline> {
         assert_eq!(self.sets.len(), 1, "Formula reducer requires one parent");
-        self.sets[0].clone()
+        self.sets[0]
+            .iter()
+            .filter_map(|(value, admission)| {
+                (*admission == FormulaOrAdmission::Pending).then_some(*value)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.sets
+            .iter()
+            .flat_map(OrdMap::values)
+            .filter(|admission| **admission == FormulaOrAdmission::Pending)
+            .count()
     }
 }
 
@@ -6473,6 +6570,15 @@ impl FormulaBatch {
         accumulator.insert(parent, value);
     }
 
+    fn publish_current_or_value(&mut self, parent: u32, value: RawInline) -> bool {
+        assert!(!self.has_current(), "Formula OR published a retained arm");
+        let accumulator = self
+            .last_or_mut()
+            .expect("Formula OR publication lost its reducer cell")
+            .1;
+        accumulator.publish(parent, value)
+    }
+
     fn current_or_set(&self) -> OrdSet<RawInline> {
         assert!(
             !self.has_current(),
@@ -6482,7 +6588,7 @@ impl FormulaBatch {
             .last_or()
             .expect("Formula OR emission lost its reducer cell")
             .1;
-        accumulator.singleton_set()
+        accumulator.singleton_pending_set()
     }
 
     /// Pops one completed OR reducer and installs its ordered/distinct result
@@ -6564,8 +6670,6 @@ impl FormulaBatch {
                 } => {
                     source.all_parents_in(self.parents.row_count)
                         && accumulator.sets.len() == self.parents.row_count
-                        && accumulator.unique_len
-                            == accumulator.sets.iter().map(OrdSet::len).sum::<usize>()
                 }
             }),
             "formula action emitted an invalid candidate row tag"
@@ -11739,17 +11843,44 @@ impl ResidualStateMachine {
         if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom) {
             return Err(task);
         }
-        let stream_proposal = stage == FormulaStage::Propose
-            && plan.interned_formula_proposal_streamability(
+        let proposal_streaming = if stage != FormulaStage::Propose {
+            FormulaProposalStreaming::Quiescent
+        } else {
+            match plan.interned_formula_proposal_streamability(
                 &self.interner.formula_pcs,
                 cursor,
                 task.desc.bound,
-            ) == FormulaProposalStreamability::Linear;
-        if stream_proposal {
-            assert!(
+            ) {
+                FormulaProposalStreamability::Linear => FormulaProposalStreaming::Linear,
+                FormulaProposalStreamability::OnlineDirectOr { parent }
+                    if plan.formula_node_proposal_coverage(
+                        root,
+                        occurrence,
+                        node,
+                        outer_variable,
+                        task.desc.bound,
+                    ) == ProposalCoverage::Exact =>
+                {
+                    let exit = self
+                        .interner
+                        .formula_pcs
+                        .skip_remaining_children(&plan.finite_formula, parent);
+                    FormulaProposalStreaming::OnlineDirectOr { exit }
+                }
+                FormulaProposalStreamability::OnlineDirectOr { .. }
+                | FormulaProposalStreamability::Barrier(_) => FormulaProposalStreaming::Quiescent,
+            }
+        };
+        match proposal_streaming {
+            FormulaProposalStreaming::Linear => assert!(
                 batch.or_count() == 0,
                 "a relational linear formula proposal carried an OR reducer cell"
-            );
+            ),
+            FormulaProposalStreaming::OnlineDirectOr { .. } => assert!(
+                batch.or_count() == 1 && !batch.has_current(),
+                "an online direct-OR proposal carried the wrong reducer layout"
+            ),
+            FormulaProposalStreaming::Quiescent => {}
         }
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
         let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
@@ -11800,7 +11931,7 @@ impl ResidualStateMachine {
             if proposal_paged
                 && !transition_paged
                 && !proposal_has_transition_roots
-                && !stream_proposal
+                && !proposal_streaming.streams()
                 && !plan.has_paged_transition_source(root, variable, &view)
             {
                 // A quiescent formula reducer cannot publish direct proposal
@@ -11870,7 +12001,7 @@ impl ResidualStateMachine {
                 cursor,
                 stage,
                 batch,
-                stream_proposal,
+                proposal_streaming,
                 plan,
                 &mut self.worklist,
                 &mut self.interner,
@@ -11885,7 +12016,7 @@ impl ResidualStateMachine {
                 cursor,
                 stage,
                 batch,
-                stream_proposal,
+                proposal_streaming,
             );
             return Ok(DeltaSeedOutcome {
                 continuation: None,
@@ -11904,7 +12035,7 @@ impl ResidualStateMachine {
             stage,
             batch,
             seeds,
-            stream_proposal,
+            proposal_streaming,
             plan,
             &mut self.worklist,
             &mut self.interner,
@@ -21327,7 +21458,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_proposal_streamability_accepts_only_linear_synthetic_roots() {
+    fn formula_proposal_streamability_accepts_only_linear_non_or_suffixes() {
         fn start(plan: &ResidualPlan) -> FormulaProgramCounter {
             plan.finite_formula.start(
                 0,
@@ -21423,7 +21554,7 @@ mod tests {
         assert_eq!(
             old_formula_plan
                 .formula_proposal_streamability(&old_formula_action, VariableSet::new_empty(),),
-            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::NotSyntheticRoot)
+            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
         );
     }
 
@@ -21977,7 +22108,7 @@ mod tests {
     fn formula_live_cells_encode_only_payload_that_exists_in_each_phase() {
         assert_eq!(std::mem::size_of::<CandidatePayload>(), 40);
         assert_eq!(std::mem::size_of::<FormulaBatch>(), 80);
-        assert_eq!(std::mem::size_of::<FormulaLiveCell>(), 112);
+        assert_eq!(std::mem::size_of::<FormulaLiveCell>(), 104);
         assert_eq!(std::mem::size_of::<FormulaReturnRecord>(), 16);
 
         let and = FiniteFormulaNodeKind::And {
@@ -22216,15 +22347,40 @@ mod tests {
         accumulator.insert(1, candidate);
         accumulator.insert(1, candidate);
 
-        assert_eq!(accumulator.unique_len, 2);
+        assert_eq!(accumulator.sets.iter().map(OrdMap::len).sum::<usize>(), 2);
         assert_eq!(accumulator.sets.len(), 2);
         assert_eq!(
-            accumulator.sets[0].iter().copied().collect::<Vec<_>>(),
+            accumulator.sets[0].keys().copied().collect::<Vec<_>>(),
             [candidate]
         );
         assert_eq!(
-            accumulator.sets[1].iter().copied().collect::<Vec<_>>(),
+            accumulator.sets[1].keys().copied().collect::<Vec<_>>(),
             [candidate]
+        );
+    }
+
+    #[test]
+    fn formula_or_online_admission_promotes_pending_values_once_and_clones_independently() {
+        let pending = raw(7);
+        let online = raw(8);
+        let mut accumulator = FormulaOrAccumulator::empty(1);
+        accumulator.insert(0, pending);
+        let mut cloned = accumulator.clone();
+
+        assert!(accumulator.publish(0, pending));
+        assert!(!accumulator.publish(0, pending));
+        assert!(accumulator.publish(0, online));
+        assert!(!accumulator.publish(0, online));
+        assert_eq!(accumulator.sets[0].len(), 2);
+        assert_eq!(accumulator.pending_len(), 0);
+        assert!(accumulator.singleton_pending_set().is_empty());
+
+        assert_eq!(cloned.pending_len(), 1);
+        assert!(cloned.publish(0, pending));
+        assert_eq!(cloned.pending_len(), 0);
+        assert_eq!(
+            cloned.sets[0].keys().copied().collect::<Vec<_>>(),
+            [pending]
         );
     }
 
@@ -22270,7 +22426,7 @@ mod tests {
             };
             assert_eq!(
                 accumulator
-                    .singleton_set()
+                    .singleton_pending_set()
                     .iter()
                     .copied()
                     .collect::<Vec<_>>(),
@@ -22380,7 +22536,7 @@ mod tests {
         assert_eq!(source, &vec![(0, raw(20)), (2, raw(21))]);
         assert!(accumulator.sets[0].is_empty());
         assert_eq!(
-            accumulator.sets[1].iter().copied().collect::<Vec<_>>(),
+            accumulator.sets[1].keys().copied().collect::<Vec<_>>(),
             [raw(22)]
         );
         assert!(accumulator.sets[2].is_empty());
@@ -27102,16 +27258,19 @@ mod tests {
         let focused_first = focused.next().expect("the ring has a path result");
         let focused_first_stats = focused.stats().clone();
         assert_eq!(
-            focused_first_stats.propose_rows, 3,
-            "{focused_first_stats:#?}"
+            focused_first_stats.propose_rows, 2,
+            "online admission of the exact source Union arm must avoid a \
+             separate quiescent source proposal before the path seed: \
+             {focused_first_stats:#?}"
         );
         assert_eq!(focused_first_stats.max_propose_rows, 1);
         assert_eq!(
             focused_first_stats.support_action_pops
                 + focused_first_stats.propose_action_pops
                 + focused_first_stats.confirm_action_pops,
-            10,
-            "the singleton path seed must reach target confirmation before the cold source remainder"
+            8,
+            "the admitted singleton path seed must reach target confirmation \
+             before the cold source remainder"
         );
 
         let mut cold = Query::new(make(), project)
@@ -27679,7 +27838,7 @@ mod tests {
     }
 
     #[test]
-    fn quiescent_formula_eagerly_materializes_only_proposal_paging() {
+    fn online_formula_pages_exact_proposals_without_eager_materialization() {
         let run = |transition_source| {
             let proposes = Arc::new(AtomicUsize::new(0));
             let pages = Arc::new(AtomicUsize::new(0));
@@ -27704,9 +27863,9 @@ mod tests {
 
         let (proposal_only, proposes, pages) = run(false);
         assert_eq!(proposal_only.results, [raw(1), raw(2), raw(3)]);
-        assert_eq!(proposes.load(Ordering::Relaxed), 2);
-        assert_eq!(pages.load(Ordering::Relaxed), 0);
-        assert_eq!(proposal_only.stats.delta_source_pages, 0);
+        assert_eq!(proposes.load(Ordering::Relaxed), 0);
+        assert!(pages.load(Ordering::Relaxed) > 0);
+        assert!(proposal_only.stats.delta_source_pages > 0);
 
         let (transition, proposes, pages) = run(true);
         assert_eq!(transition.results, proposal_only.results);
