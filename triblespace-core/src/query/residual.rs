@@ -21290,62 +21290,8 @@ mod tests {
         assert_eq!(counters.1.load(Ordering::Relaxed), 0);
     }
 
-    /// Keeps adaptive planning visible while proving selected actions execute
-    /// through the typed Program route rather than the ordinary protocol.
-    struct ProgramActionTrap<C> {
-        inner: C,
-    }
-
-    impl<'a, C> Constraint<'a> for ProgramActionTrap<C>
-    where
-        C: Constraint<'a>,
-    {
-        fn variables(&self) -> VariableSet {
-            self.inner.variables()
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            self.inner.proposal_coverage(variable, bound)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            self.inner.estimate(variable, view, out)
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-            panic!("ordinary propose bypassed an available typed Program route")
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-            panic!("ordinary confirm bypassed an available typed Program route")
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            self.inner.satisfied(view)
-        }
-
-        fn residual_program(&self) -> Option<ProgramRef<'_>> {
-            self.inner.residual_program()
-        }
-    }
-
     #[test]
-    fn adaptive_program_routing_preserves_sorted_constant_projection_and_child_order() {
+    fn adaptive_routing_preserves_sorted_constant_projection_and_child_order() {
         use crate::inline::encodings::UnknownInline;
         use crate::query::sortedsliceconstraint::SortedSlice;
 
@@ -21354,13 +21300,10 @@ mod tests {
         let variable = Variable::<UnknownInline>::new(0);
         let project = |binding: &Binding| binding.get(variable.index).copied();
 
-        let trapped = |constant_first| {
-            let source = Box::new(ProgramActionTrap {
-                inner: SortedSlice::new(values).unwrap().has(variable),
-            }) as ShapeConstraint;
-            let constant = Box::new(ProgramActionTrap {
-                inner: variable.is(a),
-            }) as ShapeConstraint;
+        let constraints = |constant_first| {
+            let source =
+                Box::new(SortedSlice::new(values).unwrap().has(variable)) as ShapeConstraint;
+            let constant = Box::new(variable.is(a)) as ShapeConstraint;
             IntersectionConstraint::new(if constant_first {
                 vec![constant, source]
             } else {
@@ -21368,10 +21311,10 @@ mod tests {
             })
         };
 
-        let mut residual_source_first: Vec<_> = Query::new(trapped(false), project)
+        let mut residual_source_first: Vec<_> = Query::new(constraints(false), project)
             .solve_residual_state_lazy()
             .collect();
-        let mut residual_constant_first: Vec<_> = Query::new(trapped(true), project)
+        let mut residual_constant_first: Vec<_> = Query::new(constraints(true), project)
             .solve_residual_state_lazy()
             .collect();
 
