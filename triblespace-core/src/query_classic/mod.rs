@@ -689,6 +689,14 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
     projection: ProjectionGate,
+    /// Whether [`Iterator::next`] has ever been called, including a call that
+    /// returned `None` or unwound through the mapper.
+    ///
+    /// The classic Rayon's split-or-descend invariant is guaranteed only for
+    /// a fresh DFS state. A started query may retain proposal siblings at
+    /// several ancestor levels, so its exact remainder must remain one
+    /// unsplit producer leaf.
+    iteration_started: bool,
     mode: Search,
     binding: Binding,
     influences: [VariableSet; 128],
@@ -712,6 +720,7 @@ where
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             projection: self.projection.clone(),
+            iteration_started: self.iteration_started,
             mode: self.mode,
             binding: self.binding.clone(),
             influences: self.influences,
@@ -849,6 +858,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             constraint,
             postprocessing,
             projection,
+            iteration_started: false,
             mode,
             binding,
             influences,
@@ -882,6 +892,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
     type Item = R;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Record the pull before every return path and before invoking user
+        // mapping code, which may unwind.
+        self.iteration_started = true;
         loop {
             if self.projection.is_done() {
                 self.mode = Search::Done;
@@ -1033,9 +1046,17 @@ mod parallel {
             // for rebalancing. log₂(N²) = 2·log₂(N), so depth stays modest
             // (8 on a 16-thread box, 10 on a 32-thread) — well below any
             // stack concern.
-            let n = rayon::current_num_threads();
-            let split_budget = n.saturating_mul(n).max(2);
-            self.projection.share_for_parallel();
+            let split_budget = if self.iteration_started {
+                // Proposal vectors below the top can retain siblings after a
+                // serial pull. Cloning such a state would copy those ancestor
+                // remainders into both shards, so preserve the exact remainder
+                // as one sequential fold leaf.
+                0
+            } else {
+                let n = rayon::current_num_threads();
+                self.projection.share_for_parallel();
+                n.saturating_mul(n).max(2)
+            };
             QueryParIter {
                 inner: Box::new(self),
                 split_budget,
@@ -1729,5 +1750,38 @@ mod classic_tests {
         );
 
         assert_eq!(query.into_par_iter().count(), 1);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn started_query_parallel_conversion_preserves_one_exact_remainder_leaf() {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        let rows = (0..32)
+            .flat_map(|left| (0..4).map(move |right| (raw(left), raw(64 + right))))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut query = Query::new(
+            FinitePairs {
+                left: 0,
+                right: 1,
+                rows: rows.into(),
+            },
+            |binding| {
+                Some((
+                    *binding.get(0).expect("left is bound"),
+                    *binding.get(1).expect("right is bound"),
+                ))
+            },
+        );
+
+        assert!(query.next().is_some());
+        let expected = query.clone().collect::<Vec<_>>();
+        let parallel = query.into_par_iter();
+        assert_eq!(
+            parallel.split_budget, 0,
+            "a started DFS remainder must not be cloned across Rayon shards"
+        );
+        assert_eq!(parallel.collect::<Vec<_>>(), expected);
     }
 }
