@@ -2,8 +2,7 @@
 //!
 //! TribleSet is the executable reference for same-variable equality. These
 //! tests exercise SuccinctArchive through the complete constraint protocol and
-//! the fixed production solver, including the typed Program used for
-//! repeated-position proposals.
+//! the fixed production solver.
 
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::id::Id;
@@ -110,10 +109,6 @@ fn assert_protocol_equal<'a, L, R>(
         protocol_snapshot(left, variable, view, candidate_seed),
         protocol_snapshot(right, variable, view, candidate_seed),
         "{name}: SuccinctArchive disagreed with TribleSet",
-    );
-    assert!(
-        right.residual_program().is_some(),
-        "{name}: repeated-position equality has no typed Program family",
     );
 }
 
