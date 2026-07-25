@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reusable CPU paging and WGPU execution remain available directly through
   `QueryProgram` and `WgpuQueryProgram`, including exact per-input grants,
   branded receipts, and resumable morsels.
+- **RPQ Programs now represent only recurrent graph-product fixpoints.**
+  Repetition-free paths, free-endpoint FIRST selection, and partial support use
+  the ordinary constraint actions. The finite transition-depth ranks, direct
+  source/filter states, and finite support routes are removed; repeated
+  bound-endpoint proposals retain their bounded whole-fixpoint completion.
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm

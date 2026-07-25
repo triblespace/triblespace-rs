@@ -11,10 +11,9 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, PathOp, PreferredProgram,
-    ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RegularPathConstraint,
-    RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedSeedSink, Variable,
-    VariableId, VariableSet,
+    ProgramAction, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ProposalCoverage,
+    Query, RegularPathConstraint, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedSeedSink, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -389,91 +388,6 @@ impl TypedProgramSpec for SupportRouteProbe {
         _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         unreachable!("the route-only Support probe is never stepped")
-    }
-}
-
-#[derive(Default)]
-struct PhysicalSupportCounters {
-    seed_calls: AtomicUsize,
-    step_calls: AtomicUsize,
-}
-
-#[derive(Clone, Copy)]
-struct PhysicalSupportState {
-    supported: bool,
-}
-
-/// A deliberately separate production Support arm.
-///
-/// The accepted endpoint set is the test oracle for one fixed source. This
-/// family owns real typed roots and replacements, making mixed-arm fallback
-/// observable without duplicating the RPQ implementation in the fixture.
-#[derive(Clone)]
-struct PhysicalSupportProbe {
-    accepted: Arc<Vec<RawInline>>,
-    counters: Arc<PhysicalSupportCounters>,
-}
-
-impl TypedProgramSpec for PhysicalSupportProbe {
-    type State = PhysicalSupportState;
-    type NoveltyKey = ();
-    type Rank = u8;
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        (request.action == ProgramAction::Support).then_some(ProgramRoute {
-            key: ProgramKey::new(0),
-            variable: END,
-            stratum: ProgramStratum::Finite,
-            grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
-        })
-    }
-
-    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-        DispatchClass::new(0)
-    }
-
-    fn progress(&self, _state: &Self::State) -> Self::Rank {
-        1
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.request.action, ProgramAction::Support);
-        assert_eq!(batch.route.variable, END);
-        let target = batch
-            .view
-            .col(END)
-            .expect("physical Support fixture lost its bound target");
-        self.counters.seed_calls.fetch_add(1, Ordering::Relaxed);
-        for (parent, row) in batch.view.iter().enumerate() {
-            effects.finite_root(
-                u32::try_from(parent).expect("too many physical Support parents"),
-                PhysicalSupportState {
-                    supported: self.accepted.contains(&row[target]),
-                },
-                None,
-            );
-        }
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(states.len(), batch.limits.len());
-        self.counters.step_calls.fetch_add(1, Ordering::Relaxed);
-        for (input, state) in states.drain(..).enumerate() {
-            if state.supported {
-                effects.support(u32::try_from(input).expect("too many physical Support inputs"));
-            }
-            effects.page(1, None);
-        }
     }
 }
 
@@ -887,38 +801,6 @@ fn covering_target_confirm_root(
             program: PreferredProgram::new(
                 SupportRouteProbe {
                     calls: support_routes,
-                },
-                rpq,
-            ),
-            covering_proposals: false,
-        }) as DynConstraint,
-    ]))
-}
-
-fn physical_support_fallback_target_confirm_root(
-    set: TribleSet,
-    bound: Inline<GenId>,
-    candidates: Vec<RawInline>,
-    accepted: Vec<RawInline>,
-    ops: &[PathOp],
-    counters: Arc<PhysicalSupportCounters>,
-) -> Root {
-    let start = Variable::<GenId>::new(START);
-    let end = Variable::<GenId>::new(END);
-    let rpq = RegularPathConstraint::new(set, start, end, ops);
-    Arc::new(IntersectionConstraint::new(vec![
-        Box::new(start.is(bound)) as DynConstraint,
-        Box::new(CoveringOrderedDomain(OrderedDomain {
-            variable: END,
-            gate: START,
-            unbound_estimate: 4,
-            values: candidates,
-        })) as DynConstraint,
-        Box::new(ProbedConfirmRpq {
-            program: PreferredProgram::new(
-                PhysicalSupportProbe {
-                    accepted: Arc::new(accepted),
-                    counters,
                 },
                 rpq,
             ),
@@ -1839,7 +1721,6 @@ fn synthetic_root_and_streams_early_and_late_relational_survivors() {
             expected_before_emit,
             "accepted_node={accepted_node}, nested_and={nested_and}"
         );
-        assert!(query.stats().delta_handoff_probe_pops >= expected_before_emit);
         assert_eq!(query.next(), None);
         assert_eq!(query.stats().delta_transition_pages, 5);
         assert_eq!(query.stats().delta_transition_candidates_examined, 4);
@@ -1932,11 +1813,6 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
     let first = query.next().expect("the first endpoint streamed");
     assert_eq!(first, graph.value(1).raw);
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
-    assert_eq!(
-        query.stats().delta_handoff_probe_pops,
-        2,
-        "the accepted adjacency and typed program/formula boundary are each probed once"
-    );
     let exact_clone = query.clone();
     let cancelled = query.clone();
     drop(cancelled);
@@ -3358,13 +3234,6 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
         "one positive witness must publish exactly one row"
     );
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 1);
-    assert_eq!(
-        query
-            .stats()
-            .delta_positive_publication_relational_prefix_commits,
-        1,
-        "the earlier exact Confirm successor is independently relational"
-    );
     assert_eq!(support_routes.load(Ordering::Relaxed), 1);
     let early_examined = query.stats().delta_transition_candidates_examined;
 
@@ -3419,62 +3288,8 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
         "v1 must not feed occurrence one after occurrence-zero Support is false"
     );
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
-    assert_eq!(
-        query
-            .stats()
-            .delta_positive_publication_relational_prefix_commits,
-        1,
-        "the accepted sibling may enter its exact relational continuation even though the hedge dies"
-    );
     assert!(actual.contains(&graph.value(1).raw));
     assert!(query.stats().delta_transition_candidates_examined > 0);
-}
-
-#[test]
-fn mixed_arm_production_support_fallback_spends_one_public_demand_step() {
-    let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
-    let first = graph.value(1).raw;
-    let later = graph.value(3).raw;
-    let absent = [u8::MAX; 32];
-    let accepted = vec![first, graph.value(2).raw, later];
-    let ops = repeated(graph.attribute, false);
-    let mut expected = vec![first, later];
-    expected.sort_unstable();
-    for (candidates, expected_commits) in [
-        (vec![first, later, absent], 1),
-        (vec![absent, first, later], 0),
-    ] {
-        let counters = Arc::new(PhysicalSupportCounters::default());
-        let mut query = Query::new(
-            physical_support_fallback_target_confirm_root(
-                graph.set.clone(),
-                graph.value(0),
-                candidates,
-                accepted.clone(),
-                &ops,
-                Arc::clone(&counters),
-            ),
-            project_end,
-        )
-        .solve_residual_state_lazy();
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
-        assert_eq!(
-            query.stats().delta_positive_publication_terminal_commits,
-            expected_commits,
-            "only true B[0] may win the shared exact/Support publication ledger"
-        );
-        assert_eq!(counters.seed_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            counters.step_calls.load(Ordering::Relaxed),
-            1,
-            "the public pull should assign and prefer exactly one Support step"
-        );
-        assert_eq!(query.stats().delta_positive_support_demand_assigned, 1);
-        assert_eq!(query.stats().delta_positive_support_examined, 1);
-        assert!(query.stats().delta_transition_candidates_examined > 0);
-    }
 }
 
 #[test]
@@ -3625,13 +3440,6 @@ fn forward_exact_confirm_chunk_tap_that_dies_is_not_replayed_from_g_minus_p() {
     assert_eq!(actual, [survivor]);
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
     assert_eq!(
-        query
-            .stats()
-            .delta_positive_publication_relational_prefix_commits,
-        2,
-        "both exact relational Confirm successors publish once"
-    );
-    assert_eq!(
         query.stats().delta_transition_candidates_examined,
         exact_work,
         "Chunk publication must not add a fully-bound Support traversal"
@@ -3689,13 +3497,6 @@ fn target_confirm_positive_support_classifies_a_relational_prefix_commit() {
         .next()
         .expect("the positive candidate must survive its relational suffix");
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
-    assert_eq!(
-        query
-            .stats()
-            .delta_positive_publication_relational_prefix_commits,
-        2,
-        "the successful value crosses both exact relational Confirm successors"
-    );
     assert_eq!(query.stats().delta_direct_terminal_publication_rows, 0);
     let early_examined = query.stats().delta_transition_candidates_examined;
 
@@ -3749,14 +3550,6 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
         "only original occurrence zero may open a Support hedge"
     );
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
-    assert_eq!(
-        query
-            .stats()
-            .delta_positive_publication_relational_prefix_commits,
-        2,
-        "both exact relational Confirm successors commit before the suffix decides survival"
-    );
-
     let calls = calls.lock().expect("candidate-value trace poisoned");
     let first_visits = calls
         .iter()
@@ -3938,7 +3731,7 @@ fn bound_literal_endpoint_uses_the_inverse_delta_route() {
 }
 
 #[test]
-fn two_free_distinct_endpoints_page_the_first_binding_before_traversal() {
+fn two_free_distinct_endpoints_use_an_ordinary_first_binding_before_fixpoint() {
     let graph = Graph::new(
         16,
         &[
@@ -3960,8 +3753,6 @@ fn two_free_distinct_endpoints_page_the_first_binding_before_traversal() {
     let mut query = Query::new(root, project_pair).solve_residual_state_lazy();
     let first = query.next().expect("one two-free RPQ edge");
     assert!(expected.contains(&first));
-    assert_eq!(query.stats().delta_source_pages, 1);
-    assert_eq!(query.stats().delta_source_direct_candidates, 1);
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     drop(query);
 }
@@ -4265,7 +4056,7 @@ fn generated_formula_rpq_cases_match_the_oracle_and_are_monotone() {
 }
 
 #[test]
-fn finite_path_families_use_native_transition_programs() {
+fn finite_path_families_stay_in_the_ordinary_action_protocol() {
     let mut graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let other = other_attribute();
     graph
@@ -4331,23 +4122,21 @@ fn finite_path_families_use_native_transition_programs() {
         let mut residual: Vec<_> = query.by_ref().collect();
         residual.sort_unstable();
         assert_eq!(residual, expected, "{name}");
-        assert!(query.stats().delta_transition_pages > 0, "{name}");
     }
 }
 
 #[test]
-fn finite_bound_end_uses_the_inverse_transition_program() {
+fn finite_bound_end_uses_the_ordinary_inverse_action() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = vec![PathOp::Attr(graph.attribute.raw())];
     let root = bound_end_root(graph.set.clone(), graph.value(2), &ops);
 
     let mut query = Query::new(root, project_start).solve_residual_state_lazy();
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
-    assert!(query.stats().delta_transition_pages > 0);
 }
 
 #[test]
-fn finite_concat_first_result_takes_only_its_two_transition_steps() {
+fn finite_concat_first_result_stays_outside_the_transition_program() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let ops = vec![
         PathOp::Attr(graph.attribute.raw()),
@@ -4358,12 +4147,11 @@ fn finite_concat_first_result_takes_only_its_two_transition_steps() {
     let mut query = Query::new(root, project_end).solve_residual_state_lazy();
 
     assert_eq!(query.next(), Some(graph.value(2).raw));
-    assert_eq!(query.stats().delta_transition_candidates_examined, 2);
     drop(query);
 }
 
 #[test]
-fn finite_confirm_keeps_geometric_pages_then_set_admits() {
+fn finite_confirm_uses_ordinary_set_admission() {
     let graph = Graph::new(4, &[(0, 1), (1, 2)]);
     let absent = genid(&rngid().id).raw;
     let candidates = vec![
@@ -4389,12 +4177,10 @@ fn finite_confirm_keeps_geometric_pages_then_set_admits() {
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     assert_eq!(actual, expected);
-    assert!(query.stats().delta_transition_pages > 0);
-    assert!(query.stats().max_confirm_candidates < 5);
 }
 
 #[test]
-fn finite_same_variable_optional_pages_preserve_epsilon_scope_then_set_admit() {
+fn finite_same_variable_optional_preserves_epsilon_scope_via_ordinary_actions() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let absent = genid(&rngid().id).raw;
     let candidates = vec![
@@ -4415,11 +4201,6 @@ fn finite_same_variable_optional_pages_preserve_epsilon_scope_then_set_admit() {
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     assert_eq!(actual, expected);
-    assert_eq!(query.stats().delta_source_pages, 3);
-    assert_eq!(query.stats().delta_source_candidates_examined, 3);
-    assert_eq!(query.stats().delta_source_roots, 2);
-    assert!(query.stats().delta_transition_pages > 0);
-    assert_eq!(query.stats().max_confirm_candidates, 1);
 }
 
 #[test]
@@ -4429,7 +4210,7 @@ fn positive_transition_frontiers_page_by_automaton_branch_and_value() {
         bound_start_root(
             graph.set.clone(),
             graph.value(0),
-            &[PathOp::Attr(graph.attribute.raw())],
+            &[PathOp::Attr(graph.attribute.raw()), PathOp::Plus],
         )
     };
     let mut query = Query::new(make(), project_end).solve_residual_state_lazy();
@@ -4446,7 +4227,7 @@ fn positive_transition_frontiers_page_by_automaton_branch_and_value() {
 fn first_fanout_result_scans_one_transition_and_clone_keeps_the_exact_cursor() {
     let edges: Vec<_> = (1..17).map(|target| (0, target)).collect();
     let graph = Graph::new(17, &edges);
-    let ops = [PathOp::Attr(graph.attribute.raw())];
+    let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Plus];
     let make = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut query = Query::new(make(), project_end).solve_residual_state_lazy();
 
@@ -4472,7 +4253,7 @@ fn first_fanout_result_scans_one_transition_and_clone_keeps_the_exact_cursor() {
 #[test]
 fn paged_transitions_preserve_affine_parent_rows_and_storage_monotonicity() {
     let graph = Graph::new(5, &[(0, 1), (0, 2), (0, 3), (0, 4)]);
-    let ops = [PathOp::Attr(graph.attribute.raw())];
+    let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Plus];
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make = || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
     let mut expected: Vec<_> = Query::new(make(), project_end)
@@ -4552,7 +4333,7 @@ fn negated_transition_pages_count_rejections_and_emit_each_destination_once() {
     insert(&excluded, destinations[3]);
     insert(&other, destinations[4]);
 
-    let ops = [PathOp::NotAttr(excluded.raw())];
+    let ops = [PathOp::NotAttr(excluded.raw()), PathOp::Plus];
     let mut query = Query::new(
         bound_start_root(graph.set.clone(), genid(&start), &ops),
         project_end,
@@ -4606,7 +4387,11 @@ fn inverse_negated_transition_pages_from_literals_are_exact_and_distinct() {
             graph.set.clone(),
             start_var,
             end_var,
-            &[PathOp::NotAttr(excluded.raw()), PathOp::Inverse],
+            &[
+                PathOp::NotAttr(excluded.raw()),
+                PathOp::Inverse,
+                PathOp::Plus,
+            ],
         )) as DynConstraint,
     ]));
     let mut query = Query::new(root, project_end).solve_residual_state_lazy();
@@ -4675,6 +4460,7 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicit
             PathOp::Attr(graph.primary.raw()),
             PathOp::NotAttr(graph.primary.raw()),
             PathOp::Union,
+            PathOp::Plus,
         ];
         let mut query = Query::new(
             bound_start_root(graph.set.clone(), graph.value(0), &ops),
