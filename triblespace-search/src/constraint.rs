@@ -30,10 +30,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction, ProgramCompletion,
-    ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute,
-    ProgramSeedBatch, ProgramStratum, ProposalCoverage, RowsView, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
+    CandidateSink, Constraint, EstimateSink, ProposalCoverage, RowsView, Variable, VariableId,
     VariableSet,
 };
 
@@ -495,20 +492,6 @@ pub struct CosineAtLeast<'a, I: CosineSimilarity + ?Sized> {
     score_floor: f32,
 }
 
-/// Canonical finite continuation for [`CosineAtLeast`].
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CosineAtLeastProgramState {
-    Confirm { variable: VariableId, offset: usize },
-    Support,
-}
-
-const COSINE_CONFIRM_ROUTE: u32 = 1 << 4;
-const COSINE_SUPPORT_ROUTE: u32 = 2 << 4;
-
-const COSINE_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(0);
-const COSINE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(1);
-
 impl<'a, I: CosineSimilarity + ?Sized> CosineAtLeast<'a, I> {
     /// Build a constraint. Usually invoked through the `cosine_at_least`
     /// method on an attached index rather than directly.
@@ -524,14 +507,6 @@ impl<'a, I: CosineSimilarity + ?Sized> CosineAtLeast<'a, I> {
             b,
             score_floor,
         }
-    }
-
-    fn variable_mask(&self, variable: VariableId) -> u32 {
-        u32::from(variable == self.a.index) | (u32::from(variable == self.b.index) << 1)
-    }
-
-    fn bound_mask(&self, bound: VariableSet) -> u32 {
-        u32::from(bound.is_set(self.a.index)) | (u32::from(bound.is_set(self.b.index)) << 1)
     }
 
     fn pair_matches(&self, a: RawInline, b: RawInline) -> bool {
@@ -565,163 +540,6 @@ impl<'a, I: CosineSimilarity + ?Sized> CosineAtLeast<'a, I> {
         match (view.col(self.a.index), view.col(self.b.index)) {
             (Some(a), Some(b)) => self.pair_matches(row[a], row[b]),
             _ => true,
-        }
-    }
-}
-
-impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
-    type State = CosineAtLeastProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 2];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let bound_mask = self.bound_mask(request.bound);
-        let (key, variable) = match request.action {
-            ProgramAction::Propose(_) => return None,
-            ProgramAction::Confirm(variable) => {
-                let target_mask = self.variable_mask(variable);
-                if target_mask == 0 || request.bound.is_set(variable) {
-                    return None;
-                }
-                (
-                    COSINE_CONFIRM_ROUTE | (target_mask << 2) | bound_mask,
-                    variable,
-                )
-            }
-            ProgramAction::Support => (COSINE_SUPPORT_ROUTE | bound_mask, self.a.index),
-        };
-        Some(ProgramRoute {
-            key: ProgramKey::new(key),
-            variable,
-            stratum: ProgramStratum::Finite,
-            grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
-        })
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        match state {
-            CosineAtLeastProgramState::Confirm { .. } => COSINE_CONFIRM_DISPATCH,
-            CosineAtLeastProgramState::Support => COSINE_SUPPORT_DISPATCH,
-        }
-    }
-
-    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
-        ProgramPacing::Search
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        match state {
-            CosineAtLeastProgramState::Support => [1, 0],
-            CosineAtLeastProgramState::Confirm { offset, .. } => [
-                2,
-                u64::MAX
-                    - u64::try_from(*offset).expect("cosine candidate offset exceeds rank limb"),
-            ],
-        }
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
-        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
-        let state = match batch.request.action {
-            ProgramAction::Propose(_) => panic!("filter-only cosine Program admitted a proposal"),
-            ProgramAction::Confirm(variable) => {
-                assert_ne!(self.variable_mask(variable), 0);
-                assert!(!batch.request.bound.is_set(variable));
-                assert_eq!(batch.route.variable, variable);
-                CosineAtLeastProgramState::Confirm {
-                    variable,
-                    offset: 0,
-                }
-            }
-            ProgramAction::Support => CosineAtLeastProgramState::Support,
-        };
-        for parent in 0..batch.view.len() {
-            effects.finite_root(
-                u32::try_from(parent).expect("too many exact cosine parents"),
-                state.clone(),
-                None,
-            );
-        }
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.stratum, ProgramStratum::Finite);
-        assert_eq!(states.len(), batch.view.len());
-        assert_eq!(states.len(), batch.candidate_sets.len());
-        assert_eq!(states.len(), batch.limits.len());
-        let Some(first) = states.first() else {
-            return;
-        };
-        match first {
-            CosineAtLeastProgramState::Confirm { variable, .. } => {
-                let variable = *variable;
-                for (input, state) in states.drain(..).enumerate() {
-                    let CosineAtLeastProgramState::Confirm {
-                        variable: state_variable,
-                        offset,
-                    } = state
-                    else {
-                        panic!("one exact cosine cohort mixed action variants")
-                    };
-                    assert_eq!(state_variable, variable);
-                    let candidates = batch.candidate_sets[input]
-                        .expect("exact cosine confirmation lost its candidate group");
-                    assert!(offset <= candidates.len());
-                    let end = offset
-                        .saturating_add(batch.limits[input])
-                        .min(candidates.len());
-                    let input_tag =
-                        u32::try_from(input).expect("too many exact cosine inputs in one cohort");
-                    for &candidate in &candidates[offset..end] {
-                        if self.candidate_matches_or_is_unresolved(
-                            variable,
-                            &batch.view,
-                            batch.view.row(input),
-                            candidate,
-                        ) {
-                            effects.accept(input_tag, candidate);
-                        }
-                    }
-                    let examined = end - offset;
-                    assert!(
-                        end == candidates.len() || examined > 0,
-                        "exact cosine confirmation resumed without examining a candidate"
-                    );
-                    let resume = (end < candidates.len()).then(|| {
-                        TypedResume::Immediate(CosineAtLeastProgramState::Confirm {
-                            variable,
-                            offset: end,
-                        })
-                    });
-                    effects.page(examined, resume);
-                }
-            }
-            CosineAtLeastProgramState::Support => {
-                for (input, state) in states.drain(..).enumerate() {
-                    assert_eq!(state, CosineAtLeastProgramState::Support);
-                    assert!(
-                        batch.candidate_sets[input].is_none(),
-                        "exact cosine support received a candidate group"
-                    );
-                    if self.support_row(&batch.view, batch.view.row(input)) {
-                        effects
-                            .support(u32::try_from(input).expect("too many exact cosine inputs"));
-                    }
-                    effects.page(1, None);
-                }
-            }
         }
     }
 }
@@ -777,10 +595,6 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         view.iter().all(|row| self.support_row(view, row))
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
     }
 }
 
@@ -1421,52 +1235,42 @@ mod tests {
     }
 
     #[test]
-    fn exact_cosine_is_a_program_confirmer_but_never_a_paged_source() {
+    fn exact_cosine_is_an_ordinary_filter_and_never_a_source() {
         let (flat, hnsw, mut store, _handles) = sample_sim();
         let reader = store.reader().unwrap();
         let a = Variable::<Handle<Embedding>>::new(0);
         let b = Variable::<Handle<Embedding>>::new(1);
         let bound_pivot = VariableSet::new_singleton(a.index);
-        let proposal_request = ProgramRequest {
-            action: ProgramAction::Propose(b.index),
-            bound: bound_pivot,
-        };
 
         let flat_view = flat.attach(&reader);
         let flat_constraint = flat_view.cosine_at_least(a, b, 0.8);
-        assert!(
-            flat_constraint.route(proposal_request).is_none(),
-            "exact cosine offers no proposal Program",
+        assert_eq!(
+            flat_constraint.proposal_coverage(b.index, bound_pivot),
+            ProposalCoverage::None,
+            "exact cosine owns no proposal domain",
         );
-        assert!(
-            flat_constraint.residual_program().is_some(),
-            "exact cosine must expose its pageable confirmer Program",
-        );
+        assert!(flat_constraint.residual_program().is_none());
 
         let hnsw_view = hnsw.attach(&reader);
         let hnsw_constraint = hnsw_view.cosine_at_least(a, b, 0.8);
-        assert!(
-            hnsw_constraint.route(proposal_request).is_none(),
+        assert_eq!(
+            hnsw_constraint.proposal_coverage(b.index, bound_pivot),
+            ProposalCoverage::None,
             "an attached HNSW view does not turn exact cosine into ANN expansion",
         );
-        assert!(
-            hnsw_constraint.residual_program().is_some(),
-            "HNSW attachment still supports exact pairwise confirmation",
-        );
+        assert!(hnsw_constraint.residual_program().is_none());
 
         #[cfg(feature = "succinct")]
         {
             let succinct = crate::succinct::SuccinctHNSWIndex::from_naive(&hnsw).unwrap();
             let succinct_view = succinct.attach(&reader);
             let succinct_constraint = succinct_view.cosine_at_least(a, b, 0.8);
-            assert!(
-                succinct_constraint.route(proposal_request).is_none(),
+            assert_eq!(
+                succinct_constraint.proposal_coverage(b.index, bound_pivot),
+                ProposalCoverage::None,
                 "succinct attachment keeps retrieval and exact filtering separate",
             );
-            assert!(
-                succinct_constraint.residual_program().is_some(),
-                "succinct attachment supports exact pairwise confirmation",
-            );
+            assert!(succinct_constraint.residual_program().is_none());
         }
     }
 
@@ -1763,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_cosine_filters_in_production_without_a_proposal_route() {
+    fn exact_cosine_filters_in_production_without_a_machine_route() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
@@ -1771,18 +1575,11 @@ mod tests {
         let b = Variable::<Handle<Embedding>>::new(1);
 
         let exact = view.cosine_at_least(a, b, 0.8);
-        assert!(exact
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(a.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_none());
-        assert!(exact
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(a.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
+        assert_eq!(
+            exact.proposal_coverage(a.index, VariableSet::new_empty()),
+            ProposalCoverage::None,
+        );
+        assert!(exact.residual_program().is_none());
         let good = triblespace_core::and!(a.is(handles[0]), b.is(handles[2]), exact,);
         let rows: Vec<_> = Query::new(good, project_pair)
             .solve_residual_state_lazy()
