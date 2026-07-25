@@ -13,6 +13,6 @@ if ! command -v mdbook >/dev/null 2>&1; then
 fi
 
 # Run formatting check, tests, and build the book
-cargo fmt -- --check
+cargo fmt --all -- --check
 cargo test
 ./scripts/build_book.sh
