@@ -29,13 +29,13 @@
 //! chooses the deepest live bucket able to fill the desired actionable width;
 //! if none can, it drains the minimum-rank bucket through the strict readiness
 //! gate. When a full Propose or Confirm action advances to an underfilled
-//! successor, an exact physical filing token keeps at most that newly appended
-//! tail hot until it emits or dies. Readiness pops and planning-state splits do
-//! not themselves activate a sprint, so planning-created underfill still uses
-//! ordinary batch assembly. Once an action lineage is hot, however, it may
-//! intentionally defer reconvergence with an older cohort in exchange for
-//! first-result latency. The token is not part of canonical state identity and
-//! never consumes that older cohort. Ready and
+//! successor, an exact physical filing token keeps that newly appended cohort
+//! hot until it emits or dies. A drain pop consumes the receipt alone while the
+//! whole canonical bucket is underfilled; once it can fill search width, the
+//! pop recoalesces with older equal-future work. Readiness pops and planning-
+//! state splits do not themselves activate a sprint, so planning-created
+//! underfill still uses ordinary batch assembly. The token is not part of
+//! canonical state identity. Ready and
 //! Propose states measure parent rows. Candidate and Confirm states measure and
 //! split SET-admitted candidate occurrences. They remain parent-atomic only
 //! while a selected typed Program route must reuse one complete parent
@@ -44,9 +44,9 @@
 //! selected parent block.
 //! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
 //! Lazy width is unchanged while nonempty successors advance. Once a partial
-//! action activates an exact continuation cohort, that lineage outranks cold
-//! siblings—even when it merges into an already-live bucket—until it emits or
-//! dies. Search width grows geometrically after negative work. A separate
+//! action activates an exact continuation cohort, its receipt outranks cold
+//! siblings until it emits, dies, or recoalesces into a full canonical chunk.
+//! Search width grows geometrically after negative work. A separate
 //! projected-result window grows only after the caller consumes the whole
 //! window and pulls again; that confirmed promotion floors search width at the
 //! new demand window without treating emission itself as search feedback.
@@ -7410,8 +7410,9 @@ type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 /// while the lazy scheduler temporarily keeps the newly advanced cohort hot.
 /// Single-threaded filing appends at the payload tail. Equal `(rank, state)`
 /// receipts in one transition reduction are coalesced by occupancy, so the
-/// selected token names their complete appended tail without consuming older
-/// work already present under the same canonical key.
+/// selected token names their complete appended tail. A drain-phase selection
+/// may include older equal-future work when the whole canonical bucket fills
+/// search width; an underfilled drain or one-atom probe remains receipt-local.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContinuationToken {
     rank: usize,
@@ -7422,10 +7423,12 @@ struct ContinuationToken {
 
 /// Physical scheduling policy for one exact continuation receipt.
 ///
-/// `Cohort` preserves the ordinary action sprint. `ProbeOne` is reserved for
-/// delta-to-stable handoffs: it selects one promising atom, then hands that
-/// atom's ordered fanout back to `Cohort`, without resetting the query-wide
-/// cold-harvest width or making width part of canonical state.
+/// `Cohort` is the ordinary drain phase: it takes a full canonical search-width
+/// chunk when available and otherwise consumes only the newly filed receipt.
+/// `ProbeOne` is reserved for delta-to-stable handoffs: it selects one
+/// promising atom, then hands that atom's ordered fanout back to `Cohort`,
+/// without resetting the query-wide cold-harvest width or making width part of
+/// canonical state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContinuationMode {
     Cohort,
@@ -10762,10 +10765,12 @@ impl ResidualStateMachine {
     ///
     /// A global strict-deepest flag is insufficient here: another history may
     /// already occupy a deeper state, and an older cohort may already occupy
-    /// this exact state. The token limits the tail cut to all equal-key filings
-    /// coalesced by the selected transition, preserving DFS latency without
-    /// changing readiness legality or canonical state identity. The cut may
-    /// deliberately defer the opportunity to merge with older work.
+    /// this exact state. A one-atom probe and an underfilled cohort remain
+    /// within the exact receipt. Once the whole canonical bucket fills search
+    /// width, a cohort takes the full canonical suffix and may include older
+    /// equal-future work. This preserves first-witness latency while letting
+    /// the drain phase recoalesce without changing readiness legality or
+    /// canonical state identity.
     fn take_continuation(
         &mut self,
         plan: &ResidualPlan,
@@ -10787,11 +10792,6 @@ impl ResidualStateMachine {
         let candidate_pages = desc.uses_candidate_pages(plan, &self.interner.formula_pcs);
         let cohort_occupancy = token.occupancy(&desc, plan, &self.interner.formula_pcs);
         assert!(cohort_occupancy > 0, "continuation cohort is empty");
-        let take = match mode {
-            ContinuationMode::Cohort => cohort_occupancy.min(width.max(1)),
-            ContinuationMode::ProbeOne => 1,
-        };
-
         let (mut bucket, remove_level) = {
             let level = self
                 .worklist
@@ -10811,6 +10811,12 @@ impl ResidualStateMachine {
             before >= cohort_occupancy,
             "canonical bucket lost part of its newly filed continuation cohort"
         );
+        let width = width.max(1);
+        let take = match mode {
+            ContinuationMode::Cohort if before >= width => width,
+            ContinuationMode::Cohort => cohort_occupancy.min(width),
+            ContinuationMode::ProbeOne => 1,
+        };
         let chunk = bucket.take_tail(desc.bound.count(), take, candidate_pages);
         let remainder = bucket.occupancy(candidate_pages);
         if remainder != 0 {
@@ -10832,7 +10838,7 @@ impl ResidualStateMachine {
         if mode == ContinuationMode::ProbeOne {
             self.stats.delta_handoff_probe_pops += 1;
         }
-        if cohort_occupancy < width.max(1) {
+        if cohort_occupancy < width {
             self.stats.underfilled_continuation_pops += 1;
         }
         SelectedResidualTask {
@@ -28676,7 +28682,59 @@ mod tests {
     }
 
     #[test]
-    fn continuation_token_cuts_only_the_new_tail_of_a_merged_state() {
+    fn cohort_continuation_full_recoalesces_the_canonical_suffix() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile_production(&root);
+        let desc = ready_desc(1);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
+
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: [10, 11, 12, 13, 14, 15].map(raw).into(),
+                row_count: 6,
+            }),
+            &mut machine.stats,
+        );
+        let hot = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc,
+            StateBucket::Rows(RowBatch {
+                rows: [40, 41].map(raw).into(),
+                row_count: 2,
+            }),
+            &mut machine.stats,
+        )
+        .expect("the drain receipt is nonempty");
+
+        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(hot), 4);
+        let StateBucket::Rows(chunk) = task.bucket else {
+            panic!("cohort drain changed payload shape")
+        };
+        assert_eq!(chunk.rows, [14, 15, 40, 41].map(raw));
+        assert_eq!(chunk.row_count, 4);
+
+        let StateBucket::Rows(remainder) = machine
+            .worklist
+            .get(&hot.rank)
+            .and_then(|level| level.get(&hot.state))
+            .expect("the canonical prefix remains live")
+        else {
+            panic!("cohort remainder changed payload shape")
+        };
+        assert_eq!(remainder.rows, [10, 11, 12, 13].map(raw));
+        assert_eq!(remainder.row_count, 4);
+        assert_eq!(machine.stats.continuation_pops, 1);
+        assert_eq!(machine.stats.partial_pops, 1);
+    }
+
+    #[test]
+    fn cohort_continuation_underfull_cuts_only_the_new_receipt() {
         const PARENT: VariableId = 0;
         const VARIABLE: VariableId = 1;
         let root = IntersectionConstraint::new(vec![
@@ -28845,8 +28903,10 @@ mod tests {
             assert_eq!(rows.row_count, 1);
         }
 
-        // A hit returns the selected atom's ordered fanout to ordinary cohort
-        // continuation. Only the original delta handoff is probed one-at-a-time.
+        // A hit returns the selected atom's ordered fanout to the drain phase.
+        // Only the original delta handoff is probed one-at-a-time. Here the
+        // whole canonical bucket fills width eight, so the drain recoalesces
+        // the three-row successor with five older equal-future rows.
         let successor = file(
             &mut machine.worklist,
             &mut machine.interner,
@@ -28867,8 +28927,8 @@ mod tests {
         let StateBucket::Rows(resumed) = resumed.bucket else {
             panic!("probe successor changed payload shape")
         };
-        assert_eq!(resumed.rows, [50, 51, 52].map(raw));
-        assert_eq!(resumed.row_count, 3);
+        assert_eq!(resumed.rows, [42, 43, 44, 45, 46, 50, 51, 52].map(raw));
+        assert_eq!(resumed.row_count, 8);
         assert_eq!(
             machine.stats.delta_handoff_probe_pops, 1,
             "the ordered successor cohort must not be probed again"

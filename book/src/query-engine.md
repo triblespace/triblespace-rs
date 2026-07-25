@@ -204,11 +204,14 @@ the universal final SET guard across hidden witnesses and routes.
 
 Lazy residual execution begins with actionable width one. A surviving action
 keeps its newly filed continuation hot, allowing a successful path to descend
-and emit before cold siblings are evaluated. Dead actions and terminal rows
-grow the desired width geometrically; once no hot continuation can run, an
-occupancy/readiness policy harvests wider batches. This gives the state machine
-a low-latency-to-throughput ramp without requiring a complete intersection to
-run eagerly for one binding.
+and emit before cold siblings are evaluated. The initial cyclic handoff probes
+one atom; its successor enters the ordinary drain phase. A drain consumes only
+its new receipt while the whole canonical bucket is underfilled, but takes a
+full search-width suffix—including older equal-future work—once that bucket can
+fill the width. Dead actions and terminal rows grow the desired width
+geometrically; once no hot continuation can run, an occupancy/readiness policy
+harvests wider batches. This gives the state machine a low-latency-to-throughput
+ramp without requiring a complete intersection to run eagerly for one binding.
 
 Regular-path product states apply that demand inside a node as well as across
 nodes. Positive, inverse, and negated attribute transitions expose an ordered
