@@ -11154,6 +11154,7 @@ impl ResidualStateMachine {
         dispatch: &impl ResidualActionDispatch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
+        requested_tail: Option<usize>,
     ) -> Option<Self> {
         // StateId is a machine-local family key. Once a terminal admission
         // exists, splitting would require either a shared projected-yield
@@ -11180,7 +11181,9 @@ impl ResidualStateMachine {
             );
 
             if self.emit_count >= 2 {
-                let right_count = self.emit_count / 2;
+                let right_count = requested_tail
+                    .map(|width| width.max(1).min(self.emit_count - 1))
+                    .unwrap_or(self.emit_count / 2);
                 let left_count = self.emit_count - right_count;
                 let stride = self.emit_vars.len();
                 debug_assert!(stride > 0, "a zero-variable query has one result");
@@ -11230,12 +11233,25 @@ impl ResidualStateMachine {
             if let Some((rank, id, candidate_pages)) = splittable {
                 let desc = self.interner.get(id);
                 let stride = desc.bound.count();
-                let right_bucket = self
-                    .worklist
-                    .get_mut(&rank)
-                    .and_then(|level| level.get_mut(&id))
-                    .and_then(|bucket| bucket.split_for_parallel(stride, candidate_pages))
-                    .expect("selected residual payload is splittable");
+                let right_bucket = {
+                    let bucket = self
+                        .worklist
+                        .get_mut(&rank)
+                        .and_then(|level| level.get_mut(&id))
+                        .expect("selected residual payload exists");
+                    if let Some(width) = requested_tail {
+                        let occupancy = bucket.occupancy(candidate_pages);
+                        bucket.take_tail(
+                            stride,
+                            width.max(1).min(occupancy.saturating_sub(1)),
+                            candidate_pages,
+                        )
+                    } else {
+                        bucket
+                            .split_for_parallel(stride, candidate_pages)
+                            .expect("selected residual payload is splittable")
+                    }
+                };
 
                 let mut right = self.parallel_sibling();
                 assert!(
@@ -11344,7 +11360,19 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
     ) -> Option<Self> {
-        self.split_for_parallel_with_dispatch(&DirectActionDispatch, root, plan)
+        self.split_for_parallel_with_dispatch(&DirectActionDispatch, root, plan, None)
+    }
+
+    /// Carves at most `width` scheduling atoms into a latency lane while
+    /// retaining the remaining affine frontier in `self`.
+    #[cfg(feature = "parallel")]
+    fn take_parallel_latency_lane<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        width: usize,
+    ) -> Option<Self> {
+        self.split_for_parallel_with_dispatch(&DirectActionDispatch, root, plan, Some(width.max(1)))
     }
 
     /// Observed counterpart of [`Self::split_for_parallel`]. The affine split
@@ -11357,7 +11385,7 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
     ) -> Option<Self> {
-        self.split_for_parallel_with_dispatch(&ShadowActionDispatch { epoch }, root, plan)
+        self.split_for_parallel_with_dispatch(&ShadowActionDispatch { epoch }, root, plan, None)
     }
 }
 
@@ -11783,7 +11811,9 @@ pub use parallel::{ResidualShadowParIter, ResidualStateParIter};
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
-    use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
+    use rayon::iter::plumbing::{
+        bridge_unindexed, Folder, Reducer, UnindexedConsumer, UnindexedProducer,
+    };
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     /// Parallel iterator over one affine residual-state frontier.
@@ -11892,12 +11922,137 @@ mod parallel {
         where
             Con: UnindexedConsumer<Self::Item>,
         {
-            self.split_budget = if self.inner.iteration_started {
-                0
-            } else {
-                rayon::current_num_threads().saturating_sub(1)
+            if self.inner.iteration_started
+                || self.inner.projection.is_empty_head()
+                || consumer.full()
+            {
+                self.split_budget = 0;
+                return bridge_unindexed(self, consumer);
+            }
+
+            let Some(lane_state) = self.inner.state.take_parallel_latency_lane(
+                &self.inner.root,
+                &self.inner.plan,
+                self.inner.state.width,
+            ) else {
+                self.split_budget = 0;
+                return bridge_unindexed(self, consumer);
             };
-            bridge_unindexed(self, consumer)
+
+            let shared_projection = self.inner.projection.share_for_parallel();
+            let mut lane_projection = self.inner.projection.clone();
+            lane_projection.attach_shared(shared_projection);
+            let mut lane = ResidualStateIter {
+                root: self.inner.root.clone(),
+                plan: self.inner.plan.clone(),
+                postprocessing: self.inner.postprocessing.clone(),
+                projection: lane_projection,
+                state: lane_state,
+                iteration_started: false,
+            };
+
+            if std::env::var_os("TRIBLES_DEBUG_RAYON_RESERVE").is_some() {
+                let summarize = |state: &ResidualStateMachine, plan: &ResidualPlan| {
+                    let stable = state
+                        .worklist
+                        .iter()
+                        .flat_map(|(&rank, level)| {
+                            level.iter().map(move |(&id, bucket)| {
+                                let desc = state.interner.get(id);
+                                let pageable =
+                                    desc.uses_candidate_pages(plan, &state.interner.formula_pcs);
+                                (rank, id.0, bucket.occupancy(pageable))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        state.width,
+                        state.emit_count.saturating_sub(state.emit_next),
+                        stable,
+                        state.delta.is_empty(),
+                        state.terminal_yield.ever_admitted,
+                    )
+                };
+                eprintln!(
+                    "rayon reserve carve reserve={:?} lane={:?}",
+                    summarize(&self.inner.state, &self.inner.plan),
+                    summarize(&lane.state, &lane.plan),
+                );
+            }
+
+            let prefix = lane.state.pull(
+                &lane.root,
+                &lane.plan,
+                &lane.postprocessing,
+                &mut lane.projection,
+            );
+
+            if std::env::var_os("TRIBLES_DEBUG_RAYON_RESERVE").is_some() {
+                eprintln!(
+                    "rayon latency pull yielded={} reserve_width={} reserve_terminal={} lane_width={} lane_emit={}/{} lane_work={} lane_delta_empty={} lane_terminal={}",
+                    prefix.is_some(),
+                    self.inner.state.width,
+                    self.inner.state.terminal_yield.ever_admitted,
+                    lane.state.width,
+                    lane.state.emit_next,
+                    lane.state.emit_count,
+                    lane.state.worklist.values().map(BTreeMap::len).sum::<usize>(),
+                    lane.state.delta.is_empty(),
+                    lane.state.terminal_yield.ever_admitted,
+                );
+            }
+
+            let Some(item) = prefix else {
+                // The carved affine lane was genuine negative search feedback.
+                // Its exhaustion cannot affect the untouched reserve except
+                // through already-shared projection claims.
+                self.inner.state.increase_width();
+                self.inner.state.width = RESIDUAL_ROW_CAP;
+                self.split_budget = rayon::current_num_threads().saturating_sub(1);
+                return bridge_unindexed(self, consumer);
+            };
+
+            let reducer = consumer.to_reducer();
+            let prefix_consumer = consumer.split_off_left();
+            let prefix_result = prefix_consumer.into_folder().consume(item).complete();
+            if consumer.full() {
+                let remainder = consumer.into_folder().complete();
+                return reducer.reduce(prefix_result, remainder);
+            }
+
+            // Rebase the consumed prefix out of the latency lane so its exact
+            // raw suffix can re-enter ordinary parallel splitting.
+            let consumed = lane.state.emit_next;
+            let stride = lane.state.emit_vars.len();
+            lane.state.emit_rows = lane.state.emit_rows.split_off(consumed * stride);
+            if let Some(origins) = &mut lane.state.emit_origins {
+                origins.drain(..consumed);
+            }
+            lane.state.emit_count -= consumed;
+            lane.state.emit_next = 0;
+
+            // Causal probe: only a consumer that accepted the latency result
+            // reaches the bulk path. A successful probe will replace this
+            // saturation with the single geometric law.
+            lane.state.width = RESIDUAL_ROW_CAP;
+            self.inner.state.width = RESIDUAL_ROW_CAP;
+            let split_budget = rayon::current_num_threads().saturating_sub(1);
+            let lane_producer = ResidualStateParIter {
+                inner: Box::new(lane),
+                split_budget,
+            };
+            self.split_budget = split_budget;
+
+            let remainder_reducer = consumer.to_reducer();
+            let lane_consumer = consumer.split_off_left();
+            let (lane_result, reserve_result) = rayon::join(
+                || bridge_unindexed(lane_producer, lane_consumer),
+                || bridge_unindexed(self, consumer),
+            );
+            reducer.reduce(
+                prefix_result,
+                remainder_reducer.reduce(lane_result, reserve_result),
+            )
         }
     }
 
