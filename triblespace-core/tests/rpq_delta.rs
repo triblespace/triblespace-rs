@@ -2277,12 +2277,14 @@ fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
         .cap(1)
         .start_width(1);
 
-    let first = query.next().expect("one source activation quiesced");
-    assert_eq!(query.stats().delta_transition_pages, 4);
+    let first = query
+        .next()
+        .expect("one source activation published its first endpoint");
+    assert_eq!(query.stats().delta_transition_pages, 1);
     assert_eq!(
         query.stats().delta_transition_candidates_examined,
-        3,
-        "the other source activation must remain live"
+        1,
+        "the first admitted endpoint must leave both cyclic remainders live"
     );
     let exact_clone = query.clone();
     let cancelled = query.clone();
