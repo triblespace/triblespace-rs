@@ -20,7 +20,6 @@ use crate::query::DispatchClass;
 use crate::query::EstimateSink;
 use crate::query::ProgramAction;
 use crate::query::ProgramGrouping;
-use crate::query::ProgramKey;
 use crate::query::ProgramPacing;
 use crate::query::ProgramRef;
 use crate::query::ProgramRequest;
@@ -1415,10 +1414,6 @@ pub struct RpqNoveltyKey {
     pc: u32,
 }
 
-const RPQ_BOUND_FORWARD: ProgramKey = ProgramKey::new(0);
-const RPQ_BOUND_INVERSE: ProgramKey = ProgramKey::new(1);
-const RPQ_SAME_VARIABLE: ProgramKey = ProgramKey::new(2);
-
 const RPQ_SOURCE_START: DispatchClass = DispatchClass::new(0);
 const RPQ_SOURCE_AFTER: DispatchClass = DispatchClass::new(1);
 const RPQ_TRANSITION_START: DispatchClass = DispatchClass::new(2);
@@ -2374,11 +2369,6 @@ impl TypedProgramSpec for RegularPathConstraint {
                 if request.bound.is_set(self.start) && request.bound.is_set(self.end) =>
             {
                 ProgramRoute {
-                    key: if self.start == self.end {
-                        RPQ_SAME_VARIABLE
-                    } else {
-                        RPQ_BOUND_FORWARD
-                    },
                     variable: self.end,
                     // Support has no candidate relation to reuse.
                     grouping: ProgramGrouping::PageLocal,
@@ -2394,7 +2384,6 @@ impl TypedProgramSpec for RegularPathConstraint {
                 let confirming = matches!(request.action, ProgramAction::Confirm(_));
                 if self.start == self.end {
                     ProgramRoute {
-                        key: RPQ_SAME_VARIABLE,
                         variable,
                         grouping: if confirming {
                             ProgramGrouping::ParentAtomic
@@ -2403,16 +2392,15 @@ impl TypedProgramSpec for RegularPathConstraint {
                         },
                     }
                 } else {
-                    let (opposite, key) = if variable == self.end {
-                        (self.start, RPQ_BOUND_FORWARD)
+                    let opposite = if variable == self.end {
+                        self.start
                     } else {
-                        (self.end, RPQ_BOUND_INVERSE)
+                        self.end
                     };
                     if !request.bound.is_set(opposite) {
                         return None;
                     }
                     ProgramRoute {
-                        key,
                         variable,
                         grouping: if confirming {
                             ProgramGrouping::ParentAtomic
@@ -2447,8 +2435,6 @@ impl TypedProgramSpec for RegularPathConstraint {
         let mut fully_bound = confirm_request.bound;
         fully_bound.set(self.end);
         support_request.bound == fully_bound
-            && confirm_route.key == RPQ_BOUND_FORWARD
-            && support_route.key == RPQ_BOUND_FORWARD
             && confirm_route.variable == self.end
             && support_route.variable == self.end
     }
@@ -2531,8 +2517,11 @@ impl TypedProgramSpec for RegularPathConstraint {
         effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     ) {
         debug_assert_eq!(batch.view.len(), batch.activations.len());
-        let same_source = batch.route.key == RPQ_SAME_VARIABLE
-            && !matches!(batch.request.action, ProgramAction::Support);
+        let same_source = !matches!(batch.request.action, ProgramAction::Support)
+            && matches!(
+                self.program_for_variable(batch.route.variable),
+                Some(RpqRoute::SameVariable { .. })
+            );
         if same_source {
             for parent in 0..batch.view.len() {
                 effects.finite_root(

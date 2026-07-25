@@ -71,13 +71,13 @@ impl DeltaDesc {
 
 /// Immutable occurrence-local address of one constructed typed program.
 ///
-/// The structural site distinguishes repeated references to the same `Arc`;
-/// the family-local key distinguishes routes of that occurrence without a
-/// query-global program catalog.
+/// The structural site and semantic variable distinguish repeated references
+/// and orientations. Route-specific future computation lives in typed state,
+/// so compatible routes of this occurrence deliberately share one runtime.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ProgramAddress {
     /// A route owned by one structural constraint occurrence.
-    Constraint { desc: DeltaDesc, key: ProgramKey },
+    Constraint(DeltaDesc),
     /// One engine-owned finite reducer family. Bound schema, return PC,
     /// cursors, accumulators, and phase remain affine typed payload, so the
     /// address names only the static operation.
@@ -111,26 +111,16 @@ impl ProgramAddress {
             desc.variable, route.variable,
             "constructed program route changed its structural variable"
         );
-        Self::Constraint {
-            desc,
-            key: route.key,
-        }
+        Self::Constraint(desc)
     }
 
     fn resolve<'r, 'a>(&self, root: &'r dyn Constraint<'a>, plan: &ResidualPlan) -> ProgramRef<'r> {
         match self {
-            Self::Constraint { desc, .. } => desc
+            Self::Constraint(desc) => desc
                 .resolve(root, plan)
                 .residual_program()
                 .expect("constructed typed program disappeared during execution"),
             Self::Engine(kind) => kind.resolve(),
-        }
-    }
-
-    fn key(&self) -> ProgramKey {
-        match self {
-            Self::Constraint { key, .. } => *key,
-            Self::Engine(_) => ProgramKey::new(0),
         }
     }
 
@@ -4740,7 +4730,7 @@ impl DeltaScheduler {
             .intern_program(ProgramAddress::new(desc, route));
         self.program_runtimes
             .entry(state)
-            .or_insert_with(|| spec.new_runtime_for(route.key));
+            .or_insert_with(|| spec.new_runtime());
         state
     }
 
@@ -4929,7 +4919,6 @@ impl DeltaScheduler {
                 self.program_runtimes
                     .get_mut(&state)
                     .expect("prepared program lost its runtime"),
-                route.key,
                 &retired,
             );
         }
@@ -5066,7 +5055,6 @@ impl DeltaScheduler {
                 self.program_runtimes
                     .get_mut(&confirm_state)
                     .expect("prepared program lost its runtime"),
-                route.key,
                 &retired,
             );
         }
@@ -5143,7 +5131,7 @@ impl DeltaScheduler {
                         .get_mut(&support_state)
                         .expect("positive Support program lost its runtime");
                     for seed in seeds {
-                        spec.discard_work(runtime, route.key, program_activation, &seed.work);
+                        spec.discard_work(runtime, program_activation, &seed.work);
                     }
                     let installed = self
                         .registry
@@ -5182,7 +5170,6 @@ impl DeltaScheduler {
                     self.program_runtimes
                         .get_mut(&support_state)
                         .expect("positive Support program lost its runtime"),
-                    route.key,
                     &retired,
                 );
             }
@@ -5327,7 +5314,6 @@ impl DeltaScheduler {
                 self.program_runtimes
                     .get_mut(&state)
                     .expect("prepared program lost its runtime"),
-                route.key,
                 &retired,
             );
         }
@@ -6347,7 +6333,6 @@ impl DeltaScheduler {
                 .cloned()
                 .expect("cancelled PositiveSupport work occupied an unknown state");
             let spec = address.resolve(root, plan);
-            let key = address.key();
             let mut retired = Vec::new();
             let mut seen = AHashSet::new();
             let mut proofs = Vec::new();
@@ -6362,7 +6347,7 @@ impl DeltaScheduler {
                         "PositiveSupport cancellation removed an untargeted task"
                     );
                     let program_activation = ProgramActivation(task.activation.0);
-                    spec.discard_work(runtime, key, program_activation, &task.work);
+                    spec.discard_work(runtime, program_activation, &task.work);
                     if seen.insert(task.activation) {
                         retired.push(program_activation);
                     }
@@ -6373,7 +6358,7 @@ impl DeltaScheduler {
                         proofs.push(proof);
                     }
                 }
-                spec.retire_activations(runtime, key, &retired);
+                spec.retire_activations(runtime, &retired);
             }
             for proof in proofs {
                 let completed_activation = self.registry.finish(proof);
@@ -6825,7 +6810,6 @@ impl DeltaScheduler {
             .program(state)
             .cloned()
             .expect("typed program task was scheduled under an unknown state");
-        let address_key = address.key();
         let spec = address.resolve(root, plan);
         let private_direct = address.has_private_direct_effects();
         let cohort_key = ProgramCohortKey::of(&self.registry, &tasks[0]);
@@ -6874,11 +6858,10 @@ impl DeltaScheduler {
             scratch.work.push(task.work);
         }
         scratch.receipt.clear();
-        spec.step_batch_for(
+        spec.step_batch(
             self.program_runtimes
                 .get_mut(&state)
                 .expect("typed program state lost its runtime"),
-            address_key,
             ProgramBatch {
                 view,
                 candidate_sets: &candidate_sets,
@@ -6909,7 +6892,7 @@ impl DeltaScheduler {
         // novelty admission, so taking it here preserves fixpoint semantics.
         let receipt_local_fusion = directed_active
             && row_count == 1
-            && matches!(&address, ProgramAddress::Constraint { .. })
+            && matches!(&address, ProgramAddress::Constraint(_))
             && cohort_key.class == ProgramCohortClass::ActivationStreaming
             && self
                 .registry
@@ -6960,11 +6943,10 @@ impl DeltaScheduler {
             scratch.work.clear();
             scratch.work.push(child.work);
             let fused_limits = [remaining];
-            spec.step_batch_for(
+            spec.step_batch(
                 self.program_runtimes
                     .get_mut(&state)
                     .expect("typed program state lost its runtime during receipt-local fusion"),
-                address_key,
                 ProgramBatch {
                     view,
                     candidate_sets: &candidate_sets,
@@ -7389,7 +7371,6 @@ impl DeltaScheduler {
                 self.program_runtimes
                     .get_mut(&state)
                     .expect("typed program state lost its runtime during retirement"),
-                address_key,
                 &retired_activations,
             );
         }
@@ -7651,7 +7632,6 @@ mod tests {
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
-                key: ProgramKey::new(0),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -7735,6 +7715,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn one_occurrence_variable_has_one_runtime_across_route_groupings() {
+        let root = ZeroProgressProgram;
+        let spec = ProgramRef::new(&root);
+        let desc = DeltaDesc::leaf(0, 7);
+        let mut scheduler = DeltaScheduler::new();
+        let page_state = scheduler.prepare_program(
+            desc.clone(),
+            ProgramRoute {
+                variable: 0,
+                grouping: ProgramGrouping::PageLocal,
+            },
+            spec,
+        );
+        let atomic_state = scheduler.prepare_program(
+            desc.clone(),
+            ProgramRoute {
+                variable: 0,
+                grouping: ProgramGrouping::ParentAtomic,
+            },
+            spec,
+        );
+
+        assert_eq!(atomic_state, page_state);
+        assert_eq!(scheduler.program_runtimes.len(), 1);
+        assert_eq!(
+            scheduler.interner.program(page_state),
+            Some(&ProgramAddress::Constraint(desc))
+        );
+    }
+
     #[derive(Clone, Copy)]
     struct OneShotSupportState {
         keep_cleanup_live: bool,
@@ -7752,7 +7763,6 @@ mod tests {
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             matches!(request.action, ProgramAction::Support).then_some(ProgramRoute {
-                key: ProgramKey::new(0),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -8610,7 +8620,6 @@ mod tests {
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
-                key: ProgramKey::new(0),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -12886,7 +12895,6 @@ mod tests {
     fn singleton_program_lease_selects_one_lineage_inside_the_canonical_bucket() {
         let mut scheduler = DeltaScheduler::new();
         let route = ProgramRoute {
-            key: ProgramKey::new(0),
             variable: 0,
             grouping: ProgramGrouping::PageLocal,
         };
@@ -12963,7 +12971,6 @@ mod tests {
 
     fn test_program_state(scheduler: &mut DeltaScheduler) -> DeltaStateId {
         let route = ProgramRoute {
-            key: ProgramKey::new(0),
             variable: 0,
             grouping: ProgramGrouping::PageLocal,
         };
@@ -13172,7 +13179,6 @@ mod tests {
         let mut scheduler = DeltaScheduler::new();
         let dormant_state = test_program_state(&mut scheduler);
         let active_route = ProgramRoute {
-            key: ProgramKey::new(0),
             variable: 0,
             grouping: ProgramGrouping::PageLocal,
         };
@@ -13624,7 +13630,6 @@ mod tests {
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             matches!(request.action, ProgramAction::Confirm(0)).then_some(ProgramRoute {
-                key: ProgramKey::new(0),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -14556,7 +14561,6 @@ mod tests {
     fn terminal_program_pop_funds_the_hot_activation_without_cross_quantum_averaging() {
         let mut scheduler = DeltaScheduler::new();
         let route = ProgramRoute {
-            key: ProgramKey::new(0),
             variable: 0,
             grouping: ProgramGrouping::PageLocal,
         };

@@ -97,22 +97,6 @@ pub struct ProgramRequest {
     pub bound: VariableSet,
 }
 
-/// Family-local immutable identity within one structural occurrence.
-///
-/// The occurrence-local address is not a query-global catalog or forwarding
-/// lookup key.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ProgramKey {
-    local: u32,
-}
-
-impl ProgramKey {
-    pub const fn new(value: u32) -> Self {
-        Self { local: value }
-    }
-}
-
 /// Action-specific physical grouping preference carried by a constructed route.
 ///
 /// Both variants have the same SET-valued query semantics. This hint controls
@@ -145,7 +129,6 @@ pub enum ProgramGrouping {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramRoute {
-    pub key: ProgramKey,
     /// Variable naming the structural graph-product operator.
     pub variable: VariableId,
     pub grouping: ProgramGrouping,
@@ -461,6 +444,13 @@ impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
 /// novelty admission. Within one activation, equal novelty keys must identify
 /// states with the same possible future outputs; otherwise admission order
 /// would change the relation produced by the Program.
+///
+/// Route selection ends at seeding: every distinction that can change future
+/// computation must be lowered into [`TypedProgramSpec::State`]. The scheduler
+/// may keep one runtime for several routes of the same structural occurrence
+/// and variable, and may co-batch their states whenever the state-derived
+/// dispatch metadata and physical input shape are compatible. A route cannot
+/// rely on a separate runtime partition to carry hidden semantics.
 #[doc(hidden)]
 pub trait TypedProgramSpec {
     type State: Clone + Send + 'static;
@@ -475,7 +465,9 @@ pub trait TypedProgramSpec {
     /// Selects one structural action route.
     ///
     /// In addition to being stable for the solve, confirmation routes obey
-    /// [`ProgramGrouping`]'s V1 family-local planning contract.
+    /// [`ProgramGrouping`]'s V1 family-local planning contract. The returned
+    /// route supplies planning and seed metadata, not an enduring runtime
+    /// identity.
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
     /// Certifies that the selected exact Confirm Program physically dominates
@@ -497,8 +489,8 @@ pub trait TypedProgramSpec {
     /// trace. Exact Confirm acceptance is independently authoritative;
     /// returning `true` says only that retaining the competing one-occurrence
     /// Support feeder cannot improve its first-positive latency. The default is
-    /// deliberately conservative: matching route keys or Boolean denotations
-    /// alone do not prove physical dominance.
+    /// deliberately conservative: matching route shapes or Boolean
+    /// denotations alone do not prove physical dominance.
     fn certifies_confirm_dominates_support_positive_prefix(
         &self,
         _confirm_request: ProgramRequest,
@@ -588,7 +580,7 @@ pub struct ProgramRuntime {
 /// that action is owned by the Program and cannot fall back to a second
 /// residual execution path.
 trait ErasedProgramSpec {
-    fn new_runtime(&self, key: ProgramKey) -> ProgramRuntime;
+    fn new_runtime(&self) -> ProgramRuntime;
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
@@ -610,7 +602,6 @@ trait ErasedProgramSpec {
     fn step_batch(
         &self,
         runtime: &mut ProgramRuntime,
-        key: ProgramKey,
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     );
@@ -618,17 +609,11 @@ trait ErasedProgramSpec {
     fn discard_work(
         &self,
         runtime: &mut ProgramRuntime,
-        key: ProgramKey,
         activation: ProgramActivation,
         work: &ProgramWork,
     );
 
-    fn retire_activations(
-        &self,
-        runtime: &mut ProgramRuntime,
-        key: ProgramKey,
-        activations: &[ProgramActivation],
-    );
+    fn retire_activations(&self, runtime: &mut ProgramRuntime, activations: &[ProgramActivation]);
 }
 
 /// Borrowed immutable typed program behind a private erased vtable.
@@ -647,11 +632,7 @@ impl<'a> ProgramRef<'a> {
     }
 
     pub(crate) fn new_runtime(self) -> ProgramRuntime {
-        self.new_runtime_for(ProgramKey::new(0))
-    }
-
-    pub(crate) fn new_runtime_for(self, key: ProgramKey) -> ProgramRuntime {
-        self.erased.new_runtime(key)
+        self.erased.new_runtime()
     }
 
     pub(crate) fn route(self, request: ProgramRequest) -> Option<ProgramRoute> {
@@ -687,24 +668,13 @@ impl<'a> ProgramRef<'a> {
         self.erased.seed_batch(runtime, batch, effects);
     }
 
-    #[cfg(test)]
     pub(crate) fn step_batch(
         self,
         runtime: &mut ProgramRuntime,
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     ) {
-        self.step_batch_for(runtime, ProgramKey::new(0), batch, effects);
-    }
-
-    pub(crate) fn step_batch_for(
-        self,
-        runtime: &mut ProgramRuntime,
-        key: ProgramKey,
-        batch: ProgramBatch<'_>,
-        effects: &mut ProgramBatchEffects,
-    ) {
-        self.erased.step_batch(runtime, key, batch, effects);
+        self.erased.step_batch(runtime, batch, effects);
     }
 
     /// Affinely discards typed work that policy declines before execution.
@@ -715,20 +685,18 @@ impl<'a> ProgramRef<'a> {
     pub(crate) fn discard_work(
         self,
         runtime: &mut ProgramRuntime,
-        key: ProgramKey,
         activation: ProgramActivation,
         work: &ProgramWork,
     ) {
-        self.erased.discard_work(runtime, key, activation, work);
+        self.erased.discard_work(runtime, activation, work);
     }
 
     pub(crate) fn retire_activations(
         self,
         runtime: &mut ProgramRuntime,
-        key: ProgramKey,
         activations: &[ProgramActivation],
     ) {
-        self.erased.retire_activations(runtime, key, activations);
+        self.erased.retire_activations(runtime, activations);
     }
 }
 
@@ -1035,7 +1003,7 @@ impl<T> ErasedProgramSpec for T
 where
     T: TypedProgramSpec,
 {
-    fn new_runtime(&self, _key: ProgramKey) -> ProgramRuntime {
+    fn new_runtime(&self) -> ProgramRuntime {
         ProgramRuntime {
             erased: Box::new(TypedProgramRuntime::<T::State, T::NoveltyKey, T::Rank>::default()),
             family: TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
@@ -1121,11 +1089,9 @@ where
     fn step_batch(
         &self,
         runtime: &mut ProgramRuntime,
-        key: ProgramKey,
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     ) {
-        let _ = key;
         let input_count = batch.work.len();
         assert_eq!(batch.view.len(), input_count);
         assert_eq!(batch.candidate_sets.len(), input_count);
@@ -1434,11 +1400,9 @@ where
     fn discard_work(
         &self,
         runtime: &mut ProgramRuntime,
-        key: ProgramKey,
         activation: ProgramActivation,
         work: &ProgramWork,
     ) {
-        let _ = key;
         assert_eq!(
             runtime.family,
             TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
@@ -1455,13 +1419,7 @@ where
         runtime.discard(activation, work);
     }
 
-    fn retire_activations(
-        &self,
-        runtime: &mut ProgramRuntime,
-        key: ProgramKey,
-        activations: &[ProgramActivation],
-    ) {
-        let _ = key;
+    fn retire_activations(&self, runtime: &mut ProgramRuntime, activations: &[ProgramActivation]) {
         assert_eq!(
             runtime.family,
             TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
@@ -1503,7 +1461,6 @@ mod tests {
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
             Some(ProgramRoute {
-                key: ProgramKey::new(0),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -1558,7 +1515,6 @@ mod tests {
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
             Some(ProgramRoute {
-                key: ProgramKey::new(0),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -1638,7 +1594,6 @@ mod tests {
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
             Some(ProgramRoute {
-                key: ProgramKey::new(13),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -1707,7 +1662,6 @@ mod tests {
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
             Some(ProgramRoute {
-                key: ProgramKey::new(14),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -1791,7 +1745,6 @@ mod tests {
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
             Some(ProgramRoute {
-                key: ProgramKey::new(0),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
@@ -1837,7 +1790,6 @@ mod tests {
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
             Some(ProgramRoute {
-                key: ProgramKey::new(0),
                 variable: 0,
                 grouping: ProgramGrouping::PageLocal,
             })
