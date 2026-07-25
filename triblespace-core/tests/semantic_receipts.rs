@@ -921,21 +921,19 @@ fn opaque_transparent_wrapper_forwards_source_actions() {
 }
 
 #[derive(Clone)]
-struct CoveringProposalWithExactProgram {
+struct CoveringProposalWithFiniteExactProgram {
     ordinary_proposes: Arc<AtomicUsize>,
     ordinary_confirms: Arc<AtomicUsize>,
     program_seeds: Arc<AtomicUsize>,
-    selected: bool,
 }
 
-impl TypedProgramSpec for CoveringProposalWithExactProgram {
+impl TypedProgramSpec for CoveringProposalWithFiniteExactProgram {
     type State = ();
     type NoveltyKey = ();
     type Rank = u8;
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        if !self.selected || request.action != ProgramAction::Propose(X) || request.bound.is_set(X)
-        {
+        if request.action != ProgramAction::Propose(X) || request.bound.is_set(X) {
             return None;
         }
         Some(ProgramRoute {
@@ -978,7 +976,7 @@ impl TypedProgramSpec for CoveringProposalWithExactProgram {
     }
 }
 
-impl Constraint<'static> for CoveringProposalWithExactProgram {
+impl Constraint<'static> for CoveringProposalWithFiniteExactProgram {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(X)
     }
@@ -1103,16 +1101,15 @@ impl Constraint<'static> for ConfirmationOnlyUniversalSibling {
 }
 
 #[test]
-fn selected_exact_program_source_composes_with_an_ordinary_weak_confirmer() {
+fn finite_exact_program_receipt_does_not_discharge_the_ordinary_covering_source() {
     let ordinary_proposes = Arc::new(AtomicUsize::new(0));
     let ordinary_confirms = Arc::new(AtomicUsize::new(0));
     let program_seeds = Arc::new(AtomicUsize::new(0));
     let sibling_confirms = Arc::new(AtomicUsize::new(0));
-    let proposer = CoveringProposalWithExactProgram {
+    let proposer = CoveringProposalWithFiniteExactProgram {
         ordinary_proposes: ordinary_proposes.clone(),
         ordinary_confirms: ordinary_confirms.clone(),
         program_seeds: program_seeds.clone(),
-        selected: true,
     };
     assert_eq!(
         proposer.proposal_coverage(X, VariableSet::new_empty()),
@@ -1134,57 +1131,18 @@ fn selected_exact_program_source_composes_with_an_ordinary_weak_confirmer() {
         .collect();
 
     assert_eq!(results, vec![MEMBER]);
-    assert_eq!(
-        ordinary_proposes.load(Ordering::Relaxed),
-        0,
-        "the selected Exact Program is the source, not the ordinary Covering fallback"
+    assert!(
+        ordinary_proposes.load(Ordering::Relaxed) > 0,
+        "finite Programs cannot replace the ordinary source"
     );
-    assert_eq!(
-        ordinary_confirms.load(Ordering::Relaxed),
-        0,
-        "the selected Exact Program needs no same-constraint self-confirmation"
+    assert!(
+        ordinary_confirms.load(Ordering::Relaxed) > 0,
+        "the ordinary Covering source must still confirm itself"
     );
     assert!(sibling_confirms.load(Ordering::Relaxed) > 0);
     assert_eq!(
         program_seeds.load(Ordering::Relaxed),
-        1,
-        "ordinary weak confirmation must not prevent the selected Exact Program source"
-    );
-}
-
-#[test]
-fn declined_exact_program_receipt_does_not_discharge_covering_ordinary_source() {
-    let ordinary_proposes = Arc::new(AtomicUsize::new(0));
-    let ordinary_confirms = Arc::new(AtomicUsize::new(0));
-    let program_seeds = Arc::new(AtomicUsize::new(0));
-    let proposer = CoveringProposalWithExactProgram {
-        ordinary_proposes: ordinary_proposes.clone(),
-        ordinary_confirms: ordinary_confirms.clone(),
-        program_seeds: program_seeds.clone(),
-        selected: false,
-    };
-    assert_eq!(
-        proposer.proposal_coverage(X, VariableSet::new_empty()),
-        ProposalCoverage::Covering
-    );
-    assert_eq!(
-        proposer.residual_program_proposal_coverage(X, VariableSet::new_empty()),
-        ProposalCoverage::Exact
-    );
-
-    let results: Vec<_> = Query::new(proposer, project_x)
-        .solve_residual_state_lazy()
-        .collect();
-
-    assert_eq!(results, vec![MEMBER]);
-    assert!(ordinary_proposes.load(Ordering::Relaxed) > 0);
-    assert!(
-        ordinary_confirms.load(Ordering::Relaxed) > 0,
-        "a declined Exact Program receipt must leave Covering self-confirmation active"
-    );
-    assert_eq!(
-        program_seeds.load(Ordering::Relaxed),
         0,
-        "a declined route must not seed its Program"
+        "a finite Program route must not seed its Machine"
     );
 }
