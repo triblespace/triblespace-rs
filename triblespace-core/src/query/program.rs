@@ -212,6 +212,14 @@ pub struct ProgramBatchEffects {
     pub source_roots: usize,
     pub transition_pages: usize,
     pub transition_examined: usize,
+    /// Additional typed family calls normalized behind this one erased
+    /// receipt. This is scheduler telemetry only.
+    pub(crate) normalized_steps: usize,
+    pub(crate) source_cohorts: usize,
+    pub(crate) max_source_cohort: usize,
+    pub(crate) transition_cohorts: usize,
+    pub(crate) max_transition_cohort: usize,
+    pub(crate) final_source_telemetry_cohort: bool,
 }
 
 impl ProgramBatchEffects {
@@ -226,6 +234,12 @@ impl ProgramBatchEffects {
         self.source_roots = 0;
         self.transition_pages = 0;
         self.transition_examined = 0;
+        self.normalized_steps = 0;
+        self.source_cohorts = 0;
+        self.max_source_cohort = 0;
+        self.transition_cohorts = 0;
+        self.max_transition_cohort = 0;
+        self.final_source_telemetry_cohort = false;
     }
 }
 
@@ -412,6 +426,152 @@ impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
         self.transition_pages += 1;
         self.transition_examined += examined;
     }
+}
+
+struct ValidatedTypedState<State> {
+    state: State,
+    dispatch: DispatchClass,
+    pacing: ProgramPacing,
+}
+
+enum ValidatedTypedResume<State> {
+    Immediate(ValidatedTypedState<State>),
+    AfterChildren(ValidatedTypedState<State>),
+    AfterChildrenDone,
+}
+
+struct ValidatedTypedPage<State> {
+    examined: usize,
+    resume: Option<ValidatedTypedResume<State>>,
+}
+
+struct ValidatedTypedChild<State> {
+    input: u32,
+    state: ValidatedTypedState<State>,
+    accepted: Option<RawInline>,
+}
+
+struct ValidatedTypedEffects<State> {
+    pages: Vec<ValidatedTypedPage<State>>,
+    children: Vec<ValidatedTypedChild<State>>,
+    direct: Vec<(u32, RawInline)>,
+    accepted: Vec<(u32, RawInline)>,
+    supported: Vec<(u32, ())>,
+    source_pages: usize,
+    source_examined: usize,
+    source_roots: usize,
+    transition_pages: usize,
+    transition_examined: usize,
+    source_cohorts: usize,
+    max_source_cohort: usize,
+    transition_cohorts: usize,
+    max_transition_cohort: usize,
+    final_source_telemetry_cohort: bool,
+}
+
+impl<State> Default for ValidatedTypedEffects<State> {
+    fn default() -> Self {
+        Self {
+            pages: Vec::new(),
+            children: Vec::new(),
+            direct: Vec::new(),
+            accepted: Vec::new(),
+            supported: Vec::new(),
+            source_pages: 0,
+            source_examined: 0,
+            source_roots: 0,
+            transition_pages: 0,
+            transition_examined: 0,
+            source_cohorts: 0,
+            max_source_cohort: 0,
+            transition_cohorts: 0,
+            max_transition_cohort: 0,
+            final_source_telemetry_cohort: false,
+        }
+    }
+}
+
+impl<State> ValidatedTypedEffects<State> {
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.children.clear();
+        self.direct.clear();
+        self.accepted.clear();
+        self.supported.clear();
+        self.source_pages = 0;
+        self.source_examined = 0;
+        self.source_roots = 0;
+        self.transition_pages = 0;
+        self.transition_examined = 0;
+        self.source_cohorts = 0;
+        self.max_source_cohort = 0;
+        self.transition_cohorts = 0;
+        self.max_transition_cohort = 0;
+        self.final_source_telemetry_cohort = false;
+    }
+
+    fn absorb_observations_and_telemetry(&mut self, other: &mut Self) {
+        self.direct.append(&mut other.direct);
+        self.accepted.append(&mut other.accepted);
+        self.supported.append(&mut other.supported);
+        self.source_pages += other.source_pages;
+        self.source_examined += other.source_examined;
+        self.source_roots += other.source_roots;
+        self.transition_pages += other.transition_pages;
+        self.transition_examined += other.transition_examined;
+        self.source_cohorts += other.source_cohorts;
+        self.max_source_cohort = self.max_source_cohort.max(other.max_source_cohort);
+        self.transition_cohorts += other.transition_cohorts;
+        self.max_transition_cohort = self.max_transition_cohort.max(other.max_transition_cohort);
+        self.final_source_telemetry_cohort = other.final_source_telemetry_cohort;
+        other.source_pages = 0;
+        other.source_examined = 0;
+        other.source_roots = 0;
+        other.transition_pages = 0;
+        other.transition_examined = 0;
+        other.source_cohorts = 0;
+        other.max_source_cohort = 0;
+        other.transition_cohorts = 0;
+        other.max_transition_cohort = 0;
+        other.final_source_telemetry_cohort = false;
+    }
+}
+
+enum TypedFrontierDisposition {
+    Immediate,
+    Child { accepted: Option<RawInline> },
+}
+
+struct TypedFrontierState<State> {
+    state: ValidatedTypedState<State>,
+    disposition: TypedFrontierDisposition,
+}
+
+fn escape_typed_frontier<State>(
+    frontier: &mut Vec<TypedFrontierState<State>>,
+    receipt: &mut ValidatedTypedEffects<State>,
+    examined: usize,
+) {
+    let mut resume = None;
+    for frontier_state in frontier.drain(..) {
+        match frontier_state.disposition {
+            TypedFrontierDisposition::Immediate => {
+                assert!(
+                    resume.is_none(),
+                    "typed morsel manufactured more than one same-lineage resume"
+                );
+                resume = Some(ValidatedTypedResume::Immediate(frontier_state.state));
+            }
+            TypedFrontierDisposition::Child { accepted } => {
+                receipt.children.push(ValidatedTypedChild {
+                    input: 0,
+                    state: frontier_state.state,
+                    accepted,
+                });
+            }
+        }
+    }
+    receipt.pages.push(ValidatedTypedPage { examined, resume });
 }
 
 /// Family-typed residual program contract.
@@ -704,6 +864,9 @@ struct TypedProgramScratch<State, NoveltyKey, Rank> {
     states: Vec<State>,
     input_ranks: Vec<Rank>,
     effects: TypedEffectSink<State, NoveltyKey>,
+    layer: ValidatedTypedEffects<State>,
+    morsel: ValidatedTypedEffects<State>,
+    frontier: Vec<TypedFrontierState<State>>,
     examined: Vec<usize>,
     raw_effects: Vec<usize>,
     resume_physical: Vec<Option<(DispatchClass, ProgramPacing)>>,
@@ -718,6 +881,9 @@ impl<State, NoveltyKey, Rank> Default for TypedProgramScratch<State, NoveltyKey,
             states: Vec::new(),
             input_ranks: Vec::new(),
             effects: TypedEffectSink::default(),
+            layer: ValidatedTypedEffects::default(),
+            morsel: ValidatedTypedEffects::default(),
+            frontier: Vec::new(),
             examined: Vec::new(),
             raw_effects: Vec::new(),
             resume_physical: Vec::new(),
@@ -725,6 +891,266 @@ impl<State, NoveltyKey, Rank> Default for TypedProgramScratch<State, NoveltyKey,
             child_admitted: Vec::new(),
             child_physical: Vec::new(),
         }
+    }
+}
+
+impl<State, NoveltyKey, Rank> TypedProgramScratch<State, NoveltyKey, Rank>
+where
+    State: Clone + Send + 'static,
+    NoveltyKey: Clone + Eq + Hash + Send + 'static,
+    Rank: Ord + Send + 'static,
+{
+    /// Validates one complete family call into a handle-free typed receipt.
+    ///
+    /// Novelty admission is committed only after every receipt law in this
+    /// family call validates. Later typed layers observe that committed
+    /// admission, while outward effects and arena handles remain buffered until
+    /// the complete morsel escapes.
+    fn validate_layer<T>(
+        &mut self,
+        spec: &T,
+        runtime: &mut TypedProgramRuntime<State, NoveltyKey, Rank>,
+        activations: &[ProgramActivation],
+        limits: &[usize],
+    ) where
+        T: TypedProgramSpec<State = State, NoveltyKey = NoveltyKey, Rank = Rank>,
+    {
+        let input_count = self.input_ranks.len();
+        assert_eq!(activations.len(), input_count);
+        assert_eq!(limits.len(), input_count);
+        self.batch_novelty.clear();
+        let typed = &mut self.effects;
+        assert_eq!(
+            typed.pages.len(),
+            input_count,
+            "typed program returned the wrong page count"
+        );
+
+        self.examined.clear();
+        self.examined
+            .extend(typed.pages.iter().map(|page| page.examined));
+        assert!(
+            self.examined
+                .iter()
+                .zip(limits)
+                .all(|(&spent, &limit)| spent <= limit),
+            "typed program exceeded one input's physical work budget"
+        );
+        self.raw_effects.clear();
+        self.raw_effects.resize(input_count, 0);
+
+        self.resume_physical.clear();
+        self.resume_physical.reserve(input_count);
+        for (input, page) in typed.pages.iter().enumerate() {
+            match &page.resume {
+                Some(TypedResume::Immediate(state) | TypedResume::AfterChildren(state)) => {
+                    assert!(
+                        spec.progress(state) < self.input_ranks[input],
+                        "typed program resume did not strictly decrease its finite rank"
+                    );
+                    self.resume_physical
+                        .push(Some((spec.dispatch(state), spec.pacing(state))));
+                }
+                Some(TypedResume::AfterChildrenDone) | None => {
+                    self.resume_physical.push(None);
+                }
+            }
+        }
+
+        // This bitmap and the novelty map form a transaction plan. Repeated
+        // keys consult the local plan first; the runtime remains immutable
+        // until every traversed layer has validated.
+        self.child_admitted.clear();
+        self.child_admitted.reserve(typed.children.len());
+        self.child_physical.clear();
+        self.child_physical.reserve(typed.children.len());
+        let mut previous = 0u32;
+        for (position, child) in typed.children.iter().enumerate() {
+            assert!(
+                (child.input as usize) < input_count,
+                "typed program child tag is out of range"
+            );
+            assert!(
+                position == 0 || child.input >= previous,
+                "typed program child tags are not grouped in ascending order"
+            );
+            previous = child.input;
+            self.raw_effects[child.input as usize] += 1;
+            if child.novelty.is_none() {
+                assert!(
+                    spec.progress(&child.state) < self.input_ranks[child.input as usize],
+                    "typed program finite child did not strictly decrease its input rank"
+                );
+            }
+            self.child_physical
+                .push((spec.dispatch(&child.state), spec.pacing(&child.state)));
+
+            let admitted = if let Some(novelty) = child.novelty.as_ref() {
+                let activation = activations[child.input as usize];
+                match self.batch_novelty.entry((activation, novelty.clone())) {
+                    Entry::Occupied(previous) => {
+                        assert_eq!(
+                            *previous.get(),
+                            child.accepted,
+                            "one typed novelty key changed its endpoint observation"
+                        );
+                        false
+                    }
+                    Entry::Vacant(first) => {
+                        let admitted = match runtime
+                            .novelty
+                            .get(&activation)
+                            .and_then(|seen| seen.get(novelty))
+                        {
+                            Some(previous) => {
+                                assert_eq!(
+                                    *previous, child.accepted,
+                                    "one typed novelty key changed its endpoint observation"
+                                );
+                                false
+                            }
+                            None => true,
+                        };
+                        first.insert(child.accepted);
+                        admitted
+                    }
+                }
+            } else {
+                true
+            };
+            self.child_admitted.push(admitted);
+        }
+
+        let mut previous = 0u32;
+        for (position, (input, _)) in typed.direct.iter().enumerate() {
+            assert!((*input as usize) < input_count);
+            assert!(
+                position == 0 || *input >= previous,
+                "typed direct observations are not grouped in ascending order"
+            );
+            previous = *input;
+            self.raw_effects[*input as usize] += 1;
+        }
+        let mut previous = 0u32;
+        for (position, (input, _)) in typed.accepted.iter().enumerate() {
+            assert!((*input as usize) < input_count);
+            assert!(
+                position == 0 || *input >= previous,
+                "typed candidate observations are not grouped in ascending order"
+            );
+            previous = *input;
+            self.raw_effects[*input as usize] += 1;
+        }
+        let mut previous = 0u32;
+        for (position, (input, ())) in typed.supported.iter().enumerate() {
+            assert!((*input as usize) < input_count);
+            assert!(
+                position == 0 || *input >= previous,
+                "typed support observations are not grouped in ascending order"
+            );
+            assert!(
+                position == 0 || *input != previous,
+                "one typed input page reported Boolean support more than once"
+            );
+            previous = *input;
+            self.raw_effects[*input as usize] += 1;
+        }
+        assert!(
+            self.raw_effects
+                .iter()
+                .zip(&self.examined)
+                .all(|(&outputs, &spent)| outputs <= spent),
+            "typed program emitted more raw effects than its examined-work receipt"
+        );
+        assert!(
+            typed
+                .pages
+                .iter()
+                .all(|page| page.examined > 0 || page.resume.is_none()),
+            "typed program scheduled zero-examined continuation work without a positive work receipt"
+        );
+
+        // Only after the complete layer validates do we move family-owned
+        // states into the private transaction receipt.
+        self.layer.clear();
+        self.layer.pages.extend(
+            typed
+                .pages
+                .drain(..)
+                .zip(self.resume_physical.drain(..))
+                .map(|(page, physical)| {
+                    let resume = match (page.resume, physical) {
+                        (Some(TypedResume::Immediate(state)), Some((dispatch, pacing))) => {
+                            Some(ValidatedTypedResume::Immediate(ValidatedTypedState {
+                                state,
+                                dispatch,
+                                pacing,
+                            }))
+                        }
+                        (Some(TypedResume::AfterChildren(state)), Some((dispatch, pacing))) => {
+                            Some(ValidatedTypedResume::AfterChildren(ValidatedTypedState {
+                                state,
+                                dispatch,
+                                pacing,
+                            }))
+                        }
+                        (Some(TypedResume::AfterChildrenDone), None) => {
+                            Some(ValidatedTypedResume::AfterChildrenDone)
+                        }
+                        (None, None) => None,
+                        _ => unreachable!("typed Program resume preflight lost alignment"),
+                    };
+                    ValidatedTypedPage {
+                        examined: page.examined,
+                        resume,
+                    }
+                }),
+        );
+        for ((child, (dispatch, pacing)), admitted) in typed
+            .children
+            .drain(..)
+            .zip(self.child_physical.drain(..))
+            .zip(self.child_admitted.drain(..))
+        {
+            if admitted {
+                if let Some(novelty) = child.novelty {
+                    let activation = activations[child.input as usize];
+                    let previous = runtime
+                        .novelty
+                        .entry(activation)
+                        .or_default()
+                        .insert(novelty, child.accepted);
+                    assert!(
+                        previous.is_none(),
+                        "typed novelty preflight admitted an existing key"
+                    );
+                }
+                self.layer.children.push(ValidatedTypedChild {
+                    input: child.input,
+                    state: ValidatedTypedState {
+                        state: child.state,
+                        dispatch,
+                        pacing,
+                    },
+                    accepted: child.accepted,
+                });
+            }
+        }
+        self.layer.direct.append(&mut typed.direct);
+        self.layer.accepted.append(&mut typed.accepted);
+        self.layer.supported.append(&mut typed.supported);
+        self.layer.source_pages = typed.source_pages;
+        self.layer.source_examined = typed.source_examined;
+        self.layer.source_roots = typed.source_roots;
+        self.layer.transition_pages = typed.transition_pages;
+        self.layer.transition_examined = typed.transition_examined;
+        self.layer.source_cohorts = usize::from(typed.source_pages > 0);
+        self.layer.max_source_cohort = typed.source_pages;
+        self.layer.transition_cohorts = usize::from(typed.transition_pages > 0);
+        self.layer.max_transition_cohort = typed.transition_pages;
+        self.layer.final_source_telemetry_cohort =
+            typed.source_pages > 0 && typed.transition_pages == 0;
+        typed.clear();
     }
 }
 
@@ -877,6 +1303,73 @@ where
             seen.insert(key, accepted);
             true
         }
+    }
+
+    fn publish_validated(
+        &mut self,
+        activations: &[ProgramActivation],
+        receipt: &mut ValidatedTypedEffects<State>,
+        normalized_steps: usize,
+        effects: &mut ProgramBatchEffects,
+    ) {
+        effects
+            .pages
+            .extend(receipt.pages.drain(..).enumerate().map(|(input, page)| {
+                let activation = activations[input];
+                let resume = match page.resume {
+                    Some(ValidatedTypedResume::Immediate(state)) => {
+                        Some(ProgramResume::Immediate(ProgramWork {
+                            handle: self.insert(activation, state.state),
+                            dispatch: state.dispatch,
+                            pacing: state.pacing,
+                        }))
+                    }
+                    Some(ValidatedTypedResume::AfterChildren(state)) => {
+                        Some(ProgramResume::AfterChildren(ProgramWork {
+                            handle: self.insert(activation, state.state),
+                            dispatch: state.dispatch,
+                            pacing: state.pacing,
+                        }))
+                    }
+                    Some(ValidatedTypedResume::AfterChildrenDone) => {
+                        Some(ProgramResume::AfterChildrenDone)
+                    }
+                    None => None,
+                };
+                ProgramPage {
+                    examined: page.examined,
+                    resume,
+                }
+            }));
+        for child in receipt.children.drain(..) {
+            let activation = activations[child.input as usize];
+            effects.children.push(ProgramChild {
+                input: child.input,
+                work: ProgramWork {
+                    handle: self.insert(activation, child.state.state),
+                    dispatch: child.state.dispatch,
+                    pacing: child.state.pacing,
+                },
+                accepted: child.accepted,
+            });
+        }
+        effects.direct.append(&mut receipt.direct);
+        effects.accepted.append(&mut receipt.accepted);
+        effects.supported.append(&mut receipt.supported);
+        effects.source_pages += receipt.source_pages;
+        effects.source_examined += receipt.source_examined;
+        effects.source_roots += receipt.source_roots;
+        effects.transition_pages += receipt.transition_pages;
+        effects.transition_examined += receipt.transition_examined;
+        effects.normalized_steps += normalized_steps;
+        effects.source_cohorts += receipt.source_cohorts;
+        effects.max_source_cohort = effects.max_source_cohort.max(receipt.max_source_cohort);
+        effects.transition_cohorts += receipt.transition_cohorts;
+        effects.max_transition_cohort = effects
+            .max_transition_cohort
+            .max(receipt.max_transition_cohort);
+        effects.final_source_telemetry_cohort = receipt.final_source_telemetry_cohort;
+        receipt.clear();
     }
 
     /// Atomically retires a cohort after at most one arena ownership pass.
@@ -1125,261 +1618,211 @@ where
             );
         }
 
-        let typed_batch = TypedProgramBatch {
-            view: batch.view,
-            candidate_sets: batch.candidate_sets,
-            activations: batch.activations,
-            limits: batch.limits,
-        };
-        scratch.effects.clear();
-        self.step_typed(&mut scratch.states, typed_batch, &mut scratch.effects);
-        scratch.states.clear();
-        let typed = &mut scratch.effects;
-        assert_eq!(
-            typed.pages.len(),
-            input_count,
-            "typed program returned the wrong page count"
-        );
-        scratch.examined.clear();
-        scratch
-            .examined
-            .extend(typed.pages.iter().map(|page| page.examined));
-        assert!(
-            scratch
-                .examined
-                .iter()
-                .zip(batch.limits)
-                .all(|(&spent, &limit)| spent <= limit),
-            "typed program exceeded one input's physical work budget"
-        );
-        scratch.raw_effects.clear();
-        scratch.raw_effects.resize(input_count, 0);
+        scratch.layer.clear();
+        scratch.morsel.clear();
+        scratch.frontier.clear();
 
-        // Validate the entire typed receipt before publishing any replacement
-        // handle, novelty admission, or outward effect. The family call
-        // produces a transaction candidate, not permission to commit a valid
-        // prefix before a later malformed effect is discovered.
-        scratch.resume_physical.clear();
-        scratch.resume_physical.reserve(input_count);
-        for (input, page) in typed.pages.iter().enumerate() {
-            match &page.resume {
-                Some(TypedResume::Immediate(state) | TypedResume::AfterChildren(state)) => {
-                    assert!(
-                        self.progress(state) < scratch.input_ranks[input],
-                        "typed program resume did not strictly decrease its finite rank"
-                    );
-                    scratch
-                        .resume_physical
-                        .push(Some((self.dispatch(state), self.pacing(state))));
-                }
-                Some(TypedResume::AfterChildrenDone) | None => scratch.resume_physical.push(None),
-            }
-        }
-
-        scratch.batch_novelty.clear();
-        // The bitmap is a receipt-local transaction plan. Repetitions consult
-        // the batch observation first, so only the first exact key reads the
-        // runtime. Neither map nor handles are mutated until every receipt law
-        // below has validated.
-        scratch.child_admitted.clear();
-        scratch.child_admitted.reserve(typed.children.len());
-        scratch.child_physical.clear();
-        scratch.child_physical.reserve(typed.children.len());
-        let mut previous = 0u32;
-        for (position, child) in typed.children.iter().enumerate() {
-            assert!(
-                (child.input as usize) < input_count,
-                "typed program child tag is out of range"
-            );
-            assert!(
-                position == 0 || child.input >= previous,
-                "typed program child tags are not grouped in ascending order"
-            );
-            previous = child.input;
-            scratch.raw_effects[child.input as usize] += 1;
-            if child.novelty.is_none() {
-                assert!(
-                    self.progress(&child.state) < scratch.input_ranks[child.input as usize],
-                    "typed program finite child did not strictly decrease its input rank"
-                );
-            }
-            scratch
-                .child_physical
-                .push((self.dispatch(&child.state), self.pacing(&child.state)));
-
-            let admitted = if let Some(novelty) = child.novelty.as_ref() {
-                let activation = batch.activations[child.input as usize];
-                match scratch.batch_novelty.entry((activation, novelty.clone())) {
-                    Entry::Occupied(previous) => {
-                        assert_eq!(
-                            *previous.get(),
-                            child.accepted,
-                            "one typed novelty key changed its endpoint observation"
-                        );
-                        false
-                    }
-                    Entry::Vacant(first) => {
-                        let admitted = match runtime
-                            .novelty
-                            .get(&activation)
-                            .and_then(|seen| seen.get(novelty))
-                        {
-                            Some(previous) => {
-                                assert_eq!(
-                                    *previous, child.accepted,
-                                    "one typed novelty key changed its endpoint observation"
-                                );
-                                false
-                            }
-                            None => true,
-                        };
-                        first.insert(child.accepted);
-                        admitted
-                    }
-                }
-            } else {
-                true
-            };
-            scratch.child_admitted.push(admitted);
-        }
-
-        let mut previous = 0u32;
-        for (position, (input, _)) in typed.direct.iter().enumerate() {
-            assert!((*input as usize) < input_count);
-            assert!(
-                position == 0 || *input >= previous,
-                "typed direct observations are not grouped in ascending order"
-            );
-            previous = *input;
-            scratch.raw_effects[*input as usize] += 1;
-        }
-        let mut previous = 0u32;
-        for (position, (input, _)) in typed.accepted.iter().enumerate() {
-            assert!((*input as usize) < input_count);
-            assert!(
-                position == 0 || *input >= previous,
-                "typed candidate observations are not grouped in ascending order"
-            );
-            previous = *input;
-            scratch.raw_effects[*input as usize] += 1;
-        }
-        let mut previous = 0u32;
-        for (position, (input, ())) in typed.supported.iter().enumerate() {
-            assert!((*input as usize) < input_count);
-            assert!(
-                position == 0 || *input >= previous,
-                "typed support observations are not grouped in ascending order"
-            );
-            assert!(
-                position == 0 || *input != previous,
-                "one typed input page reported Boolean support more than once"
-            );
-            previous = *input;
-            scratch.raw_effects[*input as usize] += 1;
-        }
-        assert!(
-            scratch
-                .raw_effects
-                .iter()
-                .zip(&scratch.examined)
-                .all(|(&outputs, &spent)| outputs <= spent),
-            "typed program emitted more raw effects than its examined-work receipt"
-        );
-        assert!(
-            typed
-                .pages
-                .iter()
-                .all(|page| page.examined > 0 || page.resume.is_none()),
-            "typed program scheduled zero-examined continuation work without a positive work receipt"
-        );
-
-        scratch.batch_novelty.clear();
-
-        // From here onward every family-derived value and every static receipt
-        // law has already been checked. Allocation failure, generation
-        // exhaustion, or another panic remains fatal and non-rollback, exactly
-        // like the affine input take above; recoverable backends return `None`
-        // before reaching this commit phase.
-        effects.pages.extend(
-            typed
-                .pages
-                .drain(..)
-                .zip(scratch.resume_physical.drain(..))
-                .enumerate()
-                .map(|(input, (page, physical))| {
-                    let activation = batch.activations[input];
-                    let resume = match (page.resume, physical) {
-                        (Some(TypedResume::Immediate(state)), Some((dispatch, pacing))) => {
-                            let work = ProgramWork {
-                                handle: runtime.insert(activation, state),
-                                dispatch,
-                                pacing,
-                            };
-                            Some(ProgramResume::Immediate(work))
-                        }
-                        (Some(TypedResume::AfterChildren(state)), Some((dispatch, pacing))) => {
-                            let work = ProgramWork {
-                                handle: runtime.insert(activation, state),
-                                dispatch,
-                                pacing,
-                            };
-                            Some(ProgramResume::AfterChildren(work))
-                        }
-                        (Some(TypedResume::AfterChildrenDone), None) => {
-                            Some(ProgramResume::AfterChildrenDone)
-                        }
-                        (None, None) => None,
-                        _ => unreachable!("typed Program resume preflight lost alignment"),
-                    };
-                    ProgramPage {
-                        examined: page.examined,
-                        resume,
-                    }
-                }),
-        );
-
-        for ((child, (dispatch, pacing)), admitted) in typed
-            .children
-            .drain(..)
-            .zip(scratch.child_physical.drain(..))
-            .zip(scratch.child_admitted.drain(..))
-        {
-            if !admitted {
-                continue;
-            }
-            let activation = batch.activations[child.input as usize];
-            if let Some(novelty) = child.novelty {
-                let previous = runtime
-                    .novelty
-                    .entry(activation)
-                    .or_default()
-                    .insert(novelty, child.accepted);
-                assert!(
-                    previous.is_none(),
-                    "typed novelty preflight admitted an existing key"
-                );
-            }
-            let work = ProgramWork {
-                handle: runtime.insert(activation, child.state),
-                dispatch,
-                pacing,
-            };
-            effects.children.push(ProgramChild {
-                input: child.input,
-                work,
-                accepted: child.accepted,
+        let normalized_steps;
+        if input_count == 1 {
+            // The first adapter-local morsel is deliberately a singleton
+            // frontier. A branch can contain independent receipt-local joins;
+            // flattening two such lineages into one ProgramPage would widen an
+            // AfterChildren barrier. Branches therefore escape unchanged.
+            let state = scratch
+                .states
+                .pop()
+                .expect("typed singleton cohort lost its affine state");
+            scratch.input_ranks.clear();
+            scratch.frontier.push(TypedFrontierState {
+                state: ValidatedTypedState {
+                    state,
+                    dispatch: batch.work[0].dispatch,
+                    pacing: batch.work[0].pacing,
+                },
+                disposition: TypedFrontierDisposition::Immediate,
             });
+
+            let dispatch = batch.work[0].dispatch;
+            let pacing = batch.work[0].pacing;
+            let limit = batch.limits[0];
+            let mut total_examined = 0usize;
+            let mut typed_calls = 0usize;
+            loop {
+                if matches!(
+                    &scratch
+                        .frontier
+                        .last()
+                        .expect("typed morsel lost its singleton frontier")
+                        .disposition,
+                    TypedFrontierDisposition::Child { accepted: Some(_) }
+                ) {
+                    // An accepted child is already a reducer-visible
+                    // publication. Traversing behind it could expose a later
+                    // AfterChildren barrier to PositiveSupport even though
+                    // the unfused reducer would publish and cancel first.
+                    escape_typed_frontier(
+                        &mut scratch.frontier,
+                        &mut scratch.morsel,
+                        total_examined,
+                    );
+                    break;
+                }
+                let frontier_state = scratch
+                    .frontier
+                    .pop()
+                    .expect("typed morsel lost its singleton frontier");
+                if frontier_state.state.dispatch != dispatch
+                    || frontier_state.state.pacing != pacing
+                {
+                    scratch.frontier.push(frontier_state);
+                    escape_typed_frontier(
+                        &mut scratch.frontier,
+                        &mut scratch.morsel,
+                        total_examined,
+                    );
+                    break;
+                }
+
+                scratch.input_ranks.clear();
+                scratch
+                    .input_ranks
+                    .push(self.progress(&frontier_state.state.state));
+                scratch.states.clear();
+                scratch.states.push(frontier_state.state.state);
+                let remaining = limit
+                    .checked_sub(total_examined)
+                    .expect("typed morsel overspent its input grant");
+                assert!(remaining > 0, "typed morsel re-entered an exhausted grant");
+                let local_limits = [remaining];
+                scratch.effects.clear();
+                self.step_typed(
+                    &mut scratch.states,
+                    TypedProgramBatch {
+                        view: batch.view,
+                        candidate_sets: batch.candidate_sets,
+                        activations: batch.activations,
+                        limits: &local_limits,
+                    },
+                    &mut scratch.effects,
+                );
+                scratch.states.clear();
+                scratch.validate_layer(self, runtime, batch.activations, &local_limits);
+                scratch.input_ranks.clear();
+                typed_calls += 1;
+
+                let page = scratch
+                    .layer
+                    .pages
+                    .pop()
+                    .expect("validated singleton layer lost its page");
+                assert!(
+                    scratch.layer.pages.is_empty(),
+                    "validated singleton layer manufactured extra pages"
+                );
+                total_examined = total_examined
+                    .checked_add(page.examined)
+                    .expect("typed morsel examined-work count overflow");
+                scratch
+                    .morsel
+                    .absorb_observations_and_telemetry(&mut scratch.layer);
+
+                match page.resume {
+                    Some(
+                        resume @ (ValidatedTypedResume::AfterChildren(_)
+                        | ValidatedTypedResume::AfterChildrenDone),
+                    ) => {
+                        scratch.morsel.children.append(&mut scratch.layer.children);
+                        scratch.morsel.pages.push(ValidatedTypedPage {
+                            examined: total_examined,
+                            resume: Some(resume),
+                        });
+                        break;
+                    }
+                    Some(ValidatedTypedResume::Immediate(state)) => {
+                        for child in scratch.layer.children.drain(..) {
+                            scratch.frontier.push(TypedFrontierState {
+                                state: child.state,
+                                disposition: TypedFrontierDisposition::Child {
+                                    accepted: child.accepted,
+                                },
+                            });
+                        }
+                        scratch.frontier.push(TypedFrontierState {
+                            state,
+                            disposition: TypedFrontierDisposition::Immediate,
+                        });
+                    }
+                    None => {
+                        for child in scratch.layer.children.drain(..) {
+                            scratch.frontier.push(TypedFrontierState {
+                                state: child.state,
+                                disposition: TypedFrontierDisposition::Child {
+                                    accepted: child.accepted,
+                                },
+                            });
+                        }
+                    }
+                }
+
+                if scratch.frontier.is_empty() {
+                    scratch.morsel.pages.push(ValidatedTypedPage {
+                        examined: total_examined,
+                        resume: None,
+                    });
+                    break;
+                }
+                // Outward observations are a publication boundary. This keeps
+                // their typed page chronology intact and avoids delaying an
+                // already available witness behind more local work.
+                if !scratch.morsel.direct.is_empty()
+                    || !scratch.morsel.accepted.is_empty()
+                    || !scratch.morsel.supported.is_empty()
+                    || scratch.frontier.len() != 1
+                    || total_examined == limit
+                {
+                    escape_typed_frontier(
+                        &mut scratch.frontier,
+                        &mut scratch.morsel,
+                        total_examined,
+                    );
+                    break;
+                }
+            }
+            normalized_steps = typed_calls.saturating_sub(1);
+        } else {
+            scratch.effects.clear();
+            self.step_typed(
+                &mut scratch.states,
+                TypedProgramBatch {
+                    view: batch.view,
+                    candidate_sets: batch.candidate_sets,
+                    activations: batch.activations,
+                    limits: batch.limits,
+                },
+                &mut scratch.effects,
+            );
+            scratch.states.clear();
+            scratch.validate_layer(self, runtime, batch.activations, batch.limits);
+            scratch.input_ranks.clear();
+            normalized_steps = 0;
         }
 
-        effects.direct.extend(typed.direct.drain(..));
-        effects.accepted.extend(typed.accepted.drain(..));
-        effects.supported.extend(typed.supported.drain(..));
-        effects.source_pages += typed.source_pages;
-        effects.source_examined += typed.source_examined;
-        effects.source_roots += typed.source_roots;
-        effects.transition_pages += typed.transition_pages;
-        effects.transition_examined += typed.transition_examined;
-        typed.clear();
+        // Every traversed layer has validated and admitted novelty. Allocate
+        // handles only for the final escaped frontier.
+        if input_count == 1 {
+            runtime.publish_validated(
+                batch.activations,
+                &mut scratch.morsel,
+                normalized_steps,
+                effects,
+            );
+        } else {
+            runtime.publish_validated(batch.activations, &mut scratch.layer, 0, effects);
+        }
+        scratch.effects.clear();
+        scratch.layer.clear();
+        scratch.morsel.clear();
+        scratch.frontier.clear();
         scratch.input_ranks.clear();
         scratch.examined.clear();
         scratch.raw_effects.clear();
@@ -1803,6 +2246,416 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MorselMode {
+        BranchMixedNovelty,
+        AcceptedChain,
+        ImmediateChain,
+        AfterChildren,
+        MalformedLater,
+    }
+
+    #[derive(Clone, Debug)]
+    struct MorselState(u8);
+
+    struct MorselProbe {
+        mode: MorselMode,
+        calls: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl TypedProgramSpec for MorselProbe {
+        type State = MorselState;
+        type NoveltyKey = Key;
+        type Rank = u8;
+
+        fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
+            Some(ProgramRoute { variable: 0 })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            DispatchClass::new(21)
+        }
+
+        fn progress(&self, state: &Self::State) -> Self::Rank {
+            state.0
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            match self.mode {
+                MorselMode::BranchMixedNovelty => {
+                    effects.fixpoint_root(0, MorselState(9), Key(0), None);
+                }
+                MorselMode::AcceptedChain
+                | MorselMode::ImmediateChain
+                | MorselMode::AfterChildren
+                | MorselMode::MalformedLater => {
+                    effects.finite_root(0, MorselState(3), None);
+                }
+            }
+        }
+
+        fn step_typed(
+            &self,
+            states: &mut Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            assert_eq!(states.len(), 1);
+            let state = states.pop().unwrap();
+            self.calls.lock().unwrap().push(state.0);
+            match (self.mode, state.0) {
+                (MorselMode::BranchMixedNovelty, 9) => {
+                    // Existing, fresh, local duplicate, fresh: only the two
+                    // first fresh keys may own escaped handles.
+                    effects.fixpoint_child(0, MorselState(8), Key(0), None);
+                    effects.fixpoint_child(0, MorselState(7), Key(1), Some([1; 32]));
+                    effects.fixpoint_child(0, MorselState(6), Key(1), Some([1; 32]));
+                    effects.fixpoint_child(0, MorselState(5), Key(2), Some([2; 32]));
+                    effects.direct(0, [3; 32]);
+                    effects.accept(0, [4; 32]);
+                    effects.account_transition(6);
+                    effects.page(6, Some(TypedResume::Immediate(MorselState(4))));
+                }
+                (MorselMode::AcceptedChain, 3) => {
+                    effects.fixpoint_child(0, MorselState(2), Key(2), Some([0xA2; 32]));
+                    effects.account_transition(1);
+                    effects.page(1, None);
+                }
+                (MorselMode::AcceptedChain, 2) => {
+                    effects.fixpoint_child(0, MorselState(1), Key(1), Some([0xA1; 32]));
+                    effects.account_transition(1);
+                    effects.page(1, None);
+                }
+                (MorselMode::AcceptedChain, 1) => {
+                    effects.accept(0, [0xAF; 32]);
+                    effects.account_transition(1);
+                    effects.page(1, None);
+                }
+                (MorselMode::ImmediateChain, 3 | 2) => {
+                    effects.account_transition(1);
+                    effects.page(1, Some(TypedResume::Immediate(MorselState(state.0 - 1))));
+                }
+                (MorselMode::ImmediateChain, 1) => {
+                    effects.account_transition(1);
+                    effects.page(1, None);
+                }
+                (MorselMode::AfterChildren, 3) => {
+                    effects.fixpoint_child(0, MorselState(2), Key(2), Some([0xB2; 32]));
+                    effects.account_transition(1);
+                    effects.page(1, Some(TypedResume::AfterChildren(MorselState(1))));
+                }
+                (MorselMode::MalformedLater, 3) => {
+                    effects.fixpoint_child(0, MorselState(2), Key(2), None);
+                    effects.account_transition(1);
+                    effects.page(1, None);
+                }
+                (MorselMode::MalformedLater, 2) => {
+                    effects.accept(0, [0xCF; 32]);
+                    effects.account_transition(1);
+                    effects.page(1, Some(TypedResume::Immediate(MorselState(2))));
+                }
+                _ => panic!("morsel probe entered an unexpected state"),
+            }
+        }
+    }
+
+    fn seed_morsel_probe(
+        spec: &MorselProbe,
+        activation: ProgramActivation,
+    ) -> (ProgramRuntime, ProgramWork) {
+        let program = ProgramRef::new(spec);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(0),
+            bound: VariableSet::new_empty(),
+        };
+        let route = program.route(request).unwrap();
+        let activations = [activation];
+        let view = RowsView::new_with_row_count(&[], &[], 1);
+        let mut runtime = program.new_runtime();
+        let mut seeded = ProgramSeedEffects::default();
+        program.seed_batch(
+            &mut runtime,
+            ProgramSeedBatch {
+                request,
+                route,
+                view,
+                activations: &activations,
+            },
+            &mut seeded,
+        );
+        assert_eq!(seeded.work.len(), 1);
+        (runtime, seeded.work.pop().unwrap().work)
+    }
+
+    fn step_morsel_probe(
+        spec: &MorselProbe,
+        runtime: &mut ProgramRuntime,
+        activation: ProgramActivation,
+        work: &ProgramWork,
+        limit: usize,
+    ) -> ProgramBatchEffects {
+        let activations = [activation];
+        let work = [work.clone()];
+        let candidate_sets = [None];
+        let limits = [limit];
+        let mut effects = ProgramBatchEffects::default();
+        ProgramRef::new(spec).step_batch(
+            runtime,
+            ProgramBatch {
+                view: RowsView::new_with_row_count(&[], &[], 1),
+                candidate_sets: &candidate_sets,
+                activations: &activations,
+                work: &work,
+                limits: &limits,
+            },
+            &mut effects,
+        );
+        effects
+    }
+
+    fn morsel_runtime(
+        runtime: &mut ProgramRuntime,
+    ) -> &mut TypedProgramRuntime<MorselState, Key, u8> {
+        runtime
+            .erased
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<TypedProgramRuntime<MorselState, Key, u8>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn typed_morsel_escapes_branches_with_mixed_novelty_and_only_frontier_handles() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let spec = MorselProbe {
+            mode: MorselMode::BranchMixedNovelty,
+            calls: Arc::clone(&calls),
+        };
+        let activation = ProgramActivation(91);
+        let (mut runtime, work) = seed_morsel_probe(&spec, activation);
+        let effects = step_morsel_probe(&spec, &mut runtime, activation, &work, 8);
+
+        assert_eq!(*calls.lock().unwrap(), [9]);
+        assert_eq!(effects.pages.len(), 1);
+        assert_eq!(effects.pages[0].examined, 6);
+        assert!(matches!(
+            effects.pages[0].resume,
+            Some(ProgramResume::Immediate(_))
+        ));
+        assert_eq!(effects.children.len(), 2);
+        assert_eq!(
+            effects
+                .children
+                .iter()
+                .map(|child| child.accepted)
+                .collect::<Vec<_>>(),
+            [Some([1; 32]), Some([2; 32])]
+        );
+        assert_eq!(effects.direct, [(0, [3; 32])]);
+        assert_eq!(effects.accepted, [(0, [4; 32])]);
+        assert_eq!(effects.normalized_steps, 0);
+
+        let typed = morsel_runtime(&mut runtime);
+        assert_eq!(typed.novelty[&activation].len(), 3);
+        assert_eq!(typed.novelty[&activation][&Key(0)], None);
+        assert_eq!(typed.novelty[&activation][&Key(1)], Some([1; 32]));
+        assert_eq!(typed.novelty[&activation][&Key(2)], Some([2; 32]));
+        assert_eq!(
+            typed
+                .slots
+                .iter()
+                .filter(|slot| slot.value.is_some())
+                .count(),
+            3,
+            "only two admitted children and the Immediate resume may escape"
+        );
+        let child_states = effects
+            .children
+            .iter()
+            .map(|child| typed.take(activation, child.work.handle.clone()).0)
+            .collect::<Vec<_>>();
+        assert_eq!(child_states, [7, 5]);
+        let Some(ProgramResume::Immediate(resume)) = &effects.pages[0].resume else {
+            unreachable!()
+        };
+        assert_eq!(typed.take(activation, resume.handle.clone()).0, 4);
+    }
+
+    #[test]
+    fn typed_morsel_treats_an_accepted_child_as_a_publication_boundary() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let spec = MorselProbe {
+            mode: MorselMode::AcceptedChain,
+            calls: Arc::clone(&calls),
+        };
+        let activation = ProgramActivation(92);
+        let (mut runtime, work) = seed_morsel_probe(&spec, activation);
+        let effects = step_morsel_probe(&spec, &mut runtime, activation, &work, 3);
+
+        assert_eq!(*calls.lock().unwrap(), [3]);
+        assert_eq!(effects.pages.len(), 1);
+        assert_eq!(effects.pages[0].examined, 1);
+        assert!(effects.pages[0].resume.is_none());
+        assert_eq!(effects.children.len(), 1);
+        assert_eq!(effects.children[0].accepted, Some([0xA2; 32]));
+        assert!(effects.accepted.is_empty());
+        assert_eq!(effects.normalized_steps, 0);
+
+        let typed = morsel_runtime(&mut runtime);
+        assert_eq!(typed.novelty[&activation].len(), 1);
+        assert!(typed.contains(&effects.children[0].work.handle));
+    }
+
+    #[test]
+    fn typed_morsel_consumes_unobserved_immediate_spine_under_one_budget() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let spec = MorselProbe {
+            mode: MorselMode::ImmediateChain,
+            calls: Arc::clone(&calls),
+        };
+        let activation = ProgramActivation(96);
+        let (mut runtime, work) = seed_morsel_probe(&spec, activation);
+        let effects = step_morsel_probe(&spec, &mut runtime, activation, &work, 3);
+
+        assert_eq!(*calls.lock().unwrap(), [3, 2, 1]);
+        assert_eq!(effects.pages.len(), 1);
+        assert_eq!(effects.pages[0].examined, 3);
+        assert!(effects.pages[0].resume.is_none());
+        assert!(effects.children.is_empty());
+        assert_eq!(effects.normalized_steps, 2);
+        assert!(morsel_runtime(&mut runtime)
+            .slots
+            .iter()
+            .all(|slot| slot.value.is_none()));
+    }
+
+    #[test]
+    fn typed_morsel_stops_at_budget_and_clones_the_escaped_owner_independently() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let spec = MorselProbe {
+            mode: MorselMode::ImmediateChain,
+            calls: Arc::clone(&calls),
+        };
+        let activation = ProgramActivation(93);
+        let (mut runtime, input) = seed_morsel_probe(&spec, activation);
+        let first = step_morsel_probe(&spec, &mut runtime, activation, &input, 1);
+        assert_eq!(first.pages[0].examined, 1);
+        assert!(first.children.is_empty());
+        assert_eq!(first.normalized_steps, 0);
+
+        let Some(ProgramResume::Immediate(escaped)) = &first.pages[0].resume else {
+            panic!("budget boundary lost the Immediate owner")
+        };
+        let escaped = escaped.clone();
+        let input_handle = input.handle.clone();
+        let typed = morsel_runtime(&mut runtime);
+        assert!(!typed.contains(&input_handle));
+        assert!(typed.contains(&escaped.handle));
+        assert_eq!(
+            typed
+                .slots
+                .iter()
+                .filter(|slot| slot.value.is_some())
+                .count(),
+            1
+        );
+
+        let mut cloned = runtime.clone();
+        let left = step_morsel_probe(&spec, &mut runtime, activation, &escaped, 2);
+        let right = step_morsel_probe(&spec, &mut cloned, activation, &escaped, 2);
+        for effects in [&left, &right] {
+            assert_eq!(effects.pages[0].examined, 2);
+            assert!(effects.pages[0].resume.is_none());
+            assert!(effects.children.is_empty());
+            assert!(effects.accepted.is_empty());
+            assert_eq!(effects.normalized_steps, 1);
+        }
+        assert!(morsel_runtime(&mut runtime)
+            .slots
+            .iter()
+            .all(|slot| slot.value.is_none()));
+        assert!(morsel_runtime(&mut cloned)
+            .slots
+            .iter()
+            .all(|slot| slot.value.is_none()));
+    }
+
+    #[test]
+    fn typed_morsel_treats_after_children_as_a_hard_escape_barrier() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let spec = MorselProbe {
+            mode: MorselMode::AfterChildren,
+            calls: Arc::clone(&calls),
+        };
+        let activation = ProgramActivation(94);
+        let (mut runtime, work) = seed_morsel_probe(&spec, activation);
+        let effects = step_morsel_probe(&spec, &mut runtime, activation, &work, 3);
+
+        assert_eq!(*calls.lock().unwrap(), [3]);
+        assert_eq!(effects.normalized_steps, 0);
+        assert_eq!(effects.pages.len(), 1);
+        assert_eq!(effects.pages[0].examined, 1);
+        assert!(matches!(
+            effects.pages[0].resume,
+            Some(ProgramResume::AfterChildren(_))
+        ));
+        assert_eq!(effects.children.len(), 1);
+        assert_eq!(effects.children[0].accepted, Some([0xB2; 32]));
+        assert_eq!(
+            morsel_runtime(&mut runtime)
+                .slots
+                .iter()
+                .filter(|slot| slot.value.is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn typed_morsel_later_malformed_layer_publishes_no_effect_or_handle_prefix() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let spec = MorselProbe {
+            mode: MorselMode::MalformedLater,
+            calls: Arc::clone(&calls),
+        };
+        let activation = ProgramActivation(95);
+        let (mut runtime, work) = seed_morsel_probe(&spec, activation);
+        let mut effects = ProgramBatchEffects::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let activations = [activation];
+            let work = [work.clone()];
+            ProgramRef::new(&spec).step_batch(
+                &mut runtime,
+                ProgramBatch {
+                    view: RowsView::new_with_row_count(&[], &[], 1),
+                    candidate_sets: &[None],
+                    activations: &activations,
+                    work: &work,
+                    limits: &[2],
+                },
+                &mut effects,
+            );
+        }));
+
+        assert!(
+            panic_text(result.expect_err("later rank violation must fail closed"))
+                .contains("resume did not strictly decrease")
+        );
+        assert_eq!(*calls.lock().unwrap(), [3, 2]);
+        assert!(effects.pages.is_empty());
+        assert!(effects.children.is_empty());
+        assert!(effects.direct.is_empty());
+        assert!(effects.accepted.is_empty());
+        assert!(effects.supported.is_empty());
+        let typed = morsel_runtime(&mut runtime);
+        assert_eq!(typed.novelty[&activation].get(&Key(2)), Some(&None));
+        assert!(typed.slots.iter().all(|slot| slot.value.is_none()));
     }
 
     #[test]

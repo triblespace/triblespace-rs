@@ -315,11 +315,12 @@ fn main() {
         "revision\tring\thidden_parents\treps\trows\tdigest16\t\
          ttfr_p50_us\tdrain_p50_us\twide_admissions\tmax_admission_parents\t\
          terminal_calls\tterminal_tasks\tactivations_completed\tactive_lease_steps\t\
-         source_pages\tsource_candidates\ttransition_pages\ttransition_candidates"
+         source_pages\tsource_candidates\ttransition_pages\ttransition_candidates\t\
+         receipt_local_fused_steps\treceipt_local_refiles_avoided\tmax_receipt_local_chain"
     );
     println!(
         "{REVISION}\t{RING_SIZE}\t{HIDDEN_PARENTS}\t{reps}\t{}\t{}\t\
-         {ttfr_us:.3}\t{drain_us:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+         {ttfr_us:.3}\t{drain_us:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         oracle.rows,
         digest_prefix(&oracle.digest),
         stats.delta_terminal_demand_wide_admissions,
@@ -332,5 +333,8 @@ fn main() {
         stats.delta_source_candidates_examined,
         stats.delta_transition_pages,
         stats.delta_transition_candidates_examined,
+        stats.delta_program_receipt_local_fused_steps,
+        stats.delta_program_receipt_local_refiles_avoided,
+        stats.max_delta_program_receipt_local_chain,
     );
 }
