@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Whole query-module alternatives own native UnionArchive and diagnostic
+  constraints.** The classic arm constructs a scalar `Binding`/`Vec` union
+  directly over the current Succinct shards and implements the scalar protocol
+  for common diagnostic wrapper data; common `UnionArchive` storage exposes
+  only a crate-private shard view, with no cross-protocol adapter.
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm
