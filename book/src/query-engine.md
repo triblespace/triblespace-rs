@@ -172,9 +172,9 @@ phases:
 - `Ready` jointly chooses a row's next variable and exact proposing leaf.
 - `Propose` invokes one uniform proposer over an assembled parent-row bucket.
 - `Candidate` chooses the next unchecked relevant confirmer.
-- `Confirm` invokes one uniform confirmer over a disjoint page of the admitted
-  candidate relation. A selected typed Program may retain one complete parent
-  activation when doing so reuses traversal state.
+- `Confirm` invokes one uniform ordinary confirmer over a disjoint page of the
+  admitted candidate relation. Selecting a typed Program Confirm instead owns
+  the complete relation for each parent in one activation.
 
 Planning phases only estimate, partition, and file work; protocol calls happen
 in the explicit action phases. The checked-leaf set is canonical, so histories
@@ -186,11 +186,12 @@ remain independent. Confirmers may conservatively retain different false
 positives for different pages, but must preserve every true support and become
 exact under their fully bound schema, so correctness depends only on the final
 raw SET rather than intermediate payload or trace equality. Formula OR retains
-its private ordered-set reducer and live-frame payload barrier; a repeated RPQ
-may retain one complete parent activation solely to reuse graph-product
-traversal. Segmented affine payloads cross through a bounded engine admission
-phase rather than synchronous materialization. The terminal projection remains
-the universal final SET guard across hidden witnesses and routes.
+its private ordered-set reducer and live-frame payload barrier; every selected
+typed Program Confirm retains one complete parent activation, with repeated
+RPQ using that structural law to reuse graph-product traversal. Segmented
+affine payloads cross through a bounded engine admission phase rather than
+synchronous materialization. The terminal projection remains the universal
+final SET guard across hidden witnesses and routes.
 
 Lazy residual execution begins with actionable width one. A surviving action
 keeps its newly filed continuation hot, allowing a successful path to descend
@@ -329,9 +330,9 @@ With the `parallel` feature, ordinary `IntoParallelIterator` consumption uses
 the same canonical residual runtime as ordinary serial iteration. A fresh
 query starts with width one and partitions its exact affine frontier into at
 most one shard per worker. Rows and SET-admitted candidate occurrences are the
-same shard atoms used by the serial residual path. A selected typed Program may
-retain one complete parent activation for physical traversal reuse, and a live
-Formula OR frame retains its private payload.
+same shard atoms used by the serial residual path. A selected typed Program
+Confirm retains one complete parent activation for physical traversal reuse,
+and a live Formula OR frame retains its private payload.
 Cross-shard reconvergence is traded for concurrency, but no second solver or
 seed restart is involved.
 

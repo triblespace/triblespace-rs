@@ -19,7 +19,6 @@ use crate::query::Constraint;
 use crate::query::DispatchClass;
 use crate::query::EstimateSink;
 use crate::query::ProgramAction;
-use crate::query::ProgramGrouping;
 use crate::query::ProgramPacing;
 use crate::query::ProgramRef;
 use crate::query::ProgramRequest;
@@ -2368,11 +2367,7 @@ impl TypedProgramSpec for RegularPathConstraint {
             ProgramAction::Support
                 if request.bound.is_set(self.start) && request.bound.is_set(self.end) =>
             {
-                ProgramRoute {
-                    variable: self.end,
-                    // Support has no candidate relation to reuse.
-                    grouping: ProgramGrouping::PageLocal,
-                }
+                ProgramRoute { variable: self.end }
             }
             ProgramAction::Support => return None,
             ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
@@ -2381,17 +2376,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                 {
                     return None;
                 }
-                let confirming = matches!(request.action, ProgramAction::Confirm(_));
-                if self.start == self.end {
-                    ProgramRoute {
-                        variable,
-                        grouping: if confirming {
-                            ProgramGrouping::ParentAtomic
-                        } else {
-                            ProgramGrouping::PageLocal
-                        },
-                    }
-                } else {
+                if self.start != self.end {
                     let opposite = if variable == self.end {
                         self.start
                     } else {
@@ -2400,15 +2385,8 @@ impl TypedProgramSpec for RegularPathConstraint {
                     if !request.bound.is_set(opposite) {
                         return None;
                     }
-                    ProgramRoute {
-                        variable,
-                        grouping: if confirming {
-                            ProgramGrouping::ParentAtomic
-                        } else {
-                            ProgramGrouping::PageLocal
-                        },
-                    }
                 }
+                ProgramRoute { variable }
             }
         };
         Some(route)
@@ -3005,7 +2983,6 @@ mod delta_program_tests {
         let forward_route = path.route(confirm_forward).unwrap();
         let inverse_route = path.route(confirm_inverse).unwrap();
         let support_route = path.route(support).unwrap();
-        assert_eq!(support_route.grouping, ProgramGrouping::PageLocal);
 
         assert!(path.certifies_confirm_dominates_support_positive_prefix(
             confirm_forward,
@@ -3448,7 +3425,7 @@ mod seeded_frame_tests {
     use crate::trible::Trible;
 
     #[test]
-    fn repeated_machine_grouping_requires_the_opposite_endpoint() {
+    fn repeated_machine_confirm_route_requires_the_opposite_endpoint() {
         let mut variables = VariableContext::new();
         let start = variables.next_variable::<GenId>();
         let end = variables.next_variable::<GenId>();
@@ -3461,20 +3438,18 @@ mod seeded_frame_tests {
         );
 
         let program = repeated.residual_program().unwrap();
-        let start_route = program
+        assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(start.index),
                 bound: VariableSet::new_singleton(end.index),
             })
-            .unwrap();
-        assert_eq!(start_route.grouping, ProgramGrouping::ParentAtomic);
-        let end_route = program
+            .is_some());
+        assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(end.index),
                 bound: VariableSet::new_singleton(start.index),
             })
-            .unwrap();
-        assert_eq!(end_route.grouping, ProgramGrouping::ParentAtomic);
+            .is_some());
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(start.index),
@@ -3498,15 +3473,14 @@ mod seeded_frame_tests {
             start,
             &[PathOp::Attr(attribute), PathOp::Star],
         );
-        let same_route = same_endpoint
+        assert!(same_endpoint
             .residual_program()
             .unwrap()
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(start.index),
                 bound: VariableSet::new_empty(),
             })
-            .unwrap();
-        assert_eq!(same_route.grouping, ProgramGrouping::ParentAtomic);
+            .is_some());
     }
 
     #[test]

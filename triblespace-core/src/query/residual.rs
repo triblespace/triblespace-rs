@@ -30,10 +30,10 @@
 //! never consumes that older cohort. Ready and
 //! Propose states measure parent rows. Candidate and Confirm states measure and
 //! split SET-admitted candidate occurrences. They remain parent-atomic only
-//! while a selected typed Program route must reuse one complete parent
-//! activation. Thus width one can confirm one value and descend while Formula
-//! OR retains its live-frame payload barrier. Proposal remains eager for each
-//! selected parent block.
+//! while a typed Program Confirm route is selected, because that action owns
+//! one complete parent activation. Thus width one can confirm one value and
+//! descend while Formula OR retains its live-frame payload barrier. Proposal
+//! remains eager for each selected parent block.
 //! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
 //! Lazy width is unchanged while nonempty successors advance. Once a partial
 //! action activates an exact continuation cohort, that lineage outranks cold
@@ -135,7 +135,7 @@ struct FormulaPath(Box<[FormulaStep]>);
 /// Execution capabilities captured at one opaque formula occurrence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FormulaNodeCapabilities {
-    parent_atomic_program_confirms: Box<[(VariableId, VariableSet)]>,
+    program_confirm_requirements: Box<[(VariableId, VariableSet)]>,
 }
 
 /// Selects the recurrent typed Machine route for one action.
@@ -153,16 +153,18 @@ fn select_program<'r, 'a>(
 }
 
 impl FormulaNodeCapabilities {
-    fn parent_atomic_program_confirm(&self, variable: VariableId, bound: VariableSet) -> bool {
-        parent_atomic_program_confirm_is_active(
-            &self.parent_atomic_program_confirms,
-            variable,
-            bound,
-        )
+    fn has_program_confirm(&self, variable: VariableId, bound: VariableSet) -> bool {
+        program_confirm_is_active(&self.program_confirm_requirements, variable, bound)
     }
 }
 
-fn compile_parent_atomic_program_confirms<'a>(
+/// Compiles the family-local schemas at which a typed Confirm route exists.
+///
+/// A selected Program Confirm structurally owns one complete admitted
+/// candidate relation per parent. The route-presence contract on
+/// [`TypedProgramSpec::route`] makes this family-local probe invariant under
+/// unrelated ambient bound enrichment.
+fn compile_program_confirm_requirements<'a>(
     constraint: &dyn Constraint<'a>,
 ) -> Box<[(VariableId, VariableSet)]> {
     let variables = constraint.variables();
@@ -171,22 +173,20 @@ fn compile_parent_atomic_program_confirms<'a>(
         .filter_map(|variable| {
             let mut required = variables;
             required.unset(variable);
-            let (_, route) = select_program(
+            select_program(
                 constraint,
                 ProgramRequest {
                     action: ProgramAction::Confirm(variable),
                     bound: required,
                 },
             )?;
-            // ParentAtomic is a physical activation-reuse boundary, not a
-            // stronger semantic confirmation law.
-            (route.grouping == ProgramGrouping::ParentAtomic).then_some((variable, required))
+            Some((variable, required))
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
 }
 
-fn parent_atomic_program_confirm_is_active(
+fn program_confirm_is_active(
     requirements: &[(VariableId, VariableSet)],
     variable: VariableId,
     bound: VariableSet,
@@ -195,6 +195,13 @@ fn parent_atomic_program_confirm_is_active(
         .iter()
         .find_map(|&(candidate, required)| (candidate == variable).then_some(required))
         .is_some_and(|required| required.is_subset_of(&bound))
+}
+
+fn assert_program_confirm_route_presence(planned: bool, selected: bool) {
+    assert_eq!(
+        selected, planned,
+        "typed Program Confirm route presence changed under unrelated ambient bound enrichment"
+    );
 }
 
 /// Conservative proof result for publishing cyclic proposal endpoints before
@@ -381,9 +388,7 @@ impl FiniteFormulaProgram {
                 let id = self.reserve_node();
                 let node_path = FormulaPath(path.clone().into_boxed_slice());
                 let capabilities = FormulaNodeCapabilities {
-                    parent_atomic_program_confirms: compile_parent_atomic_program_confirms(
-                        constraint,
-                    ),
+                    program_confirm_requirements: compile_program_confirm_requirements(constraint),
                 };
                 let kind = if let Some(children) = constraint.residual_union_children() {
                     assert!(
@@ -942,10 +947,7 @@ impl FiniteFormulaProgram {
         let node = self.node(node);
         match &node.kind {
             FiniteFormulaNodeKind::Atom => {
-                if node
-                    .capabilities
-                    .parent_atomic_program_confirm(variable, bound)
-                {
+                if node.capabilities.has_program_confirm(variable, bound) {
                     FormulaProposalStreamability::Barrier(
                         FormulaProposalStreamBarrier::ActivationReuse,
                     )
@@ -1288,9 +1290,9 @@ struct ResidualPlan {
     /// Runtime migration is intentionally separate from compilation.
     finite_formula: FiniteFormulaProgram,
     /// Per-variable bound-schema prerequisites under which a selected typed
-    /// Program confirmation reuses one complete parent activation until that
-    /// Program quiesces.
-    parent_atomic_program_confirms: Vec<Box<[(VariableId, VariableSet)]>>,
+    /// Program confirmation exists and therefore owns one complete parent
+    /// activation until that Program quiesces.
+    program_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>>,
 }
 
 impl ResidualPlan {
@@ -1304,7 +1306,7 @@ impl ResidualPlan {
             constraint: &dyn Constraint<'a>,
             path: &mut Vec<usize>,
             leaves: &mut Vec<ResidualLeaf>,
-            parent_atomic_program_confirms: &mut Vec<Box<[(VariableId, VariableSet)]>>,
+            program_confirm_requirements: &mut Vec<Box<[(VariableId, VariableSet)]>>,
         ) {
             match constraint.residual_shape() {
                 ConstraintShape::And(children) => {
@@ -1314,7 +1316,7 @@ impl ResidualPlan {
                             children.child(child),
                             path,
                             leaves,
-                            parent_atomic_program_confirms,
+                            program_confirm_requirements,
                         );
                         path.pop();
                     }
@@ -1329,9 +1331,9 @@ impl ResidualPlan {
                         path: ConstraintPath(path.clone().into_boxed_slice()),
                         lowering,
                     });
-                    parent_atomic_program_confirms.push(
+                    program_confirm_requirements.push(
                         if matches!(lowering, LeafLowering::Opaque) {
-                            compile_parent_atomic_program_confirms(constraint)
+                            compile_program_confirm_requirements(constraint)
                         } else {
                             Box::new([])
                         },
@@ -1341,18 +1343,18 @@ impl ResidualPlan {
         }
 
         let mut leaves = Vec::new();
-        let mut parent_atomic_program_confirms: Vec<Box<[(VariableId, VariableSet)]>> = Vec::new();
+        let mut program_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>> = Vec::new();
         visit(
             root,
             &mut Vec::new(),
             &mut leaves,
-            &mut parent_atomic_program_confirms,
+            &mut program_confirm_requirements,
         );
         let finite_formula = FiniteFormulaProgram::compile(root, &leaves);
         Self {
             leaves,
             finite_formula,
-            parent_atomic_program_confirms,
+            program_confirm_requirements,
         }
     }
 
@@ -1467,7 +1469,7 @@ impl ResidualPlan {
     /// A typed Program may strengthen an already complete ordinary source,
     /// because stable fallback can still execute that source and validate its
     /// covering candidates. It cannot make an ordinary `None` source eligible
-    /// here: a later parent-atomic confirmer may prevent delta seeding, and the
+    /// here: a later typed Program confirmer may prevent delta seeding, and the
     /// eager fallback would then be incomplete. Formula atoms are different—
     /// their selected Program route is guaranteed by `seed_delta_formula`—so
     /// [`formula_node_proposal_coverage`](Self::formula_node_proposal_coverage)
@@ -1643,8 +1645,8 @@ impl ResidualPlan {
 
     /// Whether candidate occurrences may be consumed as independent pages.
     /// Ordinary weak support refinement is relational over SET-admitted
-    /// `(parent, value)` occurrences. Only a selected typed Program route that
-    /// reuses one complete parent activation remains parent-atomic.
+    /// `(parent, value)` occurrences. A selected typed Program Confirm owns one
+    /// complete parent activation and therefore remains parent-atomic.
     fn remaining_confirms_accept_pages(
         &self,
         relevant: &ChildSet,
@@ -1655,8 +1657,8 @@ impl ResidualPlan {
         (0..self.len()).all(|leaf| {
             !relevant.contains(leaf)
                 || checked.contains(leaf)
-                || !parent_atomic_program_confirm_is_active(
-                    &self.parent_atomic_program_confirms[leaf],
+                || !program_confirm_is_active(
+                    &self.program_confirm_requirements[leaf],
                     variable,
                     bound,
                 )
@@ -2971,7 +2973,7 @@ impl StateDesc {
     }
 
     /// SET-admitted candidate occurrences are independent scheduling atoms
-    /// unless a selected typed Program route reuses the complete parent
+    /// unless a selected typed Program Confirm owns the complete parent
     /// activation.
     fn uses_candidate_pages(&self, plan: &ResidualPlan, _formula_pcs: &FormulaPcInterner) -> bool {
         match &self.phase {
@@ -5101,7 +5103,7 @@ impl CandidateBatch {
 
     /// Takes at most `width` candidate occurrences from the tail, allowing a
     /// parent group to be bisected. Callers must establish that no selected
-    /// typed Program route needs the complete parent activation for reuse.
+    /// typed Program Confirm owns the complete parent activation.
     fn take_candidate_tail(&mut self, stride: usize, width: usize) -> Self {
         let take = self.candidate_count().min(width.max(1));
         debug_assert!(take > 0);
@@ -6200,9 +6202,9 @@ impl StateBucket {
         }
     }
 
-    /// Scheduling occupancy. Row-bearing phases and activation-reuse routes
-    /// are measured in parent rows; pageable candidate continuations use
-    /// candidate occurrences instead.
+    /// Scheduling occupancy. Row-bearing phases and typed Program Confirm
+    /// activations are measured in parent rows; pageable ordinary candidate
+    /// continuations use candidate occurrences instead.
     fn occupancy(&self, candidate_pages: bool) -> usize {
         match self {
             StateBucket::Candidates(batch) if candidate_pages => batch.candidate_count(),
@@ -6222,8 +6224,8 @@ impl StateBucket {
     /// Bisects one affine payload into two independently executable shards.
     ///
     /// Row phases split on row boundaries. Candidate phases split either on
-    /// complete parent activations when a selected typed route requests reuse,
-    /// or on SET-admitted candidate-occurrence boundaries. The latter may copy
+    /// complete parent activations for a selected typed Program Confirm, or on
+    /// SET-admitted candidate-occurrence boundaries. The latter may copy
     /// one parent binding into both shards, but every speculative candidate
     /// remains owned by exactly one side.
     #[cfg(feature = "parallel")]
@@ -6317,8 +6319,8 @@ struct ResidualActionTask {
     /// Number of candidate occurrences presented to Confirm; zero for
     /// Support/Propose.
     candidate_occurrences: usize,
-    /// Scheduler occupancy consumed by this action. This is parent rows for an
-    /// activation-reuse route and candidate occurrences for ordinary pageable
+    /// Scheduler occupancy consumed by this action. This is parent rows for a
+    /// typed Program Confirm and candidate occurrences for ordinary pageable
     /// confirmation.
     action_atoms: usize,
 }
@@ -9670,9 +9672,9 @@ impl ResidualStateMachine {
 
     /// Converts one eligible confirmer into one typed Program activation per
     /// parent candidate batch. The reducer retains its admitted input relation
-    /// and filters it only after the Program quiesces. Ordinary typed
-    /// confirmations may receive one disjoint page; repeated RPQ routes retain
-    /// one complete parent activation to reuse graph-product work.
+    /// and filters it only after the Program quiesces. Selecting a typed
+    /// Confirm route structurally retains one complete parent activation;
+    /// ordinary Constraint confirmation remains occurrence-pageable.
     fn seed_delta_confirm<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -9697,18 +9699,11 @@ impl ResidualStateMachine {
         if plan.has_finite_formula(*confirmer) {
             return Err(task);
         }
-        if parent_atomic_program_confirm_is_active(
-            &plan.parent_atomic_program_confirms[*confirmer],
+        let planned_program_confirm = program_confirm_is_active(
+            &plan.program_confirm_requirements[*confirmer],
             *variable,
             task.desc.bound,
-        ) {
-            assert!(
-                !task
-                    .desc
-                    .uses_candidate_pages(plan, &self.interner.formula_pcs),
-                "parent-atomic typed confirmation was split into candidate pages"
-            );
-        }
+        );
 
         let variable = *variable;
         let confirmer = *confirmer;
@@ -9719,17 +9714,17 @@ impl ResidualStateMachine {
             action: ProgramAction::Confirm(variable),
             bound: task.desc.bound,
         };
-        let Some((spec, route)) = select_program(constraint, program_request) else {
+        let selected = select_program(constraint, program_request);
+        assert_program_confirm_route_presence(planned_program_confirm, selected.is_some());
+        let Some((spec, route)) = selected else {
             return Err(task);
         };
-        if route.grouping == ProgramGrouping::ParentAtomic {
-            assert!(
-                !task
-                    .desc
-                    .uses_candidate_pages(plan, &self.interner.formula_pcs),
-                "parent-atomic typed confirmation was split into candidate pages"
-            );
-        }
+        assert!(
+            !task
+                .desc
+                .uses_candidate_pages(plan, &self.interner.formula_pcs),
+            "typed Program confirmation was split into candidate pages"
+        );
         let SelectedResidualTask {
             state,
             desc,
@@ -9820,10 +9815,8 @@ impl ResidualStateMachine {
     /// Suspends a currently focused formula Atom behind one typed Program
     /// reducer activation per affine parent. The exact Action cursor and live
     /// payload cells remain activation data; [`DeltaDesc`] names only the
-    /// common Program kernel. Pageable finite confirmations retain the
-    /// formula's geometric split over admitted candidate occurrences; repeated
-    /// confirmations may keep one complete parent activation to reuse their
-    /// work.
+    /// common Program kernel. A selected Confirm route keeps the complete
+    /// admitted relation for its parent in that activation.
     fn seed_delta_formula<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -9849,6 +9842,10 @@ impl ResidualStateMachine {
         if !matches!(formula_node.kind, FiniteFormulaNodeKind::Atom) {
             return Err(task);
         }
+        let planned_program_confirm = stage == FormulaStage::Confirm
+            && formula_node
+                .capabilities
+                .has_program_confirm(outer_variable, task.desc.bound);
         let proposal_streaming = if stage != FormulaStage::Propose {
             FormulaProposalStreaming::Quiescent
         } else {
@@ -9897,15 +9894,19 @@ impl ResidualStateMachine {
             },
             bound: task.desc.bound,
         };
-        let Some((spec, route)) = select_program(constraint, program_request) else {
+        let selected = select_program(constraint, program_request);
+        if stage == FormulaStage::Confirm {
+            assert_program_confirm_route_presence(planned_program_confirm, selected.is_some());
+        }
+        let Some((spec, route)) = selected else {
             return Err(task);
         };
-        if stage == FormulaStage::Confirm && route.grouping == ProgramGrouping::ParentAtomic {
+        if stage == FormulaStage::Confirm {
             assert!(
                 !task
                     .desc
                     .uses_candidate_pages(plan, &self.interner.formula_pcs),
-                "parent-atomic typed formula confirmation was split into candidate pages"
+                "typed Formula Program confirmation was split into candidate pages"
             );
         }
         let variable = route.variable;
@@ -12126,13 +12127,12 @@ mod tests {
         }
     }
 
-    /// Planning-only typed confirmer whose complete parent candidate relation
-    /// is retained for one activation. It models the repeated-RPQ physical
-    /// reuse boundary without inventing a semantic grouping hook.
+    /// Planning-only typed confirmer. Selecting its route structurally retains
+    /// the complete parent candidate relation for one activation.
     #[derive(Clone, Copy)]
-    struct ParentAtomicProgramLeaf(CapabilityLeaf);
+    struct ProgramConfirmLeaf(CapabilityLeaf);
 
-    impl TypedProgramSpec for ParentAtomicProgramLeaf {
+    impl TypedProgramSpec for ProgramConfirmLeaf {
         type State = ();
         type NoveltyKey = ();
         type Rank = ();
@@ -12141,16 +12141,15 @@ mod tests {
             matches!(request.action, ProgramAction::Confirm(variable) if variable == self.0.variable)
                 .then_some(ProgramRoute {
                     variable: self.0.variable,
-                    grouping: ProgramGrouping::ParentAtomic,
                 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-            unreachable!("planning-only ParentAtomic fixture was executed")
+            unreachable!("planning-only Program Confirm fixture was executed")
         }
 
         fn progress(&self, _state: &Self::State) -> Self::Rank {
-            unreachable!("planning-only ParentAtomic fixture was executed")
+            unreachable!("planning-only Program Confirm fixture was executed")
         }
 
         fn seed_typed(
@@ -12158,7 +12157,7 @@ mod tests {
             _batch: ProgramSeedBatch<'_>,
             _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
         ) {
-            unreachable!("planning-only ParentAtomic fixture was executed")
+            unreachable!("planning-only Program Confirm fixture was executed")
         }
 
         fn step_typed(
@@ -12167,11 +12166,11 @@ mod tests {
             _batch: TypedProgramBatch<'_>,
             _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
-            unreachable!("planning-only ParentAtomic fixture was executed")
+            unreachable!("planning-only Program Confirm fixture was executed")
         }
     }
 
-    impl Constraint<'static> for ParentAtomicProgramLeaf {
+    impl Constraint<'static> for ProgramConfirmLeaf {
         fn variables(&self) -> VariableSet {
             self.0.variables()
         }
@@ -12576,14 +12575,38 @@ mod tests {
     }
 
     #[test]
-    fn declined_program_route_does_not_invent_an_activation_reuse_barrier() {
+    fn declined_program_route_does_not_invent_a_confirm_barrier() {
         let leaf = DecliningProgramCapabilityLeaf(CapabilityLeaf { variable: 0 });
 
         assert_eq!(
-            compile_parent_atomic_program_confirms(&leaf).as_ref(),
+            compile_program_confirm_requirements(&leaf).as_ref(),
             &[],
             "only a selected typed route may retain a parent activation"
         );
+    }
+
+    #[test]
+    fn program_confirm_requirement_survives_ambient_bound_enrichment() {
+        let leaf = ProgramConfirmLeaf(CapabilityLeaf { variable: 0 });
+        let requirements = compile_program_confirm_requirements(&leaf);
+
+        for bound in [VariableSet::new_empty(), VariableSet::new_singleton(1)] {
+            assert!(program_confirm_is_active(&requirements, 0, bound));
+            assert!(leaf
+                .route(ProgramRequest {
+                    action: ProgramAction::Confirm(0),
+                    bound,
+                })
+                .is_some());
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "typed Program Confirm route presence changed under unrelated ambient bound enrichment"
+    )]
+    fn program_confirm_presence_guard_rejects_an_ambient_only_route() {
+        assert_program_confirm_route_presence(false, true);
     }
 
     #[test]
@@ -14968,7 +14991,7 @@ mod tests {
         assert_eq!(
             program.node(children[0]).capabilities,
             FormulaNodeCapabilities {
-                parent_atomic_program_confirms: Box::new([]),
+                program_confirm_requirements: Box::new([]),
             }
         );
 
@@ -17098,10 +17121,10 @@ mod tests {
     }
 
     #[test]
-    fn paging_waits_only_for_selected_parent_atomic_program_reuse() {
+    fn paging_waits_only_for_selected_program_confirm_reuse() {
         let root = IntersectionConstraint::new(vec![
             Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            Box::new(ParentAtomicProgramLeaf(CapabilityLeaf { variable: 0 })),
+            Box::new(ProgramConfirmLeaf(CapabilityLeaf { variable: 0 })),
             Box::new(CapabilityLeaf { variable: 0 }),
         ]);
         let plan = ResidualPlan::compile_production(&root);
@@ -17298,7 +17321,7 @@ mod tests {
         let formula_pcs = FormulaPcInterner::default();
         let activation_reuse_root = IntersectionConstraint::new(vec![
             Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            Box::new(ParentAtomicProgramLeaf(CapabilityLeaf { variable: 0 })),
+            Box::new(ProgramConfirmLeaf(CapabilityLeaf { variable: 0 })),
             shape_leaf(1),
         ]);
         let activation_reuse_plan = ResidualPlan::compile_production(&activation_reuse_root);
@@ -17319,7 +17342,7 @@ mod tests {
                 &formula_pcs,
             ),
             ContinuationPublicationReceipt::Barrier,
-            "a selected ParentAtomic route keeps the activation private",
+            "a selected Program Confirm route keeps the activation private",
         );
 
         let formula_root = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
@@ -17554,9 +17577,7 @@ mod tests {
 
         let atomic_root = IntersectionConstraint::new(vec![
             Box::new(CapabilityLeaf { variable: VARIABLE }) as ShapeConstraint,
-            Box::new(ParentAtomicProgramLeaf(CapabilityLeaf {
-                variable: VARIABLE,
-            })),
+            Box::new(ProgramConfirmLeaf(CapabilityLeaf { variable: VARIABLE })),
         ]);
         let atomic_plan = ResidualPlan::compile_production(&atomic_root);
         assert_eq!(
@@ -17565,7 +17586,7 @@ mod tests {
                 .expect("the same concrete confirmation remains actionable")
                 .action_atoms,
             2,
-            "ParentAtomic activation reuse quotes parent rows, not occurrences"
+            "Program Confirm activation reuse quotes parent rows, not occurrences"
         );
 
         let ready = SelectedResidualTask {
