@@ -77,11 +77,7 @@ impl DeltaDesc {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ProgramAddress {
     /// A route owned by one structural constraint occurrence.
-    Constraint {
-        desc: DeltaDesc,
-        key: ProgramKey,
-        stratum: ProgramStratum,
-    },
+    Constraint { desc: DeltaDesc, key: ProgramKey },
     /// One engine-owned finite reducer family. Bound schema, return PC,
     /// cursors, accumulators, and phase remain affine typed payload, so the
     /// address names only the static operation.
@@ -118,7 +114,6 @@ impl ProgramAddress {
         Self::Constraint {
             desc,
             key: route.key,
-            stratum: route.stratum,
         }
     }
 
@@ -129,13 +124,6 @@ impl ProgramAddress {
                 .residual_program()
                 .expect("constructed typed program disappeared during execution"),
             Self::Engine(kind) => kind.resolve(),
-        }
-    }
-
-    fn stratum(&self) -> ProgramStratum {
-        match self {
-            Self::Constraint { stratum, .. } => *stratum,
-            Self::Engine(_) => ProgramStratum::Finite,
         }
     }
 
@@ -6892,7 +6880,6 @@ impl DeltaScheduler {
                 .expect("typed program state lost its runtime"),
             address_key,
             ProgramBatch {
-                stratum: address.stratum(),
                 view,
                 candidate_sets: &candidate_sets,
                 activations: &scratch.activations,
@@ -6979,7 +6966,6 @@ impl DeltaScheduler {
                     .expect("typed program state lost its runtime during receipt-local fusion"),
                 address_key,
                 ProgramBatch {
-                    stratum: address.stratum(),
                     view,
                     candidate_sets: &candidate_sets,
                     activations: &scratch.activations,
@@ -7667,7 +7653,6 @@ mod tests {
             matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -7769,7 +7754,6 @@ mod tests {
             matches!(request.action, ProgramAction::Support).then_some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -8628,7 +8612,6 @@ mod tests {
             matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -12905,7 +12888,6 @@ mod tests {
         let route = ProgramRoute {
             key: ProgramKey::new(0),
             variable: 0,
-            stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
         };
         let state = scheduler
@@ -12983,7 +12965,6 @@ mod tests {
         let route = ProgramRoute {
             key: ProgramKey::new(0),
             variable: 0,
-            stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
         };
         scheduler
@@ -13193,7 +13174,6 @@ mod tests {
         let active_route = ProgramRoute {
             key: ProgramKey::new(0),
             variable: 0,
-            stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
         };
         let active_state = scheduler
@@ -13646,7 +13626,6 @@ mod tests {
             matches!(request.action, ProgramAction::Confirm(0)).then_some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -14579,7 +14558,6 @@ mod tests {
         let route = ProgramRoute {
             key: ProgramKey::new(0),
             variable: 0,
-            stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
         };
         let state = scheduler

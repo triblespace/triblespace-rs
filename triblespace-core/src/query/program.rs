@@ -113,18 +113,6 @@ impl ProgramKey {
     }
 }
 
-/// Certificate for the recurrence stratum of a constructed program.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ProgramStratum {
-    /// The typed continuation graph is acyclic for this route.
-    Finite,
-    /// Per-activation typed novelty computes a least fixpoint. Quiescence
-    /// additionally relies on the family exposing a finite reachable novelty
-    /// domain; RPQ keys are finite graph-value × program-counter products.
-    Fixpoint,
-}
-
 /// Action-specific physical grouping preference carried by a constructed route.
 ///
 /// Both variants have the same SET-valued query semantics. This hint controls
@@ -149,15 +137,17 @@ pub enum ProgramGrouping {
 
 /// Structural route selected by an immutable program spec for one action.
 ///
-/// Returning a route admits typed execution for that exact request. Returning
-/// `None` leaves the action on the ordinary [`super::Constraint`] protocol.
+/// Returning a route certifies that typed novelty computes a least fixpoint for
+/// that exact request. Quiescence additionally relies on the family exposing a
+/// finite reachable novelty domain; RPQ keys are finite graph-value ×
+/// program-counter products. Returning `None` leaves the action on the ordinary
+/// [`super::Constraint`] protocol.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramRoute {
     pub key: ProgramKey,
     /// Variable naming the structural graph-product operator.
     pub variable: VariableId,
-    pub stratum: ProgramStratum,
     pub grouping: ProgramGrouping,
 }
 
@@ -195,7 +185,6 @@ pub struct ProgramSeedEffects {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct ProgramBatch<'v> {
-    pub stratum: ProgramStratum,
     pub view: RowsView<'v>,
     pub candidate_sets: &'v [Option<&'v [RawInline]>],
     pub activations: &'v [ProgramActivation],
@@ -329,7 +318,6 @@ impl<State, NoveltyKey> TypedSeedSink<State, NoveltyKey> {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct TypedProgramBatch<'v> {
-    pub stratum: ProgramStratum,
     pub view: RowsView<'v>,
     pub candidate_sets: &'v [Option<&'v [RawInline]>],
     pub activations: &'v [ProgramActivation],
@@ -1109,10 +1097,6 @@ where
                 "typed program seed emitted more than one unbudgeted root for a parent"
             );
             previous = seed.parent;
-            assert!(
-                batch.route.stratum == ProgramStratum::Fixpoint || seed.novelty.is_none(),
-                "a finite typed program emitted a fixpoint root"
-            );
             let activation = batch.activations[seed.parent as usize];
             if let Some(novelty) = seed.novelty {
                 if !runtime.admit(activation, novelty, seed.accepted) {
@@ -1187,7 +1171,6 @@ where
         }
 
         let typed_batch = TypedProgramBatch {
-            stratum: batch.stratum,
             view: batch.view,
             candidate_sets: batch.candidate_sets,
             activations: batch.activations,
@@ -1259,10 +1242,6 @@ where
             );
             previous = child.input;
             scratch.raw_effects[child.input as usize] += 1;
-            assert!(
-                batch.stratum == ProgramStratum::Fixpoint || child.novelty.is_none(),
-                "a finite typed program emitted a fixpoint child"
-            );
             if child.novelty.is_none() {
                 assert!(
                     self.progress(&child.state) < scratch.input_ranks[child.input as usize],
@@ -1526,7 +1505,6 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -1582,7 +1560,6 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -1663,7 +1640,6 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(13),
                 variable: 0,
-                stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -1733,7 +1709,6 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(14),
                 variable: 0,
-                stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -1785,42 +1760,6 @@ mod tests {
         }
     }
 
-    struct FiniteNovelty;
-
-    impl TypedProgramSpec for FiniteNovelty {
-        type State = NonComparableState;
-        type NoveltyKey = Key;
-        type Rank = u64;
-
-        fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
-            None
-        }
-
-        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-            DispatchClass::new(0)
-        }
-
-        fn progress(&self, state: &Self::State) -> Self::Rank {
-            state.exact_cursor as u64
-        }
-
-        fn seed_typed(
-            &self,
-            _batch: ProgramSeedBatch<'_>,
-            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-        ) {
-            effects.fixpoint_root(0, NonComparableState { exact_cursor: 0 }, Key(0), None);
-        }
-
-        fn step_typed(
-            &self,
-            _states: &mut Vec<Self::State>,
-            _batch: TypedProgramBatch<'_>,
-            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) {
-        }
-    }
-
     #[derive(Clone, Copy)]
     enum RankAttack {
         FiniteResume,
@@ -1854,7 +1793,6 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -1901,10 +1839,6 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: match self {
-                    Self::FiniteResume => ProgramStratum::Finite,
-                    Self::FixpointFiniteChild => ProgramStratum::Fixpoint,
-                },
                 grouping: ProgramGrouping::PageLocal,
             })
         }
@@ -2124,7 +2058,6 @@ mod tests {
             program.step_batch(
                 &mut runtime,
                 ProgramBatch {
-                    stratum: route.stratum,
                     view,
                     candidate_sets: &candidate_sets,
                     activations: &activations,
@@ -2170,7 +2103,6 @@ mod tests {
         program.step_batch(
             &mut runtime,
             ProgramBatch {
-                stratum: route.stratum,
                 view,
                 candidate_sets: &candidate_sets,
                 activations,
@@ -2352,7 +2284,6 @@ mod tests {
         program.step_batch(
             &mut runtime,
             ProgramBatch {
-                stratum: route.stratum,
                 view: wide_view,
                 candidate_sets: &wide_candidates,
                 activations: &wide_activations,
@@ -2418,7 +2349,6 @@ mod tests {
         program.step_batch(
             &mut runtime,
             ProgramBatch {
-                stratum: route.stratum,
                 view: narrow_view,
                 candidate_sets: &[None],
                 activations: &narrow_activations,
@@ -2504,7 +2434,6 @@ mod tests {
             program.step_batch(
                 runtime,
                 ProgramBatch {
-                    stratum: ProgramStratum::Finite,
                     view,
                     candidate_sets: &candidates,
                     activations: &activations,
@@ -2578,7 +2507,6 @@ mod tests {
             program.step_batch(
                 &mut runtime,
                 ProgramBatch {
-                    stratum: ProgramStratum::Finite,
                     view,
                     candidate_sets: &candidates,
                     activations: &crossed,
@@ -2623,7 +2551,6 @@ mod tests {
             program.step_batch(
                 &mut runtime,
                 ProgramBatch {
-                    stratum: route.stratum,
                     view,
                     candidate_sets: &[None],
                     activations: &activations,
@@ -2640,35 +2567,6 @@ mod tests {
             .or_else(|| payload.downcast_ref::<&str>().copied())
             .unwrap_or("");
         assert!(message.contains("incompatible pacing cohort"));
-    }
-
-    #[test]
-    fn finite_route_rejects_fixpoint_novelty_at_the_adapter_boundary() {
-        let spec = FiniteNovelty;
-        let program = ProgramRef::new(&spec);
-        let mut runtime = program.new_runtime();
-        let route = ProgramRoute {
-            key: ProgramKey::new(0),
-            variable: 0,
-            stratum: ProgramStratum::Finite,
-            grouping: ProgramGrouping::PageLocal,
-        };
-        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            program.seed_batch(
-                &mut runtime,
-                ProgramSeedBatch {
-                    request: ProgramRequest {
-                        action: ProgramAction::Propose(0),
-                        bound: VariableSet::new_empty(),
-                    },
-                    route,
-                    view: RowsView::EMPTY,
-                    activations: &[ProgramActivation(1)],
-                },
-                &mut ProgramSeedEffects::default(),
-            );
-        }));
-        assert!(rejected.is_err());
     }
 
     #[test]
@@ -2698,7 +2596,6 @@ mod tests {
                 program.step_batch(
                     &mut runtime,
                     ProgramBatch {
-                        stratum: route.stratum,
                         view: RowsView::EMPTY,
                         candidate_sets: &[None],
                         activations: &activation,
@@ -2755,7 +2652,6 @@ mod tests {
             step_program.step_batch(
                 &mut runtime,
                 ProgramBatch {
-                    stratum: ProgramStratum::Finite,
                     view: RowsView::EMPTY,
                     candidate_sets: &[None],
                     activations: &[ProgramActivation(1)],
