@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: unrouted finite GPU adapters are removed.** The public
+  `typed_program` and `value_route` experiments, their placement knobs,
+  per-snapshot lease/prewarm state, and bespoke route tests are deleted.
+  Reusable CPU paging and WGPU execution remain available directly through
+  `QueryProgram` and `WgpuQueryProgram`, including exact per-input grants,
+  branded receipts, and resumable morsels.
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm
@@ -754,30 +760,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each archive, callers can safely k-way merge independent LSM segments
   without comparing segment-local universe codes; joins and deduplication
   remain explicit caller responsibilities.
-
-- **Resident succinct two-bound proposals have a real `pattern!` entry.**
-  `WgpuSuccinctArchive::two_bound_route[_with]` wraps the canonical succinct
-  constraint and exposes one typed Program for `(A,V) -> E`, `(E,V) -> A`, and
-  `(E,A) -> V` proposals. One immutable rotation descriptor drives both Native
-  paging and resident WGPU dispatch with exact ragged grants, absolute
-  continuations, branded receipts, and raw occurrence-bag execution below the
-  SET-admission boundary. Its typed capability is
-  now left-biased over the canonical Succinct Program: qualifying two-bound
-  proposals select the resident family, while insufficiently bound proposals,
-  Confirm, and Support select the canonical family before runtime construction.
-  Physical decline remains within the selected family. Placement is Off by
-  default and `Force` is the all-target parity probe. The experimental `WarmM4`
-  score remains calibrated only for `(E,A) -> V`; E/A targets decline Native
-  until measured.
-- **Resident value routes expose honest snapshot-local preparation.**
-  `WgpuSuccinctArchive::prepare_value_route` synchronously runs one real
-  nonempty `(E,A) -> V` parent with grant one through the exact production
-  resident path, checks its receipt/readback against the canonical Native
-  pager while the snapshot lease remains held, and only then commits
-  `ValueRouteReadiness::Prepared`. A default-fail guard makes errors and
-  panics publish `Failed`; empty snapshots remain `Cold`, and successful
-  preparation is idempotent. Generic `auto` remains rejected because this
-  snapshot-local proof is not a device-wide cooperative idleness gate.
 
 ### Fixed
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**

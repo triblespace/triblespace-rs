@@ -1,35 +1,23 @@
-//! Budgeted physical-dispatch contract between the typed Program scheduler
-//! and device-resident executors.
+//! Budgeted morsels for device-resident query transitions.
 //!
-//! This module is the *interface* of phase-3 budgeted execution: the shapes a
-//! cohort's exact per-input grants take on the way down to a kernel, and the
-//! shapes per-input results take on the way back up. The full budgeted-prefix
-//! kernels consume these types; until they land, the contract itself is the
-//! deliverable and is enforced host-side by [`CohortReceipts::validate`].
+//! These types carry a cohort's exact per-input grants down to a kernel and
+//! validated per-input progress back up. They do not prescribe an execution
+//! strategy: a caller may issue one latency-sensitive morsel, concentrate
+//! larger cohorts on an accelerator, or resume partial inputs later.
 //!
-//! Laws (fixed by the typed Program substrate, re-checked here fail-closed):
+//! The boundary enforces three laws fail-closed:
 //!
-//! - `ProgramPacing` remains the sole budget authority. The scheduler's
-//!   `PhysicalDispatch.task_limits` arrive here verbatim as [`CohortGrants`];
-//!   no kernel may average, pool, or transfer budget across inputs. Every
-//!   device-side clamp is element-wise against `limits[i]` only.
+//! - [`CohortGrants`] is authoritative. No kernel may average, pool, or
+//!   transfer work across inputs; every device-side clamp is element-wise
+//!   against `limits[i]` only.
 //! - One receipt per input, in input order, with `examined <= limit`. A
 //!   missing, misordered, or oversized receipt fails the whole cohort closed;
-//!   the untouched cohort input then re-executes natively.
+//!   the caller can retry that untouched cohort elsewhere.
 //! - A [`PhysicalCursor`] is *physical* resume data (an offset into the
 //!   archive-local candidate interval of one input). It is meaningful only
 //!   against the same [`ArchiveIdentity`]-branded snapshot it was produced
-//!   from, and it is **not** semantic state: the owning Program's
-//!   `TypedProgramSpec` is the only consumer, converting it into the
-//!   Program's canonical typed `State`/`TypedResume`, after which the typed
-//!   adapter re-checks its strict progress and replay laws. Executors never
-//!   hand back opaque continuations, and nothing outside that conversion may
-//!   interpret the offset.
-//!
-//! The capability seam is deliberately absent here: whether a Program's
-//! `DispatchClass` has a physical lowering at all lives on the
-//! `TypedProgramSpec` side (a default-`Unsupported` `try_step_physical`
-//! hook), never in a registry and never inside `DispatchClass` itself.
+//!   from. It is not semantic query state: it only tells a later call where
+//!   to resume that same physical interval.
 
 use std::error::Error;
 use std::fmt;
@@ -38,19 +26,17 @@ use crate::succinct_query::ArchiveIdentity;
 
 /// Exact per-input work grants for one submitted cohort.
 ///
-/// Constructed from the scheduler's `task_limits` unchanged. Kernels clamp
-/// each input's candidate interval element-wise against its own grant;
-/// budget never moves between inputs.
+/// Kernels clamp each input's candidate interval element-wise against its own
+/// grant; budget never moves between inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CohortGrants {
     limits: Vec<u32>,
 }
 
 impl CohortGrants {
-    /// Adopts the scheduler's exact per-input grants.
+    /// Adopts exact per-input work grants.
     ///
-    /// Fails closed if any grant exceeds the device's `u32` lane (the
-    /// scheduler grants in `usize`).
+    /// Fails closed if any grant exceeds the device's `u32` lane.
     pub fn from_task_limits(task_limits: &[usize]) -> Result<Self, BudgetContractError> {
         let mut limits = Vec::with_capacity(task_limits.len());
         for (input, &limit) in task_limits.iter().enumerate() {
@@ -80,12 +66,11 @@ impl CohortGrants {
 /// Physical resume data for one clamped input: the offset into that input's
 /// archive-local candidate interval at which a later cohort continues.
 ///
-/// This is device bookkeeping, not a continuation: the only legal consumer
-/// is the owning Program's `TypedProgramSpec`, which converts the offset into
-/// the Program's canonical typed `State`/`TypedResume`. The type is
-/// deliberately non-`Copy`/non-`Clone` so a cursor is converted exactly once.
+/// This is device bookkeeping, not semantic query state. The type is
+/// deliberately non-`Copy`/non-`Clone` so a resume offset is consumed exactly
+/// once.
 #[derive(Debug, PartialEq, Eq)]
-#[must_use = "a physical cursor must be converted into canonical typed state or the input replays"]
+#[must_use = "a physical cursor must be consumed for resumption or the input replays"]
 pub struct PhysicalCursor {
     offset: u32,
 }
@@ -96,12 +81,12 @@ impl PhysicalCursor {
         Self { offset }
     }
 
-    /// Consumes the cursor, yielding the interval offset for the owning
-    /// Program's `TypedProgramSpec` conversion into canonical typed state.
+    /// Consumes the cursor, yielding the absolute interval offset for a later
+    /// call over the same resident snapshot.
     ///
-    /// Nothing else may interpret this value; it is archive-local physical
-    /// data, valid only against the snapshot the receipt was branded with.
-    pub fn into_typed_conversion_offset(self) -> u32 {
+    /// The offset is archive-local physical data, valid only against the
+    /// snapshot the receipt was branded with.
+    pub fn into_resume_offset(self) -> u32 {
         self.offset
     }
 }
@@ -179,9 +164,7 @@ impl CohortReceipts {
         &self.receipts
     }
 
-    /// Consumes the cohort, yielding each input's receipt in input order for
-    /// the `TypedProgramSpec`-side conversion of any cursors into canonical
-    /// typed state.
+    /// Consumes the cohort, yielding each input's receipt in input order.
     pub fn into_receipts(self) -> Vec<InputReceipt> {
         self.receipts
     }
@@ -189,11 +172,11 @@ impl CohortReceipts {
 
 /// Fail-closed violations of the budgeted dispatch contract.
 ///
-/// Any violation fails the whole cohort; the retained cohort input then
-/// re-executes natively. Nothing truncates; nothing guesses.
+/// Any violation fails the whole cohort without exposing partial output.
+/// Nothing truncates; nothing guesses.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BudgetContractError {
-    /// A scheduler grant does not fit the device's `u32` lane.
+    /// A work grant does not fit the device's `u32` lane.
     GrantExceedsDeviceLane {
         /// Zero-based cohort input.
         input: usize,
@@ -207,8 +190,7 @@ pub enum BudgetContractError {
         /// Number of grants supplied.
         grants: usize,
     },
-    /// A dispatched input carried no work grant. The scheduler never grants
-    /// zero to a dispatched input, and admitting one would make the
+    /// A dispatched input carried no work grant. Admitting one would make the
     /// no-cursor receipt ambiguous between "interval exhausted" and "never
     /// examined".
     ZeroGrant {
@@ -363,7 +345,7 @@ mod tests {
             .unwrap()
             .physical_cursor
             .unwrap();
-        assert_eq!(cursor.into_typed_conversion_offset(), 4);
+        assert_eq!(cursor.into_resume_offset(), 4);
     }
 
     #[test]
