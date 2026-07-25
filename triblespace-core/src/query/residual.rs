@@ -142,12 +142,12 @@ struct FormulaNodeCapabilities {
 ///
 /// Structurally absent routes use the ordinary constraint protocol.
 fn select_program<'r, 'a>(
-    constraint: &'r dyn Constraint<'a>,
-    request: ProgramRequest,
+    _constraint: &'r dyn Constraint<'a>,
+    _request: ProgramRequest,
 ) -> Option<(ProgramRef<'r>, ProgramRoute)> {
-    let program = constraint.residual_program()?;
-    let route = program.route(request)?;
-    Some((program, route))
+    // Causal experiment: force every finite action through the ordinary,
+    // indivisible Constraint protocol.
+    None
 }
 
 impl FormulaNodeCapabilities {
