@@ -7,28 +7,13 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::RawInline;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
-use crate::query::DispatchClass;
 use crate::query::EstimateSink;
-use crate::query::ProgramPacing;
-use crate::query::ProgramRef;
-use crate::query::ProgramRequest;
-use crate::query::ProgramRoute;
-use crate::query::ProgramSeedBatch;
 use crate::query::ProposalCoverage;
-use crate::query::ResidualDeltaSourceCursor;
-use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
-use crate::query::TypedEffectSink;
-use crate::query::TypedProgramBatch;
-use crate::query::TypedProgramSpec;
-use crate::query::TypedSeedSink;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-
-use super::triblesetconstraint::direct_source_page;
-use super::triblesetconstraint::next_id_source_in_range;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
 /// to restrict IDs to the intersection of its E-axis domain and an inclusive
@@ -64,63 +49,6 @@ impl EntityRangeConstraint {
     fn contains(&self, value: &RawInline) -> bool {
         id_from_value(value)
             .is_some_and(|id| id >= self.min && id <= self.max && self.set.eav.has_prefix(&id))
-    }
-
-    fn proposal_page(
-        &self,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
-        direct_source_page(cursor, limit, accepted, |after| {
-            next_id_source_in_range(&self.set.eav, &[], &self.min, &self.max, after)
-        })
-    }
-}
-
-impl TypedProgramSpec for EntityRangeConstraint {
-    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        crate::query::finiteunaryprogram::route(self.variable_e, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        crate::query::finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        crate::query::finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        crate::query::finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::seed(self.variable_e, batch, effects)
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::step(
-            self.variable_e,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
-            |_input, value| self.contains(value),
-        )
     }
 }
 
@@ -183,10 +111,6 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         }
     }
 
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_e) {
             Some(col) => view.iter().all(|row| self.contains(&row[col])),
@@ -229,63 +153,6 @@ impl AttributeRangeConstraint {
     fn contains(&self, value: &RawInline) -> bool {
         id_from_value(value)
             .is_some_and(|id| id >= self.min && id <= self.max && self.set.aev.has_prefix(&id))
-    }
-
-    fn proposal_page(
-        &self,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
-        direct_source_page(cursor, limit, accepted, |after| {
-            next_id_source_in_range(&self.set.aev, &[], &self.min, &self.max, after)
-        })
-    }
-}
-
-impl TypedProgramSpec for AttributeRangeConstraint {
-    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        crate::query::finiteunaryprogram::route(self.variable_a, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        crate::query::finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        crate::query::finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        crate::query::finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::seed(self.variable_a, batch, effects)
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::step(
-            self.variable_a,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
-            |_input, value| self.contains(value),
-        )
     }
 }
 
@@ -348,10 +215,6 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         }
     }
 
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_a) {
             Some(col) => view.iter().all(|row| self.contains(&row[col])),
@@ -362,20 +225,13 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
 
 #[cfg(test)]
 mod tests {
-    use crate::id::id_into_value;
     use crate::inline::encodings::genid::GenId;
     use crate::inline::RawInline;
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
     use crate::query::Binding;
-    use crate::query::Constraint;
-    use crate::query::ProgramAction;
-    use crate::query::ProgramRequest;
     use crate::query::Query;
-    use crate::query::ResidualDeltaSourceCursor;
-    use crate::query::VariableContext;
     use crate::query::VariableId;
-    use crate::query::VariableSet;
 
     attributes! {
         "CC00000000000000CC00000000000000" as id_range_test_score: R256BE;
@@ -527,138 +383,5 @@ mod tests {
 
     fn project(variable: VariableId, binding: &Binding) -> Option<RawInline> {
         binding.get(variable).copied()
-    }
-
-    #[test]
-    fn entity_and_attribute_ranges_use_production_program_strict_frontiers() {
-        let entity_ids = [
-            deterministic_id(1),
-            deterministic_id(2),
-            deterministic_id(3),
-            deterministic_id(4),
-        ];
-        let entities = entity_ids.map(ExclusiveId::force);
-        let attributes = [
-            deterministic_id(0x11),
-            deterministic_id(0x12),
-            deterministic_id(0x13),
-            deterministic_id(0x14),
-        ];
-        let values: [Inline<R256BE>; 4] = [
-            10i128.to_inline(),
-            20i128.to_inline(),
-            30i128.to_inline(),
-            40i128.to_inline(),
-        ];
-        let mut data = TribleSet::new();
-        for ((entity, attribute), value) in
-            entities.iter().zip(attributes.iter()).zip(values.iter())
-        {
-            data.insert(&Trible::new(entity, attribute, value));
-        }
-
-        let mut context = VariableContext::new();
-        let entity = context.next_variable::<GenId>();
-        let attribute = context.next_variable::<GenId>();
-        let entity_range = data.entity_in_range(entity, entity_ids[1], entity_ids[2]);
-        let attribute_range = data.attribute_in_range(attribute, attributes[1], attributes[2]);
-
-        for (variable, constraint) in [
-            (entity.index, &entity_range as &dyn Constraint<'_>),
-            (attribute.index, &attribute_range as &dyn Constraint<'_>),
-        ] {
-            assert!(constraint
-                .residual_program()
-                .expect("id ranges expose their ordered frontier as a typed Program")
-                .route(ProgramRequest {
-                    action: ProgramAction::Propose(variable),
-                    bound: VariableSet::new_empty(),
-                })
-                .is_some());
-        }
-
-        let entity_expected = [
-            id_into_value(&entity_ids[1].raw()),
-            id_into_value(&entity_ids[2].raw()),
-        ];
-        let mut entity_direct = Vec::new();
-        let entity_first =
-            entity_range.proposal_page(ResidualDeltaSourceCursor::Start, 1, &mut entity_direct);
-        assert_eq!(entity_direct, entity_expected[..1]);
-        assert_eq!(entity_first.examined, 1);
-        assert_eq!(
-            entity_first.next,
-            Some(ResidualDeltaSourceCursor::After(entity_expected[0])),
-        );
-        let entity_second =
-            entity_range.proposal_page(entity_first.next.unwrap(), 1, &mut entity_direct);
-        assert_eq!(entity_direct, entity_expected);
-        assert_eq!(entity_second.examined, 1);
-        assert_eq!(entity_second.next, None);
-
-        let attribute_expected = [
-            id_into_value(&attributes[1].raw()),
-            id_into_value(&attributes[2].raw()),
-        ];
-        let mut attribute_direct = Vec::new();
-        let attribute_first = attribute_range.proposal_page(
-            ResidualDeltaSourceCursor::Start,
-            1,
-            &mut attribute_direct,
-        );
-        assert_eq!(attribute_direct, attribute_expected[..1]);
-        assert_eq!(attribute_first.examined, 1);
-        assert_eq!(
-            attribute_first.next,
-            Some(ResidualDeltaSourceCursor::After(attribute_expected[0])),
-        );
-        let attribute_second =
-            attribute_range.proposal_page(attribute_first.next.unwrap(), 1, &mut attribute_direct);
-        assert_eq!(attribute_direct, attribute_expected);
-        assert_eq!(attribute_second.examined, 1);
-        assert_eq!(attribute_second.next, None);
-
-        let mut entity_query = Query::new(
-            data.entity_in_range(entity, entity_ids[1], entity_ids[2]),
-            move |binding| project(entity.index, binding),
-        )
-        .solve_residual_state_lazy();
-        assert_eq!(
-            entity_query.next(),
-            Some(id_into_value(&entity_ids[1].raw()))
-        );
-        assert_eq!(entity_query.stats().delta_source_candidates_examined, 1);
-        assert_eq!(entity_query.stats().delta_source_direct_candidates, 1);
-        drop(entity_query);
-
-        let mut full_entities: Vec<_> = Query::new(
-            data.entity_in_range(entity, entity_ids[1], entity_ids[2]),
-            move |binding| project(entity.index, binding),
-        )
-        .solve_residual_state_lazy()
-        .collect();
-        full_entities.sort_unstable();
-        assert_eq!(
-            full_entities,
-            [
-                id_into_value(&entity_ids[1].raw()),
-                id_into_value(&entity_ids[2].raw())
-            ]
-        );
-
-        let mut actual: Vec<_> = Query::new(
-            data.attribute_in_range(attribute, attributes[1], attributes[2]),
-            move |binding| project(attribute.index, binding),
-        )
-        .solve_residual_state_lazy()
-        .collect();
-        actual.sort_unstable();
-        assert_eq!(
-            actual,
-            [
-                id_into_value(&attributes[1].raw()),
-                id_into_value(&attributes[2].raw())
-            ]
-        );
     }
 }

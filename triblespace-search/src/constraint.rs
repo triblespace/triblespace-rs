@@ -30,53 +30,15 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    finiteunaryprogram, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
+    CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction, ProgramCompletion,
+    ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute,
+    ProgramSeedBatch, ProgramStratum, ProposalCoverage, RowsView, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
+    VariableSet,
 };
 
 use crate::bm25::BM25Index;
 use crate::schemas::Embedding;
-
-/// Page one immutable, already-computed candidate sequence without changing
-/// its native order or occurrence multiplicity.
-///
-/// `Offset` is intentional: BM25 aggregation order and HNSW result order are
-/// implementation-owned and need not agree with raw-inline lexicographic
-/// order. The owning constraint never mutates the sequence after construction.
-fn cached_candidate_page(
-    entries: &[RawInline],
-    cursor: ResidualDeltaSourceCursor,
-    limit: usize,
-    accepted: &mut Vec<RawInline>,
-) -> ResidualDeltaSourcePage {
-    assert!(limit > 0, "residual source pages require positive demand");
-    let begin = match cursor {
-        ResidualDeltaSourceCursor::Start => 0,
-        ResidualDeltaSourceCursor::Offset(index) => {
-            usize::try_from(index).expect("cached search source cursor exceeds usize")
-        }
-        ResidualDeltaSourceCursor::After(_) => {
-            panic!("cached search source received a raw-value cursor")
-        }
-    };
-    assert!(
-        begin <= entries.len(),
-        "cached search source cursor exceeds the immutable frontier"
-    );
-    let end = begin.saturating_add(limit).min(entries.len());
-    accepted.extend_from_slice(&entries[begin..end]);
-    ResidualDeltaSourcePage {
-        next: (end < entries.len()).then(|| {
-            ResidualDeltaSourceCursor::Offset(
-                u64::try_from(end).expect("cached search source offset exceeds u64"),
-            )
-        }),
-        examined: end - begin,
-    }
-}
 
 /// Minimum surface a BM25 index must expose for the
 /// [`BM25Filter`] constraint to work against it. Implemented
@@ -227,57 +189,6 @@ where
 
     fn contains_raw(&self, value: &RawInline) -> bool {
         self.membership.contains(value)
-    }
-}
-
-impl<S> TypedProgramSpec for BM25Filter<S>
-where
-    S: triblespace_core::inline::InlineEncoding,
-{
-    type State = finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        finiteunaryprogram::route(self.doc.index, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        finiteunaryprogram::seed(self.doc.index, batch, effects);
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        finiteunaryprogram::step(
-            self.doc.index,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| {
-                cached_candidate_page(&self.entries, cursor, limit, accepted)
-            },
-            |_input, value| self.contains_raw(value),
-        );
     }
 }
 
@@ -477,10 +388,6 @@ where
             Some(col) => view.iter().all(|row| self.contains_raw(&row[col])),
             None => true,
         }
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
     }
 }
 
@@ -964,54 +871,6 @@ impl SimilarTo {
     }
 }
 
-impl TypedProgramSpec for SimilarTo {
-    type State = finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        finiteunaryprogram::route(self.var.index, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        finiteunaryprogram::seed(self.var.index, batch, effects);
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        finiteunaryprogram::step(
-            self.var.index,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| {
-                cached_candidate_page(&self.candidates, cursor, limit, accepted)
-            },
-            |_input, value| self.contains_raw(value),
-        );
-    }
-}
-
 impl<'a> Constraint<'a> for SimilarTo {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.var.index)
@@ -1069,10 +928,6 @@ impl<'a> Constraint<'a> for SimilarTo {
             Some(col) => view.iter().all(|row| self.contains_raw(&row[col])),
             None => true,
         }
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
     }
 }
 
@@ -1444,11 +1299,11 @@ mod tests {
     }
 
     #[test]
-    fn bm25_cached_candidates_page_exactly_across_affine_parents() {
+    fn bm25_cached_candidates_preserve_occurrences_affinity_and_monotonicity() {
         let parent = Variable::<GenId>::new(0);
         let doc = Variable::<GenId>::new(1);
         // The repeated doc is deliberate: `from_entries` is public, and the
-        // typed Program must preserve proposal occurrences even though
+        // ordinary proposal preserves occurrences even though
         // confirmation membership is set-like.
         let entries = [
             id_to_raw_value(id(3)),
@@ -1457,18 +1312,6 @@ mod tests {
             id_to_raw_value(id(2)),
         ];
         let constraint = BM25Filter::from_entries(doc, entries);
-        let mut direct = Vec::new();
-        let first =
-            cached_candidate_page(&entries, ResidualDeltaSourceCursor::Start, 2, &mut direct);
-        assert_eq!(direct, entries[..2]);
-        assert_eq!(first.examined, 2);
-        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(2)));
-
-        direct.clear();
-        let second = cached_candidate_page(&entries, first.next.unwrap(), 2, &mut direct);
-        assert_eq!(direct, entries[2..]);
-        assert_eq!(second.examined, 2);
-        assert_eq!(second.next, None);
 
         let parents: HashSet<Id> = [id(10), id(11)].into_iter().collect();
         let parent_rows = [id_to_raw_value(id(10)), id_to_raw_value(id(11))];
@@ -1518,35 +1361,6 @@ mod tests {
                 "the public raw head collapses repeated doc occurrences",
             );
         }
-        let raw_occurrences = parents.len() * entries.len();
-        assert_eq!(
-            residual.stats().delta_source_candidates_examined,
-            raw_occurrences
-        );
-        assert_eq!(
-            residual.stats().delta_source_direct_candidates,
-            raw_occurrences
-        );
-        assert_eq!(residual.stats().delta_source_roots, 0);
-        assert!(
-            residual.stats().delta_source_pages < raw_occurrences,
-            "the canonical geometric law never widened this full drain"
-        );
-        assert!(
-            residual.stats().max_propose_candidates > 1,
-            "the canonical geometric law never formed a batched page"
-        );
-
-        let mut first_only = Query::new(
-            BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
-            project_first,
-        )
-        .solve_residual_state_lazy();
-        assert_eq!(first_only.next(), Some(entries[0]));
-        assert_eq!(first_only.stats().delta_source_pages, 1);
-        assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
-        assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
-        drop(first_only);
 
         let base = entries[..3].to_vec();
         let mut before: Vec<_> = Query::new(
@@ -1657,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn similar_to_cached_candidates_preserve_order_multiplicity_and_affinity() {
+    fn similar_to_cached_candidates_preserve_multiplicity_affinity_and_set_identity() {
         let parent = Variable::<GenId>::new(0);
         let neighbour = Variable::<Handle<Embedding>>::new(1);
         let candidates = vec![
@@ -1667,27 +1481,6 @@ mod tests {
             embedding_raw(2),
         ];
         let constraint = SimilarTo::from_candidates(neighbour, candidates.clone());
-        let mut direct = Vec::new();
-        let first = cached_candidate_page(
-            &candidates,
-            ResidualDeltaSourceCursor::Start,
-            1,
-            &mut direct,
-        );
-        assert_eq!(direct, candidates[..1]);
-        assert_eq!(first.examined, 1);
-        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(1)));
-
-        direct.clear();
-        let rest = cached_candidate_page(
-            &candidates,
-            first.next.unwrap(),
-            candidates.len(),
-            &mut direct,
-        );
-        assert_eq!(direct, candidates[1..]);
-        assert_eq!(rest.examined, candidates.len() - 1);
-        assert_eq!(rest.next, None);
 
         let parents: HashSet<Id> = [id(10), id(11)].into_iter().collect();
         let parent_rows = [id_to_raw_value(id(10)), id_to_raw_value(id(11))];
@@ -1741,22 +1534,6 @@ mod tests {
                 "the public raw head collapses repeated handle occurrences",
             );
         }
-        assert_eq!(
-            residual.stats().delta_source_direct_candidates,
-            parents.len() * candidates.len()
-        );
-        assert_eq!(residual.stats().delta_source_roots, 0);
-
-        let mut first_only = Query::new(
-            SimilarTo::from_candidates(Variable::<Handle<Embedding>>::new(0), candidates.clone()),
-            project_first,
-        )
-        .solve_residual_state_lazy();
-        assert_eq!(first_only.next(), Some(candidates[0]));
-        assert_eq!(first_only.stats().delta_source_pages, 1);
-        assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
-        assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
-        drop(first_only);
     }
 
     #[test]
@@ -1791,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_search_programs_execute_as_production_source_and_confirmer() {
+    fn cached_search_constraints_execute_as_exact_ordinary_source_and_confirmer() {
         let candidate = Variable::<Handle<Embedding>>::new(0);
         let source = vec![
             embedding_raw(3),
@@ -1804,24 +1581,10 @@ mod tests {
 
         // Both children can propose, so adaptive execution chooses SimilarTo's
         // tighter two-row bag even though BM25 is listed first. BM25 confirms
-        // each bounded page. Width one forces every Offset continuation edge.
-        // Public query heads are sets. Exact source order and occurrence
-        // multiplicity are asserted at the direct-source seams above; this
-        // end-to-end check uses the independently specified intersection.
+        // its candidates. Public query heads are sets; this end-to-end check
+        // uses the independently specified intersection.
         let forward_bm25 = BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone());
         let forward_similar = SimilarTo::from_candidates(candidate, allowed.clone());
-        assert!(forward_bm25
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(candidate.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
-        assert!(forward_similar
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(candidate.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
         let forward_root = triblespace_core::and!(forward_bm25, forward_similar);
         let mut forward = Query::new(forward_root, project_first).solve_residual_state_lazy();
         let first = forward
@@ -1834,22 +1597,10 @@ mod tests {
         forward_results.sort_unstable();
         assert_eq!(forward_results, expected);
 
-        // Reversing the child types makes BM25's shorter bag own proposal
-        // paging while SimilarTo exercises the same pointwise confirmation.
+        // Reversing the child types makes BM25's shorter bag propose while
+        // SimilarTo exercises the same pointwise confirmation.
         let reverse_similar = SimilarTo::from_candidates(candidate, source);
         let reverse_bm25 = BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed);
-        assert!(reverse_similar
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(candidate.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
-        assert!(reverse_bm25
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(candidate.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
         let reverse_root = triblespace_core::and!(reverse_similar, reverse_bm25);
         let mut reverse: Vec<_> = Query::new(reverse_root, project_first)
             .solve_residual_state_lazy()

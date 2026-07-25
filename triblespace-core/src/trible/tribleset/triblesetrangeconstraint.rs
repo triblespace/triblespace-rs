@@ -4,28 +4,13 @@ use crate::inline::RawInline;
 use crate::inline::INLINE_LEN;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
-use crate::query::DispatchClass;
 use crate::query::EstimateSink;
-use crate::query::ProgramPacing;
-use crate::query::ProgramRef;
-use crate::query::ProgramRequest;
-use crate::query::ProgramRoute;
-use crate::query::ProgramSeedBatch;
 use crate::query::ProposalCoverage;
-use crate::query::ResidualDeltaSourceCursor;
-use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
-use crate::query::TypedEffectSink;
-use crate::query::TypedProgramBatch;
-use crate::query::TypedProgramSpec;
-use crate::query::TypedSeedSink;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-
-use super::triblesetconstraint::direct_source_page;
-use super::triblesetconstraint::next_inline_source_in_range;
 
 /// A value-range-aware constraint that uses the TribleSet's VEA index
 /// to restrict values to the intersection of its V-axis domain and an
@@ -79,63 +64,6 @@ impl TribleSetRangeConstraint {
 
     fn contains(&self, value: &RawInline) -> bool {
         *value >= self.min && *value <= self.max && self.set.vea.has_prefix(value)
-    }
-
-    fn proposal_page(
-        &self,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
-        direct_source_page(cursor, limit, accepted, |after| {
-            next_inline_source_in_range(&self.set.vea, &[], &self.min, &self.max, after)
-        })
-    }
-}
-
-impl TypedProgramSpec for TribleSetRangeConstraint {
-    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        crate::query::finiteunaryprogram::route(self.variable_v, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        crate::query::finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        crate::query::finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        crate::query::finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::seed(self.variable_v, batch, effects)
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::step(
-            self.variable_v,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
-            |_input, value| self.contains(value),
-        )
     }
 }
 
@@ -198,10 +126,6 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         }
     }
 
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_v) {
             Some(col) => view.iter().all(|row| self.contains(&row[col])),
@@ -219,18 +143,10 @@ mod tests {
     use crate::query::Binding;
     use crate::query::CandidateSink;
     use crate::query::Constraint;
-    use crate::query::ProgramAction;
-    use crate::query::ProgramCompletion;
-    use crate::query::ProgramGrouping;
-    use crate::query::ProgramRequest;
-    use crate::query::ProgramStratum;
     use crate::query::Query;
-    use crate::query::ResidualDeltaSourceCursor;
     use crate::query::RowsView;
-    use crate::query::TypedProgramSpec;
     use crate::query::VariableContext;
     use crate::query::VariableId;
-    use crate::query::VariableSet;
 
     attributes! {
         "BB00000000000000BB00000000000000" as range_test_score: R256BE;
@@ -390,77 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn value_range_production_program_is_strict_distinct_and_lazy() {
-        let v10: Inline<R256BE> = 10i128.to_inline();
-        let v50: Inline<R256BE> = 50i128.to_inline();
-        let v90: Inline<R256BE> = 90i128.to_inline();
-        let v100: Inline<R256BE> = 100i128.to_inline();
-        let mut data = TribleSet::new();
-        data += entity! { &ufoid() @ range_test_score: v10 };
-        data += entity! { &ufoid() @ range_test_score: v10 };
-        data += entity! { &ufoid() @ range_test_score: v50 };
-        data += entity! { &ufoid() @ range_test_score: v90 };
-        data += entity! { &ufoid() @ range_test_score: v100 };
-
-        let mut context = VariableContext::new();
-        let variable = context.next_variable::<R256BE>();
-        let constraint = data.value_in_range(variable, v10, v90);
-        let route = constraint
-            .residual_program()
-            .expect("value ranges expose a typed Program")
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(variable.index),
-                bound: VariableSet::new_empty(),
-            })
-            .expect("the unbound range variable has an ordered source");
-        assert_eq!(route.stratum, ProgramStratum::Finite);
-        assert_eq!(route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(route.completion, ProgramCompletion::PageableOnly);
-        assert!(
-            constraint.progress(
-                &crate::query::finiteunaryprogram::FiniteUnaryProgramState::Propose {
-                    cursor: ResidualDeltaSourceCursor::Start,
-                }
-            ) > constraint.progress(
-                &crate::query::finiteunaryprogram::FiniteUnaryProgramState::Propose {
-                    cursor: ResidualDeltaSourceCursor::After(v10.raw),
-                }
-            )
-        );
-
-        let mut direct = Vec::new();
-        let first = constraint.proposal_page(ResidualDeltaSourceCursor::Start, 1, &mut direct);
-        assert_eq!(direct, [v10.raw]);
-        assert_eq!(first.examined, 1);
-        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::After(v10.raw)));
-
-        let second = constraint.proposal_page(first.next.unwrap(), 2, &mut direct);
-        assert_eq!(direct, [v10.raw, v50.raw, v90.raw]);
-        assert_eq!(second.examined, 2);
-        assert_eq!(second.next, None);
-
-        let mut query = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
-            project(variable.index, binding)
-        })
-        .solve_residual_state_lazy();
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, [v10.raw, v50.raw, v90.raw]);
-        assert_eq!(query.stats().delta_source_candidates_examined, 3);
-        assert_eq!(query.stats().delta_source_direct_candidates, 3);
-        assert_eq!(query.stats().delta_source_roots, 0);
-
-        let mut first_only = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
-            project(variable.index, binding)
-        })
-        .solve_residual_state_lazy();
-        assert_eq!(first_only.next(), Some(v10.raw));
-        assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
-        assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
-        drop(first_only);
-    }
-
-    #[test]
     fn value_range_source_preserves_affine_parents_before_set_projection() {
         let v10: Inline<R256BE> = 10i128.to_inline();
         let v50: Inline<R256BE> = 50i128.to_inline();
@@ -544,9 +389,11 @@ mod tests {
 
         let inverted = grown.value_in_range(value, v90, v10);
         let mut direct = Vec::new();
-        let empty = inverted.proposal_page(ResidualDeltaSourceCursor::Start, 1, &mut direct);
-        assert_eq!(empty.examined, 0);
-        assert_eq!(empty.next, None);
+        inverted.propose(
+            value.index,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut direct),
+        );
         assert!(direct.is_empty());
     }
 }

@@ -6795,20 +6795,6 @@ impl DeltaScheduler {
         }
     }
 
-    /// Executes one typed Program cohort.
-    #[cfg(test)]
-    pub(super) fn step<'a>(
-        &mut self,
-        root: &dyn Constraint<'a>,
-        plan: &ResidualPlan,
-        width: usize,
-        stable: &mut Worklist,
-        stable_interner: &mut StateInterner,
-        stats: &mut ResidualStateStats,
-    ) -> DeltaStepOutcome {
-        self.step_bounded(root, plan, width, None, stable, stable_interner, stats)
-    }
-
     pub(super) fn step_bounded<'a>(
         &mut self,
         root: &dyn Constraint<'a>,

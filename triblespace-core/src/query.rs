@@ -21,7 +21,6 @@ pub mod constantconstraint;
 pub mod equalityconstraint;
 /// Shared finite continuation for immutable, ordered single-variable sources.
 #[doc(hidden)]
-pub mod finiteunaryprogram;
 /// [`KeysConstraint`](hashmapconstraint::KeysConstraint) — constrains a variable to HashMap keys.
 pub mod hashmapconstraint;
 /// [`SetConstraint`](hashsetconstraint::SetConstraint) — constrains a variable to HashSet members.

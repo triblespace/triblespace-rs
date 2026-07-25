@@ -456,28 +456,6 @@ where
     )
 }
 
-pub(super) fn page_domain<U>(
-    archive: &SuccinctArchive<U>,
-    prefix: &BitVector<Rank9SelIndex>,
-    code_range: Range<usize>,
-    cursor: ResidualDeltaSourceCursor,
-    limit: usize,
-    accepted: &mut Vec<RawInline>,
-) -> ResidualDeltaSourcePage
-where
-    U: Universe,
-{
-    consume_domain_filtered(
-        archive,
-        prefix,
-        code_range,
-        cursor,
-        limit,
-        |value| accepted.push(value),
-        |_| true,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 /// Filtered fixed-first traversal used by repeated-position proposal shapes.
 /// The unfiltered single-target shapes use [`LocatedProposalWalk`], whose

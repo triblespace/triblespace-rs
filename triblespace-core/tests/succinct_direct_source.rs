@@ -1,14 +1,10 @@
-//! Semantic receipts for SuccinctArchive production Program paging.
+//! Semantic receipts for SuccinctArchive query execution.
 //!
-//! These tests keep the source contract visible: the twelve triple-pattern
-//! bound schemas must route through the production typed Program, complete
-//! queries are checked against direct fixture relations, and first-pull
-//! receipts prove that width-one demand does not materialize a large archive
-//! frontier.
+//! Complete queries are checked against direct fixture relations so physical
+//! execution changes cannot alter the public result contract.
 
 use triblespace_core::blob::encodings::succinctarchive::{
-    CompressedUniverse, OrderedUniverse, RingBatchQuery, SuccinctArchive,
-    SuccinctArchiveConstraint, SuccinctRotation,
+    CompressedUniverse, OrderedUniverse, SuccinctArchive, SuccinctArchiveConstraint,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
@@ -56,188 +52,50 @@ fn fixture(
     (set, entities, attributes, values)
 }
 
-/// Exact CPU implementation of the optional Ring batch seam. Source paging
-/// must be identical with this attached even though direct candidates do not
-/// need a batched confirmation probe.
-struct CpuRing<'a>(&'a SuccinctArchive<OrderedUniverse>);
-
-impl RingBatchQuery for CpuRing<'_> {
-    fn rank_batch(
-        &self,
-        rotation: SuccinctRotation,
-        positions: &[usize],
-        values: &[usize],
-    ) -> Vec<usize> {
-        positions
-            .iter()
-            .zip(values)
-            .map(|(&position, &value)| self.0.ring_col(rotation).rank(position, value).unwrap())
-            .collect()
-    }
-}
-
-fn assert_typed_program_family<'a, C>(
-    name: &str,
-    constraint: &C,
-    _variable: VariableId,
-    _view: &RowsView<'_>,
-) where
-    C: Constraint<'a> + ?Sized,
-{
-    assert!(
-        constraint.residual_program().is_some(),
-        "{name}: missing typed Program family",
-    );
-}
-
 #[test]
-fn all_twelve_pattern_bound_schemas_use_production_program_on_cpu_and_ring_backend() {
-    let (set, entities, attributes, values) = fixture(3, 3, 3);
-    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-    let ring = CpuRing(&archive);
-    let entity = Variable::<GenId>::new(0);
-    let attribute = Variable::<GenId>::new(1);
-    let value = Variable::<UnknownInline>::new(2);
-
-    let cases = [
-        ("zero/e", entity.index, vec![], vec![]),
-        ("zero/a", attribute.index, vec![], vec![]),
-        ("zero/v", value.index, vec![], vec![]),
-        (
-            "e/a",
-            attribute.index,
-            vec![entity.index],
-            vec![entities[0].raw],
-        ),
-        (
-            "e/v",
-            value.index,
-            vec![entity.index],
-            vec![entities[0].raw],
-        ),
-        (
-            "a/e",
-            entity.index,
-            vec![attribute.index],
-            vec![attributes[0].raw],
-        ),
-        (
-            "a/v",
-            value.index,
-            vec![attribute.index],
-            vec![attributes[0].raw],
-        ),
-        ("v/e", entity.index, vec![value.index], vec![values[0].raw]),
-        (
-            "v/a",
-            attribute.index,
-            vec![value.index],
-            vec![values[0].raw],
-        ),
-        (
-            "av/e",
-            entity.index,
-            vec![attribute.index, value.index],
-            vec![attributes[0].raw, values[0].raw],
-        ),
-        (
-            "ev/a",
-            attribute.index,
-            vec![entity.index, value.index],
-            vec![entities[0].raw, values[0].raw],
-        ),
-        (
-            "ea/v",
-            value.index,
-            vec![entity.index, attribute.index],
-            vec![entities[0].raw, attributes[0].raw],
-        ),
-    ];
-
-    for backend in [false, true] {
-        let constraint = if backend {
-            SuccinctArchiveConstraint::with_ring_batch(entity, attribute, value, &archive, &ring)
-        } else {
-            SuccinctArchiveConstraint::new(entity, attribute, value, &archive)
-        };
-        for (schema, variable, vars, row) in &cases {
-            let view = if vars.is_empty() {
-                RowsView::EMPTY
-            } else {
-                RowsView::new(vars, row)
-            };
-            assert_typed_program_family(
-                &format!("{schema}/{}", if backend { "ring" } else { "cpu" }),
-                &constraint,
-                *variable,
-                &view,
-            );
-        }
-    }
-}
-
-#[test]
-fn compressed_universe_preserves_zero_one_two_bound_and_range_sources() {
-    let (set, entities, attributes, values) = fixture(3, 3, 3);
+fn compressed_universe_value_range_matches_known_values() {
+    let (set, _, _, values) = fixture(3, 3, 3);
     let archive: SuccinctArchive<CompressedUniverse> = (&set).into();
-    let entity = Variable::<GenId>::new(0);
-    let attribute = Variable::<GenId>::new(1);
-    let value = Variable::<UnknownInline>::new(2);
-    let constraint = SuccinctArchiveConstraint::new(entity, attribute, value, &archive);
+    let value = Variable::<UnknownInline>::new(0);
+    let mut expected = vec![values[0].raw, values[1].raw];
+    expected.sort_unstable();
 
-    assert_typed_program_family(
-        "compressed/zero-v",
-        &constraint,
-        value.index,
-        &RowsView::EMPTY,
+    assert_eq!(
+        sorted_values_ordinary(
+            archive.value_in_range(value, values[0], values[1]),
+            value.index,
+        ),
+        expected
     );
-    let attribute_vars = [attribute.index];
-    let attribute_row = [attributes[0].raw];
-    let attribute_view = RowsView::new(&attribute_vars, &attribute_row);
-    assert_typed_program_family("compressed/a-v", &constraint, value.index, &attribute_view);
-    let entity_attribute_vars = [entity.index, attribute.index];
-    let entity_attribute_row = [entities[0].raw, attributes[0].raw];
-    let entity_attribute_view = RowsView::new(&entity_attribute_vars, &entity_attribute_row);
-    assert_typed_program_family(
-        "compressed/ea-v",
-        &constraint,
-        value.index,
-        &entity_attribute_view,
-    );
-    let range = archive.value_in_range(value, values[0], values[1]);
-    assert_typed_program_family(
-        "compressed/value-range",
-        &range,
-        value.index,
-        &RowsView::EMPTY,
+    assert_eq!(
+        sorted_values_full(
+            archive.value_in_range(value, values[0], values[1]),
+            value.index,
+        ),
+        expected
     );
 }
 
 #[test]
-fn absent_bound_values_and_empty_ranges_exhaust_without_candidates() {
+fn absent_bound_values_and_empty_ranges_have_no_results() {
     let (set, _, attributes, values) = fixture(2, 2, 2);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-    let entity = Variable::<GenId>::new(0);
-    let attribute = Variable::<GenId>::new(1);
-    let value = Variable::<UnknownInline>::new(2);
-    let constraint = SuccinctArchiveConstraint::new(entity, attribute, value, &archive);
+    let value = Variable::<UnknownInline>::new(0);
     let absent_entity: Inline<GenId> = id(90).to_inline();
-    let absent_vars = [entity.index];
-    let absent_row = [absent_entity.raw];
-    let absent_view = RowsView::new(&absent_vars, &absent_row);
-    assert_typed_program_family("absent-e/a", &constraint, attribute.index, &absent_view);
-    let absent_pair_vars = [entity.index, attribute.index];
-    let absent_pair_row = [absent_entity.raw, attributes[0].raw];
-    let absent_pair_view = RowsView::new(&absent_pair_vars, &absent_pair_row);
-    assert_typed_program_family("absent-ea/v", &constraint, value.index, &absent_pair_view);
+    let absent_pair = SuccinctArchiveConstraint::new(absent_entity, attributes[0], value, &archive);
+    assert!(sorted_values_ordinary(absent_pair.clone(), value.index).is_empty());
+    assert!(sorted_values_full(absent_pair, value.index).is_empty());
 
-    let empty_range = archive.value_in_range(value, values[1], values[0]);
-    assert_typed_program_family(
-        "inverted-value-range",
-        &empty_range,
+    assert!(sorted_values_ordinary(
+        archive.value_in_range(value, values[1], values[0]),
         value.index,
-        &RowsView::EMPTY,
-    );
+    )
+    .is_empty());
+    assert!(sorted_values_full(
+        archive.value_in_range(value, values[1], values[0]),
+        value.index,
+    )
+    .is_empty());
 }
 
 fn project_pattern(axes: [VariableId; 3]) -> impl Fn(&Binding) -> Option<[RawInline; 3]> {
@@ -331,41 +189,23 @@ where
 }
 
 #[test]
-fn succinct_value_range_uses_production_program_and_matches_the_tribleset_oracle() {
+fn succinct_value_range_ordinary_action_matches_the_tribleset_oracle() {
     let (set, _, _, values) = fixture(2, 2, 6);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let variable = Variable::<UnknownInline>::new(0);
     let min = values[1];
     let max = values[4];
 
-    let source = archive.value_in_range(variable, min, max);
-    assert_typed_program_family("value-range", &source, variable.index, &RowsView::EMPTY);
-    let mut expected: Vec<_> = values[1..=4].iter().map(|value| value.raw).collect();
-    expected.sort_unstable();
+    let expected = sorted_values_full(set.value_in_range(variable, min, max), variable.index);
+    let mut known: Vec<_> = values[1..=4].iter().map(|value| value.raw).collect();
+    known.sort_unstable();
+    assert_eq!(expected, known);
     let archive_ordinary =
         sorted_values_ordinary(archive.value_in_range(variable, min, max), variable.index);
     let archive_residual =
         sorted_values_full(archive.value_in_range(variable, min, max), variable.index);
     assert_eq!(archive_ordinary, expected);
     assert_eq!(archive_residual, expected);
-}
-
-#[test]
-fn production_program_first_pull_is_one_direct_candidate() {
-    let (set, entities, attributes, values) = fixture(1, 1, 24);
-    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-    let variable = Variable::<UnknownInline>::new(0);
-    let root = SuccinctArchiveConstraint::new(entities[0], attributes[0], variable, &archive);
-    let mut query = Query::new(root, move |binding: &Binding| {
-        binding.get(variable.index).copied()
-    })
-    .solve_residual_state_lazy();
-
-    assert_eq!(query.next(), Some(values[0].raw));
-    assert_eq!(query.stats().delta_source_pages, 1);
-    assert_eq!(query.stats().delta_source_candidates_examined, 1);
-    assert_eq!(query.stats().delta_source_direct_candidates, 1);
-    assert_eq!(query.stats().delta_source_roots, 0);
 }
 
 #[derive(Clone)]
@@ -434,7 +274,7 @@ impl<'a> Constraint<'a> for ParentDomain {
 type DynConstraint<'a> = Box<dyn Constraint<'a> + 'a>;
 
 #[test]
-fn direct_sources_preserve_affine_parent_multiplicity() {
+fn succinct_constraints_preserve_affine_parent_multiplicity() {
     let (set, entities, attributes, values) = fixture(1, 1, 4);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let variable = Variable::<UnknownInline>::new(0);
@@ -454,8 +294,9 @@ fn direct_sources_preserve_affine_parent_multiplicity() {
         ])
     };
     let project = move |binding: &Binding| binding.get(variable.index).copied();
-    let mut residual_query = Query::new(make_root(), project).solve_residual_state_lazy();
-    let mut residual: Vec<_> = residual_query.by_ref().collect();
+    let mut residual: Vec<_> = Query::new(make_root(), project)
+        .solve_residual_state_lazy()
+        .collect();
     residual.sort_unstable();
     let mut expected: Vec<_> = values
         .iter()
@@ -463,9 +304,6 @@ fn direct_sources_preserve_affine_parent_multiplicity() {
         .collect();
     expected.sort_unstable();
     assert_eq!(residual, expected);
-    assert_eq!(residual_query.stats().delta_source_candidates_examined, 8);
-    assert_eq!(residual_query.stats().delta_source_direct_candidates, 8);
-    assert_eq!(residual_query.stats().delta_source_roots, 0);
 }
 
 fn fixed_pair_results(
