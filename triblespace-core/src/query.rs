@@ -387,7 +387,7 @@ struct ProjectionGate {
     mapper_binding: Option<Box<Binding>>,
 }
 
-/// Result of offering one complete raw binding to the public projection.
+/// Result of mapping one newly claimed complete raw binding.
 ///
 /// `Done` is distinct from `Skip`: an empty head has exactly one possible raw
 /// key. Once that key is claimed, no later hidden witness can produce another
@@ -489,20 +489,13 @@ impl ProjectionGate {
         }
     }
 
-    /// Claims the raw head, then invokes the mapper with exactly the binding
-    /// scope represented by that head. Hidden witnesses cannot affect a
-    /// macro-created result through the doc-hidden constructor seam.
-    fn project<P, R>(&mut self, binding: &Binding, postprocessing: &P) -> ProjectionStep<R>
+    /// Maps a raw head already admitted by [`Self::claim`] with exactly the
+    /// binding scope represented by that head. Hidden witnesses cannot affect
+    /// a macro-created result through the doc-hidden constructor seam.
+    fn project_claimed<P, R>(&mut self, binding: &Binding, postprocessing: &P) -> ProjectionStep<R>
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        if !self.claim(binding) {
-            return if self.is_empty_head() {
-                ProjectionStep::Done
-            } else {
-                ProjectionStep::Skip
-            };
-        }
         let mapped = if let Some(projected) = &mut self.mapper_binding {
             for &variable in self.head.iter() {
                 projected.set(
@@ -2496,6 +2489,23 @@ mod tests {
         assert!(strict_zero.is_done());
         assert!(!strict_zero.claim(&Binding::default()));
         assert!(strict_zero.clone().is_done());
+    }
+
+    #[test]
+    fn projection_gate_raw_claim_survives_mapper_rejection() {
+        let mut gate = ProjectionGate::new([0], variable_set([0, 1]));
+        let mut first = Binding::default();
+        first.set(0, &[7; 32]);
+        first.set(1, &[1; 32]);
+        assert!(gate.claim(&first));
+        assert!(matches!(
+            gate.project_claimed(&first, &|_| None::<()>),
+            ProjectionStep::Skip
+        ));
+
+        let mut same_head = first;
+        same_head.set(1, &[2; 32]);
+        assert!(!gate.claim(&same_head));
     }
 
     #[cfg(feature = "parallel")]

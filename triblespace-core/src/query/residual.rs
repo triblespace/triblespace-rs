@@ -98,7 +98,7 @@ mod set_admit;
 use delta::{
     ActivationId as DeltaActivationId, ActiveDeltaContinuation, ActiveDeltaStatus, DeltaDesc,
     DeltaScheduler, DeltaSeedOutcome, DeltaStepOutcome, PositivePublicationSeed,
-    TerminalPublicationBatch,
+    TerminalProjectionFeedback, TerminalPublicationBatch,
 };
 
 /// Fixed upper bound for every geometric residual scheduling width.
@@ -1984,11 +1984,11 @@ pub struct ResidualStateStats {
     /// Terminal calls that produced at least one stable effect, including a
     /// direct physical publication receipt.
     pub delta_terminal_publications: usize,
-    /// Publication resets that changed a terminal activation's local sparse
-    /// quantum back to one examined-work unit.
+    /// Novel raw projection claims (or publications without a staged public
+    /// gate) that reset a terminal activation's local sparse quantum to one.
     pub delta_terminal_sparse_resets: usize,
-    /// Live transition no-publication calls that doubled a terminal
-    /// activation's local sparse-search quantum toward global search width.
+    /// Saturated live transition receipts whose staged rows supplied no novel
+    /// raw projected key and doubled their activation-local sparse quantum.
     pub delta_terminal_sparse_widenings: usize,
     /// Projected result windows opened after the initial width-one window.
     /// A window opens only when the caller pulls again after consuming every
@@ -9068,6 +9068,9 @@ struct ResidualStateMachine {
     /// Ordinary stable emission stores `None`. This physical sideband never
     /// contributes to canonical state identity or observable result order.
     emit_origins: Option<SmallVec<[DeltaActivationId; 1]>>,
+    /// Physical row origins for the affinely moved projection feedback below.
+    emit_physical_origins: Option<SmallVec<[DeltaActivationId; 1]>>,
+    emit_projection_feedback: SmallVec<[TerminalProjectionFeedback; 1]>,
     emit_next: usize,
     emit_count: usize,
     /// Exact physical cohort activated by a partially surviving full action
@@ -9273,6 +9276,8 @@ impl ResidualStateMachine {
             emit_vars: Vec::new(),
             emit_rows: Vec::new(),
             emit_origins: None,
+            emit_physical_origins: None,
+            emit_projection_feedback: SmallVec::new(),
             emit_next: 0,
             emit_count: 0,
             continuation: None,
@@ -9728,8 +9733,10 @@ impl ResidualStateMachine {
         self.stats.delta_terminal_eager_cohort_rows += published.row_count;
         let publication = (published.row_count > 0).then_some(TerminalPublicationBatch {
             rows: published,
+            physical_origins: origins.clone(),
             origins,
             registrations: SmallVec::new(),
+            projection_feedback: SmallVec::new(),
         });
         debug_assert!(receipts
             .iter()
@@ -10692,6 +10699,8 @@ impl ResidualStateMachine {
     fn stage_emit(&mut self, rows: RowBatch) {
         debug_assert!(self.emit_next >= self.emit_count);
         self.emit_origins = None;
+        self.emit_physical_origins = None;
+        self.emit_projection_feedback.clear();
         self.emit_rows = rows.rows;
         self.emit_next = 0;
         self.emit_count = rows.row_count;
@@ -10702,12 +10711,19 @@ impl ResidualStateMachine {
             rows,
             origins,
             registrations,
+            physical_origins,
+            projection_feedback,
         } = publication;
         assert!(rows.row_count > 0, "direct publication staged no rows");
         assert_eq!(
             origins.len(),
             rows.row_count,
             "direct publication lost activation origins"
+        );
+        assert_eq!(
+            physical_origins.len(),
+            rows.row_count,
+            "direct publication lost physical origins"
         );
         assert!(
             registrations
@@ -10726,12 +10742,14 @@ impl ResidualStateMachine {
         self.emit_vars.extend(self.full);
         debug_assert!(self.emit_next >= self.emit_count);
         self.emit_origins = Some(origins);
+        self.emit_physical_origins = Some(physical_origins);
+        self.emit_projection_feedback = projection_feedback;
         self.emit_rows = rows.rows;
         self.emit_next = 0;
         self.emit_count = rows.row_count;
         // This replaces exactly one eventual terminal Emit batch. In this
         // scheduler output is not search feedback: S stays unchanged, q is
-        // charged only by a successful projection, and the independent
+        // charged only by a novel raw projection claim, and the independent
         // activation-breadth receipt remains identical to ordinary Emit.
         self.increase_delta_activation_width();
     }
@@ -10747,6 +10765,8 @@ impl ResidualStateMachine {
                 drop(self.terminal_yield.begin_projection(origin));
             }
         }
+        self.emit_physical_origins = None;
+        self.emit_projection_feedback.clear();
     }
 
     /// Opens the next confirmed terminal-demand window at a public pull
@@ -11001,6 +11021,10 @@ impl ResidualStateMachine {
                 // unwind is caught, a later pull must not repeat its effects.
                 self.emit_next += 1;
                 let origin = self.emit_origins.as_ref().map(|origins| origins[row]);
+                let physical_origin = self
+                    .emit_physical_origins
+                    .as_ref()
+                    .map(|origins| origins[row]);
                 let mut projection =
                     origin.map(|activation| self.terminal_yield.begin_projection(activation));
                 let stride = self.emit_vars.len();
@@ -11008,7 +11032,34 @@ impl ResidualStateMachine {
                 for (column, &variable) in self.emit_vars.iter().enumerate() {
                     self.binding.set(variable, &self.emit_rows[start + column]);
                 }
-                match projection_gate.project(&self.binding, postprocessing) {
+                let claimed = projection_gate.claim(&self.binding);
+                let done = !claimed && projection_gate.is_empty_head();
+                if !done {
+                    if let Some(index) = physical_origin.and_then(|origin| {
+                        self.emit_projection_feedback
+                            .iter()
+                            .position(|receipt| receipt.activation == origin)
+                    }) {
+                        if claimed || self.emit_projection_feedback[index].last_row == row {
+                            let receipt = self.emit_projection_feedback.remove(index);
+                            self.delta.settle_terminal_projection_feedback(
+                                receipt,
+                                claimed,
+                                &mut self.stats,
+                            );
+                        }
+                    }
+                }
+                let projection_step = if claimed {
+                    projection_gate.project_claimed(&self.binding, postprocessing)
+                } else if done {
+                    // No future public demand remains: retire all receipts
+                    // neutrally rather than interpreting this row as a miss.
+                    ProjectionStep::Done
+                } else {
+                    ProjectionStep::Skip
+                };
+                match projection_step {
                     ProjectionStep::Yield(result) => {
                         if let Some(projection) = &mut projection {
                             projection.mark_successful();
@@ -11031,6 +11082,8 @@ impl ResidualStateMachine {
                 }
             }
             if draining_unprojected_emit {
+                debug_assert!(self.emit_projection_feedback.is_empty());
+                self.emit_physical_origins = None;
                 // Exhausting a staged raw-result suffix without satisfying
                 // this public pull is negative search feedback, but it is not
                 // confirmed projected-result demand.
@@ -11111,6 +11164,8 @@ impl ResidualStateMachine {
             emit_vars: Vec::new(),
             emit_rows: Vec::new(),
             emit_origins: None,
+            emit_physical_origins: None,
+            emit_projection_feedback: SmallVec::new(),
             emit_next: 0,
             emit_count: 0,
             continuation: None,
