@@ -1951,13 +1951,6 @@ pub struct ResidualStateStats {
     /// Admissions whose projected-yield demand quote transferred more than
     /// the scalar miss/fairness floor.
     pub delta_terminal_demand_wide_admissions: usize,
-    /// Demand-wide terminal admissions evaluated by the family-owned complete
-    /// Program action instead of opening sparse cyclic activations.
-    pub delta_terminal_eager_cohort_admissions: usize,
-    /// Exact terminal parents evaluated in those physical phase-change cohorts.
-    pub delta_terminal_eager_cohort_parents: usize,
-    /// Full rows published by those complete-action cohorts.
-    pub delta_terminal_eager_cohort_rows: usize,
     /// Parent rows refiled under the same canonical proposal state when a
     /// terminal admission split a wider selected chunk.
     pub delta_terminal_admission_remainders: usize,
@@ -4676,25 +4669,6 @@ impl CandidatePayload {
                 pairs.reverse();
                 pairs.retain(|pair| admitted.insert(*pair));
                 pairs.reverse();
-                true
-            }
-            Self::Deferred(_) => false,
-        }
-    }
-
-    /// Admits one occurrence of each `(parent, value)` in first-occurrence
-    /// order for direct forward publication.
-    fn admit_set_forward_stable(&mut self, parent_count: usize) -> bool {
-        self.debug_assert_valid_for(parent_count);
-        match self {
-            Self::Values(values) => {
-                let mut admitted = AHashSet::with_capacity(values.len());
-                values.retain(|value| admitted.insert(*value));
-                true
-            }
-            Self::Tagged(pairs) => {
-                let mut admitted = AHashSet::with_capacity(pairs.len());
-                pairs.retain(|pair| admitted.insert(*pair));
                 true
             }
             Self::Deferred(_) => false,
@@ -9086,8 +9060,6 @@ struct ResidualStateMachine {
     continuation_sprint_enabled: bool,
     #[cfg(test)]
     direct_terminal_publication_enabled: bool,
-    #[cfg(test)]
-    eager_terminal_phase_enabled: bool,
     last_selection: SelectionKind,
     last_was_action: bool,
     /// Independent confirmed projected-result window. It advances only after
@@ -9283,8 +9255,6 @@ impl ResidualStateMachine {
             continuation_sprint_enabled: true,
             #[cfg(test)]
             direct_terminal_publication_enabled: true,
-            #[cfg(test)]
-            eager_terminal_phase_enabled: true,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
             terminal_demand_width: INITIAL_RESIDUAL_WIDTH,
@@ -9572,281 +9542,6 @@ impl ResidualStateMachine {
         self.terminal_admission_width(task.state, rows.row_count) == 0
     }
 
-    /// Cold arbitration for one demand-admitted terminal Program cohort.
-    ///
-    /// The erased adapter quotes, selects, completes, and validates one exact
-    /// tail before returning. A decline leaves `rows` untouched and opens the
-    /// ordinary sparse route. Only a successful transaction permits this
-    /// method to split/refile a quote-rejected prefix or reserve receipts.
-    #[cold]
-    #[inline(never)]
-    fn seed_complete_terminal_program_candidate<'a>(
-        &mut self,
-        program: ProgramRef<'a>,
-        request: ProgramRequest,
-        route: ProgramRoute,
-        family: StateId,
-        desc: StateDesc,
-        delta_desc: DeltaDesc,
-        successor: StateDesc,
-        mut rows: RowBatch,
-        direct_terminal_publication_full: Option<VariableSet>,
-        plan: &ResidualPlan,
-    ) -> DeltaSeedOutcome {
-        assert!(rows.row_count > 1, "eager terminal phase requires a cohort");
-        let capacity = self.width.max(1);
-        let completion = {
-            let affinity = ProgramCompleteAffinity::new(&rows);
-            let vars: Vec<VariableId> = request.bound.into_iter().collect();
-            let batch = ProgramCompleteBatch {
-                request,
-                route,
-                view: rows_view(&vars, &rows.rows, rows.row_count),
-            };
-            program
-                .try_complete_bounded(batch, capacity, &affinity)
-                .map(|completion| completion.into_parts_for(batch, &affinity, &rows))
-        };
-
-        let Some((first_parent, work, raw_occurrence_count, occurrences)) = completion else {
-            let admitted_parent_count = rows.row_count;
-            self.stats.delta_terminal_admissions += 1;
-            self.stats.delta_terminal_admitted_parents += admitted_parent_count;
-            self.stats.max_delta_terminal_admission_parents = self
-                .stats
-                .max_delta_terminal_admission_parents
-                .max(admitted_parent_count);
-            self.stats.delta_terminal_demand_wide_admissions +=
-                usize::from(admitted_parent_count > 1);
-            self.stats.propose_action_pops += 1;
-            self.stats.propose_calls += 1;
-            self.stats.propose_rows += admitted_parent_count;
-            self.stats.max_propose_rows = self.stats.max_propose_rows.max(admitted_parent_count);
-
-            let mut outcome = self.delta.seed_program_proposals_with_full(
-                program,
-                delta_desc,
-                request,
-                route,
-                successor,
-                rows,
-                self.full,
-                direct_terminal_publication_full,
-                plan,
-                &mut self.worklist,
-                &mut self.interner,
-                &mut self.stats,
-            );
-            if self.uses_direct_terminal_publication() {
-                outcome.terminal_family = Some(family);
-            } else {
-                outcome.terminal_activations.clear();
-            }
-            return outcome;
-        };
-
-        debug_assert!(work.drain_work_units <= capacity);
-        debug_assert!(work.raw_occurrences <= capacity);
-        assert_eq!(work.raw_occurrences, raw_occurrence_count);
-
-        if first_parent > 0 {
-            let completed_parent_count = rows.row_count - first_parent;
-            let mut deferred = StateBucket::Rows(rows);
-            let completed = deferred.take_tail(desc.bound.count(), completed_parent_count, false);
-            let deferred_parents = deferred.row_count();
-            let receipt = file_with_plan(
-                &mut self.worklist,
-                &mut self.interner,
-                plan,
-                desc,
-                deferred,
-                &mut self.stats,
-            )
-            .expect("bounded complete-action prefix is nonempty");
-            debug_assert_eq!(receipt.state, family);
-            let StateBucket::Rows(completed) = completed else {
-                unreachable!("bounded terminal split preserved row payloads")
-            };
-            rows = completed;
-            self.stats.delta_terminal_admission_remainders += deferred_parents;
-        }
-
-        let seeded_parents = rows.row_count;
-        self.stats.delta_terminal_admissions += 1;
-        self.stats.delta_terminal_admitted_parents += seeded_parents;
-        self.stats.max_delta_terminal_admission_parents = self
-            .stats
-            .max_delta_terminal_admission_parents
-            .max(seeded_parents);
-        self.stats.delta_terminal_demand_wide_admissions += usize::from(seeded_parents > 1);
-        self.stats.propose_action_pops += 1;
-        self.stats.propose_calls += 1;
-        self.stats.propose_rows += seeded_parents;
-        self.stats.max_propose_rows = self.stats.max_propose_rows.max(seeded_parents);
-
-        let bound = request.bound;
-        let variable = route.variable;
-        let candidates = CandidatePayload::from_tagged(occurrences, seeded_parents);
-        candidates.debug_assert_valid_for(rows.row_count);
-        debug_assert!(
-            {
-                let mut admitted = candidates.clone();
-                admitted.admit_set_forward_stable(rows.row_count)
-                    && admitted.len() == candidates.len()
-            },
-            "typed complete adapter returned a duplicate candidate"
-        );
-        // The family call may unwind. Reserve receipt identities only after it
-        // succeeds so a caught action panic cannot leave ghost terminal
-        // samples in the shared activation namespace.
-        let receipts = self.delta.reserve_terminal_receipts(seeded_parents);
-        debug_assert!(receipts
-            .iter()
-            .all(|&receipt| !self.delta.receipt_has_live_activation(receipt)));
-        self.stats.candidates_proposed += raw_occurrence_count;
-        self.stats.max_propose_candidates =
-            self.stats.max_propose_candidates.max(raw_occurrence_count);
-
-        let mut origins = SmallVec::with_capacity(candidates.len());
-        let (next_bound, published) = committed_candidate_rows_mapped(
-            bound,
-            variable,
-            CandidateBatch {
-                parents: rows,
-                candidates,
-            },
-            |parent| origins.push(receipts[parent]),
-        );
-        assert_eq!(
-            next_bound, self.full,
-            "complete terminal Program action did not commit a full row"
-        );
-        assert_eq!(origins.len(), published.row_count);
-
-        self.stats.delta_terminal_eager_cohort_admissions += 1;
-        self.stats.delta_terminal_eager_cohort_parents += seeded_parents;
-        self.stats.delta_terminal_eager_cohort_rows += published.row_count;
-        let publication = (published.row_count > 0).then_some(TerminalPublicationBatch {
-            rows: published,
-            origins,
-            registrations: SmallVec::new(),
-        });
-        debug_assert!(receipts
-            .iter()
-            .all(|&receipt| !self.delta.receipt_has_live_activation(receipt)));
-
-        DeltaSeedOutcome {
-            continuation: None,
-            publication,
-            active: None,
-            terminal_activations: receipts.clone(),
-            completed_activation_ids: receipts,
-            terminal_family: Some(family),
-            seeded_parents,
-        }
-    }
-
-    /// Publishes one completed, nonterminal Program proposal back into the
-    /// ordinary canonical Candidate continuation.
-    ///
-    /// Completion is selected only after projected demand has widened beyond
-    /// the scalar latency lane. The Program family still owns the action and
-    /// certifies the same parent-local candidate SET; only its physical
-    /// execution changes from affine pages to one block-native cohort.
-    #[cold]
-    #[inline(never)]
-    fn finish_complete_program_candidate(
-        &mut self,
-        family: StateId,
-        desc: StateDesc,
-        successor: StateDesc,
-        mut rows: RowBatch,
-        completion: (
-            usize,
-            ProgramCompleteWorkQuote,
-            usize,
-            Vec<(u32, RawInline)>,
-        ),
-        plan: &ResidualPlan,
-    ) -> DeltaSeedOutcome {
-        let (first_parent, work, raw_occurrence_count, occurrences) = completion;
-        let capacity = self.width.max(1);
-        debug_assert!(work.drain_work_units <= capacity);
-        debug_assert!(work.raw_occurrences <= capacity);
-        assert_eq!(work.raw_occurrences, raw_occurrence_count);
-
-        if first_parent > 0 {
-            let completed_parent_count = rows.row_count - first_parent;
-            let mut deferred = StateBucket::Rows(rows);
-            let completed = deferred.take_tail(desc.bound.count(), completed_parent_count, false);
-            let receipt = file_with_plan(
-                &mut self.worklist,
-                &mut self.interner,
-                plan,
-                desc.clone(),
-                deferred,
-                &mut self.stats,
-            )
-            .expect("bounded complete-action prefix is nonempty");
-            debug_assert_eq!(receipt.state, family);
-            let StateBucket::Rows(completed) = completed else {
-                unreachable!("bounded complete split preserved row payloads")
-            };
-            rows = completed;
-        }
-
-        let seeded_parents = rows.row_count;
-        self.stats.propose_action_pops += 1;
-        self.stats.propose_calls += 1;
-        self.stats.propose_rows += seeded_parents;
-        self.stats.max_propose_rows = self.stats.max_propose_rows.max(seeded_parents);
-
-        let mut candidates = CandidatePayload::from_tagged(occurrences, seeded_parents);
-        candidates.debug_assert_valid_for(rows.row_count);
-        debug_assert!(
-            {
-                let mut admitted = candidates.clone();
-                admitted.admit_set_forward_stable(rows.row_count)
-                    && admitted.len() == candidates.len()
-            },
-            "typed complete adapter returned a duplicate candidate"
-        );
-        self.stats.candidates_proposed += raw_occurrence_count;
-        self.stats.max_propose_candidates =
-            self.stats.max_propose_candidates.max(raw_occurrence_count);
-
-        if crosses_candidate_set_boundary(&desc, &successor, plan, &self.interner.formula_pcs) {
-            assert!(
-                candidates.admit_set_tail_stable(rows.row_count),
-                "completed Program proposal returned a deferred candidate payload"
-            );
-        }
-        let parent_columns = desc.bound.count();
-        let candidate = CandidateBatch {
-            parents: rows,
-            candidates,
-        };
-        let continuation = candidate.compact(parent_columns).and_then(|candidate| {
-            file_with_plan(
-                &mut self.worklist,
-                &mut self.interner,
-                plan,
-                successor,
-                StateBucket::Candidates(candidate),
-                &mut self.stats,
-            )
-        });
-        DeltaSeedOutcome {
-            continuation,
-            publication: None,
-            active: None,
-            terminal_activations: Vec::new(),
-            completed_activation_ids: Vec::new(),
-            terminal_family: None,
-            seeded_parents,
-        }
-    }
-
     /// Converts one eligible proposer action into activation-owned cyclic
     /// work.
     fn seed_delta_proposal<'a>(
@@ -9904,17 +9599,6 @@ impl ResidualStateMachine {
         } else {
             selected_parent_count
         };
-        let complete_terminal_candidate = terminal_streaming
-            && admitted_parent_count > 1
-            && self.uses_eager_terminal_phase()
-            && route.completion == ProgramCompletion::CompleteActionEquivalent;
-        let complete_wide_candidate = !terminal_streaming
-            && self.width > 1
-            && self.terminal_demand_width > 1
-            && route.completion == ProgramCompletion::CompleteActionEquivalent;
-        // A semantic Program certificate and independent physical evidence
-        // jointly select this phase. Do not open sparse roots for the fresh
-        // admitted suffix when both agree.
         let SelectedResidualTask {
             state,
             desc,
@@ -9925,7 +9609,7 @@ impl ResidualStateMachine {
         };
         debug_assert_eq!(selected_parent_count, selected_rows.row_count);
         let first_admitted = selected_parent_count - admitted_parent_count;
-        if terminal_streaming && !complete_terminal_candidate {
+        if terminal_streaming {
             self.stats.delta_terminal_admissions += 1;
             self.stats.delta_terminal_admitted_parents += admitted_parent_count;
             self.stats.max_delta_terminal_admission_parents = self
@@ -9955,39 +9639,6 @@ impl ResidualStateMachine {
             unreachable!("terminal admission preserved proposal rows")
         };
         let direct_terminal_publication_full = self.direct_terminal_publication_full();
-        if complete_terminal_candidate {
-            return Ok(self.seed_complete_terminal_program_candidate(
-                spec,
-                program_request,
-                route,
-                state,
-                desc,
-                DeltaDesc::leaf(variable, proposer),
-                successor,
-                rows,
-                direct_terminal_publication_full,
-                plan,
-            ));
-        }
-        if complete_wide_candidate {
-            let capacity = self.width.max(1);
-            let completion = {
-                let affinity = ProgramCompleteAffinity::new(&rows);
-                let vars: Vec<VariableId> = program_request.bound.into_iter().collect();
-                let batch = ProgramCompleteBatch {
-                    request: program_request,
-                    route,
-                    view: rows_view(&vars, &rows.rows, rows.row_count),
-                };
-                spec.try_complete_bounded(batch, capacity, &affinity)
-                    .map(|completion| completion.into_parts_for(batch, &affinity, &rows))
-            };
-            if let Some(completion) = completion {
-                return Ok(self.finish_complete_program_candidate(
-                    state, desc, successor, rows, completion, plan,
-                ));
-            }
-        }
         self.stats.propose_action_pops += 1;
         self.stats.propose_calls += 1;
         self.stats.propose_rows += rows.row_count;
@@ -10624,13 +10275,6 @@ impl ResidualStateMachine {
         true
     }
 
-    fn uses_eager_terminal_phase(&self) -> bool {
-        #[cfg(test)]
-        return self.eager_terminal_phase_enabled;
-        #[cfg(not(test))]
-        true
-    }
-
     /// A cyclic seed inherits depth-first preference whenever the selected
     /// action transferred exactly one affine parent. That parent names the
     /// whole new activation even for Full and Readiness selections;
@@ -11119,8 +10763,6 @@ impl ResidualStateMachine {
             continuation_sprint_enabled: self.continuation_sprint_enabled,
             #[cfg(test)]
             direct_terminal_publication_enabled: self.direct_terminal_publication_enabled,
-            #[cfg(test)]
-            eager_terminal_phase_enabled: self.eager_terminal_phase_enabled,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
             terminal_demand_width: self.terminal_demand_width,
@@ -12451,7 +12093,6 @@ mod tests {
                     variable: self.0.variable,
                     stratum: ProgramStratum::Fixpoint,
                     grouping: ProgramGrouping::ParentAtomic,
-                    completion: ProgramCompletion::PageableOnly,
                 })
         }
 
@@ -12603,7 +12244,6 @@ mod tests {
                 variable: self.variable,
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
-                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -16960,23 +16600,6 @@ mod tests {
         assert!(tail.admit_set_tail_stable(1));
         assert_eq!(tail, [(0, raw(2)), (0, raw(1))]);
 
-        let mut forward = candidate_payload(
-            2,
-            vec![
-                (0, raw(1)),
-                (0, raw(2)),
-                (0, raw(1)),
-                (1, raw(1)),
-                (1, raw(1)),
-            ],
-        );
-        assert!(forward.admit_set_forward_stable(2));
-        assert_eq!(
-            forward,
-            [(0, raw(1)), (0, raw(2)), (1, raw(1))],
-            "equal values under distinct affine parents remain distinct"
-        );
-
         let mut deferred =
             deferred_candidate_payload(1, vec![(0, raw(1)), (0, raw(1)), (0, raw(2))]);
         let before = deferred.tagged_snapshot();
@@ -20355,54 +19978,10 @@ mod tests {
                 .all(Option::is_none),
             "a complete drain must leave no terminal yield sample live"
         );
-
-        // Eight distinct hidden parent identities carry the same path source.
-        // Action-boundary admission must retain all eight parents, the typed
-        // complete phase may cohort them, and explicit `(source, target)` SET
-        // projection still collapses the hidden discriminator.
-        let cohort_source = id_into_value(&nodes[0][0]);
-        let make_cohort = || {
-            let mut discriminators =
-                crate::debug::query::EstimateOverrideConstraint::new(FanoutLeaf {
-                    variable: 2,
-                    values: Arc::new((0..8).map(raw).collect()),
-                });
-            discriminators.set_estimate(2, 1);
-            IntersectionConstraint::new(vec![
-                Box::new(FanoutLeaf {
-                    variable: 0,
-                    values: Arc::new(vec![cohort_source]),
-                }) as ShapeConstraint,
-                Box::new(discriminators) as ShapeConstraint,
-                Box::new(make_path()) as ShapeConstraint,
-            ])
-        };
-        // One source in this fixture consumes exactly 68 transition work
-        // units, so this bound admits an exact two-parent cohort.
-        let mut eager_cohort = Query::new_projected(make_cohort(), [0, 1], project)
-            .solve_residual_state_lazy()
-            .collect_profiled();
-        let mut sparse_cohort =
-            Query::new_projected(make_cohort(), [0, 1], project).solve_residual_state_lazy();
-        sparse_cohort.state.eager_terminal_phase_enabled = false;
-        let mut sparse_cohort = sparse_cohort.collect_profiled();
-        eager_cohort.results.sort_unstable();
-        sparse_cohort.results.sort_unstable();
-        assert_eq!(eager_cohort.results, sparse_cohort.results);
-        assert_eq!(eager_cohort.results.len(), nodes[0].len());
-        assert!(
-            eager_cohort.stats.delta_terminal_eager_cohort_admissions > 0,
-            "relational RPQ never entered the complete Program phase"
-        );
-        assert_eq!(
-            sparse_cohort.stats.delta_terminal_eager_cohort_admissions,
-            0
-        );
-        assert!(sparse_cohort.stats.delta_terminal_calls > 0);
     }
 
     #[test]
-    fn typed_terminal_rpq_matches_sparse_and_ordinary_oracle_across_path_shapes() {
+    fn recurrent_terminal_rpq_matches_ordinary_oracle_across_path_shapes() {
         use crate::debug::query::EstimateOverrideConstraint;
         use crate::id::{id_into_value, ExclusiveId, Id};
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
@@ -20469,46 +20048,6 @@ mod tests {
             ])
         };
 
-        // Bound-endpoint Propose routes carry the family-owned exact-complete
-        // certificate through every ordinary constraint wrapper.
-        let capability_ops = [PathOp::Attr(p.raw()), PathOp::Plus];
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(2),
-            bound: VariableSet::new_singleton(0),
-        };
-        let boxed: Box<dyn Constraint<'static> + Send + Sync> =
-            Box::new(make_path(&capability_ops));
-        assert_eq!(
-            boxed
-                .residual_program()
-                .unwrap()
-                .route(request)
-                .unwrap()
-                .completion,
-            ProgramCompletion::CompleteActionEquivalent
-        );
-        let shared: Arc<dyn Constraint<'static> + Send + Sync> =
-            Arc::new(make_path(&capability_ops));
-        assert_eq!(
-            shared
-                .residual_program()
-                .unwrap()
-                .route(request)
-                .unwrap()
-                .completion,
-            ProgramCompletion::CompleteActionEquivalent
-        );
-        let estimated = EstimateOverrideConstraint::new(make_path(&capability_ops));
-        assert_eq!(
-            estimated
-                .residual_program()
-                .unwrap()
-                .route(request)
-                .unwrap()
-                .completion,
-            ProgramCompletion::CompleteActionEquivalent
-        );
-
         let cases = [
             ("nullable star", vec![PathOp::Attr(p.raw()), PathOp::Star]),
             (
@@ -20537,53 +20076,17 @@ mod tests {
             let mut typed = Query::new_projected(make(&ops), [0, 2], project)
                 .solve_residual_state_lazy()
                 .collect_profiled();
-            let mut sparse =
-                Query::new_projected(make(&ops), [0, 2], project).solve_residual_state_lazy();
-            sparse.state.eager_terminal_phase_enabled = false;
-            let mut sparse = sparse.collect_profiled();
 
             baseline.sort_unstable();
             typed.results.sort_unstable();
-            sparse.results.sort_unstable();
             assert_eq!(typed.results, baseline, "typed mismatch for {name}");
-            assert_eq!(sparse.results, baseline, "sparse mismatch for {name}");
-            assert!(
-                typed.stats.delta_terminal_eager_cohort_admissions > 0,
-                "{name} never entered the complete Program phase: {:#?}",
-                typed.stats
-            );
-            assert_eq!(
-                sparse.stats.delta_terminal_eager_cohort_admissions, 0,
-                "forced sparse control entered the eager phase for {name}"
-            );
 
             let expected = baseline.clone();
             let mut clone_source = Query::new_projected(Arc::new(make(&ops)), [0, 2], project)
                 .solve_residual_state_lazy();
-            let mut prefix = Vec::new();
-            let drained_before_phase = loop {
-                if clone_source.stats().delta_terminal_eager_cohort_admissions > 0 {
-                    break false;
-                }
-                let Some(result) = clone_source.next() else {
-                    break true;
-                };
-                prefix.push(result);
-            };
-            if drained_before_phase {
-                // Duplicate terminal occurrences used to keep public demand
-                // open long enough to guarantee a live post-admission clone
-                // point. SET projection can satisfy the complete result set
-                // first; the full-run assertion above still verifies that an
-                // unconstrained drain admits the eager Program cohort.
-                prefix.sort_unstable();
-                assert_eq!(prefix, expected, "pre-phase drain mismatch for {name}");
-                continue;
-            }
-            assert!(
-                clone_source.stats().delta_terminal_eager_cohort_admissions > 0,
-                "{name} clone oracle did not cross the complete Program phase"
-            );
+            let mut prefix = vec![clone_source
+                .next()
+                .expect("every RPQ fixture has at least one endpoint")];
             let mut clone = clone_source.clone();
             drop(clone_source);
             prefix.extend(clone.by_ref());

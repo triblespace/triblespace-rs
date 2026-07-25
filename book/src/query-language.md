@@ -481,10 +481,9 @@ methods are:
 | `satisfied` | Report exact truth once every relevant variable is bound. |
 
 Every constraint occurrence denotes one fixed raw-inline SET relation over the
-variables returned by `variables`. Its ordinary, paged, typed-Program, and
-complete-equivalent routes must agree on that relation. `estimate` supplies
-cost guidance only; it cannot change relevance, source eligibility, or query
-results.
+variables returned by `variables`. Its ordinary and typed-Program routes must
+agree on that relation. `estimate` supplies cost guidance only; it cannot
+change relevance, source eligibility, or query results.
 
 `proposal_coverage` is the structural source-eligibility receipt. It says
 whether `propose` makes no completeness claim for a target (`None`), covers

@@ -74,10 +74,10 @@ at `None`.
 
 Five laws are load-bearing for correctness:
 
-1. Ordinary, paged, typed-Program, and complete-equivalent routes must agree on
-   the same relation. Activation-local novelty keys exposed by an accelerated
-   route must be congruent for future outputs: equal keys cannot hide states
-   with different relational futures.
+1. Ordinary and typed-Program routes must agree on the same relation.
+   Activation-local novelty keys exposed by an accelerated route must be
+   congruent for future outputs: equal keys cannot hide states with different
+   relational futures.
 2. `propose` is always given an **empty** sink. A composite must preserve that
    ownership when delegating. In particular, each arm of a union proposes into
    its own empty buffer before the buffers are merged.
@@ -258,20 +258,16 @@ query starts no worklist at all. Production lowering flattens exposed
 associative AND regions, lowers finite Union leaves and their recursive
 AND/OR descendants into continuations, and admits the typed Program route
 returned for each exact action.
-Canonical single-shard SuccinctArchive Propose, Confirm, and Support routes are
-returned directly, so their pageable typed form participates in ordinary
-execution. Program retirement validates a wider activation receipt with
-one arena membership pass, avoiding the previous activation-count by arena-size
-multiplier while retaining cheap singleton and fully drained paths.
-UnionArchive returns typed Propose and Support routes and declines Confirm,
-which stays on the ordinary constraint action. Propose normally retains sparse,
-geometrically widened shard paging for low-demand and nonterminal work. A fresh multi-parent terminal
-cohort may instead use `CompleteActionEquivalent`, preserving the exact
-parent-major then shard-major raw occurrence bag until parent-local SET
-admission. Dense complete drains and bounded Succinct proposal pages consume
-the same already-located Ring walk. The WGPU Succinct wrapper accelerates
-ordinary confirmation rank batches directly; it does not install an alternate
-typed Program family.
+Finite storage relations, including SuccinctArchive and UnionArchive, remain
+on the ordinary constraint protocol; backend-specific rank kernels may still
+accelerate those ordinary actions. Repeated RPQ Propose, Confirm, and Support
+routes enter the typed Machine seam. Every fresh RPQ cohort—including a
+demand-wide terminal cohort—is seeded into affine activations and follows the
+same sparse, geometrically widened paging law. There is no separate
+whole-action drain phase. Program retirement validates a wider activation
+receipt with one arena membership pass, avoiding the previous
+activation-count by arena-size multiplier while retaining cheap singleton and
+fully drained paths.
 
 Ordinary [`Query`](triblespace::core::query::Query) iteration owns the residual
 cursor for every root. Its compiler policy is fixed: native AND flattening,

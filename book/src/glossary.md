@@ -66,8 +66,8 @@ interest. Selectors power history traversals such as `parents`,
 The trait that every query operator implements. Its five operational
 methods—`variables`, `estimate`, `propose`, `confirm`, and `satisfied`—let the
 Atreides solver navigate the search space without a separate planner. Every
-occurrence denotes one fixed raw-inline SET relation,
-shared by its ordinary, paged, typed-Program, and complete-equivalent routes.
+occurrence denotes one fixed raw-inline SET relation, shared by its ordinary
+and typed-Program routes.
 `proposal_coverage` identifies sound proposal sources. Estimates guide cost
 ordering and never change semantics. Custom data sources and application
 predicates participate in queries by implementing this trait.

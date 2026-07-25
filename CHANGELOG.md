@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: recurrent Programs have one geometric execution path.**
+  `ProgramCompletion`, complete batches, quotes, evidence, sinks, affinity
+  tokens, arbiters, and the complete-action trait/vtable hooks are removed.
+  Repeated RPQ proposals always seed affine Machine activations and advance
+  through the same sparse, geometrically widened pager, including demand-wide
+  terminal cohorts. Rank descent, activation-local novelty, and quiescence
+  barriers are unchanged.
 - **Breaking: typed Programs now erase exactly one semantic family and execute
   one native step.** The never-used `PreferredProgram` left-biased
   composition, route-arm addresses, generic physical-step negotiation,
@@ -25,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Repetition-free paths, free-endpoint FIRST selection, and partial support use
   the ordinary constraint actions. The finite transition-depth ranks, direct
   source/filter states, and finite support routes are removed; repeated
-  bound-endpoint proposals retain their bounded whole-fixpoint completion.
+  bound-endpoint proposals use the recurrent Machine pager.
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm
@@ -73,11 +80,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plan-local count array are removed: every production built-in supplied the
   same count for all of its variables, while every Ready state already computes
   fresh per-row estimates.
-- **RPQ complete actions now obey exact scheduler work bounds.** Bound-endpoint
-  graph-product traversal admits only a descending parent tail whose examined
-  transitions and distinct endpoint outputs fit the current grant; positive
-  PATCH branches preflight exact fanout, while negated branches remain
-  cursor-bounded.
 - **Ordinary Rayon query iteration now reuses the canonical residual
   producer.** A fresh `Query::into_par_iter()` moves directly into the
   residual iterator and its affine splitter instead of entering the removed
@@ -101,7 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   choices and checked-state transitions are unchanged.
 - **The `Constraint` protocol now has unconditional relational SET
   semantics.** Every occurrence denotes a fixed raw-inline relation shared by
-  its ordinary, paged, typed-Program, and complete-equivalent routes; the
+  its ordinary and typed-Program routes; the
   never-shipped `fixed_denotation` switch and parallel certified action methods
   are removed. Planning always uses `ProposalCoverage` for logical source
   eligibility, physical proposal multiplicity remains an execution detail, and
@@ -186,12 +188,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Canonical Succinct archive paging is selected directly.** Propose, Confirm,
   and Support routes participate in ordinary execution, keeping their typed
   paging and physical-backend seam available through the one plan.
-- **`UnionArchive` returns typed Propose and Support routes and declines
-  Confirm.** Ordinary execution keeps sparse, geometrically
-  widened paging for low-demand and nonterminal work. A fresh multi-parent
-  terminal Propose cohort may instead use its `CompleteActionEquivalent`
-  certificate, preserving the exact parent-major then shard-major raw
-  occurrence bag before parent-local SET admission.
+- **`UnionArchive` uses the ordinary relation protocol.** Propose, Confirm,
+  and Support preserve shard order and exact SET semantics without installing
+  finite Program activations.
 - **Specialized `UnionArchiveConstraint`s can now retain per-shard execution
   attachments.** `from_shards` accepts already-constructed Succinct archive
   constraints, validates their exact ordered entity/attribute/value terms, and
@@ -208,14 +207,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   random-rank classes; finite-formula actions, repeated-position Succinct
   targets, and multi-shard UnionArchive constraints remain on raw-cardinality
   estimates.
-- **Finite equality work and pointwise TribleSet checks stay on the ordinary
-  path, while TribleSet proposal cursors remain resumable.** Equality exposes
-  no typed Program. TribleSet declines typed Confirm and Support, so ordinary
-  execution uses their already bounded kernels.
-  TribleSet Propose remains pageable for low-demand
-  and high-fanout work. For multi-parent terminal cohorts, its exact complete
-  occurrence-bag certificate lets the geometrically widened scheduler drain a
-  batch without opening one Program activation per parent.
+- **Finite equality and TribleSet work stay on the ordinary path.** Equality
+  and TribleSet expose no typed Program; their direct proposal, confirmation,
+  and support kernels retain exact relation semantics without opening finite
+  activations.
 - **Hash-set and hash-map membership filters stay on the ordinary production
   residual path.** Their pointwise Confirm and Support work is already bounded
   by the scheduler's input page, so production execution does not expand each
@@ -396,13 +391,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   atomically; a resumed, negated, or oversized member preserves the existing
   pageable path for everyone. This recovers 2.4–2.5x on the measured mixed
   formula+RPQ cells without implying a general engine-wide speedup.
-- **Typed RPQ complete actions now drain the compiled product automaton
-  directly.** Bound-endpoint proposal cohorts use a parent-local
-  `(value, program-counter)` novelty set and direct PATCH transition pages for
-  finite and fixpoint paths, preserving nullable graph-term gating, inverse
-  traversal, endpoint distinctness, and duplicate outer parents without
-  opening a nested WCO frame. The conservative ordinary constraint evaluator
-  remains unchanged.
 - **Typed Program cohorts separate physical compatibility from activation
   identity.** Program buckets now own one pacing-sensitive selection law:
   Search pages retain LIFO order and may mix physically identical reducer
@@ -422,17 +410,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Search/Activation pacing keeps physical grants independent of family
   telemetry; terminal cohorts allocate and advance sparse grants per affine
   activation, so aggregate or truncated cohorts cannot manufacture widening.
-- **Demand-wide terminal RPQ admissions change execution regime without
-  disturbing live sparse traversals.** When completed-yield evidence admits
-  more than one new terminal parent in a turn, an action-specific Program route
-  certificate lets that fresh suffix run through the family's exact complete
-  proposal executor and publish full rows directly. The semantic certificate
-  is pure in the request and bound schema; the scheduler independently supplies
-  terminality, cohort width, and physical phase evidence. Per-parent receipts
-  are reserved only after the family call succeeds and share the delta
-  activation namespace without owning registry state or producer credit;
-  publication staging and immediate completion preserve exact zero-yield and
-  projected-yield accounting while existing activations remain sparse.
 - **Activation-indexed terminal delta buckets preserve affine cohort order
   without rescanning mixed work.** Ordinary and formula transition buckets
   remain contiguous vectors; terminal cohort selection lazily promotes only

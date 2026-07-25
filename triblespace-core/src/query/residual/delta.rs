@@ -1149,7 +1149,7 @@ enum DeltaReturn {
     Stable {
         desc: StateDesc,
         parent: Box<[RawInline]>,
-        /// The complete action result crosses from an occurrence bag into a
+        /// The cyclic action result crosses from an occurrence bag into a
         /// candidate continuation that may split or commit independently.
         /// Cyclic Confirm computes this receipt with the shared stable-state
         /// boundary predicate before opening graph traversal.
@@ -2308,29 +2308,6 @@ impl ProducerRegistry {
                 PositivePublicationRegistration::Eligible(ledger) => Some(ledger.clone()),
                 PositivePublicationRegistration::Private { .. } => None,
             })
-    }
-
-    /// Reserves query-local activation identities for a terminal cohort that
-    /// is evaluated eagerly instead of entering the sparse fixpoint machine.
-    ///
-    /// These are receipts, not activations: they deliberately have no
-    /// registry entry and mint no affine producer credit. Sharing the same
-    /// monotone namespace lets the outer projected-yield ledger treat eager
-    /// and sparse parents uniformly without manufacturing fake cyclic work.
-    fn reserve_terminal_receipts(&mut self, count: usize) -> Vec<ActivationId> {
-        let mut receipts = Vec::with_capacity(count);
-        for _ in 0..count {
-            let receipt = ActivationId(take_monotonic(
-                &mut self.state.next_activation,
-                "activation",
-            ));
-            debug_assert!(
-                !self.state.activations.contains_key(&receipt),
-                "eager terminal receipt unexpectedly owns a live activation"
-            );
-            receipts.push(receipt);
-        }
-        receipts
     }
 
     /// Creates one reducer activation before typed seed states are installed.
@@ -4743,17 +4720,6 @@ impl DeltaScheduler {
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
         }
-    }
-
-    /// Mints exact per-parent terminal receipts without filing sparse Program
-    /// work. The caller returns each identity as both an
-    /// admission registration and an immediate completion receipt.
-    pub(super) fn reserve_terminal_receipts(&mut self, count: usize) -> Vec<ActivationId> {
-        self.registry.reserve_terminal_receipts(count)
-    }
-
-    pub(super) fn receipt_has_live_activation(&self, receipt: ActivationId) -> bool {
-        self.registry.state.activations.contains_key(&receipt)
     }
 
     pub(super) fn grow_activation_width(&mut self) -> bool {
@@ -7703,7 +7669,6 @@ mod tests {
                 variable: 0,
                 stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
-                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -7806,7 +7771,6 @@ mod tests {
                 variable: 0,
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
-                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -8666,7 +8630,6 @@ mod tests {
                 variable: 0,
                 stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
-                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -10808,53 +10771,6 @@ mod tests {
     }
 
     #[test]
-    fn eager_receipts_and_sparse_activations_share_a_nonreusing_namespace() {
-        let mut registry = ProducerRegistry::new();
-
-        let receipts = registry.reserve_terminal_receipts(3);
-        assert_eq!(
-            receipts,
-            [
-                ActivationId::test(0),
-                ActivationId::test(1),
-                ActivationId::test(2),
-            ]
-        );
-        assert!(
-            receipts
-                .iter()
-                .all(|receipt| !registry.state.activations.contains_key(receipt)),
-            "eager receipts must not manufacture sparse registry state"
-        );
-
-        let sparse = registry.open_program_activation(
-            DeltaReducer::StreamProposal,
-            stable_return(Vec::new()),
-            None,
-            None,
-        );
-        let installed = registry.install_program_roots(
-            sparse,
-            [ProgramSeedWork {
-                parent: 0,
-                work: positive_test_work(0),
-                accepted: None,
-            }],
-        );
-        assert!(installed.quiescence.is_none());
-        assert_eq!(sparse, ActivationId::test(3));
-        assert!(registry.state.activations.contains_key(&sparse));
-        assert!(receipts
-            .iter()
-            .all(|receipt| !registry.state.activations.contains_key(receipt)));
-
-        assert_eq!(
-            registry.reserve_terminal_receipts(1),
-            [ActivationId::test(4)]
-        );
-    }
-
-    #[test]
     fn exact_confirm_replacement_publishes_b0_once_and_finalizes_g_minus_p() {
         let first = value(41);
         let later = value(42);
@@ -12991,7 +12907,6 @@ mod tests {
             variable: 0,
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
         };
         let state = scheduler
             .interner
@@ -13070,7 +12985,6 @@ mod tests {
             variable: 0,
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
         };
         scheduler
             .interner
@@ -13281,7 +13195,6 @@ mod tests {
             variable: 0,
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
         };
         let active_state = scheduler
             .interner
@@ -13735,7 +13648,6 @@ mod tests {
                 variable: 0,
                 stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
-                completion: ProgramCompletion::PageableOnly,
             })
         }
 
@@ -14669,7 +14581,6 @@ mod tests {
             variable: 0,
             stratum: ProgramStratum::Fixpoint,
             grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
         };
         let state = scheduler
             .interner
