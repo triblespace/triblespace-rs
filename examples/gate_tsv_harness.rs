@@ -680,6 +680,29 @@ fn main() {
 
     let fixture = Fixture::new(component_count, ring_size, fanout);
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
+    if std::env::var_os("STATS_FINITE").is_some() {
+        let mut query =
+            finite_union_query!(&fixture.graph, &fixture).solve_residual_state_lazy();
+        let started = Instant::now();
+        let first = query.next();
+        eprintln!(
+            "STATS_FINITE first={} elapsed={:?} width={}\n{:#?}",
+            first.is_some(),
+            started.elapsed(),
+            query.current_width(),
+            query.stats()
+        );
+        let mut rows = usize::from(first.is_some());
+        rows += query.by_ref().count();
+        eprintln!(
+            "STATS_FINITE full rows={rows} elapsed={:?} width={}\n{:#?}",
+            started.elapsed(),
+            query.current_width(),
+            query.stats()
+        );
+        drop(archive);
+        return;
+    }
     if std::env::var_os("TRACE_MIXED_FIRST").is_some() {
         let started = Instant::now();
         let first = mixed_formula_rpq_query!(&fixture.graph, &fixture).next();
