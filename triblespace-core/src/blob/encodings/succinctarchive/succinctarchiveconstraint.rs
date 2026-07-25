@@ -507,7 +507,6 @@ enum LocatedProposalHead<'a> {
     Domain {
         prefix: &'a BitVector<Rank9SelIndex>,
         code_range: Range<usize>,
-        len: usize,
     },
     /// The middle component of a fixed-first rotation. `changed_pair` has one
     /// bit per distinct `(first, middle)` pair, so this indexed driver is
@@ -540,20 +539,6 @@ impl<U> LocatedProposalWalk<'_, U>
 where
     U: Universe,
 {
-    /// Exact values examined by an unbounded consumption of this already
-    /// located head. The count and consumer share one navigation object, so
-    /// complete-action quotes cannot drift onto a parallel estimator path.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn exact_len(&self) -> usize {
-        match &self.head {
-            LocatedProposalHead::Domain { len, .. } | LocatedProposalHead::Middle { len, .. } => {
-                *len
-            }
-            LocatedProposalHead::Last { range, .. } => range.len(),
-        }
-    }
-
     /// Consume this already-located ordered walk. `Start` plus an unbounded
     /// budget is the dense proposal; a finite budget plus `After(value)` is
     /// its bounded infix. Both feed the caller's sink directly.
@@ -612,39 +597,6 @@ where
     }
 }
 
-/// One block-schema specialization for locating single-target proposal walks.
-///
-/// [`Positions`] contains only target flags and column/constant sources, so it
-/// is invariant across every row of a [`RowsView`]. Physical wrappers that
-/// need parent-major traversal can build this locator once, then locate each
-/// row without repeating variable-to-column resolution.
-pub(crate) struct ProposalWalkLocator<'a, U>
-where
-    U: Universe,
-{
-    constraint: SuccinctArchiveConstraint<'a, U>,
-    positions: Positions,
-    row_width: usize,
-}
-
-impl<'a, U> ProposalWalkLocator<'a, U>
-where
-    U: Universe,
-{
-    /// Locate one row's ordered Ring walk using the already-resolved block
-    /// schema. The resulting walk owns no borrow of the row or this locator.
-    pub(crate) fn locate(&self, row: &[RawInline]) -> LocatedProposalWalk<'a, U> {
-        assert_eq!(
-            row.len(),
-            self.row_width,
-            "Succinct proposal row disagrees with its locator schema"
-        );
-        self.constraint
-            .located_proposal_walk(&self.positions, row)
-            .expect("single-target Succinct proposal locator lost its walk")
-    }
-}
-
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -660,17 +612,12 @@ where
         }
     }
 
-    fn domain_walk(
-        &self,
-        prefix: &'a BitVector<Rank9SelIndex>,
-        len: usize,
-    ) -> LocatedProposalWalk<'a, U> {
+    fn domain_walk(&self, prefix: &'a BitVector<Rank9SelIndex>) -> LocatedProposalWalk<'a, U> {
         LocatedProposalWalk {
             archive: self.archive,
             head: LocatedProposalHead::Domain {
                 prefix,
                 code_range: 0..self.archive.domain.len(),
-                len,
             },
         }
     }
@@ -731,15 +678,9 @@ where
         let v_bound = p.v(row);
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => {
-                self.domain_walk(&self.archive.e_a, self.archive.entity_count)
-            }
-            (None, None, None, false, true, false) => {
-                self.domain_walk(&self.archive.a_a, self.archive.attribute_count)
-            }
-            (None, None, None, false, false, true) => {
-                self.domain_walk(&self.archive.v_a, self.archive.value_count)
-            }
+            (None, None, None, true, false, false) => self.domain_walk(&self.archive.e_a),
+            (None, None, None, false, true, false) => self.domain_walk(&self.archive.a_a),
+            (None, None, None, false, false, true) => self.domain_walk(&self.archive.v_a),
             (Some(e), None, None, false, true, false) => self.middle_walk(
                 &self.archive.changed_e_a,
                 base_range(&self.archive.domain, &self.archive.e_a, e),
@@ -1159,73 +1100,6 @@ where
         self.located_proposal_walk(p, row)
             .expect("single-target Succinct proposal has an ordered walk")
             .consume(cursor, limit, |value| accepted.push(value))
-    }
-
-    /// Returns the already-located ordered walk for a one-parent,
-    /// single-position target. Physical wrappers such as a union may consume
-    /// this directly into their own SET-admission sink without materialising a
-    /// per-shard vector. Repeated-position targets keep their filtered source
-    /// path and return `None` here.
-    pub(crate) fn proposal_walk_single_target(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> Option<LocatedProposalWalk<'a, U>> {
-        if view.len() != 1 {
-            return None;
-        }
-        self.proposal_walk_locator_single_target(variable, view)
-            .map(|locator| locator.locate(view.row(0)))
-    }
-
-    /// Resolve one single-target proposal schema for every row in `view`.
-    /// Row values are deliberately absent from this object; [`locate`](ProposalWalkLocator::locate)
-    /// supplies them later while preserving the shared column layout.
-    pub(crate) fn proposal_walk_locator_single_target(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-    ) -> Option<ProposalWalkLocator<'a, U>> {
-        if view.col(variable).is_some() {
-            return None;
-        }
-        let positions = self.positions(variable, view);
-        if positions.target_count() != 1 {
-            return None;
-        }
-        Some(ProposalWalkLocator {
-            constraint: *self,
-            positions,
-            row_width: view.stride(),
-        })
-    }
-
-    /// Exact single-parent proposal page used by physical wrappers that own
-    /// their own typed continuation. Unlike the optional erased capability,
-    /// this entry point cannot decline after a wrapper route has been chosen.
-    pub(crate) fn proposal_source_page_single(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
-        if let Some(walk) = self.proposal_walk_single_target(variable, view) {
-            return walk.consume(cursor, limit, |value| accepted.push(value));
-        }
-        assert_eq!(view.len(), 1, "Succinct proposal pages have one parent");
-        assert!(
-            view.col(variable).is_none(),
-            "Succinct proposal target is already bound"
-        );
-        let positions = self.positions(variable, view);
-        assert_ne!(
-            positions.target_count(),
-            0,
-            "Succinct proposal target is absent"
-        );
-        self.proposal_source_page_row(&positions, view.row(0), cursor, limit, accepted)
     }
 }
 
@@ -1981,187 +1855,39 @@ mod typed_program_tests {
         assert_eq!(empty_page.next, None);
     }
 
-    fn assert_dense_equals_bounded<U>(
+    fn assert_ordinary_propose_matches_oracle<'a, U, O>(
         label: &str,
-        constraint: &SuccinctArchiveConstraint<'_, U>,
-        variable: VariableId,
-        view: RowsView<'_>,
-        expected: &[RawInline],
-    ) where
-        U: Universe,
-    {
-        assert_eq!(view.len(), 1, "{label}: test view must have one row");
-        let positions = constraint.positions(variable, &view);
-        assert_eq!(
-            positions.target_count(),
-            1,
-            "{label}: test shape must have one target position"
-        );
-
-        let mut dense = Vec::new();
-        constraint.propose_row(&positions, view.row(0), &mut |value| dense.push(value));
-        assert_eq!(dense, expected, "{label}: dense Ring order");
-
-        let n = expected.len();
-        let mut limits = vec![1, n.saturating_sub(1).max(1), n.max(1), n + 1, usize::MAX];
-        limits.sort_unstable();
-        limits.dedup();
-        for limit in limits {
-            let mut cursor = ResidualDeltaSourceCursor::Start;
-            let mut bounded = Vec::new();
-            let mut examined = 0usize;
-            loop {
-                let page = constraint.proposal_source_page_row(
-                    &positions,
-                    view.row(0),
-                    cursor,
-                    limit,
-                    &mut bounded,
-                );
-                assert!(page.examined <= limit, "{label}: page exceeds demand");
-                examined += page.examined;
-                let Some(next) = page.next else {
-                    break;
-                };
-                assert!(
-                    page.examined > 0,
-                    "{label}: a live continuation must make progress"
-                );
-                cursor = next;
-            }
-            assert_eq!(
-                bounded, dense,
-                "{label}: bounded concatenation at limit {limit}"
-            );
-            assert_eq!(
-                examined,
-                dense.len(),
-                "{label}: every logical candidate is examined once"
-            );
-        }
-    }
-
-    fn assert_ordinary_propose_equals_full_walks<U>(
-        label: &str,
-        constraint: &SuccinctArchiveConstraint<'_, U>,
+        constraint: &SuccinctArchiveConstraint<'a, U>,
+        oracle: &O,
         variable: VariableId,
         view: RowsView<'_>,
     ) where
         U: Universe,
+        O: Constraint<'a>,
     {
-        let mut ordinary = Candidates::new();
+        let mut actual = Candidates::new();
         Constraint::propose(
             constraint,
             variable,
             &view,
-            &mut CandidateSink::Tagged(&mut ordinary),
+            &mut CandidateSink::Tagged(&mut actual),
         );
-
-        let mut walked = Candidates::new();
-        let locator = constraint
-            .proposal_walk_locator_single_target(variable, &view)
-            .expect("test shape must have one target position");
-        for parent in 0..view.len() {
-            let walk = locator.locate(view.row(parent));
-            let exact_len = walk.exact_len();
-            let mut emitted = 0usize;
-            let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
-                emitted += 1;
-                walked.push((parent as u32, value));
-            });
-            assert_eq!(page.examined, emitted, "{label}: full walk accounting");
-            assert_eq!(exact_len, emitted, "{label}: located exact length");
-            assert_eq!(page.next, None, "{label}: full walk must drain");
-        }
-
+        let mut expected = Candidates::new();
+        Constraint::propose(
+            oracle,
+            variable,
+            &view,
+            &mut CandidateSink::Tagged(&mut expected),
+        );
+        actual.sort_unstable();
+        expected.sort_unstable();
         assert_eq!(
-            walked, ordinary,
-            "{label}: full located walks must preserve ordinary tagged propose"
+            actual, expected,
+            "{label}: ordinary Succinct proposal disagrees with TribleSet"
         );
     }
-
     #[test]
-    fn located_walk_dense_and_bounded_match_for_all_single_target_shapes() {
-        let entities: Vec<_> = (1..=4).map(id_value).collect();
-        let attributes: Vec<_> = (11..=14).map(id_value).collect();
-        let values: Vec<_> = (21..=24).map(inline_value).collect();
-        let set: TribleSet = (1..=4)
-            .flat_map(|entity| {
-                (11..=14).flat_map(move |attribute| {
-                    (21..=24).map(move |value| trible(entity, attribute, inline_value(value)))
-                })
-            })
-            .collect();
-        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-        let e = Variable::<GenId>::new(0);
-        let a = Variable::<GenId>::new(1);
-        let v = Variable::<UnknownInline>::new(2);
-        let constraint = SuccinctArchiveConstraint::new(e, a, v, &archive);
-
-        // Three top-level domain walks.
-        assert_dense_equals_bounded("domain E", &constraint, e.index, RowsView::EMPTY, &entities);
-        assert_dense_equals_bounded(
-            "domain A",
-            &constraint,
-            a.index,
-            RowsView::EMPTY,
-            &attributes,
-        );
-        assert_dense_equals_bounded("domain V", &constraint, v.index, RowsView::EMPTY, &values);
-
-        // Six fixed-first middle walks, one through every Ring rotation.
-        let e_vars = [e.index];
-        let e_rows = [entities[0]];
-        let e_view = RowsView::new(&e_vars, &e_rows);
-        assert_dense_equals_bounded("middle EAV", &constraint, a.index, e_view, &attributes);
-        assert_dense_equals_bounded("middle EVA", &constraint, v.index, e_view, &values);
-
-        let a_vars = [a.index];
-        let a_rows = [attributes[0]];
-        let a_view = RowsView::new(&a_vars, &a_rows);
-        assert_dense_equals_bounded("middle AEV", &constraint, e.index, a_view, &entities);
-        assert_dense_equals_bounded("middle AVE", &constraint, v.index, a_view, &values);
-
-        let v_vars = [v.index];
-        let v_rows = [values[0]];
-        let v_view = RowsView::new(&v_vars, &v_rows);
-        assert_dense_equals_bounded("middle VEA", &constraint, e.index, v_view, &entities);
-        assert_dense_equals_bounded("middle VAE", &constraint, a.index, v_view, &attributes);
-
-        // Three fixed-pair last walks use their structurally unique ranges.
-        let av_vars = [a.index, v.index];
-        let av_rows = [attributes[0], values[0]];
-        assert_dense_equals_bounded(
-            "last VAE",
-            &constraint,
-            e.index,
-            RowsView::new(&av_vars, &av_rows),
-            &entities,
-        );
-
-        let ev_vars = [e.index, v.index];
-        let ev_rows = [entities[0], values[0]];
-        assert_dense_equals_bounded(
-            "last VEA",
-            &constraint,
-            a.index,
-            RowsView::new(&ev_vars, &ev_rows),
-            &attributes,
-        );
-
-        let ea_vars = [e.index, a.index];
-        let ea_rows = [entities[0], attributes[0]];
-        assert_dense_equals_bounded(
-            "last AEV",
-            &constraint,
-            v.index,
-            RowsView::new(&ea_vars, &ea_rows),
-            &values,
-        );
-    }
-
-    #[test]
-    fn ordinary_propose_matches_full_attached_walks_for_all_single_target_shapes() {
+    fn ordinary_propose_matches_tribleset_for_all_single_target_shapes() {
         struct PanicRingBatch;
 
         impl RingBatchQuery for PanicRingBatch {
@@ -2189,58 +1915,62 @@ mod typed_program_tests {
         let e = Variable::<GenId>::new(0);
         let a = Variable::<GenId>::new(1);
         let v = Variable::<UnknownInline>::new(2);
+        let oracle = set.pattern(e, a, v);
         let ring_batch = PanicRingBatch;
         let constraint = SuccinctArchiveConstraint::with_ring_batch(e, a, v, &archive, &ring_batch);
 
-        // Three top-level domain walks over two explicit empty bindings.
+        // Three top-level domains over two explicit empty bindings.
         let seeds = RowsView::new_with_row_count(&[], &[], 2);
-        assert_ordinary_propose_equals_full_walks("domain E", &constraint, e.index, seeds);
-        assert_ordinary_propose_equals_full_walks("domain A", &constraint, a.index, seeds);
-        assert_ordinary_propose_equals_full_walks("domain V", &constraint, v.index, seeds);
+        assert_ordinary_propose_matches_oracle("domain E", &constraint, &oracle, e.index, seeds);
+        assert_ordinary_propose_matches_oracle("domain A", &constraint, &oracle, a.index, seeds);
+        assert_ordinary_propose_matches_oracle("domain V", &constraint, &oracle, v.index, seeds);
 
-        // Six middle walks, each with two independently located parent rows.
+        // Six middle shapes, each with two independent parent rows.
         let e_vars = [e.index];
         let e_rows = [entities[0], entities[1]];
         let e_view = RowsView::new(&e_vars, &e_rows);
-        assert_ordinary_propose_equals_full_walks("middle EAV", &constraint, a.index, e_view);
-        assert_ordinary_propose_equals_full_walks("middle EVA", &constraint, v.index, e_view);
+        assert_ordinary_propose_matches_oracle("middle EAV", &constraint, &oracle, a.index, e_view);
+        assert_ordinary_propose_matches_oracle("middle EVA", &constraint, &oracle, v.index, e_view);
 
         let a_vars = [a.index];
         let a_rows = [attributes[0], attributes[1]];
         let a_view = RowsView::new(&a_vars, &a_rows);
-        assert_ordinary_propose_equals_full_walks("middle AEV", &constraint, e.index, a_view);
-        assert_ordinary_propose_equals_full_walks("middle AVE", &constraint, v.index, a_view);
+        assert_ordinary_propose_matches_oracle("middle AEV", &constraint, &oracle, e.index, a_view);
+        assert_ordinary_propose_matches_oracle("middle AVE", &constraint, &oracle, v.index, a_view);
 
         let v_vars = [v.index];
         let v_rows = [values[0], values[1]];
         let v_view = RowsView::new(&v_vars, &v_rows);
-        assert_ordinary_propose_equals_full_walks("middle VEA", &constraint, e.index, v_view);
-        assert_ordinary_propose_equals_full_walks("middle VAE", &constraint, a.index, v_view);
+        assert_ordinary_propose_matches_oracle("middle VEA", &constraint, &oracle, e.index, v_view);
+        assert_ordinary_propose_matches_oracle("middle VAE", &constraint, &oracle, a.index, v_view);
 
-        // Three last walks with two different fixed pairs apiece.
+        // Three last-position shapes with two different fixed pairs apiece.
         let av_vars = [a.index, v.index];
         let av_rows = [attributes[0], values[0], attributes[1], values[1]];
-        assert_ordinary_propose_equals_full_walks(
+        assert_ordinary_propose_matches_oracle(
             "last VAE",
             &constraint,
+            &oracle,
             e.index,
             RowsView::new(&av_vars, &av_rows),
         );
 
         let ev_vars = [e.index, v.index];
         let ev_rows = [entities[0], values[0], entities[1], values[1]];
-        assert_ordinary_propose_equals_full_walks(
+        assert_ordinary_propose_matches_oracle(
             "last VEA",
             &constraint,
+            &oracle,
             a.index,
             RowsView::new(&ev_vars, &ev_rows),
         );
 
         let ea_vars = [e.index, a.index];
         let ea_rows = [entities[0], attributes[0], entities[1], attributes[1]];
-        assert_ordinary_propose_equals_full_walks(
+        assert_ordinary_propose_matches_oracle(
             "last AEV",
             &constraint,
+            &oracle,
             v.index,
             RowsView::new(&ea_vars, &ea_rows),
         );
