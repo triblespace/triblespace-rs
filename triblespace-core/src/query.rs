@@ -63,13 +63,13 @@ pub(crate) use program::ProgramCompleteAffinity;
 pub use program::ProgramCompleteEffects;
 #[doc(hidden)]
 pub use program::{
-    DispatchClass, PreferredProgram, ProgramAction, ProgramActivation, ProgramBatch,
-    ProgramBatchEffects, ProgramChild, ProgramCompleteBatch, ProgramCompleteWorkEvidence,
-    ProgramCompleteWorkQuote, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing,
-    ProgramPage, ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume, ProgramRoute,
-    ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork, ProgramStratum,
-    ProgramWork, ProgramWorkHandle, TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
+    DispatchClass, ProgramAction, ProgramActivation, ProgramBatch, ProgramBatchEffects,
+    ProgramChild, ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote,
+    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramPage, ProgramRef,
+    ProgramRequest, ProgramResume, ProgramRoute, ProgramRuntime, ProgramSeedBatch,
+    ProgramSeedEffects, ProgramSeedWork, ProgramStratum, ProgramWork, ProgramWorkHandle,
+    TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink,
 };
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;

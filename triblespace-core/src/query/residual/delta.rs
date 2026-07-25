@@ -6974,13 +6974,8 @@ impl DeltaScheduler {
         let mut max_transition_cohort = scratch.receipt.transition_pages;
         let mut transition_pages = scratch.receipt.transition_pages;
         let mut transition_examined = scratch.receipt.transition_examined;
-        let mut placement_granted_work = scratch
-            .receipt
-            .placement
-            .map(|_| limits.iter().sum::<usize>());
         while receipt_local_fusion && total_examined < limits[0] {
-            let exact_tail = scratch.receipt.placement.is_none()
-                && scratch.receipt.pages.len() == 1
+            let exact_tail = scratch.receipt.pages.len() == 1
                 && scratch.receipt.pages[0].examined > 0
                 && scratch.receipt.pages[0].resume.is_none()
                 && scratch.receipt.children.len() == 1
@@ -7050,9 +7045,6 @@ impl DeltaScheduler {
                 max_transition_cohort.max(scratch.fused_receipt.transition_pages);
             transition_pages += scratch.fused_receipt.transition_pages;
             transition_examined += scratch.fused_receipt.transition_examined;
-            if scratch.fused_receipt.placement.is_some() {
-                placement_granted_work = Some(remaining);
-            }
             std::mem::swap(&mut scratch.receipt, &mut scratch.fused_receipt);
             scratch.fused_receipt.clear();
             fused_steps += 1;
@@ -7099,21 +7091,6 @@ impl DeltaScheduler {
             "program support observation",
             &mut scratch.supported_ranges,
         );
-
-        // Placement is observation only. Static executor labels deliberately
-        // stay out of the ordinary hot-path aggregate and never feed dispatch.
-        if scratch.receipt.placement.is_some() {
-            let granted_work =
-                placement_granted_work.expect("non-Native Program placement lost its exact grant");
-            stats.delta_program_physical_cohorts += 1;
-            stats.delta_program_physical_rows += row_count;
-            stats.delta_program_physical_granted_work += granted_work;
-            stats.max_delta_program_physical_cohort =
-                stats.max_delta_program_physical_cohort.max(row_count);
-            stats.max_delta_program_physical_granted_work = stats
-                .max_delta_program_physical_granted_work
-                .max(granted_work);
-        }
 
         // Source/transition naming remains family-reported telemetry; it is
         // never consulted for dispatch, novelty, or replacement semantics.
@@ -8666,7 +8643,6 @@ mod tests {
         DuplicateChronology,
         DuplicateDeadTail,
         TransitionThenSourceDead,
-        PhysicalBoundary,
         ZeroExaminedChild,
     }
 
@@ -8704,7 +8680,6 @@ mod tests {
                 | ReceiptProbeMode::DuplicateChronology
                 | ReceiptProbeMode::DuplicateDeadTail
                 | ReceiptProbeMode::TransitionThenSourceDead
-                | ReceiptProbeMode::PhysicalBoundary
                 | ReceiptProbeMode::ZeroExaminedChild => 0,
             };
             DispatchClass::new(class)
@@ -8818,8 +8793,7 @@ mod tests {
                         ReceiptProbeMode::Linear
                         | ReceiptProbeMode::EffectBoundary
                         | ReceiptProbeMode::ImmediateBoundary
-                        | ReceiptProbeMode::AlternatingDispatch
-                        | ReceiptProbeMode::PhysicalBoundary,
+                        | ReceiptProbeMode::AlternatingDispatch,
                         remaining,
                     ) => {
                         let next = remaining - 1;
@@ -8849,29 +8823,6 @@ mod tests {
                     }
                 }
             }
-        }
-
-        fn try_step_physical(
-            &self,
-            states: &[Self::State],
-            batch: TypedProgramBatch<'_>,
-            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) -> Option<ProgramPhysicalReceipt> {
-            if self.mode != ReceiptProbeMode::PhysicalBoundary
-                || !matches!(states, [ReceiptProbeState(1)])
-            {
-                return None;
-            }
-            assert_eq!(batch.limits.len(), 1);
-            assert!(batch.limits[0] >= 1);
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            effects.fixpoint_child(0, ReceiptProbeState(0), 0, Some(value(1)));
-            effects.account_transition(1);
-            effects.page(1, None);
-            Some(ProgramPhysicalReceipt::new(
-                "receipt-probe-physical",
-                "placement-boundary",
-            ))
         }
     }
 
@@ -9287,56 +9238,6 @@ mod tests {
         assert_eq!(original.stats, cloned.stats);
         assert_eq!(original.stats.candidates_proposed, 7);
         assert_eq!(original.stats.delta_transition_candidates_examined, 7);
-    }
-
-    #[test]
-    fn receipt_local_program_chain_stops_at_a_physical_placement_boundary() {
-        let mut probe = ReceiptProbeHarness::new(ReceiptProbeMode::PhysicalBoundary, 3);
-        let placement = probe.step(4);
-        let active = placement
-            .resume
-            .expect("the placement page's child must remain scheduled");
-
-        assert_eq!(placement.status, ActiveDeltaStatus::Yielded);
-        assert_eq!(probe.root.calls.load(Ordering::Relaxed), 3);
-        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 2);
-        assert_eq!(probe.stats.delta_program_receipt_local_refiles_avoided, 2);
-        assert_eq!(probe.stats.max_delta_program_receipt_local_chain, 3);
-        assert_eq!(probe.stats.delta_program_physical_cohorts, 1);
-        assert_eq!(probe.stats.delta_program_physical_rows, 1);
-        assert_eq!(probe.stats.delta_program_physical_granted_work, 2);
-        assert_eq!(probe.stats.max_delta_program_physical_cohort, 1);
-        assert_eq!(probe.stats.max_delta_program_physical_granted_work, 2);
-        assert_eq!(probe.stats.delta_transition_pages, 3);
-        assert_eq!(probe.stats.delta_transition_cohorts, 3);
-        assert_eq!(probe.stats.delta_transition_candidates_examined, 3);
-        assert!(probe.scheduler.has_active_program(active));
-        let tasks = &probe.scheduler.program_worklist[&active.state].tasks;
-        assert_eq!(tasks.len(), 1);
-        assert!(probe
-            .scheduler
-            .registry
-            .program_credit_is_unjoined_unique(&tasks[0].credit));
-        assert_eq!(
-            probe.stable_candidate_values(),
-            [value(3), value(2), value(1)]
-        );
-
-        let finished = probe.step(1);
-        assert_eq!(finished.status, ActiveDeltaStatus::Quiescent);
-        assert!(finished.resume.is_none());
-        assert!(probe.scheduler.is_empty());
-        assert_eq!(probe.root.calls.load(Ordering::Relaxed), 4);
-        assert_eq!(probe.stats.delta_program_receipt_local_fused_steps, 2);
-        assert_eq!(probe.stats.delta_program_physical_cohorts, 1);
-        assert_eq!(probe.stats.delta_program_physical_granted_work, 2);
-        assert_eq!(probe.stats.delta_transition_pages, 3);
-        assert_eq!(probe.stats.delta_transition_candidates_examined, 3);
-        assert_eq!(probe.stats.candidates_proposed, 3);
-        assert_eq!(
-            probe.stable_candidate_values(),
-            [value(3), value(2), value(1)]
-        );
     }
 
     #[test]
@@ -10129,7 +10030,6 @@ mod tests {
         assert_eq!(stats.delta_transition_candidates_examined, 0);
         assert_eq!(stats.delta_source_pages, 0);
         assert_eq!(stats.delta_transition_pages, 0);
-        assert_eq!(stats.delta_program_physical_cohorts, 0);
     }
 
     #[test]
@@ -13799,7 +13699,6 @@ mod tests {
     #[derive(Clone)]
     struct OneShotConfirmProgram {
         novelty_drops: Arc<AtomicUsize>,
-        physical: bool,
     }
 
     impl OneShotConfirmProgram {
@@ -13874,20 +13773,6 @@ mod tests {
         ) {
             self.fill_step(&states, batch, effects);
         }
-
-        fn try_step_physical(
-            &self,
-            states: &[Self::State],
-            batch: TypedProgramBatch<'_>,
-            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) -> Option<ProgramPhysicalReceipt> {
-            if !self.physical {
-                return None;
-            }
-            let placement = ProgramPhysicalReceipt::new("test-physical", "one-shot-confirm");
-            self.fill_step(states, batch, effects);
-            Some(placement)
-        }
     }
 
     impl Constraint<'static> for OneShotConfirmProgram {
@@ -13936,7 +13821,6 @@ mod tests {
         let novelty_drops = Arc::new(AtomicUsize::new(0));
         let root = OneShotConfirmProgram {
             novelty_drops: Arc::clone(&novelty_drops),
-            physical: false,
         };
         let plan = ResidualPlan::compile_production(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
@@ -14151,11 +14035,6 @@ mod tests {
         assert_eq!(stats.delta_transition_cohorts, 1);
         assert_eq!(stats.max_delta_transition_cohort, 2);
         assert_eq!(stats.delta_transition_dead_pages, 0);
-        assert_eq!(stats.delta_program_physical_cohorts, 0);
-        assert_eq!(stats.delta_program_physical_rows, 0);
-        assert_eq!(stats.delta_program_physical_granted_work, 0);
-        assert_eq!(stats.max_delta_program_physical_cohort, 0);
-        assert_eq!(stats.max_delta_program_physical_granted_work, 0);
     }
 
     #[test]
@@ -14600,10 +14479,7 @@ mod tests {
     #[test]
     fn active_program_confirm_retargets_exactly_to_the_engine_finalizer() {
         let novelty_drops = Arc::new(AtomicUsize::new(0));
-        let root = OneShotConfirmProgram {
-            novelty_drops,
-            physical: false,
-        };
+        let root = OneShotConfirmProgram { novelty_drops };
         let plan = ResidualPlan::compile_production(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let successor = StateDesc {
@@ -14692,87 +14568,6 @@ mod tests {
             graph_telemetry
         );
         assert!(!scheduler.registry.is_live(old.activation));
-    }
-
-    #[test]
-    fn physical_program_placement_stats_count_exact_cohort_geometry() {
-        let novelty_drops = Arc::new(AtomicUsize::new(0));
-        let root = OneShotConfirmProgram {
-            novelty_drops,
-            physical: true,
-        };
-        let plan = ResidualPlan::compile_production(&root);
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let successor = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Candidate {
-                variable: 0,
-                relevant: relevant.clone(),
-                checked: relevant,
-            },
-        };
-        let request = ProgramRequest {
-            action: ProgramAction::Confirm(0),
-            bound: VariableSet::new_empty(),
-        };
-        let spec = root.residual_program().unwrap();
-        let route = spec.route(request).unwrap();
-        let mut scheduler = DeltaScheduler::new();
-        scheduler.activation_width = 2;
-        scheduler
-            .seed_program_confirms(
-                spec,
-                DeltaDesc::leaf(0, 0),
-                request,
-                route,
-                successor,
-                false,
-                CandidateBatch {
-                    parents: RowBatch {
-                        rows: Vec::new(),
-                        row_count: 2,
-                    },
-                    candidates: CandidatePayload::Tagged(vec![(0, value(7)), (1, value(8))]),
-                },
-                None,
-                &mut ResidualStateStats::default(),
-            )
-            .active
-            .expect("both Confirm parents must seed one live Program root");
-
-        let mut stable = Worklist::new();
-        let mut stable_interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let graph = scheduler.step_bounded(
-            &root,
-            &plan,
-            8,
-            None,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-
-        assert_eq!(graph.completed_activations, 0);
-        assert_eq!(stats.delta_program_physical_cohorts, 1);
-        assert_eq!(stats.delta_program_physical_rows, 2);
-        assert_eq!(stats.delta_program_physical_granted_work, 8);
-        assert_eq!(stats.max_delta_program_physical_cohort, 2);
-        assert_eq!(stats.max_delta_program_physical_granted_work, 8);
-
-        let finalized = scheduler.step_bounded(
-            &root,
-            &plan,
-            8,
-            None,
-            &mut stable,
-            &mut stable_interner,
-            &mut stats,
-        );
-        assert_eq!(finalized.completed_activations, 2);
-        assert_eq!(stats.delta_program_physical_cohorts, 1);
-        assert_eq!(stats.delta_program_physical_rows, 2);
-        assert_eq!(stats.delta_program_physical_granted_work, 8);
     }
 
     #[test]

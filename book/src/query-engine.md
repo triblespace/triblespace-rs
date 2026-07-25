@@ -233,8 +233,11 @@ published an earlier seed effect.
 Paged product states cross one block-native typed Program seam. The erased
 batch carries row-aligned opaque work handles, immutable parent context, and
 ragged limits whose sum is the current global width; typed effects return with
-input tags. Storage and accelerator implementations may fuse a cohort without
-changing canonical state, novelty, rank, or producer-credit semantics.
+input tags. Each `ProgramRef` names one semantic family and every page enters
+that family's native typed step. Storage-specific acceleration remains on the
+ordinary constraint path rather than introducing a second Program placement
+route, without changing canonical state, novelty, rank, or producer-credit
+semantics.
 
 Final-variable streaming activations use a terminal physical policy on that
 same seam. A directed hot continuation advances exactly one affine activation
@@ -266,9 +269,9 @@ geometrically widened shard paging for low-demand and nonterminal work. A fresh 
 cohort may instead use `CompleteActionEquivalent`, preserving the exact
 parent-major then shard-major raw occurrence bag until parent-local SET
 admission. Dense complete drains and bounded Succinct proposal pages consume
-the same already-located Ring walk. A resident WGPU two-bound proposal is a
-distinct preferred production family; a structurally declined action falls
-back to the canonical production Succinct route.
+the same already-located Ring walk. The WGPU Succinct wrapper accelerates
+ordinary confirmation rank batches directly; it does not install an alternate
+typed Program family.
 
 Ordinary [`Query`](triblespace::core::query::Query) iteration owns the residual
 cursor for every root. Its compiler policy is fixed: native AND flattening,

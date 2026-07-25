@@ -98,54 +98,19 @@ pub struct ProgramRequest {
     pub bound: VariableSet,
 }
 
-/// Private semantic arm of one family-local route key.
-///
-/// `Preferred` and `Fallback` are introduced only by [`PreferredProgram`].
-/// The arm is carried by the immutable occurrence-local address, so it is
-/// selected once before runtime construction and never rides an affine work
-/// handle or a family state. It is not a physical placement tag: Native and
-/// accelerated execution remain interchangeable inside the selected arm.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-enum ProgramRouteArm {
-    Direct,
-    Preferred,
-    Fallback,
-}
-
 /// Family-local immutable identity within one structural occurrence.
 ///
-/// The occurrence-local address carries both the route's local value and its
-/// private composition arm directly; it is not a query-global catalog or a
-/// forwarding lookup key.
+/// The occurrence-local address is not a query-global catalog or forwarding
+/// lookup key.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProgramKey {
     local: u32,
-    arm: ProgramRouteArm,
 }
 
 impl ProgramKey {
     pub const fn new(value: u32) -> Self {
-        Self {
-            local: value,
-            arm: ProgramRouteArm::Direct,
-        }
-    }
-
-    fn in_arm(self, arm: ProgramRouteArm) -> Self {
-        assert_eq!(
-            self.arm,
-            ProgramRouteArm::Direct,
-            "a composed Program route attempted to wrap an already-armed key"
-        );
-        Self {
-            local: self.local,
-            arm,
-        }
-    }
-
-    fn direct(self) -> Self {
-        Self::new(self.local)
+        Self { local: value }
     }
 }
 
@@ -733,28 +698,6 @@ pub struct ProgramChild {
     pub accepted: Option<RawInline>,
 }
 
-/// Diagnostic receipt naming the physical executor selected for one complete
-/// typed Program cohort.
-///
-/// Placement is never semantic input. The scheduler may aggregate these
-/// static labels in statistics, but route selection, novelty, affine
-/// replacement, and future cohort identity must not consult them.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProgramPhysicalReceipt {
-    pub executor: &'static str,
-    pub operation: &'static str,
-}
-
-impl ProgramPhysicalReceipt {
-    pub const fn new(executor: &'static str, operation: &'static str) -> Self {
-        Self {
-            executor,
-            operation,
-        }
-    }
-}
-
 /// Effects returned by one typed cohort call.
 ///
 /// The erased adapter publishes this receipt only after validating every tag
@@ -783,10 +726,6 @@ pub struct ProgramBatchEffects {
     pub source_roots: usize,
     pub transition_pages: usize,
     pub transition_examined: usize,
-    /// Successful non-Native placement for this exact cohort. `None` denotes
-    /// the ordinary typed implementation, including immediate fallback after
-    /// a physical attempt declined or failed before effect commit.
-    pub placement: Option<ProgramPhysicalReceipt>,
 }
 
 impl ProgramBatchEffects {
@@ -801,7 +740,6 @@ impl ProgramBatchEffects {
         self.source_roots = 0;
         self.transition_pages = 0;
         self.transition_examined = 0;
-        self.placement = None;
     }
 }
 
@@ -1066,7 +1004,7 @@ pub trait TypedProgramSpec {
         effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     );
 
-    /// Executes the Native cohort against affinely taken typed inputs.
+    /// Executes one cohort against affinely taken typed inputs.
     ///
     /// Implementations may drain or otherwise move states when convenient,
     /// but they may also borrow them to construct a complete receipt. The
@@ -1078,25 +1016,6 @@ pub trait TypedProgramSpec {
         batch: TypedProgramBatch<'_>,
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     );
-
-    /// Attempts one already-formed cohort on a family-owned physical backend.
-    ///
-    /// The adapter calls this only after affinely taking and revalidating every
-    /// canonical state. Inputs remain borrowed so `None` can immediately move
-    /// the exact retained states into [`Self::step_typed`]. A successful result
-    /// is still uncommitted and passes through the ordinary adapter checks.
-    /// `effects` is a borrowed transaction sink: returning `None` discards any
-    /// speculative prefix before Native fallback.
-    /// Implementations must return `None` rather than wait when their backend
-    /// is unsupported, unavailable, still preparing, or fails recoverably.
-    fn try_step_physical(
-        &self,
-        _states: &[Self::State],
-        _batch: TypedProgramBatch<'_>,
-        _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) -> Option<ProgramPhysicalReceipt> {
-        None
-    }
 
     /// Executes one complete action certified by the selected route.
     ///
@@ -1174,43 +1093,6 @@ pub struct ProgramRuntime {
     family_name: &'static str,
 }
 
-/// Left-biased composition of two typed Program capabilities.
-///
-/// The preferred family owns an action whenever its `route` returns `Some`;
-/// only a structural decline consults the fallback family. The selected arm
-/// is sealed into [`ProgramKey`] before the occurrence-local runtime exists.
-/// Consequently each address constructs exactly one child-native runtime and
-/// every affine resume remains in that child's unchanged typed state arena.
-/// A physical decline therefore returns to the selected family's Native step,
-/// never across the composition boundary.
-///
-/// V1 deliberately composes two direct [`TypedProgramSpec`] implementations,
-/// not another `PreferredProgram`. A one-level arm tag is sufficient for this
-/// law and cannot silently truncate a nested composition path.
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct PreferredProgram<Preferred, Fallback> {
-    preferred: Preferred,
-    fallback: Fallback,
-}
-
-impl<Preferred, Fallback> PreferredProgram<Preferred, Fallback> {
-    pub fn new(preferred: Preferred, fallback: Fallback) -> Self {
-        Self {
-            preferred,
-            fallback,
-        }
-    }
-
-    pub fn preferred(&self) -> &Preferred {
-        &self.preferred
-    }
-
-    pub fn fallback(&self) -> &Fallback {
-        &self.fallback
-    }
-}
-
 /// Immutable residual-program family specification.
 ///
 /// Implementations downcast `runtime` once at the beginning of each seed or
@@ -1278,10 +1160,8 @@ struct BoundedCompleteEffects {
 
 /// Borrowed immutable typed program behind a private erased vtable.
 ///
-/// Direct construction accepts [`TypedProgramSpec`]. Left-biased construction
-/// accepts a [`PreferredProgram`] whose two children are themselves direct
-/// typed specs. Neither path lets custom constraints bypass typed sinks,
-/// activation ownership, or novelty admission.
+/// Construction accepts one [`TypedProgramSpec`] and does not let custom
+/// constraints bypass typed sinks, activation ownership, or novelty admission.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct ProgramRef<'a> {
@@ -1290,14 +1170,6 @@ pub struct ProgramRef<'a> {
 
 impl<'a> ProgramRef<'a> {
     pub fn new<T: TypedProgramSpec>(spec: &'a T) -> Self {
-        Self { erased: spec }
-    }
-
-    pub fn preferred<Preferred, Fallback>(spec: &'a PreferredProgram<Preferred, Fallback>) -> Self
-    where
-        Preferred: TypedProgramSpec,
-        Fallback: TypedProgramSpec,
-    {
         Self { erased: spec }
     }
 
@@ -1726,153 +1598,11 @@ where
     }
 }
 
-impl<Preferred, Fallback> PreferredProgram<Preferred, Fallback>
-where
-    Preferred: TypedProgramSpec,
-    Fallback: TypedProgramSpec,
-{
-    fn selected(&self, key: ProgramKey) -> (&dyn ErasedProgramSpec, ProgramKey) {
-        match key.arm {
-            ProgramRouteArm::Preferred => (&self.preferred, key.direct()),
-            ProgramRouteArm::Fallback => (&self.fallback, key.direct()),
-            ProgramRouteArm::Direct => {
-                panic!("composed Program address lost its selected semantic arm")
-            }
-        }
-    }
-}
-
-impl<Preferred, Fallback> ErasedProgramSpec for PreferredProgram<Preferred, Fallback>
-where
-    Preferred: TypedProgramSpec,
-    Fallback: TypedProgramSpec,
-{
-    fn new_runtime(&self, key: ProgramKey) -> ProgramRuntime {
-        let (selected, child_key) = self.selected(key);
-        selected.new_runtime(child_key)
-    }
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        if let Some(mut route) = TypedProgramSpec::route(&self.preferred, request) {
-            route.key = route.key.in_arm(ProgramRouteArm::Preferred);
-            Some(route)
-        } else {
-            TypedProgramSpec::route(&self.fallback, request).map(|mut route| {
-                route.key = route.key.in_arm(ProgramRouteArm::Fallback);
-                route
-            })
-        }
-    }
-
-    fn certifies_confirm_dominates_support_positive_prefix(
-        &self,
-        confirm_request: ProgramRequest,
-        confirm_route: ProgramRoute,
-        support_request: ProgramRequest,
-        support_route: ProgramRoute,
-    ) -> bool {
-        if confirm_route.key.arm != support_route.key.arm {
-            return false;
-        }
-        let (selected, confirm_key) = self.selected(confirm_route.key);
-        let (_, support_key) = self.selected(support_route.key);
-        selected.certifies_confirm_dominates_support_positive_prefix(
-            confirm_request,
-            ProgramRoute {
-                key: confirm_key,
-                ..confirm_route
-            },
-            support_request,
-            ProgramRoute {
-                key: support_key,
-                ..support_route
-            },
-        )
-    }
-
-    fn seed_batch(
-        &self,
-        runtime: &mut ProgramRuntime,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut ProgramSeedEffects,
-    ) {
-        let (selected, child_key) = self.selected(batch.route.key);
-        selected.seed_batch(
-            runtime,
-            ProgramSeedBatch {
-                route: ProgramRoute {
-                    key: child_key,
-                    ..batch.route
-                },
-                ..batch
-            },
-            effects,
-        );
-    }
-
-    fn step_batch(
-        &self,
-        runtime: &mut ProgramRuntime,
-        key: ProgramKey,
-        batch: ProgramBatch<'_>,
-        effects: &mut ProgramBatchEffects,
-    ) {
-        let (selected, child_key) = self.selected(key);
-        selected.step_batch(runtime, child_key, batch, effects);
-    }
-
-    fn discard_work(
-        &self,
-        runtime: &mut ProgramRuntime,
-        key: ProgramKey,
-        activation: ProgramActivation,
-        work: &ProgramWork,
-    ) {
-        let (selected, child_key) = self.selected(key);
-        selected.discard_work(runtime, child_key, activation, work);
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn try_complete_bounded(
-        &self,
-        batch: ProgramCompleteBatch<'_>,
-        capacity: usize,
-    ) -> Option<BoundedCompleteEffects> {
-        let (selected, child_key) = self.selected(batch.route.key);
-        selected.try_complete_bounded(
-            ProgramCompleteBatch {
-                route: ProgramRoute {
-                    key: child_key,
-                    ..batch.route
-                },
-                ..batch
-            },
-            capacity,
-        )
-    }
-
-    fn retire_activations(
-        &self,
-        runtime: &mut ProgramRuntime,
-        key: ProgramKey,
-        activations: &[ProgramActivation],
-    ) {
-        let (selected, child_key) = self.selected(key);
-        selected.retire_activations(runtime, child_key, activations);
-    }
-}
-
 impl<T> ErasedProgramSpec for T
 where
     T: TypedProgramSpec,
 {
-    fn new_runtime(&self, key: ProgramKey) -> ProgramRuntime {
-        assert_eq!(
-            key.arm,
-            ProgramRouteArm::Direct,
-            "a direct typed Program received a composed route arm"
-        );
+    fn new_runtime(&self, _key: ProgramKey) -> ProgramRuntime {
         ProgramRuntime {
             erased: Box::new(TypedProgramRuntime::<T::State, T::NoveltyKey, T::Rank>::default()),
             family: TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
@@ -1891,16 +1621,6 @@ where
         support_request: ProgramRequest,
         support_route: ProgramRoute,
     ) -> bool {
-        assert_eq!(
-            confirm_route.key.arm,
-            ProgramRouteArm::Direct,
-            "a direct typed Program received a composed Confirm route arm"
-        );
-        assert_eq!(
-            support_route.key.arm,
-            ProgramRouteArm::Direct,
-            "a direct typed Program received a composed Support route arm"
-        );
         TypedProgramSpec::certifies_confirm_dominates_support_positive_prefix(
             self,
             confirm_request,
@@ -1916,11 +1636,6 @@ where
         batch: ProgramSeedBatch<'_>,
         effects: &mut ProgramSeedEffects,
     ) {
-        assert_eq!(
-            batch.route.key.arm,
-            ProgramRouteArm::Direct,
-            "a direct typed Program seed received a composed route arm"
-        );
         assert_eq!(batch.activations.len(), batch.view.len());
         assert_eq!(
             runtime.family,
@@ -1981,15 +1696,7 @@ where
         batch: ProgramBatch<'_>,
         effects: &mut ProgramBatchEffects,
     ) {
-        assert_eq!(
-            key.arm,
-            ProgramRouteArm::Direct,
-            "a direct typed Program step received a composed route arm"
-        );
-        assert!(
-            effects.placement.is_none(),
-            "one ProgramBatchEffects sink received more than one physical placement"
-        );
+        let _ = key;
         let input_count = batch.work.len();
         assert_eq!(batch.view.len(), input_count);
         assert_eq!(batch.candidate_sets.len(), input_count);
@@ -2042,22 +1749,8 @@ where
             limits: batch.limits,
         };
         scratch.effects.clear();
-        let placement =
-            match self.try_step_physical(&scratch.states, typed_batch, &mut scratch.effects) {
-                Some(placement) => {
-                    scratch.states.clear();
-                    Some(placement)
-                }
-                None => {
-                    // A declined physical attempt has no committed prefix. Clear
-                    // its borrowed transaction before executing the same Native
-                    // kernel into the retained scratch sink.
-                    scratch.effects.clear();
-                    self.step_typed(&mut scratch.states, typed_batch, &mut scratch.effects);
-                    scratch.states.clear();
-                    None
-                }
-            };
+        self.step_typed(&mut scratch.states, typed_batch, &mut scratch.effects);
+        scratch.states.clear();
         let typed = &mut scratch.effects;
         assert_eq!(
             typed.pages.len(),
@@ -2080,8 +1773,8 @@ where
         scratch.raw_effects.resize(input_count, 0);
 
         // Validate the entire typed receipt before publishing any replacement
-        // handle, novelty admission, or outward effect. A physical `Some`
-        // result is a transaction candidate, not permission to commit a valid
+        // handle, novelty admission, or outward effect. The family call
+        // produces a transaction candidate, not permission to commit a valid
         // prefix before a later malformed effect is discovered.
         scratch.resume_physical.clear();
         scratch.resume_physical.reserve(input_count);
@@ -2307,7 +2000,6 @@ where
         effects.source_roots += typed.source_roots;
         effects.transition_pages += typed.transition_pages;
         effects.transition_examined += typed.transition_examined;
-        effects.placement = placement;
         typed.clear();
         scratch.input_ranks.clear();
         scratch.examined.clear();
@@ -2322,11 +2014,7 @@ where
         activation: ProgramActivation,
         work: &ProgramWork,
     ) {
-        assert_eq!(
-            key.arm,
-            ProgramRouteArm::Direct,
-            "a direct typed Program discard received a composed route arm"
-        );
+        let _ = key;
         assert_eq!(
             runtime.family,
             TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
@@ -2350,11 +2038,6 @@ where
         batch: ProgramCompleteBatch<'_>,
         capacity: usize,
     ) -> Option<BoundedCompleteEffects> {
-        assert_eq!(
-            batch.route.key.arm,
-            ProgramRouteArm::Direct,
-            "a direct typed Program completion received a composed route arm"
-        );
         assert!(
             matches!(batch.request.action, ProgramAction::Propose(_)),
             "typed complete actions currently support only Propose"
@@ -2404,11 +2087,7 @@ where
         key: ProgramKey,
         activations: &[ProgramActivation],
     ) {
-        assert_eq!(
-            key.arm,
-            ProgramRouteArm::Direct,
-            "a direct typed Program retirement received a composed route arm"
-        );
+        let _ = key;
         assert_eq!(
             runtime.family,
             TypeId::of::<TypedProgramRuntime<T::State, T::NoveltyKey, T::Rank>>(),
@@ -2504,35 +2183,9 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum PhysicalProbeMode {
-        Decline,
-        SpeculativeDecline,
-        NativeWideReceipt,
-        Complete,
-        OverBudget,
-        LateRawAmplification,
-        LateDuplicateSupport,
-        LateZeroExaminedResume,
-    }
+    struct ScratchReuseProbe;
 
-    struct PhysicalProbe {
-        mode: PhysicalProbeMode,
-        physical_states: Arc<Mutex<Vec<Vec<usize>>>>,
-        native_states: Arc<Mutex<Vec<Vec<usize>>>>,
-    }
-
-    impl PhysicalProbe {
-        fn new(mode: PhysicalProbeMode) -> Self {
-            Self {
-                mode,
-                physical_states: Arc::new(Mutex::new(Vec::new())),
-                native_states: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-    }
-
-    impl TypedProgramSpec for PhysicalProbe {
+    impl TypedProgramSpec for ScratchReuseProbe {
         type State = NonComparableState;
         type NoveltyKey = Key;
         type Rank = u64;
@@ -2541,16 +2194,7 @@ mod tests {
             Some(ProgramRoute {
                 key: ProgramKey::new(0),
                 variable: 0,
-                stratum: if matches!(
-                    self.mode,
-                    PhysicalProbeMode::LateRawAmplification
-                        | PhysicalProbeMode::LateDuplicateSupport
-                        | PhysicalProbeMode::LateZeroExaminedResume
-                ) {
-                    ProgramStratum::Fixpoint
-                } else {
-                    ProgramStratum::Finite
-                },
+                stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
             })
@@ -2570,19 +2214,13 @@ mod tests {
             effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
         ) {
             for parent in 0..batch.view.len() {
-                let state = NonComparableState {
-                    exact_cursor: parent + 10,
-                };
-                if matches!(
-                    self.mode,
-                    PhysicalProbeMode::LateRawAmplification
-                        | PhysicalProbeMode::LateDuplicateSupport
-                        | PhysicalProbeMode::LateZeroExaminedResume
-                ) {
-                    effects.fixpoint_root(parent as u32, state, Key(parent as u8), None);
-                } else {
-                    effects.finite_root(parent as u32, state, None);
-                }
+                effects.finite_root(
+                    parent as u32,
+                    NonComparableState {
+                        exact_cursor: parent + 10,
+                    },
+                    None,
+                );
             }
         }
 
@@ -2592,12 +2230,7 @@ mod tests {
             _batch: TypedProgramBatch<'_>,
             effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
         ) {
-            self.native_states
-                .lock()
-                .unwrap()
-                .push(states.iter().map(|state| state.exact_cursor).collect());
-            let rich =
-                matches!(self.mode, PhysicalProbeMode::NativeWideReceipt) && states.len() > 1;
+            let rich = states.len() > 1;
             for (input, state) in states.iter().enumerate() {
                 effects.page(1, None);
                 if rich {
@@ -2619,278 +2252,6 @@ mod tests {
             if rich {
                 effects.account_source(states.len(), 1);
                 effects.account_transition(states.len());
-            }
-        }
-
-        fn try_step_physical(
-            &self,
-            states: &[Self::State],
-            batch: TypedProgramBatch<'_>,
-            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) -> Option<ProgramPhysicalReceipt> {
-            self.physical_states
-                .lock()
-                .unwrap()
-                .push(states.iter().map(|state| state.exact_cursor).collect());
-            match self.mode {
-                PhysicalProbeMode::Decline | PhysicalProbeMode::NativeWideReceipt => None,
-                PhysicalProbeMode::SpeculativeDecline => {
-                    for (input, state) in states.iter().enumerate() {
-                        effects.page(
-                            batch.limits[input],
-                            Some(TypedResume::Immediate(NonComparableState {
-                                exact_cursor: state.exact_cursor - 1,
-                            })),
-                        );
-                        effects.finite_child(
-                            input as u32,
-                            NonComparableState {
-                                exact_cursor: state.exact_cursor - 2,
-                            },
-                            Some(RawInline::default()),
-                        );
-                        effects.direct(input as u32, RawInline::default());
-                        effects.accept(input as u32, RawInline::default());
-                        effects.support(input as u32);
-                        effects.account_source(batch.limits[input], 1);
-                        effects.account_transition(batch.limits[input]);
-                    }
-                    None
-                }
-                PhysicalProbeMode::Complete
-                | PhysicalProbeMode::OverBudget
-                | PhysicalProbeMode::LateRawAmplification
-                | PhysicalProbeMode::LateDuplicateSupport
-                | PhysicalProbeMode::LateZeroExaminedResume => {
-                    let placement = ProgramPhysicalReceipt::new("test-physical", "dense-page");
-                    for (input, state) in states.iter().enumerate() {
-                        let examined = match self.mode {
-                            PhysicalProbeMode::Complete => 1,
-                            PhysicalProbeMode::OverBudget => batch.limits[input] + 1,
-                            PhysicalProbeMode::LateRawAmplification => 1,
-                            PhysicalProbeMode::LateDuplicateSupport if input == 1 => 2,
-                            PhysicalProbeMode::LateDuplicateSupport => 1,
-                            PhysicalProbeMode::LateZeroExaminedResume if input == 1 => 0,
-                            PhysicalProbeMode::LateZeroExaminedResume => 1,
-                            PhysicalProbeMode::Decline
-                            | PhysicalProbeMode::SpeculativeDecline
-                            | PhysicalProbeMode::NativeWideReceipt => unreachable!(),
-                        };
-                        let resume = (matches!(self.mode, PhysicalProbeMode::LateRawAmplification)
-                            || (matches!(self.mode, PhysicalProbeMode::LateZeroExaminedResume)
-                                && input == 1))
-                            .then(|| {
-                                TypedResume::Immediate(NonComparableState {
-                                    exact_cursor: state.exact_cursor - 1,
-                                })
-                            });
-                        effects.page(examined, resume);
-                        if matches!(self.mode, PhysicalProbeMode::LateRawAmplification) {
-                            effects.fixpoint_child(
-                                input as u32,
-                                NonComparableState {
-                                    exact_cursor: state.exact_cursor - 2,
-                                },
-                                Key(input as u8 + 64),
-                                None,
-                            );
-                            effects.direct(input as u32, RawInline::default());
-                        }
-                        if matches!(
-                            self.mode,
-                            PhysicalProbeMode::LateDuplicateSupport
-                                | PhysicalProbeMode::LateZeroExaminedResume
-                        ) && input == 0
-                        {
-                            effects.fixpoint_child(
-                                0,
-                                NonComparableState {
-                                    exact_cursor: state.exact_cursor - 1,
-                                },
-                                Key(91),
-                                Some(raw(0x91)),
-                            );
-                        }
-                        if matches!(self.mode, PhysicalProbeMode::LateDuplicateSupport)
-                            && input == 1
-                        {
-                            effects.support(1);
-                            effects.support(1);
-                        }
-                    }
-                    Some(placement)
-                }
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct PreferredChoiceState;
-
-    #[derive(Clone)]
-    struct FallbackChoiceState;
-
-    #[derive(Clone, Eq, Hash, PartialEq)]
-    struct PreferredChoiceKey;
-
-    #[derive(Clone, Eq, Hash, PartialEq)]
-    struct FallbackChoiceKey;
-
-    #[derive(Default)]
-    struct ChoiceCalls {
-        preferred_physical: usize,
-        preferred_native: usize,
-        fallback_native: usize,
-        preferred_quote: usize,
-        preferred_complete: usize,
-    }
-
-    struct PreferredChoiceProbe {
-        calls: Arc<Mutex<ChoiceCalls>>,
-    }
-
-    impl TypedProgramSpec for PreferredChoiceProbe {
-        type State = PreferredChoiceState;
-        type NoveltyKey = PreferredChoiceKey;
-        type Rank = u8;
-
-        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            let ProgramAction::Propose(variable) = request.action else {
-                return None;
-            };
-            if variable > 1 {
-                return None;
-            }
-            Some(ProgramRoute {
-                key: ProgramKey::new(7),
-                variable,
-                stratum: ProgramStratum::Finite,
-                grouping: ProgramGrouping::PageLocal,
-                completion: if variable == 1 {
-                    ProgramCompletion::CompleteActionEquivalent
-                } else {
-                    ProgramCompletion::PageableOnly
-                },
-            })
-        }
-
-        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-            DispatchClass::new(70)
-        }
-
-        fn progress(&self, _state: &Self::State) -> Self::Rank {
-            1
-        }
-
-        fn seed_typed(
-            &self,
-            batch: ProgramSeedBatch<'_>,
-            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-        ) {
-            assert_eq!(batch.route.key, ProgramKey::new(7));
-            for parent in 0..batch.view.len() {
-                effects.finite_root(parent as u32, PreferredChoiceState, None);
-            }
-        }
-
-        fn step_typed(
-            &self,
-            states: &mut Vec<Self::State>,
-            _batch: TypedProgramBatch<'_>,
-            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) {
-            self.calls.lock().unwrap().preferred_native += 1;
-            for _ in states {
-                effects.page(1, None);
-            }
-        }
-
-        fn try_step_physical(
-            &self,
-            _states: &[Self::State],
-            _batch: TypedProgramBatch<'_>,
-            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) -> Option<ProgramPhysicalReceipt> {
-            self.calls.lock().unwrap().preferred_physical += 1;
-            None
-        }
-
-        fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
-            assert_eq!(batch.route.key, ProgramKey::new(7));
-            self.calls.lock().unwrap().preferred_complete += 1;
-            for parent in 0..batch.view.len() {
-                effects.push(parent as u32, RawInline::default());
-            }
-        }
-
-        fn quote_complete_typed(
-            &self,
-            batch: ProgramCompleteBatch<'_>,
-        ) -> ProgramCompleteWorkEvidence {
-            assert_eq!(batch.route.key, ProgramKey::new(7));
-            self.calls.lock().unwrap().preferred_quote += 1;
-            ProgramCompleteWorkEvidence::Quoted(vec![
-                ProgramCompleteWorkQuote {
-                    drain_work_units: 1,
-                    raw_occurrences: 1,
-                };
-                batch.view.len()
-            ])
-        }
-    }
-
-    struct FallbackChoiceProbe {
-        calls: Arc<Mutex<ChoiceCalls>>,
-    }
-
-    impl TypedProgramSpec for FallbackChoiceProbe {
-        type State = FallbackChoiceState;
-        type NoveltyKey = FallbackChoiceKey;
-        type Rank = u8;
-
-        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            let ProgramAction::Confirm(variable) = request.action else {
-                return None;
-            };
-            Some(ProgramRoute {
-                // Deliberately collides with the preferred family's local
-                // key. The private semantic arm keeps the addresses distinct.
-                key: ProgramKey::new(7),
-                variable,
-                stratum: ProgramStratum::Finite,
-                grouping: ProgramGrouping::PageLocal,
-                completion: ProgramCompletion::PageableOnly,
-            })
-        }
-
-        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-            DispatchClass::new(71)
-        }
-
-        fn progress(&self, _state: &Self::State) -> Self::Rank {
-            1
-        }
-
-        fn seed_typed(
-            &self,
-            batch: ProgramSeedBatch<'_>,
-            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-        ) {
-            assert_eq!(batch.route.key, ProgramKey::new(7));
-            for parent in 0..batch.view.len() {
-                effects.finite_root(parent as u32, FallbackChoiceState, None);
-            }
-        }
-
-        fn step_typed(
-            &self,
-            states: &mut Vec<Self::State>,
-            _batch: TypedProgramBatch<'_>,
-            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) {
-            self.calls.lock().unwrap().fallback_native += 1;
-            for _ in states {
-                effects.page(1, None);
             }
         }
     }
@@ -3899,47 +3260,6 @@ mod tests {
         assert!(!runtime.novelty.contains_key(&live));
     }
 
-    fn step_physical_probe(spec: &PhysicalProbe, limits: &[usize]) -> ProgramBatchEffects {
-        let program = ProgramRef::new(spec);
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(0),
-            bound: VariableSet::new_empty(),
-        };
-        let route = program.route(request).unwrap();
-        let activations: Vec<_> = (0..limits.len())
-            .map(|index| ProgramActivation(index as u64 + 1))
-            .collect();
-        let view = RowsView::new_with_row_count(&[], &[], activations.len());
-        let mut runtime = program.new_runtime();
-        let mut seeded = ProgramSeedEffects::default();
-        program.seed_batch(
-            &mut runtime,
-            ProgramSeedBatch {
-                request,
-                route,
-                view,
-                activations: &activations,
-            },
-            &mut seeded,
-        );
-        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
-        let candidate_sets: Vec<Option<&[RawInline]>> = vec![None; limits.len()];
-        let mut effects = ProgramBatchEffects::default();
-        program.step_batch(
-            &mut runtime,
-            ProgramBatch {
-                stratum: route.stratum,
-                view,
-                candidate_sets: &candidate_sets,
-                activations: &activations,
-                work: &work,
-                limits,
-            },
-            &mut effects,
-        );
-        effects
-    }
-
     fn run_novelty_batch_probe(
         mode: NoveltyBatchMode,
     ) -> (
@@ -4088,7 +3408,6 @@ mod tests {
             assert!(effects.direct.is_empty());
             assert!(effects.accepted.is_empty());
             assert!(effects.supported.is_empty());
-            assert_eq!(effects.placement, None);
 
             let typed_runtime = runtime
                 .erased
@@ -4172,43 +3491,8 @@ mod tests {
     }
 
     #[test]
-    fn declined_physical_step_falls_back_with_the_exact_retained_states() {
-        let spec = PhysicalProbe::new(PhysicalProbeMode::Decline);
-        let effects = step_physical_probe(&spec, &[1, 1]);
-
-        assert_eq!(*spec.physical_states.lock().unwrap(), vec![vec![10, 11]]);
-        assert_eq!(*spec.native_states.lock().unwrap(), vec![vec![10, 11]]);
-        assert_eq!(effects.pages.len(), 2);
-        assert_eq!(effects.placement, None);
-    }
-
-    #[test]
-    fn declined_physical_step_discards_every_speculative_effect_before_native_fallback() {
-        let spec = PhysicalProbe::new(PhysicalProbeMode::SpeculativeDecline);
-        let effects = step_physical_probe(&spec, &[1, 1]);
-
-        assert_eq!(*spec.physical_states.lock().unwrap(), vec![vec![10, 11]]);
-        assert_eq!(*spec.native_states.lock().unwrap(), vec![vec![10, 11]]);
-        assert_eq!(effects.pages.len(), 2);
-        assert!(effects
-            .pages
-            .iter()
-            .all(|page| page.examined == 1 && page.resume.is_none()));
-        assert!(effects.children.is_empty());
-        assert!(effects.direct.is_empty());
-        assert!(effects.accepted.is_empty());
-        assert!(effects.supported.is_empty());
-        assert_eq!(effects.source_pages, 0);
-        assert_eq!(effects.source_examined, 0);
-        assert_eq!(effects.source_roots, 0);
-        assert_eq!(effects.transition_pages, 0);
-        assert_eq!(effects.transition_examined, 0);
-        assert_eq!(effects.placement, None);
-    }
-
-    #[test]
     fn typed_program_scratch_reuse_clears_a_wide_receipt_before_a_narrow_step() {
-        let spec = PhysicalProbe::new(PhysicalProbeMode::NativeWideReceipt);
+        let spec = ScratchReuseProbe;
         let program = ProgramRef::new(&spec);
         let request = ProgramRequest {
             action: ProgramAction::Propose(0),
@@ -4326,7 +3610,6 @@ mod tests {
         assert_eq!(narrow.source_roots, 0);
         assert_eq!(narrow.transition_pages, 0);
         assert_eq!(narrow.transition_examined, 0);
-        assert_eq!(narrow.placement, None);
 
         let typed = runtime
             .erased
@@ -4347,319 +3630,6 @@ mod tests {
         assert!(scratch.states.capacity() >= wide_capacities.0);
         assert!(scratch.effects.pages.capacity() >= wide_capacities.1);
         assert!(scratch.effects.children.capacity() >= wide_capacities.2);
-    }
-
-    #[test]
-    fn preferred_program_seals_route_arm_and_keeps_child_native_state() {
-        assert_eq!(
-            std::mem::size_of::<ProgramRef<'static>>(),
-            std::mem::size_of::<&'static dyn ErasedProgramSpec>(),
-            "Program composition must not widen every direct ProgramRef"
-        );
-        let calls = Arc::new(Mutex::new(ChoiceCalls::default()));
-        let choice = PreferredProgram::new(
-            PreferredChoiceProbe {
-                calls: Arc::clone(&calls),
-            },
-            FallbackChoiceProbe {
-                calls: Arc::clone(&calls),
-            },
-        );
-        let program = ProgramRef::preferred(&choice);
-        let view = RowsView::new_with_row_count(&[], &[], 1);
-        let activations = [ProgramActivation(41)];
-        let candidate = [RawInline::default()];
-
-        let preferred_request = ProgramRequest {
-            action: ProgramAction::Propose(0),
-            bound: VariableSet::new_empty(),
-        };
-        let preferred_route = program.route(preferred_request).unwrap();
-        assert_eq!(preferred_route.key.arm, ProgramRouteArm::Preferred);
-        let mut preferred_runtime = program.new_runtime_for(preferred_route.key);
-        let mut preferred_seed = ProgramSeedEffects::default();
-        program.seed_batch(
-            &mut preferred_runtime,
-            ProgramSeedBatch {
-                request: preferred_request,
-                route: preferred_route,
-                view,
-                activations: &activations,
-            },
-            &mut preferred_seed,
-        );
-        let preferred_work: Vec<_> = preferred_seed
-            .work
-            .into_iter()
-            .map(|seed| seed.work)
-            .collect();
-        let mut preferred_effects = ProgramBatchEffects::default();
-        program.step_batch_for(
-            &mut preferred_runtime,
-            preferred_route.key,
-            ProgramBatch {
-                stratum: preferred_route.stratum,
-                view,
-                candidate_sets: &[None],
-                activations: &activations,
-                work: &preferred_work,
-                limits: &[1],
-            },
-            &mut preferred_effects,
-        );
-        assert_eq!(preferred_effects.pages.len(), 1);
-        {
-            let calls = calls.lock().unwrap();
-            assert_eq!(calls.preferred_physical, 1);
-            assert_eq!(calls.preferred_native, 1);
-            assert_eq!(calls.fallback_native, 0);
-        }
-        program.retire_activations(&mut preferred_runtime, preferred_route.key, &activations);
-
-        let fallback_request = ProgramRequest {
-            action: ProgramAction::Confirm(0),
-            bound: VariableSet::new_empty(),
-        };
-        let fallback_route = program.route(fallback_request).unwrap();
-        assert_eq!(fallback_route.key.arm, ProgramRouteArm::Fallback);
-        assert_eq!(preferred_route.key.local, fallback_route.key.local);
-        assert_ne!(preferred_route.key, fallback_route.key);
-        let mut fallback_runtime = program.new_runtime_for(fallback_route.key);
-        let mut fallback_seed = ProgramSeedEffects::default();
-        program.seed_batch(
-            &mut fallback_runtime,
-            ProgramSeedBatch {
-                request: fallback_request,
-                route: fallback_route,
-                view,
-                activations: &activations,
-            },
-            &mut fallback_seed,
-        );
-        let fallback_work: Vec<_> = fallback_seed
-            .work
-            .into_iter()
-            .map(|seed| seed.work)
-            .collect();
-        let mut fallback_effects = ProgramBatchEffects::default();
-        program.step_batch_for(
-            &mut fallback_runtime,
-            fallback_route.key,
-            ProgramBatch {
-                stratum: fallback_route.stratum,
-                view,
-                candidate_sets: &[Some(&candidate)],
-                activations: &activations,
-                work: &fallback_work,
-                limits: &[1],
-            },
-            &mut fallback_effects,
-        );
-        assert_eq!(fallback_effects.pages.len(), 1);
-        assert_eq!(calls.lock().unwrap().fallback_native, 1);
-        program.retire_activations(&mut fallback_runtime, fallback_route.key, &activations);
-
-        let complete_request = ProgramRequest {
-            action: ProgramAction::Propose(1),
-            bound: VariableSet::new_empty(),
-        };
-        let complete_route = program.route(complete_request).unwrap();
-        assert_eq!(complete_route.key.arm, ProgramRouteArm::Preferred);
-        let complete_view = RowsView::new_with_row_count(&[], &[], 2);
-        let mut complete = ProgramCompleteEffects::default();
-        program.complete_batch(
-            ProgramCompleteBatch {
-                request: complete_request,
-                route: complete_route,
-                view: complete_view,
-            },
-            &mut complete,
-        );
-        assert_eq!(
-            complete.occurrences,
-            [(0, RawInline::default()), (1, RawInline::default())]
-        );
-        assert_eq!(complete.raw_occurrence_count, 2);
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.preferred_quote, 1);
-        assert_eq!(calls.preferred_complete, 1);
-    }
-
-    #[test]
-    fn preferred_bounded_completion_remaps_once_without_touching_fallback() {
-        let calls = Arc::new(Mutex::new(ChoiceCalls::default()));
-        let choice = PreferredProgram::new(
-            PreferredChoiceProbe {
-                calls: Arc::clone(&calls),
-            },
-            FallbackChoiceProbe {
-                calls: Arc::clone(&calls),
-            },
-        );
-        let program = ProgramRef::preferred(&choice);
-        let request = ProgramRequest {
-            action: ProgramAction::Propose(1),
-            bound: VariableSet::new_empty(),
-        };
-        let batch = ProgramCompleteBatch {
-            request,
-            route: program.route(request).unwrap(),
-            view: RowsView::new_with_row_count(&[], &[], 2),
-        };
-        assert_eq!(batch.route.key.arm, ProgramRouteArm::Preferred);
-        let affinity = ProgramCompleteAffinity::new(&batch);
-        let completion = program
-            .try_complete_bounded(batch, 2, &affinity)
-            .expect("preferred child has an exact two-parent completion");
-        let (first, work, raw_occurrences, occurrences) =
-            completion.into_parts_for(batch, &affinity, &batch);
-        assert_eq!(first, 0);
-        assert_eq!(
-            work,
-            ProgramCompleteWorkQuote {
-                drain_work_units: 2,
-                raw_occurrences: 2,
-            }
-        );
-        assert_eq!(raw_occurrences, 2);
-        assert_eq!(
-            occurrences,
-            [(0, RawInline::default()), (1, RawInline::default())]
-        );
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.preferred_quote, 1);
-        assert_eq!(calls.preferred_complete, 1);
-        assert_eq!(calls.preferred_physical, 0);
-        assert_eq!(calls.preferred_native, 0);
-        assert_eq!(calls.fallback_native, 0);
-    }
-
-    #[test]
-    fn completed_physical_step_uses_the_shared_adapter_and_records_placement() {
-        let spec = PhysicalProbe::new(PhysicalProbeMode::Complete);
-        let effects = step_physical_probe(&spec, &[1, 1]);
-
-        assert_eq!(*spec.physical_states.lock().unwrap(), vec![vec![10, 11]]);
-        assert!(spec.native_states.lock().unwrap().is_empty());
-        assert_eq!(effects.pages.len(), 2);
-        assert_eq!(
-            effects.placement,
-            Some(ProgramPhysicalReceipt::new("test-physical", "dense-page"))
-        );
-    }
-
-    #[test]
-    fn physical_step_cannot_bypass_the_shared_budget_validation() {
-        let spec = PhysicalProbe::new(PhysicalProbeMode::OverBudget);
-        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = step_physical_probe(&spec, &[1]);
-        }));
-        let message = panic_text(rejected.expect_err("over-budget physical receipt must fail"));
-        assert!(message.contains("exceeded one input's physical work budget"));
-        assert!(spec.native_states.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn late_invalid_physical_receipt_commits_no_output_prefix() {
-        let cases: &[(PhysicalProbeMode, &[usize], &str)] = &[
-            (
-                PhysicalProbeMode::LateRawAmplification,
-                &[1],
-                "more raw effects than its examined-work receipt",
-            ),
-            (
-                PhysicalProbeMode::LateDuplicateSupport,
-                &[1, 2],
-                "reported Boolean support more than once",
-            ),
-            (
-                PhysicalProbeMode::LateZeroExaminedResume,
-                &[1, 1],
-                "zero-examined continuation work",
-            ),
-        ];
-
-        for &(mode, limits, expected) in cases {
-            let spec = PhysicalProbe::new(mode);
-            let program = ProgramRef::new(&spec);
-            let request = ProgramRequest {
-                action: ProgramAction::Propose(0),
-                bound: VariableSet::new_empty(),
-            };
-            let route = program.route(request).unwrap();
-            let activations: Vec<_> = (0..limits.len())
-                .map(|input| ProgramActivation(input as u64 + 1))
-                .collect();
-            let view = RowsView::new_with_row_count(&[], &[], activations.len());
-            let mut runtime = program.new_runtime();
-            let mut seeded = ProgramSeedEffects::default();
-            program.seed_batch(
-                &mut runtime,
-                ProgramSeedBatch {
-                    request,
-                    route,
-                    view,
-                    activations: &activations,
-                },
-                &mut seeded,
-            );
-            let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
-            let novelty_before = runtime
-                .erased
-                .as_mut()
-                .as_any_mut()
-                .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
-                .unwrap()
-                .novelty
-                .clone();
-            let candidate_sets: Vec<Option<&[RawInline]>> = vec![None; limits.len()];
-            let mut effects = ProgramBatchEffects::default();
-
-            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                program.step_batch(
-                    &mut runtime,
-                    ProgramBatch {
-                        stratum: route.stratum,
-                        view,
-                        candidate_sets: &candidate_sets,
-                        activations: &activations,
-                        work: &work,
-                        limits,
-                    },
-                    &mut effects,
-                )
-            }));
-            let message = panic_text(rejected.expect_err("late-invalid receipt must fail"));
-            assert!(message.contains(expected), "unexpected panic: {message}");
-
-            assert!(effects.pages.is_empty());
-            assert!(effects.children.is_empty());
-            assert!(effects.direct.is_empty());
-            assert!(effects.accepted.is_empty());
-            assert!(effects.supported.is_empty());
-            assert_eq!(effects.source_pages, 0);
-            assert_eq!(effects.source_examined, 0);
-            assert_eq!(effects.source_roots, 0);
-            assert_eq!(effects.transition_pages, 0);
-            assert_eq!(effects.transition_examined, 0);
-            assert_eq!(effects.placement, None);
-
-            let typed_runtime = runtime
-                .erased
-                .as_mut()
-                .as_any_mut()
-                .downcast_mut::<TypedProgramRuntime<NonComparableState, Key, u64>>()
-                .unwrap();
-            assert!(
-                typed_runtime.slots.iter().all(|slot| slot.value.is_none()),
-                "late validation committed a resume or child handle"
-            );
-            assert!(
-                typed_runtime.novelty == novelty_before,
-                "late validation admitted an output novelty key"
-            );
-            assert!(spec.native_states.lock().unwrap().is_empty());
-        }
     }
 
     #[test]
