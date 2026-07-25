@@ -112,7 +112,10 @@ impl Fixture {
             "ring size must be divisible by four"
         );
         assert!(fanout > 0, "fanout must be non-zero");
-        assert!(2 * fanout < ring_size, "p and q edge bands must be disjoint");
+        assert!(
+            2 * fanout < ring_size,
+            "p and q edge bands must be disjoint"
+        );
 
         const NODE_NAMESPACE: u64 = 0xD46A_0003_0000_0001;
         const MARKER_NAMESPACE: u64 = 0xD46A_0003_0000_0002;
@@ -681,8 +684,7 @@ fn main() {
     let fixture = Fixture::new(component_count, ring_size, fanout);
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.graph).into();
     if std::env::var_os("STATS_FINITE").is_some() {
-        let mut query =
-            finite_union_query!(&fixture.graph, &fixture).solve_residual_state_lazy();
+        let mut query = finite_union_query!(&fixture.graph, &fixture).solve_residual_state_lazy();
         let started = Instant::now();
         let first = query.next();
         eprintln!(
@@ -696,6 +698,28 @@ fn main() {
         rows += query.by_ref().count();
         eprintln!(
             "STATS_FINITE full rows={rows} elapsed={:?} width={}\n{:#?}",
+            started.elapsed(),
+            query.current_width(),
+            query.stats()
+        );
+        drop(archive);
+        return;
+    }
+    if std::env::var_os("STATS_CYCLIC").is_some() {
+        let mut query = cyclic_rpq_query!(&fixture).solve_residual_state_lazy();
+        let started = Instant::now();
+        let first = query.next();
+        eprintln!(
+            "STATS_CYCLIC first={} elapsed={:?} width={}\n{:#?}",
+            first.is_some(),
+            started.elapsed(),
+            query.current_width(),
+            query.stats()
+        );
+        let mut rows = usize::from(first.is_some());
+        rows += query.by_ref().count();
+        eprintln!(
+            "STATS_CYCLIC full rows={rows} elapsed={:?} width={}\n{:#?}",
             started.elapsed(),
             query.current_width(),
             query.stats()
@@ -747,7 +771,9 @@ fn main() {
     );
     eprintln!("samples: {reps}; hot cache; release profile; default find! iterator");
     if june_safe {
-        eprintln!("GATE_JUNE_SAFE: the 3 or!-bearing shapes emit as not-ok (June cannot construct them)");
+        eprintln!(
+            "GATE_JUNE_SAFE: the 3 or!-bearing shapes emit as not-ok (June cannot construct them)"
+        );
     }
 
     // Oracles / set digests (untimed).
@@ -782,33 +808,57 @@ fn main() {
         cells.push(notok("nested-formula", "TribleSet"));
         cells.push(notok("nested-formula", "SuccinctArchive"));
     } else {
-        cells.push(bench_shape("finite-union", "TribleSet", &finite, reps, || {
-            finite_union_query!(&fixture.graph, &fixture)
-        }));
-        cells.push(bench_shape("finite-union", "SuccinctArchive", &finite, reps, || {
-            finite_union_query!(&archive, &fixture)
-        }));
-        cells.push(bench_shape("nested-formula", "TribleSet", &nested, reps, || {
-            nested_formula_query!(&fixture.graph, &fixture)
-        }));
-        cells.push(bench_shape("nested-formula", "SuccinctArchive", &nested, reps, || {
-            nested_formula_query!(&archive, &fixture)
-        }));
+        cells.push(bench_shape(
+            "finite-union",
+            "TribleSet",
+            &finite,
+            reps,
+            || finite_union_query!(&fixture.graph, &fixture),
+        ));
+        cells.push(bench_shape(
+            "finite-union",
+            "SuccinctArchive",
+            &finite,
+            reps,
+            || finite_union_query!(&archive, &fixture),
+        ));
+        cells.push(bench_shape(
+            "nested-formula",
+            "TribleSet",
+            &nested,
+            reps,
+            || nested_formula_query!(&fixture.graph, &fixture),
+        ));
+        cells.push(bench_shape(
+            "nested-formula",
+            "SuccinctArchive",
+            &nested,
+            reps,
+            || nested_formula_query!(&archive, &fixture),
+        ));
     }
 
     // cyclic RPQ is union-free at the constraint level (the path alternation is
     // a path operator, not an `or!` over patterns) — runs on June.
-    cells.push(bench_shape("cyclic-rpq", "TribleSet(owned)", &rpq, reps, || {
-        cyclic_rpq_query!(&fixture)
-    }));
+    cells.push(bench_shape(
+        "cyclic-rpq",
+        "TribleSet(owned)",
+        &rpq,
+        reps,
+        || cyclic_rpq_query!(&fixture),
+    ));
 
     if june_safe {
         cells.push(notok("mixed-formula-rpq", "TribleSet-sib"));
         cells.push(notok("mixed-formula-rpq", "SuccinctArchive-sib"));
     } else {
-        cells.push(bench_shape("mixed-formula-rpq", "TribleSet-sib", &mixed, reps, || {
-            mixed_formula_rpq_query!(&fixture.graph, &fixture)
-        }));
+        cells.push(bench_shape(
+            "mixed-formula-rpq",
+            "TribleSet-sib",
+            &mixed,
+            reps,
+            || mixed_formula_rpq_query!(&fixture.graph, &fixture),
+        ));
         cells.push(bench_shape(
             "mixed-formula-rpq",
             "SuccinctArchive-sib",
@@ -822,9 +872,13 @@ fn main() {
     cells.push(bench_shape("point", "TribleSet", &point, reps, || {
         point_query!(&fixture.graph, &fixture)
     }));
-    cells.push(bench_shape("point", "SuccinctArchive", &point, reps, || {
-        point_query!(&archive, &fixture)
-    }));
+    cells.push(bench_shape(
+        "point",
+        "SuccinctArchive",
+        &point,
+        reps,
+        || point_query!(&archive, &fixture),
+    ));
     cells.push(bench_shape("scan", "TribleSet", &scan, reps, || {
         scan_query!(&fixture.graph, &fixture)
     }));
@@ -838,9 +892,13 @@ fn main() {
     }));
 
     // Shape 13: UNIQUE-CONTROL (exactly one target per source).
-    cells.push(bench_shape("unique-control", "TribleSet", &unique, reps, || {
-        unique_query!(&fixture.graph, &fixture)
-    }));
+    cells.push(bench_shape(
+        "unique-control",
+        "TribleSet",
+        &unique,
+        reps,
+        || unique_query!(&fixture.graph, &fixture),
+    ));
 
     for c in &cells {
         emit_row(c);
