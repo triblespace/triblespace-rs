@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "parallel")]
@@ -10,10 +9,8 @@ use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, PathOp, PreferredProgram,
-    ProgramAction, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ProposalCoverage,
-    Query, RegularPathConstraint, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
-    TypedSeedSink, Variable, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProposalCoverage, Query,
+    RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -349,112 +346,6 @@ impl<'a> Constraint<'a> for CoveringOrderedDomain {
 }
 
 #[derive(Clone)]
-struct SupportRouteProbe {
-    calls: Arc<AtomicUsize>,
-}
-
-impl TypedProgramSpec for SupportRouteProbe {
-    type State = ();
-    type NoveltyKey = ();
-    type Rank = ();
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        if request.action == ProgramAction::Support {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-        }
-        None
-    }
-
-    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-        unreachable!("the route-only Support probe never owns work")
-    }
-
-    fn progress(&self, _state: &Self::State) -> Self::Rank {
-        unreachable!("the route-only Support probe never owns work")
-    }
-
-    fn seed_typed(
-        &self,
-        _batch: ProgramSeedBatch<'_>,
-        _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        unreachable!("the route-only Support probe is never seeded")
-    }
-
-    fn step_typed(
-        &self,
-        _states: &mut Vec<Self::State>,
-        _batch: TypedProgramBatch<'_>,
-        _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        unreachable!("the route-only Support probe is never stepped")
-    }
-}
-
-/// Observes or owns Support through a preferred arm while the fallback RPQ
-/// remains the exact Confirm executor.
-///
-/// Most target-Confirm fixtures suppress the fallback RPQ's covering proposal
-/// receipt to isolate confirmation; the partial fixture retains it so the
-/// remaining endpoint can still be enumerated.
-struct ProbedConfirmRpq<Preferred> {
-    program: PreferredProgram<Preferred, RegularPathConstraint>,
-    covering_proposals: bool,
-}
-
-impl<'a, Preferred> Constraint<'a> for ProbedConfirmRpq<Preferred>
-where
-    Preferred: TypedProgramSpec + Send + Sync,
-{
-    fn variables(&self) -> VariableSet {
-        self.program.fallback().variables()
-    }
-
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if self.covering_proposals {
-            self.program.fallback().proposal_coverage(variable, bound)
-        } else {
-            ProposalCoverage::None
-        }
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.program.fallback().estimate(variable, view, out)
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.program.fallback().propose(variable, view, candidates);
-    }
-
-    fn confirm(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.program.fallback().confirm(variable, view, candidates);
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        self.program.fallback().satisfied(view)
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::preferred(&self.program))
-    }
-}
-
-#[derive(Clone)]
 struct PageTraceFilter {
     variable: VariableId,
     estimate: usize,
@@ -784,7 +675,6 @@ fn covering_target_confirm_root(
     bound: Inline<GenId>,
     candidates: Vec<RawInline>,
     ops: &[PathOp],
-    support_routes: Arc<AtomicUsize>,
 ) -> Root {
     let start_var = Variable::<GenId>::new(START);
     let end_var = Variable::<GenId>::new(END);
@@ -797,15 +687,7 @@ fn covering_target_confirm_root(
             unbound_estimate: 4,
             values: candidates,
         })) as DynConstraint,
-        Box::new(ProbedConfirmRpq {
-            program: PreferredProgram::new(
-                SupportRouteProbe {
-                    calls: support_routes,
-                },
-                rpq,
-            ),
-            covering_proposals: false,
-        }) as DynConstraint,
+        Box::new(rpq) as DynConstraint,
     ]))
 }
 
@@ -814,7 +696,6 @@ fn covering_chunk_target_confirm_root(
     bound: Inline<GenId>,
     candidates: Vec<RawInline>,
     ops: &[PathOp],
-    support_routes: Arc<AtomicUsize>,
     suffix: DynConstraint,
 ) -> Root {
     let start = Variable::<GenId>::new(START);
@@ -828,15 +709,7 @@ fn covering_chunk_target_confirm_root(
             unbound_estimate: 4,
             values: candidates,
         })) as DynConstraint,
-        Box::new(ProbedConfirmRpq {
-            program: PreferredProgram::new(
-                SupportRouteProbe {
-                    calls: support_routes,
-                },
-                rpq,
-            ),
-            covering_proposals: false,
-        }) as DynConstraint,
+        Box::new(rpq) as DynConstraint,
         suffix,
     ]))
 }
@@ -3209,14 +3082,12 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
         graph.value(reachable[0]).raw,
         graph.value(reachable[0]).raw,
     ];
-    let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
         covering_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
             &repeated(graph.attribute, false),
-            Arc::clone(&support_routes),
         )
     };
     let mut query = Query::new(make(), project_end).solve_residual_state_lazy();
@@ -3234,7 +3105,6 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
         "one positive witness must publish exactly one row"
     );
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 1);
-    assert_eq!(support_routes.load(Ordering::Relaxed), 1);
     let early_examined = query.stats().delta_transition_candidates_examined;
 
     let mut actual = vec![first];
@@ -3263,25 +3133,18 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
 fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let candidates = vec![[0; 32], graph.value(1).raw, [u8::MAX; 32]];
-    let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
         covering_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
             &repeated(graph.attribute, false),
-            Arc::clone(&support_routes),
         )
     };
     let mut query = Query::new(make(), project_end).solve_residual_state_lazy();
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     assert_eq!(actual, [graph.value(1).raw]);
-    assert_eq!(
-        support_routes.load(Ordering::Relaxed),
-        1,
-        "v1 must select exactly one occurrence-zero Support route"
-    );
     assert_eq!(
         query.stats().delta_direct_terminal_publication_batches,
         0,
@@ -3473,14 +3336,12 @@ fn target_confirm_positive_support_classifies_a_relational_prefix_commit() {
         absent,
         graph.value(2).raw,
     ];
-    let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
         covering_chunk_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
             &repeated(graph.attribute, false),
-            Arc::clone(&support_routes),
             // This exact ordinary sibling remains after the RPQ activation,
             // making the successful hedge's continuation
             // a relational prefix rather than Terminal.
@@ -3510,11 +3371,6 @@ fn target_confirm_positive_support_classifies_a_relational_prefix_commit() {
         query.stats().delta_transition_candidates_examined > early_examined,
         "the exact Confirm remainder must stay live after the chunk yield"
     );
-    assert_eq!(
-        support_routes.load(Ordering::Relaxed),
-        1,
-        "the production policy must select occurrence-zero Support once"
-    );
 }
 
 #[test]
@@ -3523,14 +3379,12 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
     let first = graph.value(1).raw;
     let survivor = graph.value(3).raw;
     let candidates = vec![first, survivor, [u8::MAX; 32]];
-    let support_routes = Arc::new(AtomicUsize::new(0));
     let make = |calls| {
         covering_chunk_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
             &repeated(graph.attribute, false),
-            Arc::clone(&support_routes),
             Box::new(CandidateValueTraceFilter {
                 variable: END,
                 accepted: survivor,
@@ -3544,11 +3398,6 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
     assert_eq!(actual, [survivor]);
-    assert_eq!(
-        support_routes.load(Ordering::Relaxed),
-        1,
-        "only original occurrence zero may open a Support hedge"
-    );
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
     let calls = calls.lock().expect("candidate-value trace poisoned");
     let first_visits = calls
@@ -3573,24 +3422,17 @@ fn target_confirm_nullable_support_seed_is_not_publication_authority() {
     let graph = Graph::new(2, &[(0, 1)]);
     let start = graph.value(0).raw;
     let candidates = vec![start, start, start];
-    let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
         covering_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
             &[PathOp::Attr(graph.attribute.raw()), PathOp::Star],
-            Arc::clone(&support_routes),
         )
     };
     let mut query = Query::new(make(), project_end).solve_residual_state_lazy();
     let actual: Vec<_> = query.by_ref().collect();
     assert_eq!(actual, [start]);
-    assert_eq!(
-        support_routes.load(Ordering::Relaxed),
-        1,
-        "v1 must select only occurrence-zero Support"
-    );
     assert_eq!(
         query.stats().delta_direct_terminal_publication_batches,
         0,
@@ -3626,7 +3468,6 @@ fn forward_exact_confirm_nullable_seed_stays_on_the_late_exact_path() {
 fn positive_support_gate_precedes_partial_rpq_optimistic_support_selection() {
     let graph = Graph::new(5, &[(4, 0), (1, 2), (2, 3)]);
     let candidates = vec![graph.value(0).raw, graph.value(1).raw];
-    let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
         let start = Variable::<GenId>::new(START);
         let end = Variable::<GenId>::new(END);
@@ -3643,15 +3484,7 @@ fn positive_support_gate_precedes_partial_rpq_optimistic_support_selection() {
                 unbound_estimate: 0,
                 values: candidates.clone(),
             })) as DynConstraint,
-            Box::new(ProbedConfirmRpq {
-                program: PreferredProgram::new(
-                    SupportRouteProbe {
-                        calls: Arc::clone(&support_routes),
-                    },
-                    rpq,
-                ),
-                covering_proposals: true,
-            }) as DynConstraint,
+            Box::new(rpq) as DynConstraint,
         ]))
     };
     let mut query = Query::new(make(), project_pair).solve_residual_state_lazy();
@@ -3663,11 +3496,6 @@ fn positive_support_gate_precedes_partial_rpq_optimistic_support_selection() {
     ];
     expected.sort_unstable();
     assert_eq!(actual, expected);
-    assert_eq!(
-        support_routes.load(Ordering::Relaxed),
-        0,
-        "the full-bound gate must precede optimistic partial Support selection"
-    );
     assert!(
         query.stats().confirm_calls > 0
             && query.stats().candidates_confirmed >= candidates.len()

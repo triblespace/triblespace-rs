@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: typed Programs now erase exactly one semantic family and execute
+  one native step.** The never-used `PreferredProgram` left-biased
+  composition, route-arm addresses, generic physical-step negotiation,
+  placement receipts, and placement telemetry are removed. `ProgramRef`
+  directly names one `TypedProgramSpec`; backend-specific acceleration such as
+  WGPU Succinct confirmation ranks remains on its ordinary constraint path.
 - **Breaking: unrouted finite GPU adapters are removed.** The public
   `typed_program` and `value_route` experiments, their placement knobs,
   per-snapshot lease/prewarm state, and bespoke route tests are deleted.
@@ -167,11 +173,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Directed singleton Program chains can spend one scheduler grant locally.**
   An unjoined streaming activation may consume exact same-cohort sole children
   inside its producing receipt until the original work budget is exhausted or
-  a direct page effect, resume, placement, dispatch change, or join boundary
-  is reached. Accepting sole-child endpoints are SET-admitted at the final
-  receipt in their original page order. The producer registry still observes
-  one affine replacement, while global cohorts retain their existing
-  scheduling behavior.
+  a direct page effect, resume, dispatch change, or join boundary is reached.
+  Accepting sole-child endpoints are SET-admitted at the final receipt in their
+  original page order. The producer registry still observes one affine
+  replacement, while global cohorts retain their existing scheduling behavior.
 - **Typed Program activation retirement scans its arena at most once per
   cohort.** A fully drained arena retires immediately; singleton receipts keep
   their allocation-free one-entry scan, while wider live arenas build
@@ -378,15 +383,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain intersections as well. Coverage, rather than estimates, selects a
   source; Covering proposals retain self-confirmation, while Exact proposals
   may discharge it. Approximate ANN publishes no exact source receipt.
-- **Typed Program capabilities compose by immutable semantic route arm.**
-  `PreferredProgram` chooses a preferred typed family only when that family
-  structurally owns an action, otherwise choosing a canonical typed fallback
-  before runtime construction. The private arm is part of the occurrence-local
-  Program address, while each selected child keeps its own state and novelty
-  arena unchanged. A physical backend decline therefore runs that same child's
-  Native step and never crosses into the semantic fallback. Direct programs
-  retain the original single-trait-object `ProgramRef` and unchanged runtime;
-  composition adds no state enum, handle tag, or per-row dispatch.
 - **Typed Program novelty commits from one fully validated batch plan.** The
   erased adapter now checks batch-local repetitions before consulting runtime
   novelty, records first admissions in receipt order, and mutates runtime state

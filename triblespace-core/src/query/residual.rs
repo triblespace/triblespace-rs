@@ -1836,18 +1836,6 @@ pub struct ResidualStateStats {
     /// whether from geometric negative-work feedback or a confirmed projected-
     /// demand floor. Saturated attempts do not increment this counter.
     pub width_increases: usize,
-    /// Successful non-Native typed Program cohort placements.
-    pub delta_program_physical_cohorts: usize,
-    /// Affine Program inputs carried by successful non-Native placements.
-    pub delta_program_physical_rows: usize,
-    /// Exact per-input work limits granted to successful non-Native placements.
-    pub delta_program_physical_granted_work: usize,
-    /// Largest number of affine Program inputs in one successful non-Native
-    /// placement.
-    pub max_delta_program_physical_cohort: usize,
-    /// Largest sum of exact per-input work limits granted to one successful
-    /// non-Native placement.
-    pub max_delta_program_physical_granted_work: usize,
     /// Additional same-lineage Program child pages consumed inside the
     /// producing directed receipt while staying within its original grant.
     pub delta_program_receipt_local_fused_steps: usize,
