@@ -32,10 +32,12 @@
 //! key, its next pop recomputes physical width from the whole merged bucket.
 //! A bucket that fills search width runs an ordinary full chunk, including
 //! older equal-future work; an underfilled bucket probes one atom from the
-//! newly filed receipt. Only the successor key remains preferred, so no frozen
-//! receipt mode or occupancy survives across transitions. Readiness pops and
-//! planning-state splits do not themselves activate a sprint. The preference
-//! is not part of canonical state identity. Ready and
+//! newly filed receipt. Only a scalar pop carries preference into its
+//! successor. A true full chunk at width greater than one returns to ordinary
+//! full-action arbitration; width one remains scalar and depth-first. Thus no
+//! frozen receipt mode or occupancy survives across transitions. Readiness
+//! pops and planning-state splits do not themselves activate a sprint. The
+//! preference is not part of canonical state identity. Ready and
 //! Propose states measure parent rows. Candidate and Confirm states measure and
 //! split SET-admitted candidate occurrences. They remain parent-atomic only
 //! while a selected typed Program route must reuse one complete parent
@@ -44,9 +46,10 @@
 //! selected parent block.
 //! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
 //! Lazy width is unchanged while nonempty successors advance. Once a partial
-//! action activates a preferred key, its recomputed canonical chunks outrank
-//! cold siblings until the lineage emits or dies. Search width grows
-//! geometrically after negative work. A separate
+//! action activates a preferred key, scalar steps outrank cold siblings until
+//! the path emits, dies, or reaches a true full chunk. That full chunk then
+//! rejoins ordinary arbitration. Search width grows geometrically after
+//! negative work. A separate
 //! projected-result window grows only after the caller consumes the whole
 //! window and pulls again; that confirmed promotion floors search width at the
 //! new demand window without treating emission itself as search feedback.
@@ -9785,8 +9788,9 @@ enum MachineStep {
         /// reducer. Staging remains the outer iterator's responsibility.
         publication: Option<TerminalPublicationBatch>,
         /// Last newly filed live cyclic activation. The outer scheduler may
-        /// arm it only when the selected action was already in a scalar
-        /// continuation sprint.
+        /// arm it when the seed transferred exactly one affine parent, so the
+        /// token names the complete new activation rather than an arbitrary
+        /// member of a wider cohort.
         active: Option<ActiveDeltaContinuation>,
         /// Exact affine parents transferred by the selected action. One delta
         /// activation is created per parent; a last-filed token therefore
@@ -10383,8 +10387,9 @@ struct ResidualStateMachine {
     emit_count: usize,
     /// Preferred canonical key activated by a partially surviving full action
     /// or a delta-to-stable handoff. Each pop recomputes its physical width
-    /// from current canonical occupancy; only this key preference remains
-    /// outside canonical state identity.
+    /// from current canonical occupancy. Only a scalar pop passes key
+    /// preference to its successor; a true full chunk uses ordinary Full
+    /// arbitration. The key remains outside canonical state identity.
     continuation: Option<ContinuationToken>,
     /// Exact cyclic activation created while probing one stable continuation
     /// atom. This is a physical latency preference only; all logical work
@@ -10787,8 +10792,10 @@ impl ResidualStateMachine {
     /// ordinary full-canonical suffix of `S` atoms runs, including older
     /// equal-future work when necessary. Otherwise one atom from the receipt
     /// probes a latency path without claiming that the underfilled bucket is
-    /// readiness-closed. Only the successor key propagates; the full/probe
-    /// decision and receipt occupancy are recomputed at every pop.
+    /// readiness-closed. The full/probe decision and receipt occupancy are
+    /// recomputed at every pop. Scalar means `take == 1`, including the
+    /// width-one full case; only scalar pops pass preference to their
+    /// successor.
     fn take_preferred(
         &mut self,
         plan: &ResidualPlan,
@@ -10851,7 +10858,11 @@ impl ResidualStateMachine {
         debug_assert_eq!(chunk.occupancy(candidate_pages), take);
 
         self.stats.state_pops += 1;
-        self.last_selection = SelectionKind::Preferred;
+        self.last_selection = if take == 1 {
+            SelectionKind::Preferred
+        } else {
+            SelectionKind::Full
+        };
         if full {
             self.stats.full_pops += 1;
         } else {
@@ -11938,13 +11949,33 @@ impl ResidualStateMachine {
         let successor_is_underfilled =
             continuation.occupancy(desc, plan, &self.interner.formula_pcs) < width.max(1);
         match self.last_selection {
-            // Preserve only the preferred successor key. Its actual chunk is
-            // chosen from fresh canonical occupancy on the next pop.
+            // A scalar preferred pop preserves only its successor key. Its
+            // actual chunk is chosen from fresh canonical occupancy next.
             SelectionKind::Preferred => Some(continuation),
             SelectionKind::Full if self.last_was_action && successor_is_underfilled => {
                 Some(continuation)
             }
             SelectionKind::Full | SelectionKind::Readiness => None,
+        }
+    }
+
+    /// Returns a yielding producer to ordinary delta arbitration after its
+    /// stable handoff has run as a true full chunk.
+    ///
+    /// `active_delta` is only a non-owning physical preference; the delta
+    /// registry and worklist retain the affine credit. Stable dispatch is
+    /// synchronous, so the full task has settled or synchronously refiled
+    /// before this hook runs and no persistent blocked-lease state is needed.
+    /// Public-demand preferences do not set `active_delta_after_yield` and are
+    /// therefore preserved.
+    fn release_yielding_delta_preference_after_full(&mut self) {
+        debug_assert!(
+            !self.active_delta_after_yield || self.active_delta.is_some(),
+            "yield-marked delta preference lost its active token"
+        );
+        if self.last_selection == SelectionKind::Full && self.active_delta_after_yield {
+            self.active_delta = None;
+            self.active_delta_after_yield = false;
         }
     }
 
@@ -12159,11 +12190,14 @@ impl ResidualStateMachine {
             }
 
             let width = self.width;
-            // A newly seeded activation on the scalar continuation path is
-            // the cyclic analogue of a preferred stable key: follow that
-            // exact affine lineage before any cold stable cohort. It owns no work;
-            // dropping the token merely returns scheduling to the global
-            // typed Program worklist.
+            // A newly seeded singleton activation is the cyclic analogue of a
+            // preferred stable key: follow that exact affine lineage before
+            // any cold stable cohort. It owns no work; dropping the token
+            // merely returns scheduling to the global typed Program worklist.
+            // Stable dispatch is synchronous, so when a true full pop declines
+            // successor preference below, that whole task has already settled
+            // or refiled and this lease may return to ordinary arbitration
+            // without a separate blocked marker.
             if self.continuation.is_none() {
                 if let Some(active) = self.active_delta.take() {
                     self.stats.delta_active_lease_steps += 1;
@@ -12250,14 +12284,16 @@ impl ResidualStateMachine {
                 self.accept_delta_step(outcome);
                 continue;
             }
-            match self.pop_once_with_dispatch(
+            let step = self.pop_once_with_dispatch(
                 dispatch,
                 root,
                 plan,
                 influences,
                 base_estimates,
                 width,
-            ) {
+            );
+            self.release_yielding_delta_preference_after_full();
+            match step {
                 MachineStep::Stable(StepOutcome::Advanced(continuation)) => {
                     self.continuation = self.continuation_after_advanced(plan, width, continuation);
                 }
@@ -29116,6 +29152,11 @@ mod tests {
             assert_eq!(current.stats.full_pops, 1);
             assert_eq!(current.stats.continuation_pops, 0);
             assert_eq!(current.stats.preferred_probe_pops, 0);
+            assert_eq!(
+                current.last_selection,
+                SelectionKind::Full,
+                "a true full preferred chunk at width greater than one rejoins Full arbitration"
+            );
 
             let StateBucket::Rows(remainder) = current
                 .worklist
@@ -29206,6 +29247,88 @@ mod tests {
         assert_eq!(machine.stats.continuation_pops, 1);
         assert_eq!(machine.stats.full_pops, 1);
         assert_eq!(machine.stats.preferred_probe_pops, 1);
+        assert_eq!(
+            machine.last_selection,
+            SelectionKind::Full,
+            "the recomputed full successor must not preserve scalar ancestry"
+        );
+
+        let next = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(1),
+            StateBucket::Rows(RowBatch {
+                rows: vec![raw(70)],
+                row_count: 1,
+            }),
+            &mut machine.stats,
+        )
+        .expect("the full task filed a nonempty successor");
+        assert_eq!(
+            machine.continuation_after_advanced(&plan, machine.width, next),
+            None,
+            "a full planning pop must use ordinary Full successor arbitration"
+        );
+    }
+
+    #[test]
+    fn preferred_width_one_full_pop_remains_scalar_and_depth_first() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile(&root);
+        let desc = ready_desc(1);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
+        machine.width = 1;
+
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: [10, 11].map(raw).into(),
+                row_count: 2,
+            }),
+            &mut machine.stats,
+        );
+        let preferred = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: [40, 41].map(raw).into(),
+                row_count: 2,
+            }),
+            &mut machine.stats,
+        )
+        .expect("width-one preferred receipt is nonempty");
+        let task = machine.take_preferred(&plan, preferred, machine.width);
+        let StateBucket::Rows(rows) = task.bucket else {
+            panic!("width-one preferred pop changed payload shape")
+        };
+        assert_eq!(rows.rows, [raw(41)]);
+        assert_eq!(machine.stats.full_pops, 1);
+        assert_eq!(machine.stats.continuation_pops, 0);
+        assert_eq!(machine.last_selection, SelectionKind::Preferred);
+
+        let successor = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc,
+            StateBucket::Rows(RowBatch {
+                rows: vec![raw(50)],
+                row_count: 1,
+            }),
+            &mut machine.stats,
+        )
+        .expect("width-one successor is nonempty");
+        assert_eq!(
+            machine.continuation_after_advanced(&plan, machine.width, successor),
+            Some(successor),
+            "width one is a scalar DFS step even when canonical occupancy fills S"
+        );
     }
 
     #[test]
@@ -29429,10 +29552,125 @@ mod tests {
     }
 
     #[test]
+    fn true_full_preferred_pop_needs_no_blocked_delta_lease_marker() {
+        let root = FanoutLeaf {
+            variable: 0,
+            values: Arc::new(vec![raw(1)]),
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
+        machine.width = 2;
+        let program = PagedProposalLeaf {
+            variable: 0,
+            values: Arc::new(vec![raw(9)]),
+            proposes: Arc::new(AtomicUsize::new(0)),
+            pages: Arc::new(AtomicUsize::new(0)),
+            action_log: None,
+        };
+        let active = seed_test_program_proposal(&program, &mut machine, &plan, root.variables());
+        assert!(machine.worklist.is_empty());
+        machine.active_delta = Some(active);
+        machine.active_delta_after_yield = true;
+
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(0),
+            StateBucket::Rows(RowBatch::seed()),
+            &mut machine.stats,
+        );
+        let preferred = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(0),
+            StateBucket::Rows(RowBatch::seed()),
+            &mut machine.stats,
+        )
+        .expect("the second stable receipt is nonempty");
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+        let task = machine.take_preferred(&plan, preferred, machine.width);
+        assert_eq!(machine.last_selection, SelectionKind::Full);
+        machine.last_was_action = task.is_action_for_plan(&plan, &machine.interner);
+        assert!(!machine.last_was_action);
+        let MachineStep::Stable(StepOutcome::Advanced(successor)) =
+            machine.execute_selected_task(&root, &plan, task, &influences, &base_estimates)
+        else {
+            panic!("the full Ready task did not settle into its proposal action")
+        };
+        machine.release_yielding_delta_preference_after_full();
+        machine.continuation = machine.continuation_after_advanced(&plan, machine.width, successor);
+        assert!(
+            machine.continuation.is_none(),
+            "a true full planning task must not leave a preferred blocking marker"
+        );
+        assert!(
+            machine.active_delta.is_none() && !machine.active_delta_after_yield,
+            "the yielding producer must return to ordinary arbitration"
+        );
+
+        // The released token must still name runnable scheduler work. Compare
+        // exhausting it directly with letting an otherwise identical cold
+        // scheduler choose the same sole activation globally.
+        let mut directed = machine.clone();
+        let directed_step = directed.delta.step_active_bounded(
+            &program,
+            &plan,
+            active,
+            directed.width,
+            None,
+            &mut directed.worklist,
+            &mut directed.interner,
+            &mut directed.stats,
+        );
+        let cold_step = machine.delta.step_bounded(
+            &program,
+            &plan,
+            machine.width,
+            None,
+            &mut machine.worklist,
+            &mut machine.interner,
+            &mut machine.stats,
+        );
+        assert_eq!(
+            directed_step.status,
+            ActiveDeltaStatus::Yielded,
+            "the old lease must still identify a runnable activation"
+        );
+        assert!(directed_step.resume.is_none());
+        assert_eq!(
+            directed_step.outcome.continuation, cold_step.continuation,
+            "directed and cold arbitration must transfer the same exact stable receipt"
+        );
+        assert!(directed.delta.is_empty());
+        assert!(machine.delta.is_empty());
+        assert_eq!(
+            directed.stats.delta_source_pages, machine.stats.delta_source_pages,
+            "the released activation must retain its exact bounded source receipt"
+        );
+        assert_eq!(
+            directed.stats.delta_source_candidates_examined,
+            machine.stats.delta_source_candidates_examined,
+            "lease arbitration must not duplicate or lose source candidates"
+        );
+    }
+
+    #[test]
     fn full_action_successor_that_fills_width_returns_to_global_batching() {
         let root = CapabilityLeaf { variable: 127 };
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
+        let underfilled = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(0),
+            ready_bucket(0, 1, 7),
+            &mut machine.stats,
+        )
+        .unwrap();
         let successor = file(
             &mut machine.worklist,
             &mut machine.interner,
@@ -29453,6 +29691,11 @@ mod tests {
 
         machine.last_selection = SelectionKind::Full;
         machine.last_was_action = true;
+        assert_eq!(
+            machine.continuation_after_advanced(&plan, 2, underfilled),
+            Some(underfilled),
+            "ordinary Full action arbitration may prefer an underfilled successor"
+        );
         assert_eq!(
             machine.continuation_after_advanced(&plan, 2, successor),
             None,
