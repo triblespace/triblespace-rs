@@ -33,11 +33,12 @@
 //! A bucket that fills search width runs an ordinary full chunk, including
 //! older equal-future work; an underfilled bucket probes one atom from the
 //! newly filed receipt. Only a scalar pop carries preference into its
-//! successor. A true full chunk at width greater than one returns to ordinary
-//! full-action arbitration; width one remains scalar and depth-first. Thus no
-//! frozen receipt mode or occupancy survives across transitions. Readiness
-//! pops and planning-state splits do not themselves activate a sprint. The
-//! preference is not part of canonical state identity. Ready and
+//! successor. A true full chunk at width greater than one returns directly to
+//! global arbitration without inheriting the separate ordinary-Full action
+//! sprint; width one remains scalar and depth-first. Thus no frozen receipt
+//! mode or occupancy survives across transitions. Readiness pops and
+//! planning-state splits do not themselves activate a sprint. The preference
+//! is not part of canonical state identity. Ready and
 //! Propose states measure parent rows. Candidate and Confirm states measure and
 //! split SET-admitted candidate occurrences. They remain parent-atomic only
 //! while a selected typed Program route must reuse one complete parent
@@ -7472,7 +7473,8 @@ fn prefer_continuation(
 enum SelectionKind {
     Full,
     Readiness,
-    Preferred,
+    PreferredScalar,
+    PreferredFull,
 }
 
 fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize) -> RowsView<'v> {
@@ -10388,8 +10390,8 @@ struct ResidualStateMachine {
     /// Preferred canonical key activated by a partially surviving full action
     /// or a delta-to-stable handoff. Each pop recomputes its physical width
     /// from current canonical occupancy. Only a scalar pop passes key
-    /// preference to its successor; a true full chunk uses ordinary Full
-    /// arbitration. The key remains outside canonical state identity.
+    /// preference to its successor; a true full chunk returns directly to
+    /// global arbitration. The key remains outside canonical state identity.
     continuation: Option<ContinuationToken>,
     /// Exact cyclic activation created while probing one stable continuation
     /// atom. This is a physical latency preference only; all logical work
@@ -10795,7 +10797,8 @@ impl ResidualStateMachine {
     /// readiness-closed. The full/probe decision and receipt occupancy are
     /// recomputed at every pop. Scalar means `take == 1`, including the
     /// width-one full case; only scalar pops pass preference to their
-    /// successor.
+    /// successor. `PreferredFull` is one-pop provenance, not persistent
+    /// receipt state.
     fn take_preferred(
         &mut self,
         plan: &ResidualPlan,
@@ -10859,9 +10862,9 @@ impl ResidualStateMachine {
 
         self.stats.state_pops += 1;
         self.last_selection = if take == 1 {
-            SelectionKind::Preferred
+            SelectionKind::PreferredScalar
         } else {
-            SelectionKind::Full
+            SelectionKind::PreferredFull
         };
         if full {
             self.stats.full_pops += 1;
@@ -11945,17 +11948,17 @@ impl ResidualStateMachine {
         if !self.continuation_sprint_enabled {
             return None;
         }
-        let desc = self.interner.get(continuation.state);
-        let successor_is_underfilled =
-            continuation.occupancy(desc, plan, &self.interner.formula_pcs) < width.max(1);
         match self.last_selection {
             // A scalar preferred pop preserves only its successor key. Its
             // actual chunk is chosen from fresh canonical occupancy next.
-            SelectionKind::Preferred => Some(continuation),
-            SelectionKind::Full if self.last_was_action && successor_is_underfilled => {
-                Some(continuation)
+            SelectionKind::PreferredScalar => Some(continuation),
+            SelectionKind::Full if self.last_was_action => {
+                let desc = self.interner.get(continuation.state);
+                let successor_is_underfilled =
+                    continuation.occupancy(desc, plan, &self.interner.formula_pcs) < width.max(1);
+                successor_is_underfilled.then_some(continuation)
             }
-            SelectionKind::Full | SelectionKind::Readiness => None,
+            SelectionKind::Full | SelectionKind::Readiness | SelectionKind::PreferredFull => None,
         }
     }
 
@@ -11968,12 +11971,12 @@ impl ResidualStateMachine {
     /// before this hook runs and no persistent blocked-lease state is needed.
     /// Public-demand preferences do not set `active_delta_after_yield` and are
     /// therefore preserved.
-    fn release_yielding_delta_preference_after_full(&mut self) {
+    fn release_yielding_delta_preference_after_preferred_full(&mut self) {
         debug_assert!(
             !self.active_delta_after_yield || self.active_delta.is_some(),
             "yield-marked delta preference lost its active token"
         );
-        if self.last_selection == SelectionKind::Full && self.active_delta_after_yield {
+        if self.last_selection == SelectionKind::PreferredFull && self.active_delta_after_yield {
             self.active_delta = None;
             self.active_delta_after_yield = false;
         }
@@ -12292,7 +12295,7 @@ impl ResidualStateMachine {
                 base_estimates,
                 width,
             );
-            self.release_yielding_delta_preference_after_full();
+            self.release_yielding_delta_preference_after_preferred_full();
             match step {
                 MachineStep::Stable(StepOutcome::Advanced(continuation)) => {
                     self.continuation = self.continuation_after_advanced(plan, width, continuation);
@@ -16942,7 +16945,7 @@ mod tests {
         // path proves TerminalStreaming from the reducer and return payload;
         // the fixture does not forge a publication receipt.
         let relevant = ChildSet::empty(iter.plan.len()).with_inserted(1);
-        iter.state.last_selection = SelectionKind::Preferred;
+        iter.state.last_selection = SelectionKind::PreferredScalar;
         let seeded = iter
             .state
             .seed_delta_proposal(
@@ -29154,8 +29157,8 @@ mod tests {
             assert_eq!(current.stats.preferred_probe_pops, 0);
             assert_eq!(
                 current.last_selection,
-                SelectionKind::Full,
-                "a true full preferred chunk at width greater than one rejoins Full arbitration"
+                SelectionKind::PreferredFull,
+                "a true full preferred chunk retains only one-pop provenance"
             );
 
             let StateBucket::Rows(remainder) = current
@@ -29172,7 +29175,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_successor_recomputes_probe_then_full_without_frozen_mode() {
+    fn preferred_successor_recomputes_probe_then_full_and_returns_underfilled_action_cold() {
         let root = ShapeLeaf(0);
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
@@ -29249,7 +29252,7 @@ mod tests {
         assert_eq!(machine.stats.preferred_probe_pops, 1);
         assert_eq!(
             machine.last_selection,
-            SelectionKind::Full,
+            SelectionKind::PreferredFull,
             "the recomputed full successor must not preserve scalar ancestry"
         );
 
@@ -29265,10 +29268,11 @@ mod tests {
             &mut machine.stats,
         )
         .expect("the full task filed a nonempty successor");
+        machine.last_was_action = true;
         assert_eq!(
             machine.continuation_after_advanced(&plan, machine.width, next),
             None,
-            "a full planning pop must use ordinary Full successor arbitration"
+            "preferred-full provenance must return even an underfilled action successor to global arbitration"
         );
     }
 
@@ -29310,7 +29314,7 @@ mod tests {
         assert_eq!(rows.rows, [raw(41)]);
         assert_eq!(machine.stats.full_pops, 1);
         assert_eq!(machine.stats.continuation_pops, 0);
-        assert_eq!(machine.last_selection, SelectionKind::Preferred);
+        assert_eq!(machine.last_selection, SelectionKind::PreferredScalar);
 
         let successor = file(
             &mut machine.worklist,
@@ -29491,11 +29495,11 @@ mod tests {
         };
         let active = seed_test_program_proposal(&program, &mut machine, &plan, root.variables());
 
-        machine.last_selection = SelectionKind::Preferred;
+        machine.last_selection = SelectionKind::PreferredScalar;
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert_eq!(machine.active_delta, Some(active));
 
-        machine.last_selection = SelectionKind::Preferred;
+        machine.last_selection = SelectionKind::PreferredScalar;
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert_eq!(
             machine.active_delta,
@@ -29516,7 +29520,7 @@ mod tests {
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert_eq!(machine.active_delta, Some(active));
 
-        machine.last_selection = SelectionKind::Preferred;
+        machine.last_selection = SelectionKind::PreferredScalar;
         let stable = file(
             &mut machine.worklist,
             &mut machine.interner,
@@ -29592,7 +29596,7 @@ mod tests {
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [1; 128];
         let task = machine.take_preferred(&plan, preferred, machine.width);
-        assert_eq!(machine.last_selection, SelectionKind::Full);
+        assert_eq!(machine.last_selection, SelectionKind::PreferredFull);
         machine.last_was_action = task.is_action_for_plan(&plan, &machine.interner);
         assert!(!machine.last_was_action);
         let MachineStep::Stable(StepOutcome::Advanced(successor)) =
@@ -29600,7 +29604,7 @@ mod tests {
         else {
             panic!("the full Ready task did not settle into its proposal action")
         };
-        machine.release_yielding_delta_preference_after_full();
+        machine.release_yielding_delta_preference_after_preferred_full();
         machine.continuation = machine.continuation_after_advanced(&plan, machine.width, successor);
         assert!(
             machine.continuation.is_none(),

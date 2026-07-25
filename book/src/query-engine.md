@@ -202,8 +202,9 @@ recomputes from current canonical occupancy: a bucket that fills search width
 runs an ordinary full chunk, including older equal-future work, while an
 underfilled bucket probes one atom from the newest receipt. Only a scalar pop
 carries the successor key forward. A true full chunk at width greater than one
-returns to ordinary full-action arbitration; width one remains scalar and
-depth-first. Dead actions and terminal rows grow the desired width
+returns directly to global arbitration without inheriting the separate
+ordinary-Full action sprint; width one remains scalar and depth-first. Dead
+actions and terminal rows grow the desired width
 geometrically; once no preferred key can run, an occupancy/readiness policy
 harvests wider batches. This gives the state machine a low-latency-to-throughput
 ramp without requiring a complete intersection to run eagerly for one binding.
@@ -504,7 +505,7 @@ makes the exact proposer occurrence and remaining confirmer set part of
 canonical state so equivalent futures can reconverge after their selected
 actions run. At width one it follows the preferred key depth-first; as width
 grows it recoalesces equivalent futures into full canonical chunks and returns
-them to ordinary arbitration. Because every path refreshes estimates
+them directly to global arbitration. Because every path refreshes estimates
 during evaluation, binding order adapts whenever a constraint updates its
 influence set—there is no separate planning artifact to maintain.
 For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
