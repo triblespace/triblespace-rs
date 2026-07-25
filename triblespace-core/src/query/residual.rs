@@ -2652,6 +2652,27 @@ impl Drop for ShadowActionSpan {
     }
 }
 
+/// One flattened leaf-occurrence ID.
+///
+/// Canonical state names a future computation and nothing else, so every field
+/// reachable from [`StateDesc`] must be a structural term. A bare `usize` is
+/// also the type of cardinality estimates, examined-work counts, cohort widths,
+/// and row indices; this newtype prevents any of those physical quantities
+/// from entering canonical identity accidentally.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct LeafOccurrence(usize);
+
+impl LeafOccurrence {
+    /// Crosses one deterministic preorder leaf index into canonical identity.
+    const fn new(occurrence: usize) -> Self {
+        Self(occurrence)
+    }
+
+    const fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// A dynamic bitset of flattened leaf-occurrence IDs.
 ///
 /// Leaf identity is its deterministic preorder occurrence in the maximal root
@@ -2770,7 +2791,7 @@ enum ResidualPhase {
     Propose {
         variable: VariableId,
         relevant: ChildSet,
-        proposer: usize,
+        proposer: LeafOccurrence,
     },
     /// A variable has speculative candidates and some leaf occurrences have
     /// already accepted them. Plan the next confirmer per parent row.
@@ -2785,7 +2806,7 @@ enum ResidualPhase {
         variable: VariableId,
         relevant: ChildSet,
         checked: ChildSet,
-        confirmer: usize,
+        confirmer: LeafOccurrence,
     },
     /// One exact finite-formula continuation. Planning and opaque protocol
     /// actions share this identity; the focused program node distinguishes
@@ -2870,7 +2891,7 @@ impl StateDesc {
                 );
                 assert!(relevant.count() > 0, "residual relevant set is empty");
                 assert!(
-                    *proposer < leaf_count && relevant.contains(*proposer),
+                    proposer.index() < leaf_count && relevant.contains(proposer.index()),
                     "residual proposer is not relevant"
                 );
             }
@@ -2891,9 +2912,9 @@ impl StateDesc {
                 validate_variable(*variable);
                 validate_sets(relevant, checked);
                 assert!(
-                    *confirmer < leaf_count
-                        && relevant.contains(*confirmer)
-                        && !checked.contains(*confirmer),
+                    confirmer.index() < leaf_count
+                        && relevant.contains(confirmer.index())
+                        && !checked.contains(confirmer.index()),
                     "residual confirmer is not an unchecked relevant leaf"
                 );
             }
@@ -3060,9 +3081,9 @@ fn continuation_publication_receipt(
     let exact_successor = previous.bound == successor.bound
         && variable == successor_variable
         && relevant == successor_relevant
-        && relevant.contains(*confirmer)
-        && !checked.contains(*confirmer)
-        && successor_checked == &checked.clone().with_inserted(*confirmer);
+        && relevant.contains(confirmer.index())
+        && !checked.contains(confirmer.index())
+        && successor_checked == &checked.clone().with_inserted(confirmer.index());
     if !exact_successor {
         return ContinuationPublicationReceipt::Barrier;
     }
@@ -6369,8 +6390,8 @@ impl SelectedResidualTask {
     /// materialize executor geometry on the default path.
     fn is_action_for_plan(&self, plan: &ResidualPlan, interner: &StateInterner) -> bool {
         match &self.desc.phase {
-            ResidualPhase::Propose { proposer, .. } => !plan.has_finite_formula(*proposer),
-            ResidualPhase::Confirm { confirmer, .. } => !plan.has_finite_formula(*confirmer),
+            ResidualPhase::Propose { proposer, .. } => !plan.has_finite_formula(proposer.index()),
+            ResidualPhase::Confirm { confirmer, .. } => !plan.has_finite_formula(confirmer.index()),
             ResidualPhase::Formula { cursor } => {
                 matches!(
                     &interner.formula(*cursor).focus,
@@ -6406,10 +6427,10 @@ impl SelectedResidualTask {
                     variable, proposer, ..
                 },
                 StateBucket::Rows(_),
-            ) if !plan.has_finite_formula(*proposer) => (
+            ) if !plan.has_finite_formula(proposer.index()) => (
                 ResidualAction::Propose {
                     variable: *variable,
-                    leaf: *proposer,
+                    leaf: proposer.index(),
                 },
                 0,
             ),
@@ -6420,10 +6441,10 @@ impl SelectedResidualTask {
                     ..
                 },
                 StateBucket::Candidates(batch),
-            ) if !plan.has_finite_formula(*confirmer) => (
+            ) if !plan.has_finite_formula(confirmer.index()) => (
                 ResidualAction::Confirm {
                     variable: *variable,
-                    leaf: *confirmer,
+                    leaf: confirmer.index(),
                 },
                 batch.candidate_count(),
             ),
@@ -6461,12 +6482,12 @@ impl SelectedResidualTask {
             }
             (ResidualPhase::Ready | ResidualPhase::Candidate { .. }, _) => return None,
             (ResidualPhase::Propose { proposer, .. }, StateBucket::Rows(_))
-                if plan.has_finite_formula(*proposer) =>
+                if plan.has_finite_formula(proposer.index()) =>
             {
                 return None;
             }
             (ResidualPhase::Confirm { confirmer, .. }, StateBucket::Candidates(_))
-                if plan.has_finite_formula(*confirmer) =>
+                if plan.has_finite_formula(confirmer.index()) =>
             {
                 return None;
             }
@@ -6888,7 +6909,7 @@ fn ready_plan_transition<'a>(
                 phase: ResidualPhase::Propose {
                     variable: variable_plan.variable,
                     relevant: variable_plan.relevant.clone(),
-                    proposer: action.leaf,
+                    proposer: LeafOccurrence::new(action.leaf),
                 },
             },
             StateBucket::Rows(selected),
@@ -7190,7 +7211,7 @@ fn candidate_plan_transition<'a>(
                     variable,
                     relevant: relevant.clone(),
                     checked: checked.clone(),
-                    confirmer,
+                    confirmer: LeafOccurrence::new(confirmer),
                 },
             },
             StateBucket::Candidates(selected),
@@ -8538,7 +8559,7 @@ fn execute_task<'a>(
             },
             StateBucket::Rows(rows),
         ) => {
-            if !plan.has_finite_formula(*proposer) {
+            if !plan.has_finite_formula(proposer.index()) {
                 stats.propose_action_pops += 1;
             }
             let continuation = propose_action_transition(
@@ -8547,7 +8568,7 @@ fn execute_task<'a>(
                 &desc,
                 *variable,
                 relevant,
-                *proposer,
+                proposer.index(),
                 rows,
                 next_activation,
                 worklist,
@@ -8586,7 +8607,7 @@ fn execute_task<'a>(
             },
             StateBucket::Candidates(batch),
         ) => {
-            if !plan.has_finite_formula(*confirmer) {
+            if !plan.has_finite_formula(confirmer.index()) {
                 stats.confirm_action_pops += 1;
             }
             let continuation = confirm_action_transition(
@@ -8596,7 +8617,7 @@ fn execute_task<'a>(
                 *variable,
                 relevant,
                 checked,
-                *confirmer,
+                confirmer.index(),
                 batch,
                 next_activation,
                 worklist,
@@ -9569,16 +9590,17 @@ impl ResidualStateMachine {
 
         // Formula actions enter the same cyclic stratum through their own
         // suspension path below; this hook owns ordinary opaque leaf actions.
-        if plan.has_finite_formula(*proposer) {
+        if plan.has_finite_formula(proposer.index()) {
             return Err(task);
         }
 
-        let checked = plan.initial_proposal_checked(root, *proposer, *variable, task.desc.bound);
+        let checked =
+            plan.initial_proposal_checked(root, proposer.index(), *variable, task.desc.bound);
         if !plan.remaining_confirms_accept_pages(relevant, &checked, *variable, task.desc.bound) {
             return Err(task);
         }
         let variable = *variable;
-        let proposer = *proposer;
+        let proposer = proposer.index();
         let relevant = relevant.clone();
         let successor = StateDesc {
             bound: task.desc.bound,
@@ -9696,17 +9718,17 @@ impl ResidualStateMachine {
         // Lowered finite formulas own their own action reducer. Any ordinary
         // opaque confirmer may offer a typed Program; absence falls back to
         // the ordinary protocol below.
-        if plan.has_finite_formula(*confirmer) {
+        if plan.has_finite_formula(confirmer.index()) {
             return Err(task);
         }
         let planned_program_confirm = program_confirm_is_active(
-            &plan.program_confirm_requirements[*confirmer],
+            &plan.program_confirm_requirements[confirmer.index()],
             *variable,
             task.desc.bound,
         );
 
         let variable = *variable;
-        let confirmer = *confirmer;
+        let confirmer = confirmer.index();
         let relevant = relevant.clone();
         let checked = checked.clone();
         let constraint = plan.resolve(root, confirmer);
@@ -14590,7 +14612,7 @@ mod tests {
                 else {
                     panic!("Ready planning filed a non-proposal state")
                 };
-                actions.push((variable, proposer, bucket.row_count()));
+                actions.push((variable, proposer.index(), bucket.row_count()));
             }
         }
         actions.sort_unstable();
@@ -14635,7 +14657,7 @@ mod tests {
                 else {
                     panic!("Ready planning filed a non-proposal state")
                 };
-                actions.push((variable, proposer, bucket.row_count()));
+                actions.push((variable, proposer.index(), bucket.row_count()));
             }
         }
         actions.sort_unstable();
@@ -14853,7 +14875,7 @@ mod tests {
             phase: ResidualPhase::Propose {
                 variable: 0,
                 relevant: ChildSet::empty(1).with_inserted(0),
-                proposer: 0,
+                proposer: LeafOccurrence::new(0),
             },
         };
         let mut next_activation = 0;
@@ -16233,7 +16255,7 @@ mod tests {
             ResidualPhase::Propose {
                 variable: 0,
                 relevant: relevant.clone(),
-                proposer: 1,
+                proposer: LeafOccurrence::new(1),
             },
         );
         let start = formula_pcs.start_with_proposer_checked(
@@ -16327,7 +16349,7 @@ mod tests {
                 variable: 0,
                 relevant: relevant.clone(),
                 checked: checked.clone(),
-                confirmer: 1,
+                confirmer: LeafOccurrence::new(1),
             },
         );
         let confirm_start =
@@ -17211,7 +17233,7 @@ mod tests {
                     variable,
                     relevant: relevant.clone(),
                     checked,
-                    confirmer,
+                    confirmer: LeafOccurrence::new(confirmer),
                 },
             },
             StateDesc {
@@ -17365,7 +17387,7 @@ mod tests {
                 variable: 0,
                 relevant: formula_relevant,
                 checked: formula_checked,
-                confirmer: 0,
+                confirmer: LeafOccurrence::new(0),
             },
         };
         let formula_successor = StateDesc {
@@ -17492,7 +17514,7 @@ mod tests {
                 phase: ResidualPhase::Propose {
                     variable: VARIABLE,
                     relevant: relevant.clone(),
-                    proposer: 0,
+                    proposer: LeafOccurrence::new(0),
                 },
             },
             bucket: StateBucket::Rows(RowBatch {
@@ -17554,7 +17576,7 @@ mod tests {
                     variable: VARIABLE,
                     relevant,
                     checked,
-                    confirmer: 1,
+                    confirmer: LeafOccurrence::new(1),
                 },
             },
             bucket: StateBucket::Candidates(candidate_batch()),
@@ -22238,7 +22260,7 @@ mod tests {
             phase: ResidualPhase::Propose {
                 variable: 127,
                 relevant,
-                proposer: 0,
+                proposer: LeafOccurrence::new(0),
             },
         };
         file(
@@ -22310,7 +22332,7 @@ mod tests {
                     variable: 127,
                     relevant,
                     checked,
-                    confirmer: 1,
+                    confirmer: LeafOccurrence::new(1),
                 },
             }
         }
@@ -22448,7 +22470,7 @@ mod tests {
             phase: ResidualPhase::Propose {
                 variable: 0,
                 relevant: relevant.clone(),
-                proposer: 0,
+                proposer: LeafOccurrence::new(0),
             },
         };
         let mut worklist = Worklist::new();
@@ -22502,7 +22524,7 @@ mod tests {
                 variable: 0,
                 relevant: relevant.clone(),
                 checked: checked.clone(),
-                confirmer: 1,
+                confirmer: LeafOccurrence::new(1),
             },
         };
         let mut worklist = Worklist::new();
@@ -22557,7 +22579,7 @@ mod tests {
                 variable: 0,
                 relevant: relevant.clone(),
                 checked: checked.clone(),
-                confirmer: 0,
+                confirmer: LeafOccurrence::new(0),
             },
         };
         let mut worklist = Worklist::new();
@@ -22647,7 +22669,7 @@ mod tests {
             phase: ResidualPhase::Propose {
                 variable: 0,
                 relevant,
-                proposer: 0,
+                proposer: LeafOccurrence::new(0),
             },
         };
 
@@ -22688,7 +22710,7 @@ mod tests {
             phase: ResidualPhase::Propose {
                 variable: VARIABLE,
                 relevant,
-                proposer: 0,
+                proposer: LeafOccurrence::new(0),
             },
         };
         let mut worklist = Worklist::new();
@@ -23253,7 +23275,7 @@ mod tests {
                 phase: ResidualPhase::Propose {
                     variable: 4,
                     relevant: relevant.clone(),
-                    proposer: 0,
+                    proposer: LeafOccurrence::new(0),
                 },
                 ..candidate.clone()
             },
@@ -23261,7 +23283,7 @@ mod tests {
                 phase: ResidualPhase::Propose {
                     variable: 4,
                     relevant: relevant.clone(),
-                    proposer: 1,
+                    proposer: LeafOccurrence::new(1),
                 },
                 ..candidate.clone()
             },
@@ -23269,7 +23291,7 @@ mod tests {
                 phase: ResidualPhase::Propose {
                     variable: 4,
                     relevant: relevant_all.clone(),
-                    proposer: 0,
+                    proposer: LeafOccurrence::new(0),
                 },
                 ..candidate.clone()
             },
@@ -23278,7 +23300,7 @@ mod tests {
                     variable: 4,
                     relevant: relevant.clone(),
                     checked: checked.clone(),
-                    confirmer: 1,
+                    confirmer: LeafOccurrence::new(1),
                 },
                 ..candidate.clone()
             },
@@ -23287,7 +23309,7 @@ mod tests {
                     variable: 4,
                     relevant: relevant_all.clone(),
                     checked: checked.clone(),
-                    confirmer: 1,
+                    confirmer: LeafOccurrence::new(1),
                 },
                 ..candidate.clone()
             },
@@ -23296,7 +23318,7 @@ mod tests {
                     variable: 4,
                     relevant: relevant_all,
                     checked,
-                    confirmer: 2,
+                    confirmer: LeafOccurrence::new(2),
                 },
                 ..candidate.clone()
             },
@@ -23335,7 +23357,7 @@ mod tests {
             phase: ResidualPhase::Propose {
                 variable: 3,
                 relevant: relevant.clone(),
-                proposer: 0,
+                proposer: LeafOccurrence::new(0),
             },
         };
         let candidate = |checked| StateDesc {
@@ -23352,7 +23374,7 @@ mod tests {
                 variable: 3,
                 relevant: relevant.clone(),
                 checked,
-                confirmer,
+                confirmer: LeafOccurrence::new(confirmer),
             },
         };
 
@@ -23395,7 +23417,7 @@ mod tests {
             phase: ResidualPhase::Propose {
                 variable: 1,
                 relevant: relevant.clone(),
-                proposer: 2,
+                proposer: LeafOccurrence::new(2),
             },
         };
         assert!(std::panic::catch_unwind(|| irrelevant_proposer.rank(leaf_count)).is_err());
@@ -23418,7 +23440,7 @@ mod tests {
                 variable: 1,
                 relevant,
                 checked,
-                confirmer: 0,
+                confirmer: LeafOccurrence::new(0),
             },
         };
         assert!(std::panic::catch_unwind(|| already_checked_confirmer.rank(leaf_count)).is_err());
@@ -23430,7 +23452,7 @@ mod tests {
             phase: ResidualPhase::Propose {
                 variable: 1,
                 relevant: non_leaf_relevant,
-                proposer: 0,
+                proposer: LeafOccurrence::new(0),
             },
         };
         assert!(std::panic::catch_unwind(|| non_leaf_proposer_set.rank(leaf_count)).is_err());

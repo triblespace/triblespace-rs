@@ -9652,7 +9652,7 @@ mod tests {
                 variable: 0,
                 relevant: relevant.clone(),
                 checked: checked.clone(),
-                confirmer: 0,
+                confirmer: LeafOccurrence::new(0),
             },
         };
         let successor = StateDesc {
@@ -9694,7 +9694,7 @@ mod tests {
                 variable: 0,
                 relevant: relevant.clone(),
                 checked: checked.clone(),
-                confirmer: 0,
+                confirmer: LeafOccurrence::new(0),
             },
         };
         let successor = StateDesc {
