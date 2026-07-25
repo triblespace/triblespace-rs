@@ -1295,6 +1295,15 @@ impl<'a, U> UnionArchive<'a, U> {
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
+
+    /// Borrow the physical shards for the selected query implementation.
+    ///
+    /// The storage view owns no query protocol. Whole query-module
+    /// alternatives use this crate-private seam to construct their native
+    /// constraints without adapting one protocol through another.
+    pub(crate) fn segments(&self) -> &'a [SuccinctArchive<U>] {
+        self.segments
+    }
 }
 
 #[doc(hidden)]
