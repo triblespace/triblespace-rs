@@ -1,4 +1,4 @@
-//! Semantic receipts for normalized production Program paging across Succinct shards.
+//! Ordinary relational semantics for normalized unions across Succinct shards.
 
 use std::sync::Arc;
 
@@ -61,22 +61,8 @@ fn fixed_shard(entity: Id, attribute: Id, values: impl IntoIterator<Item = u8>) 
     set
 }
 
-fn assert_typed_program_family<'a, C>(
-    name: &str,
-    constraint: &C,
-    _variable: VariableId,
-    _view: &RowsView<'_>,
-) where
-    C: Constraint<'a> + ?Sized,
-{
-    assert!(
-        constraint.residual_program().is_some(),
-        "{name}: normalized archive has no typed Program family",
-    );
-}
-
 #[test]
-fn identical_shards_use_one_production_program_for_all_twelve_schemas() {
+fn identical_shards_form_one_atomic_ordinary_relation_for_all_twelve_schemas() {
     let (set, entities, attributes, values) = fixture(3, 3, 3);
     let empty = TribleSet::new();
     let archives: Vec<SuccinctArchive<OrderedUniverse>> =
@@ -86,9 +72,14 @@ fn identical_shards_use_one_production_program_for_all_twelve_schemas() {
     let attribute = Variable::<GenId>::new(1);
     let value = Variable::<UnknownInline>::new(2);
     let constraint = union.pattern(entity, attribute, value);
+    let oracle = set.pattern(entity, attribute, value);
     assert!(
         constraint.residual_union_children().is_none(),
         "the normalized shard source must remain one atomic formula action"
+    );
+    assert!(
+        constraint.residual_program().is_none(),
+        "a finite normalized union is an ordinary relation, not a Machine"
     );
 
     let cases = [
@@ -152,12 +143,20 @@ fn identical_shards_use_one_production_program_for_all_twelve_schemas() {
         } else {
             RowsView::new(vars, row)
         };
-        assert_typed_program_family(name, &constraint, *variable, &view);
+        let mut actual = Vec::new();
+        constraint.propose(*variable, &view, &mut CandidateSink::Values(&mut actual));
+        let mut expected = Vec::new();
+        oracle.propose(*variable, &view, &mut CandidateSink::Values(&mut expected));
+        actual.sort_unstable();
+        actual.dedup();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(actual, expected, "{name}");
     }
 }
 
 #[test]
-fn interleaved_shards_keep_eager_occurrences_and_production_program_set_parity() {
+fn interleaved_shards_keep_eager_occurrences_and_ordinary_set_parity() {
     let entity = id(0x41);
     let attribute = id(0x42);
     let left = fixed_shard(entity, attribute, [1, 3, 5]);
@@ -169,12 +168,7 @@ fn interleaved_shards_keep_eager_occurrences_and_production_program_set_parity()
     let attribute: Inline<GenId> = attribute.to_inline();
     let constraint = union.pattern(entity, attribute, variable);
 
-    assert_typed_program_family(
-        "interleaved/v",
-        &constraint,
-        variable.index,
-        &RowsView::EMPTY,
-    );
+    assert!(constraint.residual_program().is_none());
     let mut eager = Vec::new();
     constraint.propose(
         variable.index,
@@ -247,7 +241,7 @@ fn project_value(binding: &Binding) -> Option<RawInline> {
 }
 
 #[test]
-fn width_one_production_program_and_live_clone_preserve_the_exact_normalized_remainder() {
+fn width_one_ordinary_query_and_live_clone_preserve_the_exact_normalized_remainder() {
     let (set, entities, attributes, values) = fixture(1, 1, 8);
     let archives: Vec<SuccinctArchive<OrderedUniverse>> =
         vec![(&set).into(), (&set).into(), (&set).into()];
@@ -257,20 +251,15 @@ fn width_one_production_program_and_live_clone_preserve_the_exact_normalized_rem
     let mut query = Query::new(root, project_value).solve_residual_state_lazy();
 
     let first = query.next().expect("the union has eight values");
-    assert_eq!(first, values[0].raw);
-    assert_eq!(query.stats().delta_source_candidates_examined, 1);
-    assert_eq!(query.stats().delta_source_direct_candidates, 1);
-    assert_eq!(query.stats().delta_source_roots, 0);
-
     let clone = query.clone();
     let remainder: Vec<_> = query.collect();
     let cloned_remainder: Vec<_> = clone.collect();
     assert_eq!(cloned_remainder, remainder);
-    let reconstructed: Vec<_> = std::iter::once(first).chain(remainder).collect();
-    assert_eq!(
-        reconstructed,
-        values.iter().map(|value| value.raw).collect::<Vec<_>>()
-    );
+    let mut reconstructed: Vec<_> = std::iter::once(first).chain(remainder).collect();
+    let mut expected: Vec<_> = values.iter().map(|value| value.raw).collect();
+    reconstructed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(reconstructed, expected);
 }
 
 #[derive(Clone)]
