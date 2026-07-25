@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: typed Program pages again cross one affine replacement boundary
+  each.** The directed receipt-local sole-child fusion loop, its deferred
+  accepted-prefix channel, and its three fusion telemetry fields are removed.
+  Every validated page now commits its effects and files its exact replacement
+  immediately.
 - **Breaking: recurrent Programs have one geometric execution path.**
   `ProgramCompletion`, complete batches, quotes, evidence, sinks, affinity
   tokens, arbiters, and the complete-action trait/vtable hooks are removed.

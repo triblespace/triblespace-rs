@@ -1836,17 +1836,6 @@ pub struct ResidualStateStats {
     /// whether from geometric negative-work feedback or a confirmed projected-
     /// demand floor. Saturated attempts do not increment this counter.
     pub width_increases: usize,
-    /// Additional same-lineage Program child pages consumed inside the
-    /// producing directed receipt while staying within its original grant.
-    pub delta_program_receipt_local_fused_steps: usize,
-    /// Canonical Program worklist filings avoided by those fused child pages.
-    /// This currently equals `delta_program_receipt_local_fused_steps`; it is
-    /// kept separate so later receipt shapes cannot silently change what the
-    /// structural counter means.
-    pub delta_program_receipt_local_refiles_avoided: usize,
-    /// Largest number of Program pages in one directed receipt-local chain,
-    /// including the originally selected page.
-    pub max_delta_program_receipt_local_chain: usize,
     /// Bounded pages requested from constraint-owned source frontiers.
     pub delta_source_pages: usize,
     /// Physical calls that consumed one compatible cohort of affine source
@@ -1954,9 +1943,7 @@ pub struct ResidualStateStats {
     /// Parent rows refiled under the same canonical proposal state when a
     /// terminal admission split a wider selected chunk.
     pub delta_terminal_admission_remainders: usize,
-    /// Scheduler dispatch receipts serving terminal-streaming work. One
-    /// receipt may contain additional typed Program calls accounted by
-    /// `delta_program_receipt_local_fused_steps`.
+    /// Scheduler dispatch receipts serving terminal-streaming work.
     pub delta_terminal_calls: usize,
     /// Scheduler dispatch receipts serving all other cyclic work. Physical
     /// source and transition call counts remain in their cohort counters.
