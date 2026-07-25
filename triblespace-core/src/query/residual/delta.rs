@@ -163,7 +163,7 @@ static CONFIRM_FINALIZER_PROGRAM: ConfirmFinalizerProgram = ConfirmFinalizerProg
 
 impl TypedProgramSpec for ConfirmFinalizerProgram {
     type State = ConfirmFinalizerState;
-    type NoveltyKey = ();
+    type NoveltyKey = std::convert::Infallible;
     type Rank = usize;
 
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
@@ -238,7 +238,7 @@ static SET_ADMISSION_PROGRAM: SetAdmissionProgram = SetAdmissionProgram;
 
 impl TypedProgramSpec for SetAdmissionProgram {
     type State = SetAdmissionState;
-    type NoveltyKey = ();
+    type NoveltyKey = std::convert::Infallible;
     type Rank = u128;
 
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
@@ -301,7 +301,7 @@ static FORMULA_OR_ADMISSION_PROGRAM: FormulaOrAdmissionProgram = FormulaOrAdmiss
 
 impl TypedProgramSpec for FormulaOrAdmissionProgram {
     type State = FormulaOrAdmissionState;
-    type NoveltyKey = ();
+    type NoveltyKey = std::convert::Infallible;
     type Rank = usize;
 
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
@@ -373,7 +373,7 @@ static FORMULA_OR_EMISSION_PROGRAM: FormulaOrEmissionProgram = FormulaOrEmission
 
 impl TypedProgramSpec for FormulaOrEmissionProgram {
     type State = FormulaOrEmissionState;
-    type NoveltyKey = ();
+    type NoveltyKey = std::convert::Infallible;
     type Rank = usize;
 
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
@@ -460,7 +460,7 @@ static PROPOSAL_MATERIALIZER_PROGRAM: ProposalMaterializerProgram = ProposalMate
 
 impl TypedProgramSpec for ProposalMaterializerProgram {
     type State = ProposalMaterializerState;
-    type NoveltyKey = ();
+    type NoveltyKey = std::convert::Infallible;
     type Rank = u128;
 
     fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
