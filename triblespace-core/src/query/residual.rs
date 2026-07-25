@@ -1313,6 +1313,9 @@ impl FiniteFormulaProgram {
         let mut completed = focused;
         let mut current = cursor.pc;
         let mut direct_or = None;
+        // Online admission jumps directly to the first OR accumulator. AND
+        // frames before that OR are therefore transparent only when every
+        // sibling besides the returning child is already in `done`.
         let mut transparent_to_or = true;
         while let Some(return_to) = formula_pcs.get(current).return_to {
             let address = formula_pcs.return_by_id(return_to);
