@@ -4596,10 +4596,6 @@ pub(super) struct DeltaStepOutcome {
     pub(super) source_dead_pages: usize,
     pub(super) transition_dead_pages: usize,
     pub(super) completed_activations: usize,
-    /// More than one activation from the scheduler's deliberately bounded
-    /// transition cohort completed in this step. Source paging batches rows
-    /// for storage efficiency, not as a latency/throughput activation choice.
-    pub(super) completed_transition_cohort: bool,
     /// Whether a globally negative physical step is mature evidence for
     /// widening outer search `S`. Terminal traversal first exhausts its local
     /// geometric quantum; only a saturated still-live miss reaches this tier.
@@ -4630,7 +4626,6 @@ impl DeltaStepOutcome {
             source_dead_pages: 0,
             transition_dead_pages: 0,
             completed_activations: 0,
-            completed_transition_cohort: false,
             allows_global_width_growth: false,
             release_directed_lease: false,
             demand_preference: None,
@@ -7516,7 +7511,6 @@ impl DeltaScheduler {
                 source_dead_pages,
                 transition_dead_pages,
                 completed_activations,
-                completed_transition_cohort: !search_cohort && completed_activations > 1,
                 allows_global_width_growth: true,
                 release_directed_lease,
                 demand_preference,
@@ -14032,7 +14026,6 @@ mod tests {
 
         assert!(graph.completed_activation_ids.is_empty());
         assert_eq!(graph.completed_activations, 0);
-        assert!(!graph.completed_transition_cohort);
         assert!(graph.continuation.is_none());
         assert_eq!(graph.retargeted.len(), 2);
         assert!(activation_ids.iter().all(|activation| {
@@ -14107,7 +14100,6 @@ mod tests {
         );
         assert_eq!(first_finalized.completed_activation_ids.len(), 1);
         assert_eq!(first_finalized.completed_activations, 1);
-        assert!(!first_finalized.completed_transition_cohort);
         assert!(first_finalized.continuation.is_some());
         assert_eq!(scheduler.program_worklist.len(), 1);
         let scratch = scheduler.program_scratch.as_ref().unwrap();
@@ -14146,7 +14138,6 @@ mod tests {
         completed_ids.sort_unstable();
         assert_eq!(completed_ids, activation_ids);
         assert_eq!(second_finalized.completed_activations, 1);
-        assert!(!second_finalized.completed_transition_cohort);
         assert!(second_finalized.continuation.is_some());
         assert!(scheduler.program_worklist.is_empty());
         assert!(activation_ids

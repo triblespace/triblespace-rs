@@ -1613,7 +1613,7 @@ fn synthetic_root_parent_atomic_rpq_precedes_ordinary_suffix() {
 }
 
 #[test]
-fn synthetic_root_cyclic_proposer_streams_into_an_ordinary_relational_suffix() {
+fn synthetic_root_cyclic_proposer_recoalesces_into_an_ordinary_relational_suffix() {
     let edges: Vec<_> = (0..8).map(|node| (node, node)).collect();
     let graph = Graph::new(8, &edges);
     let suffix_calls = Arc::new(Mutex::new(Vec::new()));
@@ -1647,10 +1647,14 @@ fn synthetic_root_cyclic_proposer_streams_into_an_ordinary_relational_suffix() {
     assert_eq!(query.stats().delta_source_roots, 8);
     assert_eq!(
         *suffix_calls.lock().expect("suffix recorder poisoned"),
-        [1, 1, 1, 1],
-        "each ProbeOne handoff must isolate one streamed relation atom"
+        [1, 2, 4, 1],
+        "each preferred receipt rejoins its canonical bucket at the current geometric width"
     );
-    assert_eq!(query.stats().delta_handoff_probe_pops, 4);
+    assert_eq!(
+        query.stats().preferred_probe_pops,
+        4,
+        "each source page leaves one downstream preferred bucket underfilled"
+    );
     assert_eq!(query.stats().delta_source_dead_pages, 0);
     assert_eq!(query.stats().delta_source_negative_steps, 0);
     assert_eq!(query.stats().width_increases, 3);
@@ -1903,7 +1907,7 @@ fn synthetic_root_atom_streams_a_cycle_before_fixpoint_cleanup() {
     assert_eq!(query.next(), Some(graph.value(0).raw));
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     assert_eq!(
-        query.stats().delta_handoff_probe_pops,
+        query.stats().preferred_probe_pops,
         0,
         "a fully checked final candidate tail is already exact output"
     );
@@ -1936,9 +1940,9 @@ fn synthetic_root_and_streams_early_and_late_relational_survivors() {
             "accepted_node={accepted_node}, nested_and={nested_and}"
         );
         assert_eq!(
-            query.stats().delta_handoff_probe_pops,
-            expected_before_emit + 2,
-            "each adjacency plus the SET and typed program/formula handoffs are probed once"
+            query.stats().preferred_probe_pops,
+            0,
+            "at width one every nonempty preferred canonical bucket is full"
         );
         assert_eq!(query.next(), None);
         assert_eq!(query.stats().delta_transition_pages, 5);
@@ -2045,9 +2049,9 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
     assert_eq!(first, graph.value(1).raw);
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     assert_eq!(
-        query.stats().delta_handoff_probe_pops,
-        2,
-        "the accepted adjacency and typed program/formula boundary are each probed once"
+        query.stats().preferred_probe_pops,
+        0,
+        "at width one every nonempty preferred canonical bucket is full"
     );
     let exact_clone = query.clone();
     let cancelled = query.clone();
@@ -2448,7 +2452,7 @@ fn zero_root_cyclic_and_returns_empty_without_erasing_its_or_sibling() {
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_dead_pages, 0);
     assert_eq!(query.stats().delta_source_negative_steps, 0);
-    assert!(query.stats().delta_handoff_probe_pops > 0);
+    assert!(query.stats().preferred_probe_pops > 0);
 }
 
 #[test]
@@ -2987,7 +2991,7 @@ fn same_variable_negative_source_pages_grow_one_two_four() {
     assert_eq!(query.stats().delta_source_roots, 6);
     assert_eq!(query.stats().delta_source_dead_pages, 3);
     assert_eq!(query.stats().delta_source_negative_steps, 3);
-    assert_eq!(query.stats().delta_handoff_probe_pops, 0);
+    assert_eq!(query.stats().preferred_probe_pops, 0);
 }
 
 #[test]
@@ -3014,7 +3018,7 @@ fn same_variable_late_hit_keeps_the_geometric_negative_prefix() {
     assert_eq!(query.stats().delta_source_dead_pages, 2);
     assert_eq!(query.stats().delta_source_negative_steps, 2);
     assert_eq!(
-        query.stats().delta_handoff_probe_pops,
+        query.stats().preferred_probe_pops,
         0,
         "the late hit is terminal and needs no selective probe"
     );
@@ -4656,8 +4660,6 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
         ),
         ("whole-root-transitions", ResidualLowering::FULL),
     ];
-    let mut saw_root_cyclic_probe_one = false;
-
     for program in programs {
         let mut results_by_formula = Vec::new();
         for formula in formulas {
@@ -4684,13 +4686,6 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
                         actual, expected,
                         "level={level} program={program:?} formula={formula:?} capability={capability}"
                     );
-                    if capability == "whole-root-transitions"
-                        && program == GeneratedPathProgram::Plus
-                        && formula == GeneratedFormulaCase::OrdinaryAnd
-                        && query.stats().delta_handoff_probe_pops > 0
-                    {
-                        saw_root_cyclic_probe_one = true;
-                    }
                 }
                 results_by_level.push(expected);
             }
@@ -4712,11 +4707,6 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
             "formula lowering changed semantics for program={program:?}"
         );
     }
-
-    assert!(
-        saw_root_cyclic_probe_one,
-        "the generated width-one root+cyclic lane never exercised a streamed handoff probe"
-    );
 
     // The projected SET cannot reveal accidental occurrence collapse because
     // its two arms denote the same relation. Pin the structural invariant once

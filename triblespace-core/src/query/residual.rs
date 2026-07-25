@@ -28,14 +28,14 @@
 //! only when they selected the same variable and proposer. Occupancy scheduling
 //! chooses the deepest live bucket able to fill the desired actionable width;
 //! if none can, it drains the minimum-rank bucket through the strict readiness
-//! gate. When a full Propose or Confirm action advances to an underfilled
-//! successor, an exact physical filing token keeps at most that newly appended
-//! tail hot until it emits or dies. Readiness pops and planning-state splits do
-//! not themselves activate a sprint, so planning-created underfill still uses
-//! ordinary batch assembly. Once an action lineage is hot, however, it may
-//! intentionally defer reconvergence with an older cohort in exchange for
-//! first-result latency. The token is not part of canonical state identity and
-//! never consumes that older cohort. Ready and
+//! gate. When a full action or cyclic handoff activates a preferred canonical
+//! key, its next pop recomputes physical width from the whole merged bucket.
+//! A bucket that fills search width runs an ordinary full chunk, including
+//! older equal-future work; an underfilled bucket probes one atom from the
+//! newly filed receipt. Only the successor key remains preferred, so no frozen
+//! receipt mode or occupancy survives across transitions. Readiness pops and
+//! planning-state splits do not themselves activate a sprint. The preference
+//! is not part of canonical state identity. Ready and
 //! Propose states measure parent rows. Candidate and Confirm states measure and
 //! split SET-admitted candidate occurrences. They remain parent-atomic only
 //! while a selected typed Program route must reuse one complete parent
@@ -44,9 +44,9 @@
 //! selected parent block.
 //! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
 //! Lazy width is unchanged while nonempty successors advance. Once a partial
-//! action activates an exact continuation cohort, that lineage outranks cold
-//! siblings—even when it merges into an already-live bucket—until it emits or
-//! dies. Search width grows geometrically after negative work. A separate
+//! action activates a preferred key, its recomputed canonical chunks outrank
+//! cold siblings until the lineage emits or dies. Search width grows
+//! geometrically after negative work. A separate
 //! projected-result window grows only after the caller consumes the whole
 //! window and pulls again; that confirmed promotion floors search width at the
 //! new demand window without treating emission itself as search feedback.
@@ -2367,19 +2367,20 @@ pub struct ResidualStateStats {
     pub dead_action_pops: usize,
     /// Terminal Ready-state chunks emitted for projection.
     pub emit_pops: usize,
-    /// Full actionable-width chunks selected from the maximum eligible rank.
-    /// The unit is a parent row for Ready/Propose and activation-reuse
-    /// candidate states, or a candidate occurrence when paging is available.
+    /// Full actionable-width canonical chunks. Cold harvesting selects the
+    /// maximum eligible rank; a preferred key may instead recoalesce its newly
+    /// filed receipt with older equal-future work. The unit is a parent row
+    /// for Ready/Propose and activation-reuse candidate states, or a candidate
+    /// occurrence when paging is available.
     pub full_pops: usize,
     /// Underfilled buckets drained through the minimum-rank readiness gate
     /// because no live state could fill the desired width. The eager solver
     /// counts every one of its readiness-gated pops here.
     pub readiness_pops: usize,
-    /// Physical continuation-cohort chunks selected after a full action
-    /// partially survived. These pops deliberately bypass global occupancy
-    /// harvesting without changing canonical state identity.
+    /// One-atom probes selected from an underfilled preferred receipt. These
+    /// pops bypass the readiness gate without changing canonical identity.
     pub continuation_pops: usize,
-    /// Continuation-cohort pops whose coalesced receipt occupancy was smaller
+    /// Preferred probes whose complete canonical bucket occupancy was smaller
     /// than the current desired width.
     pub underfilled_continuation_pops: usize,
     /// Pops that left unprocessed parent rows or candidate occurrences live
@@ -2494,9 +2495,10 @@ pub struct ResidualStateStats {
     pub delta_activations_completed: usize,
     /// Numeric increases of the independent quiescent-activation cohort width.
     pub delta_activation_width_increases: usize,
-    /// One-atom continuation pops used to probe a delta-to-stable handoff
-    /// before returning the rest of that cohort to global cold harvesting.
-    pub delta_handoff_probe_pops: usize,
+    /// One-atom preferred pops used while a complete canonical bucket remains
+    /// underfilled. The preferred successor key may continue the same latency
+    /// path, but every pop recomputes its full/probe choice.
+    pub preferred_probe_pops: usize,
     /// Directed scalar steps spent following one exact cyclic activation.
     pub delta_active_lease_steps: usize,
     /// Stable yields after which the same cyclic activation remained live and
@@ -7401,48 +7403,15 @@ type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 /// while the lazy scheduler temporarily keeps the newly advanced cohort hot.
 /// Single-threaded filing appends at the payload tail. Equal `(rank, state)`
 /// receipts in one transition reduction are coalesced by occupancy, so the
-/// selected token names their complete appended tail without consuming older
-/// work already present under the same canonical key.
+/// selected token names their complete appended tail. It is a scheduling
+/// witness, not exclusive ownership: a full preferred pop may combine that
+/// tail with older work under the same canonical key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContinuationToken {
     rank: usize,
     state: StateId,
     rows: usize,
     candidates: usize,
-}
-
-/// Physical scheduling policy for one exact continuation receipt.
-///
-/// `Cohort` preserves the ordinary action sprint. `ProbeOne` is reserved for
-/// delta-to-stable handoffs: it selects one promising atom, then hands that
-/// atom's ordered fanout back to `Cohort`, without resetting the query-wide
-/// cold-harvest width or making width part of canonical state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ContinuationMode {
-    Cohort,
-    ProbeOne,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ActiveContinuation {
-    token: ContinuationToken,
-    mode: ContinuationMode,
-}
-
-impl ActiveContinuation {
-    fn cohort(token: ContinuationToken) -> Self {
-        Self {
-            token,
-            mode: ContinuationMode::Cohort,
-        }
-    }
-
-    fn probe_one(token: ContinuationToken) -> Self {
-        Self {
-            token,
-            mode: ContinuationMode::ProbeOne,
-        }
-    }
 }
 
 impl ContinuationToken {
@@ -7500,7 +7469,7 @@ fn prefer_continuation(
 enum SelectionKind {
     Full,
     Readiness,
-    Continuation(ContinuationMode),
+    Preferred,
 }
 
 fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize) -> RowsView<'v> {
@@ -10412,10 +10381,11 @@ struct ResidualStateMachine {
     emit_origins: Option<SmallVec<[DeltaActivationId; 1]>>,
     emit_next: usize,
     emit_count: usize,
-    /// Exact physical cohort activated by a partially surviving full action
-    /// or a delta-to-stable handoff. Its physical scheduling mode remains
+    /// Preferred canonical key activated by a partially surviving full action
+    /// or a delta-to-stable handoff. Each pop recomputes its physical width
+    /// from current canonical occupancy; only this key preference remains
     /// outside canonical state identity.
-    continuation: Option<ActiveContinuation>,
+    continuation: Option<ContinuationToken>,
     /// Exact cyclic activation created while probing one stable continuation
     /// atom. This is a physical latency preference only; all logical work
     /// remains owned by [`DeltaScheduler`].
@@ -10810,21 +10780,22 @@ impl ResidualStateMachine {
         })
     }
 
-    /// Removes one coalesced-receipt chunk from the current canonical tail.
+    /// Removes one dynamically sized chunk from a preferred canonical key.
     ///
-    /// A global strict-deepest flag is insufficient here: another history may
-    /// already occupy a deeper state, and an older cohort may already occupy
-    /// this exact state. The token limits the tail cut to all equal-key filings
-    /// coalesced by the selected transition, preserving DFS latency without
-    /// changing readiness legality or canonical state identity. The cut may
-    /// deliberately defer the opportunity to merge with older work.
-    fn take_continuation(
+    /// The newly filed receipt remains a nonempty suffix until this method
+    /// runs. If the complete canonical bucket fills search width `S`, the
+    /// ordinary full-canonical suffix of `S` atoms runs, including older
+    /// equal-future work when necessary. Otherwise one atom from the receipt
+    /// probes a latency path without claiming that the underfilled bucket is
+    /// readiness-closed. Only the successor key propagates; the full/probe
+    /// decision and receipt occupancy are recomputed at every pop.
+    fn take_preferred(
         &mut self,
         plan: &ResidualPlan,
-        active: ActiveContinuation,
+        token: ContinuationToken,
         width: usize,
     ) -> SelectedResidualTask {
-        let ActiveContinuation { token, mode } = active;
+        let width = width.max(1);
         let desc = self.interner.get(token.state).clone();
         assert_eq!(
             desc.rank_with_span(
@@ -10837,12 +10808,11 @@ impl ResidualStateMachine {
             "continuation token disagrees with canonical state rank"
         );
         let candidate_pages = desc.uses_candidate_pages(plan, &self.interner.formula_pcs);
-        let cohort_occupancy = token.occupancy(&desc, plan, &self.interner.formula_pcs);
-        assert!(cohort_occupancy > 0, "continuation cohort is empty");
-        let take = match mode {
-            ContinuationMode::Cohort => cohort_occupancy.min(width.max(1)),
-            ContinuationMode::ProbeOne => 1,
-        };
+        let receipt_occupancy = token.occupancy(&desc, plan, &self.interner.formula_pcs);
+        assert!(
+            receipt_occupancy > 0,
+            "preferred continuation receipt is empty"
+        );
 
         let (mut bucket, remove_level) = {
             let level = self
@@ -10860,9 +10830,11 @@ impl ResidualStateMachine {
 
         let before = bucket.occupancy(candidate_pages);
         assert!(
-            before >= cohort_occupancy,
+            before >= receipt_occupancy,
             "canonical bucket lost part of its newly filed continuation cohort"
         );
+        let full = before >= width;
+        let take = if full { width } else { 1 };
         let chunk = bucket.take_tail(desc.bound.count(), take, candidate_pages);
         let remainder = bucket.occupancy(candidate_pages);
         if remainder != 0 {
@@ -10879,12 +10851,12 @@ impl ResidualStateMachine {
         debug_assert_eq!(chunk.occupancy(candidate_pages), take);
 
         self.stats.state_pops += 1;
-        self.stats.continuation_pops += 1;
-        self.last_selection = SelectionKind::Continuation(mode);
-        if mode == ContinuationMode::ProbeOne {
-            self.stats.delta_handoff_probe_pops += 1;
-        }
-        if cohort_occupancy < width.max(1) {
+        self.last_selection = SelectionKind::Preferred;
+        if full {
+            self.stats.full_pops += 1;
+        } else {
+            self.stats.continuation_pops += 1;
+            self.stats.preferred_probe_pops += 1;
             self.stats.underfilled_continuation_pops += 1;
         }
         SelectedResidualTask {
@@ -11832,7 +11804,7 @@ impl ResidualStateMachine {
         width: usize,
     ) -> MachineStep {
         let task = if let Some(token) = self.continuation.take() {
-            self.take_continuation(plan, token, width)
+            self.take_preferred(plan, token, width)
         } else {
             self.take_next_with_plan(plan, width)
                 .expect("pop_once requires a non-empty residual worklist")
@@ -11943,33 +11915,7 @@ impl ResidualStateMachine {
         self.active_delta = resume.or_else(|| outcome.demand_preference.take());
         self.active_delta_after_yield = retained_yielding_activation;
         self.stats.delta_active_live_yields_retained += usize::from(retained_yielding_activation);
-        self.continuation = outcome.continuation.take().map(|token| {
-            let desc = self.interner.get(token.state);
-            let commits_terminal_candidates = match &desc.phase {
-                ResidualPhase::Candidate {
-                    variable,
-                    relevant,
-                    checked,
-                } if relevant == checked => {
-                    let mut committed = desc.bound;
-                    committed.set(*variable);
-                    committed == self.full
-                }
-                _ => false,
-            };
-            if outcome.completed_transition_cohort || commits_terminal_candidates {
-                // A geometrically selected activation cohort is already the
-                // engine's chosen throughput unit. Keep its exact appended
-                // tail hot. The same is safe for fully checked candidates
-                // whose commit binds the final variable: their next step can
-                // only emit, so probing one cannot reveal downstream
-                // selectivity and would strand exact results behind live
-                // cyclic work.
-                ActiveContinuation::cohort(token)
-            } else {
-                ActiveContinuation::probe_one(token)
-            }
-        });
+        self.continuation = outcome.continuation.take();
         if let Some(publication) = outcome.publication.take() {
             self.stage_direct_terminal_publication(publication);
         }
@@ -11983,7 +11929,7 @@ impl ResidualStateMachine {
         plan: &ResidualPlan,
         width: usize,
         continuation: ContinuationToken,
-    ) -> Option<ActiveContinuation> {
+    ) -> Option<ContinuationToken> {
         #[cfg(test)]
         if !self.continuation_sprint_enabled {
             return None;
@@ -11992,17 +11938,11 @@ impl ResidualStateMachine {
         let successor_is_underfilled =
             continuation.occupancy(desc, plan, &self.interner.formula_pcs) < width.max(1);
         match self.last_selection {
-            // ProbeOne governs exactly the delta-filed handoff atom. Once it
-            // advances, its ordered fanout is an ordinary semantic cohort;
-            // probing that tail again could reverse observable result order.
-            SelectionKind::Continuation(ContinuationMode::ProbeOne) => {
-                Some(ActiveContinuation::cohort(continuation))
-            }
-            SelectionKind::Continuation(ContinuationMode::Cohort) => {
-                Some(ActiveContinuation::cohort(continuation))
-            }
+            // Preserve only the preferred successor key. Its actual chunk is
+            // chosen from fresh canonical occupancy on the next pop.
+            SelectionKind::Preferred => Some(continuation),
             SelectionKind::Full if self.last_was_action && successor_is_underfilled => {
-                Some(ActiveContinuation::cohort(continuation))
+                Some(continuation)
             }
             SelectionKind::Full | SelectionKind::Readiness => None,
         }
@@ -12084,7 +12024,7 @@ impl ResidualStateMachine {
             (continuation.is_some() || publication.is_some()) && retained.is_some();
         self.stats.delta_active_live_yields_retained += usize::from(self.active_delta_after_yield);
         self.active_delta = retained;
-        self.continuation = continuation.map(ActiveContinuation::probe_one);
+        self.continuation = continuation;
         if let Some(publication) = publication {
             self.stage_direct_terminal_publication(publication);
         }
@@ -12220,8 +12160,8 @@ impl ResidualStateMachine {
 
             let width = self.width;
             // A newly seeded activation on the scalar continuation path is
-            // the cyclic analogue of `ActiveContinuation`: follow that exact
-            // affine lineage before any cold stable cohort. It owns no work;
+            // the cyclic analogue of a preferred stable key: follow that
+            // exact affine lineage before any cold stable cohort. It owns no work;
             // dropping the token merely returns scheduling to the global
             // typed Program worklist.
             if self.continuation.is_none() {
@@ -12825,14 +12765,14 @@ impl ResidualStateMachine {
 /// successor or staging raw output leaves that search width unchanged. A
 /// separate `1, 2, 4, ...` projected-result window advances only when the
 /// caller pulls after consuming its previous window. When a full
-/// Propose or Confirm action files fewer actionable atoms than that width, the
-/// coalesced-receipt physical tail becomes hot and outranks cold sibling
-/// harvesting until it emits or dies. Planning splits and readiness pops do not
-/// activate a sprint on their own. With no hot lineage they retain ordinary
-/// batching; within a hot lineage they may continue its deliberate
-/// latency-for-reconvergence tradeoff. The token never changes canonical
-/// identity or consumes work older than the coalesced receipt bound. With no
-/// hot continuation, the deepest live bucket able to fill the width wins; if
+/// Propose or Confirm action files a successor, its canonical key may become
+/// preferred and outrank cold sibling harvesting until it emits or dies. Each
+/// preferred pop recomputes from the whole canonical bucket: a full bucket
+/// supplies the ordinary width, while an underfilled bucket probes one atom
+/// from the newest receipt. Only the successor key propagates. Planning splits
+/// and readiness pops do not activate a sprint on their own. The preference
+/// never changes canonical identity. With no preferred key, the deepest live
+/// bucket able to fill the width wins; if
 /// none can, the minimum-rank bucket drains through the strict readiness gate.
 /// The cap only bounds geometric width growth.
 ///
@@ -13235,11 +13175,13 @@ where
     ///
     /// The first pull uses a one-parent depth-first batch by default. Filing a
     /// nonempty successor preserves that width. When a full proposal or
-    /// confirmation action partially survives, only its coalesced-receipt
-    /// physical tail becomes the next continuation; it remains ahead of cold
-    /// sibling harvesting until it emits or dies. Planning splits and
-    /// readiness-selected work cannot activate a sprint themselves, but may
-    /// carry an already-hot lineage forward. Negative work grows the search
+    /// confirmation action partially survives, its successor key becomes
+    /// preferred and remains ahead of cold sibling harvesting until it emits
+    /// or dies. A full canonical bucket supplies the whole search width,
+    /// recoalescing older equal-future work; an underfilled bucket probes one
+    /// atom from the newest receipt. Planning splits and readiness-selected
+    /// work cannot activate a sprint themselves, but may carry an already-hot
+    /// lineage forward. Negative work grows the search
     /// width geometrically; producing raw terminal rows does not. Confirmed
     /// projected-result demand is tracked independently and grows only at a
     /// later pull boundary. Whenever no continuation is hot and no live state
@@ -16964,7 +16906,7 @@ mod tests {
         // path proves TerminalStreaming from the reducer and return payload;
         // the fixture does not forge a publication receipt.
         let relevant = ChildSet::empty(iter.plan.len()).with_inserted(1);
-        iter.state.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
+        iter.state.last_selection = SelectionKind::Preferred;
         let seeded = iter
             .state
             .seed_delta_proposal(
@@ -25325,7 +25267,7 @@ mod tests {
         assert_eq!(stats.candidates_confirmed, 6);
         assert_eq!(stats.max_confirm_candidates, 2);
         assert_eq!(stats.underfilled_continuation_pops, 2);
-        assert_eq!(stats.delta_handoff_probe_pops, 0);
+        assert_eq!(stats.preferred_probe_pops, 2);
         assert_eq!(
             stats.state_pops,
             stats.full_pops + stats.readiness_pops + stats.continuation_pops,
@@ -25354,7 +25296,7 @@ mod tests {
         assert_eq!(stats.candidates_confirmed, 126);
         assert_eq!(stats.max_confirm_candidates, 32);
         assert_eq!(stats.underfilled_continuation_pops, 2);
-        assert_eq!(stats.delta_handoff_probe_pops, 0);
+        assert_eq!(stats.preferred_probe_pops, 2);
         assert_eq!(stats.width_increases, 5);
         assert_eq!(width, 32, "the surviving emission must not widen search S");
 
@@ -28458,7 +28400,7 @@ mod tests {
         prefer_continuation(&mut continuation, Some(second));
         let continuation = continuation.expect("equal receipts coalesce");
         assert_eq!(continuation.rows, expected.len());
-        machine.continuation = Some(ActiveContinuation::probe_one(continuation));
+        machine.continuation = Some(continuation);
 
         let mut right = machine
             .split_for_parallel(&root, &plan, &influences, &base_estimates)
@@ -28834,13 +28776,14 @@ mod tests {
         let receipt = receipt.expect("virtual rows produce a physical receipt");
         assert_eq!(receipt.rows, 7);
 
-        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(receipt), 8);
+        let task = machine.take_preferred(&plan, receipt, 7);
         let StateBucket::Rows(rows) = task.bucket else {
             panic!("zero-width continuation changed payload shape")
         };
         assert!(rows.rows.is_empty());
         assert_eq!(rows.row_count, 7);
-        assert_eq!(machine.stats.underfilled_continuation_pops, 1);
+        assert_eq!(machine.stats.full_pops, 1);
+        assert_eq!(machine.stats.underfilled_continuation_pops, 0);
         assert!(machine.worklist.is_empty());
     }
 
@@ -28903,11 +28846,7 @@ mod tests {
         assert_eq!(candidate_receipt.rows, 3);
         assert_eq!(candidate_receipt.candidates, 5);
 
-        let task = candidate_machine.take_continuation(
-            &candidate_plan,
-            ActiveContinuation::cohort(candidate_receipt),
-            4,
-        );
+        let task = candidate_machine.take_preferred(&candidate_plan, candidate_receipt, 4);
         let StateBucket::Candidates(page) = task.bucket else {
             panic!("candidate-page receipt changed payload shape")
         };
@@ -29006,11 +28945,7 @@ mod tests {
         assert_eq!(formula_receipt.rows, 3);
         assert_eq!(formula_receipt.candidates, 5);
 
-        let task = formula_machine.take_continuation(
-            &formula_plan,
-            ActiveContinuation::cohort(formula_receipt),
-            8,
-        );
+        let task = formula_machine.take_preferred(&formula_plan, formula_receipt, 5);
         let StateBucket::Formula(page) = task.bucket else {
             panic!("formula-page receipt changed payload shape")
         };
@@ -29029,7 +28964,8 @@ mod tests {
                 (2, raw(14)),
             ]
         );
-        assert_eq!(formula_machine.stats.underfilled_continuation_pops, 1);
+        assert_eq!(formula_machine.stats.full_pops, 1);
+        assert_eq!(formula_machine.stats.underfilled_continuation_pops, 0);
         assert!(formula_machine.worklist.is_empty());
     }
 
@@ -29104,7 +29040,7 @@ mod tests {
             &mut machine.stats,
         );
 
-        let task = machine.take_continuation(&plan, ActiveContinuation::cohort(hot), 8);
+        let task = machine.take_preferred(&plan, hot, 8);
         assert_eq!(task.state, hot.state);
         assert_eq!(task.desc, desc);
         let StateBucket::Candidates(chunk) = task.bucket else {
@@ -29137,12 +29073,12 @@ mod tests {
     }
 
     #[test]
-    fn probe_one_preserves_old_cold_tail_across_hit_miss_and_clone() {
+    fn preferred_full_pop_recoalesces_receipt_with_canonical_prefix() {
         let root = ShapeLeaf(0);
         let plan = ResidualPlan::compile(&root);
         let desc = ready_desc(1);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
-        machine.width = 8;
+        machine.width = 4;
         machine.cap = 64;
 
         file(
@@ -29151,111 +29087,129 @@ mod tests {
             plan.len(),
             desc.clone(),
             StateBucket::Rows(RowBatch {
-                rows: [10, 11, 12].map(raw).into(),
-                row_count: 3,
+                rows: [10, 11, 12, 13, 14, 15].map(raw).into(),
+                row_count: 6,
             }),
             &mut machine.stats,
         );
-        let first_hot = file(
-            &mut machine.worklist,
-            &mut machine.interner,
-            plan.len(),
-            desc.clone(),
-            StateBucket::Rows(RowBatch {
-                rows: [40, 41, 42, 43].map(raw).into(),
-                row_count: 4,
-            }),
-            &mut machine.stats,
-        )
-        .expect("first hot receipt is nonempty");
-        let second_hot = file(
-            &mut machine.worklist,
-            &mut machine.interner,
-            plan.len(),
-            desc.clone(),
-            StateBucket::Rows(RowBatch {
-                rows: [44, 45, 46, 47].map(raw).into(),
-                row_count: 4,
-            }),
-            &mut machine.stats,
-        )
-        .expect("equal-key hot receipt is nonempty");
-        let mut hot = None;
-        prefer_continuation(&mut hot, Some(first_hot));
-        prefer_continuation(&mut hot, Some(second_hot));
-        let hot = hot.expect("equal-key hot receipts coalesce");
-        assert_eq!(hot.rows, 8);
-        machine.continuation = Some(ActiveContinuation::probe_one(hot));
-
-        let mut missed = machine.clone();
-        assert_eq!(missed.continuation, machine.continuation);
-        let hit = machine.continuation.take().unwrap();
-        let hit_width = machine.width;
-        let hit_task = machine.take_continuation(&plan, hit, hit_width);
-        let miss = missed.continuation.take().unwrap();
-        let miss_width = missed.width;
-        let miss_task = missed.take_continuation(&plan, miss, miss_width);
-        for task in [hit_task, miss_task] {
-            let StateBucket::Rows(rows) = task.bucket else {
-                panic!("ready probe changed payload shape")
-            };
-            assert_eq!(rows.rows, [raw(47)]);
-            assert_eq!(rows.row_count, 1);
-        }
-
-        // A hit returns the selected atom's ordered fanout to ordinary cohort
-        // continuation. Only the original delta handoff is probed one-at-a-time.
-        let successor = file(
+        let preferred = file(
             &mut machine.worklist,
             &mut machine.interner,
             plan.len(),
             desc,
             StateBucket::Rows(RowBatch {
+                rows: [40, 41].map(raw).into(),
+                row_count: 2,
+            }),
+            &mut machine.stats,
+        )
+        .expect("preferred receipt is nonempty");
+        let mut cloned = machine.clone();
+
+        for current in [&mut machine, &mut cloned] {
+            let task = current.take_preferred(&plan, preferred, current.width);
+            let StateBucket::Rows(rows) = task.bucket else {
+                panic!("preferred full pop changed payload shape")
+            };
+            assert_eq!(rows.rows, [14, 15, 40, 41].map(raw));
+            assert_eq!(rows.row_count, 4);
+            assert_eq!(current.stats.full_pops, 1);
+            assert_eq!(current.stats.continuation_pops, 0);
+            assert_eq!(current.stats.preferred_probe_pops, 0);
+
+            let StateBucket::Rows(remainder) = current
+                .worklist
+                .get(&preferred.rank)
+                .and_then(|level| level.get(&preferred.state))
+                .expect("the canonical prefix remainder stays live")
+            else {
+                panic!("preferred full remainder changed payload shape")
+            };
+            assert_eq!(remainder.rows, [10, 11, 12, 13].map(raw));
+            assert_eq!(remainder.row_count, 4);
+        }
+    }
+
+    #[test]
+    fn preferred_successor_recomputes_probe_then_full_without_frozen_mode() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile(&root);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
+        machine.width = 4;
+
+        let first_desc = ready_desc(1);
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            first_desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: [10, 11].map(raw).into(),
+                row_count: 2,
+            }),
+            &mut machine.stats,
+        );
+        let first = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            first_desc,
+            StateBucket::Rows(RowBatch {
+                rows: vec![raw(40)],
+                row_count: 1,
+            }),
+            &mut machine.stats,
+        )
+        .expect("underfilled preferred receipt is nonempty");
+        let first_task = machine.take_preferred(&plan, first, machine.width);
+        let StateBucket::Rows(first_rows) = first_task.bucket else {
+            panic!("preferred probe changed payload shape")
+        };
+        assert_eq!(first_rows.rows, [raw(40)]);
+        assert_eq!(machine.stats.continuation_pops, 1);
+        assert_eq!(machine.stats.full_pops, 0);
+
+        let successor_desc = ready_desc(1);
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            successor_desc.clone(),
+            StateBucket::Rows(RowBatch {
                 rows: [50, 51, 52].map(raw).into(),
                 row_count: 3,
             }),
             &mut machine.stats,
+        );
+        let successor = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            successor_desc,
+            StateBucket::Rows(RowBatch {
+                rows: [60, 61].map(raw).into(),
+                row_count: 2,
+            }),
+            &mut machine.stats,
         )
-        .unwrap();
-        let resumed = machine
+        .expect("preferred successor receipt is nonempty");
+        let preferred = machine
             .continuation_after_advanced(&plan, machine.width, successor)
-            .expect("the probe hit has an ordered successor");
-        assert_eq!(resumed, ActiveContinuation::cohort(successor));
-        let resumed = machine.take_continuation(&plan, resumed, machine.width);
-        let StateBucket::Rows(resumed) = resumed.bucket else {
-            panic!("probe successor changed payload shape")
-        };
-        assert_eq!(resumed.rows, [50, 51, 52].map(raw));
-        assert_eq!(resumed.row_count, 3);
-        assert_eq!(
-            machine.stats.delta_handoff_probe_pops, 1,
-            "the ordered successor cohort must not be probed again"
-        );
+            .expect("a preferred probe propagates its successor key");
+        assert_eq!(preferred, successor);
 
-        // A miss leaves the unprobed hot prefix merged with older work. The
-        // next selection is ordinary global cold harvesting at width eight.
-        let cold = missed.take_next_with_plan(&plan, missed.width).unwrap();
-        let StateBucket::Rows(cold) = cold.bucket else {
-            panic!("cold ready cohort changed payload shape")
+        let successor_task = machine.take_preferred(&plan, preferred, machine.width);
+        let StateBucket::Rows(successor_rows) = successor_task.bucket else {
+            panic!("preferred full successor changed payload shape")
         };
-        assert_eq!(
-            cold.rows,
-            [12, 40, 41, 42, 43, 44, 45, 46]
-                .map(raw)
-                .into_iter()
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(cold.row_count, 8);
-        assert_eq!(machine.width, 8);
-        assert_eq!(missed.width, 8);
-        assert_eq!(machine.stats.delta_handoff_probe_pops, 1);
-        assert_eq!(missed.stats.delta_handoff_probe_pops, 1);
-        assert_eq!(machine.stats.underfilled_continuation_pops, 1);
-        assert_eq!(missed.stats.underfilled_continuation_pops, 0);
+        assert_eq!(successor_rows.rows, [51, 52, 60, 61].map(raw));
+        assert_eq!(machine.stats.continuation_pops, 1);
+        assert_eq!(machine.stats.full_pops, 1);
+        assert_eq!(machine.stats.preferred_probe_pops, 1);
     }
 
     #[test]
-    fn mixed_delta_feedback_arms_probe_without_widening() {
+    fn mixed_delta_feedback_arms_one_preferred_key_without_widening() {
         let mut machine = ResidualStateMachine::new(VariableSet::new_singleton(0), 1, None);
         machine.width = 4;
         machine.cap = 64;
@@ -29288,17 +29242,13 @@ mod tests {
             source_dead_pages: 2,
             transition_dead_pages: 0,
             completed_activations: 0,
-            completed_transition_cohort: false,
             allows_global_width_growth: true,
             release_directed_lease: false,
             demand_preference: None,
         });
         assert_eq!(machine.width, 4);
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
-        assert_eq!(
-            machine.continuation,
-            Some(ActiveContinuation::probe_one(token))
-        );
+        assert_eq!(machine.continuation, Some(token));
 
         machine.accept_delta_step(DeltaStepOutcome {
             continuation: Some(token),
@@ -29309,15 +29259,11 @@ mod tests {
             source_dead_pages: 0,
             transition_dead_pages: 0,
             completed_activations: 2,
-            completed_transition_cohort: true,
             allows_global_width_growth: true,
             release_directed_lease: false,
             demand_preference: None,
         });
-        assert_eq!(
-            machine.continuation,
-            Some(ActiveContinuation::cohort(token))
-        );
+        assert_eq!(machine.continuation, Some(token));
 
         let (terminal_state, _) = machine.interner.intern_with_status(
             StateDesc {
@@ -29343,15 +29289,14 @@ mod tests {
             source_dead_pages: 0,
             transition_dead_pages: 0,
             completed_activations: 0,
-            completed_transition_cohort: false,
             allows_global_width_growth: true,
             release_directed_lease: false,
             demand_preference: None,
         });
         assert_eq!(
             machine.continuation,
-            Some(ActiveContinuation::cohort(terminal)),
-            "fully checked candidates that bind the last variable emit directly"
+            Some(terminal),
+            "terminal and nonterminal handoffs use the same preferred-key law"
         );
 
         machine.accept_delta_step(DeltaStepOutcome {
@@ -29363,7 +29308,6 @@ mod tests {
             source_dead_pages: 2,
             transition_dead_pages: 0,
             completed_activations: 0,
-            completed_transition_cohort: false,
             allows_global_width_growth: true,
             release_directed_lease: false,
             demand_preference: None,
@@ -29381,7 +29325,6 @@ mod tests {
             source_dead_pages: 0,
             transition_dead_pages: 1,
             completed_activations: 0,
-            completed_transition_cohort: false,
             allows_global_width_growth: false,
             release_directed_lease: false,
             demand_preference: None,
@@ -29401,7 +29344,6 @@ mod tests {
             source_dead_pages: 0,
             transition_dead_pages: 0,
             completed_activations: 1,
-            completed_transition_cohort: false,
             allows_global_width_growth: true,
             release_directed_lease: false,
             demand_preference: None,
@@ -29426,11 +29368,11 @@ mod tests {
         };
         let active = seed_test_program_proposal(&program, &mut machine, &plan, root.variables());
 
-        machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
+        machine.last_selection = SelectionKind::Preferred;
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert_eq!(machine.active_delta, Some(active));
 
-        machine.last_selection = SelectionKind::Continuation(ContinuationMode::Cohort);
+        machine.last_selection = SelectionKind::Preferred;
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert_eq!(
             machine.active_delta,
@@ -29451,7 +29393,7 @@ mod tests {
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
         assert_eq!(machine.active_delta, Some(active));
 
-        machine.last_selection = SelectionKind::Continuation(ContinuationMode::ProbeOne);
+        machine.last_selection = SelectionKind::Preferred;
         let stable = file(
             &mut machine.worklist,
             &mut machine.interner,
@@ -29476,10 +29418,7 @@ mod tests {
             "an immediate stable effect must not discard independent traversal affinity"
         );
         assert!(machine.active_delta_after_yield);
-        assert_eq!(
-            machine.continuation,
-            Some(ActiveContinuation::probe_one(stable))
-        );
+        assert_eq!(machine.continuation, Some(stable));
 
         machine.continuation_sprint_enabled = false;
         machine.accept_delta_seed(None, None, Some(active), 1, None, Vec::new(), Vec::new());
