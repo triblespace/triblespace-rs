@@ -2599,27 +2599,33 @@ enum QueryScheduler {
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
-/// Every live fresh ordinary iterator uses canonical
+/// With the `residual` feature, a fresh ordinary iterator uses canonical
 /// residual states. It starts with narrow, depth-first action cohorts and
 /// widens as the consumer keeps pulling, while histories with identical future
-/// computation can reconverge under one state identity. The production
-/// lowering flattens exposed associative AND regions, preserves other finite
-/// composites such as Union as fused constraint kernels, and executes
-/// production-qualified regular-path Programs as heterogeneous state actions.
-/// Explicit routes deferred by policy use the ordinary constraint action. A
-/// structurally absent route may instead retain the constraint's legacy pager
-/// or seed hooks. Seed-rejected queries start no runtime. Use
-/// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
-/// [`Query::sequential`] for the scalar depth-first specialization. The
-/// Scheduler selection and structural lowering are independent controls; use
-/// [`Query::residual_lowering`] to select a conservative or intermediate
-/// lowering without changing the scheduler. Fully drained scheduler results
-/// produce the same distinct raw projected-row set; their iteration order may
-/// differ. Strict-projection keys are claimed before Rust conversion, so
-/// conversion failure or panic never retries the same raw row through another
-/// witness. Full heads need no terminal claim table: engine action admission
-/// already makes complete raw bindings unique, and a full projection is
-/// injective.
+/// computation can reconverge under one state identity. Without the feature,
+/// ordinary iteration uses the scalar depth-first specialization. The
+/// residual implementation and its explicit entry points remain available in
+/// either build so the two ordinary policies can be measured against the same
+/// constraint protocol and storage format.
+///
+/// Residual production lowering flattens exposed associative AND regions,
+/// preserves other finite composites such as Union as fused constraint
+/// kernels, and executes production-qualified regular-path Programs as
+/// heterogeneous state actions. Explicit routes deferred by policy use the
+/// ordinary constraint action. A structurally absent route may instead retain
+/// the constraint's legacy pager or seed hooks. Seed-rejected queries start no
+/// runtime. Use [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG
+/// control, [`Query::sequential`] for scalar depth-first execution, and
+/// [`Query::residual_state_scheduler`] for residual execution independent of
+/// the feature-selected ordinary policy. Scheduler selection and structural
+/// lowering are independent controls; use [`Query::residual_lowering`] to
+/// select a conservative or intermediate lowering without changing the
+/// scheduler. Fully drained scheduler results produce the same distinct raw
+/// projected-row set; their iteration order may differ. Strict-projection keys
+/// are claimed before Rust conversion, so conversion failure or panic never
+/// retries the same raw row through another witness. Full heads need no
+/// terminal claim table: engine action admission already makes complete raw
+/// bindings unique, and a full projection is injective.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -2835,17 +2841,20 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 
     /// Use the scalar depth-first scheduler for this query.
     ///
-    /// Every live fresh ordinary iterator uses residual states. The scalar
-    /// scheduler remains useful for tiny queries, strict frontier-memory
-    /// bounds, and as the block-of-one specialization of the same block-native
-    /// constraint protocol; [`Query::lazy_dag_scheduler`] selects the explicit
-    /// bound-variable-set worklist control.
+    /// Without the `residual` feature this is the ordinary scheduler. It also
+    /// remains an explicit control in residual-enabled builds for tiny
+    /// queries, strict frontier-memory bounds, and as the block-of-one
+    /// specialization of the same block-native constraint protocol;
+    /// [`Query::lazy_dag_scheduler`] selects the explicit bound-variable-set
+    /// worklist control.
     ///
-    /// This selection governs direct [`Iterator`] pulls. Converting a fresh
-    /// `.sequential()` query through ordinary Rayon iteration intentionally
-    /// moves it into the canonical adaptive residual producer. After scalar
-    /// iteration has started, `into_par_iter()` instead drains that exact
-    /// scalar cursor remainder as one unsplittable leaf.
+    /// This selection governs direct [`Iterator`] pulls. In a
+    /// residual-enabled build, converting a fresh `.sequential()` query
+    /// through ordinary Rayon iteration intentionally moves it into the
+    /// canonical adaptive residual producer; without the feature it retains
+    /// scalar split-or-descend. After scalar iteration has started,
+    /// `into_par_iter()` drains that exact scalar cursor remainder as one
+    /// unsplittable leaf in either build.
     ///
     /// # Panics
     ///
@@ -2863,11 +2872,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Force canonical residual-state execution through the ordinary
     /// resumable [`Query`] iterator.
     ///
-    /// Ordinary live iteration already selects residual states for every root.
-    /// This explicit selector can restore that scheduler after another builder
-    /// choice and remains useful as a completeness/comparison control. A
-    /// seed-rejected query still starts no worklist. The selector preserves the
-    /// query's structural lowering. Use
+    /// With the `residual` feature ordinary live iteration already selects
+    /// residual states for every live root. In either build this explicit
+    /// selector can restore that scheduler after another builder choice and
+    /// remains useful as a completeness/comparison control. A seed-rejected
+    /// query still starts no worklist. The selector preserves the query's
+    /// structural lowering. Use
     /// [`Query::residual_lowering`] before this method to choose another of the
     /// nine canonical lowering forms. The runtime cursor remains behind
     /// `Query::next`, so cloning a started query
@@ -2891,8 +2901,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 
     /// Select structural lowering independently from the physical scheduler.
     ///
-    /// Ordinary live queries start with [`residual::ResidualLowering::HYBRID`].
-    /// Explicit scheduler comparisons can request
+    /// Residual execution starts with
+    /// [`residual::ResidualLowering::HYBRID`]. Explicit scheduler comparisons
+    /// can request
     /// [`residual::ResidualLowering::CONSERVATIVE`] or any intermediate form
     /// without changing their scheduler.
     ///
@@ -2913,12 +2924,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// [`Query`] iterator.
     ///
     /// This is a diagnostic and behavioral control for comparing the DAG
-    /// worklist with the residual-default ordinary scheduler. It keeps its raw
+    /// worklist with the feature-selected ordinary scheduler. It keeps its raw
     /// resumable worklist behind `Query::next`, so cloning a started query
     /// snapshots the exact remainder. Converting an unstarted selected query
-    /// through ordinary Rayon iteration uses the canonical residual runtime;
-    /// use `Query::into_par_dag_iter` (with the `parallel` feature) to request
-    /// affine DAG sharding explicitly.
+    /// through ordinary Rayon iteration uses the feature-selected ordinary
+    /// runtime; use `Query::into_par_dag_iter` (with the `parallel` feature) to
+    /// request affine DAG sharding explicitly.
     ///
     /// # Panics
     ///
@@ -3035,11 +3046,14 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         if matches!(mode, Search::NextVariable) && !variables.is_empty() {
             assert!(has_initial_source, "{SOURCE_FRONTIER_ERROR}");
         }
+        #[cfg(feature = "residual")]
         let scheduler = if matches!(mode, Search::NextVariable) {
             QueryScheduler::ResidualState
         } else {
             QueryScheduler::LazyDag
         };
+        #[cfg(not(feature = "residual"))]
+        let scheduler = QueryScheduler::Sequential;
         Query {
             constraint,
             postprocessing,
@@ -4742,8 +4756,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 //
 // Usage: `find!(...).into_par_iter().map(...).collect::<Vec<_>>()`.
 //
-// Ordinary `IntoParallelIterator` installs the canonical residual runtime on
-// a fresh query and delegates partitioning to its affine splitter.
+// With the `residual` feature, ordinary `IntoParallelIterator` installs the
+// canonical residual runtime on a fresh query and delegates partitioning to
+// its affine splitter. Without it, ordinary parallel iteration retains the
+// scalar split-or-descend path.
 // `Query::into_par_dag_iter` explicitly selects the comparison DAG: seed
 // negotiation runs until a bucket contains multiple rows, then Rayon bisects
 // those affine rows into independent worklists. Each DAG fold leaf therefore
@@ -4765,15 +4781,16 @@ mod parallel {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     /// Parallel iterator over the results of a [`Query`]. Obtained either via
-    /// ordinary [`IntoParallelIterator::into_par_iter`] (canonical residual
-    /// affine sharding) or [`Query::into_par_dag_iter`] (affine DAG-frontier
-    /// sharding).
+    /// ordinary [`IntoParallelIterator::into_par_iter`] (feature-selected
+    /// scalar or residual sharding) or [`Query::into_par_dag_iter`] (affine
+    /// DAG-frontier sharding).
     ///
-    /// Fresh ordinary iteration delegates directly to
+    /// In a residual-enabled build, fresh ordinary iteration delegates
+    /// directly to
     /// [`ResidualStateParIter`](residual::ResidualStateParIter), including its
-    /// affine splitter and fold loop. The wrapped [`Query`] producer exists
-    /// only for the explicit comparison DAG and already-started exact
-    /// remainders.
+    /// affine splitter and fold loop. Otherwise the wrapped [`Query`] producer
+    /// performs scalar split-or-descend. The same wrapper also owns the
+    /// explicit comparison DAG and already-started exact remainders.
     ///
     /// Rayon clones the constraint tree and postprocessor for each shard.
     /// Clone-local interior state is therefore clone-local by definition;
@@ -4800,9 +4817,10 @@ mod parallel {
         /// Consume a fresh query as a block-native parallel DAG iterator.
         ///
         /// Unlike ordinary [`IntoParallelIterator::into_par_iter`], which uses
-        /// the adaptive-width canonical residual runtime, this explicit path
-        /// starts the lazy DAG at saturated width and partitions its affine row
-        /// frontier into at most one worklist shard per Rayon worker.
+        /// the feature-selected scalar or adaptive residual runtime, this
+        /// explicit path starts the lazy DAG at saturated width and partitions
+        /// its affine row frontier into at most one worklist shard per Rayon
+        /// worker.
         /// Each shard preserves backend batches, per-row variable selection,
         /// and route reconvergence among the rows it owns; reconvergence across
         /// shards is traded for parallelism. Fully drained results preserve the
@@ -4861,23 +4879,59 @@ mod parallel {
         type Iter = QueryParIter<C, P, R>;
 
         fn into_par_iter(self) -> Self::Iter {
-            // Move a fresh ordinary query directly into the existing residual
-            // iterator and producer. QueryParIter is only a type-level adapter;
-            // it adds no residual split or execution path of its own.
-            if !self.iteration_started && self.dag.is_none() && self.residual.is_none() {
-                let lowering = self.residual_lowering;
-                let residual = self.solve_residual_state_lazy_with(lowering);
+            #[cfg(feature = "residual")]
+            {
+                // Move a fresh ordinary query directly into the existing
+                // residual iterator and producer. QueryParIter is only a
+                // type-level adapter; it adds no residual split or execution
+                // path of its own.
+                if !self.iteration_started && self.dag.is_none() && self.residual.is_none() {
+                    let lowering = self.residual_lowering;
+                    let residual = self.solve_residual_state_lazy_with(lowering);
+                    return QueryParIter {
+                        inner: QueryParInner::Residual(residual.into_par_iter()),
+                    };
+                }
+
                 return QueryParIter {
-                    inner: QueryParInner::Residual(residual.into_par_iter()),
+                    inner: QueryParInner::Query {
+                        inner: Box::new(self),
+                        // An already-started exact remainder is one leaf.
+                        split_budget: 0,
+                    },
                 };
             }
 
-            QueryParIter {
-                inner: QueryParInner::Query {
-                    inner: Box::new(self),
-                    // An already-started exact remainder is one leaf.
-                    split_budget: 0,
-                },
+            #[cfg(not(feature = "residual"))]
+            {
+                let mut query = self;
+                if !query.iteration_started
+                    && query.scheduler == QueryScheduler::ResidualState
+                    && query.dag.is_none()
+                    && query.residual.is_none()
+                {
+                    // An explicit residual scheduler request remains explicit
+                    // even when residual is not the ordinary policy.
+                    let lowering = query.residual_lowering;
+                    let residual = query.solve_residual_state_lazy_with(lowering);
+                    return QueryParIter {
+                        inner: QueryParInner::Residual(residual.into_par_iter()),
+                    };
+                } else if !query.iteration_started
+                    && query.dag.is_none()
+                    && query.residual.is_none()
+                {
+                    // Keep ordinary Rayon execution on the same scalar engine
+                    // selected by ordinary serial iteration.
+                    query.scheduler = QueryScheduler::Sequential;
+                }
+
+                QueryParIter {
+                    inner: QueryParInner::Query {
+                        inner: Box::new(query),
+                        split_budget: 0,
+                    },
+                }
             }
         }
     }
@@ -4912,11 +4966,7 @@ mod parallel {
             // The empty projection has one possible public key. Sharding its
             // hidden witnesses can only do redundant work and weakens the
             // existence-query latency guarantee, so keep it in one leaf.
-            if inner.projection.is_empty_head()
-                || inner.iteration_started
-                || inner.dag.is_none()
-                || split_budget == 0
-            {
+            if inner.projection.is_empty_head() || inner.iteration_started || split_budget == 0 {
                 return (
                     QueryParIter {
                         inner: QueryParInner::Query {
@@ -4929,18 +4979,65 @@ mod parallel {
             }
             split_budget -= 1;
 
-            // Explicit parallel-DAG query: split the affine frontier. `right`
-            // owns disjoint raw rows and receives its own cloned constraint
-            // and postprocessor when the surrounding Query is cloned.
-            let right_state = {
-                let q = &mut *inner;
-                q.dag.as_mut().expect("checked above").split_for_parallel(
-                    &q.constraint,
-                    &q.influences,
-                    &q.base_estimates,
-                )
-            };
-            let Some(right_state) = right_state else {
+            if inner.dag.is_some() {
+                // Explicit parallel-DAG query: split the affine frontier.
+                // `right` owns disjoint raw rows and receives its own cloned
+                // constraint and postprocessor.
+                let right_state = {
+                    let q = &mut *inner;
+                    q.dag.as_mut().expect("checked above").split_for_parallel(
+                        &q.constraint,
+                        &q.influences,
+                        &q.base_estimates,
+                    )
+                };
+                let Some(right_state) = right_state else {
+                    return (
+                        QueryParIter {
+                            inner: QueryParInner::Query {
+                                inner,
+                                split_budget: 0,
+                            },
+                        },
+                        None,
+                    );
+                };
+                if dag_stats::enabled() {
+                    dag_stats::record_parallel_split();
+                }
+
+                // Clone only the small Query shell plus constraint and
+                // postprocessor. Temporarily remove the left worklist so a
+                // split does not deep-clone all of its frontier rows.
+                let left_state = inner.dag.take().expect("checked above");
+                let projection = inner.projection.share_for_parallel();
+                let mut right = (*inner).clone();
+                inner.dag = Some(left_state);
+                right.dag = Some(Box::new(right_state));
+                right.projection.attach_shared(projection);
+                let left_budget = split_budget / 2;
+                let right_budget = split_budget - left_budget;
+                return (
+                    QueryParIter {
+                        inner: QueryParInner::Query {
+                            inner,
+                            split_budget: left_budget,
+                        },
+                    },
+                    Some(QueryParIter {
+                        inner: QueryParInner::Query {
+                            inner: Box::new(right),
+                            split_budget: right_budget,
+                        },
+                    }),
+                );
+            }
+
+            #[cfg(feature = "residual")]
+            {
+                // In a residual-enabled build an unstarted ordinary query is
+                // represented by `QueryParInner::Residual`. A wrapped scalar
+                // query can therefore only be an exact remainder.
                 return (
                     QueryParIter {
                         inner: QueryParInner::Query {
@@ -4950,36 +5047,118 @@ mod parallel {
                     },
                     None,
                 );
-            };
-            if dag_stats::enabled() {
-                dag_stats::record_parallel_split();
             }
 
-            // Clone only the small Query shell plus constraint and
-            // postprocessor. Temporarily remove the left worklist so a split
-            // does not deep-clone all of its frontier rows.
-            let left_state = inner.dag.take().expect("checked above");
-            let projection = inner.projection.share_for_parallel();
-            let mut right = (*inner).clone();
-            inner.dag = Some(left_state);
-            right.dag = Some(Box::new(right_state));
-            right.projection.attach_shared(projection);
-            let left_budget = split_budget / 2;
-            let right_budget = split_budget - left_budget;
-            (
-                QueryParIter {
-                    inner: QueryParInner::Query {
-                        inner,
-                        split_budget: left_budget,
-                    },
-                },
-                Some(QueryParIter {
-                    inner: QueryParInner::Query {
-                        inner: Box::new(right),
-                        split_budget: right_budget,
-                    },
-                }),
-            )
+            #[cfg(not(feature = "residual"))]
+            {
+                // Ordinary scalar scheduler: descend through singleton
+                // proposals until a proposal vector can be bisected.
+                let q = &mut *inner;
+                loop {
+                    while !matches!(q.mode, Search::NextValue) {
+                        match q.mode {
+                            Search::NextVariable => {
+                                q.mode = Search::NextValue;
+                                if q.unbound.is_empty() {
+                                    // Fully bound: leave the single result to
+                                    // `fold_with`.
+                                    q.mode = Search::NextVariable;
+                                    return (
+                                        QueryParIter {
+                                            inner: QueryParInner::Query {
+                                                inner,
+                                                split_budget: 0,
+                                            },
+                                        },
+                                        None,
+                                    );
+                                }
+                                q.push_next_variable();
+                            }
+                            Search::Backtrack => {
+                                if let Some(variable) = q.stack.pop() {
+                                    q.row.pop();
+                                    q.cols[variable] = COL_UNBOUND;
+                                    q.bound.unset(variable);
+                                    q.unbound.push(variable);
+                                    q.touched_variables.set(variable);
+                                    q.mode = Search::NextValue;
+                                } else {
+                                    q.mode = Search::Done;
+                                    return (
+                                        QueryParIter {
+                                            inner: QueryParInner::Query {
+                                                inner,
+                                                split_budget: 0,
+                                            },
+                                        },
+                                        None,
+                                    );
+                                }
+                            }
+                            Search::Done => {
+                                return (
+                                    QueryParIter {
+                                        inner: QueryParInner::Query {
+                                            inner,
+                                            split_budget: 0,
+                                        },
+                                    },
+                                    None,
+                                );
+                            }
+                            Search::NextValue => unreachable!(),
+                        }
+                    }
+
+                    let Some(&top) = q.stack.last() else {
+                        return (
+                            QueryParIter {
+                                inner: QueryParInner::Query {
+                                    inner,
+                                    split_budget: 0,
+                                },
+                            },
+                            None,
+                        );
+                    };
+                    match q.values[top].as_ref().map_or(0, Vec::len) {
+                        0 => q.mode = Search::Backtrack,
+                        1 => {
+                            let assignment = q.values[top].as_mut().unwrap().pop().unwrap();
+                            *q.row.last_mut().expect("cursor row parallel to stack") = assignment;
+                            q.touched_variables.set(top);
+                            q.mode = Search::NextVariable;
+                        }
+                        _ => {
+                            let values = q.values[top].as_mut().unwrap();
+                            let midpoint = values.len() / 2;
+                            let right_values: Vec<RawInline> = values.drain(midpoint..).collect();
+                            let projection = q.projection.share_for_parallel();
+                            let mut right = q.clone();
+                            right.values[top] = Some(right_values);
+                            right.projection.attach_shared(projection);
+
+                            let left_budget = split_budget / 2;
+                            let right_budget = split_budget - left_budget;
+                            return (
+                                QueryParIter {
+                                    inner: QueryParInner::Query {
+                                        inner,
+                                        split_budget: left_budget,
+                                    },
+                                },
+                                Some(QueryParIter {
+                                    inner: QueryParInner::Query {
+                                        inner: Box::new(right),
+                                        split_budget: right_budget,
+                                    },
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         fn fold_with<F: Folder<R>>(self, folder: F) -> F {
@@ -5019,8 +5198,14 @@ mod parallel {
                 QueryParInner::Query { inner, .. } => inner,
             };
 
+            let workers = rayon::current_num_threads();
             let split_budget = if inner.dag.is_some() && !inner.iteration_started {
-                rayon::current_num_threads().saturating_sub(1)
+                workers.saturating_sub(1)
+            } else if cfg!(not(feature = "residual"))
+                && inner.residual.is_none()
+                && !inner.iteration_started
+            {
+                workers.saturating_mul(workers).max(2)
             } else {
                 0
             };
@@ -5042,14 +5227,30 @@ mod parallel {
         use crate::inline::encodings::iu256::U256BE;
 
         #[test]
-        fn fresh_sequential_query_routes_to_residual_parallel_producer() {
+        fn fresh_ordinary_query_routes_to_feature_selected_parallel_producer() {
+            let mut context = VariableContext::new();
+            let variable = context.next_variable::<U256BE>();
+            let query = Query::new(
+                Arc::new(variable.is(U256BE::inline_from(1u64))),
+                move |binding: &Binding| binding.get(variable.index).copied(),
+            );
+
+            let parallel = query.into_par_iter();
+            #[cfg(feature = "residual")]
+            assert!(matches!(parallel.inner, QueryParInner::Residual(_)));
+            #[cfg(not(feature = "residual"))]
+            assert!(matches!(parallel.inner, QueryParInner::Query { .. }));
+        }
+
+        #[test]
+        fn explicit_residual_query_routes_to_residual_parallel_producer() {
             let mut context = VariableContext::new();
             let variable = context.next_variable::<U256BE>();
             let query = Query::new(
                 Arc::new(variable.is(U256BE::inline_from(1u64))),
                 move |binding: &Binding| binding.get(variable.index).copied(),
             )
-            .sequential();
+            .residual_state_scheduler();
 
             let parallel = query.into_par_iter();
             assert!(matches!(parallel.inner, QueryParInner::Residual(_)));
@@ -5476,7 +5677,10 @@ mod tests {
         let mut context = VariableContext::new();
         let variable = context.next_variable::<U256BE>();
         let ordinary = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()));
+        #[cfg(feature = "residual")]
         assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
+        #[cfg(not(feature = "residual"))]
+        assert_eq!(ordinary.scheduler, QueryScheduler::Sequential);
         assert_eq!(
             ordinary.residual_lowering,
             residual::ResidualLowering::HYBRID
@@ -6031,7 +6235,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", feature = "residual"))]
     #[test]
     fn ordinary_parallel_residual_admits_set_before_splitting() {
         use rayon::prelude::*;

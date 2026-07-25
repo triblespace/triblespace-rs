@@ -503,13 +503,14 @@ an optional deduplication elision. It does not strengthen proposal coverage or
 alter the constraint's SET meaning.
 
 The explicit `Query::sequential()` scheduler calls these methods with a one-row
-[`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks;
-every live fresh ordinary iterator uses canonical residual states, while
+[`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks.
+Fresh ordinary iterators use that scalar scheduler unless the `residual`
+feature selects canonical residual states;
 `Query::lazy_dag_scheduler()` selects the bound-variable-set DAG explicitly for
 comparison. Both block-native engines call the same methods with row blocks and
-tagged candidate frontiers. Implementations without a
-specialized batch operation can loop over the rows, use
-`CandidateSink::extend_row`, and use the `confirm_per_row` adapter.
+tagged candidate frontiers. Implementations without a specialized batch
+operation can loop over the rows, use `CandidateSink::extend_row`, and use the
+`confirm_per_row` adapter.
 
 The four row-taking operations must also be row-homomorphic: evaluating
 non-empty consecutive sub-blocks independently and concatenating their

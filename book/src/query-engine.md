@@ -9,10 +9,12 @@ adapt to the values already found instead of being fixed before evaluation.
 
 The current protocol is **block-native**. Its unit of work is not necessarily
 one partial binding, but a block of partial bindings that have the same set of
-bound variables. Every live serial ordinary
-iterator uses the canonical residual-state worklist. The bound-variable-set
-DAG and [`Query::sequential`](triblespace::core::query::Query::sequential)
-remain explicit controls; the sequential path speaks the same protocol with
+bound variables. With the `residual` feature, every live serial ordinary
+iterator uses the canonical residual-state worklist; without it, ordinary
+iteration uses scalar depth-first execution. The bound-variable-set DAG,
+[`Query::sequential`](triblespace::core::query::Query::sequential), and
+[`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
+remain explicit controls. The sequential path speaks the same protocol with
 blocks of one row. This shared interface is the important part of the design:
 a constraint has one implementation whether its probes are issued one at a
 time, fused into a CPU loop, or dispatched to a batch-oriented accelerator.
@@ -272,13 +274,16 @@ whose live transition miss doubles its own quantum. Source misses leave every
 transition quantum unchanged. A negative transition cohort reaches outer
 search-width growth only after it saturates `S` and leaves terminal work live.
 
-The ordinary [`Query`](triblespace::core::query::Query) uses this engine whenever
-exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
-disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
-truths therefore all exercise the same residual substrate. A seed-rejected
-query starts no worklist at all. Production lowering flattens exposed
-associative AND regions, keeps other finite logical composites such as Union as
-fused constraint kernels inside that substrate, and enables
+With the `residual` feature, the ordinary
+[`Query`](triblespace::core::query::Query) uses this engine whenever exact seed
+settlement leaves a live search. The explicit
+[`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
+does the same in either build. Opaque roots, one-leaf ANDs, disjoint
+conjunctions, finite Union roots, RPQ roots, and live zero-variable truths
+therefore all exercise the same residual substrate when selected. A
+seed-rejected query starts no worklist at all. Production lowering flattens
+exposed associative AND regions, keeps other finite logical composites such as
+Union as fused constraint kernels inside that substrate, and enables
 production-qualified typed Programs for RPQs and other heterogeneous actions.
 Canonical single-shard SuccinctArchive Propose, Confirm, and Support routes are
 production-qualified, so their pageable typed form participates in ordinary
@@ -343,17 +348,19 @@ after its first parent filed into it. The tradeoff is explicit: highly
 reconvergent queries can retain a broader frontier and use more memory in
 exchange for larger batches.
 
-The ordinary [`Query`](triblespace::core::query::Query) uses residual states for
-every live seed;
+With the `residual` feature, the ordinary
+[`Query`](triblespace::core::query::Query) uses residual states for every live
+seed. [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
+selects them explicitly in either build, while
 [`Query::lazy_dag_scheduler`](triblespace::core::query::Query::lazy_dag_scheduler)
-selects this worklist explicitly for comparison. Demand-adaptive chunk width
-starts at one row and grows geometrically whenever the consumer asks the engine
-to resume. Before
-the width cap is reached, scheduling is strict deepest-first, preserving
-sequential-class first-result behavior; after saturation, the readiness gate
-turns on and the remaining computation enters the batch-harvesting regime. An
-`exists!` or `take(1)` consumer can therefore discard the worklist after the
-first match instead of paying for full enumeration.
+selects the bound-variable-set DAG for comparison. Demand-adaptive chunk width
+starts at one row and grows geometrically whenever the consumer asks the
+residual engine to resume. Before the width cap is reached, scheduling is
+strict deepest-first, preserving sequential-class first-result behavior; after
+saturation, the readiness gate turns on and the remaining computation enters
+the batch-harvesting regime. An `exists!` or `take(1)` consumer can therefore
+discard the worklist after the first match instead of paying for full
+enumeration.
 
 Variable grouping preserves the exact adaptive action selected for each row.
 The selected variable and proposer occurrence own that row's candidate action;
@@ -433,14 +440,14 @@ carry no claim state in either execution mode.
 
 ## Parallel execution
 
-With the `parallel` feature, ordinary `IntoParallelIterator` consumption uses
-the same canonical residual runtime as ordinary serial iteration. A fresh
-query starts with the adaptive geometric width policy and partitions its exact
-affine frontier into at most one shard per worker. Rows, complete
-candidate-parent groups, and candidates whose remaining confirmation suffix is
-page-local are the same shard atoms used by the explicit residual path.
-Cross-shard reconvergence is traded for concurrency, but no second solver or
-seed restart is involved.
+With both the `parallel` and `residual` features, ordinary
+`IntoParallelIterator` consumption uses the same canonical residual runtime as
+ordinary serial iteration. A fresh query starts with the adaptive geometric
+width policy and partitions its exact affine frontier into at most one shard
+per worker. With `parallel` alone, ordinary iteration instead bisects scalar
+proposal frontiers and descends each shard depth-first. In either mode,
+cross-shard reconvergence is traded for concurrency without restarting the
+seed.
 
 [`Query::into_par_dag_iter`](triblespace::core::query::Query::into_par_dag_iter)
 is the explicit block-native alternative. It partitions a fresh query's affine

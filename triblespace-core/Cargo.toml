@@ -79,6 +79,10 @@ kani = []
 deterministic = []
 wasm = ["dep:wasmi"]
 parallel = ["dep:rayon", "blake3/rayon"]
+# Select canonical residual-state execution for ordinary `Query` iterators.
+# The residual implementation remains compiled without this feature because
+# explicit residual APIs and regular-path internals share its primitives.
+residual = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Ordinary residual query execution is now selected by the additive
+  `residual` feature.** Without it, fresh ordinary serial and Rayon queries use
+  the scalar depth-first engine; with it, they use the adaptive canonical
+  residual engine. Explicit residual entry points and shared regular-path
+  primitives remain compiled in both builds, providing a same-revision,
+  current-format A/B seam rather than a compatibility mode for old pile
+  formats.
 - **Ordinary Rayon query iteration now reuses the canonical residual
   producer.** A fresh `Query::into_par_iter()` moves directly into the
   adaptive-width residual iterator and its affine splitter instead of entering

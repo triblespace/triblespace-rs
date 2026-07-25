@@ -109,12 +109,8 @@ enum RpqEngine {
 /// promotion while allocating only one `Query` local at a time. Keeping the
 /// scheduler choice in a runtime loop avoids the very large debug stack frames
 /// produced by expanding a fresh `find!` temporary in every assertion.
-fn assert_rpq_engines<'a, C, P, R, F>(
-    label: &str,
-    expected: &[R],
-    expected_ordinary_scheduler: &str,
-    make_query: F,
-) where
+fn assert_rpq_engines<'a, C, P, R, F>(label: &str, expected: &[R], make_query: F)
+where
     C: Constraint<'a> + Clone + Send + 'a,
     P: Fn(&Binding) -> Option<R> + Clone + Send,
     R: Debug + Ord + Send,
@@ -139,13 +135,7 @@ fn assert_rpq_engines<'a, C, P, R, F>(
             RpqEngine::Sequential => make_query().sequential().collect::<Vec<_>>(),
             RpqEngine::Ordinary => {
                 let mut query = make_query();
-                let rows = query.by_ref().collect::<Vec<_>>();
-                let state = format!("{query:?}");
-                assert!(
-                    state.contains(&format!("scheduler: {expected_ordinary_scheduler}")),
-                    "{label}: unexpected ordinary scheduler: {state}"
-                );
-                rows
+                query.by_ref().collect::<Vec<_>>()
             }
             RpqEngine::LazyDag => make_query().solve_dag_lazy().collect::<Vec<_>>(),
             RpqEngine::ResidualCursor => {
@@ -193,7 +183,7 @@ macro_rules! assert_all_engines_match {
         prop_assert_eq!(
             multiset($query),
             expected.clone(),
-            "{}: ordinary residual-default Query",
+            "{}: ordinary feature-selected Query",
             $label
         );
         prop_assert_eq!(
@@ -245,7 +235,7 @@ macro_rules! assert_all_engines_match {
             prop_assert_eq!(
                 ordinary_parallel,
                 expected.clone(),
-                "{}: ordinary parallel residual state ({} workers)",
+                "{}: ordinary parallel feature-selected state ({} workers)",
                 $label,
                 threads
             );
@@ -274,7 +264,7 @@ macro_rules! assert_residual_engines_match {
         prop_assert_eq!(
             multiset($query),
             expected.clone(),
-            "{}: ordinary residual-default Query",
+            "{}: ordinary feature-selected Query",
             $label
         );
         prop_assert_eq!(
@@ -724,7 +714,6 @@ proptest! {
         assert_rpq_engines(
             "opaque-rpq/tribleset",
             &expected,
-            "ResidualState",
             || {
                 find!(
                     (src: Inline<GenId>, dst: Inline<GenId>),
@@ -735,7 +724,6 @@ proptest! {
         assert_rpq_engines(
             "opaque-rpq/archive-roundtrip-graph",
             &expected,
-            "ResidualState",
             || {
                 find!(
                     (src: Inline<GenId>, dst: Inline<GenId>),
@@ -747,15 +735,14 @@ proptest! {
             },
         );
 
-        // The full-switch default also routes the exposed RPQ/pattern AND
-        // through ResidualState. The archive case is the real heterogeneous
-        // composition gate: RPQ traversal uses the roundtripped TribleSet graph
-        // while its sibling's estimate/propose/confirm verbs run natively
-        // against SuccinctArchive.
+        // The archive case is the real heterogeneous composition gate: RPQ
+        // traversal uses the roundtripped TribleSet graph while its sibling's
+        // estimate/propose/confirm verbs run natively against SuccinctArchive.
+        // The ordinary lane is feature-selected; the explicit residual lanes
+        // below continue to exercise residual composition in either build.
         assert_rpq_engines(
             "rpq-and-pattern/tribleset",
             &expected_marked,
-            "ResidualState",
             || {
                 find!(
                     dst: Inline<GenId>,
@@ -772,7 +759,6 @@ proptest! {
         assert_rpq_engines(
             "rpq-and-pattern/succinctarchive-sibling",
             &expected_marked,
-            "ResidualState",
             || {
                 find!(
                     dst: Inline<GenId>,

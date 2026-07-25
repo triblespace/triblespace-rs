@@ -169,7 +169,7 @@ macro_rules! gate {
                 parallel_pool().install(|| multiset(($q).into_par_iter().collect::<Vec<_>>()));
             assert_eq!(
                 sequential, parallel_residual,
-                "ordinary parallel residual engine diverged from the sequential engine on {}",
+                "ordinary parallel feature-selected engine diverged from the sequential engine on {}",
                 $name
             );
             let parallel_dag =

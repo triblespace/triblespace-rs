@@ -22655,6 +22655,7 @@ mod tests {
         ])));
     }
 
+    #[cfg(feature = "residual")]
     #[test]
     fn full_switch_routes_every_live_relational_shape_to_residual() {
         fn assert_residual<C>(root: C)
@@ -22689,6 +22690,7 @@ mod tests {
         assert!(false_constant.dag.is_none());
     }
 
+    #[cfg(feature = "residual")]
     #[test]
     fn full_switch_keeps_constant_edges_exact() {
         let false_root =
@@ -25635,7 +25637,8 @@ mod tests {
             }) as ShapeConstraint,
         ]));
         let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .residual_lowering(ResidualLowering::FULL);
+            .residual_lowering(ResidualLowering::FULL)
+            .residual_state_scheduler();
 
         let first = query.next().expect("the formula frontier is nonempty");
         let runtime = query.residual.as_deref().expect("residual cursor started");

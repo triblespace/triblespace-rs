@@ -51,6 +51,7 @@ fn ordinary_query_with_non_send_output_is_send() {
     assert_send(residual);
 }
 
+#[cfg(feature = "residual")]
 #[test]
 fn ordinary_query_uses_residual_for_exposed_overlapping_and() {
     let mut context = VariableContext::new();
@@ -66,6 +67,7 @@ fn ordinary_query_uses_residual_for_exposed_overlapping_and() {
     assert!(state.contains("dag_started: false"), "{state}");
 }
 
+#[cfg(feature = "residual")]
 #[test]
 fn ordinary_query_uses_residual_for_disjoint_and_leaves() {
     let mut context = VariableContext::new();
@@ -84,6 +86,7 @@ fn ordinary_query_uses_residual_for_disjoint_and_leaves() {
     assert!(state.contains("dag_started: false"), "{state}");
 }
 
+#[cfg(feature = "residual")]
 #[test]
 fn ordinary_query_uses_residual_for_opaque_root() {
     let mut context = VariableContext::new();
@@ -98,6 +101,7 @@ fn ordinary_query_uses_residual_for_opaque_root() {
     assert!(state.contains("dag_started: false"), "{state}");
 }
 
+#[cfg(feature = "residual")]
 #[test]
 fn ordinary_query_uses_residual_for_exposed_one_leaf_and() {
     let mut context = VariableContext::new();
@@ -443,7 +447,7 @@ fn fresh_query_into_par_iter_matches_explicit_residual_raw_set() {
     assert_eq!(ordinary, explicit_residual);
 }
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", feature = "residual"))]
 #[test]
 fn ordinary_parallel_residual_honors_early_consumer_cancellation() {
     use std::sync::atomic::{AtomicUsize, Ordering};

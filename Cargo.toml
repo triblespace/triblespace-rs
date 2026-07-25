@@ -78,6 +78,10 @@ telemetry = [
 net = ["dep:triblespace-net"]
 search = ["dep:triblespace-search"]
 parallel = ["triblespace-core/parallel"]
+# Select canonical residual-state execution for ordinary `Query` iterators.
+# Without this feature, ordinary queries use the scalar depth-first engine;
+# explicit residual APIs remain available in either build.
+residual = ["triblespace-core/residual"]
 gpu = ["parallel", "dep:triblespace-gpu", "triblespace-gpu/wgpu"]
 
 [[bench]]
