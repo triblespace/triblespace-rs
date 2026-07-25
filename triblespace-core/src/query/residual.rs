@@ -11197,11 +11197,20 @@ impl ResidualStateMachine {
                 return Some(right);
             }
 
+            // A staged singleton is already an exact affine component. Keep
+            // it intact while the other shard owns the remaining worklist.
+            if self.emit_count == 1 && (!self.worklist.is_empty() || !self.delta.is_empty()) {
+                let mut right = self.parallel_sibling();
+                right.emit_vars = std::mem::take(&mut self.emit_vars);
+                right.emit_rows = std::mem::take(&mut self.emit_rows);
+                right.emit_origins = self.emit_origins.take();
+                right.emit_count = 1;
+                self.emit_count = 0;
+                return Some(right);
+            }
+
             // Prefer splitting inside one exact state so both workers retain
-            // similarly shaped block-native continuations. A staged singleton
-            // stays on the left: spending a Rayon shard and half of the
-            // remaining split budget on one already-finished row would strand
-            // workers while divisible computation remained cold.
+            // similarly shaped block-native continuations.
             let splittable = self.worklist.iter().rev().find_map(|(&rank, level)| {
                 level.iter().rev().find_map(|(&id, bucket)| {
                     let desc = self.interner.get(id);
@@ -11268,15 +11277,6 @@ impl ResidualStateMachine {
                 let mut right = self.parallel_sibling();
                 right.worklist.entry(rank).or_default().insert(id, bucket);
                 return Some(right);
-            }
-
-            // One staged row is immediately consumable. If the remaining
-            // computation cannot itself be partitioned, leave it untouched for
-            // the fold instead of evaluating more work merely to manufacture
-            // a sibling. This is the parallel analogue of serial first-result
-            // latency and lets a full consumer cancel before bulk work.
-            if self.emit_count == 1 {
-                return None;
             }
 
             // One unsplittable affine atom remains. Advance the exact machine
@@ -11783,9 +11783,7 @@ pub use parallel::{ResidualShadowParIter, ResidualStateParIter};
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
-    use rayon::iter::plumbing::{
-        bridge_unindexed, Folder, Reducer, UnindexedConsumer, UnindexedProducer,
-    };
+    use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     /// Parallel iterator over one affine residual-state frontier.
@@ -11874,18 +11872,7 @@ mod parallel {
             } = self;
             while !folder.full() {
                 match iter.next() {
-                    Some(item) => {
-                        folder = folder.consume(item);
-                        if !folder.full() {
-                            // A Rayon folder that remains open after accepting
-                            // a result has demonstrated another unit of public
-                            // demand. Promote the one private scheduler law
-                            // once per such receipt; short-circuiting folders
-                            // become full before this point and retain the
-                            // narrow state they no longer need.
-                            iter.state.increase_width();
-                        }
-                    }
+                    Some(item) => folder = folder.consume(item),
                     None => break,
                 }
             }
@@ -11905,74 +11892,12 @@ mod parallel {
         where
             Con: UnindexedConsumer<Self::Item>,
         {
-            if self.inner.iteration_started || consumer.full() {
-                self.split_budget = 0;
-                return bridge_unindexed(self, consumer);
-            }
-
-            // Let the consumer see the latency result before negotiating a
-            // parallel frontier. If it remains open, that is an explicit
-            // demand receipt: geometrically promote the same machine once,
-            // then partition only its exact remainder. A short-circuiting
-            // consumer can become full here without any speculative sibling
-            // work.
-            let reducer = consumer.to_reducer();
-            let prefix_consumer = consumer.split_off_left();
-            let mut prefix_folder = prefix_consumer.into_folder();
-            let prefix = {
-                let iter = &mut *self.inner;
-                iter.state.pull(
-                    &iter.root,
-                    &iter.plan,
-                    &iter.postprocessing,
-                    &mut iter.projection,
-                )
+            self.split_budget = if self.inner.iteration_started {
+                0
+            } else {
+                rayon::current_num_threads().saturating_sub(1)
             };
-            let prefix_exhausted = prefix.is_none();
-            if let Some(item) = prefix {
-                prefix_folder = prefix_folder.consume(item);
-            }
-            let prefix_result = prefix_folder.complete();
-
-            if std::env::var_os("TRIBLES_DEBUG_RAYON_PREFIX").is_some() {
-                eprintln!(
-                    "rayon prefix exhausted={} consumer_full={} empty_head={} emit={}/{} work_buckets={} delta_empty={} continuation={} active_delta={} terminal_admitted={} width={}",
-                    prefix_exhausted,
-                    consumer.full(),
-                    self.inner.projection.is_empty_head(),
-                    self.inner.state.emit_next,
-                    self.inner.state.emit_count,
-                    self.inner
-                        .state
-                        .worklist
-                        .values()
-                        .map(BTreeMap::len)
-                        .sum::<usize>(),
-                    self.inner.state.delta.is_empty(),
-                    self.inner.state.continuation.is_some(),
-                    self.inner.state.active_delta.is_some(),
-                    self.inner.state.terminal_yield.ever_admitted,
-                    self.inner.state.width,
-                );
-            }
-
-            if prefix_exhausted || consumer.full() || self.inner.projection.is_empty_head() {
-                let remainder = consumer.into_folder().complete();
-                return reducer.reduce(prefix_result, remainder);
-            }
-
-            let consumed = self.inner.state.emit_next;
-            let stride = self.inner.state.emit_vars.len();
-            self.inner.state.emit_rows = self.inner.state.emit_rows.split_off(consumed * stride);
-            if let Some(origins) = &mut self.inner.state.emit_origins {
-                origins.drain(..consumed);
-            }
-            self.inner.state.emit_count -= consumed;
-            self.inner.state.emit_next = 0;
-            self.inner.state.increase_width();
-            self.split_budget = rayon::current_num_threads().saturating_sub(1);
-            let remainder = bridge_unindexed(self, consumer);
-            reducer.reduce(prefix_result, remainder)
+            bridge_unindexed(self, consumer)
         }
     }
 

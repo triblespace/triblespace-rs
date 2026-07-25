@@ -279,9 +279,6 @@ fn bench_backend<S: TriblePattern>(
         ranges.push((min, max));
     }
     let parity = sigs.iter().all(|&s| s == sigs[0]) && sigs[0].0 == expected;
-    if !parity {
-        eprintln!("{label} signatures: {sigs:?}, expected rows {expected}");
-    }
     println!(
         "{label:<24} rows {:>7}  {}",
         sigs[0].0,
