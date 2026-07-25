@@ -1647,10 +1647,10 @@ fn synthetic_root_cyclic_proposer_streams_into_an_ordinary_relational_suffix() {
     assert_eq!(query.stats().delta_source_roots, 8);
     assert_eq!(
         *suffix_calls.lock().expect("suffix recorder poisoned"),
-        [1, 1, 1, 1],
-        "each ProbeOne handoff must isolate one streamed relation atom"
+        [1, 2, 4, 1],
+        "the exact streamed receipts must follow geometric cohort growth"
     );
-    assert_eq!(query.stats().delta_handoff_probe_pops, 4);
+    assert_eq!(query.stats().delta_handoff_probe_pops, 0);
     assert_eq!(query.stats().delta_source_dead_pages, 0);
     assert_eq!(query.stats().delta_source_negative_steps, 0);
     assert_eq!(query.stats().width_increases, 3);
@@ -1937,8 +1937,8 @@ fn synthetic_root_and_streams_early_and_late_relational_survivors() {
         );
         assert_eq!(
             query.stats().delta_handoff_probe_pops,
-            expected_before_emit + 2,
-            "each adjacency plus the SET and typed program/formula handoffs are probed once"
+            0,
+            "width one is already the scalar handoff policy"
         );
         assert_eq!(query.next(), None);
         assert_eq!(query.stats().delta_transition_pages, 5);
@@ -2046,8 +2046,8 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
     assert_eq!(
         query.stats().delta_handoff_probe_pops,
-        2,
-        "the accepted adjacency and typed program/formula boundary are each probed once"
+        0,
+        "width one is already the scalar handoff policy"
     );
     let exact_clone = query.clone();
     let cancelled = query.clone();
@@ -2448,7 +2448,7 @@ fn zero_root_cyclic_and_returns_empty_without_erasing_its_or_sibling() {
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_dead_pages, 0);
     assert_eq!(query.stats().delta_source_negative_steps, 0);
-    assert!(query.stats().delta_handoff_probe_pops > 0);
+    assert_eq!(query.stats().delta_handoff_probe_pops, 0);
 }
 
 #[test]
@@ -4656,7 +4656,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
         ),
         ("whole-root-transitions", ResidualLowering::FULL),
     ];
-    let mut saw_root_cyclic_probe_one = false;
+    let mut saw_root_cyclic_continuation = false;
 
     for program in programs {
         let mut results_by_formula = Vec::new();
@@ -4687,9 +4687,9 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
                     if capability == "whole-root-transitions"
                         && program == GeneratedPathProgram::Plus
                         && formula == GeneratedFormulaCase::OrdinaryAnd
-                        && query.stats().delta_handoff_probe_pops > 0
+                        && query.stats().continuation_pops > 0
                     {
-                        saw_root_cyclic_probe_one = true;
+                        saw_root_cyclic_continuation = true;
                     }
                 }
                 results_by_level.push(expected);
@@ -4714,8 +4714,8 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
     }
 
     assert!(
-        saw_root_cyclic_probe_one,
-        "the generated width-one root+cyclic lane never exercised a streamed handoff probe"
+        saw_root_cyclic_continuation,
+        "the generated width-one root+cyclic lane never exercised a streamed handoff"
     );
 
     // The projected SET cannot reveal accidental occurrence collapse because

@@ -7535,6 +7535,7 @@ impl ActiveContinuation {
         }
     }
 
+    #[cfg(test)]
     fn probe_one(token: ContinuationToken) -> Self {
         Self {
             token,
@@ -12273,7 +12274,7 @@ impl ResidualStateMachine {
         }
     }
 
-    /// Accepts a delta-to-stable handoff into its geometric continuation mode.
+    /// Accepts a delta-to-stable handoff as one exact geometric cohort.
     fn accept_delta_step(&mut self, outcome: DeltaStepOutcome) {
         self.accept_delta_step_with_resume(outcome, None);
     }
@@ -12293,33 +12294,12 @@ impl ResidualStateMachine {
         self.active_delta = resume.or_else(|| outcome.demand_preference.take());
         self.active_delta_after_yield = retained_yielding_activation;
         self.stats.delta_active_live_yields_retained += usize::from(retained_yielding_activation);
-        self.continuation = outcome.continuation.take().map(|token| {
-            let desc = self.interner.get(token.state);
-            let commits_terminal_candidates = match &desc.phase {
-                ResidualPhase::Candidate {
-                    variable,
-                    relevant,
-                    checked,
-                } if relevant == checked => {
-                    let mut committed = desc.bound;
-                    committed.set(*variable);
-                    committed == self.full
-                }
-                _ => false,
-            };
-            if outcome.completed_transition_cohort || commits_terminal_candidates {
-                // A geometrically selected activation cohort is already the
-                // engine's chosen throughput unit. Keep its exact appended
-                // tail hot. The same is safe for fully checked candidates
-                // whose commit binds the final variable: their next step can
-                // only emit, so probing one cannot reveal downstream
-                // selectivity and would strand exact results behind live
-                // cyclic work.
-                ActiveContinuation::cohort(token)
-            } else {
-                ActiveContinuation::probe_one(token)
-            }
-        });
+        // Stable filing has already reduced every equal-key effect into this
+        // exact appended receipt. Preserve that semantic cohort across every
+        // delta handoff; `take_continuation` still caps it by the current
+        // geometric width, so width one retains scalar TTFR without imposing
+        // a second scalar policy after the search has widened.
+        self.continuation = outcome.continuation.take().map(ActiveContinuation::cohort);
         if let Some(publication) = outcome.publication.take() {
             self.stage_direct_terminal_publication(publication);
         }
@@ -12434,7 +12414,7 @@ impl ResidualStateMachine {
             (continuation.is_some() || publication.is_some()) && retained.is_some();
         self.stats.delta_active_live_yields_retained += usize::from(self.active_delta_after_yield);
         self.active_delta = retained;
-        self.continuation = continuation.map(ActiveContinuation::probe_one);
+        self.continuation = continuation.map(ActiveContinuation::cohort);
         if let Some(publication) = publication {
             self.stage_direct_terminal_publication(publication);
         }
@@ -29797,6 +29777,63 @@ mod tests {
     }
 
     #[test]
+    fn cohort_handoff_takes_minimum_of_exact_receipt_and_geometric_width() {
+        let root = ShapeLeaf(0);
+        let plan = ResidualPlan::compile(&root);
+        let desc = ready_desc(1);
+        let mut scalar = ResidualStateMachine::new(root.variables(), plan.len(), None);
+
+        file(
+            &mut scalar.worklist,
+            &mut scalar.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Rows(RowBatch {
+                rows: [10, 11, 12].map(raw).into(),
+                row_count: 3,
+            }),
+            &mut scalar.stats,
+        );
+        let receipt = file(
+            &mut scalar.worklist,
+            &mut scalar.interner,
+            plan.len(),
+            desc,
+            StateBucket::Rows(RowBatch {
+                rows: [40, 41, 42, 43, 44, 45, 46, 47].map(raw).into(),
+                row_count: 8,
+            }),
+            &mut scalar.stats,
+        )
+        .expect("the exact appended handoff cohort is nonempty");
+        let mut widened = scalar.clone();
+
+        let scalar_task = scalar.take_continuation(&plan, ActiveContinuation::cohort(receipt), 1);
+        let StateBucket::Rows(scalar_rows) = scalar_task.bucket else {
+            panic!("scalar cohort handoff changed payload shape")
+        };
+        assert_eq!(scalar_rows.rows, [raw(47)]);
+        assert_eq!(scalar_rows.row_count, 1);
+
+        let widened_task = widened.take_continuation(&plan, ActiveContinuation::cohort(receipt), 4);
+        let StateBucket::Rows(widened_rows) = widened_task.bucket else {
+            panic!("widened cohort handoff changed payload shape")
+        };
+        assert_eq!(widened_rows.rows, [44, 45, 46, 47].map(raw));
+        assert_eq!(widened_rows.row_count, 4);
+
+        for (machine, expected_remainder) in [(&scalar, 10), (&widened, 7)] {
+            let remainder = machine
+                .worklist
+                .get(&receipt.rank)
+                .and_then(|level| level.get(&receipt.state))
+                .expect("the older prefix and untaken receipt tail remain canonical");
+            assert_eq!(remainder.occupancy(false), expected_remainder);
+            assert_eq!(machine.stats.delta_handoff_probe_pops, 0);
+        }
+    }
+
+    #[test]
     fn probe_one_preserves_old_cold_tail_across_hit_miss_and_clone() {
         let root = ShapeLeaf(0);
         let plan = ResidualPlan::compile(&root);
@@ -29915,7 +29952,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_delta_feedback_arms_probe_without_widening() {
+    fn mixed_delta_feedback_keeps_exact_handoff_cohort_without_widening() {
         let mut machine = ResidualStateMachine::new(VariableSet::new_singleton(0), 1, None);
         machine.width = 4;
         machine.cap = 64;
@@ -29957,7 +29994,7 @@ mod tests {
         assert_eq!(machine.stats.delta_source_negative_steps, 0);
         assert_eq!(
             machine.continuation,
-            Some(ActiveContinuation::probe_one(token))
+            Some(ActiveContinuation::cohort(token))
         );
 
         machine.accept_delta_step(DeltaStepOutcome {
@@ -30141,7 +30178,7 @@ mod tests {
         assert!(machine.active_delta_after_yield);
         assert_eq!(
             machine.continuation,
-            Some(ActiveContinuation::probe_one(stable))
+            Some(ActiveContinuation::cohort(stable))
         );
 
         machine.continuation_sprint_enabled = false;

@@ -5373,6 +5373,10 @@ pub(super) struct DeltaStepOutcome {
     /// More than one activation from the scheduler's deliberately bounded
     /// transition cohort completed in this step. Source paging batches rows
     /// for storage efficiency, not as a latency/throughput activation choice.
+    ///
+    /// Retained by the cohort-handoff probe so producer telemetry stays
+    /// byte-for-byte comparable while the consumer policy ignores it.
+    #[allow(dead_code)]
     pub(super) completed_transition_cohort: bool,
     /// Whether a globally negative physical step is mature evidence for
     /// widening outer search `S`. Terminal traversal first exhausts its local
