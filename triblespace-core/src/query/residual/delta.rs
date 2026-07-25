@@ -1375,6 +1375,17 @@ struct DeltaStreamingReturn {
     effect: DeltaStreamingEffect,
 }
 
+/// Affine sparse-pacing authority delayed until one activation's staged rows
+/// either claim a novel raw projection or exhaust their physical suffix.
+#[derive(Clone, Debug)]
+pub(super) struct TerminalProjectionFeedback {
+    pub(super) activation: ActivationId,
+    pub(super) last_row: usize,
+    /// Original transition search ceiling when a saturated miss may widen;
+    /// `None` makes a duplicate exhaustion a consumed but neutral receipt.
+    widen_to: Option<usize>,
+}
+
 /// Full-bound rows published by terminal streaming activations, with one
 /// exact affine origin per row. Origin is the semantic publication identity
 /// for the outer projected-yield ledger; it never enters canonical residual
@@ -1391,6 +1402,10 @@ pub(super) struct TerminalPublicationBatch {
     /// is staged. Ordinary terminal batches carry none; the first positive
     /// winner for one Confirm parent carries exactly one.
     pub(super) registrations: SmallVec<[TerminalOriginRegistration; 1]>,
+    /// Physical row origins. Positive Confirm/Support rows may carry a
+    /// different semantic activation in `origins`.
+    pub(super) physical_origins: SmallVec<[ActivationId; 1]>,
+    pub(super) projection_feedback: SmallVec<[TerminalProjectionFeedback; 1]>,
 }
 
 impl TerminalPublicationBatch {
@@ -1403,22 +1418,39 @@ impl TerminalPublicationBatch {
         rows: RowBatch,
         registration: Option<TerminalOriginRegistration>,
     ) -> Self {
+        let row_count = rows.row_count;
         let mut origins = SmallVec::new();
-        origins.resize(rows.row_count, activation);
+        origins.resize(row_count, activation);
         let mut registrations = SmallVec::new();
         registrations.extend(registration);
+        let physical_origins = origins.clone();
         Self {
             rows,
             origins,
             registrations,
+            physical_origins,
+            projection_feedback: SmallVec::new(),
         }
     }
 
     fn append(&mut self, mut other: Self) {
+        assert!(
+            self.projection_feedback.is_empty() && other.projection_feedback.is_empty(),
+            "terminal batches append before dispatch feedback is attached"
+        );
         self.rows.append(other.rows);
         self.origins.extend(other.origins.drain(..));
         self.registrations.extend(other.registrations.drain(..));
+        self.physical_origins
+            .extend(other.physical_origins.drain(..));
         debug_assert_eq!(self.origins.len(), self.rows.row_count);
+        debug_assert_eq!(self.physical_origins.len(), self.rows.row_count);
+    }
+
+    /// Reattributes a just-created positive publication from its semantic
+    /// Confirm parent to the child activation that physically produced it.
+    fn set_physical_origin(&mut self, activation: ActivationId) {
+        self.physical_origins.fill(activation);
     }
 }
 
@@ -1459,6 +1491,13 @@ impl DeltaStableEffects {
 
     fn has_effect(&self) -> bool {
         self.continuation.is_some() || self.publication.is_some()
+    }
+
+    fn with_physical_origin(mut self, activation: ActivationId) -> Self {
+        if let Some(publication) = &mut self.publication {
+            publication.set_physical_origin(activation);
+        }
+        self
     }
 }
 
@@ -6443,6 +6482,7 @@ impl DeltaScheduler {
         search_width: usize,
         examined_before: usize,
         terminal_publications: &OrderedActivationSet,
+        mut publication: Option<&mut TerminalPublicationBatch>,
         stats: &mut ResidualStateStats,
     ) -> bool {
         if dispatch.terminal_activations.is_empty() {
@@ -6469,11 +6509,40 @@ impl DeltaScheduler {
         stats.delta_terminal_publications += usize::from(published);
         for receipt in &dispatch.terminal_budgets {
             let published = terminal_publications.contains(&receipt.activation);
-            // Publication is always activation-local reset evidence. A miss
-            // advances sparse effort only after this activation, rather than
-            // the physical cohort in aggregate, received its complete
-            // pre-dispatch quantum.
-            let (reset, widened) = if published || receipt.assigned >= receipt.quantum {
+            // A direct terminal row crosses one more semantic boundary before
+            // it can prove novelty: the public raw ProjectionGate. Transfer
+            // reset/miss authority affinely with the staged batch.
+            let delayed = published
+                && publication.as_ref().is_some_and(|publication| {
+                    publication.physical_origins.contains(&receipt.activation)
+                });
+            let (reset, widened) = if delayed {
+                let publication = publication
+                    .as_mut()
+                    .expect("delayed feedback lost its terminal publication");
+                let last_row = publication
+                    .physical_origins
+                    .iter()
+                    .rposition(|&origin| origin == receipt.activation)
+                    .unwrap();
+                assert!(
+                    !publication
+                        .projection_feedback
+                        .iter()
+                        .any(|feedback| feedback.activation == receipt.activation),
+                    "one dispatch attached two projection receipts to one activation"
+                );
+                publication
+                    .projection_feedback
+                    .push(TerminalProjectionFeedback {
+                        activation: receipt.activation,
+                        last_row,
+                        widen_to: (dispatch.kind == PhysicalDispatchKind::Program
+                            && receipt.assigned >= receipt.quantum)
+                            .then_some(search_width),
+                    });
+                (false, false)
+            } else if published || receipt.assigned >= receipt.quantum {
                 self.registry.finish_dispatch(
                     receipt.activation,
                     search_width,
@@ -6487,6 +6556,27 @@ impl DeltaScheduler {
             stats.delta_terminal_sparse_widenings += usize::from(widened);
         }
         self.allows_global_width_growth(&dispatch, search_width, terminal_publications)
+    }
+
+    pub(super) fn settle_terminal_projection_feedback(
+        &mut self,
+        receipt: TerminalProjectionFeedback,
+        claimed: bool,
+        stats: &mut ResidualStateStats,
+    ) {
+        let (search_width, kind) = if claimed {
+            (1, PhysicalDispatchKind::Source)
+        } else {
+            let Some(search_width) = receipt.widen_to else {
+                return;
+            };
+            (search_width, PhysicalDispatchKind::Program)
+        };
+        let (reset, widened) =
+            self.registry
+                .finish_dispatch(receipt.activation, search_width, kind, claimed);
+        stats.delta_terminal_sparse_resets += usize::from(reset);
+        stats.delta_terminal_sparse_widenings += usize::from(widened);
     }
 
     fn pop_active_program(
@@ -6701,6 +6791,7 @@ impl DeltaScheduler {
             search_width,
             examined_before,
             &physical.terminal_publications,
+            outcome.publication.as_mut(),
             stats,
         );
         outcome.allows_global_width_growth =
@@ -6787,6 +6878,7 @@ impl DeltaScheduler {
             search_width,
             examined_before,
             &physical.terminal_publications,
+            outcome.publication.as_mut(),
             stats,
         );
         outcome.allows_global_width_growth =
@@ -7191,13 +7283,16 @@ impl DeltaScheduler {
                     .registry
                     .commit_positive_publication(*witness, direct_terminal_full)
                 {
-                    task_effects.absorb(Self::release_positive_publication(
-                        grant,
-                        plan,
-                        stable,
-                        stable_interner,
-                        stats,
-                    ));
+                    task_effects.absorb(
+                        Self::release_positive_publication(
+                            grant,
+                            plan,
+                            stable,
+                            stable_interner,
+                            stats,
+                        )
+                        .with_physical_origin(activation),
+                    );
                 }
                 // A real positive receipt exhausts this fully-bound hedge
                 // regardless of whether it won the parent/value SET race.
@@ -7212,13 +7307,16 @@ impl DeltaScheduler {
                 {
                     positive_support_retirements
                         .extend(self.registry.positive_support_children(parent));
-                    task_effects.absorb(Self::release_positive_publication(
-                        grant,
-                        plan,
-                        stable,
-                        stable_interner,
-                        stats,
-                    ));
+                    task_effects.absorb(
+                        Self::release_positive_publication(
+                            grant,
+                            plan,
+                            stable,
+                            stable_interner,
+                            stats,
+                        )
+                        .with_physical_origin(activation),
+                    );
                 }
             }
             // Raw accepted/supported reports from a PositiveSupport child are
@@ -9409,6 +9507,43 @@ mod tests {
             parent: parent.into_boxed_slice(),
             set_admit_result,
         }
+    }
+
+    fn open_terminal_projection_feedback_activation(
+        machine: &mut ResidualStateMachine,
+        full: VariableSet,
+        leaf_count: usize,
+    ) -> ActivationId {
+        let checked = ChildSet::empty(leaf_count);
+        machine.delta.registry.open_program_activation(
+            DeltaReducer::StreamProposal,
+            positive_candidate_return(
+                vec![value(0)],
+                VariableSet::new_singleton(0),
+                1,
+                checked.clone(),
+                checked,
+                false,
+            ),
+            None,
+            Some(full),
+        )
+    }
+
+    fn terminal_projection_feedback_fixture() -> (
+        IntersectionConstraint<PositiveCertificateLeaf>,
+        ResidualPlan,
+        ResidualStateMachine,
+        VariableSet,
+    ) {
+        let root = IntersectionConstraint::new(vec![
+            PositiveCertificateLeaf { variable: 0 },
+            PositiveCertificateLeaf { variable: 1 },
+        ]);
+        let plan = ResidualPlan::compile_production(&root);
+        let full = root.variables();
+        let machine = ResidualStateMachine::new_for_plan(full, &plan, None);
+        (root, plan, machine, full)
     }
 
     fn terminal_positive_return(parent: Vec<RawInline>) -> DeltaReturn {
@@ -14645,11 +14780,250 @@ mod tests {
             8,
             0,
             &OrderedActivationSet::default(),
+            None,
             &mut stats,
         ));
         assert_eq!(scheduler.registry.transition_dispatch_width(narrow, 8), 1);
         assert_eq!(scheduler.registry.transition_dispatch_width(wide, 8), 8);
         assert_eq!(stats.delta_terminal_sparse_widenings, 0);
+    }
+
+    #[test]
+    fn terminal_projection_feedback_is_one_receipt_per_activation_batch() {
+        let (root, plan, mut machine, full) = terminal_projection_feedback_fixture();
+        let first = open_terminal_projection_feedback_activation(&mut machine, full, plan.len());
+        let second = open_terminal_projection_feedback_activation(&mut machine, full, plan.len());
+        assert_eq!(
+            machine
+                .delta
+                .registry
+                .finish_dispatch(first, 8, PhysicalDispatchKind::Program, false),
+            (false, true)
+        );
+        for expected in [2, 4] {
+            let (_, widened) = machine.delta.registry.finish_dispatch(
+                second,
+                8,
+                PhysicalDispatchKind::Program,
+                false,
+            );
+            assert!(widened);
+            assert_eq!(
+                machine.delta.registry.transition_dispatch_width(second, 8),
+                expected
+            );
+        }
+
+        let mut publication = TerminalPublicationBatch::new(
+            first,
+            RowBatch {
+                rows: vec![value(7), value(1), value(7), value(2), value(7), value(3)],
+                row_count: 3,
+            },
+        );
+        publication.append(TerminalPublicationBatch::new(
+            second,
+            RowBatch {
+                rows: vec![value(8), value(4)],
+                row_count: 1,
+            },
+        ));
+        let dispatch = PhysicalDispatch::new(
+            &machine.delta.registry,
+            PhysicalDispatchKind::Program,
+            8,
+            [first, second],
+            vec![2, 4],
+            0,
+        );
+        let terminal_publications = OrderedActivationSet::from(vec![first, second]);
+        machine.delta.account_physical_dispatch(
+            dispatch,
+            8,
+            0,
+            &terminal_publications,
+            Some(&mut publication),
+            &mut machine.stats,
+        );
+        assert_eq!(
+            publication
+                .projection_feedback
+                .iter()
+                .map(|receipt| (receipt.activation, receipt.last_row, receipt.widen_to))
+                .collect::<Vec<_>>(),
+            [(first, 2, Some(8)), (second, 3, Some(8))]
+        );
+        assert_eq!(
+            machine.delta.registry.transition_dispatch_width(first, 8),
+            2
+        );
+        assert_eq!(
+            machine.delta.registry.transition_dispatch_width(second, 8),
+            4
+        );
+
+        machine
+            .terminal_yield
+            .register(StateId(99), &[first, second]);
+        machine.stage_direct_terminal_publication(publication);
+        machine.width = 8;
+        let mut projection = ProjectionGate::new([0], full);
+        let mut preclaimed = Binding::default();
+        preclaimed.set(0, &value(7));
+        assert!(projection.claim(&preclaimed));
+        let mapper_calls = AtomicUsize::new(0);
+        assert_eq!(
+            machine.pull(
+                &root,
+                &plan,
+                &|_| {
+                    mapper_calls.fetch_add(1, Ordering::Relaxed);
+                    None::<()>
+                },
+                &mut projection,
+            ),
+            None
+        );
+
+        assert_eq!(mapper_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            machine.delta.registry.transition_dispatch_width(first, 8),
+            4,
+            "three duplicate rows are one negative activation receipt"
+        );
+        assert_eq!(
+            machine.delta.registry.transition_dispatch_width(second, 8),
+            1,
+            "a fresh raw claim resets before a rejecting mapper runs"
+        );
+        assert_eq!(machine.stats.delta_terminal_sparse_widenings, 1);
+        assert_eq!(machine.stats.delta_terminal_sparse_resets, 1);
+        assert!(machine.emit_projection_feedback.is_empty());
+    }
+
+    #[test]
+    fn empty_projected_head_retires_unvisited_feedback_neutrally() {
+        let (root, plan, mut machine, full) = terminal_projection_feedback_fixture();
+        let first = open_terminal_projection_feedback_activation(&mut machine, full, plan.len());
+        let second = open_terminal_projection_feedback_activation(&mut machine, full, plan.len());
+        machine
+            .delta
+            .registry
+            .finish_dispatch(first, 8, PhysicalDispatchKind::Program, false);
+        for _ in 0..2 {
+            machine
+                .delta
+                .registry
+                .finish_dispatch(second, 8, PhysicalDispatchKind::Program, false);
+        }
+        let mut publication = TerminalPublicationBatch::new(
+            first,
+            RowBatch {
+                rows: vec![value(7), value(1)],
+                row_count: 1,
+            },
+        );
+        publication.append(TerminalPublicationBatch::new(
+            second,
+            RowBatch {
+                rows: vec![value(8), value(2)],
+                row_count: 1,
+            },
+        ));
+        let dispatch = PhysicalDispatch::new(
+            &machine.delta.registry,
+            PhysicalDispatchKind::Program,
+            8,
+            [first, second],
+            vec![2, 4],
+            0,
+        );
+        machine.delta.account_physical_dispatch(
+            dispatch,
+            8,
+            0,
+            &OrderedActivationSet::from(vec![first, second]),
+            Some(&mut publication),
+            &mut machine.stats,
+        );
+        machine
+            .terminal_yield
+            .register(StateId(100), &[first, second]);
+        machine.stage_direct_terminal_publication(publication);
+        let mapper_calls = AtomicUsize::new(0);
+        assert_eq!(
+            machine.pull(
+                &root,
+                &plan,
+                &|_| {
+                    mapper_calls.fetch_add(1, Ordering::Relaxed);
+                    None::<()>
+                },
+                &mut ProjectionGate::new([], full),
+            ),
+            None
+        );
+
+        assert_eq!(mapper_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            machine.delta.registry.transition_dispatch_width(first, 8),
+            1
+        );
+        assert_eq!(
+            machine.delta.registry.transition_dispatch_width(second, 8),
+            4,
+            "an exhausted empty head is not negative evidence about its suffix"
+        );
+        assert_eq!(machine.stats.delta_terminal_sparse_resets, 1);
+        assert_eq!(machine.stats.delta_terminal_sparse_widenings, 0);
+        assert!(machine.emit_projection_feedback.is_empty());
+    }
+
+    #[test]
+    fn terminal_projection_miss_uses_the_dispatch_search_ceiling() {
+        let (_, plan, mut machine, full) = terminal_projection_feedback_fixture();
+        let activation =
+            open_terminal_projection_feedback_activation(&mut machine, full, plan.len());
+        machine
+            .delta
+            .registry
+            .finish_dispatch(activation, 8, PhysicalDispatchKind::Program, false);
+        let mut publication = TerminalPublicationBatch::new(
+            activation,
+            RowBatch {
+                rows: vec![value(7), value(1)],
+                row_count: 1,
+            },
+        );
+        let dispatch = PhysicalDispatch::new(
+            &machine.delta.registry,
+            PhysicalDispatchKind::Program,
+            2,
+            [activation],
+            vec![2],
+            0,
+        );
+        machine.delta.account_physical_dispatch(
+            dispatch,
+            2,
+            0,
+            &OrderedActivationSet::from(vec![activation]),
+            Some(&mut publication),
+            &mut machine.stats,
+        );
+        let receipt = publication.projection_feedback.pop().unwrap();
+        assert_eq!(receipt.widen_to, Some(2));
+        machine
+            .delta
+            .settle_terminal_projection_feedback(receipt, false, &mut machine.stats);
+        assert_eq!(
+            machine
+                .delta
+                .registry
+                .transition_dispatch_width(activation, 8),
+            2
+        );
+        assert_eq!(machine.stats.delta_terminal_sparse_widenings, 0);
     }
 
     #[test]
