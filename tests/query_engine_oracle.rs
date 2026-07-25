@@ -2,8 +2,8 @@
 //!
 //! Route-to-route parity can preserve a shared bug. These tests instead
 //! interpret generated relations with plain Rust set algebra, then require the
-//! ordinary cursor and every residual configuration to produce exactly that
-//! distinct raw projected-row set on both in-memory and succinct backends.
+//! ordinary and explicit residual cursors to produce exactly that distinct raw
+//! projected-row set on both in-memory and succinct backends.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -105,8 +105,12 @@ where
             #[cfg(feature = "parallel")]
             RpqRoute::ResidualParallel(threads) => {
                 let query = make_query();
-                parallel_pool(threads)
-                    .install(move || query.into_par_residual_state_iter().collect::<Vec<_>>())
+                parallel_pool(threads).install(move || {
+                    query
+                        .solve_residual_state_lazy()
+                        .into_par_iter()
+                        .collect::<Vec<_>>()
+                })
             }
         };
         actual.sort_unstable();
@@ -169,28 +173,16 @@ macro_rules! assert_residual_routes_match {
             "{}: lazy residual state",
             $label
         );
-        prop_assert_eq!(
-            multiset(
-                ($query)
-                    .solve_residual_state_lazy()
-                    .cap(1)
-                    .start_width(1)
-                    .growth(1)
-            ),
-            expected.clone(),
-            "{}: residual fixed-width sprint",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_residual_state_lazy().cap(2)),
-            expected.clone(),
-            "{}: residual forced harvest",
-            $label
-        );
         #[cfg(feature = "parallel")]
         for threads in [1usize, 4] {
-            let residual = parallel_pool(threads)
-                .install(|| multiset(($query).into_par_residual_state_iter().collect::<Vec<_>>()));
+            let residual = parallel_pool(threads).install(|| {
+                multiset(
+                    ($query)
+                        .solve_residual_state_lazy()
+                        .into_par_iter()
+                        .collect::<Vec<_>>(),
+                )
+            });
             prop_assert_eq!(
                 residual,
                 expected.clone(),
@@ -205,11 +197,10 @@ macro_rules! assert_residual_routes_match {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
-    /// Independently checks ordinary iteration, geometric, fixed-width, and
-    /// forced-harvest production schedules over random joins and overlapping
-    /// unions on both storage backends. Keeping this in a separate property
-    /// test also keeps the generated query temporaries below the test thread's
-    /// stack budget.
+    /// Independently checks serial and parallel production execution over
+    /// random joins and overlapping unions on both storage backends. Keeping
+    /// this in a separate property test also keeps the generated query
+    /// temporaries below the test thread's stack budget.
     #[test]
     fn residual_schedules_match_relational_oracles(
         p_masks in prop::array::uniform4(0u8..16),
@@ -380,20 +371,12 @@ fn formula_candidate_paging_is_storage_polymorphic() {
                 expected,
                 concat!($label, ": ordinary")
             );
-            for (geometry, cap, growth) in [("width one", 1, 1), ("geometric", 64, 2)] {
-                assert_eq!(
-                    multiset(
-                        query!($store)
-                            .solve_residual_state_lazy()
-                            .cap(cap)
-                            .start_width(1)
-                            .growth(growth)
-                    ),
-                    expected,
-                    "{}: production residual ({geometry})",
-                    $label
-                );
-            }
+            assert_eq!(
+                multiset(query!($store).solve_residual_state_lazy()),
+                expected,
+                "{}: production residual",
+                $label
+            );
         }};
     }
 

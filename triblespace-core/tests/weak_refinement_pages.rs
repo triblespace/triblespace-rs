@@ -206,13 +206,10 @@ fn project(binding: &Binding) -> Option<(RawInline, RawInline)> {
     Some((*binding.get(X)?, *binding.get(Y)?))
 }
 
-fn run(width: usize) -> (BTreeSet<(RawInline, RawInline)>, Vec<Vec<RawInline>>) {
+fn run() -> (BTreeSet<(RawInline, RawInline)>, Vec<Vec<RawInline>>) {
     let (root, pages) = fixture();
     let profiled = Query::new(root, project)
         .solve_residual_state_lazy()
-        .cap(width)
-        .start_width(width)
-        .growth(1)
         .collect_profiled();
     let pages = pages
         .lock()
@@ -245,20 +242,12 @@ fn weak_refinement_need_not_be_a_candidate_page_homomorphism() {
 #[test]
 fn ordinary_paging_set_admits_then_reaches_the_exact_raw_relation() {
     let expected = BTreeSet::from([(raw(1), raw(9))]);
-    for width in [1, 2, 4] {
-        let (actual, pages) = run(width);
-        assert_eq!(actual, expected, "width {width}");
-        assert_eq!(
-            pages.iter().map(Vec::len).sum::<usize>(),
-            3,
-            "width {width}: duplicate proposals crossed the first split"
-        );
-    }
-
-    let (_, singleton_pages) = run(1);
-    assert!(
-        singleton_pages.iter().all(|page| page.len() == 1),
-        "fixed width one must refine independent candidate occurrences"
+    let (actual, pages) = run();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        pages.iter().map(Vec::len).sum::<usize>(),
+        3,
+        "duplicate proposals crossed SET admission"
     );
 }
 
@@ -268,9 +257,6 @@ fn parallel_affine_partitioning_preserves_the_weak_refinement_set() {
     let (root, _) = fixture();
     let actual: BTreeSet<_> = Query::new(root, project)
         .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
-        .growth(1)
         .into_par_iter()
         .collect();
     assert_eq!(actual, BTreeSet::from([(raw(1), raw(9))]));

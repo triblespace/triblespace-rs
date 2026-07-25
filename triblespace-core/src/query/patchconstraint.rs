@@ -698,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn value_program_pages_match_default_and_width_one_production_paths() {
+    fn value_program_pages_match_ordinary_and_explicit_residual_paths() {
         // Repeated insertion is set-idempotent: the direct frontier must not
         // manufacture a second occurrence for the duplicate stored key.
         let patch = value_patch(&[3, 1, 2, 2]);
@@ -732,35 +732,36 @@ mod tests {
 
         let mut default: Vec<_> =
             Query::new(PatchValueConstraint::new(variable, &patch), project_value).collect();
-        let mut narrow_query =
+        let mut residual_query =
             Query::new(PatchValueConstraint::new(variable, &patch), project_value)
-                .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1);
-        let mut narrow: Vec<_> = narrow_query.by_ref().collect();
-        for bag in [&mut default, &mut narrow] {
+                .solve_residual_state_lazy();
+        let mut residual: Vec<_> = residual_query.by_ref().collect();
+        for bag in [&mut default, &mut residual] {
             bag.sort_unstable();
         }
         assert_eq!(default, direct);
-        assert_eq!(narrow, direct);
+        assert_eq!(residual, direct);
         assert_eq!(
-            narrow_query.stats().delta_source_pages,
+            residual_query.stats().delta_source_candidates_examined,
             patch.len() as usize
         );
         assert_eq!(
-            narrow_query.stats().delta_source_candidates_examined,
+            residual_query.stats().delta_source_direct_candidates,
             patch.len() as usize
         );
-        assert_eq!(
-            narrow_query.stats().delta_source_direct_candidates,
-            patch.len() as usize
+        assert_eq!(residual_query.stats().delta_source_roots, 0);
+        assert!(
+            residual_query.stats().delta_source_pages < patch.len() as usize,
+            "the canonical geometric law never widened this full drain"
         );
-        assert_eq!(narrow_query.stats().delta_source_roots, 0);
-        assert_eq!(narrow_query.stats().max_propose_candidates, 1);
+        assert!(
+            residual_query.stats().max_propose_candidates > 1,
+            "the canonical geometric law never formed a batched page"
+        );
     }
 
     #[test]
-    fn id_program_pages_match_default_and_width_one_production_paths() {
+    fn id_program_pages_match_ordinary_and_explicit_residual_paths() {
         let patch = id_patch(&[0xf0, 0x10, 0x80, 0x10]);
         let variable = Variable::<GenId>::new(0);
         let constraint = PatchIdConstraint::new(variable, patch.clone());
@@ -790,16 +791,14 @@ mod tests {
 
         let make = || PatchIdConstraint::new(variable, patch.clone());
         let mut default: Vec<_> = Query::new(make(), project_value).collect();
-        let mut narrow: Vec<_> = Query::new(make(), project_value)
+        let mut residual: Vec<_> = Query::new(make(), project_value)
             .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
             .collect();
-        for bag in [&mut default, &mut narrow] {
+        for bag in [&mut default, &mut residual] {
             bag.sort_unstable();
         }
         assert_eq!(default, direct);
-        assert_eq!(narrow, direct);
+        assert_eq!(residual, direct);
     }
 
     #[test]
@@ -948,12 +947,9 @@ mod tests {
         );
 
         let mut default: Vec<_> = Query::new(make(), project).collect();
-        let mut narrow_query = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
-        let mut narrow: Vec<_> = narrow_query.by_ref().collect();
-        for bag in [&mut default, &mut narrow] {
+        let mut residual_query = Query::new(make(), project).solve_residual_state_lazy();
+        let mut residual: Vec<_> = residual_query.by_ref().collect();
+        for bag in [&mut default, &mut residual] {
             bag.sort_unstable();
         }
         let expected: Vec<_> = members
@@ -964,13 +960,13 @@ mod tests {
         assert!(default
             .iter()
             .all(|(parent, _member)| *parent == parent_value));
-        assert_eq!(narrow, expected);
+        assert_eq!(residual, expected);
         assert_eq!(
-            narrow_query.stats().delta_source_direct_candidates,
+            residual_query.stats().delta_source_direct_candidates,
             3,
             "the SET boundary admits byte-identical semantic parents before direct source work",
         );
-        assert_eq!(narrow_query.stats().delta_source_roots, 0);
+        assert_eq!(residual_query.stats().delta_source_roots, 0);
     }
 
     #[test]
@@ -982,8 +978,6 @@ mod tests {
         let solve = |patch| {
             Query::new(PatchValueConstraint::new(variable, patch), project_value)
                 .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1)
                 .collect::<Vec<_>>()
         };
 

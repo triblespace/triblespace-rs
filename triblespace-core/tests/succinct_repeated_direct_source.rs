@@ -200,11 +200,7 @@ fn assert_negative_growth<'a, C>(root: C, expected: RawInline)
 where
     C: Constraint<'a> + 'a,
 {
-    let mut query = Query::new(root, project_zero)
-        .solve_residual_state_lazy()
-        .start_width(1)
-        .growth(2)
-        .cap(16);
+    let mut query = Query::new(root, project_zero).solve_residual_state_lazy();
 
     assert_eq!(query.next(), Some(expected));
     assert_eq!(query.stats().delta_source_pages, 3);
@@ -254,10 +250,7 @@ fn clone_drop_and_duplicate_affine_parents_preserve_exact_sets() {
         .collect();
     expected.sort_unstable();
 
-    let mut query = Query::new(root, project_zero)
-        .solve_residual_state_lazy()
-        .start_width(1)
-        .cap(1);
+    let mut query = Query::new(root, project_zero).solve_residual_state_lazy();
     let first = query
         .next()
         .expect("fixture has repeated-position witnesses");
@@ -296,8 +289,6 @@ fn clone_drop_and_duplicate_affine_parents_preserve_exact_sets() {
     let project = |binding: &Binding| Some((*binding.get(PARENT)?, *binding.get(TARGET)?));
     let mut residual: Vec<_> = Query::new(make(), project)
         .solve_residual_state_lazy()
-        .start_width(1)
-        .cap(1)
         .collect();
     let mut affine_expected: Vec<_> = expected
         .iter()
@@ -377,7 +368,6 @@ fn program_snapshot(archive: &SuccinctArchive<OrderedUniverse>, attribute: Id) -
     assert_typed_program_family("snapshot/E=V", &constraint, x.index, &RowsView::EMPTY);
     let mut values: Vec<_> = Query::new(constraint, project_zero)
         .solve_residual_state_lazy()
-        .start_width(1)
         .collect();
     values.sort_unstable();
     values

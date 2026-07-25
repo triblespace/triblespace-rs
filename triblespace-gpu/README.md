@@ -114,13 +114,13 @@ failures currently panic because the `Constraint::confirm` protocol has no
 error channel.
 
 The `residual_reconverge_bench` example measures why admission belongs at
-this seam. It compares adaptive and saturated residual execution, serially
-and through Rayon, across four interleaved rank policies: the canonical
-archive, the wrapper forced to CPU rank, every non-empty rank batch forced to
-WGPU, and the default thresholded hybrid. Exact sorted result vectors are
-compared before timing. Because the crossover depends on archive shape,
-scheduler batch geometry, runtime, and hardware, rerun the probe on deployment
-hardware instead of treating one machine's measurements as constants.
+this seam. It compares the same residual execution law serially and through
+Rayon across four interleaved rank policies: the canonical archive, the wrapper
+forced to CPU rank, every non-empty rank batch forced to WGPU, and the default
+thresholded hybrid. Exact sorted result vectors are compared before timing.
+Because the crossover depends on archive shape, scheduler batch geometry,
+runtime, and hardware, rerun the probe on deployment hardware instead of
+treating one machine's measurements as constants.
 
 ### Resident `QueryProgram` transition
 

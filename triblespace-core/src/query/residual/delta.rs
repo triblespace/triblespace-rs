@@ -4739,7 +4739,7 @@ impl DeltaScheduler {
             public_pull_demand: PublicPullDemandState::Closed,
             program_runtimes: AHashMap::new(),
             program_scratch: None,
-            activation_width: 1,
+            activation_width: INITIAL_RESIDUAL_WIDTH,
             terminal_selection_slots: AHashMap::new(),
             terminal_selections: Vec::new(),
         }
@@ -4756,11 +4756,8 @@ impl DeltaScheduler {
         self.registry.state.activations.contains_key(&receipt)
     }
 
-    pub(super) fn grow_activation_width(&mut self, growth: usize, cap: usize) -> bool {
-        let next = self
-            .activation_width
-            .saturating_mul(growth.max(1))
-            .clamp(1, cap.max(1));
+    pub(super) fn grow_activation_width(&mut self) -> bool {
+        let next = next_residual_width(self.activation_width);
         let grew = next > self.activation_width;
         self.activation_width = next;
         grew
@@ -9211,14 +9208,12 @@ mod tests {
         let mut fused_feedback =
             ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), None);
         fused_feedback.width = 8;
-        fused_feedback.cap = 64;
         fused_feedback.account_delta_feedback(&fused_outcome.outcome);
 
         let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateChronology, 4);
         let mut unfused_feedback =
             ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), None);
         unfused_feedback.width = 8;
-        unfused_feedback.cap = 64;
         for _ in 0..8 {
             if unfused.scheduler.is_empty() {
                 break;
@@ -9370,7 +9365,6 @@ mod tests {
         let mut fused_feedback =
             ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), None);
         fused_feedback.width = 2;
-        fused_feedback.cap = 64;
         fused_feedback.account_delta_feedback(&fused_outcome.outcome);
 
         let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateDeadTail, 2);
@@ -9378,7 +9372,6 @@ mod tests {
         let mut unfused_feedback =
             ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), None);
         unfused_feedback.width = 2;
-        unfused_feedback.cap = 64;
         for _ in 0..4 {
             if unfused.scheduler.is_empty() {
                 break;
@@ -9413,14 +9406,12 @@ mod tests {
         let mut fused_feedback =
             ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), None);
         fused_feedback.width = 2;
-        fused_feedback.cap = 64;
         fused_feedback.account_delta_feedback(&fused_outcome.outcome);
 
         let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::TransitionThenSourceDead, 2);
         let mut unfused_feedback =
             ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), None);
         unfused_feedback.width = 2;
-        unfused_feedback.cap = 64;
         for _ in 0..4 {
             if unfused.scheduler.is_empty() {
                 break;

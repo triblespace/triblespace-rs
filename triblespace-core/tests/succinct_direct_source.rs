@@ -359,9 +359,7 @@ fn production_program_first_pull_is_one_direct_candidate() {
     let mut query = Query::new(root, move |binding: &Binding| {
         binding.get(variable.index).copied()
     })
-    .solve_residual_state_lazy()
-    .start_width(1)
-    .cap(1);
+    .solve_residual_state_lazy();
 
     assert_eq!(query.next(), Some(values[0].raw));
     assert_eq!(query.stats().delta_source_pages, 1);
@@ -456,9 +454,7 @@ fn direct_sources_preserve_affine_parent_multiplicity() {
         ])
     };
     let project = move |binding: &Binding| binding.get(variable.index).copied();
-    let mut residual_query = Query::new(make_root(), project)
-        .solve_residual_state_lazy()
-        .cap(1);
+    let mut residual_query = Query::new(make_root(), project).solve_residual_state_lazy();
     let mut residual: Vec<_> = residual_query.by_ref().collect();
     residual.sort_unstable();
     let mut expected: Vec<_> = values

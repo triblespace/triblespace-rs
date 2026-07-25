@@ -273,12 +273,13 @@ back to the canonical production Succinct route.
 Ordinary [`Query`](triblespace::core::query::Query) iteration owns the residual
 cursor for every root. Its compiler policy is fixed: native AND flattening,
 finite Union-leaf continuations, and returned typed Program routes.
-`solve_residual_state_lazy` uses the same production plan while exposing width
-controls and `collect_profiled` reports state, merge, action, and batch
-measurements. A full drain preserves the distinct raw projected-row set, but
-may change result order. Fully-bound rows remain raw until the consumer pulls
-them, so the worklist never stores projected `R`s and a partially consumed
-query can snapshot its exact remainder without requiring `R: Clone`.
+`solve_residual_state_lazy` exposes the same production cursor for explicit
+iteration and observation; `collect_profiled` reports state, merge, action, and
+batch measurements. Width follows the engine's single private geometric law.
+A full drain preserves the distinct raw projected-row set, but may change
+result order. Fully-bound rows remain raw until the consumer pulls them, so the
+worklist never stores projected `R`s and a partially consumed query can snapshot
+its exact remainder without requiring `R: Clone`.
 
 ## Terminal projection and SET identity
 
@@ -325,26 +326,19 @@ carry no claim state in either execution mode.
 
 With the `parallel` feature, ordinary `IntoParallelIterator` consumption uses
 the same canonical residual runtime as ordinary serial iteration. A fresh
-query starts with the adaptive geometric width policy and partitions its exact
-affine frontier into at most one shard per worker. Rows and SET-admitted
-candidate occurrences are the same shard atoms used by the explicit residual
-path. A selected typed Program may retain one complete parent activation for
-physical traversal reuse, and a live Formula OR frame retains its private
-payload.
+query starts with width one and partitions its exact affine frontier into at
+most one shard per worker. Rows and SET-admitted candidate occurrences are the
+same shard atoms used by the serial residual path. A selected typed Program may
+retain one complete parent activation for physical traversal reuse, and a live
+Formula OR frame retains its private payload.
 Cross-shard reconvergence is traded for concurrency, but no second solver or
 seed restart is involved.
 
-[`Query::into_par_residual_state_iter`](triblespace::core::query::Query::into_par_residual_state_iter)
-is the explicit saturated-width residual entry point. It uses the same affine
-splitter and executor as ordinary parallel iteration, but treats the call as a
-full-enumeration throughput request and starts at the width cap. Rows and
-SET-admitted candidate occurrences are valid shard atoms; a selected typed
-Program may keep one complete parent activation intact for physical traversal
-reuse, and a live Formula OR frame retains its private payload. Every shard
-retains canonical state merging locally; state is moved rather than
+Every shard retains canonical state merging locally; state is moved rather than
 duplicated, and the constraint/postprocessor pair is cloned only when a real
-sibling shard is created. Both ordinary and saturated parallel entry points
-use the same fixed production plan as serial `Query`.
+sibling shard is created. There is no separate parallel width policy:
+`solve_residual_state_lazy().into_par_iter()` and ordinary fresh
+`Query::into_par_iter()` preserve the same geometric law as serial execution.
 
 ### Opt-in residual action observation
 
@@ -439,19 +433,16 @@ The adapter captures the current `ActionCorrelation` once and carries that
 capability across the synchronous WGPU round trip, so asynchronous device work
 does not depend on ambient TLS after dispatch.
 The `residual_reconverge_bench` example measures this admission boundary across
-adaptive and saturated serial/Rayon residual execution. It compares exact
-sorted output before timing and reports the CPU, forced-WGPU, and thresholded
-hybrid paths separately rather than treating executor choice as a planner
-mode.
+serial and Rayon residual execution. It compares exact sorted output before
+timing and reports the CPU, forced-WGPU, and thresholded hybrid paths separately
+rather than treating executor choice as a planner mode.
 
 A partially consumed ordinary query converted through
 `into_par_iter()` is drained as one parallel leaf so its exact remaining state
-cannot be restarted or partitioned by a second solver. The explicit saturated
-block-native entry point requires a fresh query. With one Rayon worker it has a
-zero split budget; with `N` workers it permits at most `N - 1` splits. In every
-case the result
-guarantee is equality of the distinct raw projected-row set, not iteration
-order.
+cannot be restarted or partitioned by a second solver. With one Rayon worker a
+fresh query has a zero split budget; with `N` workers it permits at most `N - 1`
+splits. In every case the result guarantee is equality of the distinct raw
+projected-row set, not iteration order.
 
 The parallel paths clone the constraint tree and result postprocessor per
 shard. Code that needs aggregate observations across clones should use shared

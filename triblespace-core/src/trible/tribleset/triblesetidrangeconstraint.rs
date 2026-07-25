@@ -504,8 +504,6 @@ mod tests {
             move |binding| project(entity.index, binding),
         )
         .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
         .collect();
         assert!(residual_entities.is_empty());
 
@@ -519,8 +517,6 @@ mod tests {
             move |binding| project(attribute.index, binding),
         )
         .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
         .collect();
         assert!(residual_attributes.is_empty());
     }
@@ -626,9 +622,7 @@ mod tests {
             data.entity_in_range(entity, entity_ids[1], entity_ids[2]),
             move |binding| project(entity.index, binding),
         )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
+        .solve_residual_state_lazy();
         assert_eq!(
             entity_query.next(),
             Some(id_into_value(&entity_ids[1].raw()))
@@ -642,9 +636,6 @@ mod tests {
             move |binding| project(entity.index, binding),
         )
         .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
-        .growth(1)
         .collect();
         full_entities.sort_unstable();
         assert_eq!(
@@ -660,8 +651,6 @@ mod tests {
             move |binding| project(attribute.index, binding),
         )
         .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
         .collect();
         actual.sort_unstable();
         assert_eq!(

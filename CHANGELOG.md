@@ -28,9 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TribleSet patterns and ranges, and UnionArchive use the same typed paging
   substrate.
 - **Breaking: ordinary queries now have one fixed residual compiler policy.**
-  Serial iteration, ordinary Rayon iteration, saturated parallel iteration,
-  and private RPQ subframes all compile native AND regions with finite
-  Union-leaf continuations and the typed Programs returned for each action.
+  Serial iteration, ordinary Rayon iteration, and private RPQ subframes all
+  compile native AND regions with finite Union-leaf continuations and the typed
+  Programs returned for each action.
   `Query::residual_lowering`, `ResidualLowering`, `FormulaScope`,
   `ProgramScope`, and `solve_residual_state_lazy_with` are removed rather than
   retained as never-shipped compatibility or tuning surfaces.
@@ -63,8 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cursor-bounded.
 - **Ordinary Rayon query iteration now reuses the canonical residual
   producer.** A fresh `Query::into_par_iter()` moves directly into the
-  adaptive-width residual iterator and its affine splitter instead of entering
-  the removed scalar split-or-descend path. Already-started queries remain one
+  residual iterator and its affine splitter instead of entering the removed
+  scalar split-or-descend path. Already-started queries remain one
   exact-remainder leaf.
 - **Breaking: ordinary confirmation now pages under weak support refinement.**
   The never-shipped public `Constraint::residual_confirm_is_page_local` and
@@ -326,13 +326,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking: the unpublished query-engine families are gone.**
   `Query` now has one block-native production engine: the canonical residual
-  state machine, with adaptive ordinary iteration and an explicit saturated
-  residual/Rayon control. The `solve_blocked`, `solve_dag*`,
-  `lazy_dag_scheduler`, and `into_par_dag_iter` APIs, their worklist types,
-  gates, statistics, probes, and dedicated benchmarks were removed outright,
-  together with the scalar DFS selector and runtime. Historical engine
-  comparisons remain reproducible from frozen Git revisions rather than a
-  compatibility matrix in the current tree.
+  state machine. The `solve_blocked`, `solve_dag*`, `lazy_dag_scheduler`, and
+  `into_par_dag_iter` APIs, their worklist types, gates, statistics, probes,
+  and dedicated benchmarks were removed outright, together with the scalar
+  DFS selector and runtime. Historical engine comparisons remain reproducible
+  from frozen Git revisions rather than a compatibility matrix in the current
+  tree.
 - **Obsolete query-engine tuning fixtures are gone.** The source-identical
   cross-generation benchmark and the experimental backoff-policy matrix were
   deleted instead of being kept compiling against adapters that no longer
@@ -468,11 +467,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Confirmed projected demand floors residual search width.** Exhausting a
   projected-result window leaves search width unchanged until the caller pulls
   again; that later pull doubles the result window and raises search `S` to at
-  least the confirmed demand. The floor is cap-bounded and counter-neutral when
-  search is already ahead, while `growth(1)` continues to disable only
-  negative-work growth. Raw emission alone remains outside the search-feedback
-  signal, while exhausting a staged projection suffix without satisfying the
-  public pull grows `S` as negative work without charging projected demand.
+  least the confirmed demand. The floor is bounded by the private residual row
+  cap and counter-neutral when search is already ahead. Raw emission alone
+  remains outside the search-feedback signal, while exhausting a staged
+  projection suffix without satisfying the public pull grows `S` as negative
+  work without charging projected demand.
 - **Proven direct-terminal delta lanes publish final rows without stable-state
   churn.** A selected singleton or retained affine lease may turn accepted
   proposal pages directly into the ordinary projection buffer only when its
@@ -660,10 +659,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clones snapshot candidate remainders and staged raw rows without requiring
   `R: Clone`; a partially consumed residual query converts to Rayon as one
   exact unsplittable remainder leaf. Fresh ordinary Rayon conversion divides
-  one adaptive affine residual frontier into at most one shard per worker. The
-  explicit `into_par_residual_state_iter` path uses the same splitter at
-  saturated width, paging SET-admitted candidates unless a selected typed
-  route retains one parent activation for reuse.
+  one affine residual frontier into at most one shard per worker, paging
+  SET-admitted candidates unless a selected typed route retains one parent
+  activation for reuse.
 - **Constraints gain a canonical residual-state solver.** Every root
   `Constraint` participates in the same runtime: roots that expose associative
   AND structure are recursively flattened, while an opaque root is represented
@@ -682,24 +680,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more structure. Profiled iterator collection reports planning/action pops,
   interner and bucket merges, and leaf-call batch measurements.
 - **Canonical residual states gain a demand-driven batch-fill iterator.**
-  `solve_residual_state_lazy` starts with a narrow desired parent-atom width so
-  descendants can yield before sibling rows are evaluated. Filing a nonempty
+  `solve_residual_state_lazy` starts with one desired parent atom so descendants
+  can yield before sibling rows are evaluated. Filing a nonempty
   successor—including a merge into an already-live bucket—keeps that width;
   an action that compacts to no successor or raw terminal output grows it
   geometrically. Successful first paths therefore retain their exact width-one
   trace, while negative prefixes ramp within a single pull even when no result
   is ever projected. The deepest live state able to fill the desired width
   wins; when none can, minimum-rank readiness drains the remaining feeder
-  frontier. The saturation cap only bounds width growth. Candidate chunks may
-  split admitted `(parent, value)` occurrences independently; a selected typed
-  Program may retain one complete parent activation solely to reuse its
-  traversal. Candidate fanout therefore remains distinct from a total-work
-  estimate. Exact descriptors remain interned so early states can safely reopen
-  when later histories reach them. Full drains preserve the distinct raw
-  projected-row set; partial consumers may drop the remaining
-  affine frontier after the first useful result. Ready planning retains each row's
-  exact adaptive variable and proposing leaf, then cohorts only rows with the
-  same action.
+  frontier. Candidate chunks may split admitted `(parent, value)` occurrences
+  independently; a selected typed Program may retain one complete parent
+  activation solely to reuse its traversal. Candidate fanout therefore remains
+  distinct from a total-work estimate. Exact descriptors remain interned so
+  early states can safely reopen when later histories reach them. Full drains
+  preserve the distinct raw projected-row set; partial consumers may drop the
+  remaining affine frontier after the first useful result. Ready planning
+  retains each row's exact adaptive variable and proposing leaf, then cohorts
+  only rows with the same action.
+- **Breaking: residual width selection is one private geometric law.** Search
+  width `S`, projected-result demand `Q`, and activation quantum `A` each begin
+  at one and independently double on their existing feedback signal up to the
+  fixed private `2^20` row cap. Public start-width, growth, cap, block-row-cap,
+  and environment tuning surfaces are removed. The immediate-saturation
+  parallel entry point is removed as a duplicate policy; callers use the same
+  residual iterator directly or through ordinary Rayon conversion.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM
@@ -776,10 +780,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot-local proof is not a device-wide cooperative idleness gate.
 
 ### Fixed
-
-- **Explicit parallel residual queries use the production compiler policy.**
-  `Query::into_par_residual_state_iter` carries the same fixed production plan
-  as serial and ordinary Rayon execution into its affine shards.
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**
   `hash_tokens` previously discarded every token without an alphanumeric
   character, making standalone emoji queries produce an empty term list.
@@ -962,8 +962,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-wrapper fallback/fragmentation counters, a CPU fake-backend gate, and a
   native Metal parity gate keep this hybrid explicit. The deterministic
   `residual_reconverge_bench` compares canonical CPU, wrapper CPU, forced WGPU,
-  and thresholded hybrid rank execution under adaptive/saturated serial and
-  Rayon residual drivers with exact sorted-output parity. Adapter
+  and thresholded hybrid rank execution under the same serial and Rayon
+  residual driver with exact sorted-output parity. Adapter
   construction/device enqueue is reported separately from the first
   synchronizing query rather than mislabeled as upload latency. Selecting the
   fork still only makes future mmap-to-Metal aliasing possible: both this
@@ -997,13 +997,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coverage switch, not a claim that residual control overhead pays back for
   every shape. Production structural lowering is fixed rather than carried as
   per-query state.
-  Demand-adaptive chunk width starts with depth-first, first-result-oriented
-  execution and grows into readiness-gated batch harvesting. Residual planning
-  cohorts explicit `(variable, proposer occurrence)` actions and never
-  reassigns a row's choice, because that action owns candidate support and
-  first-seen order.
-  Ordinary fresh Rayon iteration partitions the adaptive affine residual
-  frontier into at most one shard per worker. A partially
+  Chunk width starts at one for depth-first, first-result-oriented execution and
+  doubles into readiness-gated batch harvesting. Residual planning cohorts
+  explicit `(variable, proposer occurrence)` actions and never reassigns a row's
+  choice, because that action owns candidate support and first-seen order.
+  Ordinary fresh Rayon iteration partitions the affine residual frontier into
+  at most one shard per worker. A partially
   consumed ordinary residual query still drains its exact remainder as one
   Rayon leaf. The constraint protocol states the row-homomorphism law that
   makes chunking and sharding semantics-neutral.

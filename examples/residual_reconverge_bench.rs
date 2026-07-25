@@ -24,8 +24,7 @@
 //!     TRIBLES_WGPU_ONLY=1 cargo run --release --features gpu \
 //!         --example residual_reconverge_bench -- 2048 16 8
 //!
-//! Compares the one residual-state solver under its adaptive and saturated
-//! admission policies, both serially and through Rayon. Each backend reports
+//! Compares the one residual-state solver serially and through Rayon. Each backend reports
 //! min/median/max wall time and an order-independent parity signature.
 //! With `--features gpu`, an additional controlled comparison interleaves the
 //! canonical CPU archive, the WGPU wrapper forced to its CPU rank path, forced
@@ -208,12 +207,9 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    AdaptiveSerial,
-    SaturatedSerial,
+    Serial,
     #[cfg(feature = "parallel")]
-    AdaptiveParallel,
-    #[cfg(feature = "parallel")]
-    SaturatedParallel,
+    Parallel,
 }
 
 fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode) -> (usize, u64) {
@@ -230,17 +226,9 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         ])
     );
     match mode {
-        Mode::AdaptiveSerial => tally(q.solve_residual_state_lazy()),
-        Mode::SaturatedSerial => tally(
-            q.solve_residual_state_lazy()
-                .cap(usize::MAX)
-                .start_width(usize::MAX)
-                .growth(1),
-        ),
+        Mode::Serial => tally(q.solve_residual_state_lazy()),
         #[cfg(feature = "parallel")]
-        Mode::AdaptiveParallel => tally_par(q.into_par_iter()),
-        #[cfg(feature = "parallel")]
-        Mode::SaturatedParallel => tally_par(q.into_par_residual_state_iter()),
+        Mode::Parallel => tally_par(q.solve_residual_state_lazy().into_par_iter()),
     }
 }
 
@@ -264,15 +252,10 @@ fn bench_backend<S: TriblePattern>(
     expected: usize,
     reps: usize,
 ) {
-    let mut modes = vec![
-        ("serial-adaptive", Mode::AdaptiveSerial),
-        ("serial-saturated", Mode::SaturatedSerial),
-    ];
     #[cfg(feature = "parallel")]
-    modes.extend([
-        ("rayon-adaptive", Mode::AdaptiveParallel),
-        ("rayon-saturated", Mode::SaturatedParallel),
-    ]);
+    let modes = [("serial", Mode::Serial), ("rayon", Mode::Parallel)];
+    #[cfg(not(feature = "parallel"))]
+    let modes = [("serial", Mode::Serial)];
     for &(_, mode) in &modes {
         std::hint::black_box(run_query(kb, markers, mode));
     }
@@ -325,10 +308,9 @@ type QueryRow = (
     Inline<inlineencodings::GenId>,
 );
 
-/// Collects a full result multiset for the adaptive/saturated admission
-/// policies used by the controlled GPU comparison. Callers sort the result
-/// before comparison, because Rayon deliberately does not promise encounter
-/// order here.
+/// Collects a full result multiset for the controlled GPU comparison. Callers
+/// sort the result before comparison, because Rayon deliberately does not
+/// promise encounter order here.
 #[cfg(feature = "gpu")]
 fn collect_query<S: TriblePattern>(
     kb: &S,
@@ -348,15 +330,8 @@ fn collect_query<S: TriblePattern>(
         ])
     );
     match mode {
-        Mode::AdaptiveSerial => q.solve_residual_state_lazy().collect(),
-        Mode::SaturatedSerial => q
-            .solve_residual_state_lazy()
-            .cap(usize::MAX)
-            .start_width(usize::MAX)
-            .growth(1)
-            .collect(),
-        Mode::AdaptiveParallel => q.into_par_iter().collect(),
-        Mode::SaturatedParallel => q.into_par_residual_state_iter().collect(),
+        Mode::Serial => q.solve_residual_state_lazy().collect(),
+        Mode::Parallel => q.solve_residual_state_lazy().into_par_iter().collect(),
     }
 }
 
@@ -463,12 +438,12 @@ fn case_threshold(case: RankCase) -> String {
     }
 }
 
-/// Measures adaptive and saturated residual admission, serially and through
-/// Rayon, with a controlled, interleaved rank-executor comparison.
+/// Measures serial and Rayon execution with a controlled, interleaved
+/// rank-executor comparison.
 ///
 /// Construction only measures host preparation and device enqueue. A separate
 /// first forced query accounts for any deferred synchronization and pipeline
-/// setup, outside the timed repetitions. Every policy then receives one exact
+/// setup, outside the timed repetitions. Every driver then receives one exact
 /// collection pass plus one tally warm-up before the rotated timing rounds.
 #[cfg(feature = "gpu")]
 fn bench_wgpu_backend(
@@ -488,11 +463,11 @@ fn bench_wgpu_backend(
         "WGPU host preparation: archive clone {clone_elapsed:?}; adapter construction/device enqueue {enqueue_elapsed:?}",
     );
 
-    let canonical_setup_signature = run_query(archive, markers, Mode::SaturatedSerial);
+    let canonical_setup_signature = run_query(archive, markers, Mode::Serial);
     gpu_archive.set_min_rank_batch(1);
     gpu_archive.reset_stats();
     let ready_started = Instant::now();
-    let ready_signature = run_query(&gpu_archive, markers, Mode::SaturatedSerial);
+    let ready_signature = run_query(&gpu_archive, markers, Mode::Serial);
     let ready_elapsed = ready_started.elapsed();
     let ready_stats = gpu_archive.stats();
     assert_eq!(
@@ -505,12 +480,7 @@ fn bench_wgpu_backend(
         ready_stats.gpu_probes,
     );
 
-    let modes = [
-        ("serial-adaptive", Mode::AdaptiveSerial),
-        ("serial-saturated", Mode::SaturatedSerial),
-        ("rayon-adaptive", Mode::AdaptiveParallel),
-        ("rayon-saturated", Mode::SaturatedParallel),
-    ];
+    let modes = [("serial", Mode::Serial), ("rayon", Mode::Parallel)];
     println!(
         "\n== Controlled SuccinctArchive rank executors ({} Rayon threads) ==",
         rayon::current_num_threads(),
@@ -540,8 +510,8 @@ fn bench_wgpu_backend(
             );
         }
 
-        // One additional, equally counted warm-up per policy and scheduler.
-        // Use a different balanced order row for each scheduler mode.
+        // One additional, equally counted warm-up per rank case and driver.
+        // Use a different balanced order row for each driver.
         for case_index in BALANCED_CASE_ORDERS[mode_index] {
             let case = RANK_CASES[case_index];
             configure_rank_case(case, &mut gpu_archive);
@@ -652,10 +622,6 @@ fn main() {
     #[cfg(not(feature = "gpu"))]
     let controlled_gpu_only = false;
 
-    eprintln!(
-        "block row cap: {}",
-        triblespace::core::query::block_row_cap()
-    );
     #[cfg(feature = "parallel")]
     eprintln!("Rayon worker threads: {}", rayon::current_num_threads());
 

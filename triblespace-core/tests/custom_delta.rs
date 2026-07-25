@@ -982,8 +982,6 @@ fn assert_recursive_support_case(include_terminal: bool) -> Vec<RawInline> {
         project_outer,
     )
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
     .collect_profiled();
     let residual_results = sorted(residual.results);
 
@@ -1075,8 +1073,6 @@ fn assert_paged_support_case(
         project_outer,
     )
     .solve_residual_state_lazy()
-    .cap(32)
-    .start_width(1)
     .collect_profiled();
     let actual = sorted(residual.results);
     assert_eq!(actual, expected);
@@ -1108,10 +1104,6 @@ fn assert_paged_support_case(
         .expect("custom Program Support trace poisoned");
     assert!(!pages.is_empty());
     assert!(pages.iter().all(|page| page.examined <= page.limit));
-    assert!(
-        pages.iter().any(|page| page.offset > 0),
-        "the typed traversal never retained a live page cursor"
-    );
     assert!(
         pages.iter().any(|page| page.limit > 1),
         "negative Program pages never received geometric work growth"
@@ -1165,9 +1157,7 @@ fn live_program_support_clone_is_exact_and_matches_rayon_workers() {
         ),
         project_outer,
     )
-    .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1);
+    .solve_residual_state_lazy();
     let first = query
         .next()
         .expect("the positive Program formula has a nonempty affine relation");
@@ -1206,9 +1196,7 @@ fn live_program_support_clone_is_exact_and_matches_rayon_workers() {
             ),
             project_outer,
         )
-        .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(1);
+        .solve_residual_state_lazy();
         let mut actual = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .build()
@@ -1235,9 +1223,7 @@ fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
         direct_source_fixture(vec![raw(1), raw(2), raw(3), raw(4)], Arc::clone(&evidence)),
         project_start,
     )
-    .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1);
+    .solve_residual_state_lazy();
 
     assert_eq!(query.next(), Some(raw(1)));
     let pages = evidence
@@ -1274,8 +1260,6 @@ fn assert_direct_source_case(values: Vec<RawInline>, expected: Vec<RawInline>) -
         project_start,
     )
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
     .collect_profiled();
     let actual = sorted(residual.results);
     assert_eq!(actual, expected);
@@ -1317,7 +1301,7 @@ fn custom_direct_source_preserves_distinct_full_bindings_and_monotone_growth() {
 }
 
 #[test]
-fn custom_direct_source_duplicate_occurrences_collapse_per_parent_at_width_one() {
+fn custom_direct_source_duplicate_occurrences_collapse_per_parent() {
     // Equal occurrences straddle pages deliberately. The ordinal cursor is
     // what makes their two positions representable despite equal values.
     let values = vec![raw(1), raw(1)];
@@ -1339,13 +1323,10 @@ fn custom_direct_source_duplicate_occurrences_collapse_per_parent_at_width_one()
         project_start,
     )
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
     .collect_profiled();
     let actual = sorted(residual.results);
     assert_eq!(actual, oracle);
     let pages = evidence.pages.lock().expect("direct source trace poisoned");
-    assert_eq!(pages.len(), 4, "each affine parent owns two source pages");
     for parent in [raw(8), raw(9)] {
         let accepted: Vec<_> = pages
             .iter()
@@ -1367,9 +1348,7 @@ fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
         direct_source_fixture(values.clone(), Arc::clone(&evidence)),
         project_start,
     )
-    .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1);
+    .solve_residual_state_lazy();
     let first = query
         .next()
         .expect("the direct source has eight affine occurrences");
@@ -1396,9 +1375,7 @@ fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
             direct_source_fixture(values.clone(), Arc::clone(&evidence)),
             project_start,
         )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
+        .solve_residual_state_lazy();
         let mut actual = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .build()
@@ -1431,8 +1408,6 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(fixture(Arc::clone(&residual_evidence)), project_end)
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(1)
         .collect_profiled();
     let residual = sorted(residual.results);
 
@@ -1453,8 +1428,6 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
         let parallel = sorted(
             Query::new(fixture(Arc::clone(&parallel_evidence)), project_end)
                 .solve_residual_state_lazy()
-                .cap(4)
-                .start_width(4)
                 .into_par_iter()
                 .collect(),
         );
@@ -1473,8 +1446,6 @@ fn custom_cyclic_delta_confirms_a_more_specific_proposal_source() {
             project_end,
         )
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(1)
         .collect(),
     );
 
@@ -1496,8 +1467,6 @@ fn custom_cyclic_delta_shadow_preserves_native_execution() {
     let direct_evidence = Arc::new(DeltaEvidence::default());
     let direct = Query::new(fixture(Arc::clone(&direct_evidence)), project_end)
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(1)
         .collect_profiled();
     assert!(direct_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
     assert!(direct_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
@@ -1511,8 +1480,6 @@ fn custom_cyclic_delta_shadow_preserves_native_execution() {
     let epoch = ResidualShadowEpoch::new();
     let shadow = Query::new(fixture(Arc::clone(&shadow_evidence)), project_end)
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(1)
         .shadow(epoch.clone())
         .collect_profiled();
 
@@ -1541,8 +1508,6 @@ fn custom_cyclic_delta_shadow_preserves_native_execution() {
         let parallel_epoch = ResidualShadowEpoch::new();
         let mut parallel: Vec<_> = Query::new(fixture(Arc::clone(&parallel_evidence)), project_end)
             .solve_residual_state_lazy()
-            .cap(4)
-            .start_width(4)
             .shadow(parallel_epoch.clone())
             .into_par_iter()
             .collect();

@@ -261,7 +261,8 @@ fn fresh_query_into_par_iter_matches_explicit_residual_raw_set() {
     let mut expected = values.map(|value| value.raw).to_vec();
     let mut explicit_residual = query
         .clone()
-        .into_par_residual_state_iter()
+        .solve_residual_state_lazy()
+        .into_par_iter()
         .collect::<Vec<_>>();
     let mut ordinary = query.into_par_iter().collect::<Vec<_>>();
     expected.sort_unstable();
@@ -293,7 +294,8 @@ fn fresh_query_into_par_iter_matches_explicit_residual_raw_set() {
     });
     let mut ordinary = selected_query.clone().into_par_iter().collect::<Vec<_>>();
     let mut explicit_residual = selected_query
-        .into_par_residual_state_iter()
+        .solve_residual_state_lazy()
+        .into_par_iter()
         .collect::<Vec<_>>();
     ordinary.sort_unstable();
     explicit_residual.sort_unstable();

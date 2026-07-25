@@ -101,6 +101,21 @@ use delta::{
     TerminalPublicationBatch,
 };
 
+/// Fixed upper bound for every geometric residual scheduling width.
+///
+/// Keeping the policy private leaves one execution law: search width,
+/// confirmed-demand width, and delta-activation breadth all start at one and
+/// double on their respective feedback until this power-of-two bound.
+const RESIDUAL_ROW_CAP: usize = 1 << 20;
+const INITIAL_RESIDUAL_WIDTH: usize = 1;
+
+#[inline]
+fn next_residual_width(width: usize) -> usize {
+    debug_assert!(width.is_power_of_two());
+    debug_assert!(width <= RESIDUAL_ROW_CAP);
+    width.saturating_mul(2).min(RESIDUAL_ROW_CAP)
+}
+
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
@@ -9094,8 +9109,6 @@ struct ResidualStateMachine {
     /// resets and of the currently open demand window.
     terminal_projected_rows: usize,
     width: usize,
-    growth: usize,
-    cap: usize,
 }
 
 /// Borrow-free residual cursor stored by the ordinary [`Query`].
@@ -9255,7 +9268,6 @@ impl ResidualStateMachine {
         action_span: usize,
         seed: Option<FrameSeedRow>,
     ) -> Self {
-        let cap = block_row_cap();
         let mut state = Self {
             full,
             leaf_count,
@@ -9283,13 +9295,11 @@ impl ResidualStateMachine {
             eager_terminal_phase_enabled: true,
             last_selection: SelectionKind::Readiness,
             last_was_action: false,
-            terminal_demand_width: 1,
+            terminal_demand_width: INITIAL_RESIDUAL_WIDTH,
             terminal_demand_consumed: 0,
             terminal_demand_exhausted: false,
             terminal_projected_rows: 0,
-            width: lazy_start_width().clamp(1, cap),
-            growth: lazy_growth(),
-            cap,
+            width: INITIAL_RESIDUAL_WIDTH,
         };
         if let Some(seed) = seed {
             file_with_span(
@@ -10477,12 +10487,13 @@ impl ResidualStateMachine {
     }
 
     fn increase_width(&mut self) {
-        let next = self.width.saturating_mul(self.growth).clamp(1, self.cap);
+        let next = next_residual_width(self.width);
         self.raise_width_to(next);
     }
 
     fn raise_width_to(&mut self, floor: usize) {
-        let floor = floor.clamp(1, self.cap);
+        debug_assert!(floor.is_power_of_two());
+        debug_assert!(floor <= RESIDUAL_ROW_CAP);
         if floor <= self.width {
             return;
         }
@@ -10491,7 +10502,7 @@ impl ResidualStateMachine {
     }
 
     fn increase_delta_activation_width(&mut self) {
-        if self.delta.grow_activation_width(self.growth, self.cap) {
+        if self.delta.grow_activation_width() {
             self.stats.delta_activation_width_increases += 1;
         }
     }
@@ -10751,10 +10762,7 @@ impl ResidualStateMachine {
         if !self.terminal_demand_exhausted {
             return;
         }
-        let next = self
-            .terminal_demand_width
-            .saturating_mul(2)
-            .clamp(1, self.cap);
+        let next = next_residual_width(self.terminal_demand_width);
         self.stats.terminal_demand_windows_opened += 1;
         if next > self.terminal_demand_width {
             self.stats.terminal_demand_width_promotions += 1;
@@ -11128,8 +11136,6 @@ impl ResidualStateMachine {
             terminal_demand_exhausted: false,
             terminal_projected_rows: self.terminal_projected_rows,
             width: self.width,
-            growth: self.growth,
-            cap: self.cap,
         }
     }
 
@@ -11296,10 +11302,10 @@ impl ResidualStateMachine {
                 return None;
             }
             match self.pop_once_with_dispatch(dispatch, root, plan, width) {
-                // Split negotiation is a saturated throughput path. It files
-                // every successor normally and deliberately does not arm the
-                // first-result continuation sprint before the frontier has
-                // been partitioned.
+                // Split negotiation follows the same current geometric width
+                // as serial execution. It files every successor normally and
+                // deliberately does not arm the first-result continuation
+                // sprint before the frontier has been partitioned.
                 MachineStep::Stable(StepOutcome::Advanced(_)) => {}
                 MachineStep::DeltaSeeded {
                     continuation,
@@ -11360,8 +11366,8 @@ impl ResidualStateMachine {
 /// The iterator begins with a narrow desired actionable width, so full
 /// descendant buckets can produce a result before sibling rows or candidate
 /// values are evaluated.
-/// With a growth factor above one, semantic branch death prepares a
-/// geometrically wider search width for later frontier work; filing a nonempty
+/// Semantic branch death prepares a geometrically wider search width for later
+/// frontier work; filing a nonempty
 /// successor or staging raw output leaves that search width unchanged. A
 /// separate `1, 2, 4, ...` projected-result window advances only when the
 /// caller pulls after consuming its previous window. When a full
@@ -11374,7 +11380,8 @@ impl ResidualStateMachine {
 /// identity or consumes work older than the coalesced receipt bound. With no
 /// hot continuation, the deepest live bucket able to fill the width wins; if
 /// none can, the minimum-rank bucket drains through the strict readiness gate.
-/// The cap only bounds geometric width growth.
+/// Every scheduler width follows the same private `1, 2, 4, ...` law up to a
+/// fixed row bound.
 ///
 /// Dropping the iterator discards its remaining affine frontier. Fully drained,
 /// it produces the query's complete distinct projected-row set.
@@ -11504,32 +11511,6 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualShadowIter<C, P, R> {
 }
 
 impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
-    /// Overrides the initial chunk width, clamped to `1..=cap`.
-    pub fn start_width(mut self, width: usize) -> Self {
-        self.state.width = width.clamp(1, self.state.cap);
-        self
-    }
-
-    /// Overrides the geometric negative-work growth factor. A value of `1`
-    /// disables that feedback, but confirmed projected demand may still floor
-    /// search width at its independently doubling result window.
-    pub fn growth(mut self, growth: usize) -> Self {
-        self.state.growth = growth.max(1);
-        self
-    }
-
-    /// Overrides the geometric width-growth cap.
-    ///
-    /// This never raises the current width. To start above the default cap,
-    /// set the new cap first:
-    /// `.cap(new_cap).start_width(new_cap)`.
-    pub fn cap(mut self, cap: usize) -> Self {
-        self.state.cap = cap.max(1);
-        self.state.width = self.state.width.min(self.state.cap);
-        self.state.terminal_demand_width = self.state.terminal_demand_width.min(self.state.cap);
-        self
-    }
-
     /// Width the next engine resumption will use.
     pub fn current_width(&self) -> usize {
         self.state.width
@@ -11807,43 +11788,12 @@ mod parallel {
 
     /// Parallel iterator over one affine residual-state frontier.
     ///
-    /// Construct it explicitly with
-    /// [`Query::into_par_residual_state_iter`] for saturated block-native
-    /// throughput, or convert a configured [`ResidualStateIter`] through
-    /// [`IntoParallelIterator`] to preserve its selected width policy.
+    /// Construct it by converting a [`ResidualStateIter`] through
+    /// [`IntoParallelIterator`]. Parallel shards preserve the same geometric
+    /// scheduler law as serial execution.
     pub struct ResidualStateParIter<C, P: Fn(&Binding) -> Option<R>, R> {
         inner: Box<ResidualStateIter<C, P, R>>,
         split_budget: usize,
-    }
-
-    impl<'a, C, P, R> Query<C, P, R>
-    where
-        C: Constraint<'a> + Clone + Send + 'a,
-        P: Fn(&Binding) -> Option<R> + Clone + Send,
-        R: Send,
-    {
-        /// Consume a fresh query as a block-native parallel residual iterator.
-        ///
-        /// The exact state machine starts at saturated width because this
-        /// entry point is an explicit full-enumeration throughput request.
-        /// Seed negotiation advances in place until an affine frontier can be
-        /// split; it is never restarted. At most one residual shard per Rayon
-        /// worker is created, and fully drained output preserves the serial
-        /// query's distinct projected-row set rather than its order.
-        ///
-        /// Candidate occurrences are independent shard atoms after SET
-        /// admission. A selected typed Program route may retain one complete
-        /// parent activation instead when that enables traversal reuse.
-        ///
-        /// # Panics
-        ///
-        /// Panics if the query has already been pulled, like the serial
-        /// residual entry points.
-        pub fn into_par_residual_state_iter(self) -> ResidualStateParIter<C, P, R> {
-            let mut residual = self.solve_residual_state_lazy();
-            residual.state.width = residual.state.cap;
-            residual.into_par_iter()
-        }
     }
 
     impl<'a, C, P, R> IntoParallelIterator for ResidualStateIter<C, P, R>
@@ -13423,10 +13373,7 @@ mod tests {
             action_log: None,
         });
         let mut solve = Query::new(leaf, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy()
-            .cap(8)
-            .start_width(1)
-            .growth(2);
+            .solve_residual_state_lazy();
 
         let first = solve.next().expect("ordinary proposal returned no values");
         assert!(proposes.load(Ordering::Relaxed) > 0);
@@ -13459,9 +13406,6 @@ mod tests {
         ]);
         let profiled = Query::new(root, |binding: &Binding| binding.get(0).copied())
             .solve_residual_state_lazy()
-            .cap(8)
-            .start_width(1)
-            .growth(2)
             .collect_profiled();
 
         assert_eq!(profiled.results, [raw(5)]);
@@ -13489,9 +13433,6 @@ mod tests {
         ]);
         let mut profiled = Query::new(root, |binding: &Binding| binding.get(0).copied())
             .solve_residual_state_lazy()
-            .cap(4)
-            .start_width(1)
-            .growth(2)
             .collect_profiled();
 
         profiled.results.sort_unstable();
@@ -13692,10 +13633,7 @@ mod tests {
                 (value[0] % 2 == 0).then_some(value)
             },
         )
-        .solve_residual_state_lazy()
-        .cap(8)
-        .start_width(1)
-        .growth(2);
+        .solve_residual_state_lazy();
 
         assert!(query.next().is_some());
         assert_eq!(query.state.terminal_demand_width, 1);
@@ -13734,7 +13672,6 @@ mod tests {
     #[test]
     fn projected_demand_floor_does_not_counter_charge_when_search_is_ahead() {
         let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
-        machine.cap = 8;
         machine.width = 8;
 
         machine.charge_projected_result();
@@ -13749,40 +13686,45 @@ mod tests {
     }
 
     #[test]
-    fn projected_demand_floor_ignores_growth_and_saturates_at_cap() {
+    fn all_scheduler_widths_follow_the_single_power_of_two_law() {
+        assert_eq!(next_residual_width(1), 2);
+        assert_eq!(next_residual_width(RESIDUAL_ROW_CAP / 2), RESIDUAL_ROW_CAP);
+        assert_eq!(next_residual_width(RESIDUAL_ROW_CAP), RESIDUAL_ROW_CAP);
+
         let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
-        machine.cap = 4;
-        machine.width = 1;
-        machine.growth = 1;
+        for _ in 0..10 {
+            let before = (
+                machine.width,
+                machine.terminal_demand_width,
+                machine.delta.activation_width(),
+            );
+            assert!(before.0.is_power_of_two());
+            assert!(before.1.is_power_of_two());
+            assert!(before.2.is_power_of_two());
+            assert!(before.1 <= before.0);
 
-        machine.charge_projected_result();
-        assert_eq!((machine.terminal_demand_width, machine.width), (1, 1));
-        assert_eq!(machine.stats.width_increases, 0);
-        machine.confirm_terminal_demand();
-        assert_eq!((machine.terminal_demand_width, machine.width), (2, 2));
+            machine.increase_width();
+            machine.increase_delta_activation_width();
+            for _ in 0..machine.terminal_demand_width {
+                machine.charge_projected_result();
+            }
+            machine.confirm_terminal_demand();
 
-        for _ in 0..2 {
-            machine.charge_projected_result();
+            let after = (
+                machine.width,
+                machine.terminal_demand_width,
+                machine.delta.activation_width(),
+            );
+            assert!(after.0 >= before.0);
+            assert!(after.1 >= before.1);
+            assert!(after.2 >= before.2);
+            assert!(after.1 <= after.0);
         }
-        machine.confirm_terminal_demand();
-        assert_eq!((machine.terminal_demand_width, machine.width), (4, 4));
-
-        for _ in 0..4 {
-            machine.charge_projected_result();
-        }
-        machine.confirm_terminal_demand();
-        assert_eq!((machine.terminal_demand_width, machine.width), (4, 4));
-        assert_eq!(machine.stats.terminal_demand_width_promotions, 2);
-        assert_eq!(machine.stats.terminal_demand_windows_opened, 3);
-        assert_eq!(machine.stats.width_increases, 2);
     }
 
     #[test]
     fn projected_demand_floor_clones_as_an_independent_pull_boundary() {
         let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
-        machine.cap = 8;
-        machine.width = 1;
-        machine.growth = 1;
         machine.charge_projected_result();
         let mut cloned = machine.clone();
 
@@ -13810,9 +13752,6 @@ mod tests {
     #[test]
     fn parallel_sibling_inherits_only_already_confirmed_demand() {
         let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
-        machine.cap = 8;
-        machine.width = 1;
-        machine.growth = 1;
         machine.charge_projected_result();
         machine.confirm_terminal_demand();
         for _ in 0..2 {
@@ -13858,9 +13797,6 @@ mod tests {
             Some((*binding.get(0)?, *binding.get(1)?))
         })
         .solve_residual_state_lazy()
-        .cap(8)
-        .start_width(8)
-        .growth(2)
         .collect_profiled();
         let mut actual = profiled.results;
         let mut expected = Vec::new();
@@ -13872,15 +13808,15 @@ mod tests {
         actual.sort_unstable();
         expected.sort_unstable();
         assert_eq!(actual, expected);
-        assert!(
-            profiled.stats.delta_terminal_admissions >= 4,
-            "{:#?}",
-            profiled.stats
-        );
+        assert!(profiled.stats.delta_terminal_admissions > 1);
         assert!(profiled.stats.delta_terminal_admission_remainders > 0);
-        assert!(profiled.stats.delta_terminal_admitted_parents >= 4);
+        assert_eq!(profiled.stats.delta_terminal_admitted_parents, 4);
+        assert!(
+            profiled.stats.delta_terminal_admissions
+                < profiled.stats.delta_terminal_admitted_parents
+        );
         assert!(profiled.stats.delta_terminal_calls > 0);
-        assert_eq!(profiled.stats.max_delta_terminal_task_cohort, 1);
+        assert!(profiled.stats.max_delta_terminal_task_cohort > 1);
         assert!(profiled.stats.delta_terminal_publications > 0);
         assert!(profiled.stats.max_delta_terminal_work_budget <= 8);
     }
@@ -14032,15 +13968,9 @@ mod tests {
             project,
         )
         .solve_residual_state_lazy()
-        .cap(8)
-        .start_width(1)
-        .growth(2)
         .collect_profiled();
         let pageable = Query::new(fixture(ProgramCompletion::PageableOnly), project)
             .solve_residual_state_lazy()
-            .cap(8)
-            .start_width(1)
-            .growth(2)
             .collect_profiled();
         let exact_len = exact.results.len();
         let pageable_len = pageable.results.len();
@@ -14118,11 +14048,7 @@ mod tests {
         }
 
         let project = |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?));
-        let mut eager = Query::new(fixture(&[1, WIDE, WIDE]), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut eager = Query::new(fixture(&[1, WIDE, WIDE]), project).solve_residual_state_lazy();
 
         let first = eager.next().expect("the singleton parent has one result");
         assert_eq!(first.1, raw(1));
@@ -14144,11 +14070,7 @@ mod tests {
             "an over-capacity quoted cohort must remain pageable"
         );
 
-        let mut fitting = Query::new(fixture(&[1, 1, 1]), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut fitting = Query::new(fixture(&[1, 1, 1]), project).solve_residual_state_lazy();
         let mut fitting_output = vec![fitting.next().unwrap()];
         let raw_before = fitting.state.stats.candidates_proposed;
         fitting_output.push(fitting.next().unwrap());
@@ -14166,11 +14088,8 @@ mod tests {
         assert_eq!(fitting_output[1].1, raw(64));
         assert_eq!(fitting_output[2].1, raw(32));
 
-        let mut fitting_pageable = Query::new(fixture(&[1, 1, 1]), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut fitting_pageable =
+            Query::new(fixture(&[1, 1, 1]), project).solve_residual_state_lazy();
         fitting_pageable.state.eager_terminal_phase_enabled = false;
         let mut fitting_set = fitting_output.clone();
         fitting_set.sort_unstable();
@@ -14183,11 +14102,8 @@ mod tests {
 
         // The next demand window admits [wide, one, one]. Only its contiguous
         // fitting tail may complete; the wide prefix is refiled untouched.
-        let mut mixed = Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut mixed =
+            Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project).solve_residual_state_lazy();
         let mut mixed_output = vec![mixed.next().unwrap()];
         mixed_output.push(mixed.next().unwrap());
         mixed_output.push(mixed.next().unwrap());
@@ -14209,11 +14125,8 @@ mod tests {
         );
         mixed_output.extend(&mut mixed);
 
-        let mut mixed_pageable = Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut mixed_pageable =
+            Query::new(fixture(&[1, 1, 1, 1, 1, WIDE]), project).solve_residual_state_lazy();
         mixed_pageable.state.eager_terminal_phase_enabled = false;
         let mut mixed_set = mixed_output;
         mixed_set.sort_unstable();
@@ -14221,11 +14134,7 @@ mod tests {
         mixed_pageable_set.sort_unstable();
         assert_eq!(mixed_set, mixed_pageable_set);
 
-        let mut blocked = Query::new(fixture(&[1, WIDE, 1]), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut blocked = Query::new(fixture(&[1, WIDE, 1]), project).solve_residual_state_lazy();
         let mut blocked_output = vec![blocked.next().unwrap()];
         let raw_before = blocked.state.stats.candidates_proposed;
         blocked_output.push(blocked.next().unwrap());
@@ -14236,11 +14145,8 @@ mod tests {
         assert!(blocked.state.stats.candidates_proposed - raw_before <= blocked.state.width);
         blocked_output.extend(&mut blocked);
 
-        let mut blocked_pageable = Query::new(fixture(&[1, WIDE, 1]), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut blocked_pageable =
+            Query::new(fixture(&[1, WIDE, 1]), project).solve_residual_state_lazy();
         blocked_pageable.state.eager_terminal_phase_enabled = false;
         assert_eq!(
             blocked_output,
@@ -14282,8 +14188,11 @@ mod tests {
                 projected: 64,
             },
         );
-        machine.terminal_projected_rows = 64;
-        machine.terminal_demand_width = 192;
+        // Preserve the cumulative demand target of 256 while keeping Q on
+        // the production power-of-two lattice. The extra 64 projected rows
+        // belong to other terminal families in this white-box fixture.
+        machine.terminal_projected_rows = 128;
+        machine.terminal_demand_width = 128;
 
         let outcome = machine
             .seed_delta_proposal(
@@ -14425,8 +14334,10 @@ mod tests {
                 projected: 64,
             },
         );
-        machine.terminal_projected_rows = 64;
-        machine.terminal_demand_width = 192;
+        // Preserve the cumulative demand target of 256 while keeping Q on
+        // the production power-of-two lattice.
+        machine.terminal_projected_rows = 128;
+        machine.terminal_demand_width = 128;
 
         let outcome = machine
             .seed_delta_proposal(
@@ -14510,8 +14421,10 @@ mod tests {
                 projected: 64,
             },
         );
-        machine.terminal_projected_rows = 64;
-        machine.terminal_demand_width = 192;
+        // Preserve the cumulative demand target of 256 while keeping Q on
+        // the production power-of-two lattice.
+        machine.terminal_projected_rows = 128;
+        machine.terminal_demand_width = 128;
 
         let outcome = machine
             .seed_delta_proposal(
@@ -14561,7 +14474,7 @@ mod tests {
         ]);
         let mut iter = Query::new(root, postprocessing).solve_residual_state_lazy();
         iter.state = ResidualStateMachine::new_for_plan(iter.root.variables(), &iter.plan, None);
-        iter.state.width = 6;
+        iter.state.width = 8;
         let family = StateId(u32::MAX);
         let constraint = iter.plan.resolve(&iter.root, 1);
         let request = ProgramRequest {
@@ -14877,15 +14790,8 @@ mod tests {
                 action_log: None,
             }) as ShapeConstraint,
         ]);
-        let mut iter = Query::new(root, postprocessing)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut iter = Query::new(root, postprocessing).solve_residual_state_lazy();
         iter.state = ResidualStateMachine::new_for_plan(iter.root.variables(), &iter.plan, None);
-        iter.state.cap = 64;
-        iter.state.width = 1;
-        iter.state.growth = 2;
 
         // Model the exact physical boundary reached after the first variable's
         // singleton lineage selected this proposal action. The ordinary seed
@@ -15112,14 +15018,12 @@ mod tests {
                 Some(value)
             },
         )
-        .solve_residual_state_lazy()
-        .cap(8)
-        .start_width(8);
+        .solve_residual_state_lazy();
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
         assert!(unwind.is_err());
-        assert_eq!(*attempts.lock().unwrap(), [raw(1)]);
-        assert_eq!((iter.state.emit_next, iter.state.emit_count), (1, 3));
+        let failed = attempts.lock().unwrap()[0];
+        assert_eq!((iter.state.emit_next, iter.state.emit_count), (1, 1));
         assert!(iter.state.emit_origins.is_none());
         assert_eq!(iter.stats().delta_direct_terminal_publication_batches, 0);
         assert!(
@@ -15127,14 +15031,19 @@ mod tests {
             "caught projection panic should leave only the unassigned token for next-pull cleanup"
         );
 
-        assert_eq!(iter.next(), Some(raw(2)));
+        let mut resumed = vec![iter.next().expect("two staged rows remain")];
         assert!(
             !iter.state.delta.has_unassigned_public_pull_demand(),
             "the resumed pull must retire stale demand before normal completion"
         );
-        assert_eq!(iter.next(), Some(raw(3)));
+        resumed.push(iter.next().expect("one staged row remains"));
         assert_eq!(iter.next(), None);
-        assert_eq!(*attempts.lock().unwrap(), [raw(1), raw(2), raw(3)]);
+        assert!(!resumed.contains(&failed));
+        let mut all = resumed;
+        all.push(failed);
+        all.sort_unstable();
+        assert_eq!(all, [raw(1), raw(2), raw(3)]);
+        assert_eq!(attempts.lock().unwrap().len(), 3);
     }
 
     #[test]
@@ -19760,101 +19669,95 @@ mod tests {
     }
 
     #[test]
-    fn residual_shadow_preserves_bag_stats_and_action_sequence_at_every_width() {
+    fn residual_shadow_preserves_bag_stats_and_action_sequence_under_canonical_geometry() {
         let values: Vec<_> = (0..16).map(raw).collect();
         let accepted = raw(5);
         let mut saw_dead_confirm = false;
         let mut saw_surviving_confirm = false;
 
-        for width in [1, 3, 16] {
-            let direct_log = Arc::new(Mutex::new(Vec::new()));
-            let direct = Query::new(
-                logged_filter_fixture(values.clone(), accepted, Arc::clone(&direct_log)),
-                |binding: &Binding| binding.get(0).copied(),
-            )
-            .solve_residual_state_lazy()
-            .cap(16)
-            .start_width(width)
-            .collect_profiled();
+        let direct_log = Arc::new(Mutex::new(Vec::new()));
+        let direct = Query::new(
+            logged_filter_fixture(values.clone(), accepted, Arc::clone(&direct_log)),
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy()
+        .collect_profiled();
 
-            let shadow_log = Arc::new(Mutex::new(Vec::new()));
-            let epoch = ResidualShadowEpoch::new();
-            let shadow = Query::new(
-                logged_filter_fixture(values.clone(), accepted, Arc::clone(&shadow_log)),
-                |binding: &Binding| binding.get(0).copied(),
-            )
-            .solve_residual_state_lazy()
-            .cap(16)
-            .start_width(width)
-            .shadow(epoch.clone())
-            .collect_profiled();
+        let shadow_log = Arc::new(Mutex::new(Vec::new()));
+        let epoch = ResidualShadowEpoch::new();
+        let shadow = Query::new(
+            logged_filter_fixture(values.clone(), accepted, Arc::clone(&shadow_log)),
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .solve_residual_state_lazy()
+        .shadow(epoch.clone())
+        .collect_profiled();
 
-            let mut direct_results = direct.results;
-            let mut shadow_results = shadow.results;
-            direct_results.sort_unstable();
-            shadow_results.sort_unstable();
-            assert_eq!(shadow_results, direct_results);
-            assert_eq!(shadow_results, [accepted]);
-            assert_eq!(shadow.stats, direct.stats);
-            assert_eq!(shadow.shadow.status, ResidualShadowStatus::Closed);
-            assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
+        let mut direct_results = direct.results;
+        let mut shadow_results = shadow.results;
+        direct_results.sort_unstable();
+        shadow_results.sort_unstable();
+        assert_eq!(shadow_results, direct_results);
+        assert_eq!(shadow_results, [accepted]);
+        assert_eq!(shadow.stats, direct.stats);
+        assert_eq!(shadow.shadow.status, ResidualShadowStatus::Closed);
+        assert_eq!(epoch.status(), ResidualShadowStatus::Closed);
 
-            let direct_calls = direct_log.lock().unwrap().clone();
-            let shadow_calls = shadow_log.lock().unwrap().clone();
-            assert_eq!(shadow_calls, direct_calls);
-            let observed_calls: Vec<_> = shadow
-                .shadow
-                .events
-                .iter()
-                .map(|event| LoggedAction {
-                    verb: event.site.verb,
-                    leaf_occurrence: event.site.leaf_occurrence,
-                    parent_rows: event.geometry.parent_rows,
-                    candidate_occurrences: event.geometry.candidate_occurrences,
-                })
-                .collect();
-            assert_eq!(observed_calls, direct_calls);
+        let direct_calls = direct_log.lock().unwrap().clone();
+        let shadow_calls = shadow_log.lock().unwrap().clone();
+        assert_eq!(shadow_calls, direct_calls);
+        let observed_calls: Vec<_> = shadow
+            .shadow
+            .events
+            .iter()
+            .map(|event| LoggedAction {
+                verb: event.site.verb,
+                leaf_occurrence: event.site.leaf_occurrence,
+                parent_rows: event.geometry.parent_rows,
+                candidate_occurrences: event.geometry.candidate_occurrences,
+            })
+            .collect();
+        assert_eq!(observed_calls, direct_calls);
+        assert_eq!(
+            shadow.shadow.events.len(),
+            shadow.stats.support_action_pops
+                + shadow.stats.propose_action_pops
+                + shadow.stats.confirm_action_pops
+        );
+
+        for event in &shadow.shadow.events {
+            assert_eq!(event.site.variable, 0);
+            assert_eq!(event.site.bound, VariableSet::new_empty());
+            assert_eq!(event.executor_samples.len(), 1);
+            let sample = event.executor_samples[0];
+            assert_eq!(sample.event, event.event);
+            assert!(!sample.stale);
+            assert!(sample.measurement.started >= event.started);
             assert_eq!(
-                shadow.shadow.events.len(),
-                shadow.stats.support_action_pops
-                    + shadow.stats.propose_action_pops
-                    + shadow.stats.confirm_action_pops
+                sample.measurement.work_units,
+                match event.site.verb {
+                    ActionVerb::Support | ActionVerb::Propose => event.geometry.parent_rows,
+                    ActionVerb::Confirm => event.geometry.candidate_occurrences,
+                }
             );
-
-            for event in &shadow.shadow.events {
-                assert_eq!(event.site.variable, 0);
-                assert_eq!(event.site.bound, VariableSet::new_empty());
-                assert_eq!(event.executor_samples.len(), 1);
-                let sample = event.executor_samples[0];
-                assert_eq!(sample.event, event.event);
-                assert!(!sample.stale);
-                assert!(sample.measurement.started >= event.started);
-                assert_eq!(
-                    sample.measurement.work_units,
-                    match event.site.verb {
-                        ActionVerb::Support | ActionVerb::Propose => event.geometry.parent_rows,
-                        ActionVerb::Confirm => event.geometry.candidate_occurrences,
+            assert_eq!(
+                event.geometry.action_atoms,
+                match event.site.verb {
+                    ActionVerb::Support | ActionVerb::Propose => event.geometry.parent_rows,
+                    ActionVerb::Confirm => event.geometry.candidate_occurrences,
+                }
+            );
+            let completion = event.completion.expect("drained action completed");
+            assert!(!completion.stale);
+            if event.site.verb == ActionVerb::Confirm {
+                match completion.outcome {
+                    ActionOutcome::Dead => saw_dead_confirm = true,
+                    ActionOutcome::Advanced(survival) => {
+                        saw_surviving_confirm = true;
+                        assert_eq!(survival.parent_rows, 1);
+                        assert_eq!(survival.candidate_occurrences, 1);
                     }
-                );
-                assert_eq!(
-                    event.geometry.action_atoms,
-                    match event.site.verb {
-                        ActionVerb::Support | ActionVerb::Propose => event.geometry.parent_rows,
-                        ActionVerb::Confirm => event.geometry.candidate_occurrences,
-                    }
-                );
-                let completion = event.completion.expect("drained action completed");
-                assert!(!completion.stale);
-                if event.site.verb == ActionVerb::Confirm {
-                    match completion.outcome {
-                        ActionOutcome::Dead => saw_dead_confirm = true,
-                        ActionOutcome::Advanced(survival) => {
-                            saw_surviving_confirm = true;
-                            assert_eq!(survival.parent_rows, 1);
-                            assert_eq!(survival.candidate_occurrences, 1);
-                        }
-                        ActionOutcome::Aborted => panic!("drained confirmation aborted"),
-                    }
+                    ActionOutcome::Aborted => panic!("drained confirmation aborted"),
                 }
             }
         }
@@ -19877,9 +19780,6 @@ mod tests {
             },
         )
         .solve_residual_state_lazy()
-        .cap(8)
-        .start_width(4)
-        .growth(2)
         .collect_profiled();
 
         let shadow_log = Arc::new(Mutex::new(Vec::new()));
@@ -19895,9 +19795,6 @@ mod tests {
             },
         )
         .solve_residual_state_lazy()
-        .cap(8)
-        .start_width(4)
-        .growth(2)
         .shadow(epoch.clone())
         .collect_profiled();
 
@@ -19913,7 +19810,7 @@ mod tests {
         assert_eq!(direct.stats.delta_direct_terminal_publication_batches, 3);
         assert_eq!(direct.stats.delta_direct_terminal_publication_rows, 3);
         assert_eq!(direct.stats.terminal_demand_projected_rows, 0);
-        assert_eq!(direct.stats.width_increases, 1);
+        assert!(direct.stats.width_increases > 0);
 
         let direct_calls = direct_log.lock().unwrap().clone();
         let shadow_calls = shadow_log.lock().unwrap().clone();
@@ -20284,23 +20181,24 @@ mod tests {
             Some((binding.get(0).copied()?, binding.get(1).copied()?))
         })
         .solve_residual_state_lazy()
-        .cap(64)
-        .start_width(64)
         .shadow(epoch)
         .collect_profiled();
 
         assert_eq!(solved.results, [(raw(1), raw(8))]);
-        assert_eq!(*calls.lock().unwrap(), [2]);
-        let confirmation = solved
+        assert_eq!(*calls.lock().unwrap(), [1, 1]);
+        let confirmations: Vec<_> = solved
             .shadow
             .events
             .iter()
-            .find(|event| event.site.verb == ActionVerb::Confirm && event.site.variable == 1)
-            .expect("paged filtering was observed");
-        assert_eq!(confirmation.site.bound, VariableSet::new_singleton(0));
-        assert_eq!(confirmation.geometry.parent_rows, 1);
-        assert_eq!(confirmation.geometry.candidate_occurrences, 2);
-        assert_eq!(confirmation.geometry.action_atoms, 2);
+            .filter(|event| event.site.verb == ActionVerb::Confirm && event.site.variable == 1)
+            .collect();
+        assert_eq!(confirmations.len(), 2);
+        for confirmation in confirmations {
+            assert_eq!(confirmation.site.bound, VariableSet::new_singleton(0));
+            assert_eq!(confirmation.geometry.parent_rows, 1);
+            assert_eq!(confirmation.geometry.candidate_occurrences, 1);
+            assert_eq!(confirmation.geometry.action_atoms, 1);
+        }
     }
 
     #[test]
@@ -20401,8 +20299,6 @@ mod tests {
             |binding: &Binding| binding.get(0).copied(),
         )
         .solve_residual_state_lazy()
-        .cap(128)
-        .start_width(128)
         .collect();
 
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -20412,8 +20308,6 @@ mod tests {
         let mut observed: Vec<_> = with_parallel_workers(4, move || {
             Query::new(root, |binding: &Binding| binding.get(0).copied())
                 .solve_residual_state_lazy()
-                .cap(128)
-                .start_width(128)
                 .shadow(run_epoch)
                 .into_par_iter()
                 .collect()
@@ -20451,8 +20345,6 @@ mod tests {
         let found = with_parallel_workers(4, move || {
             Query::new(root, |binding: &Binding| binding.get(0).copied())
                 .solve_residual_state_lazy()
-                .cap(128)
-                .start_width(128)
                 .shadow(run_epoch)
                 .into_par_iter()
                 .find_any(|_| true)
@@ -20472,8 +20364,6 @@ mod tests {
                     binding.get(0).copied()
                 })
                 .solve_residual_state_lazy()
-                .cap(128)
-                .start_width(128)
                 .shadow(run_epoch)
                 .into_par_iter()
                 .collect::<Vec<_>>()
@@ -20505,8 +20395,6 @@ mod tests {
             let results = with_parallel_workers(4, move || {
                 Query::new(root, |binding: &Binding| binding.get(0).copied())
                     .solve_residual_state_lazy()
-                    .cap(128)
-                    .start_width(128)
                     .shadow(run_epoch)
                     .into_par_iter()
                     .take_any(take)
@@ -20568,8 +20456,7 @@ mod tests {
             Arc::clone(&second_calls),
         );
         let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy()
-            .cap(64);
+            .solve_residual_state_lazy();
         lazy.state.continuation_sprint_enabled = sprint;
         let result = lazy.next();
         let first = first_calls.lock().unwrap().clone();
@@ -20673,8 +20560,7 @@ mod tests {
             Arc::clone(&second_calls),
         );
         let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy()
-            .cap(64);
+            .solve_residual_state_lazy();
 
         assert_eq!(lazy.next(), Some(raw(63)));
         assert_eq!(*first_calls.lock().unwrap(), [1]);
@@ -20812,8 +20698,7 @@ mod tests {
                 Arc::clone(&second_calls),
             );
             let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
-                .solve_residual_state_lazy()
-                .cap(64);
+                .solve_residual_state_lazy();
 
             assert_eq!(lazy.next(), expected);
             assert_eq!(*first_calls.lock().unwrap(), [1, 2, 4, 8, 16, 32, 1]);
@@ -20821,7 +20706,10 @@ mod tests {
             assert_eq!(lazy.stats().candidates_proposed, 64);
             assert_eq!(lazy.stats().candidates_confirmed, 128);
             assert_eq!(lazy.stats().max_confirm_candidates, 32);
-            assert_eq!(lazy.stats().width_increases, 6);
+            assert_eq!(
+                lazy.stats().width_increases,
+                if expected.is_some() { 6 } else { 7 }
+            );
         }
     }
 
@@ -20843,18 +20731,11 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut cap_one: Vec<_> = Query::new(make(), project)
+        let mut actual: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
-            .cap(1)
             .collect();
-        let mut geometric: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .collect();
-        cap_one.sort_unstable();
-        geometric.sort_unstable();
-        assert_eq!(cap_one, [raw(0), raw(1), raw(2)]);
-        assert_eq!(geometric, [raw(0), raw(1), raw(2)]);
+        actual.sort_unstable();
+        assert_eq!(actual, [raw(0), raw(1), raw(2)]);
     }
 
     #[test]
@@ -20887,10 +20768,7 @@ mod tests {
             *projected_rows.lock().unwrap() += 1;
             None::<()>
         })
-        .solve_residual_state_lazy()
-        .cap(8)
-        .start_width(1)
-        .growth(2);
+        .solve_residual_state_lazy();
         // This is specifically a reconvergence regression: the default
         // continuation sprint now follows each surviving page before its cold
         // sibling can merge. Pin the old physical schedule so the fixture
@@ -20911,9 +20789,6 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         let mut residual: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
             .solve_residual_state_lazy()
-            .cap(8)
-            .start_width(1)
-            .growth(2)
             .collect();
         residual.sort_unstable();
         assert_eq!(residual, (0..8).step_by(2).map(raw).collect::<Vec<_>>());
@@ -20949,7 +20824,6 @@ mod tests {
             project,
         )
         .solve_residual_state_lazy()
-        .cap(1)
         .collect();
         residual.sort_unstable();
         assert_eq!(residual, [raw(1)]);
@@ -20978,7 +20852,6 @@ mod tests {
         ]);
         let mut synthetic: Vec<_> = Query::new(synthetic_root, project)
             .solve_residual_state_lazy()
-            .cap(1)
             .collect();
         synthetic.sort_unstable();
         assert_eq!(synthetic, residual);
@@ -21032,7 +20905,6 @@ mod tests {
             project,
         )
         .solve_residual_state_lazy()
-        .cap(1)
         .collect();
         residual.sort_unstable();
         assert_eq!(residual, [raw(0), raw(1)]);
@@ -21185,9 +21057,6 @@ mod tests {
             project,
         )
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(2)
-        .growth(1)
         .collect_profiled();
         lowered.results.sort_unstable();
         assert_eq!(lowered.results, [(raw(0), raw(10)), (raw(1), raw(20))]);
@@ -21260,10 +21129,7 @@ mod tests {
         let mut lowered = Query::new(root, |binding: &Binding| {
             Some((binding.get(0).copied()?, binding.get(1).copied()?))
         })
-        .solve_residual_state_lazy()
-        .cap(32)
-        .start_width(1)
-        .growth(2);
+        .solve_residual_state_lazy();
         assert!(lowered.next().is_some());
         let calls = log.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -21545,10 +21411,8 @@ mod tests {
             preferred_fanout(start.index, source_candidates.clone(), 0),
             Box::new(wrap(&confirm_counters)) as ShapeConstraint,
         ]);
-        let mut source_residual_query = Query::new(confirm_root, project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+        let mut source_residual_query =
+            Query::new(confirm_root, project).solve_residual_state_lazy();
         let mut residual: Vec<_> = source_residual_query.by_ref().collect();
         let oracle_root = IntersectionConstraint::new(vec![
             preferred_fanout(start.index, source_candidates, 0),
@@ -21585,10 +21449,7 @@ mod tests {
             preferred_fanout(end.index, end_candidates.clone(), 0),
             Box::new(wrap(&inverse_counters)) as ShapeConstraint,
         ]);
-        let mut inverse_query = Query::new(inverse_root, project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+        let mut inverse_query = Query::new(inverse_root, project).solve_residual_state_lazy();
         let mut inverse: Vec<_> = inverse_query.by_ref().collect();
         let inverse_oracle = IntersectionConstraint::new(vec![
             preferred_fanout(end.index, end_candidates, 0),
@@ -21735,9 +21596,7 @@ mod tests {
                     &counters,
                 )) as ShapeConstraint);
                 let mut query = Query::new(IntersectionConstraint::new(children), project)
-                    .solve_residual_state_lazy()
-                    .cap(1)
-                    .start_width(1);
+                    .solve_residual_state_lazy();
                 let mut actual: Vec<_> = query.by_ref().collect();
 
                 let mut oracle_children = make_prefix();
@@ -21830,9 +21689,7 @@ mod tests {
                 Box::new(UnionConstraint::new(vec![guarded, sibling])) as ShapeConstraint,
             ]);
             let mut query = Query::new(root, |binding: &Binding| binding.get(2).copied())
-                .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1);
+                .solve_residual_state_lazy();
             let mut actual: Vec<_> = query.by_ref().collect();
             actual.sort_unstable();
             let mut expected = vec![sibling_value];
@@ -21874,9 +21731,7 @@ mod tests {
             )) as ShapeConstraint,
         ]);
         let mut query = Query::new(root, |binding: &Binding| binding.get(start.index).copied())
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+            .solve_residual_state_lazy();
         assert_eq!(query.next(), Some(id_into_value(&subject)));
         assert_eq!(query.next(), None);
         assert!(query.stats().propose_action_pops > 0);
@@ -21920,10 +21775,7 @@ mod tests {
             )) as ShapeConstraint,
         ]);
         let project = |binding: &Binding| binding.get(variable.index).copied();
-        let mut query = Query::new(root, project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+        let mut query = Query::new(root, project).solve_residual_state_lazy();
         let mut actual: Vec<_> = query.by_ref().collect();
 
         let oracle = IntersectionConstraint::new(vec![
@@ -22055,11 +21907,7 @@ mod tests {
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
 
-        let mut focused = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut focused = Query::new(make(), project).solve_residual_state_lazy();
         let focused_first = focused.next().expect("the ring has a path result");
         let focused_first_stats = focused.stats().clone();
         assert_eq!(
@@ -22078,11 +21926,7 @@ mod tests {
              before the cold source remainder"
         );
 
-        let mut cold = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut cold = Query::new(make(), project).solve_residual_state_lazy();
         cold.state.continuation_sprint_enabled = false;
         let cold_first = cold.next().expect("the control ring has a path result");
         let cold_first_stats = cold.stats().clone();
@@ -22132,11 +21976,7 @@ mod tests {
                 ],
             )
         };
-        let mut pure = Query::new(make_path(), project)
-            .solve_residual_state_lazy()
-            .cap(64)
-            .start_width(1)
-            .growth(2);
+        let mut pure = Query::new(make_path(), project).solve_residual_state_lazy();
         let mut pure_bag: Vec<_> = pure.by_ref().collect();
         let mut pure_expected = Vec::new();
         for component in &nodes {
@@ -22202,15 +22042,9 @@ mod tests {
         // units, so this bound admits an exact two-parent cohort.
         let mut eager_cohort = Query::new_projected(make_cohort(), [0, 1], project)
             .solve_residual_state_lazy()
-            .cap(136)
-            .start_width(136)
-            .growth(2)
             .collect_profiled();
-        let mut sparse_cohort = Query::new_projected(make_cohort(), [0, 1], project)
-            .solve_residual_state_lazy()
-            .cap(136)
-            .start_width(136)
-            .growth(2);
+        let mut sparse_cohort =
+            Query::new_projected(make_cohort(), [0, 1], project).solve_residual_state_lazy();
         sparse_cohort.state.eager_terminal_phase_enabled = false;
         let mut sparse_cohort = sparse_cohort.collect_profiled();
         eager_cohort.results.sort_unstable();
@@ -22363,15 +22197,9 @@ mod tests {
                 .collect();
             let mut typed = Query::new_projected(make(&ops), [0, 2], project)
                 .solve_residual_state_lazy()
-                .cap(64)
-                .start_width(1)
-                .growth(2)
                 .collect_profiled();
-            let mut sparse = Query::new_projected(make(&ops), [0, 2], project)
-                .solve_residual_state_lazy()
-                .cap(64)
-                .start_width(1)
-                .growth(2);
+            let mut sparse =
+                Query::new_projected(make(&ops), [0, 2], project).solve_residual_state_lazy();
             sparse.state.eager_terminal_phase_enabled = false;
             let mut sparse = sparse.collect_profiled();
 
@@ -22392,10 +22220,7 @@ mod tests {
 
             let expected = baseline.clone();
             let mut clone_source = Query::new_projected(Arc::new(make(&ops)), [0, 2], project)
-                .solve_residual_state_lazy()
-                .cap(64)
-                .start_width(1)
-                .growth(2);
+                .solve_residual_state_lazy();
             let mut prefix = Vec::new();
             let drained_before_phase = loop {
                 if clone_source.stats().delta_terminal_eager_cohort_admissions > 0 {
@@ -22435,9 +22260,6 @@ mod tests {
                     let mut parallel: Vec<_> = with_parallel_workers(workers, || {
                         Query::new_projected(Arc::new(make(&ops)), [0, 2], project)
                             .solve_residual_state_lazy()
-                            .cap(64)
-                            .start_width(1)
-                            .growth(2)
                             .into_par_iter()
                             .collect()
                     });
@@ -22562,15 +22384,8 @@ mod tests {
 
             let mut complete = Query::new(make(), project)
                 .solve_residual_state_lazy()
-                .cap(64)
-                .start_width(1)
-                .growth(2)
                 .collect_profiled();
-            let mut sparse = Query::new(make(), project)
-                .solve_residual_state_lazy()
-                .cap(64)
-                .start_width(1)
-                .growth(2);
+            let mut sparse = Query::new(make(), project).solve_residual_state_lazy();
             sparse.state.eager_terminal_phase_enabled = false;
             let mut sparse = sparse.collect_profiled();
 
@@ -22824,9 +22639,6 @@ mod tests {
             project,
         )
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(2)
-        .growth(1)
         .collect_profiled();
         lowered.results.sort_unstable();
         let expected = [(raw(0), raw(7)), (raw(1), raw(7))];
@@ -22851,9 +22663,6 @@ mod tests {
             project,
         )
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(2)
-        .growth(1)
         .collect_profiled();
         synthetic.results.sort_unstable();
         assert_eq!(synthetic.results, expected);
@@ -22918,9 +22727,6 @@ mod tests {
             project,
         )
         .solve_residual_state_lazy()
-        .cap(4)
-        .start_width(4)
-        .growth(1)
         .collect_profiled();
         lowered.results.sort_unstable();
         assert_eq!(
@@ -23523,7 +23329,8 @@ mod tests {
         let program_only_counters = program_fallback_counters();
         let mut program_only: Vec<_> = with_parallel_workers(4, || {
             Query::new(make(&program_only_counters, false), project)
-                .into_par_residual_state_iter()
+                .solve_residual_state_lazy()
+                .into_par_iter()
                 .collect()
         });
         assert_program_action_fallbacks_unused(&program_only_counters);
@@ -23532,7 +23339,6 @@ mod tests {
         let mut ordinary: Vec<_> = with_parallel_workers(4, || {
             Query::new(make(&ordinary_counters, true), project)
                 .solve_ordinary_constraint_oracle()
-                .start_width(block_row_cap())
                 .into_par_iter()
                 .collect()
         });
@@ -23590,14 +23396,10 @@ mod tests {
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
         let mut expected: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
-            .cap(128)
-            .start_width(128)
             .collect();
         let mut parallel: Vec<_> = with_parallel_workers(4, || {
             Query::new(make(), project)
                 .solve_residual_state_lazy()
-                .cap(128)
-                .start_width(128)
                 .into_par_iter()
                 .collect()
         });
@@ -23644,20 +23446,18 @@ mod tests {
         let mut one_worker = with_parallel_workers(1, || {
             Query::new(make(), project)
                 .solve_residual_state_lazy()
-                .start_width(block_row_cap())
                 .into_par_iter()
                 .collect::<Vec<_>>()
         });
         one_worker.sort_unstable();
         let unique = [raw(0), raw(1), raw(2), raw(3), raw(4), raw(5)];
         assert_eq!(one_worker, unique);
-        assert_eq!(*calls.lock().unwrap(), [unique.len()]);
+        assert_eq!(calls.lock().unwrap().iter().sum::<usize>(), unique.len());
 
         calls.lock().unwrap().clear();
         let mut four_workers = with_parallel_workers(4, || {
             Query::new(make(), project)
                 .solve_residual_state_lazy()
-                .start_width(block_row_cap())
                 .into_par_iter()
                 .collect::<Vec<_>>()
         });
@@ -23840,7 +23640,6 @@ mod tests {
         let mut custom = with_parallel_workers(4, || {
             Query::new(custom_root, project)
                 .solve_residual_state_lazy()
-                .start_width(block_row_cap())
                 .into_par_iter()
                 .collect::<Vec<_>>()
         });
@@ -23882,7 +23681,6 @@ mod tests {
         let mut union_results = with_parallel_workers(4, || {
             Query::new(union_root, project)
                 .solve_residual_state_lazy()
-                .start_width(block_row_cap())
                 .into_par_iter()
                 .collect::<Vec<_>>()
         });
@@ -23913,15 +23711,11 @@ mod tests {
         };
         let project = |binding: &Binding| binding.get(0).copied();
 
-        let mut serial = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(64);
+        let mut serial = Query::new(make(), project).solve_residual_state_lazy();
         let first = serial.next();
         let serial_remainder: Vec<_> = serial.collect();
 
-        let mut started = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(64);
+        let mut started = Query::new(make(), project).solve_residual_state_lazy();
         assert_eq!(started.next(), first);
         let parallel_remainder =
             with_parallel_workers(4, move || started.into_par_iter().collect::<Vec<_>>());
@@ -23949,7 +23743,8 @@ mod tests {
             for workers in [1, 4] {
                 let mut parallel = with_parallel_workers(workers, || {
                     Query::new(make(), project)
-                        .into_par_residual_state_iter()
+                        .solve_residual_state_lazy()
+                        .into_par_iter()
                         .collect::<Vec<_>>()
                 });
                 parallel.sort_unstable();
@@ -23968,7 +23763,8 @@ mod tests {
             for workers in [1, 4] {
                 let parallel = with_parallel_workers(workers, || {
                     Query::new(ZeroVariableTruth(truth), |_| Some(()))
-                        .into_par_residual_state_iter()
+                        .solve_residual_state_lazy()
+                        .into_par_iter()
                         .collect::<Vec<_>>()
                 });
                 assert_eq!(parallel, expected, "truth={truth}, workers={workers}");
@@ -23995,7 +23791,8 @@ mod tests {
                 Query::new(root, |binding: &Binding| {
                     Some(NonCloneResult(*binding.get(0).unwrap()))
                 })
-                .into_par_residual_state_iter()
+                .solve_residual_state_lazy()
+                .into_par_iter()
                 .collect::<Vec<_>>()
             });
             let mut raw_results: Vec<_> = results.into_iter().map(|result| result.0).collect();
@@ -24351,7 +24148,6 @@ mod tests {
         let desc = ready_desc(1);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         machine.width = 8;
-        machine.cap = 64;
 
         file(
             &mut machine.worklist,
@@ -24466,7 +24262,6 @@ mod tests {
     fn mixed_delta_feedback_arms_probe_without_widening() {
         let mut machine = ResidualStateMachine::new(VariableSet::new_singleton(0), 1, None);
         machine.width = 4;
-        machine.cap = 64;
         let mut relevant = ChildSet::empty(1);
         relevant.insert(0);
         let (state, _) = machine.interner.intern_with_status(
@@ -24947,7 +24742,6 @@ mod tests {
         let plan = ResidualPlan::compile_production(&root);
         let mut machine =
             ResidualStateMachine::new(root.variables(), plan.len(), Some(FrameSeedRow::empty()));
-        machine.cap = 1;
 
         assert!(matches!(
             machine.pop_once(&root, &plan, 1),
@@ -25258,21 +25052,24 @@ mod tests {
     }
 
     #[test]
-    fn width_increases_count_only_numeric_growth_before_saturation() {
+    fn width_increase_stats_stop_at_the_private_saturation_bound() {
         let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
-        machine.width = 1;
-        machine.growth = 1;
-        machine.cap = 4;
+        machine.width = RESIDUAL_ROW_CAP / 4;
         machine.increase_width();
-        assert_eq!((machine.width, machine.stats.width_increases), (1, 0));
-
-        machine.growth = 2;
+        assert_eq!(
+            (machine.width, machine.stats.width_increases),
+            (RESIDUAL_ROW_CAP / 2, 1)
+        );
         machine.increase_width();
-        assert_eq!((machine.width, machine.stats.width_increases), (2, 1));
+        assert_eq!(
+            (machine.width, machine.stats.width_increases),
+            (RESIDUAL_ROW_CAP, 2)
+        );
         machine.increase_width();
-        assert_eq!((machine.width, machine.stats.width_increases), (4, 2));
-        machine.increase_width();
-        assert_eq!((machine.width, machine.stats.width_increases), (4, 2));
+        assert_eq!(
+            (machine.width, machine.stats.width_increases),
+            (RESIDUAL_ROW_CAP, 2)
+        );
     }
 
     #[test]

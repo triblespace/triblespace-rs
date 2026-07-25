@@ -505,11 +505,10 @@ without a specialized batch operation can loop over the rows, use
 The four row-taking operations must also be row-homomorphic: evaluating
 non-empty consecutive sub-blocks independently and concatenating their
 row-remapped outputs must equal evaluating the original block. The block-native
-runtime, including ordinary `Query::into_par_iter()` and the explicit
-`Query::into_par_residual_state_iter()` frontier-sharding path, are free to
-change block boundaries; block-global top-k or first-row semantics would
-therefore be incorrect. Diagnostics may observe call boundaries, but must not
-feed those observations back into protocol answers.
+runtime, including ordinary `Query::into_par_iter()`, is free to change block
+boundaries; block-global top-k or first-row semantics would therefore be
+incorrect. Diagnostics may observe call boundaries, but must not feed those
+observations back into protocol answers.
 
 `propose` owns the empty sink it receives. `confirm` may only return a subbag
 of its input: it must retain every candidate occurrence that belongs to the

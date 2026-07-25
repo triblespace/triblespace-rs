@@ -140,8 +140,6 @@ fn attached_value_range_rejects_in_range_values_absent_from_the_v_axis() {
         move |binding| project(variable.index, binding),
     )
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
     .collect();
     assert!(residual.is_empty());
 }
@@ -236,9 +234,6 @@ fn value_range_executes_as_a_production_ordered_source_and_confirmer() {
         project(variable.index, binding)
     })
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
-    .growth(1)
     .collect();
     source.sort_unstable();
     assert_eq!(source, [v10.raw, v50.raw, v90.raw]);
@@ -254,9 +249,6 @@ fn value_range_executes_as_a_production_ordered_source_and_confirmer() {
         project(variable.index, binding)
     })
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
-    .growth(1)
     .collect();
     confirmed.sort_unstable();
     assert_eq!(confirmed, [v50.raw]);

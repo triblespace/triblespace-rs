@@ -1905,44 +1905,6 @@ fn estimate_magnitude(estimate: usize) -> u64 {
     estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64
 }
 
-/// Maximum affine rows considered by one residual-state action cohort.
-/// This bounds peak row storage while staying above batching break-even.
-pub const BLOCK_ROW_CAP: usize = 1 << 20;
-
-/// Effective residual action-row cap: [`BLOCK_ROW_CAP`] unless overridden by
-/// `TRIBLES_BLOCK_ROW_CAP` (read once).
-pub fn block_row_cap() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("TRIBLES_BLOCK_ROW_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&c| c > 0)
-            .unwrap_or(BLOCK_ROW_CAP)
-    })
-}
-
-/// Initial action width for canonical residual-state iteration.
-///
-/// Read per iterator so benchmark processes can compare widening policies
-/// without introducing process-global state.
-fn lazy_start_width() -> usize {
-    std::env::var("TRIBLES_LAZY_START_WIDTH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&width| width > 0)
-        .unwrap_or(1)
-}
-
-/// Geometric action-width multiplier for canonical residual-state iteration.
-fn lazy_growth() -> usize {
-    std::env::var("TRIBLES_LAZY_GROWTH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&growth| growth > 0)
-        .unwrap_or(2)
-}
-
 impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<C, P, R> {
     type Item = R;
 
@@ -3097,7 +3059,7 @@ mod tests {
         );
     }
     #[test]
-    fn residual_width_and_equal_key_ties_preserve_semantic_variable_actions() {
+    fn residual_equal_key_ties_preserve_semantic_variable_actions() {
         let constraint = VariableOrderBagConstraint {
             tie_children: false,
         };
@@ -3146,22 +3108,11 @@ mod tests {
         ] {
             expected.sort_unstable();
 
-            let mut residual_narrow: Vec<_> = variable_order_bag_query(tie_children)
+            let mut residual: Vec<_> = variable_order_bag_query(tie_children)
                 .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1)
-                .growth(1)
                 .collect();
-            let mut residual_wide: Vec<_> = variable_order_bag_query(tie_children)
-                .solve_residual_state_lazy()
-                .cap(8)
-                .start_width(8)
-                .growth(1)
-                .collect();
-            for bag in [&mut residual_narrow, &mut residual_wide] {
-                bag.sort_unstable();
-                assert_eq!(bag, &expected);
-            }
+            residual.sort_unstable();
+            assert_eq!(residual, expected);
         }
     }
 }

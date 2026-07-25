@@ -187,7 +187,6 @@ fn interleaved_shards_keep_eager_occurrences_and_production_program_set_parity()
     );
     let mut full: Vec<_> = Query::new(constraint, project_value)
         .solve_residual_state_lazy()
-        .start_width(1)
         .collect();
     full.sort_unstable();
     assert_eq!(full, (1..=6).map(|tag| value(tag).raw).collect::<Vec<_>>());
@@ -236,7 +235,6 @@ fn generic_union_keeps_its_boundary_and_repeated_targets_keep_full_parity() {
         let mut full_values: Vec<_> =
             Query::new(full, |binding: &Binding| binding.get(x.index).copied())
                 .solve_residual_state_lazy()
-                .start_width(1)
                 .collect();
         ordinary_values.sort_unstable();
         full_values.sort_unstable();
@@ -256,10 +254,7 @@ fn width_one_production_program_and_live_clone_preserve_the_exact_normalized_rem
     let union = UnionArchive::new(&archives);
     let value = Variable::<UnknownInline>::new(0);
     let root = Arc::new(union.pattern(entities[0], attributes[0], value));
-    let mut query = Query::new(root, project_value)
-        .solve_residual_state_lazy()
-        .start_width(1)
-        .cap(1);
+    let mut query = Query::new(root, project_value).solve_residual_state_lazy();
 
     let first = query.next().expect("the union has eight values");
     assert_eq!(first, values[0].raw);
@@ -352,7 +347,7 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
     let value = Variable::<UnknownInline>::new(0);
     let parent = Variable::<UnknownInline>::new(1);
 
-    let solve = |archives: &[SuccinctArchive<OrderedUniverse>], narrow| {
+    let solve = |archives: &[SuccinctArchive<OrderedUniverse>]| {
         let union = UnionArchive::new(archives);
         let root = IntersectionConstraint::new(vec![
             Box::new(ParentDomain {
@@ -361,32 +356,23 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
             }) as DynConstraint<'_>,
             Box::new(union.pattern(entities[0], attributes[0], value)) as DynConstraint<'_>,
         ]);
-        let query = Query::new(root, project_value);
-        let mut results: Vec<_> = if narrow {
-            query
-                .solve_residual_state_lazy()
-                .start_width(1)
-                .cap(1)
-                .collect()
-        } else {
-            query.solve_residual_state_lazy().collect()
-        };
+        let mut results: Vec<_> = Query::new(root, project_value)
+            .solve_residual_state_lazy()
+            .collect();
         results.sort_unstable();
         results
     };
 
-    let base_default = solve(&base_archives, false);
-    let base_narrow = solve(&base_archives, true);
-    assert_eq!(base_default, base_narrow);
+    let base_results = solve(&base_archives);
     let mut expected: Vec<_> = base_values
         .iter()
         .flat_map(|value| [value.raw, value.raw])
         .collect();
     expected.sort_unstable();
-    assert_eq!(base_default, expected);
+    assert_eq!(base_results, expected);
 
-    let grown = solve(&grown_archives, false);
-    for inherited in base_default {
+    let grown = solve(&grown_archives);
+    for inherited in base_results {
         assert!(
             grown.contains(&inherited),
             "adding a shard retracted an affine result"

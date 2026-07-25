@@ -103,8 +103,6 @@ fn observed_rank_query(
         move |binding: &Binding| binding.get(value.index).copied(),
     )
     .solve_residual_state_lazy()
-    .cap(64)
-    .start_width(64)
     .shadow(epoch.clone())
     .collect_profiled()
 }
@@ -125,8 +123,6 @@ fn unshadowed_observed_rank_query(
         move |binding: &Binding| binding.get(value.index).copied(),
     )
     .solve_residual_state_lazy()
-    .cap(64)
-    .start_width(64)
     .collect()
 }
 
@@ -144,8 +140,6 @@ fn direct_rank_query(
         move |binding: &Binding| binding.get(value.index).copied(),
     )
     .solve_residual_state_lazy()
-    .cap(64)
-    .start_width(64)
     .shadow(epoch.clone())
     .collect_profiled()
 }
@@ -547,8 +541,6 @@ fn observed_wgpu_nested_confirm_restores_outer_attribution() {
         move |binding: &Binding| binding.get(value.index).copied(),
     )
     .solve_residual_state_lazy()
-    .cap(64)
-    .start_width(64)
     .shadow(outer_epoch)
     .collect_profiled();
 

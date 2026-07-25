@@ -141,12 +141,6 @@ where
         Query::new(make(), project_x)
             .solve_residual_state_lazy()
             .collect(),
-        Query::new(make(), project_x)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1)
-            .collect(),
         Query::new(make(), project_x).collect(),
     ]
 }
@@ -757,21 +751,11 @@ fn a_seed_proven_false_needs_no_proposal_source() {
 
 #[test]
 fn equality_becomes_a_source_only_after_its_peer_is_bound() {
-    let mut result_sets = vec![
-        Query::new(dynamic_equality_root(), project_xy)
-            .solve_residual_state_lazy()
-            .collect::<Vec<_>>(),
-        Query::new(dynamic_equality_root(), project_xy)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1)
-            .collect(),
-    ];
-    for results in &mut result_sets {
-        results.sort_unstable();
-        assert_eq!(results, &[(MEMBER, MEMBER)]);
-    }
+    let mut results = Query::new(dynamic_equality_root(), project_xy)
+        .solve_residual_state_lazy()
+        .collect::<Vec<_>>();
+    results.sort_unstable();
+    assert_eq!(results, [(MEMBER, MEMBER)]);
 }
 
 #[test]

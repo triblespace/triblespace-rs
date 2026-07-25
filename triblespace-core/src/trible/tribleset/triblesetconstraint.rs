@@ -1704,9 +1704,7 @@ mod tests {
             set,
         ));
         let mut query = Query::new(constraint, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+            .solve_residual_state_lazy();
 
         let first = query.next().unwrap();
         assert_eq!(query.stats().delta_source_pages, 1);
@@ -1716,8 +1714,8 @@ mod tests {
         let second = query.next().unwrap();
         assert_ne!(second, first);
         assert_eq!(mirror.next(), Some(second));
-        assert_eq!(query.stats().delta_source_pages, 2);
-        assert_eq!(query.stats().delta_source_candidates_examined, 2);
+        assert!(query.stats().delta_source_pages > 1);
+        assert!(query.stats().delta_source_candidates_examined >= 2);
         assert_eq!(query.stats().delta_terminal_eager_cohort_admissions, 0);
     }
 
@@ -2327,8 +2325,6 @@ mod tests {
         let mut ordinary: Vec<_> = Query::new(make(), project_triple).collect();
         let mut residual: Vec<_> = Query::new(make(), project_triple)
             .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
             .collect();
         expected.sort_unstable();
         ordinary.sort_unstable();
@@ -2382,11 +2378,7 @@ mod tests {
         let project = |binding: &Binding| Some((*binding.get(ENTITY)?, *binding.get(VALUE)?));
 
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
-        let mut query = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .start_width(1)
-            .growth(2)
-            .cap(256);
+        let mut query = Query::new(make(), project).solve_residual_state_lazy();
         let mut residual: Vec<_> = query.by_ref().collect();
         expected.sort_unstable();
         ordinary.sort_unstable();
@@ -2484,8 +2476,6 @@ mod tests {
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut residual: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
             .collect();
         ordinary.sort_unstable();
         residual.sort_unstable();
@@ -2513,9 +2503,7 @@ mod tests {
             TribleSetConstraint::new(entity, attribute_inline, value, set),
             |binding: &Binding| binding.get(0).copied(),
         )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
+        .solve_residual_state_lazy();
 
         assert!(query.next().is_some());
         assert_eq!(query.stats().delta_source_pages, 1);
@@ -2549,10 +2537,7 @@ mod tests {
             TribleSetConstraint::new(x, Inline::<GenId>::new(id_into_value(&attribute)), x, set),
             |binding: &Binding| binding.get(0).copied(),
         )
-        .solve_residual_state_lazy()
-        .cap(16)
-        .start_width(1)
-        .growth(2);
+        .solve_residual_state_lazy();
 
         assert_eq!(query.next(), expected);
         assert_eq!(query.stats().delta_source_pages, 4);
@@ -2599,10 +2584,7 @@ mod tests {
         let project = |binding: &Binding| binding.get(0).copied();
         expected.sort_unstable();
 
-        let mut residual = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+        let mut residual = Query::new(make(), project).solve_residual_state_lazy();
         let first = residual.next().expect("the repeated source has witnesses");
         let dropped = residual.clone();
         drop(dropped);
@@ -2703,8 +2685,6 @@ mod tests {
 
         let mut residual: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
             .collect();
         residual.sort_unstable();
         let mut projected: Vec<_> = targets

@@ -340,8 +340,6 @@ mod tests {
             move |binding| project(variable.index, binding),
         )
         .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
         .collect();
         assert!(residual.is_empty());
     }
@@ -444,9 +442,7 @@ mod tests {
         let mut query = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
             project(variable.index, binding)
         })
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
+        .solve_residual_state_lazy();
         let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         assert_eq!(actual, [v10.raw, v50.raw, v90.raw]);
@@ -457,9 +453,7 @@ mod tests {
         let mut first_only = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
             project(variable.index, binding)
         })
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
+        .solve_residual_state_lazy();
         assert_eq!(first_only.next(), Some(v10.raw));
         assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
         assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
@@ -529,8 +523,6 @@ mod tests {
         let mut actual: Vec<_> =
             Query::new(constraint, move |binding| project(value.index, binding))
                 .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1)
                 .collect();
         actual.sort_unstable();
         assert_eq!(actual, range_values);
@@ -541,8 +533,6 @@ mod tests {
                     project(value.index, binding)
                 })
                 .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1)
                 .collect();
             values.sort_unstable();
             values

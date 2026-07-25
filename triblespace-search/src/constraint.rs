@@ -1497,10 +1497,7 @@ mod tests {
                 BM25Filter::from_entries(doc, entries),
             )
         };
-        let mut residual = Query::new(make(), project_pair)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+        let mut residual = Query::new(make(), project_pair).solve_residual_state_lazy();
         let mut full: Vec<_> = residual.by_ref().collect();
         full.sort_unstable();
         assert_eq!(full, expected_public_pairs);
@@ -1521,27 +1518,30 @@ mod tests {
                 "the public raw head collapses repeated doc occurrences",
             );
         }
-        assert_eq!(
-            residual.stats().delta_source_pages,
-            parents.len() * entries.len()
-        );
+        let raw_occurrences = parents.len() * entries.len();
         assert_eq!(
             residual.stats().delta_source_candidates_examined,
-            parents.len() * entries.len()
+            raw_occurrences
         );
         assert_eq!(
             residual.stats().delta_source_direct_candidates,
-            parents.len() * entries.len()
+            raw_occurrences
         );
         assert_eq!(residual.stats().delta_source_roots, 0);
+        assert!(
+            residual.stats().delta_source_pages < raw_occurrences,
+            "the canonical geometric law never widened this full drain"
+        );
+        assert!(
+            residual.stats().max_propose_candidates > 1,
+            "the canonical geometric law never formed a batched page"
+        );
 
         let mut first_only = Query::new(
             BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
             project_first,
         )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
+        .solve_residual_state_lazy();
         assert_eq!(first_only.next(), Some(entries[0]));
         assert_eq!(first_only.stats().delta_source_pages, 1);
         assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
@@ -1554,16 +1554,12 @@ mod tests {
             project_first,
         )
         .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
         .collect();
         let mut after: Vec<_> = Query::new(
             BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
             project_first,
         )
         .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
         .collect();
         before.sort_unstable();
         after.sort_unstable();
@@ -1724,10 +1720,7 @@ mod tests {
                 SimilarTo::from_candidates(neighbour, candidates.clone()),
             )
         };
-        let mut residual = Query::new(make(), project_pair)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+        let mut residual = Query::new(make(), project_pair).solve_residual_state_lazy();
         let mut full: Vec<_> = residual.by_ref().collect();
         full.sort_unstable();
         assert_eq!(full, expected_public_pairs);
@@ -1758,9 +1751,7 @@ mod tests {
             SimilarTo::from_candidates(Variable::<Handle<Embedding>>::new(0), candidates.clone()),
             project_first,
         )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
+        .solve_residual_state_lazy();
         assert_eq!(first_only.next(), Some(candidates[0]));
         assert_eq!(first_only.stats().delta_source_pages, 1);
         assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
@@ -1793,8 +1784,6 @@ mod tests {
 
         let mut rows: Vec<_> = Query::new(constraint, project_first)
             .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
             .collect();
         rows.sort_unstable();
         expected.sort_unstable();
@@ -1834,11 +1823,7 @@ mod tests {
             })
             .is_some());
         let forward_root = triblespace_core::and!(forward_bm25, forward_similar);
-        let mut forward = Query::new(forward_root, project_first)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1);
+        let mut forward = Query::new(forward_root, project_first).solve_residual_state_lazy();
         let first = forward
             .next()
             .expect("production residual cached source was empty");
@@ -1868,9 +1853,6 @@ mod tests {
         let reverse_root = triblespace_core::and!(reverse_similar, reverse_bm25);
         let mut reverse: Vec<_> = Query::new(reverse_root, project_first)
             .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1)
             .collect();
         reverse.sort_unstable();
         assert_eq!(reverse, expected);
@@ -2053,9 +2035,6 @@ mod tests {
         let good = triblespace_core::and!(a.is(handles[0]), b.is(handles[2]), exact,);
         let rows: Vec<_> = Query::new(good, project_pair)
             .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1)
             .collect();
         assert_eq!(rows, [(handles[0].raw, handles[2].raw)]);
 

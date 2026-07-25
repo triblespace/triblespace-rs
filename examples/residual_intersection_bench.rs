@@ -114,27 +114,12 @@ fn tally<T: std::hash::Hash>(items: impl IntoIterator<Item = T>) -> (usize, u64)
     (count, hash)
 }
 
-#[derive(Clone, Copy)]
-enum Mode {
-    Adaptive,
-    Saturated,
-}
-
-fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
+fn run_query<S: TriblePattern>(kb: &S) -> (usize, u64) {
     let query = find!(
         (p: Inline<_>, x: Inline<_>),
         pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
     );
-    match mode {
-        Mode::Adaptive => tally(query),
-        Mode::Saturated => tally(
-            query
-                .solve_residual_state_lazy()
-                .cap(usize::MAX)
-                .start_width(usize::MAX)
-                .growth(1),
-        ),
-    }
+    tally(query.solve_residual_state_lazy())
 }
 
 fn run_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), ResidualStateStats) {
@@ -143,24 +128,11 @@ fn run_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), ResidualSta
         pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
     )
     .solve_residual_state_lazy()
-    .cap(usize::MAX)
-    .start_width(usize::MAX)
-    .growth(1)
     .collect_profiled();
     (tally(solve.results), solve.stats)
 }
 
-fn run_lazy_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), ResidualStateStats) {
-    let solve = find!(
-        (p: Inline<_>, x: Inline<_>),
-        pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
-    )
-    .solve_residual_state_lazy()
-    .collect_profiled();
-    (tally(solve.results), solve.stats)
-}
-
-fn run_nested_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
+fn run_nested_query<S: TriblePattern>(kb: &S) -> (usize, u64) {
     let query = find!(
         (p: Inline<_>, x: Inline<_>),
         and!(
@@ -171,16 +143,7 @@ fn run_nested_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
             ),
         )
     );
-    match mode {
-        Mode::Adaptive => tally(query),
-        Mode::Saturated => tally(
-            query
-                .solve_residual_state_lazy()
-                .cap(usize::MAX)
-                .start_width(usize::MAX)
-                .growth(1),
-        ),
-    }
+    tally(query.solve_residual_state_lazy())
 }
 
 fn run_nested_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), ResidualStateStats) {
@@ -195,29 +158,16 @@ fn run_nested_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), Resi
         )
     )
     .solve_residual_state_lazy()
-    .cap(usize::MAX)
-    .start_width(usize::MAX)
-    .growth(1)
     .collect_profiled();
     (tally(solve.results), solve.stats)
 }
 
-fn run_first<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
+fn run_first<S: TriblePattern>(kb: &S) -> (usize, u64) {
     let query = find!(
         (p: Inline<_>, x: Inline<_>),
         pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
     );
-    match mode {
-        Mode::Adaptive => tally(query.take(1)),
-        Mode::Saturated => tally(
-            query
-                .solve_residual_state_lazy()
-                .cap(usize::MAX)
-                .start_width(usize::MAX)
-                .growth(1)
-                .take(1),
-        ),
-    }
+    tally(query.solve_residual_state_lazy().take(1))
 }
 
 fn median(samples: &[f64]) -> f64 {
@@ -232,91 +182,57 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 fn bench_first_result<S: TriblePattern>(label: &str, kb: &S, reps: usize) {
-    let modes = [("adaptive", Mode::Adaptive), ("saturated", Mode::Saturated)];
-    for &(_, mode) in &modes {
-        std::hint::black_box(run_first(kb, mode));
+    std::hint::black_box(run_first(kb));
+    let mut samples = Vec::with_capacity(reps);
+    let mut signature = (0, 0);
+    for _ in 0..reps {
+        let start = Instant::now();
+        signature = run_first(kb);
+        samples.push(start.elapsed().as_secs_f64() * 1e3);
     }
 
-    let mut samples = vec![Vec::with_capacity(reps); modes.len()];
-    let mut signatures = vec![(0, 0); modes.len()];
-    for repetition in 0..reps {
-        for offset in 0..modes.len() {
-            let mode_index = (repetition + offset) % modes.len();
-            let start = Instant::now();
-            signatures[mode_index] = run_first(kb, modes[mode_index].1);
-            samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
-        }
-    }
-
-    println!("  first result ({label}):");
-    for (mode_index, &(name, _)) in modes.iter().enumerate() {
-        // Search order is intentionally geometry-dependent, so only the
-        // existence of one prefix row is shared here. Full-drain signatures
-        // below remain the exact semantic parity gate.
-        assert_eq!(
-            signatures[mode_index].0, 1,
-            "{label} {name} must produce one first result"
-        );
-        println!("    {name:<11} {:>9.3} ms", median(&samples[mode_index]));
-    }
+    assert_eq!(signature.0, 1, "{label} must produce one first result");
+    println!("  first result ({label}): {:>9.3} ms", median(&samples));
 }
 
 fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
-    let modes = [("adaptive", Mode::Adaptive), ("saturated", Mode::Saturated)];
-
-    // Untimed full drains pay any one-time setup before the measurements.
-    for &(_, mode) in &modes {
-        std::hint::black_box(run_query(kb, mode));
-    }
+    std::hint::black_box(run_query(kb));
 
     println!("\n== {label} ==");
     bench_first_result(label, kb, reps);
     println!("  full drain:");
-    let mut samples = vec![Vec::with_capacity(reps); modes.len()];
-    let mut signatures = vec![(0, 0); modes.len()];
-    for repetition in 0..reps {
-        // Rotate the first mode so thermal/frequency drift is not assigned to
-        // one solver merely because the benchmark ran it first every time.
-        for offset in 0..modes.len() {
-            let mode_index = (repetition + offset) % modes.len();
-            let mode = modes[mode_index].1;
-            let start = Instant::now();
-            signatures[mode_index] = run_query(kb, mode);
-            samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
-        }
+    let mut samples = Vec::with_capacity(reps);
+    let mut signature = (0, 0);
+    for _ in 0..reps {
+        let start = Instant::now();
+        signature = run_query(kb);
+        samples.push(start.elapsed().as_secs_f64() * 1e3);
     }
 
-    let reference = signatures[0];
-    for (mode_index, &(name, _)) in modes.iter().enumerate() {
-        let signature = signatures[mode_index];
-        let parity = signature == reference && signature.0 == expected;
-        println!(
-            "  {name:<9} {:>9.3} ms  signature ({:>7}, {:#018x})  {}",
-            median(&samples[mode_index]),
-            signature.0,
-            signature.1,
-            if parity { "ok" } else { "MISMATCH" },
-        );
-        assert!(parity, "{label} {name} result signature mismatch");
-    }
-
-    let (signature, stats) = run_residual_profiled(kb);
-    assert_eq!(
-        signature.0, expected,
-        "profiled saturated row-count mismatch"
-    );
-    assert_eq!(
-        signature, reference,
-        "profiled saturated result signature mismatch"
-    );
+    assert_eq!(signature.0, expected, "{label} result count mismatch");
     println!(
-        "  saturated profile: states {} + hits {}, pops {}, bucket merges {} ({} rows); \
-         propose {} calls/{} rows/max {}, confirm {} calls/{} rows/max {}",
+        "  canonical {:>9.3} ms  signature ({:>7}, {:#018x})",
+        median(&samples),
+        signature.0,
+        signature.1,
+    );
+
+    let (profiled_signature, stats) = run_residual_profiled(kb);
+    assert_eq!(profiled_signature, signature, "profiled result mismatch");
+    println!(
+        "  profile: states {} + hits {}, pops {} (full {} / readiness {} / partial {}), \
+         live merges {} ({} rows), reentries {} ({} rows); propose {} calls/{} rows/max {}, \
+         confirm {} calls/{} rows/max {}",
         stats.states_interned,
         stats.interner_hits,
         stats.state_pops,
+        stats.full_pops,
+        stats.readiness_pops,
+        stats.partial_pops,
         stats.bucket_merges,
         stats.rows_merged,
+        stats.state_reentries,
+        stats.rows_reentered,
         stats.propose_calls,
         stats.propose_rows,
         stats.max_propose_rows,
@@ -324,69 +240,36 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
         stats.confirm_rows,
         stats.max_confirm_rows,
     );
-
-    let (lazy_signature, lazy_stats) = run_lazy_residual_profiled(kb);
-    assert_eq!(
-        lazy_signature, reference,
-        "profiled adaptive result signature mismatch"
-    );
-    println!(
-        "  adaptive profile: states {} + hits {}, pops {} (full {} / readiness {} / partial {}), \
-         live merges {} ({} rows), reentries {} ({} rows); propose {} calls/{} rows/max {}, \
-         confirm {} calls/{} rows/max {}",
-        lazy_stats.states_interned,
-        lazy_stats.interner_hits,
-        lazy_stats.state_pops,
-        lazy_stats.full_pops,
-        lazy_stats.readiness_pops,
-        lazy_stats.partial_pops,
-        lazy_stats.bucket_merges,
-        lazy_stats.rows_merged,
-        lazy_stats.state_reentries,
-        lazy_stats.rows_reentered,
-        lazy_stats.propose_calls,
-        lazy_stats.propose_rows,
-        lazy_stats.max_propose_rows,
-        lazy_stats.confirm_calls,
-        lazy_stats.confirm_rows,
-        lazy_stats.max_confirm_rows,
-    );
 }
 
 fn bench_nested_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
-    let modes = [("adaptive", Mode::Adaptive), ("saturated", Mode::Saturated)];
-    for &(_, mode) in &modes {
-        std::hint::black_box(run_nested_query(kb, mode));
-    }
+    std::hint::black_box(run_nested_query(kb));
 
     println!("\n== {label}: explicit nested AND ==");
-    let mut samples = vec![Vec::with_capacity(reps); modes.len()];
-    let mut signatures = vec![(0, 0); modes.len()];
-    for repetition in 0..reps {
-        for offset in 0..modes.len() {
-            let mode_index = (repetition + offset) % modes.len();
-            let start = Instant::now();
-            signatures[mode_index] = run_nested_query(kb, modes[mode_index].1);
-            samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
-        }
+    let mut samples = Vec::with_capacity(reps);
+    let mut signature = (0, 0);
+    for _ in 0..reps {
+        let start = Instant::now();
+        signature = run_nested_query(kb);
+        samples.push(start.elapsed().as_secs_f64() * 1e3);
     }
 
-    let reference = signatures[0];
-    for (mode_index, &(name, _)) in modes.iter().enumerate() {
-        let signature = signatures[mode_index];
-        let parity = signature == reference && signature.0 == expected;
-        println!(
-            "  {name:<9} {:>9.3} ms  signature ({:>7}, {:#018x})  {}",
-            median(&samples[mode_index]),
-            signature.0,
-            signature.1,
-            if parity { "ok" } else { "MISMATCH" },
-        );
-        assert!(parity, "{label} nested {name} result signature mismatch");
-    }
+    assert_eq!(
+        signature.0, expected,
+        "{label} nested result count mismatch"
+    );
+    println!(
+        "  canonical {:>9.3} ms  signature ({:>7}, {:#018x})",
+        median(&samples),
+        signature.0,
+        signature.1,
+    );
 
-    let (signature, stats) = run_nested_residual_profiled(kb);
-    assert_eq!(signature, reference, "profiled nested residual mismatch");
+    let (profiled_signature, stats) = run_nested_residual_profiled(kb);
+    assert_eq!(
+        profiled_signature, signature,
+        "profiled nested residual mismatch"
+    );
     println!(
         "  nested profile: states {} + hits {}, pops {}, bucket merges {} ({} rows); \
          propose {} calls/{} rows/max {}, confirm {} calls/{} rows/max {}",

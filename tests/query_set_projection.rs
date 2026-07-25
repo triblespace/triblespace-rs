@@ -512,7 +512,7 @@ fn rayon_shards_share_one_projection_claim_domain() {
         .unwrap();
     assert_eq!(pool.install(|| make().into_par_iter().count()), 1);
     assert_eq!(
-        pool.install(|| make().into_par_residual_state_iter().count()),
+        pool.install(|| make().solve_residual_state_lazy().into_par_iter().count()),
         1
     );
 }
@@ -545,7 +545,7 @@ fn rayon_full_heads_preserve_every_distinct_complete_binding_without_claims() {
         .unwrap();
     assert_eq!(pool.install(|| make().into_par_iter().count()), 64);
     assert_eq!(
-        pool.install(|| make().into_par_residual_state_iter().count()),
+        pool.install(|| make().solve_residual_state_lazy().into_par_iter().count()),
         64
     );
 }

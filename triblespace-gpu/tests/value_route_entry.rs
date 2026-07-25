@@ -129,11 +129,7 @@ fn canonical_fallback_keeps_the_width_one_geometric_pager() {
         (e: Id, v: Id),
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
-    let mut solve = query
-        .solve_residual_state_lazy()
-        .cap(64)
-        .start_width(1)
-        .growth(2);
+    let mut solve = query.solve_residual_state_lazy();
 
     assert!(solve.next().is_some());
 
@@ -251,9 +247,6 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
         )
     )
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
-    .growth(2)
     .collect_profiled();
     assert_eq!(entities.results, vec![(entity,)]);
     assert!(entities.stats.delta_source_pages > 0);
@@ -267,9 +260,6 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
         )
     )
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
-    .growth(2)
     .collect_profiled();
     assert_eq!(attributes.results, vec![(attribute,)]);
     assert!(attributes.stats.delta_source_pages > 0);
@@ -283,15 +273,18 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
         )
     )
     .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
-    .growth(2)
     .collect_profiled();
     let mut actual_values = values.results;
     actual_values.sort();
     let expected_values: Vec<_> = (0..5).map(|slot| (fixture_id(3, 500 + slot),)).collect();
     assert_eq!(actual_values, expected_values);
-    assert!(values.stats.delta_source_pages >= 5);
+    assert_eq!(values.stats.delta_source_candidates_examined, 5);
+    assert_eq!(values.stats.delta_source_direct_candidates, 5);
+    assert!(
+        values.stats.delta_source_pages < 5,
+        "the canonical geometric law never widened the five-value drain"
+    );
+    assert!(values.stats.max_propose_candidates > 1);
 
     let counters = route.counters();
     assert_eq!(counters.physical_cohorts, 0);
@@ -323,7 +316,6 @@ fn public_force_route_places_all_three_two_bound_actions_without_preparation() {
         )
     )
     .solve_residual_state_lazy()
-    .start_width(1)
     .collect_profiled();
     assert_eq!(entities.results, vec![(entity,)]);
     assert!(entities.stats.delta_program_physical_cohorts > 0);
@@ -337,7 +329,6 @@ fn public_force_route_places_all_three_two_bound_actions_without_preparation() {
         )
     )
     .solve_residual_state_lazy()
-    .start_width(1)
     .collect_profiled();
     assert_eq!(attributes.results, vec![(attribute,)]);
     assert!(attributes.stats.delta_program_physical_cohorts > 0);
@@ -351,7 +342,6 @@ fn public_force_route_places_all_three_two_bound_actions_without_preparation() {
         )
     )
     .solve_residual_state_lazy()
-    .start_width(1)
     .collect_profiled();
     let mut actual_values = values.results;
     actual_values.sort();
@@ -437,9 +427,9 @@ fn parallel_forced_routing_places_physically_and_stays_set_identical() {
         (e: Id, v: Id),
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
-    // The public parallel residual entry uses the same production plan as
+    // Rayon conversion uses the same residual iterator and production plan as
     // serial execution, so production-qualified typed Programs stay reachable.
-    let mut results: Vec<(Id, Id)> = query.into_par_residual_state_iter().collect();
+    let mut results: Vec<(Id, Id)> = query.solve_residual_state_lazy().into_par_iter().collect();
 
     results.sort();
     assert_eq!(results, expected);

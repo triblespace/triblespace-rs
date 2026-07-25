@@ -502,18 +502,22 @@ mod tests {
         assert_eq!(second.next, Some(ResidualDeltaSourceCursor::Offset(3)));
 
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+            .solve_residual_state_lazy();
         let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         assert_eq!(actual, [value(1).raw, value(2).raw, value(3).raw]);
         assert_eq!(query.stats().propose_calls, 1);
-        assert_eq!(query.stats().delta_source_pages, values.len());
         assert_eq!(query.stats().delta_source_candidates_examined, values.len());
         assert_eq!(query.stats().delta_source_direct_candidates, values.len());
         assert_eq!(query.stats().delta_source_roots, 0);
-        assert_eq!(query.stats().max_propose_candidates, 1);
+        assert!(
+            query.stats().delta_source_pages < values.len(),
+            "the canonical geometric law never widened this full drain"
+        );
+        assert!(
+            query.stats().max_propose_candidates > 1,
+            "the canonical geometric law never formed a batched page"
+        );
     }
 
     #[test]
@@ -527,8 +531,6 @@ mod tests {
                 project,
             )
             .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
         };
 
         let mut first = make(&grown);
@@ -565,9 +567,7 @@ mod tests {
         assert!(encoded.windows(2).all(|pair| pair[0] > pair[1]));
 
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+            .solve_residual_state_lazy();
         let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         let mut expected = encoded;
@@ -591,19 +591,17 @@ mod tests {
             ])
         };
 
-        let mut query = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
+        let mut query = Query::new(make(), project).solve_residual_state_lazy();
         let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         assert_eq!(actual, [value(1).raw, value(2).raw, value(3).raw]);
         assert_eq!(query.stats().delta_source_direct_candidates, 5);
         assert_eq!(query.stats().delta_source_roots, 0);
-        assert_eq!(query.stats().delta_source_pages, 5);
         // Exact direct-Union admission publishes each novel value online. The
         // duplicate source occurrences are still examined, but no normalized
-        // three-value replay page is required after both arms quiesce.
-        assert_eq!(query.stats().max_propose_candidates, 1);
+        // three-value replay page is required after both arms quiesce. The
+        // single geometric law may batch later arm-local occurrences.
+        assert!(query.stats().delta_source_pages < 5);
+        assert!(query.stats().max_propose_candidates > 1);
     }
 }
