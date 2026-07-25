@@ -52,7 +52,8 @@ the compact scalar representation.
 
 ## The constraint protocol
 
-Six execution methods perform the ordinary query negotiation:
+Five operational methods and one static dependency hint perform the ordinary
+query negotiation:
 
 | Method | Responsibility |
 |---|---|
@@ -61,7 +62,7 @@ Six execution methods perform the ordinary query negotiation:
 | `propose` | Enumerate candidate values for a variable and associate each value with its parent row. |
 | `confirm` | Remove candidates that violate this constraint. |
 | `satisfied` | Check the truth of a constraint whose relevant variables have become bound. |
-| `influence` | Report which variables may need fresh estimates after another variable changes binding state. |
+| `influence` | Declare static estimate dependencies; their count breaks equal-magnitude variable-choice ties. |
 
 Every `Constraint` occurrence unconditionally denotes one fixed raw-inline SET
 relation over the variables it declares. `proposal_coverage` is not a second
@@ -131,10 +132,14 @@ executors.
 
 An expansion still performs the familiar Atreides negotiation:
 
-1. Estimate each unbound variable under the current partial bindings.
-2. Choose the preferred next variable. In a multi-row block this decision is
-   made per row, because different bound values can imply different
-   cardinalities.
+1. Estimate each eligible proposal source for every unbound variable under the
+   current partial bindings. Directed action costs choose the physical source
+   within each variable.
+2. Choose the preferred next variable with one fixed key: the selected
+   source's raw candidate-count bit length (smaller first), then static
+   influence count (larger first), then `VariableId` (smaller first). In a
+   multi-row block this decision is made per row, because different bound
+   values can imply different cardinalities.
 3. Stable-partition the rows by their exact preferred variable. This preserves
    each row's selected occurrence bag while still batching rows whose preferred
    variable agrees; no row is reassigned to an estimate-similar variable.
@@ -498,9 +503,10 @@ providing skew-resistant and predictable performance. The residual machine
 makes the exact proposer occurrence and remaining confirmer set part of
 canonical state so equivalent futures can reconverge after their selected
 actions run. At width one it follows the hot continuation depth-first; as width
-grows it batches equivalent futures. Because every path refreshes estimates
-during evaluation, binding order adapts whenever a constraint updates its
-influence set—there is no separate planning artifact to maintain.
+grows it batches equivalent futures. Every Ready state computes fresh
+per-row estimates for all unbound variables; the static `influence` cardinality
+is only the equal-magnitude tiebreak. There is no cached estimate state or
+separate planning artifact to maintain.
 For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
 
 ## Query Languages

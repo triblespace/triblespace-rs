@@ -10,7 +10,7 @@ results.
 ## Constraints as the search frontier
 
 Every constraint implements the [`Constraint`](triblespace::core::query::Constraint) trait,
-whose six ordinary execution methods shape the search:
+whose five operational methods and one static dependency hint shape the search:
 
 1. **`variables`** – returns the set of variables this constraint touches.
 2. **`estimate`** – predicts how many results remain for a variable under the
@@ -19,8 +19,8 @@ whose six ordinary execution methods shape the search:
 4. **`confirm`** – filters a set of candidates without re-enumerating them.
 5. **`satisfied`** – returns `false` when all variables are bound but the
    constraint is unsatisfied. Used by `UnionConstraint` to prune dead variants.
-6. **`influence`** – reports which other variables need their estimates refreshed
-   when this variable changes.
+6. **`influence`** – reports static estimate dependencies. Their count breaks
+   ties between candidate counts in the same power-of-two magnitude bucket.
 
 Every constraint occurrence denotes one fixed raw-inline SET relation, and all
 of its ordinary, paged, typed-Program, and complete-equivalent routes must
@@ -36,10 +36,9 @@ Traditional databases rely on a query planner to combine statistics into a join
 plan. Atreides instead consults the constraints directly while it searches. Each
 constraint can base its estimates on whatever structure it maintains—hash maps,
 precomputed counts, or even constant values for predicates that admit at most
-one match—so long as it can provide a quick cost quote. Whenever a binding
-changes, the engine asks the influenced constraints for fresh estimates. Those
-estimates are cached per variable and reused until another binding invalidates
-them, keeping the guidance loop responsive as the search progresses.
+one match—so long as it can provide a quick cost quote. Each canonical Ready
+state asks every eligible source for fresh per-row estimates. No cached
+estimate or invalidation protocol participates in correctness.
 
 An estimate affects cost ordering only. It cannot change whether an occurrence
 is relevant, whether it is a sound source, or which rows the relation contains.
@@ -47,15 +46,15 @@ is relevant, whether it is a sound source, or which rows the relation contains.
 Because the heuristics are derived entirely from the constraints themselves, we
 do not need a separate query planner or multiple join implementations. Any
 custom constraint can participate in the same search by providing sensible
-estimates, proposal generation, confirmation, and influence tracking.
+estimates, proposal generation, confirmation, and a static dependency hint.
 
 ## A spectrum of Atreides variants
 
 The Atreides "family" refers to the spectrum of heuristics a constraint can use
 when implementing [`Constraint::estimate`](triblespace::core::query::Constraint). Each
 variant exposes the same guided depth-first search, but with progressively
-tighter cardinality guidance. In practice they all revisit their estimates when
-bindings change; what differs is **what** quantity they approximate:
+tighter cardinality guidance. In practice every Ready state revisits its
+estimates; what differs is **what** quantity they approximate:
 
 - **Row-count Join (Jessica)** estimates the remaining search volume for the
   *entire* constraint. If one variable is bound but two others are not, Jessica
@@ -88,30 +87,31 @@ wrappers that only track total counts behave like Jessica, those that surface
 their tightest per-variable proposals behave like Paul, and structures capable
 of intersecting their children on the fly approach Ghanima's accuracy. The
 engine does not need to know which variant it is running—`estimate` supplies
-whatever fidelity the data structure can provide, and `influence` ensures that
-higher quality estimates refresh when relevant bindings change.
+whatever fidelity the data structure can provide, while `influence` supplies a
+stable connectivity tiebreak when two counts have the same magnitude.
 
 ## Guided depth-first search
 
-When a query starts, [`Query::new`](triblespace::core::query::Query::new) collects the
-initial estimates and influence sets, sorts the unbound variables so the
-tightest constraints are considered first, and caches per-variable proposal
-buffers that can be reused across backtracking steps. The engine then walks the
-search space as follows:
+At query start, [`Query::new`](triblespace::core::query::Query::new) checks the
+seed and compiles the constraint tree into canonical residual states. The
+solver then repeats one negotiation for each Ready row:
 
-1. Inspect the unbound variables.
-2. Refresh the cached estimates for any variables whose constraints were
-   influenced by the latest binding.
-3. Pick the next variable to bind by sorting the unbound set on two criteria:
-   - the base‑2 logarithm of the estimate (smaller estimates are tried first),
-   - the number of other variables the constraints could influence (ties favour
-     the most connected variable, which tends to prune the search faster).
-4. Ask the relevant constraints to `propose` candidates for that variable.
-   Composite constraints enumerate the tightest member and call `confirm` on the
-   rest so that each candidate is checked without materialising cross
-   products.
-5. Push the candidates onto a stack and recurse until every variable is bound or
-   the stack runs empty, in which case the engine backtracks.
+1. Inspect every unbound variable and ask all structurally eligible sources
+   for fresh estimates.
+2. Within each variable, choose the source with the smallest directed action
+   cost. The source's raw candidate count remains that variable's logical
+   specificity estimate.
+3. Choose the next variable with one fixed ordering: smaller candidate-count
+   bit length, then larger static `influence` count, then smaller
+   `VariableId`. Counts in the same power-of-two bucket are deliberately
+   treated as equally specific.
+4. File an explicit `Propose` action for the selected source, SET-admit its
+   candidates, then file the remaining relevant occurrences as `Confirm`
+   actions from most to least selective.
+5. Extend surviving rows and return them to Ready. Equal descriptions of the
+   remaining computation share one bucket, so independently reached futures
+   reconverge; width one follows a hot continuation depth-first, while
+   geometrically wider execution batches the same states.
 
 Traditional databases rely on sorted indexes to make the above iteration
 tractable. Atreides still performs random lookups when confirming each

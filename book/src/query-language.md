@@ -469,8 +469,8 @@ The example wraps an external `HashSet` so it can be queried directly.  A
 `TriblePattern` implementation follows the same shape: create a constraint
 type that reads from your backing store and return it from `pattern`.  The query
 engine drives both traits through `Constraint`, so any data source that speaks
-the block-native protocol can participate in `find!`. The six ordinary
-execution methods are:
+the block-native protocol can participate in `find!`. Its five operational
+methods and one static dependency hint are:
 
 | Method | Role |
 |---|---|
@@ -479,7 +479,7 @@ execution methods are:
 | `propose` | Fill an initially empty sink with candidate extensions. |
 | `confirm` | Filter candidates proposed by another constraint without adding any. |
 | `satisfied` | Report exact truth once every relevant variable is bound. |
-| `influence` | Name estimates that may change after a variable is bound or unbound. |
+| `influence` | Declare static estimate dependencies; their count breaks equal-magnitude variable-choice ties. |
 
 Every constraint occurrence denotes one fixed raw-inline SET relation over the
 variables returned by `variables`. Its ordinary, paged, typed-Program, and

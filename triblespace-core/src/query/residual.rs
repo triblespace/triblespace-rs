@@ -1600,6 +1600,10 @@ impl PartialEq<ConstraintPath> for ResidualLeaf {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualPlan {
     leaves: Vec<ResidualLeaf>,
+    /// Static structural dependency count used to break ties between
+    /// equally specific variable choices. The complete influence sets are not
+    /// runtime state: residual Ready planning refreshes every unbound estimate.
+    influence_counts: [u8; 128],
     /// Structural finite-formula program below lowered Union occurrences.
     /// Runtime migration is intentionally separate from compilation.
     finite_formula: FiniteFormulaProgram,
@@ -1766,8 +1770,18 @@ impl ResidualPlan {
                 children: children.clone(),
             }
         });
+        let variables = root.variables();
+        let influence_counts = std::array::from_fn(|variable| {
+            if variables.is_set(variable) {
+                u8::try_from(root.influence(variable).count())
+                    .expect("a VariableSet influence count fits in u8")
+            } else {
+                0
+            }
+        });
         Self {
             leaves,
+            influence_counts,
             finite_formula,
             program_scope,
             parent_atomic_program_confirms,
@@ -7749,25 +7763,13 @@ fn ready_plan_transition<'a>(
     desc: &StateDesc,
     rows: RowBatch,
     full: VariableSet,
-    influences: &[VariableSet; 128],
-    base_estimates: &[usize; 128],
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> ContinuationToken {
     if let Some(quote) = &plan.formula_ready_quote {
         return ready_quoted_plan_transition(
-            root,
-            plan,
-            quote,
-            desc,
-            rows,
-            full,
-            influences,
-            base_estimates,
-            worklist,
-            interner,
-            stats,
+            root, plan, quote, desc, rows, full, worklist, interner, stats,
         );
     }
 
@@ -7870,13 +7872,12 @@ fn ready_plan_transition<'a>(
     let mut preferred_counts = vec![0; plans.len()];
     for row in 0..rows.row_count {
         let mut best = None;
-        for (pi, plan) in plans.iter().enumerate() {
+        for (pi, variable_plan) in plans.iter().enumerate() {
             let estimate = estimate_matrix[pi * rows.row_count + row];
             let key = variable_choice_key(
-                plan.variable,
+                variable_plan.variable,
                 estimate,
-                base_estimates[plan.variable],
-                influences[plan.variable].count(),
+                plan.influence_counts[variable_plan.variable],
             );
             if best.is_none_or(|(_, best_key)| key > best_key) {
                 best = Some((pi, key));
@@ -7952,8 +7953,6 @@ fn ready_quoted_plan_transition<'a>(
     desc: &StateDesc,
     rows: RowBatch,
     full: VariableSet,
-    influences: &[VariableSet; 128],
-    base_estimates: &[usize; 128],
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -7995,8 +7994,7 @@ fn ready_quoted_plan_transition<'a>(
             let key = variable_choice_key(
                 variable_plan.variable,
                 estimate,
-                base_estimates[variable_plan.variable],
-                influences[variable_plan.variable].count(),
+                plan.influence_counts[variable_plan.variable],
             );
             if best.is_none_or(|(_, best_key)| key > best_key) {
                 best = Some((pi, key));
@@ -9846,8 +9844,6 @@ fn execute_task<'a>(
     plan: &ResidualPlan,
     task: SelectedResidualTask,
     full: VariableSet,
-    influences: &[VariableSet; 128],
-    base_estimates: &[usize; 128],
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -9866,18 +9862,8 @@ fn execute_task<'a>(
         }
         (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
             stats.ready_plan_pops += 1;
-            let continuation = ready_plan_transition(
-                root,
-                plan,
-                &desc,
-                rows,
-                full,
-                influences,
-                base_estimates,
-                worklist,
-                interner,
-                stats,
-            );
+            let continuation =
+                ready_plan_transition(root, plan, &desc, rows, full, worklist, interner, stats);
             StepOutcome::Advanced(continuation)
         }
         (ResidualPhase::QuotedFormulaPropose { variable }, StateBucket::QuotedRows(batch)) => {
@@ -10154,8 +10140,6 @@ fn execute_state<'a>(
     desc: &StateDesc,
     bucket: StateBucket,
     full: VariableSet,
-    influences: &[VariableSet; 128],
-    base_estimates: &[usize; 128],
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -10173,8 +10157,6 @@ fn execute_state<'a>(
             bucket,
         },
         full,
-        influences,
-        base_estimates,
         worklist,
         interner,
         stats,
@@ -10500,8 +10482,6 @@ pub(super) struct SeededResidualFrame<C> {
     plan: ResidualPlan,
     machine: ResidualStateMachine,
     projection: ProjectionGate,
-    influences: [VariableSet; 128],
-    base_estimates: [usize; 128],
 }
 
 impl<'a, C> SeededResidualFrame<C>
@@ -10531,21 +10511,6 @@ where
             None
         };
 
-        let influences = std::array::from_fn(|variable| {
-            if full.is_set(variable) {
-                root.influence(variable)
-            } else {
-                VariableSet::new_empty()
-            }
-        });
-        let base_estimates = std::array::from_fn(|variable| {
-            if !full.is_set(variable) {
-                return usize::MAX;
-            }
-            source_quote_single_row(&root, variable, VariableSet::new_empty(), &RowsView::EMPTY)
-                .map_or(usize::MAX, |(_, estimate)| estimate)
-        });
-
         let plan = ResidualPlan::compile_production(&root);
         let machine = ResidualStateMachine::new_seeded_for_plan(full, &plan, seed);
         Self {
@@ -10553,8 +10518,6 @@ where
             plan,
             machine,
             projection: ProjectionGate::full(full),
-            influences,
-            base_estimates,
         }
     }
 
@@ -10564,8 +10527,6 @@ where
             &self.plan,
             &|binding| Some(binding.clone()),
             &mut self.projection,
-            &self.influences,
-            &self.base_estimates,
         )
     }
 }
@@ -10582,20 +10543,12 @@ impl ResidualQueryState {
         root: &dyn Constraint<'a>,
         postprocessing: &P,
         projection: &mut ProjectionGate,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> Option<R>
     where
         P: Fn(&Binding) -> Option<R>,
     {
-        self.machine.pull(
-            root,
-            &self.plan,
-            postprocessing,
-            projection,
-            influences,
-            base_estimates,
-        )
+        self.machine
+            .pull(root, &self.plan, postprocessing, projection)
     }
 }
 
@@ -11705,8 +11658,6 @@ impl ResidualStateMachine {
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         task: SelectedResidualTask,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> MachineStep {
         let task = match self.seed_delta_proposal(root, plan, task) {
             Ok(DeltaSeedOutcome {
@@ -11780,8 +11731,6 @@ impl ResidualStateMachine {
             plan,
             task,
             self.full,
-            influences,
-            base_estimates,
             &mut self.worklist,
             &mut self.interner,
             &mut self.stats,
@@ -11827,8 +11776,6 @@ impl ResidualStateMachine {
         dispatch: &impl ResidualActionDispatch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
         width: usize,
     ) -> MachineStep {
         let task = if let Some(token) = self.continuation.take() {
@@ -11862,7 +11809,7 @@ impl ResidualStateMachine {
             .then(|| task.action_task(plan, &self.interner))
             .flatten();
         dispatch.run(task, action, |task| {
-            self.execute_selected_task(root, plan, task, influences, base_estimates)
+            self.execute_selected_task(root, plan, task)
         })
     }
 
@@ -11871,18 +11818,9 @@ impl ResidualStateMachine {
         &mut self,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
         width: usize,
     ) -> MachineStep {
-        self.pop_once_with_dispatch(
-            &DirectActionDispatch,
-            root,
-            plan,
-            influences,
-            base_estimates,
-            width,
-        )
+        self.pop_once_with_dispatch(&DirectActionDispatch, root, plan, width)
     }
 
     fn increase_width(&mut self) {
@@ -12205,8 +12143,6 @@ impl ResidualStateMachine {
         dispatch: &impl ResidualActionDispatch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> PullAdvance {
         loop {
             // Direct terminal publication can stage the final rows while also
@@ -12310,14 +12246,7 @@ impl ResidualStateMachine {
                 self.accept_delta_step(outcome);
                 continue;
             }
-            match self.pop_once_with_dispatch(
-                dispatch,
-                root,
-                plan,
-                influences,
-                base_estimates,
-                width,
-            ) {
+            match self.pop_once_with_dispatch(dispatch, root, plan, width) {
                 MachineStep::Stable(StepOutcome::Advanced(continuation)) => {
                     self.continuation = self.continuation_after_advanced(plan, width, continuation);
                 }
@@ -12382,8 +12311,6 @@ impl ResidualStateMachine {
         plan: &ResidualPlan,
         postprocessing: &P,
         projection_gate: &mut ProjectionGate,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> Option<R>
     where
         P: Fn(&Binding) -> Option<R>,
@@ -12454,13 +12381,7 @@ impl ResidualStateMachine {
                 // confirmed projected-result demand.
                 self.increase_width();
             }
-            match self.advance_to_emit_with_dispatch(
-                dispatch,
-                root,
-                plan,
-                influences,
-                base_estimates,
-            ) {
+            match self.advance_to_emit_with_dispatch(dispatch, root, plan) {
                 PullAdvance::EmitReady => {}
                 PullAdvance::Exhausted => {
                     self.delta.retire_unassigned_public_pull_demand();
@@ -12476,8 +12397,6 @@ impl ResidualStateMachine {
         plan: &ResidualPlan,
         postprocessing: &P,
         projection: &mut ProjectionGate,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> Option<R>
     where
         P: Fn(&Binding) -> Option<R>,
@@ -12488,8 +12407,6 @@ impl ResidualStateMachine {
             plan,
             postprocessing,
             projection,
-            influences,
-            base_estimates,
         )
     }
 
@@ -12503,8 +12420,6 @@ impl ResidualStateMachine {
         plan: &ResidualPlan,
         postprocessing: &P,
         projection: &mut ProjectionGate,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> Option<R>
     where
         P: Fn(&Binding) -> Option<R>,
@@ -12515,8 +12430,6 @@ impl ResidualStateMachine {
             plan,
             postprocessing,
             projection,
-            influences,
-            base_estimates,
         )
     }
 }
@@ -12582,8 +12495,6 @@ impl ResidualStateMachine {
         dispatch: &impl ResidualActionDispatch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> Option<Self> {
         // StateId is a machine-local family key. Once a terminal admission
         // exists, splitting would require either a shared projected-yield
@@ -12732,14 +12643,7 @@ impl ResidualStateMachine {
             if self.worklist.is_empty() {
                 return None;
             }
-            match self.pop_once_with_dispatch(
-                dispatch,
-                root,
-                plan,
-                influences,
-                base_estimates,
-                width,
-            ) {
+            match self.pop_once_with_dispatch(dispatch, root, plan, width) {
                 // Split negotiation is a saturated throughput path. It files
                 // every successor normally and deliberately does not arm the
                 // first-result continuation sprint before the frontier has
@@ -12781,16 +12685,8 @@ impl ResidualStateMachine {
         &mut self,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> Option<Self> {
-        self.split_for_parallel_with_dispatch(
-            &DirectActionDispatch,
-            root,
-            plan,
-            influences,
-            base_estimates,
-        )
+        self.split_for_parallel_with_dispatch(&DirectActionDispatch, root, plan)
     }
 
     /// Observed counterpart of [`Self::split_for_parallel`]. The affine split
@@ -12802,16 +12698,8 @@ impl ResidualStateMachine {
         epoch: &ResidualShadowEpoch,
         root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
     ) -> Option<Self> {
-        self.split_for_parallel_with_dispatch(
-            &ShadowActionDispatch { epoch },
-            root,
-            plan,
-            influences,
-            base_estimates,
-        )
+        self.split_for_parallel_with_dispatch(&ShadowActionDispatch { epoch }, root, plan)
     }
 }
 
@@ -12845,8 +12733,6 @@ pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
     plan: ResidualPlan,
     postprocessing: P,
     projection: ProjectionGate,
-    influences: [VariableSet; 128],
-    base_estimates: [usize; 128],
     state: ResidualStateMachine,
     /// Whether the serial iterator has been pulled. A started exact remainder
     /// may still be drained in parallel, but is conservatively kept as one
@@ -12867,8 +12753,6 @@ where
             plan: self.plan.clone(),
             postprocessing: self.postprocessing.clone(),
             projection: self.projection.clone(),
-            influences: self.influences,
-            base_estimates: self.base_estimates,
             state: self.state.clone(),
             iteration_started: self.iteration_started,
         }
@@ -13050,8 +12934,6 @@ where
             &self.plan,
             &self.postprocessing,
             &mut self.projection,
-            &self.influences,
-            &self.base_estimates,
         )
     }
 }
@@ -13098,8 +12980,6 @@ where
             &self.inner.plan,
             &self.inner.postprocessing,
             &mut self.inner.projection,
-            &self.inner.influences,
-            &self.inner.base_estimates,
         );
         if item.is_none() && self.lifecycle == ShadowIteratorLifecycle::Owner {
             if self.epoch.finish_exhausted() == ResidualShadowStatus::Closed {
@@ -13115,8 +12995,6 @@ fn solve<'a, P, R>(
     root: &dyn Constraint<'a>,
     postprocessing: P,
     mut projection: ProjectionGate,
-    influences: [VariableSet; 128],
-    base_estimates: [usize; 128],
     seed: Option<FrameSeedRow>,
 ) -> ResidualStateSolve<R>
 where
@@ -13178,8 +13056,6 @@ where
                     bucket,
                 },
                 full,
-                &influences,
-                &base_estimates,
                 &mut worklist,
                 &mut interner,
                 &mut stats,
@@ -13256,8 +13132,6 @@ where
             constraint,
             postprocessing,
             projection,
-            influences,
-            base_estimates,
             seed,
             ..
         } = self;
@@ -13269,8 +13143,6 @@ where
             plan,
             postprocessing,
             projection,
-            influences,
-            base_estimates,
             state,
             iteration_started: false,
         }
@@ -13295,8 +13167,6 @@ where
             constraint,
             postprocessing,
             projection,
-            influences,
-            base_estimates,
             seed,
             ..
         } = self;
@@ -13308,8 +13178,6 @@ where
             plan,
             postprocessing,
             projection,
-            influences,
-            base_estimates,
             state,
             iteration_started: false,
         }
@@ -13356,19 +13224,10 @@ where
             constraint,
             postprocessing,
             projection,
-            influences,
-            base_estimates,
             seed,
             ..
         } = self;
-        solve(
-            &constraint,
-            postprocessing,
-            projection,
-            influences,
-            base_estimates,
-            seed,
-        )
+        solve(&constraint, postprocessing, projection, seed)
     }
 }
 
@@ -13472,12 +13331,7 @@ mod parallel {
 
             let right_state = {
                 let iter = &mut *self.inner;
-                iter.state.split_for_parallel(
-                    &iter.root,
-                    &iter.plan,
-                    &iter.influences,
-                    &iter.base_estimates,
-                )
+                iter.state.split_for_parallel(&iter.root, &iter.plan)
             };
             let Some(right_state) = right_state else {
                 self.split_budget = 0;
@@ -13494,8 +13348,6 @@ mod parallel {
                 plan: self.inner.plan.clone(),
                 postprocessing: self.inner.postprocessing.clone(),
                 projection: right_projection,
-                influences: self.inner.influences,
-                base_estimates: self.inner.base_estimates,
                 state: right_state,
                 iteration_started: false,
             };
@@ -13628,13 +13480,8 @@ mod parallel {
 
             let right_state = {
                 let iter = &mut self.inner.inner;
-                iter.state.split_for_parallel_shadow(
-                    &self.inner.epoch,
-                    &iter.root,
-                    &iter.plan,
-                    &iter.influences,
-                    &iter.base_estimates,
-                )
+                iter.state
+                    .split_for_parallel_shadow(&self.inner.epoch, &iter.root, &iter.plan)
             };
             let Some(right_state) = right_state else {
                 self.split_budget = 0;
@@ -13649,8 +13496,6 @@ mod parallel {
                 plan: self.inner.inner.plan.clone(),
                 postprocessing: self.inner.inner.postprocessing.clone(),
                 projection: right_projection,
-                influences: self.inner.inner.influences,
-                base_estimates: self.inner.inner.base_estimates,
                 state: right_state,
                 iteration_started: false,
             };
@@ -18907,8 +18752,6 @@ mod tests {
             rows: vec![raw(0), raw(1)],
             row_count: 2,
         };
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [1; 128];
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
@@ -18919,8 +18762,6 @@ mod tests {
             &desc,
             rows,
             root.variables(),
-            &influences,
-            &base_estimates,
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -18956,15 +18797,6 @@ mod tests {
             row_count: 1,
         };
         let full = root.variables();
-        let influences = std::array::from_fn(|variable| root.influence(variable));
-        let mut base_estimates = [usize::MAX; 128];
-        for variable in full {
-            assert!(root.estimate(
-                variable,
-                &RowsView::EMPTY,
-                &mut EstimateSink::Scalar(&mut base_estimates[variable]),
-            ));
-        }
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
@@ -18975,8 +18807,6 @@ mod tests {
             &desc,
             rows,
             full,
-            &influences,
-            &base_estimates,
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -19195,8 +19025,6 @@ mod tests {
             bound: VariableSet::new_singleton(PARENT),
             phase: ResidualPhase::Ready,
         };
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [1; 128];
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
@@ -19210,8 +19038,6 @@ mod tests {
                 row_count: 1,
             },
             root.variables(),
-            &influences,
-            &base_estimates,
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -19225,8 +19051,6 @@ mod tests {
                 row_count: 1,
             },
             root.variables(),
-            &influences,
-            &base_estimates,
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -19413,8 +19237,6 @@ mod tests {
                 row_count: 2,
             },
             root.variables(),
-            &[VariableSet::new_empty(); 128],
-            &[1; 128],
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -19666,8 +19488,6 @@ mod tests {
             },
             RowBatch::seed(),
             root.variables(),
-            &[VariableSet::new_empty(); 128],
-            &[1; 128],
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -19865,8 +19685,6 @@ mod tests {
                 row_count: 1,
             },
             eligibility_root.variables(),
-            &[VariableSet::new_empty(); 128],
-            &[1; 128],
             &mut worklist,
             &mut interner,
             &mut eligibility_stats,
@@ -19965,8 +19783,6 @@ mod tests {
                 row_count: 1,
             },
             root.variables(),
-            &[VariableSet::new_empty(); 128],
-            &[1; 128],
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -20037,8 +19853,6 @@ mod tests {
                 row_count: 1,
             },
             root.variables(),
-            &[VariableSet::new_empty(); 128],
-            &[1; 128],
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -28361,12 +28175,7 @@ mod tests {
         machine.emit_count = 7;
 
         let right = machine
-            .split_for_parallel(
-                &root,
-                &plan,
-                &[VariableSet::new_empty(); 128],
-                &[usize::MAX; 128],
-            )
+            .split_for_parallel(&root, &plan)
             .expect("seven staged rows are splittable");
 
         assert_eq!(machine.emit_count, 4);
@@ -28384,8 +28193,6 @@ mod tests {
     fn parallel_split_drops_only_active_delta_preference() {
         let root = ShapeLeaf(0);
         let plan = ResidualPlan::compile(&root);
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [usize::MAX; 128];
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         file(
             &mut machine.worklist,
@@ -28409,7 +28216,7 @@ mod tests {
         machine.active_delta = Some(active);
 
         let right = machine
-            .split_for_parallel(&root, &plan, &influences, &base_estimates)
+            .split_for_parallel(&root, &plan)
             .expect("the two stable rows are splittable");
         assert!(machine.active_delta.is_none());
         assert!(right.active_delta.is_none());
@@ -28424,8 +28231,6 @@ mod tests {
     fn parallel_split_clears_live_continuation_without_losing_affine_rows() {
         let root = ShapeLeaf(0);
         let plan = ResidualPlan::compile(&root);
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [usize::MAX; 128];
         let expected: Vec<_> = (0..6).map(raw).collect();
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let desc = ready_desc(1);
@@ -28461,24 +28266,15 @@ mod tests {
         machine.continuation = Some(ActiveContinuation::probe_one(continuation));
 
         let mut right = machine
-            .split_for_parallel(&root, &plan, &influences, &base_estimates)
+            .split_for_parallel(&root, &plan)
             .expect("six continuation rows are splittable");
         assert!(machine.continuation.is_none());
         assert!(right.continuation.is_none());
 
         let project = |binding: &Binding| binding.get(0).copied();
         let drain = |machine: &mut ResidualStateMachine, projection: &mut ProjectionGate| {
-            std::iter::from_fn(|| {
-                machine.pull(
-                    &root,
-                    &plan,
-                    &project,
-                    projection,
-                    &influences,
-                    &base_estimates,
-                )
-            })
-            .collect::<Vec<_>>()
+            std::iter::from_fn(|| machine.pull(&root, &plan, &project, projection))
+                .collect::<Vec<_>>()
         };
         let mut left_projection = ProjectionGate::full(root.variables());
         let mut right_projection = ProjectionGate::full(root.variables());
@@ -29740,11 +29536,9 @@ mod tests {
         let mut machine =
             ResidualStateMachine::new(root.variables(), plan.len(), Some(FrameSeedRow::empty()));
         machine.cap = 1;
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [1; 128];
 
         assert!(matches!(
-            machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
+            machine.pop_once(&root, &plan, 1),
             MachineStep::Stable(StepOutcome::Advanced(_))
         ));
         assert_eq!(machine.stats.ready_plan_pops, 1);
@@ -29755,7 +29549,7 @@ mod tests {
         assert_eq!(proposes.load(Ordering::Relaxed), 0);
 
         assert!(matches!(
-            machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
+            machine.pop_once(&root, &plan, 1),
             MachineStep::Stable(StepOutcome::Advanced(_))
         ));
         assert_eq!(machine.stats.propose_action_pops, 1);
@@ -29981,8 +29775,6 @@ mod tests {
             &propose_desc,
             StateBucket::Rows(RowBatch::seed()),
             root.variables(),
-            &[VariableSet::new_empty(); 128],
-            &[1; 128],
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -30030,8 +29822,6 @@ mod tests {
                 row_count: 2,
             }),
             root.variables(),
-            &[VariableSet::new_empty(); 128],
-            &[1; 128],
             &mut worklist,
             &mut interner,
             &mut stats,
@@ -30109,8 +29899,6 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [1; 128];
 
         assert!(matches!(
             execute_state(
@@ -30119,8 +29907,6 @@ mod tests {
                 &candidate_desc,
                 candidate_bucket,
                 root.variables(),
-                &influences,
-                &base_estimates,
                 &mut worklist,
                 &mut interner,
                 &mut stats,
@@ -30146,8 +29932,6 @@ mod tests {
                 &action_desc,
                 bucket,
                 root.variables(),
-                &influences,
-                &base_estimates,
                 &mut worklist,
                 &mut interner,
                 &mut stats,
@@ -30188,8 +29972,6 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [1; 128];
 
         assert!(matches!(
             execute_state(
@@ -30198,8 +29980,6 @@ mod tests {
                 &desc,
                 bucket,
                 root.variables(),
-                &influences,
-                &base_estimates,
                 &mut worklist,
                 &mut interner,
                 &mut stats,
@@ -30268,8 +30048,6 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [1; 128];
 
         assert!(matches!(
             execute_state(
@@ -30278,8 +30056,6 @@ mod tests {
                 &candidate_desc,
                 candidate_bucket,
                 root.variables(),
-                &influences,
-                &base_estimates,
                 &mut worklist,
                 &mut interner,
                 &mut stats,
@@ -30299,8 +30075,6 @@ mod tests {
                 &action_desc,
                 bucket,
                 root.variables(),
-                &influences,
-                &base_estimates,
                 &mut worklist,
                 &mut interner,
                 &mut stats,
@@ -30376,8 +30150,6 @@ mod tests {
         let mut worklist = Worklist::new();
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [1; 128];
 
         for first_parent in [0, 2] {
             assert!(matches!(
@@ -30387,8 +30159,6 @@ mod tests {
                     &desc,
                     chunk(first_parent),
                     root.variables(),
-                    &influences,
-                    &base_estimates,
                     &mut worklist,
                     &mut interner,
                     &mut stats,
@@ -30419,8 +30189,6 @@ mod tests {
                     &action_desc,
                     bucket,
                     root.variables(),
-                    &influences,
-                    &base_estimates,
                     &mut worklist,
                     &mut interner,
                     &mut stats,

@@ -63,10 +63,10 @@ interest. Selectors power history traversals such as `parents`,
 `nth_ancestors`, ranges like `a..b`, and helpers such as `history_of(entity)`.
 
 ### Constraint
-The trait that every query operator implements. Its six ordinary execution
-methods—`variables`, `estimate`, `propose`, `confirm`, `satisfied`, and
-`influence`—let the Atreides join engine navigate the search space without a
-separate planner. Every occurrence denotes one fixed raw-inline SET relation,
+The trait that every query operator implements. Its five operational
+methods—`variables`, `estimate`, `propose`, `confirm`, and `satisfied`—plus the
+static `influence` dependency hint let the Atreides solver navigate the search
+space without a separate planner. Every occurrence denotes one fixed raw-inline SET relation,
 shared by its ordinary, paged, typed-Program, and complete-equivalent routes.
 `proposal_coverage` identifies sound proposal sources; `ProposalLayout` is only
 a physical uniqueness receipt for a completed `propose_with_layout` call.

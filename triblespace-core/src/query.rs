@@ -1276,9 +1276,9 @@ pub trait ConstraintChildren<'a> {
 /// | [`confirm`](Constraint::confirm) | Filters candidates proposed by another constraint. | On all remaining constraints. |
 /// | [`satisfied`](Constraint::satisfied) | Checks whether fully-bound sub-constraints still hold. | Inside composite constraints. |
 ///
-/// [`influence`](Constraint::influence) completes the picture by telling
-/// the engine which estimates to refresh when a variable is bound or
-/// unbound.
+/// [`influence`](Constraint::influence) supplies a static structural
+/// dependency hint. Its cardinality breaks ties between variable estimates in
+/// the same power-of-two magnitude bucket.
 ///
 /// [`proposal_coverage`](Constraint::proposal_coverage) is the structural
 /// source-eligibility receipt. A Covering source is confirmed before its
@@ -1376,16 +1376,16 @@ pub trait ConstraintChildren<'a> {
 /// [`confirm_per_row`] adapter. Override
 /// [`satisfied`](Constraint::satisfied) when the constraint can detect
 /// unsatisfiability early (e.g. a fully-bound triple lookup that found no
-/// match). Override [`influence`](Constraint::influence) when binding one
-/// variable changes the estimates for a non-obvious set of others. Every
-/// occurrence used as a source must publish an appropriate
+/// match). Override [`influence`](Constraint::influence) when the constraint's
+/// structural estimate dependencies are narrower or less obvious than its
+/// complete variable set. Every occurrence used as a source must publish an appropriate
 /// [`proposal_coverage`](Constraint::proposal_coverage) receipt.
 pub trait Constraint<'a> {
     /// Returns the set of variables this constraint touches.
     ///
-    /// Called once at query start. The engine uses this to build influence
-    /// graphs and to determine which constraints participate when a
-    /// particular variable is being bound.
+    /// Called once at query start. The engine uses this to determine which
+    /// constraints participate when a particular variable is being bound and
+    /// which static dependency counts guide equal-magnitude choices.
     fn variables(&self) -> VariableSet;
 
     /// Returns the proposal proof for `variable` under bound schema `bound`.
@@ -1572,6 +1572,10 @@ pub trait Constraint<'a> {
     /// Returns the set of variables whose estimates may change when
     /// `variable` is bound or unbound.
     ///
+    /// The residual solver recomputes current estimates at every Ready state;
+    /// it uses this static set's cardinality only as an equal-magnitude
+    /// variable-choice tiebreak.
+    ///
     /// The default includes every variable this constraint touches except
     /// `variable` itself. Returns an empty set when `variable` is not part
     /// of this constraint.
@@ -1671,24 +1675,6 @@ pub trait Constraint<'a> {
     ) -> ProposalCoverage {
         self.proposal_coverage(variable, bound)
     }
-}
-
-/// Coverage-based source quote for one single-row view.
-fn source_quote_single_row<'a, C: Constraint<'a> + ?Sized>(
-    constraint: &C,
-    variable: VariableId,
-    bound: VariableSet,
-    view: &RowsView<'_>,
-) -> Option<(ProposalCoverage, usize)> {
-    let coverage = constraint.proposal_coverage(variable, bound);
-    if coverage == ProposalCoverage::None {
-        return None;
-    }
-    debug_assert!(constraint.variables().is_set(variable));
-
-    let mut estimate = usize::MAX;
-    constraint.estimate(variable, view, &mut EstimateSink::Scalar(&mut estimate));
-    Some((coverage, estimate))
 }
 
 /// Stable diagnostic for a frontier that cannot enumerate any remaining
@@ -1942,11 +1928,6 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// call, giving freshness the simple exact meaning "the iterator has never
     /// been pulled."
     iteration_started: bool,
-    influences: [VariableSet; 128],
-    /// PROBE (order-key experiment): each variable's estimate against the
-    /// **empty** binding, frozen at [`Query::new`] — the static baseline
-    /// the `ratio_first` / `influenced_only` keys compare against.
-    base_estimates: [usize; 128],
     /// Lazily initialized canonical residual-state cursor. The box owns only
     /// a borrow-free lowering plan plus raw machine state; `constraint` and
     /// `postprocessing` remain owned by this `Query`.
@@ -1971,8 +1952,6 @@ where
             projection: self.projection.clone(),
             seed: self.seed.clone(),
             iteration_started: self.iteration_started,
-            influences: self.influences,
-            base_estimates: self.base_estimates,
             residual: self.residual.clone(),
         }
     }
@@ -2030,32 +2009,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         variables: VariableSet,
         projection: ProjectionGate,
     ) -> Self {
-        let influences = std::array::from_fn(|v| {
-            if variables.is_set(v) {
-                constraint.influence(v)
-            } else {
-                VariableSet::new_empty()
-            }
-        });
-        let mut has_initial_source = false;
-        let estimates = std::array::from_fn(|v| {
-            if variables.is_set(v) {
-                let quote = source_quote_single_row(
-                    &constraint,
-                    v,
-                    VariableSet::new_empty(),
-                    &RowsView::EMPTY,
-                );
-                has_initial_source |= quote.is_some();
-                quote.map_or(usize::MAX, |(_, estimate)| estimate)
-            } else {
-                usize::MAX
-            }
-        });
-        // These estimates are the empty-binding baseline used by later
-        // adaptive variable choices.
-        let base_estimates = estimates;
-
         // Constraints whose variables are all constant [`Term`]s (e.g. a
         // fully-constant `pattern!` used as an existence check) have an
         // empty variable set, so the propose/confirm search never consults
@@ -2070,6 +2023,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let seed = residual::seed_survives(&constraint, VariableSet::new_empty(), &RowsView::EMPTY)
             .then(residual::FrameSeedRow::empty);
         if seed.is_some() && !variables.is_empty() {
+            let has_initial_source = variables.into_iter().any(|variable| {
+                constraint.proposal_coverage(variable, VariableSet::new_empty())
+                    >= ProposalCoverage::Covering
+            });
             assert!(has_initial_source, "{SOURCE_FRONTIER_ERROR}");
         }
         Query {
@@ -2078,120 +2035,29 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             projection,
             seed,
             iteration_started: false,
-            influences,
-            base_estimates,
             residual: None,
-        }
-    }
-}
-
-/// PROBE (order-key experiment): which variable-order key the engine
-/// uses. Selected by `TRIBLES_ORDER_KEY`, read once per process.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OrderKeyMode {
-    /// `(inverted log2-magnitude, influence-count)` — smallest estimate
-    /// first, influence as tiebreak. The shipped engine key.
-    Default,
-    /// `(influence-count, inverted log2-magnitude)` — highest influence
-    /// first. Measured 2026-07-09: loses decisively (blind to *being*
-    /// constrained; binds hubs before neighbors shrink them).
-    InfluenceFirst,
-    /// Most-constrained-*relative-to-its-domain* first: primary key is the
-    /// drop `estimate(v, ∅) / estimate(v, binding)` (descending, i.e. the
-    /// ratio `estimate/unconstrained` ascending), current magnitude as
-    /// tiebreak. Targets the "estimate DROP not estimate SIZE" signal: a
-    /// var that is small *because the binding constrained it* (?e:
-    /// 2.9M→14.7k) outranks a var that is small unconditionally (?g: 13).
-    RatioFirst,
-    /// Default `(magnitude, influence)` key, but the candidate set is
-    /// restricted to variables whose estimate has actually dropped below
-    /// its unconstrained (empty-binding) value — i.e. vars the bound set
-    /// demonstrably constrains — falling back to the full unbound set when
-    /// none qualifies (first pick, disconnected components). The cheap
-    /// approximation of "don't bind a second small var that shares no
-    /// constraint with the bound set".
-    InfluencedOnly,
-}
-
-/// PROBE (order-key experiment): the active [`OrderKeyMode`].
-/// `TRIBLES_ORDER_KEY` ∈ {`influence_first`, `ratio_first`,
-/// `influenced_only`}; anything else (or unset) is [`OrderKeyMode::Default`].
-pub fn order_key_mode() -> OrderKeyMode {
-    static MODE: std::sync::OnceLock<OrderKeyMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("TRIBLES_ORDER_KEY").as_deref() {
-        Ok("influence_first") => OrderKeyMode::InfluenceFirst,
-        Ok("ratio_first") => OrderKeyMode::RatioFirst,
-        Ok("influenced_only") => OrderKeyMode::InfluencedOnly,
-        _ => OrderKeyMode::Default,
-    })
-}
-
-/// The engine's variable-order key. **Larger key = picked next**: every
-/// site either takes `max_by_key` over the unbound set or pops the tail
-/// of a key-ascending sort.
-///
-/// `base_estimate` is the variable's estimate against the **empty**
-/// binding, computed once at [`Query::new`] (they are static — the
-/// constraint tree doesn't change during a solve) and threaded to every
-/// key site.
-///
-/// Per-mode keys (lexicographic triples):
-/// - [`Default`](OrderKeyMode::Default): `(inv_mag, influence, 0)` —
-///   identical ordering to the old inline `(Reverse(ilog2+1), influence)`
-///   tuples.
-/// - [`InfluenceFirst`](OrderKeyMode::InfluenceFirst): `(influence,
-///   inv_mag, 0)`.
-/// - [`RatioFirst`](OrderKeyMode::RatioFirst): `(drop, inv_mag,
-///   influence)` where `drop = mag(base) − mag(estimate)` (saturating).
-///   Rationale: the spec key is the raw ratio `estimate/base` ascending;
-///   in the engine's ilog2-bucket style `⌊log2(base/estimate)⌋ = mag(base)
-///   − mag(estimate)`, so the magnitude *difference* IS the log-bucketed
-///   ratio — no division, so `estimate = 0` (mag 0, maximal drop) and
-///   `base = 0` need no special-casing, and buckets stay consistent with
-///   the default key's granularity. Tiebreak: current magnitude ascending
-///   (per spec), then influence for determinism.
-/// - [`InfluencedOnly`](OrderKeyMode::InfluencedOnly): `(dropped, inv_mag,
-///   influence)` where `dropped = (estimate < base_estimate)`. The
-///   candidate-set restriction is implemented *as* the lexicographic key:
-///   any dropped var beats every undropped var, ties broken by the exact
-///   default key — and when **no** var has dropped (first pick,
-///   disconnected components) all primaries are 0 and the key degenerates
-///   to precisely the default key, which is the required fallback.
-#[inline]
-fn variable_order_key(
-    estimate: usize,
-    base_estimate: usize,
-    influence_count: usize,
-) -> (u64, u64, u64) {
-    let magnitude = estimate_magnitude(estimate);
-    let inv_magnitude = u64::MAX - magnitude;
-    let influence = influence_count as u64;
-    match order_key_mode() {
-        OrderKeyMode::Default => (inv_magnitude, influence, 0),
-        OrderKeyMode::InfluenceFirst => (influence, inv_magnitude, 0),
-        OrderKeyMode::RatioFirst => {
-            let base_magnitude = estimate_magnitude(base_estimate);
-            let drop = base_magnitude.saturating_sub(magnitude);
-            (drop, inv_magnitude, influence)
-        }
-        OrderKeyMode::InfluencedOnly => {
-            let dropped = (estimate < base_estimate) as u64;
-            (dropped, inv_magnitude, influence)
         }
     }
 }
 
 /// Total ordering for a row's adaptive variable action. Lower variable IDs win
 /// exact ordering-key ties without relying on unstable-sort tie behavior.
+///
+/// Smaller candidate-count magnitudes win. Within one power-of-two magnitude
+/// bucket, a variable that can affect more other variables wins; this preserves
+/// the established specificity-first policy without making insignificant
+/// count differences override structural pruning. **Larger key = picked next.**
 #[inline]
 fn variable_choice_key(
     variable: VariableId,
     estimate: usize,
-    base_estimate: usize,
-    influence_count: usize,
-) -> (u64, u64, u64, std::cmp::Reverse<VariableId>) {
-    let (first, second, third) = variable_order_key(estimate, base_estimate, influence_count);
-    (first, second, third, std::cmp::Reverse(variable))
+    influence_count: u8,
+) -> (u64, u8, std::cmp::Reverse<VariableId>) {
+    (
+        u64::MAX - estimate_magnitude(estimate),
+        influence_count,
+        std::cmp::Reverse(variable),
+    )
 }
 
 #[inline]
@@ -2260,13 +2126,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
         self.residual
             .as_mut()
             .expect("residual cursor was initialized")
-            .pull(
-                &self.constraint,
-                &self.postprocessing,
-                &mut self.projection,
-                &self.influences,
-                &self.base_estimates,
-            )
+            .pull(&self.constraint, &self.postprocessing, &mut self.projection)
     }
 }
 
@@ -2617,6 +2477,19 @@ mod tests {
             variables.set(variable);
         }
         variables
+    }
+
+    #[test]
+    fn fixed_variable_choice_key_preserves_magnitude_boundaries_and_ties() {
+        // Cardinality magnitude dominates every tiebreak, including the
+        // special zero-to-one and one-to-two boundaries.
+        assert!(variable_choice_key(2, 0, 0) > variable_choice_key(1, 1, u8::MAX));
+        assert!(variable_choice_key(2, 1, 0) > variable_choice_key(1, 2, u8::MAX));
+
+        // Counts within one power-of-two bucket compare by structural
+        // influence, then deterministically by lower VariableId.
+        assert!(variable_choice_key(2, 3, 4) > variable_choice_key(1, 2, 3));
+        assert!(variable_choice_key(1, 3, 4) > variable_choice_key(2, 2, 4));
     }
 
     fn action_peer(
