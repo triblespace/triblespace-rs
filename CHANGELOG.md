@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Engine-owned finite reducers now use an uninhabited novelty-key type, making
+  recurrent root and child construction impossible through their safe typed
+  effect sinks.
 - **Breaking: typed Programs now erase exactly one semantic family and execute
   one native step.** The never-used `PreferredProgram` left-biased
   composition, route-arm addresses, generic physical-step negotiation,
