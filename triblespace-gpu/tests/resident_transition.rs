@@ -680,7 +680,7 @@ fn budgeted_width_one_receipts_are_exact_for_every_two_bound_rotation() {
                 Some(cursor) => {
                     observed_cursor = true;
                     assert!(full.len() > 1);
-                    assert_eq!(cursor.into_typed_conversion_offset(), 1);
+                    assert_eq!(cursor.into_resume_offset(), 1);
                 }
                 None => assert!(full.len() <= 1),
             }
@@ -795,10 +795,7 @@ fn budgeted_transition_yields_stable_prefixes_and_lawful_receipts() {
             Some(cursor) => {
                 assert!(full > limit, "a cursor requires a clamped interval");
                 observed_clamped += 1;
-                assert_eq!(
-                    cursor.into_typed_conversion_offset() as usize,
-                    expected_examined
-                );
+                assert_eq!(cursor.into_resume_offset() as usize, expected_examined);
             }
             None => assert!(full <= limit, "an exhausted interval carries no cursor"),
         }

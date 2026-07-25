@@ -73,7 +73,3 @@ required-features = ["wgpu"]
 [[test]]
 name = "query_program_value_page"
 required-features = ["wgpu"]
-
-[[test]]
-name = "value_route_entry"
-required-features = ["wgpu"]

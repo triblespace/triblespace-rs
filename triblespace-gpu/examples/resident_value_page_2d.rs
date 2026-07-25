@@ -109,7 +109,7 @@ fn assert_page_parity(
         );
         let gpu_next = gpu_receipt
             .physical_cursor
-            .map(|cursor| cursor.into_typed_conversion_offset() as usize);
+            .map(|cursor| cursor.into_resume_offset() as usize);
         assert_eq!(
             gpu_next,
             cpu_receipt.next_offset(),

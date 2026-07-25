@@ -223,74 +223,25 @@ backend still uploads a newly materialized `u32` rotation and reads the packed
 planes back; merely selecting the fork does not make that transient path
 zero-copy.
 
-### Typed Program family and budgeted routing
+### Direct budgeted resident transitions
 
-`typed_program::SuccinctProgramFamily` implements the engine's typed Program
-contract over a compiled `QueryProgram`: the Native step is the exact CPU
-interpreter paginated by the scheduler's per-input grants, and
-`try_step_physical` offers admitted cohorts to the resident two-bound kernel
-through the budgeted dispatch contract (`budgeted`). Grants adopt the
-scheduler's `task_limits` verbatim, receipts come back validated and branded
+`QueryProgram` supplies the canonical CPU pager for one Succinct pattern.
+`WgpuQueryProgram` admits the same pattern and resident snapshot, then exposes
+the corresponding kernels directly through `transition_on`,
+`transition_on_with_capacity`, `transition_on_budgeted`, and
+`transition_on_budgeted_from`. This crate does not install a second finite
+Program or a hidden placement policy into the ordinary constraint engine;
+the caller decides when a cohort is concentrated enough to justify resident
+execution.
+
+Budgeted calls clamp each parent's candidate interval independently. Grants
+cannot move between parents, receipts return in input order and are branded
 with the resident `ArchiveIdentity`, and a clamped input's `PhysicalCursor`
-becomes canonical typed state only through
-`into_typed_conversion_offset`.
-
-Routing is **off by default**: `BackendAdmissionPolicy::disabled()` never
-routes, so attaching a device is a zero-behavior-change no-op. Routing
-activates only explicitly — `with_admission(BackendAdmissionPolicy::
-route_from(n))` in code, or the `TRIBLESPACE_GPU_PROGRAM_ROUTING` environment
-variable (unset/`0`/unparsable = disabled; a positive integer = the minimum
-cohort row count that may route), read once at family construction. Admission
-is decided post-cohort-formation from cohort size, kernel capability, and the
-hard law that ready/latency-priority work never waits for an accelerator; the
-exercised kernel covers schema-uniform two-bound cohorts, and every decline
-or recoverable device failure falls back to the exact Native step with the
-batch intact. Resumed states ride the offset-aware kernel form
-(`transition_on_budgeted_from`): per-input resume bases upload with the
-grants, candidate positions shift to `range_start + base + local`, and a
-clamped input's cursor returns the absolute `base + examined`, so successive
-budgeted pages concatenate into the exact unbudgeted transition on either
-executor.
-
-### Public resident two-bound route
-
-`WgpuSuccinctArchive::two_bound_route` and `two_bound_route_with` are the first
-real `find!`/`pattern!` entry into that substrate. The returned pattern carrier
-delegates the ordinary constraint protocol unchanged and lowers exactly three
-typed Propose actions when the other two axes are bound or constant:
-`(A,V) -> E`, `(E,V) -> A`, and `(E,A) -> V`. One descriptor shared by the
-Native and physical paths selects the peer order, fanout rotation, navigation
-Ring, and output Ring. Canonical state stores that descriptor, both peer codes,
-the checked interval length, and consumed offset; both executors independently
-re-derive the interval position and must agree exactly on examined rows,
-produced rows, absolute continuation, order, and multiplicity.
-
-Placement is `TwoBoundRouteAdmission::Off` by default and does not construct
-the resident Program arm. `Force` exists for parity and acceptance probes on
-all three targets. `WarmM4` is an explicitly experimental, prewarmed-machine
-calibration using `exact_page_work + 8 * parent_rows >= 98_304` for `(E,A) -> V`
-only; entity and attribute targets decline Native until separately measured.
-
-`WgpuSuccinctArchive::prepare_value_route` is the explicit snapshot-local
-preparation seam. On a nonempty snapshot it selects one real `(E,A)` pair and
-synchronously executes one parent with grant one through the same resident
-kernel, lease, exact receipt validation, decoding, and accounting as a public
-Force route. Before committing `ValueRouteReadiness::Prepared`, it also checks
-the complete result against the canonical Native pager while the lease remains
-held; the answer itself is discarded. Errors and panics default the snapshot
-to `Failed`, repeated success returns `AlreadyPrepared`, and an empty snapshot
-returns `EmptySnapshot` while remaining `Cold`.
-
-The `TRIBLESPACE_GPU_TWO_BOUND_ROUTE=auto` spelling is deliberately rejected:
-explicit preparation proves this snapshot's exact path, and its lease can
-decline busy or poisoned work without waiting, but neither can prove that
-unrelated snapshots, rank batches, or wavelet freezes are absent from the
-shared device service. Until a device-wide cooperative submission gate exists,
-automatic placement would still make a latency claim the runtime cannot uphold.
-
-The public parallel entry uses the same fixed production plan as serial
-queries: native AND flattening, finite Union-leaf continuations, and
-the typed Program route returned for each action.
+yields an absolute `into_resume_offset`. Passing those offsets back to
+`transition_on_budgeted_from` makes successive morsels concatenate into the
+exact unbudgeted transition. Count mismatches, zero grants, cross-snapshot
+receipts, invalid resume bases, and insufficient output capacity all fail
+closed rather than exposing a truncated frontier.
 
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:

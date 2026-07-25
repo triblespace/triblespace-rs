@@ -146,8 +146,8 @@ where
     /// The resident snapshot every buffer and code in this executor is
     /// meaningful against. The compiled [`QueryProgram`] is *not* borrowed:
     /// its tiny admitted metadata (variable count and the single pattern) is
-    /// copied at construction so an owning scheduler can
-    /// hold the program and this executor side by side.
+    /// copied at construction so a caller can hold the canonical program and
+    /// this executor side by side.
     resident: &'archive WgpuSuccinctArchive<U>,
     variable_count: usize,
     pattern: ProgramPattern,
@@ -283,8 +283,8 @@ where
 
     /// Executes the admitted transition with an explicit child-row capacity.
     ///
-    /// This is primarily useful to let a resident scheduler reuse a bounded
-    /// allocation and to regression-test fail-closed overflow. Insufficient
+    /// This is primarily useful to let a caller reuse a bounded allocation
+    /// and to regression-test fail-closed overflow. Insufficient
     /// capacity is reported after the same sole final readback; no child row is
     /// truncated or exposed.
     pub fn transition_on_with_capacity(
@@ -300,18 +300,15 @@ where
 
     /// Executes the admitted transition under exact per-input work grants.
     ///
-    /// This is the first budgeted-prefix example of the phase-3 dispatch
-    /// contract: `grants` arrives verbatim from the scheduler's
-    /// `task_limits`, every parent's candidate interval is clamped
-    /// element-wise against its own grant on the device, and the packed child
-    /// frontier is the stable prefix the receipt law demands. Output capacity
-    /// is bounded by `sum(limits)` instead of the global fanout envelope.
+    /// Every parent's candidate interval is clamped element-wise against its
+    /// own grant on the device, and the packed child frontier is the stable
+    /// prefix the receipt law demands. Output capacity is bounded by
+    /// `sum(limits)` instead of the global fanout envelope.
     ///
     /// One receipt per input returns in input order; a clamped input carries
-    /// a [`PhysicalCursor`] whose only legal consumer is the owning Program's
-    /// `TypedProgramSpec` conversion into canonical typed state. Grant-shape
-    /// violations (count mismatch, zero grants) fail closed before any
-    /// kernel launch.
+    /// a [`PhysicalCursor`] that can resume the same physical interval later.
+    /// Grant-shape violations (count mismatch, zero grants) fail closed before
+    /// any kernel launch.
     pub fn transition_on_budgeted(
         &self,
         variable: ProgramVariable,

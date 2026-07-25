@@ -20,10 +20,6 @@ mod resident_round;
 mod resident_support;
 #[cfg(feature = "wgpu")]
 mod succinct_query;
-#[cfg(feature = "wgpu")]
-pub mod typed_program;
-#[cfg(feature = "wgpu")]
-pub mod value_route;
 
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 pub use cubecl_backend::CubeClWaveletFreeze;
@@ -43,17 +39,8 @@ pub use resident_round::{
 pub use resident_support::{ResidentSupportError, WgpuResidentFrontier, WgpuResidentRound};
 #[cfg(feature = "wgpu")]
 pub use succinct_query::{
-    ArchiveIdentity, DeviceLease, DeviceLeaseGuard, ObservedWgpuSuccinctArchive, ResidencyReceipt,
-    WgpuBitVector, WgpuContext, WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix,
-    DEFAULT_MIN_RANK_BATCH,
-};
-#[cfg(feature = "wgpu")]
-pub use value_route::{
-    PrepareValueRouteError, PrepareValueRouteOutcome, ResidentTwoBoundConstraint,
-    ResidentTwoBoundRoute, SuccinctTwoBoundFamily, SuccinctTwoBoundState, TwoBoundRouteAdmission,
-    TwoBoundRouteConfigError, TwoBoundRouteCounters, TwoBoundRouteCountersSnapshot,
-    ValueRouteReadiness, TWO_BOUND_ATTRIBUTE_ROUTE_OP, TWO_BOUND_ENTITY_ROUTE_OP,
-    TWO_BOUND_ROUTE_ENV, TWO_BOUND_VALUE_ROUTE_OP, WARM_M4_ELIGIBLE_SCORE, WARM_M4_ROW_WORK,
+    ArchiveIdentity, ObservedWgpuSuccinctArchive, ResidencyReceipt, WgpuBitVector, WgpuContext,
+    WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix, DEFAULT_MIN_RANK_BATCH,
 };
 
 #[cfg(any(test, feature = "wgpu", feature = "cuda"))]

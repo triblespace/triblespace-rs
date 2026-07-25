@@ -183,18 +183,6 @@ pub(crate) enum ProgramAxis {
     Value,
 }
 
-impl ProgramAxis {
-    pub(crate) const ALL: [Self; 3] = [Self::Entity, Self::Attribute, Self::Value];
-
-    pub(crate) const fn index(self) -> usize {
-        match self {
-            Self::Entity => 0,
-            Self::Attribute => 1,
-            Self::Value => 2,
-        }
-    }
-}
-
 /// The canonical physical Ring orientation for one two-bound proposal.
 ///
 /// A host action chooses only `target`. The remaining two axes have one
@@ -870,7 +858,8 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
     ///
     /// `offsets[i]` and `limits[i]` apply only to parent row `i`; work is never
     /// pooled between inputs. A positive limit is required even for an already
-    /// exhausted interval, matching the scheduler/physical grant law. Child
+    /// exhausted interval, keeping "no cursor" unambiguous between exhausted
+    /// and unexamined. Child
     /// rows are the stable interval slice for each input, concatenated in input
     /// order. Seeking is direct rank/select navigation plus an ordinal shift,
     /// so the method is O(parent rows + produced page rows), independent of
@@ -1358,34 +1347,6 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
                     .collect()
             }
         }
-    }
-
-    /// The exact canonical output interval owned by one resolved physical pair.
-    ///
-    /// This is a pure archive-local function of the descriptor and two codes —
-    /// two `select1`s and two ranks — so a typed Program family may derive and
-    /// validate its canonical interval at seed time. The resident two-bound
-    /// route stores the checked length for O(1) progress and exact-work
-    /// admission, while each executor independently re-derives the position
-    /// before paging. A pair without occurrences yields an empty interval.
-    pub(crate) fn fixed_two_bound_interval(
-        &self,
-        rotation: TwoBoundRotation,
-        first: ArchiveCode,
-        last: ArchiveCode,
-    ) -> Result<Range<usize>, QueryProgramError> {
-        for code in [first, last] {
-            if code.index() >= self.archive.domain.len() {
-                return Err(QueryProgramError::CodeOutOfBounds(code));
-            }
-        }
-        let first_range = base_range_code(axis_prefix(self.archive, rotation.first), first);
-        Ok(restrict_range_code(
-            axis_prefix(self.archive, rotation.last),
-            self.archive.ring_col(rotation.navigation),
-            last,
-            &first_range,
-        ))
     }
 
     fn fixed_two_bound_range(
