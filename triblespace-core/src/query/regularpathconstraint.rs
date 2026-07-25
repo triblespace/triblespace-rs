@@ -387,14 +387,8 @@ impl ChainFrameReducer for ExistsEq {
 
 #[cfg(test)]
 std::thread_local! {
-    static SEEDED_CHAIN_FRAME_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BULK_TRANSITION_COHORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAGEABLE_TRANSITION_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn take_seeded_chain_frame_runs() -> usize {
-    SEEDED_CHAIN_FRAME_RUNS.with(|runs| runs.replace(0))
 }
 
 #[cfg(test)]
@@ -412,9 +406,6 @@ where
     C: Constraint<'static> + 'static,
     R: ChainFrameReducer,
 {
-    #[cfg(test)]
-    SEEDED_CHAIN_FRAME_RUNS.with(|runs| runs.set(runs.get() + 1));
-
     let mut frame = SeededResidualFrame::new(root, seed);
     while let Some(binding) = frame.next_binding() {
         if !reducer.observe(&binding) {
@@ -1287,12 +1278,13 @@ pub struct RegularPathConstraint {
     inverse_estimate: Box<[BoundEstimateAtom]>,
     nullable: bool,
     inverse_nullable: bool,
+    repeated: bool,
     /// Thompson-style transition programs for the forward and inverse
     /// expressions. Epsilon closure is compiled into each state's accepting bit
     /// and labeled frontier, so runtime residual nodes need only
-    /// `(term, program counter)`. Finite programs terminate after their acyclic
-    /// frontier drains; repeated programs use the same representation as a
-    /// least fixpoint.
+    /// `(term, program counter)`. Only repeated expressions expose these
+    /// programs to the residual Machine; finite expressions use the ordinary
+    /// constraint actions.
     delta_program: DeltaProgram,
     inverse_delta_program: DeltaProgram,
     set: TribleSet,
@@ -1346,7 +1338,6 @@ struct DeltaProgram {
     start: u32,
     accepting: Vec<bool>,
     steps: Vec<Vec<(DeltaStep, u32)>>,
-    finite_depth: Option<Box<[u32]>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1399,27 +1390,17 @@ enum RpqStateKind {
     Source {
         variable: VariableId,
         cursor: RpqSourceCursor,
-        roots: bool,
     },
     Transition {
         variable: VariableId,
         node: RpqNode,
         cursor: RpqExpandCursor,
     },
-    CandidateFilter {
-        variable: VariableId,
-        offset: usize,
-    },
-    Support,
 }
 
 impl RpqState {
-    fn source(variable: VariableId, cursor: RpqSourceCursor, roots: bool) -> Self {
-        Self(RpqStateKind::Source {
-            variable,
-            cursor,
-            roots,
-        })
+    fn source(variable: VariableId, cursor: RpqSourceCursor) -> Self {
+        Self(RpqStateKind::Source { variable, cursor })
     }
 
     fn transition(variable: VariableId, node: RpqNode, cursor: RpqExpandCursor) -> Self {
@@ -1428,14 +1409,6 @@ impl RpqState {
             node,
             cursor,
         })
-    }
-
-    fn candidate_filter(variable: VariableId, offset: usize) -> Self {
-        Self(RpqStateKind::CandidateFilter { variable, offset })
-    }
-
-    fn support() -> Self {
-        Self(RpqStateKind::Support)
     }
 
     fn kind(&self) -> &RpqStateKind {
@@ -1458,19 +1431,12 @@ pub struct RpqNoveltyKey {
 const RPQ_BOUND_FORWARD: ProgramKey = ProgramKey::new(0);
 const RPQ_BOUND_INVERSE: ProgramKey = ProgramKey::new(1);
 const RPQ_SAME_VARIABLE: ProgramKey = ProgramKey::new(2);
-const RPQ_FIRST_FORWARD: ProgramKey = ProgramKey::new(3);
-const RPQ_FIRST_INVERSE: ProgramKey = ProgramKey::new(4);
-const RPQ_CONFIRM_FIRST_FORWARD: ProgramKey = ProgramKey::new(5);
-const RPQ_CONFIRM_FIRST_INVERSE: ProgramKey = ProgramKey::new(6);
-const RPQ_SUPPORT_TRUE: ProgramKey = ProgramKey::new(7);
 
 const RPQ_SOURCE_START: DispatchClass = DispatchClass::new(0);
 const RPQ_SOURCE_AFTER: DispatchClass = DispatchClass::new(1);
 const RPQ_TRANSITION_START: DispatchClass = DispatchClass::new(2);
 const RPQ_TRANSITION_AFTER: DispatchClass = DispatchClass::new(3);
-const RPQ_CANDIDATE_FILTER: DispatchClass = DispatchClass::new(4);
-const RPQ_SUPPORT: DispatchClass = DispatchClass::new(5);
-const RPQ_SOURCE_OFFSET: DispatchClass = DispatchClass::new(6);
+const RPQ_SOURCE_OFFSET: DispatchClass = DispatchClass::new(4);
 
 enum RpqRoute<'p> {
     BoundEndpoint {
@@ -1561,44 +1527,7 @@ impl DeltaProgram {
             start: classes[self.start as usize],
             accepting,
             steps,
-            finite_depth: None,
         }
-    }
-
-    /// Longest-path rank for an acyclic epsilon-eliminated program.
-    /// Recurrent programs return `None`; their product edges require novelty.
-    fn acyclic_depths(&self) -> Option<Box<[u32]>> {
-        fn visit(
-            state: usize,
-            steps: &[Vec<(DeltaStep, u32)>],
-            marks: &mut [u8],
-            depths: &mut [u32],
-        ) -> Option<u32> {
-            match marks[state] {
-                1 => return None,
-                2 => return Some(depths[state]),
-                _ => {}
-            }
-            marks[state] = 1;
-            let mut depth = 0u32;
-            for &(_, target) in &steps[state] {
-                depth = depth.max(
-                    visit(target as usize, steps, marks, depths)?
-                        .checked_add(1)
-                        .expect("RPQ finite program depth exhausted"),
-                );
-            }
-            marks[state] = 2;
-            depths[state] = depth;
-            Some(depth)
-        }
-
-        let mut marks = vec![0u8; self.steps.len()];
-        let mut depths = vec![0u32; self.steps.len()];
-        for state in 0..self.steps.len() {
-            visit(state, &self.steps, &mut marks, &mut depths)?;
-        }
-        Some(depths.into_boxed_slice())
     }
 
     fn compile(expr: &PathExpr) -> Self {
@@ -1715,15 +1644,12 @@ impl DeltaProgram {
                     .collect(),
             );
         }
-        let mut program = Self {
+        Self {
             start,
             accepting,
             steps,
-            finite_depth: None,
         }
-        .quotient_bisimilar_states();
-        program.finite_depth = program.acyclic_depths();
-        program
+        .quotient_bisimilar_states()
     }
 
     fn encode(&self, state: u32) -> u32 {
@@ -1767,15 +1693,9 @@ impl RegularPathConstraint {
         compile_bound_estimate(&inverse_expr, &mut inverse_estimate);
         let expr_nullable = nullable(&expr);
         let inverse_nullable = nullable(&inverse_expr);
+        let repeated = has_repetition(&expr);
         let delta_program = DeltaProgram::compile(&expr);
         let inverse_delta_program = DeltaProgram::compile(&inverse_expr);
-        if !has_repetition(&expr) {
-            assert!(
-                delta_program.finite_depth.is_some()
-                    && inverse_delta_program.finite_depth.is_some(),
-                "a repetition-free RPQ compiled to a cyclic transition program"
-            );
-        }
         RegularPathConstraint {
             start: start.index,
             end: end.index,
@@ -1787,6 +1707,7 @@ impl RegularPathConstraint {
             inverse_estimate: inverse_estimate.into_boxed_slice(),
             nullable: expr_nullable,
             inverse_nullable,
+            repeated,
             delta_program,
             inverse_delta_program,
             set,
@@ -1918,73 +1839,8 @@ impl RegularPathConstraint {
         }
     }
 
-    /// Pages the first endpoint of a distinct-endpoint RPQ while the other
-    /// endpoint is still free. Nullable expressions range over NODES(G);
-    /// otherwise the endpoint must be able to take a FIRST step in the chosen
-    /// orientation. This is the same exact candidate superset as ordinary
-    /// `propose_row`, but the source generator exposes its work to geometric
-    /// scheduling before materializing the complete domain.
-    fn first_binding_source_page(
-        &self,
-        variable: VariableId,
-        cursor: RpqSourceCursor,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> RpqSourcePage {
-        assert!(limit > 0, "residual source pages require positive demand");
-        let (nullable, first) = if variable == self.start {
-            (self.nullable, self.first.as_ref())
-        } else {
-            assert_eq!(variable, self.end);
-            (self.inverse_nullable, self.inverse_first.as_ref())
-        };
-        let exact = |source: &RawInline| {
-            if nullable {
-                is_graph_term(&self.set, source)
-            } else {
-                can_take_first_step(&self.set, first, source)
-            }
-        };
-        let after = match cursor {
-            RpqSourceCursor::Start => None,
-            RpqSourceCursor::After(value) => Some(value),
-            RpqSourceCursor::Offset(_) => {
-                panic!("graph-backed RPQ source resumed with a candidate offset")
-            }
-        };
-
-        let source_steps: &[FirstStep] = if nullable {
-            &[FirstStep::AnyFwd, FirstStep::AnyInv]
-        } else {
-            first
-        };
-        let mut examined = 0usize;
-        let mut current = after;
-        while examined < limit {
-            let Some(source) = next_first_source(&self.set, source_steps, current.as_ref()) else {
-                return RpqSourcePage {
-                    next: None,
-                    examined,
-                };
-            };
-            current = Some(source);
-            examined += 1;
-            if exact(&source) {
-                accepted.push(source);
-            }
-        }
-        let last_examined = current.expect("a full positive page examined a source");
-        RpqSourcePage {
-            next: next_first_source(&self.set, source_steps, Some(&last_examined))
-                .map(|_| RpqSourceCursor::After(last_examined)),
-            examined,
-        }
-    }
-
     /// Selects the transition-program orientation for a bound endpoint or a
-    /// same-variable source frontier. Finite and repeated expressions share the
-    /// same product-state representation; the latter are the cyclic special
-    /// case whose novelty set computes a least fixpoint.
+    /// same-variable source frontier inside a repeated-path fixpoint.
     fn program_for_variable(&self, variable: VariableId) -> Option<RpqRoute<'_>> {
         if self.start == self.end {
             if variable != self.start {
@@ -2274,13 +2130,10 @@ impl RegularPathConstraint {
     /// Exhausts one bound-endpoint product traversal for the eager Program
     /// complete-action route.
     ///
-    /// Repeated sparse routes keep this `(value, pc)` novelty domain in an
-    /// activation-local registry; finite sparse routes instead terminate by
-    /// descending program rank. A complete action has no activation, so it
-    /// owns the equivalent set and work queue directly. Collapsing convergent
-    /// finite histories is valid because proposals denote distinct endpoints.
-    /// Separate parent rows still run independent drains and retain their outer
-    /// bag multiplicity.
+    /// Pageable repeated routes keep this `(value, pc)` novelty domain in an
+    /// activation-local registry. A complete action has no activation, so it
+    /// owns the equivalent set and work queue directly. Separate parent rows
+    /// still run independent drains and retain their outer bag multiplicity.
     fn complete_bound_endpoint_bounded(
         &self,
         program: &DeltaProgram,
@@ -2629,41 +2482,27 @@ impl TypedProgramSpec for RegularPathConstraint {
     type Rank = [u64; 8];
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let repeated = has_repetition(&self.expr);
-        let stratum = if repeated {
-            ProgramStratum::Fixpoint
-        } else {
-            ProgramStratum::Finite
-        };
+        if !self.repeated {
+            return None;
+        }
         let route = match request.action {
-            ProgramAction::Support => {
-                if request.bound.is_set(self.start) && request.bound.is_set(self.end) {
-                    ProgramRoute {
-                        key: if self.start == self.end {
-                            RPQ_SAME_VARIABLE
-                        } else {
-                            RPQ_BOUND_FORWARD
-                        },
-                        variable: self.end,
-                        stratum,
-                        // Support has no candidate relation to reuse.
-                        grouping: ProgramGrouping::PageLocal,
-                        completion: ProgramCompletion::PageableOnly,
-                    }
-                } else {
-                    // Ordinary `satisfied` is deliberately optimistic while
-                    // either endpoint is absent. Keep that structural
-                    // disposition inside the typed family as an explicit
-                    // Boolean effect rather than a manufactured value.
-                    ProgramRoute {
-                        key: RPQ_SUPPORT_TRUE,
-                        variable: self.end,
-                        stratum: ProgramStratum::Finite,
-                        grouping: ProgramGrouping::PageLocal,
-                        completion: ProgramCompletion::PageableOnly,
-                    }
+            ProgramAction::Support
+                if request.bound.is_set(self.start) && request.bound.is_set(self.end) =>
+            {
+                ProgramRoute {
+                    key: if self.start == self.end {
+                        RPQ_SAME_VARIABLE
+                    } else {
+                        RPQ_BOUND_FORWARD
+                    },
+                    variable: self.end,
+                    stratum: ProgramStratum::Fixpoint,
+                    // Support has no candidate relation to reuse.
+                    grouping: ProgramGrouping::PageLocal,
+                    completion: ProgramCompletion::PageableOnly,
                 }
             }
+            ProgramAction::Support => return None,
             ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
                 if request.bound.is_set(variable)
                     || (variable != self.start && variable != self.end)
@@ -2675,8 +2514,8 @@ impl TypedProgramSpec for RegularPathConstraint {
                     ProgramRoute {
                         key: RPQ_SAME_VARIABLE,
                         variable,
-                        stratum,
-                        grouping: if confirming && repeated {
+                        stratum: ProgramStratum::Fixpoint,
+                        grouping: if confirming {
                             ProgramGrouping::ParentAtomic
                         } else {
                             ProgramGrouping::PageLocal
@@ -2684,62 +2523,28 @@ impl TypedProgramSpec for RegularPathConstraint {
                         completion: ProgramCompletion::PageableOnly,
                     }
                 } else {
-                    let (opposite, bound_key, first_key, confirm_first_key) =
-                        if variable == self.end {
-                            (
-                                self.start,
-                                RPQ_BOUND_FORWARD,
-                                RPQ_FIRST_FORWARD,
-                                RPQ_CONFIRM_FIRST_FORWARD,
-                            )
-                        } else {
-                            (
-                                self.end,
-                                RPQ_BOUND_INVERSE,
-                                RPQ_FIRST_INVERSE,
-                                RPQ_CONFIRM_FIRST_INVERSE,
-                            )
-                        };
-                    if request.bound.is_set(opposite) {
-                        ProgramRoute {
-                            key: bound_key,
-                            variable,
-                            stratum,
-                            grouping: if confirming && repeated {
-                                ProgramGrouping::ParentAtomic
-                            } else {
-                                ProgramGrouping::PageLocal
-                            },
-                            completion: if confirming {
-                                ProgramCompletion::PageableOnly
-                            } else {
-                                ProgramCompletion::CompleteActionEquivalent
-                            },
-                        }
-                    } else if matches!(request.action, ProgramAction::Propose(_)) {
-                        // First-endpoint paging is a finite direct observation
-                        // source even when the later bound-endpoint product
-                        // route computes a fixpoint.
-                        ProgramRoute {
-                            key: first_key,
-                            variable,
-                            stratum: ProgramStratum::Finite,
-                            grouping: ProgramGrouping::PageLocal,
-                            completion: ProgramCompletion::PageableOnly,
-                        }
+                    let (opposite, key) = if variable == self.end {
+                        (self.start, RPQ_BOUND_FORWARD)
                     } else {
-                        // With the opposite endpoint absent, confirmation is
-                        // the finite existential FIRST-step filter over the
-                        // activation's candidate set. Nullable paths retain
-                        // every candidate, matching the ordinary optimistic
-                        // partial-binding law.
-                        ProgramRoute {
-                            key: confirm_first_key,
-                            variable,
-                            stratum: ProgramStratum::Finite,
-                            grouping: ProgramGrouping::PageLocal,
-                            completion: ProgramCompletion::PageableOnly,
-                        }
+                        (self.end, RPQ_BOUND_INVERSE)
+                    };
+                    if !request.bound.is_set(opposite) {
+                        return None;
+                    }
+                    ProgramRoute {
+                        key,
+                        variable,
+                        stratum: ProgramStratum::Fixpoint,
+                        grouping: if confirming {
+                            ProgramGrouping::ParentAtomic
+                        } else {
+                            ProgramGrouping::PageLocal
+                        },
+                        completion: if confirming {
+                            ProgramCompletion::PageableOnly
+                        } else {
+                            ProgramCompletion::CompleteActionEquivalent
+                        },
                     }
                 }
             }
@@ -2857,16 +2662,12 @@ impl TypedProgramSpec for RegularPathConstraint {
                 cursor: RpqExpandCursor::After { .. },
                 ..
             } => RPQ_TRANSITION_AFTER,
-            RpqStateKind::CandidateFilter { .. } => RPQ_CANDIDATE_FILTER,
-            RpqStateKind::Support => RPQ_SUPPORT,
         }
     }
 
     fn pacing(&self, state: &Self::State) -> ProgramPacing {
         match state.kind() {
-            RpqStateKind::Source { .. }
-            | RpqStateKind::CandidateFilter { .. }
-            | RpqStateKind::Support => ProgramPacing::Search,
+            RpqStateKind::Source { .. } => ProgramPacing::Search,
             RpqStateKind::Transition { .. } => ProgramPacing::Activation,
         }
     }
@@ -2881,29 +2682,8 @@ impl TypedProgramSpec for RegularPathConstraint {
 
         let mut rank = [0u64; 8];
         match state.kind() {
-            RpqStateKind::Support => {}
-            RpqStateKind::CandidateFilter { offset, .. } => {
-                rank[0] = 1;
-                rank[1] = u64::MAX
-                    - u64::try_from(*offset).expect("RPQ candidate offset exceeds rank limb");
-            }
-            RpqStateKind::Transition {
-                variable,
-                node,
-                cursor,
-            } => {
+            RpqStateKind::Transition { cursor, .. } => {
                 rank[0] = 2;
-                let program = match self
-                    .program_for_variable(*variable)
-                    .expect("ranked RPQ transition lost its program")
-                {
-                    RpqRoute::BoundEndpoint { program, .. }
-                    | RpqRoute::SameVariable { program } => program,
-                };
-                rank[1] = program
-                    .finite_depth
-                    .as_deref()
-                    .map_or(0, |depths| depths[program.decode(node.pc)] as u64);
                 match cursor {
                     RpqExpandCursor::Start => rank[2] = u64::MAX,
                     RpqExpandCursor::After { branch, value } => {
@@ -2938,38 +2718,13 @@ impl TypedProgramSpec for RegularPathConstraint {
         effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
     ) {
         debug_assert_eq!(batch.view.len(), batch.activations.len());
-        if batch.route.key == RPQ_SUPPORT_TRUE {
-            for parent in 0..batch.view.len() {
-                effects.finite_root(
-                    u32::try_from(parent).expect("too many RPQ program parents"),
-                    RpqState::support(),
-                    None,
-                );
-            }
-            return;
-        }
-        if batch.route.key == RPQ_CONFIRM_FIRST_FORWARD
-            || batch.route.key == RPQ_CONFIRM_FIRST_INVERSE
-        {
-            debug_assert!(matches!(batch.request.action, ProgramAction::Confirm(_)));
-            for parent in 0..batch.view.len() {
-                effects.finite_root(
-                    u32::try_from(parent).expect("too many RPQ program parents"),
-                    RpqState::candidate_filter(batch.route.variable, 0),
-                    None,
-                );
-            }
-            return;
-        }
-        let direct_source =
-            batch.route.key == RPQ_FIRST_FORWARD || batch.route.key == RPQ_FIRST_INVERSE;
         let same_source = batch.route.key == RPQ_SAME_VARIABLE
             && !matches!(batch.request.action, ProgramAction::Support);
-        if direct_source || same_source {
+        if same_source {
             for parent in 0..batch.view.len() {
                 effects.finite_root(
                     u32::try_from(parent).expect("too many RPQ program parents"),
-                    RpqState::source(batch.route.variable, RpqSourceCursor::Start, same_source),
+                    RpqState::source(batch.route.variable, RpqSourceCursor::Start),
                     None,
                 );
             }
@@ -3013,19 +2768,17 @@ impl TypedProgramSpec for RegularPathConstraint {
             let parent = u32::try_from(parent).expect("too many RPQ program parents");
             let state = RpqState::transition(batch.route.variable, node, RpqExpandCursor::Start);
             let accepted = accepted.then_some(value);
-            match batch.route.stratum {
-                ProgramStratum::Finite => effects.finite_root(parent, state, accepted),
-                ProgramStratum::Fixpoint => effects.fixpoint_root(
-                    parent,
-                    state,
-                    RpqNoveltyKey {
-                        source: node.source,
-                        value: node.value,
-                        pc: node.pc,
-                    },
-                    accepted,
-                ),
-            }
+            debug_assert_eq!(batch.route.stratum, ProgramStratum::Fixpoint);
+            effects.fixpoint_root(
+                parent,
+                state,
+                RpqNoveltyKey {
+                    source: node.source,
+                    value: node.value,
+                    pc: node.pc,
+                },
+                accepted,
+            );
         }
     }
 
@@ -3036,123 +2789,53 @@ impl TypedProgramSpec for RegularPathConstraint {
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         assert_eq!(states.len(), batch.view.len());
-        if states
-            .first()
-            .is_some_and(|state| matches!(state.kind(), RpqStateKind::Support))
-        {
-            for (input, state) in states.drain(..).enumerate() {
-                let RpqStateKind::Support = state.into_kind() else {
-                    panic!("one typed RPQ support cohort mixed continuation variants")
-                };
-                let input = u32::try_from(input).expect("too many typed RPQ inputs in one cohort");
-                effects.support(input);
-                // This is a finite structural Boolean disposition, not a
-                // graph transition. Its positive generic work receipt still
-                // budgets the typed effect, while RPQ transition telemetry
-                // remains reserved for product-state adjacency work.
-                effects.page(1, None);
-            }
-            return;
-        }
-        if states
-            .first()
-            .is_some_and(|state| matches!(state.kind(), RpqStateKind::CandidateFilter { .. }))
-        {
-            for (input, state) in states.drain(..).enumerate() {
-                let RpqStateKind::CandidateFilter { variable, offset } = state.into_kind() else {
-                    panic!("one typed RPQ candidate cohort mixed continuation variants")
-                };
-                let candidates = batch.candidate_sets[input]
-                    .expect("typed RPQ confirmation filter lost its candidate set");
-                assert!(offset <= candidates.len());
-                let end = offset
-                    .saturating_add(batch.limits[input])
-                    .min(candidates.len());
-                let (nullable, first) = if variable == self.start {
-                    (self.nullable, self.first.as_ref())
-                } else {
-                    assert_eq!(variable, self.end);
-                    (self.inverse_nullable, self.inverse_first.as_ref())
-                };
-                let input_tag =
-                    u32::try_from(input).expect("too many typed RPQ inputs in one cohort");
-                for &candidate in &candidates[offset..end] {
-                    if nullable || can_take_first_step(&self.set, first, &candidate) {
-                        effects.accept(input_tag, candidate);
-                    }
-                }
-                let resume = (end < candidates.len())
-                    .then(|| TypedResume::Immediate(RpqState::candidate_filter(variable, end)));
-                // Candidate filtering is a finite confirmation receipt, not
-                // product-state adjacency. The generic page budget accounts
-                // its probes; RPQ transition telemetry remains comparable to
-                // the historical traversal counters.
-                effects.page(end - offset, resume);
-            }
-            return;
-        }
+        debug_assert_eq!(batch.stratum, ProgramStratum::Fixpoint);
         if states
             .first()
             .is_some_and(|state| matches!(state.kind(), RpqStateKind::Source { .. }))
         {
             for (input, state) in states.drain(..).enumerate() {
-                let RpqStateKind::Source {
-                    variable,
-                    cursor,
-                    roots,
-                } = state.into_kind()
-                else {
+                let RpqStateKind::Source { variable, cursor } = state.into_kind() else {
                     panic!("one typed RPQ source cohort mixed continuation variants")
                 };
                 let limit = batch.limits[input];
                 let mut root_outputs = Vec::new();
-                let mut direct = Vec::new();
-                let page = if roots {
-                    let program = match self
-                        .program_for_variable(variable)
-                        .expect("same-variable RPQ source lost its program")
-                    {
-                        RpqRoute::SameVariable { program } => program,
-                        RpqRoute::BoundEndpoint { .. } => {
-                            panic!("root-producing source changed RPQ route")
-                        }
-                    };
-                    self.same_variable_source_page(
-                        program,
-                        batch.candidate_sets[input],
-                        cursor,
-                        limit,
-                        &mut root_outputs,
-                    )
-                } else {
-                    self.first_binding_source_page(variable, cursor, limit, &mut direct)
+                let program = match self
+                    .program_for_variable(variable)
+                    .expect("same-variable RPQ source lost its program")
+                {
+                    RpqRoute::SameVariable { program } => program,
+                    RpqRoute::BoundEndpoint { .. } => {
+                        panic!("root-producing source changed RPQ route")
+                    }
                 };
+                let page = self.same_variable_source_page(
+                    program,
+                    batch.candidate_sets[input],
+                    cursor,
+                    limit,
+                    &mut root_outputs,
+                );
                 let input_tag =
                     u32::try_from(input).expect("too many typed RPQ inputs in one cohort");
                 for output in root_outputs.iter().copied() {
                     let node = output.node;
                     let state = RpqState::transition(variable, node, RpqExpandCursor::Start);
                     let accepted = output.accepted.then_some(node.value);
-                    match batch.stratum {
-                        ProgramStratum::Finite => effects.finite_child(input_tag, state, accepted),
-                        ProgramStratum::Fixpoint => effects.fixpoint_child(
-                            input_tag,
-                            state,
-                            RpqNoveltyKey {
-                                source: node.source,
-                                value: node.value,
-                                pc: node.pc,
-                            },
-                            accepted,
-                        ),
-                    }
-                }
-                for value in direct {
-                    effects.direct(input_tag, value);
+                    effects.fixpoint_child(
+                        input_tag,
+                        state,
+                        RpqNoveltyKey {
+                            source: node.source,
+                            value: node.value,
+                            pc: node.pc,
+                        },
+                        accepted,
+                    );
                 }
                 let resume = match page.next {
                     Some(cursor) => Some(TypedResume::AfterChildren(RpqState::source(
-                        variable, cursor, roots,
+                        variable, cursor,
                     ))),
                     None if !root_outputs.is_empty() => Some(TypedResume::AfterChildrenDone),
                     None => None,
@@ -3243,19 +2926,16 @@ impl TypedProgramSpec for RegularPathConstraint {
                     let accepted = (target_accepting
                         && node.source.is_none_or(|anchor| value == anchor))
                     .then_some(value);
-                    match batch.stratum {
-                        ProgramStratum::Finite => effects.finite_child(input, state, accepted),
-                        ProgramStratum::Fixpoint => effects.fixpoint_child(
-                            input,
-                            state,
-                            RpqNoveltyKey {
-                                source: child.source,
-                                value: child.value,
-                                pc: child.pc,
-                            },
-                            accepted,
-                        ),
-                    }
+                    effects.fixpoint_child(
+                        input,
+                        state,
+                        RpqNoveltyKey {
+                            source: child.source,
+                            value: child.value,
+                            pc: child.pc,
+                        },
+                        accepted,
+                    );
                 });
             }
             for fanout in fanouts {
@@ -3295,19 +2975,16 @@ impl TypedProgramSpec for RegularPathConstraint {
                 let child = output.node;
                 let state = RpqState::transition(variable, child, RpqExpandCursor::Start);
                 let accepted = output.accepted.then_some(child.value);
-                match batch.stratum {
-                    ProgramStratum::Finite => effects.finite_child(input_tag, state, accepted),
-                    ProgramStratum::Fixpoint => effects.fixpoint_child(
-                        input_tag,
-                        state,
-                        RpqNoveltyKey {
-                            source: child.source,
-                            value: child.value,
-                            pc: child.pc,
-                        },
-                        accepted,
-                    ),
-                }
+                effects.fixpoint_child(
+                    input_tag,
+                    state,
+                    RpqNoveltyKey {
+                        source: child.source,
+                        value: child.value,
+                        pc: child.pc,
+                    },
+                    accepted,
+                );
             }
             let (examined, resume) = page.map_or((0, None), |page| {
                 effects.account_transition(page.examined);
@@ -3402,14 +3079,13 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     }
 
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
+        self.repeated.then(|| ProgramRef::new(self))
     }
 
-    /// The typed same-variable route publishes a source only after the graph
-    /// product has witnessed a path back to that source. Its accepted effects
-    /// are therefore Exact, strengthening the conservative route-wide ordinary
-    /// receipt even though eager `propose_row` also performs an exact final
-    /// self-loop filter.
+    /// A repeated typed same-variable route publishes a source only after the
+    /// graph product has witnessed a path back to that source. Its accepted
+    /// effects are therefore Exact, strengthening the conservative ordinary
+    /// receipt.
     fn residual_program_proposal_coverage(
         &self,
         variable: VariableId,
@@ -3442,67 +3118,82 @@ mod delta_program_tests {
     use super::*;
 
     #[test]
-    fn complete_action_certificate_is_exactly_bound_endpoint_propose() {
+    fn machine_routes_require_repetition_and_a_bound_recurrent_frontier() {
         let start = Variable::<GenId>::new(0);
         let end = Variable::<GenId>::new(1);
-        let path =
+        let finite =
             RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr([1; ID_LEN])]);
-        let completion = |action, bound| {
-            TypedProgramSpec::route(&path, ProgramRequest { action, bound })
-                .unwrap()
-                .completion
-        };
+        assert!(finite.residual_program().is_none());
+        for request in [
+            ProgramRequest {
+                action: ProgramAction::Propose(end.index),
+                bound: VariableSet::new_empty(),
+            },
+            ProgramRequest {
+                action: ProgramAction::Propose(end.index),
+                bound: VariableSet::new_singleton(start.index),
+            },
+            ProgramRequest {
+                action: ProgramAction::Confirm(end.index),
+                bound: VariableSet::new_singleton(start.index),
+            },
+            ProgramRequest {
+                action: ProgramAction::Support,
+                bound: VariableSet::new_singleton(start.index)
+                    .union(VariableSet::new_singleton(end.index)),
+            },
+        ] {
+            assert!(TypedProgramSpec::route(&finite, request).is_none());
+        }
 
-        assert_eq!(
-            completion(ProgramAction::Propose(1), VariableSet::new_empty()),
-            ProgramCompletion::PageableOnly
-        );
-        assert_eq!(
-            completion(ProgramAction::Propose(1), VariableSet::new_singleton(0)),
-            ProgramCompletion::CompleteActionEquivalent
-        );
-        assert_eq!(
-            completion(ProgramAction::Propose(0), VariableSet::new_singleton(1)),
-            ProgramCompletion::CompleteActionEquivalent
-        );
-        assert_eq!(
-            completion(ProgramAction::Confirm(1), VariableSet::new_singleton(0)),
-            ProgramCompletion::PageableOnly
-        );
-        assert_eq!(
-            completion(
-                ProgramAction::Support,
-                VariableSet::new_singleton(0).union(VariableSet::new_singleton(1))
-            ),
-            ProgramCompletion::PageableOnly
-        );
-
-        let same = RegularPathConstraint::new(
+        let repeated = RegularPathConstraint::new(
             TribleSet::new(),
             start,
-            start,
-            &[PathOp::Attr([1; ID_LEN])],
+            end,
+            &[PathOp::Attr([1; ID_LEN]), PathOp::Plus],
         );
+        let program = repeated.residual_program().unwrap();
+        let bound_propose = program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(end.index),
+                bound: VariableSet::new_singleton(start.index),
+            })
+            .unwrap();
         assert_eq!(
-            TypedProgramSpec::route(
-                &same,
-                ProgramRequest {
-                    action: ProgramAction::Propose(0),
-                    bound: VariableSet::new_empty(),
-                }
-            )
-            .unwrap()
-            .completion,
-            ProgramCompletion::PageableOnly
+            bound_propose.completion,
+            ProgramCompletion::CompleteActionEquivalent
         );
+        assert_eq!(bound_propose.stratum, ProgramStratum::Fixpoint);
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Propose(end.index),
+                bound: VariableSet::new_empty(),
+            })
+            .is_none());
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(end.index),
+                bound: VariableSet::new_empty(),
+            })
+            .is_none());
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Support,
+                bound: VariableSet::new_empty(),
+            })
+            .is_none());
     }
 
     #[test]
     fn confirm_support_positive_prefix_certificate_is_only_distinct_endpoint_forward() {
         let start = Variable::<GenId>::new(0);
         let end = Variable::<GenId>::new(1);
-        let path =
-            RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr([1; ID_LEN])]);
+        let path = RegularPathConstraint::new(
+            TribleSet::new(),
+            start,
+            end,
+            &[PathOp::Attr([1; ID_LEN]), PathOp::Plus],
+        );
         let confirm_forward = ProgramRequest {
             action: ProgramAction::Confirm(end.index),
             bound: VariableSet::new_singleton(start.index),
@@ -3621,7 +3312,6 @@ mod delta_program_tests {
                 vec![(first, 2), (second, 2)],
                 vec![(second, 3), (first, 3)],
             ],
-            finite_depth: None,
         }
         .quotient_bisimilar_states();
 
@@ -3966,7 +3656,7 @@ mod seeded_frame_tests {
     use crate::trible::Trible;
 
     #[test]
-    fn repeated_path_grouping_requires_the_opposite_endpoint() {
+    fn repeated_machine_grouping_requires_the_opposite_endpoint() {
         let mut variables = VariableContext::new();
         let start = variables.next_variable::<GenId>();
         let end = variables.next_variable::<GenId>();
@@ -3994,35 +3684,22 @@ mod seeded_frame_tests {
             })
             .unwrap();
         assert_eq!(end_route.grouping, ProgramGrouping::ParentAtomic);
-        let partial_route = program
+        assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(start.index),
                 bound: VariableSet::new_empty(),
             })
-            .expect("partial confirmation remains inside the typed RPQ family");
-        assert_eq!(partial_route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(partial_route.stratum, ProgramStratum::Finite);
-        let support_route = program
+            .is_none());
+        assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Support,
                 bound: VariableSet::new_empty(),
             })
-            .expect("optimistic partial support is an explicit typed disposition");
-        assert_eq!(support_route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(support_route.stratum, ProgramStratum::Finite);
+            .is_none());
 
         let direct =
             RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr(attribute)]);
-        let direct_route = direct
-            .residual_program()
-            .unwrap()
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(start.index),
-                bound: VariableSet::new_singleton(end.index),
-            })
-            .unwrap();
-        assert_eq!(direct_route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(direct_route.stratum, ProgramStratum::Finite);
+        assert!(direct.residual_program().is_none());
 
         let same_endpoint = RegularPathConstraint::new(
             TribleSet::new(),
@@ -4043,7 +3720,7 @@ mod seeded_frame_tests {
     }
 
     #[test]
-    fn typed_full_support_exposes_nullable_seed_and_first_adjacency_witness_locally() {
+    fn typed_fixpoint_support_exposes_nullable_seed_locally() {
         let source = rngid();
         let attribute = rngid();
         let mut destinations = [
@@ -4095,56 +3772,6 @@ mod seeded_frame_tests {
         );
         assert_eq!(nullable_seed.work.len(), 1);
         assert_eq!(nullable_seed.work[0].accepted, Some(source_value));
-
-        // The first sorted adjacency is the bound target. A one-unit adapter
-        // grant exposes that witness while retaining the irrelevant tail as
-        // an exact immediate resume.
-        let direct =
-            RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
-        let direct_program = direct.residual_program().unwrap();
-        let direct_route = direct_program.route(request).unwrap();
-        let direct_rows = [source_value, target];
-        let direct_view = RowsView::new(&vars, &direct_rows);
-        let mut direct_runtime = direct_program.new_runtime();
-        let mut direct_seed = ProgramSeedEffects::default();
-        direct_program.seed_batch(
-            &mut direct_runtime,
-            ProgramSeedBatch {
-                request,
-                route: direct_route,
-                view: direct_view,
-                activations: &activations,
-            },
-            &mut direct_seed,
-        );
-        assert_eq!(direct_seed.work.len(), 1);
-        assert_eq!(direct_seed.work[0].accepted, None);
-        let work = [direct_seed.work.pop().unwrap().work];
-        let candidates = [None];
-        let limits = [1];
-        let mut effects = ProgramBatchEffects::default();
-        direct_program.step_batch(
-            &mut direct_runtime,
-            ProgramBatch {
-                stratum: direct_route.stratum,
-                view: direct_view,
-                candidate_sets: &candidates,
-                activations: &activations,
-                work: &work,
-                limits: &limits,
-            },
-            &mut effects,
-        );
-        assert_eq!(effects.pages.len(), 1);
-        assert_eq!(effects.pages[0].examined, 1);
-        assert!(matches!(
-            effects.pages[0].resume,
-            Some(crate::query::ProgramResume::Immediate(_))
-        ));
-        assert_eq!(effects.children.len(), 1);
-        assert_eq!(effects.children[0].accepted, Some(target));
-        assert_eq!(effects.transition_pages, 1);
-        assert_eq!(effects.transition_examined, 1);
     }
 
     fn one_support_transition_cohort(
@@ -4214,7 +3841,12 @@ mod seeded_frame_tests {
         }
         let start = Variable::<GenId>::new(0);
         let end = Variable::<GenId>::new(1);
-        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
+        );
         // Two identical outer parents pin bag ownership independently of the
         // product-state value. The third input has the larger exact fanout.
         let rows = [
@@ -4299,7 +3931,11 @@ mod seeded_frame_tests {
             inverse_set,
             start,
             end,
-            &[PathOp::Attr(attribute.id.raw()), PathOp::Inverse],
+            &[
+                PathOp::Attr(attribute.id.raw()),
+                PathOp::Inverse,
+                PathOp::Plus,
+            ],
         );
         let (inverse_effects, bulk_cohorts) =
             one_support_transition_cohort(&inverse, &[target_value, source_values[0]], &[2]);
@@ -4333,7 +3969,7 @@ mod seeded_frame_tests {
             forward_set,
             start,
             end,
-            &[PathOp::NotAttr(excluded.id.raw())],
+            &[PathOp::NotAttr(excluded.id.raw()), PathOp::Plus],
         );
         let (forward_effects, bulk_cohorts) = one_support_transition_cohort(
             &forward_negated,
@@ -4371,7 +4007,11 @@ mod seeded_frame_tests {
             inverse_negated_set,
             start,
             end,
-            &[PathOp::NotAttr(excluded.id.raw()), PathOp::Inverse],
+            &[
+                PathOp::NotAttr(excluded.id.raw()),
+                PathOp::Inverse,
+                PathOp::Plus,
+            ],
         );
         let (inverse_effects, bulk_cohorts) = one_support_transition_cohort(
             &inverse_negated,
@@ -4388,40 +4028,34 @@ mod seeded_frame_tests {
     }
 
     #[test]
-    fn rpq_program_rank_descends_on_every_finite_spine() {
+    fn rpq_fixpoint_rank_descends_on_internal_page_cursors() {
         let mut variables = VariableContext::new();
-        let start = variables.next_variable::<GenId>();
-        let end = variables.next_variable::<GenId>();
+        let variable = variables.next_variable::<GenId>();
         let attribute = rngid().id.raw();
-        let direct =
-            RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr(attribute)]);
+        let repeated = RegularPathConstraint::new(
+            TribleSet::new(),
+            variable,
+            variable,
+            &[PathOp::Attr(attribute), PathOp::Plus],
+        );
         let low = [1; 32];
         let high = [2; 32];
 
-        let source_start = RpqState::source(start.index, RpqSourceCursor::Start, false);
-        let source_low = RpqState::source(start.index, RpqSourceCursor::After(low), false);
-        let source_high = RpqState::source(start.index, RpqSourceCursor::After(high), false);
-        assert!(direct.progress(&source_start) > direct.progress(&source_low));
-        assert!(direct.progress(&source_low) > direct.progress(&source_high));
+        let source_start = RpqState::source(variable.index, RpqSourceCursor::Start);
+        let source_low = RpqState::source(variable.index, RpqSourceCursor::After(low));
+        let source_high = RpqState::source(variable.index, RpqSourceCursor::After(high));
+        assert!(repeated.progress(&source_start) > repeated.progress(&source_low));
+        assert!(repeated.progress(&source_low) > repeated.progress(&source_high));
 
-        let filter_zero = RpqState::candidate_filter(start.index, 0);
-        let filter_one = RpqState::candidate_filter(start.index, 1);
-        assert!(direct.progress(&filter_zero) > direct.progress(&filter_one));
-
-        let program = &direct.delta_program;
+        let program = &repeated.delta_program;
         let origin = RpqNode {
             source: None,
             value: low,
             pc: program.start,
         };
-        let target = program.steps[program.start as usize][0].1;
-        let child = RpqNode {
-            pc: target,
-            ..origin
-        };
-        let transition_start = RpqState::transition(end.index, origin, RpqExpandCursor::Start);
+        let transition_start = RpqState::transition(variable.index, origin, RpqExpandCursor::Start);
         let transition_low = RpqState::transition(
-            end.index,
+            variable.index,
             origin,
             RpqExpandCursor::After {
                 branch: 0,
@@ -4429,40 +4063,21 @@ mod seeded_frame_tests {
             },
         );
         let transition_high = RpqState::transition(
-            end.index,
+            variable.index,
             origin,
             RpqExpandCursor::After {
                 branch: 0,
                 value: high,
             },
         );
-        let transition_next_branch = RpqState::transition(
-            end.index,
-            origin,
-            RpqExpandCursor::After {
-                branch: 1,
-                value: low,
-            },
-        );
-        let child_start = RpqState::transition(end.index, child, RpqExpandCursor::Start);
-        assert!(direct.progress(&transition_start) > direct.progress(&transition_low));
-        assert!(direct.progress(&transition_low) > direct.progress(&transition_high));
-        assert!(direct.progress(&transition_high) > direct.progress(&transition_next_branch));
-        assert!(direct.progress(&transition_start) > direct.progress(&child_start));
-
-        let repeated = RegularPathConstraint::new(
-            TribleSet::new(),
-            start,
-            end,
-            &[PathOp::Attr(attribute), PathOp::Plus],
-        );
-        assert!(repeated.delta_program.finite_depth.is_none());
+        assert!(repeated.progress(&transition_start) > repeated.progress(&transition_low));
+        assert!(repeated.progress(&transition_low) > repeated.progress(&transition_high));
         let repeated_route = repeated
             .residual_program()
             .unwrap()
             .route(ProgramRequest {
-                action: ProgramAction::Propose(end.index),
-                bound: VariableSet::new_singleton(start.index),
+                action: ProgramAction::Propose(variable.index),
+                bound: VariableSet::new_empty(),
             })
             .unwrap();
         assert_eq!(repeated_route.stratum, ProgramStratum::Fixpoint);
@@ -4574,7 +4189,12 @@ mod seeded_frame_tests {
 
         let start = Variable::<GenId>::new(0);
         let end = Variable::<GenId>::new(1);
-        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
+        );
         let request = ProgramRequest {
             action: ProgramAction::Propose(end.index),
             bound: VariableSet::new_singleton(start.index),
@@ -4697,48 +4317,6 @@ mod seeded_frame_tests {
     }
 
     #[test]
-    fn complete_product_drain_deduplicates_finite_convergent_witnesses_per_parent() {
-        let graph = GraphFixture::new();
-        let start = Variable::<GenId>::new(0);
-        let end = Variable::<GenId>::new(1);
-        let path = RegularPathConstraint::new(
-            graph.set,
-            start,
-            end,
-            &[
-                PathOp::Attr(graph.primary),
-                PathOp::Attr(graph.secondary),
-                PathOp::Concat,
-            ],
-        );
-
-        // Both 0-primary-1-secondary-{0,2} and
-        // 0-primary-3-secondary-{0,2} prove the same two endpoints. The
-        // complete action emits each endpoint once for each duplicate parent.
-        let _ = take_seeded_chain_frame_runs();
-        let mut actual = complete_bound_proposals(
-            &path,
-            end.index,
-            start.index,
-            &[graph.nodes[0], graph.nodes[0]],
-        );
-        assert_eq!(
-            take_seeded_chain_frame_runs(),
-            0,
-            "typed complete actions must not open a seeded nested WCO frame"
-        );
-        actual.sort_unstable();
-        let mut expected = vec![
-            (0, graph.nodes[0]),
-            (0, graph.nodes[2]),
-            (1, graph.nodes[0]),
-            (1, graph.nodes[2]),
-        ];
-        expected.sort_unstable();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
     fn complete_product_drain_computes_nullable_fixpoint_with_graph_term_gate() {
         let graph = GraphFixture::new();
         let absent = id_into_value(&rngid().id.raw());
@@ -4795,7 +4373,12 @@ mod seeded_frame_tests {
 
         let start = Variable::<UnknownInline>::new(0);
         let end = Variable::<UnknownInline>::new(1);
-        let path = RegularPathConstraint::new(set, start, end, &[PathOp::Attr(attribute.id.raw())]);
+        let path = RegularPathConstraint::new(
+            set,
+            start,
+            end,
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
+        );
         let mut actual =
             complete_bound_proposals(&path, start.index, end.index, &[literal, literal]);
         actual.sort_unstable();
@@ -4983,7 +4566,7 @@ mod seeded_frame_tests {
             set,
             variable,
             variable,
-            &[PathOp::Attr(attribute.id.raw()), PathOp::Optional],
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Star],
         );
         let mut expected = entity_values;
         expected.push(literal);
@@ -5056,7 +4639,7 @@ mod seeded_frame_tests {
             set,
             variable,
             variable,
-            &[PathOp::Attr(attribute.id.raw())],
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
         );
         let expectations = [
             (2, Some(2), vec![high, low]),
@@ -5116,7 +4699,7 @@ mod seeded_frame_tests {
             positive_set,
             start,
             end,
-            &[PathOp::Attr(attribute.id.raw())],
+            &[PathOp::Attr(attribute.id.raw()), PathOp::Plus],
         );
         let positive_node = RpqNode {
             source: None,
@@ -5194,7 +4777,7 @@ mod seeded_frame_tests {
             negated_set,
             start,
             end,
-            &[PathOp::NotAttr(excluded.id.raw())],
+            &[PathOp::NotAttr(excluded.id.raw()), PathOp::Plus],
         );
         let negated_node = RpqNode {
             source: None,
