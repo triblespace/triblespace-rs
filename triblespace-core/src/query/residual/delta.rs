@@ -3757,7 +3757,6 @@ struct ProgramSchedulerScratch {
     task_receipts: Vec<ProgramTaskReceipt>,
     work: Vec<ProgramWork>,
     receipt: ProgramBatchEffects,
-    fused_receipt: ProgramBatchEffects,
     receipt_local_observed_prefix: Vec<RawInline>,
     child_ranges: Vec<std::ops::Range<usize>>,
     direct_ranges: Vec<std::ops::Range<usize>>,
@@ -4543,24 +4542,33 @@ fn even_limits(work_budget: usize, task_count: usize) -> Vec<usize> {
     limits
 }
 
-fn validated_program_examined(
-    pages: &[ProgramPage],
-    receipt_local_fused_total: Option<usize>,
-) -> Vec<usize> {
-    let mut examined: Vec<_> = pages.iter().map(|page| page.examined).collect();
-    if let Some(total) = receipt_local_fused_total {
-        assert_eq!(
-            examined.len(),
-            1,
-            "receipt-local fusion must retain one affine input"
-        );
-        assert!(
-            total >= examined[0],
-            "receipt-local fused total fell below its final validated page"
-        );
-        examined[0] = total;
+fn retain_cumulative_program_examined(pages: &mut [ProgramPage], total: usize) {
+    let [page] = pages else {
+        panic!("receipt-local fusion must retain one affine input");
+    };
+    assert!(
+        total >= page.examined,
+        "receipt-local fused total fell below its final validated page"
+    );
+    page.examined = total;
+}
+
+fn account_program_call_telemetry(receipt: &ProgramBatchEffects, stats: &mut ResidualStateStats) {
+    stats.delta_source_pages += receipt.source_pages;
+    stats.delta_source_candidates_examined += receipt.source_examined;
+    stats.delta_source_roots += receipt.source_roots;
+    if receipt.source_pages > 0 {
+        stats.delta_source_cohorts += 1;
+        stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(receipt.source_pages);
     }
-    examined
+    stats.delta_transition_pages += receipt.transition_pages;
+    stats.delta_transition_candidates_examined += receipt.transition_examined;
+    if receipt.transition_pages > 0 {
+        stats.delta_transition_cohorts += 1;
+        stats.max_delta_transition_cohort = stats
+            .max_delta_transition_cohort
+            .max(receipt.transition_pages);
+    }
 }
 
 /// Which physical layer consumed one bounded backend call. Source misses are
@@ -6974,6 +6982,7 @@ impl DeltaScheduler {
                 "typed program exceeded one input's physical work budget"
             );
         }
+        account_program_call_telemetry(&scratch.receipt, stats);
 
         // A directed streaming activation with one unjoined producer may
         // consume an exact sole child before publishing the replacement
@@ -6990,18 +6999,8 @@ impl DeltaScheduler {
                 .registry
                 .program_credit_is_unjoined_unique(&scratch.task_receipts[0].credit);
         scratch.receipt_local_observed_prefix.clear();
-        scratch.fused_receipt.clear();
         let mut total_examined = scratch.receipt.pages[0].examined;
         let mut fused_steps = 0usize;
-        let mut source_cohorts = usize::from(scratch.receipt.source_pages > 0);
-        let mut max_source_cohort = scratch.receipt.source_pages;
-        let mut source_pages = scratch.receipt.source_pages;
-        let mut source_examined = scratch.receipt.source_examined;
-        let mut source_roots = scratch.receipt.source_roots;
-        let mut transition_cohorts = usize::from(scratch.receipt.transition_pages > 0);
-        let mut max_transition_cohort = scratch.receipt.transition_pages;
-        let mut transition_pages = scratch.receipt.transition_pages;
-        let mut transition_examined = scratch.receipt.transition_examined;
         while receipt_local_fusion && total_examined < limits[0] {
             let exact_tail = scratch.receipt.pages.len() == 1
                 && scratch.receipt.pages[0].examined > 0
@@ -7035,6 +7034,7 @@ impl DeltaScheduler {
             scratch.work.clear();
             scratch.work.push(child.work);
             let fused_limits = [remaining];
+            scratch.receipt.clear();
             spec.step_batch(
                 self.program_runtimes
                     .get_mut(&state)
@@ -7046,14 +7046,14 @@ impl DeltaScheduler {
                     work: &scratch.work,
                     limits: &fused_limits,
                 },
-                &mut scratch.fused_receipt,
+                &mut scratch.receipt,
             );
             assert_eq!(
-                scratch.fused_receipt.pages.len(),
+                scratch.receipt.pages.len(),
                 1,
                 "receipt-local typed Program returned the wrong page count"
             );
-            let examined = scratch.fused_receipt.pages[0].examined;
+            let examined = scratch.receipt.pages[0].examined;
             assert!(
                 examined <= remaining,
                 "receipt-local typed Program exceeded its remaining work budget"
@@ -7061,31 +7061,14 @@ impl DeltaScheduler {
             total_examined = total_examined
                 .checked_add(examined)
                 .expect("receipt-local Program examined-work count overflow");
-            source_cohorts += usize::from(scratch.fused_receipt.source_pages > 0);
-            max_source_cohort = max_source_cohort.max(scratch.fused_receipt.source_pages);
-            source_pages += scratch.fused_receipt.source_pages;
-            source_examined += scratch.fused_receipt.source_examined;
-            source_roots += scratch.fused_receipt.source_roots;
-            transition_cohorts += usize::from(scratch.fused_receipt.transition_pages > 0);
-            max_transition_cohort =
-                max_transition_cohort.max(scratch.fused_receipt.transition_pages);
-            transition_pages += scratch.fused_receipt.transition_pages;
-            transition_examined += scratch.fused_receipt.transition_examined;
-            std::mem::swap(&mut scratch.receipt, &mut scratch.fused_receipt);
-            scratch.fused_receipt.clear();
+            account_program_call_telemetry(&scratch.receipt, stats);
             fused_steps += 1;
         }
-        let validated_examined = validated_program_examined(
-            &scratch.receipt.pages,
-            receipt_local_fusion.then_some(total_examined),
-        );
+        if receipt_local_fusion {
+            retain_cumulative_program_examined(&mut scratch.receipt.pages, total_examined);
+        }
         let final_source_telemetry_cohort =
             scratch.receipt.source_pages > 0 && scratch.receipt.transition_pages == 0;
-        scratch.receipt.source_pages = source_pages;
-        scratch.receipt.source_examined = source_examined;
-        scratch.receipt.source_roots = source_roots;
-        scratch.receipt.transition_pages = transition_pages;
-        scratch.receipt.transition_examined = transition_examined;
         if fused_steps > 0 {
             stats.delta_program_receipt_local_fused_steps += fused_steps;
             stats.delta_program_receipt_local_refiles_avoided += fused_steps;
@@ -7120,22 +7103,8 @@ impl DeltaScheduler {
 
         // Source/transition naming remains family-reported telemetry; it is
         // never consulted for dispatch, novelty, or replacement semantics.
-        stats.delta_source_pages += scratch.receipt.source_pages;
-        stats.delta_source_candidates_examined += scratch.receipt.source_examined;
-        stats.delta_source_roots += scratch.receipt.source_roots;
         if !private_direct {
             stats.delta_source_direct_candidates += scratch.receipt.direct.len();
-        }
-        if scratch.receipt.source_pages > 0 {
-            stats.delta_source_cohorts += source_cohorts;
-            stats.max_delta_source_cohort = stats.max_delta_source_cohort.max(max_source_cohort);
-        }
-        stats.delta_transition_pages += scratch.receipt.transition_pages;
-        stats.delta_transition_candidates_examined += scratch.receipt.transition_examined;
-        if scratch.receipt.transition_pages > 0 {
-            stats.delta_transition_cohorts += transition_cohorts;
-            stats.max_delta_transition_cohort =
-                stats.max_delta_transition_cohort.max(max_transition_cohort);
         }
 
         // Physical pacing is revalidated by the typed adapter from canonical
@@ -7176,17 +7145,14 @@ impl DeltaScheduler {
             supported,
             ..
         } = receipt;
-        for (
-            input,
-            (((((task, page), child_range), direct_range), accepted_range), supported_range),
-        ) in task_receipts
-            .drain(..)
-            .zip(pages.drain(..))
-            .zip(child_ranges.drain(..))
-            .zip(direct_ranges.drain(..))
-            .zip(accepted_ranges.drain(..))
-            .zip(supported_ranges.drain(..))
-            .enumerate()
+        for (((((task, page), child_range), direct_range), accepted_range), supported_range) in
+            task_receipts
+                .drain(..)
+                .zip(pages.drain(..))
+                .zip(child_ranges.drain(..))
+                .zip(direct_ranges.drain(..))
+                .zip(accepted_ranges.drain(..))
+                .zip(supported_ranges.drain(..))
         {
             let ProgramTaskReceipt {
                 activation,
@@ -7226,7 +7192,7 @@ impl DeltaScheduler {
                 support_grant.is_some(),
                 "PositiveSupport dispatch lost or manufactured its affine work grant"
             );
-            let examined = validated_examined[input];
+            let examined = page.examined;
             if let Some(grant) = support_grant {
                 let parent = PositiveConfirmParentId {
                     brand: self.registry.brand,
@@ -7445,7 +7411,6 @@ impl DeltaScheduler {
                 let _ = terminal_publications.insert(activation);
             }
             effects.absorb(task_effects);
-            debug_assert!(input < row_count);
         }
 
         let mut runnable = Vec::with_capacity(tasks.len());
@@ -7492,7 +7457,6 @@ impl DeltaScheduler {
         scratch.activations.clear();
         scratch.work.clear();
         scratch.receipt.clear();
-        scratch.fused_receipt.clear();
         scratch.retired_activations.clear();
         self.program_scratch = Some(scratch);
         stats.delta_source_dead_pages += source_dead_pages;
@@ -7696,16 +7660,16 @@ mod tests {
 
     #[test]
     fn positive_exact_credit_uses_cumulative_receipt_local_fusion_work() {
-        let final_page = ProgramPage {
+        let mut final_page = [ProgramPage {
             examined: 1,
             resume: None,
-        };
-        let examined = validated_program_examined(&[final_page], Some(4));
-        assert_eq!(examined, [4]);
+        }];
+        retain_cumulative_program_examined(&mut final_page, 4);
+        assert_eq!(final_page[0].examined, 4);
 
         let mut budget = PositiveSupportWorkBudget::default();
         budget.mint_demand();
-        assert_eq!(budget.mint_exact(examined[0]), 4);
+        assert_eq!(budget.mint_exact(final_page[0].examined), 4);
         assert_eq!(
             (
                 budget.demand_minted,
