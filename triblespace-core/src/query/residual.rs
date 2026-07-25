@@ -9907,11 +9907,13 @@ impl ResidualStateMachine {
         let complete_terminal_candidate = terminal_streaming
             && admitted_parent_count > 1
             && self.uses_eager_terminal_phase()
-            && route.completion == ProgramCompletion::CompleteActionEquivalent;
+            && route.completion == ProgramCompletion::CompleteActionEquivalent
+            && false;
         let complete_wide_candidate = !terminal_streaming
             && self.width > 1
             && self.terminal_demand_width > 1
-            && route.completion == ProgramCompletion::CompleteActionEquivalent;
+            && route.completion == ProgramCompletion::CompleteActionEquivalent
+            && false;
         // A semantic Program certificate and independent physical evidence
         // jointly select this phase. Do not open sparse roots for the fresh
         // admitted suffix when both agree.
