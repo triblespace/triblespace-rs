@@ -1313,6 +1313,7 @@ impl FiniteFormulaProgram {
         let mut completed = focused;
         let mut current = cursor.pc;
         let mut direct_or = None;
+        let mut transparent_to_or = true;
         while let Some(return_to) = formula_pcs.get(current).return_to {
             let address = formula_pcs.return_by_id(return_to);
             if address.kind != FormulaReturnKind::Child {
@@ -1339,6 +1340,9 @@ impl FiniteFormulaProgram {
                         if child == address.child || done.contains(child) {
                             continue;
                         }
+                        if direct_or.is_none() {
+                            transparent_to_or = false;
+                        }
                         let streamability =
                             self.confirm_subtree_streamability(node, exit.variable, bound);
                         if streamability != FormulaProposalStreamability::Linear {
@@ -1347,7 +1351,7 @@ impl FiniteFormulaProgram {
                     }
                 }
                 FiniteFormulaNodeKind::Or { children }
-                    if current == cursor.pc && direct_or.is_none() =>
+                    if direct_or.is_none() && transparent_to_or =>
                 {
                     assert_eq!(children[address.child], completed);
                     direct_or = Some(address.parent);
