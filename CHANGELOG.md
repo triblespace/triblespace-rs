@@ -400,6 +400,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only after every page, tag, rank, budget, and raw-effect law succeeds. Existing
   and repeated keys no longer pay a second admission lookup, while endpoint
   stability, affine handle publication, and no-prefix failure remain exact.
+- **Receipt-local Program chains reuse one validated effects buffer.** Per-call
+  source and transition telemetry folds directly into scheduler statistics,
+  while the final affine page retains the chain's cumulative examined work.
+  This removes the shadow receipt, telemetry accumulators, and examined-work
+  side vector without changing fusion eligibility, work grants, or effect
+  order.
 - **Fresh positive typed RPQ cohorts use an exact-all-fit PATCH traversal.**
   When every activation starts at its initial cursor, every frontier branch is
   positive forward/inverse attribute traversal, and each exact fanout fits its
