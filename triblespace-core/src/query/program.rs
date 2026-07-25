@@ -97,28 +97,6 @@ pub struct ProgramRequest {
     pub bound: VariableSet,
 }
 
-/// Action-specific physical grouping preference carried by a constructed route.
-///
-/// Both variants have the same SET-valued query semantics. This hint controls
-/// only whether the scheduler may split an already admitted candidate relation
-/// before entering one typed program activation.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProgramGrouping {
-    /// Candidate pages may enter independent program activations.
-    PageLocal,
-    /// Keep one parent's complete admitted candidate relation in one activation.
-    ///
-    /// This is an activation-reuse request, not a semantic admission law:
-    /// splitting would remain correct, but could repeat family-local traversal
-    /// or destroy useful shared continuation state. The current scheduler
-    /// discovers this preference by probing `Confirm(variable)` with all other
-    /// variables owned by the same constraint family bound. A family must keep
-    /// that physical preference compatible as the ambient bound schema grows.
-    /// Repeated RPQ confirmation uses it to amortize graph-product traversal.
-    ParentAtomic,
-}
-
 /// Structural route selected by an immutable program spec for one action.
 ///
 /// Returning a route certifies that typed novelty computes a least fixpoint for
@@ -131,7 +109,6 @@ pub enum ProgramGrouping {
 pub struct ProgramRoute {
     /// Variable naming the structural graph-product operator.
     pub variable: VariableId,
-    pub grouping: ProgramGrouping,
 }
 
 /// Row block used to construct initial typed work handles.
@@ -464,10 +441,22 @@ pub trait TypedProgramSpec {
 
     /// Selects one structural action route.
     ///
-    /// In addition to being stable for the solve, confirmation routes obey
-    /// [`ProgramGrouping`]'s V1 family-local planning contract. The returned
-    /// route supplies planning and seed metadata, not an enduring runtime
-    /// identity.
+    /// A selected `Confirm` route owns the complete SET-admitted candidate
+    /// relation for each parent in one activation. Ordinary
+    /// [`Constraint`](super::Constraint) confirmation remains independently
+    /// pageable; selecting a typed Program is the structural request for
+    /// activation-local recurrence and reuse.
+    ///
+    /// The residual planner discovers confirmation routes by probing with
+    /// every other variable owned by the exposing Constraint bound. Once that
+    /// family-local schema is present, route presence must be invariant under
+    /// adding bound variables outside the exposing
+    /// [`Constraint::variables`](super::Constraint::variables) set. Runtime
+    /// checks enforce this contract before any candidate page enters a typed
+    /// activation.
+    ///
+    /// The returned route supplies planning and seed metadata, not an enduring
+    /// runtime identity.
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute>;
 
     /// Certifies that the selected exact Confirm Program physically dominates
@@ -1460,10 +1449,7 @@ mod tests {
         type Rank = u64;
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
-            Some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            Some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -1514,10 +1500,7 @@ mod tests {
         type Rank = u64;
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
-            Some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            Some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -1593,10 +1576,7 @@ mod tests {
         type Rank = u64;
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
-            Some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            Some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -1661,10 +1641,7 @@ mod tests {
         type Rank = u64;
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
-            Some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            Some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -1744,10 +1721,7 @@ mod tests {
         type Rank = u64;
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
-            Some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            Some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -1789,10 +1763,7 @@ mod tests {
         type Rank = u64;
 
         fn route(&self, _request: ProgramRequest) -> Option<ProgramRoute> {
-            Some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            Some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {

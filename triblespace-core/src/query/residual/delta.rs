@@ -7729,10 +7729,8 @@ mod tests {
         type Rank = u64;
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            matches!(request.action, ProgramAction::Propose(0))
+                .then_some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -7813,37 +7811,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn one_occurrence_variable_has_one_runtime_across_route_groupings() {
-        let root = ZeroProgressProgram;
-        let spec = ProgramRef::new(&root);
-        let desc = DeltaDesc::leaf(0, 7);
-        let mut scheduler = DeltaScheduler::new();
-        let page_state = scheduler.prepare_program(
-            desc.clone(),
-            ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            },
-            spec,
-        );
-        let atomic_state = scheduler.prepare_program(
-            desc.clone(),
-            ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::ParentAtomic,
-            },
-            spec,
-        );
-
-        assert_eq!(atomic_state, page_state);
-        assert_eq!(scheduler.program_runtimes.len(), 1);
-        assert_eq!(
-            scheduler.interner.program(page_state),
-            Some(&ProgramAddress::Constraint(desc))
-        );
-    }
-
     #[derive(Clone, Copy)]
     struct OneShotSupportState {
         keep_cleanup_live: bool,
@@ -7860,10 +7827,7 @@ mod tests {
         type Rank = u8;
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            matches!(request.action, ProgramAction::Support).then_some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            matches!(request.action, ProgramAction::Support).then_some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -8717,10 +8681,8 @@ mod tests {
         type Rank = u8;
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            matches!(request.action, ProgramAction::Propose(0)).then_some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            matches!(request.action, ProgramAction::Propose(0))
+                .then_some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, state: &Self::State) -> DispatchClass {
@@ -13029,10 +12991,7 @@ mod tests {
     #[test]
     fn singleton_program_lease_selects_one_lineage_inside_the_canonical_bucket() {
         let mut scheduler = DeltaScheduler::new();
-        let route = ProgramRoute {
-            variable: 0,
-            grouping: ProgramGrouping::PageLocal,
-        };
+        let route = ProgramRoute { variable: 0 };
         let state = scheduler
             .interner
             .intern_program(ProgramAddress::new(DeltaDesc::leaf(0, 0), route));
@@ -13105,10 +13064,7 @@ mod tests {
     }
 
     fn test_program_state(scheduler: &mut DeltaScheduler) -> DeltaStateId {
-        let route = ProgramRoute {
-            variable: 0,
-            grouping: ProgramGrouping::PageLocal,
-        };
+        let route = ProgramRoute { variable: 0 };
         scheduler
             .interner
             .intern_program(ProgramAddress::new(DeltaDesc::leaf(0, 0), route))
@@ -13313,10 +13269,7 @@ mod tests {
     fn scheduler_clone_does_not_resurrect_inactive_program_bucket_capacity() {
         let mut scheduler = DeltaScheduler::new();
         let dormant_state = test_program_state(&mut scheduler);
-        let active_route = ProgramRoute {
-            variable: 0,
-            grouping: ProgramGrouping::PageLocal,
-        };
+        let active_route = ProgramRoute { variable: 0 };
         let active_state = scheduler
             .interner
             .intern_program(ProgramAddress::new(DeltaDesc::leaf(0, 1), active_route));
@@ -13764,10 +13717,8 @@ mod tests {
         type Rank = u8;
 
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            matches!(request.action, ProgramAction::Confirm(0)).then_some(ProgramRoute {
-                variable: 0,
-                grouping: ProgramGrouping::PageLocal,
-            })
+            matches!(request.action, ProgramAction::Confirm(0))
+                .then_some(ProgramRoute { variable: 0 })
         }
 
         fn dispatch(&self, _state: &Self::State) -> DispatchClass {
@@ -14695,10 +14646,7 @@ mod tests {
     #[test]
     fn terminal_program_pop_funds_the_hot_activation_without_cross_quantum_averaging() {
         let mut scheduler = DeltaScheduler::new();
-        let route = ProgramRoute {
-            variable: 0,
-            grouping: ProgramGrouping::PageLocal,
-        };
+        let route = ProgramRoute { variable: 0 };
         let state = scheduler
             .interner
             .intern_program(ProgramAddress::new(DeltaDesc::leaf(0, 0), route));

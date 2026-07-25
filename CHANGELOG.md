@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   type, making recurrent root and child construction impossible through their
   safe typed effect sinks. Ranked finite spines inside a recurrent Machine,
   including the unkeyed same-variable RPQ source pager, remain supported.
+- **Breaking: selected Program confirmations have one structural activation
+  law.** `ProgramGrouping`, `PageLocal`, and `ParentAtomic` are removed from
+  `ProgramRoute`. Every selected typed `Confirm` owns one complete SET-admitted
+  candidate relation per parent, preserving activation-local recurrence and
+  traversal reuse; ordinary `Constraint` confirmation remains independently
+  occurrence-pageable. The planner derives the barrier from family-local route
+  presence, whose availability must remain invariant when unrelated ambient
+  variables become bound.
 - **Breaking: typed Programs now erase exactly one semantic family and execute
   one native step.** The never-used `PreferredProgram` left-biased
   composition, route-arm addresses, generic physical-step negotiation,
@@ -98,10 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proposed `(parent, value)` is SET-admitted before its first independent
   split; a confirmer may vary conservative false positives by page while
   preserving every true support and becoming exact once its peers are bound.
-  Formula OR retains its live-frame payload barrier, and repeated RPQ
-  `ParentAtomic` grouping remains only a typed Program activation-reuse hint,
-  not a stronger semantic law. Positive Confirm publication now uses an exact
-  relational-prefix receipt rather than historical SET-boundary crossing.
+  Formula OR retains its live-frame payload barrier, and a selected typed
+  Program Confirm retains one complete parent activation for physical reuse,
+  not as a stronger semantic law. Positive Confirm publication now uses an
+  exact relational-prefix receipt rather than historical SET-boundary
+  crossing.
 - **Compiled Formula proposals now record whether their outer self-confirm
   obligation is discharged.** The private boolean records that no later
   self-confirm is required—whether by an Exact source proof or validation

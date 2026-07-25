@@ -10,10 +10,10 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::{ResidualShadowEpoch, ResidualShadowStatus};
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramGrouping, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
-    ProposalCoverage, Query, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction, ProgramPacing,
+    ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch, ProposalCoverage, Query, RowsView,
+    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable,
+    VariableId, VariableSet,
 };
 
 const START: VariableId = 0;
@@ -247,26 +247,17 @@ impl TypedProgramSpec for AlternatingClosure {
     type Rank = [u64; 2];
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let grouping = match request.action {
-            ProgramAction::Propose(variable)
+        match request.action {
+            ProgramAction::Propose(variable) | ProgramAction::Confirm(variable)
                 if variable == END && request.bound.is_set(START) && !request.bound.is_set(END) =>
             {
-                ProgramGrouping::PageLocal
-            }
-            ProgramAction::Confirm(variable)
-                if variable == END && request.bound.is_set(START) && !request.bound.is_set(END) =>
-            {
-                ProgramGrouping::ParentAtomic
+                Some(ProgramRoute { variable: END })
             }
             ProgramAction::Support if request.bound.is_set(START) && request.bound.is_set(END) => {
-                ProgramGrouping::ParentAtomic
+                Some(ProgramRoute { variable: END })
             }
-            _ => return None,
-        };
-        Some(ProgramRoute {
-            variable: END,
-            grouping,
-        })
+            _ => None,
+        }
     }
 
     fn dispatch(&self, state: &Self::State) -> DispatchClass {
