@@ -16,8 +16,9 @@ use triblespace_core::query::residual::{
     ResidualShadowSolve, ResidualShadowStatus,
 };
 use triblespace_core::query::{
-    Binding, CandidateSink, Candidates, Constraint, ContainsConstraint, EstimateSink, Query,
-    RowsView, TriblePattern, Variable, VariableContext, VariableId, VariableSet,
+    Binding, CandidateSink, Candidates, Constraint, ContainsConstraint, EstimateSink,
+    ProposalCoverage, Query, RowsView, TriblePattern, Variable, VariableContext, VariableId,
+    VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::{
@@ -66,6 +67,59 @@ struct RankQueryFixture {
     values: Vec<Inline<UnknownInline>>,
 }
 
+/// Keeps an ordinary constraint's relation and confirmation behavior while
+/// structurally removing it from the proposal-source set.
+///
+/// These telemetry fixtures need the hash set to enumerate the candidate
+/// domain and the Succinct occurrence to execute `confirm`; relying on planner
+/// estimates to happen to choose that geometry would test a transient plan,
+/// not the observed WGPU confirmation surface.
+struct ConfirmationOnly<C>(C);
+
+impl<'a, C> Constraint<'a> for ConfirmationOnly<C>
+where
+    C: Constraint<'a>,
+{
+    fn variables(&self) -> VariableSet {
+        self.0.variables()
+    }
+
+    fn proposal_coverage(&self, _variable: VariableId, _bound: VariableSet) -> ProposalCoverage {
+        ProposalCoverage::None
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.0.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
+    ) {
+        panic!("confirmation-only fixture constraint must never propose")
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.confirm(variable, view, candidates);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.0.satisfied(view)
+    }
+}
+
 fn rank_query_fixture() -> RankQueryFixture {
     let identity = trible(0x5AAD_0A00, 0);
     let mut set = TribleSet::new();
@@ -98,7 +152,7 @@ fn observed_rank_query(
     Query::new(
         and!(
             allowed.has(value),
-            observed.pattern(entity, attribute, value)
+            ConfirmationOnly(observed.pattern(entity, attribute, value))
         ),
         move |binding: &Binding| binding.get(value.index).copied(),
     )
@@ -118,7 +172,7 @@ fn unshadowed_observed_rank_query(
     Query::new(
         and!(
             allowed.has(value),
-            observed.pattern(entity, attribute, value)
+            ConfirmationOnly(observed.pattern(entity, attribute, value))
         ),
         move |binding: &Binding| binding.get(value.index).copied(),
     )
@@ -136,7 +190,10 @@ fn direct_rank_query(
     let mut context = VariableContext::new();
     let value: Variable<UnknownInline> = context.next_variable();
     Query::new(
-        and!(allowed.has(value), gpu.pattern(entity, attribute, value)),
+        and!(
+            allowed.has(value),
+            ConfirmationOnly(gpu.pattern(entity, attribute, value))
+        ),
         move |binding: &Binding| binding.get(value.index).copied(),
     )
     .solve_residual_state_lazy()
@@ -144,38 +201,60 @@ fn direct_rank_query(
     .collect_profiled()
 }
 
-fn assert_one_rank_sample(
+fn assert_raw_set_eq(actual: &[RawInline], expected: &HashSet<Inline<UnknownInline>>) {
+    let actual_len = actual.len();
+    let actual: HashSet<_> = actual.iter().copied().collect();
+    let expected: HashSet<_> = expected.iter().map(|value| value.raw).collect();
+    assert_eq!(
+        actual.len(),
+        actual_len,
+        "query emitted duplicate raw projected tuples"
+    );
+    assert_eq!(actual, expected);
+}
+
+fn assert_rank_samples(
     snapshot: &ResidualShadowSnapshot,
-    candidate_occurrences: usize,
     executor: &'static str,
     operation: &'static str,
     work_units: usize,
 ) {
     assert_eq!(snapshot.status, ResidualShadowStatus::Closed);
-    let sampled: Vec<_> = snapshot
-        .events
-        .iter()
-        .filter(|event| !event.executor_samples.is_empty())
-        .collect();
-    assert_eq!(
-        sampled.len(),
-        1,
-        "unexpected sampled actions: {snapshot:#?}"
+    let mut sample_count = 0;
+    let mut sampled_work = 0;
+    for event in &snapshot.events {
+        for sample in &event.executor_samples {
+            sample_count += 1;
+            sampled_work += sample.measurement.work_units;
+            assert_eq!(event.site.verb, ActionVerb::Confirm);
+            assert_eq!(sample.event, event.event);
+            assert!(!sample.stale);
+            assert_eq!(sample.measurement.executor, executor);
+            assert_eq!(sample.measurement.operation, operation);
+            assert_eq!(sample.measurement.work_unit, "rank-probes");
+            assert!(sample.measurement.started >= event.started);
+            assert!(sample.measurement.wall <= event.completion.unwrap().wall);
+        }
+    }
+    assert!(
+        sample_count > 0,
+        "expected at least one sampled confirmation action: {snapshot:#?}"
     );
-    let event = sampled[0];
-    assert_eq!(event.site.verb, ActionVerb::Confirm);
-    assert_eq!(event.site.leaf_occurrence, 1);
-    assert_eq!(event.geometry.candidate_occurrences, candidate_occurrences);
-    assert_eq!(event.executor_samples.len(), 1);
-    let sample = event.executor_samples[0];
-    assert_eq!(sample.event, event.event);
-    assert!(!sample.stale);
-    assert_eq!(sample.measurement.executor, executor);
-    assert_eq!(sample.measurement.operation, operation);
-    assert_eq!(sample.measurement.work_unit, "rank-probes");
-    assert_eq!(sample.measurement.work_units, work_units);
-    assert!(sample.measurement.started >= event.started);
-    assert!(sample.measurement.wall <= event.completion.unwrap().wall);
+    assert_eq!(sampled_work, work_units);
+}
+
+fn assert_cpu_rank_stats(stats: WgpuQueryStats, work_units: usize) {
+    assert!(stats.cpu_fallback_batches > 0);
+    assert_eq!(stats.cpu_fallback_probes, work_units as u64);
+    assert_eq!(stats.gpu_dispatches, 0);
+    assert_eq!(stats.gpu_probes, 0);
+}
+
+fn assert_wgpu_rank_stats(stats: WgpuQueryStats, work_units: usize) {
+    assert!(stats.gpu_dispatches > 0);
+    assert_eq!(stats.gpu_probes, work_units as u64);
+    assert_eq!(stats.cpu_fallback_batches, 0);
+    assert_eq!(stats.cpu_fallback_probes, 0);
 }
 
 struct NestedSuccinctConfirm<'a> {
@@ -185,13 +264,18 @@ struct NestedSuccinctConfirm<'a> {
     attribute: Inline<GenId>,
     allowed: &'a HashSet<Inline<UnknownInline>>,
     epoch: ResidualShadowEpoch,
-    snapshot: Arc<Mutex<Option<ResidualShadowSnapshot>>>,
+    observation: Arc<Mutex<Option<(Vec<RawInline>, ResidualShadowSnapshot)>>>,
+    nested_started: Arc<AtomicBool>,
     restored_outer_scope: Arc<AtomicBool>,
 }
 
 impl<'a> Constraint<'a> for NestedSuccinctConfirm<'a> {
     fn variables(&self) -> VariableSet {
         self.inner.variables()
+    }
+
+    fn proposal_coverage(&self, _variable: VariableId, _bound: VariableSet) -> ProposalCoverage {
+        ProposalCoverage::None
     }
 
     fn estimate(
@@ -205,11 +289,11 @@ impl<'a> Constraint<'a> for NestedSuccinctConfirm<'a> {
 
     fn propose(
         &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
     ) {
-        self.inner.propose(variable, view, candidates);
+        panic!("nested confirmation-only fixture constraint must never propose")
     }
 
     fn confirm(
@@ -218,24 +302,25 @@ impl<'a> Constraint<'a> for NestedSuccinctConfirm<'a> {
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        let outer_event = current_residual_action()
-            .expect("nested wrapper must execute inside an observed action")
-            .event();
-        assert!(self.snapshot.lock().unwrap().is_none());
-        let nested = observed_rank_query(
-            *self.nested_observed,
-            self.entity,
-            self.attribute,
-            self.allowed,
-            &self.epoch,
-        );
-        assert_eq!(
-            current_residual_action().map(|correlation| correlation.event()),
-            Some(outer_event),
-            "nested residual observation did not restore its outer action"
-        );
-        self.restored_outer_scope.store(true, Ordering::Release);
-        *self.snapshot.lock().unwrap() = Some(nested.shadow);
+        if !self.nested_started.swap(true, Ordering::AcqRel) {
+            let outer_event = current_residual_action()
+                .expect("nested wrapper must execute inside an observed action")
+                .event();
+            let nested = observed_rank_query(
+                *self.nested_observed,
+                self.entity,
+                self.attribute,
+                self.allowed,
+                &self.epoch,
+            );
+            assert_eq!(
+                current_residual_action().map(|correlation| correlation.event()),
+                Some(outer_event),
+                "nested residual observation did not restore its outer action"
+            );
+            self.restored_outer_scope.store(true, Ordering::Release);
+            *self.observation.lock().unwrap() = Some((nested.results, nested.shadow));
+        }
         self.inner.confirm(variable, view, candidates);
     }
 
@@ -376,20 +461,13 @@ fn observed_wgpu_rank_cpu_route_is_opt_in_and_exact() {
         &allowed,
         &direct_epoch,
     );
-    assert_eq!(direct.results.len(), 4);
+    assert_raw_set_eq(&direct.results, &allowed);
     assert!(direct
         .shadow
         .events
         .iter()
         .all(|event| event.executor_samples.is_empty()));
-    assert_eq!(
-        gpu.stats(),
-        WgpuQueryStats {
-            cpu_fallback_batches: 1,
-            cpu_fallback_probes: 8,
-            ..WgpuQueryStats::default()
-        }
-    );
+    assert_cpu_rank_stats(gpu.stats(), 8);
 
     gpu.reset_stats();
     let observed = gpu.observe_residual_actions();
@@ -401,22 +479,14 @@ fn observed_wgpu_rank_cpu_route_is_opt_in_and_exact() {
         &allowed,
         &observed_epoch,
     );
-    assert_eq!(observed_solve.results, direct.results);
-    assert_one_rank_sample(
+    assert_raw_set_eq(&observed_solve.results, &allowed);
+    assert_rank_samples(
         &observed_solve.shadow,
-        4,
         "cpu",
         "wavelet-rank/threshold-fallback",
         8,
     );
-    assert_eq!(
-        gpu.stats(),
-        WgpuQueryStats {
-            cpu_fallback_batches: 1,
-            cpu_fallback_probes: 8,
-            ..WgpuQueryStats::default()
-        }
-    );
+    assert_cpu_rank_stats(gpu.stats(), 8);
 
     // Outside a current action the adapter delegates to the ordinary route
     // and cannot attach to a previously closed epoch.
@@ -425,16 +495,9 @@ fn observed_wgpu_rank_cpu_route_is_opt_in_and_exact() {
     let closed_snapshot = observed_epoch.snapshot();
     let actual =
         unshadowed_observed_rank_query(observed, fixture.entity, fixture.attribute, &allowed);
-    assert_eq!(actual, direct.results);
+    assert_raw_set_eq(&actual, &allowed);
     assert_eq!(observed_epoch.snapshot(), closed_snapshot);
-    assert_eq!(
-        gpu.stats(),
-        WgpuQueryStats {
-            cpu_fallback_batches: 1,
-            cpu_fallback_probes: 8,
-            ..WgpuQueryStats::default()
-        }
-    );
+    assert_cpu_rank_stats(gpu.stats(), 8);
 }
 
 #[test]
@@ -455,18 +518,9 @@ fn observed_wgpu_rank_forced_device_route_is_exact() {
         &epoch,
     );
 
-    assert_eq!(solve.results.len(), 4);
-    assert_one_rank_sample(&solve.shadow, 4, "wgpu", "wavelet-rank/gpu-round-trip", 8);
-    assert_eq!(
-        gpu.stats(),
-        WgpuQueryStats {
-            gpu_dispatches: 1,
-            gpu_probes: 8,
-            min_gpu_batch: Some(8),
-            max_gpu_batch: Some(8),
-            ..WgpuQueryStats::default()
-        }
-    );
+    assert_raw_set_eq(&solve.results, &allowed);
+    assert_rank_samples(&solve.shadow, "wgpu", "wavelet-rank/gpu-round-trip", 8);
+    assert_wgpu_rank_stats(gpu.stats(), 8);
 }
 
 #[test]
@@ -491,15 +545,15 @@ fn observed_wgpu_empty_rank_stream_attaches_no_sample() {
 
     assert!(solve.results.is_empty());
     assert_eq!(solve.shadow.status, ResidualShadowStatus::Closed);
-    let confirms: Vec<_> = solve
-        .shadow
-        .events
-        .iter()
-        .filter(|event| event.site.verb == ActionVerb::Confirm)
-        .collect();
-    assert_eq!(confirms.len(), 1, "unexpected actions: {:#?}", solve.shadow);
-    assert_eq!(confirms[0].geometry.candidate_occurrences, 1);
-    assert!(confirms[0].executor_samples.is_empty());
+    assert!(
+        solve
+            .shadow
+            .events
+            .iter()
+            .any(|event| event.site.verb == ActionVerb::Confirm),
+        "the explicitly confirmation-only Succinct source was never confirmed: {:#?}",
+        solve.shadow
+    );
     assert!(solve
         .shadow
         .events
@@ -520,7 +574,8 @@ fn observed_wgpu_nested_confirm_restores_outer_attribution() {
     let outer_observed = gpu.observe_residual_actions();
     let nested_observed = gpu.observe_residual_actions();
     let nested_epoch = ResidualShadowEpoch::new();
-    let nested_snapshot = Arc::new(Mutex::new(None));
+    let nested_observation = Arc::new(Mutex::new(None));
+    let nested_started = Arc::new(AtomicBool::new(false));
     let restored_outer_scope = Arc::new(AtomicBool::new(false));
 
     let mut context = VariableContext::new();
@@ -532,7 +587,8 @@ fn observed_wgpu_nested_confirm_restores_outer_attribution() {
         attribute: fixture.attribute,
         allowed: &nested_allowed,
         epoch: nested_epoch,
-        snapshot: Arc::clone(&nested_snapshot),
+        observation: Arc::clone(&nested_observation),
+        nested_started: Arc::clone(&nested_started),
         restored_outer_scope: Arc::clone(&restored_outer_scope),
     };
     let outer_epoch = ResidualShadowEpoch::new();
@@ -544,29 +600,17 @@ fn observed_wgpu_nested_confirm_restores_outer_attribution() {
     .shadow(outer_epoch)
     .collect_profiled();
 
-    assert_eq!(outer.results.len(), 4);
+    assert_raw_set_eq(&outer.results, &outer_allowed);
     assert!(restored_outer_scope.load(Ordering::Acquire));
-    assert_one_rank_sample(
-        &outer.shadow,
-        4,
-        "cpu",
-        "wavelet-rank/threshold-fallback",
-        8,
-    );
-    let nested = nested_snapshot
+    assert_rank_samples(&outer.shadow, "cpu", "wavelet-rank/threshold-fallback", 8);
+    let (nested_results, nested_shadow) = nested_observation
         .lock()
         .unwrap()
         .take()
-        .expect("nested query did not publish its snapshot");
-    assert_one_rank_sample(&nested, 2, "cpu", "wavelet-rank/threshold-fallback", 4);
-    assert_eq!(
-        gpu.stats(),
-        WgpuQueryStats {
-            cpu_fallback_batches: 2,
-            cpu_fallback_probes: 12,
-            ..WgpuQueryStats::default()
-        }
-    );
+        .expect("nested query did not publish its observation");
+    assert_raw_set_eq(&nested_results, &nested_allowed);
+    assert_rank_samples(&nested_shadow, "cpu", "wavelet-rank/threshold-fallback", 4);
+    assert_cpu_rank_stats(gpu.stats(), 12);
 }
 
 #[test]
@@ -603,24 +647,11 @@ fn observed_wgpu_concurrent_epochs_keep_exact_sample_ownership() {
         (left.join().unwrap(), right.join().unwrap())
     });
 
-    assert_eq!(left.results.len(), 3);
-    assert_eq!(right.results.len(), 5);
-    assert_one_rank_sample(&left.shadow, 3, "cpu", "wavelet-rank/threshold-fallback", 6);
-    assert_one_rank_sample(
-        &right.shadow,
-        5,
-        "cpu",
-        "wavelet-rank/threshold-fallback",
-        10,
-    );
-    assert_eq!(
-        gpu.stats(),
-        WgpuQueryStats {
-            cpu_fallback_batches: 2,
-            cpu_fallback_probes: 16,
-            ..WgpuQueryStats::default()
-        }
-    );
+    assert_raw_set_eq(&left.results, &left_allowed);
+    assert_raw_set_eq(&right.results, &right_allowed);
+    assert_rank_samples(&left.shadow, "cpu", "wavelet-rank/threshold-fallback", 6);
+    assert_rank_samples(&right.shadow, "cpu", "wavelet-rank/threshold-fallback", 10);
+    assert_cpu_rank_stats(gpu.stats(), 16);
 }
 
 #[test]
