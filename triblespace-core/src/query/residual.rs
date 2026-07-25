@@ -2388,8 +2388,8 @@ pub struct ResidualStateStats {
     /// partially survived. These pops deliberately bypass global occupancy
     /// harvesting without changing canonical state identity.
     pub continuation_pops: usize,
-    /// Continuation-cohort pops whose coalesced receipt occupancy was smaller
-    /// than the current desired width.
+    /// Continuation-cohort pops whose selected chunk was smaller than the
+    /// current desired width.
     pub underfilled_continuation_pops: usize,
     /// Pops that left unprocessed parent rows or candidate occurrences live
     /// under the same state.
@@ -10838,7 +10838,7 @@ impl ResidualStateMachine {
         if mode == ContinuationMode::ProbeOne {
             self.stats.delta_handoff_probe_pops += 1;
         }
-        if cohort_occupancy < width {
+        if take < width {
             self.stats.underfilled_continuation_pops += 1;
         }
         SelectedResidualTask {
@@ -28730,6 +28730,7 @@ mod tests {
         assert_eq!(remainder.rows, [10, 11, 12, 13].map(raw));
         assert_eq!(remainder.row_count, 4);
         assert_eq!(machine.stats.continuation_pops, 1);
+        assert_eq!(machine.stats.underfilled_continuation_pops, 0);
         assert_eq!(machine.stats.partial_pops, 1);
     }
 
@@ -28953,7 +28954,7 @@ mod tests {
         assert_eq!(machine.stats.delta_handoff_probe_pops, 1);
         assert_eq!(missed.stats.delta_handoff_probe_pops, 1);
         assert_eq!(machine.stats.underfilled_continuation_pops, 1);
-        assert_eq!(missed.stats.underfilled_continuation_pops, 0);
+        assert_eq!(missed.stats.underfilled_continuation_pops, 1);
     }
 
     #[test]
