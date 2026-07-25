@@ -823,16 +823,20 @@ fn prefixed_formula_bound_start_root(
     let end_var = Variable::<GenId>::new(END);
     let cyclic =
         Box::new(RegularPathConstraint::new(set, start_var, end_var, ops)) as DynConstraint;
-    let mut arms: Vec<DynConstraint> = prefix
-        .into_iter()
-        .map(|value| {
-            Box::new(IntersectionConstraint::new(vec![
-                Box::new(start_var.is(start)) as DynConstraint,
-                Box::new(end_var.is(Inline::<GenId>::new(value))) as DynConstraint,
-            ])) as DynConstraint
-        })
-        .collect();
-    arms.push(cyclic);
+    // This exact arm deliberately has no paged proposal source. It therefore
+    // reaches OR admission as one finite pending set, so the later cyclic arm
+    // must promote its duplicate through the online channel rather than
+    // merely winning first admission itself.
+    let finite = Box::new(IntersectionConstraint::new(vec![
+        Box::new(start_var.is(start)) as DynConstraint,
+        Box::new(OrderedDomain {
+            variable: END,
+            gate: START,
+            unbound_estimate: prefix.len(),
+            values: prefix,
+        }) as DynConstraint,
+    ])) as DynConstraint;
+    let arms = vec![finite, cyclic];
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(start_var.is(start)) as DynConstraint,
         Box::new(UnionConstraint::new(arms)) as DynConstraint,
