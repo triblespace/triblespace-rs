@@ -12140,7 +12140,6 @@ mod tests {
         fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
             matches!(request.action, ProgramAction::Confirm(variable) if variable == self.0.variable)
                 .then_some(ProgramRoute {
-                    key: ProgramKey::new(0),
                     variable: self.0.variable,
                     grouping: ProgramGrouping::ParentAtomic,
                 })

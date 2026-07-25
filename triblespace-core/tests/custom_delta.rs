@@ -11,9 +11,9 @@ use triblespace_core::query::residual::{ResidualShadowEpoch, ResidualShadowStatu
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute,
-    ProgramSeedBatch, ProposalCoverage, Query, RowsView, TypedEffectSink, TypedProgramBatch,
-    TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
+    ProgramGrouping, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
+    ProposalCoverage, Query, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
+    TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
 };
 
 const START: VariableId = 0;
@@ -247,24 +247,23 @@ impl TypedProgramSpec for AlternatingClosure {
     type Rank = [u64; 2];
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let (key, grouping) = match request.action {
+        let grouping = match request.action {
             ProgramAction::Propose(variable)
                 if variable == END && request.bound.is_set(START) && !request.bound.is_set(END) =>
             {
-                (ProgramKey::new(0), ProgramGrouping::PageLocal)
+                ProgramGrouping::PageLocal
             }
             ProgramAction::Confirm(variable)
                 if variable == END && request.bound.is_set(START) && !request.bound.is_set(END) =>
             {
-                (ProgramKey::new(1), ProgramGrouping::ParentAtomic)
+                ProgramGrouping::ParentAtomic
             }
             ProgramAction::Support if request.bound.is_set(START) && request.bound.is_set(END) => {
-                (ProgramKey::new(2), ProgramGrouping::ParentAtomic)
+                ProgramGrouping::ParentAtomic
             }
             _ => return None,
         };
         Some(ProgramRoute {
-            key,
             variable: END,
             grouping,
         })
