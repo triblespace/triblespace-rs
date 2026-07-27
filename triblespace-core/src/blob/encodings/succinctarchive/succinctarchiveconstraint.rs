@@ -95,6 +95,15 @@ where
 /// internally; this one exists to skip building the probe vectors at all.
 const MIN_BATCHED_CONFIRM: usize = 8;
 
+/// Candidates marshalled into one batched descent at a time.
+///
+/// Regions run to hundreds of thousands of candidates, and resolving a whole
+/// one up front would allocate megabytes per confirm and push the wavelet
+/// layers out of cache before the descent touches them. Chunking bounds that
+/// while still handing the descent far more independent probes than the
+/// memory system can keep in flight.
+const CONFIRM_CHUNK: usize = 1024;
+
 /// Kills every candidate that does not occur within row range `r` of `c`.
 ///
 /// This is the terminal step of every range-restricting `confirm` arm, and
@@ -127,7 +136,8 @@ fn retain_occurring_in<U>(
         return;
     }
 
-    let live = (0..cands.len()).filter(|&i| cands.is_live(i)).count();
+    let n = cands.len();
+    let live = (0..n).filter(|&i| cands.is_live(i)).count();
     if live < MIN_BATCHED_CONFIRM {
         cands.retain(|v| match domain.search(v) {
             Some(d) => c.rank_range(r.clone(), d).unwrap_or(0) != 0,
@@ -136,39 +146,53 @@ fn retain_occurring_in<U>(
         return;
     }
 
-    // Resolve every live candidate to a domain index first, so the batched
-    // descent sees one contiguous probe stream.
-    let mut idx = Vec::with_capacity(live);
-    let mut ds = Vec::with_capacity(live);
-    let mut absent = Vec::new();
-    {
-        let values = cands.values();
-        for i in 0..values.len() {
-            if !cands.is_live(i) {
-                continue;
-            }
-            match domain.search(&values[i]) {
-                Some(d) => {
-                    idx.push(i);
-                    ds.push(d);
+    // Work the region in bounded chunks. A confirm region can hold hundreds
+    // of thousands of candidates, and marshalling all of them at once would
+    // allocate megabytes per confirm and evict the very wavelet layers the
+    // descent is about to walk. A chunk of CONFIRM_CHUNK is already orders of
+    // magnitude more probes than the memory system can keep in flight, so
+    // nothing is lost by bounding it.
+    let cap = live.min(CONFIRM_CHUNK);
+    let mut idx: Vec<u32> = Vec::with_capacity(cap);
+    let mut ds: Vec<usize> = Vec::with_capacity(cap);
+    let mut absent: Vec<u32> = Vec::new();
+    let mut out: Vec<Option<usize>> = vec![None; cap];
+
+    let mut i = 0usize;
+    while i < n {
+        idx.clear();
+        ds.clear();
+        absent.clear();
+        {
+            // Resolving values borrows the region immutably; the kills below
+            // need it mutably, so the two phases are kept apart.
+            let values = cands.values();
+            while i < n && idx.len() < cap {
+                if cands.is_live(i) {
+                    match domain.search(&values[i]) {
+                        Some(d) => {
+                            idx.push(i as u32);
+                            ds.push(d);
+                        }
+                        None => absent.push(i as u32),
+                    }
                 }
-                None => absent.push(i),
+                i += 1;
             }
         }
-    }
 
-    let starts = vec![r.start; ds.len()];
-    let ends = vec![r.end; ds.len()];
-    let mut out = vec![None; ds.len()];
-    c.rank_range_batch_into(&starts, &ends, &ds, &mut out)
-        .expect("probe slices are built with equal lengths");
-
-    for i in absent {
-        cands.kill(i);
-    }
-    for (k, &i) in idx.iter().enumerate() {
-        if out[k].unwrap_or(0) == 0 {
-            cands.kill(i);
+        let m = ds.len();
+        if m != 0 {
+            c.rank_range_batch_into(r.clone(), &ds, &mut out[..m])
+                .expect("probe slices are built with equal lengths");
+            for k in 0..m {
+                if out[k].unwrap_or(0) == 0 {
+                    cands.kill(idx[k] as usize);
+                }
+            }
+        }
+        for &j in &absent {
+            cands.kill(j as usize);
         }
     }
 }

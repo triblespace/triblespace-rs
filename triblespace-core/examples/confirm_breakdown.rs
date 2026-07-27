@@ -236,6 +236,36 @@ fn main() {
         assert_eq!(rout[i], archive.ave_c.rank_range(r_start..r_end, d));
     }
 
+    // Component 8: the batched path AS CONFIRM ACTUALLY RUNS IT — the probe
+    // vectors are built inside the timed region, because that marshalling is
+    // real work the scalar path never does. Timing only the jerky call (as
+    // components 6 and 7 do) flatters the batch by hiding an allocation and
+    // a full pass over the region.
+    let t = Instant::now();
+    let mut idx: Vec<u32> = Vec::with_capacity(cands);
+    let mut dsb: Vec<usize> = Vec::with_capacity(cands);
+    for (i, v) in values.iter().enumerate() {
+        if let Some(d) = archive.domain.search(v) {
+            idx.push(i as u32);
+            dsb.push(d);
+        }
+    }
+    let starts2 = vec![r_start; dsb.len()];
+    let ends2 = vec![r_end; dsb.len()];
+    let mut out2 = vec![None; dsb.len()];
+    archive
+        .ave_c
+        .rank_range_batch_into(&starts2, &ends2, &dsb, &mut out2)
+        .unwrap();
+    let mut kept = 0usize;
+    for o in &out2 {
+        if o.unwrap_or(0) != 0 {
+            kept += 1;
+        }
+    }
+    let full_batched = t.elapsed();
+    std::hint::black_box((kept, &idx));
+
     let ns = |d: std::time::Duration| d.as_nanos() as f64 / cands as f64;
     let (f, s, sel, rs, rb, rr, rrb) = (
         ns(full),
@@ -296,5 +326,15 @@ fn main() {
         "  inner loop with batched range     {:>9.1} ns   ({:.2}x on the whole loop)",
         f - rs + rrb,
         f / (f - rs + rrb)
+    );
+    println!();
+    println!(
+        "  MEASURED end-to-end batched loop  {:>9.1} ns   ({:.2}x vs the real scalar loop)",
+        ns(full_batched),
+        f / ns(full_batched)
+    );
+    println!(
+        "    (marshalling overhead the estimate above ignores: {:>6.1} ns)",
+        ns(full_batched) - (f - rs + rrb)
     );
 }
