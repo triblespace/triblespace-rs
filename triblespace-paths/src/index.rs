@@ -203,11 +203,10 @@ impl AcceptedRelation {
             .collect::<Vec<_>>();
         let mut offsets = Vec::with_capacity(vertex_count + 1);
         let mut ordinals = Vec::new();
-        let mut row = Vec::new();
+        let mut row = vec![0u64; vertex_count.div_ceil(u64::BITS as usize)];
         offsets.push(0);
 
         for source in 0..vertex_count {
-            row.clear();
             for &initial_state in &initial {
                 for target in
                     closure.reachable_indices_unordered(source * state_count + initial_state)
@@ -216,12 +215,17 @@ impl AcceptedRelation {
                         continue;
                     }
                     let target = target / state_count;
-                    row.push(u32::try_from(target).expect("path vertex ordinal exceeds u32"));
+                    row[target / u64::BITS as usize] |= 1u64 << (target % u64::BITS as usize);
                 }
             }
-            row.sort_unstable();
-            row.dedup();
-            ordinals.extend_from_slice(&row);
+            for (word_index, word) in row.iter_mut().enumerate() {
+                while *word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    *word &= *word - 1;
+                    let target = word_index * u64::BITS as usize + bit;
+                    ordinals.push(u32::try_from(target).expect("path vertex ordinal exceeds u32"));
+                }
+            }
             offsets.push(ordinals.len());
         }
 
