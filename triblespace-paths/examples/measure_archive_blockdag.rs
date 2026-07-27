@@ -7,6 +7,13 @@
 //! leaf [`PathSummary`] lowering, canonical summary union, and
 //! [`PathIndex::from_summary`].
 //!
+//! The `universe_audit` line also contrasts that selective workload with the
+//! current production lowering, which retains endpoints of every source
+//! trible even when its attribute cannot drive the fixed automaton. For rungs
+//! 32 and above the probe constructs both indexes (under a separate cap),
+//! checks their accepted endpoint relations byte-for-byte by digest, and
+//! reports the current carrier's exact SCC propagation allocation.
+//!
 //! Before closing a summary, the probe bounds the endpoint-quotient propagation
 //! matrix by
 //!
@@ -29,6 +36,8 @@
 //! `PATHS_BLOCKDAG_PILE` may name another copy of the same pile. The sweep can
 //! be constrained with `PATHS_BLOCKDAG_MAX_RUNG`, `PATHS_BLOCKDAG_MAX_EDGES`,
 //! `PATHS_BLOCKDAG_MAX_VERTICES`, and `PATHS_BLOCKDAG_MAX_SCRATCH_BYTES`.
+//! `PATHS_BLOCKDAG_MAX_CURRENT_SCRATCH_BYTES` independently guards the
+//! all-source-trible production-summary comparison.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -73,6 +82,7 @@ const WARM_REPETITIONS: usize = 21;
 struct Segment {
     content_tribles: usize,
     edges: Vec<GraphEdge>,
+    all_edges: Vec<GraphEdge>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -81,6 +91,7 @@ struct Limits {
     edges: usize,
     vertices: usize,
     scratch_bytes: usize,
+    current_scratch_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -106,14 +117,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             "PATHS_BLOCKDAG_MAX_SCRATCH_BYTES",
             DEFAULT_MAX_SCRATCH_BYTES,
         )?,
+        current_scratch_bytes: env_limit(
+            "PATHS_BLOCKDAG_MAX_CURRENT_SCRATCH_BYTES",
+            8 * 1024 * 1024 * 1024,
+        )?,
     };
 
     println!("archive block-DAG endpoint-quotient scale probe (read-only)");
     println!("pile             : {}", pile_path.display());
     println!("rungs            : {RUNGS:?} (maximum {})", limits.max_rung);
     println!(
-        "pre-build limits : edges={} vertices={} endpoint_quotient_scratch_bytes={}",
-        limits.edges, limits.vertices, limits.scratch_bytes
+        "pre-build limits : edges={} vertices={} endpoint_quotient_scratch_bytes={} current_summary_scratch_bytes={}",
+        limits.edges, limits.vertices, limits.scratch_bytes, limits.current_scratch_bytes
     );
 
     let (reader, head) = open_reader_and_head(&pile_path)?;
@@ -125,6 +140,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut leaves = Vec::<PathSummary>::new();
     let mut leaf_times = Vec::<Duration>::new();
     let mut vertices = BTreeSet::new();
+    let mut all_vertices = BTreeSet::new();
     let mut matched_edges = 0usize;
 
     'rungs: for rung in RUNGS
@@ -142,7 +158,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         while segments.len() < rung {
             let content = chain[segments.len()];
-            match scan_segment(&reader, content, &mut matched_edges, &mut vertices, limits) {
+            match scan_segment(
+                &reader,
+                content,
+                &mut matched_edges,
+                &mut vertices,
+                &mut all_vertices,
+                limits,
+            ) {
                 Ok(segment) => segments.push(segment),
                 Err(error) => {
                     if let Some(cap) = error.downcast_ref::<CapReached>() {
@@ -222,11 +245,65 @@ fn main() -> Result<(), Box<dyn Error>> {
             .join(",");
         let (warm_min, warm_p50, warm_p95, warm_max) = duration_distribution(&warm_closes);
 
+        let support_components = previous_plus_component_count(
+            &vertices,
+            segments[..rung]
+                .iter()
+                .flat_map(|segment| segment.edges.iter().copied()),
+        );
+        let unmatched_vertices = all_vertices.len() - vertices.len();
+        let current_components = support_components
+            .checked_add(
+                unmatched_vertices
+                    .checked_mul(automaton.state_count() as usize)
+                    .ok_or("current component count overflow")?,
+            )
+            .ok_or("current component count overflow")?;
+        let current_product_points = all_vertices
+            .len()
+            .checked_mul(automaton.state_count() as usize)
+            .ok_or("current product-point count overflow")?;
+        let current_row_words = all_vertices.len().div_ceil(u64::BITS as usize);
+        let current_scratch_bytes = current_components
+            .checked_mul(current_row_words)
+            .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+            .ok_or("current exact scratch size overflow")?;
+        let current_blob_bytes = 48usize
+            .checked_add(
+                all_vertices
+                    .len()
+                    .checked_mul(32)
+                    .ok_or("current blob size overflow")?,
+            )
+            .and_then(|bytes| bytes.checked_add(direct_arcs.checked_mul(8)?))
+            .ok_or("current blob size overflow")?;
+        let support_blob_bytes = 48usize
+            .checked_add(
+                merged_vertices
+                    .checked_mul(32)
+                    .ok_or("support blob size overflow")?,
+            )
+            .and_then(|bytes| bytes.checked_add(direct_arcs.checked_mul(8)?))
+            .ok_or("support blob size overflow")?;
+
         println!(
             "rung={rung:>3} content_tribles={content_tribles:<9} previous_edges={matched_edges:<6} vertices={merged_vertices:<6} product_points={product_points:<6} direct_arcs={direct_arcs:<6} accepted_pairs={accepted_pairs:<10} scratch_bound_bytes={scratch_bytes:<10} leaf_lower_ms={:<9.3} summary_merge_ms={:<9.3} close_first_ms={:<9.3} signature={signature}",
             millis(leaf_time),
             millis(merge_time),
             millis(first_close),
+        );
+        println!(
+            "        universe_audit all_vertices={} matched_support={} unmatched={} current_product_points={} support_components={} current_components={} current_exact_scratch_bytes={} support_exact_scratch_bytes={} current_blob_bytes={} support_blob_bytes={}",
+            all_vertices.len(),
+            merged_vertices,
+            unmatched_vertices,
+            current_product_points,
+            support_components,
+            current_components,
+            current_scratch_bytes,
+            support_components * row_words * std::mem::size_of::<u64>(),
+            current_blob_bytes,
+            support_blob_bytes,
         );
         println!(
             "        close_warm_ms=[{warm_millis}] min={:.3} p50={:.3} p95={:.3} max={:.3}",
@@ -236,9 +313,57 @@ fn main() -> Result<(), Box<dyn Error>> {
             millis(warm_max),
         );
         println!("        {query_report}");
+
+        if rung >= 32 {
+            if current_scratch_bytes > limits.current_scratch_bytes {
+                println!(
+                    "        current_summary_close=SKIPPED exact scratch {} exceeds cap {}",
+                    current_scratch_bytes, limits.current_scratch_bytes
+                );
+            } else {
+                let lower_started = Instant::now();
+                let current_summary = PathSummary::from_edges(
+                    automaton.clone(),
+                    segments[..rung]
+                        .iter()
+                        .flat_map(|segment| segment.all_edges.iter().copied()),
+                );
+                let current_lower = lower_started.elapsed();
+                assert_eq!(current_summary.vertices().len(), all_vertices.len());
+                assert_eq!(current_summary.direct_arc_count(), direct_arcs);
+
+                let close_started = Instant::now();
+                let current = PathIndex::from_summary(current_summary)?;
+                let current_close = close_started.elapsed();
+                assert_eq!(current.accepted_pair_count(), accepted_pairs);
+                let current_relation_signature = accepted_relation_signature(&current);
+
+                let support = PathIndex::from_summary(merged.clone())?;
+                let support_relation_signature = accepted_relation_signature(&support);
+                assert_eq!(current_relation_signature, support_relation_signature);
+                println!(
+                    "        current_summary_close lower_ms={:.3} close_ms={:.3} accepted_pairs={} relation_signature={}",
+                    millis(current_lower),
+                    millis(current_close),
+                    current.accepted_pair_count(),
+                    current_relation_signature,
+                );
+            }
+        }
     }
 
     Ok(())
+}
+
+fn accepted_relation_signature(index: &PathIndex) -> String {
+    let mut hasher = Blake3::new();
+    hasher.update(b"triblespace-paths/accepted-endpoint-pairs/v1\0");
+    hasher.update(&(index.accepted_pair_count() as u64).to_le_bytes());
+    for (source, target) in index.accepted_pairs() {
+        hasher.update(&source);
+        hasher.update(&target);
+    }
+    hex(&hasher.finalize())
 }
 
 fn closure_signature(index: &PathIndex, direct_arcs: usize) -> String {
@@ -453,13 +578,25 @@ fn scan_segment(
     content: CommitHandle,
     matched_edges: &mut usize,
     vertices: &mut BTreeSet<triblespace_core::inline::RawInline>,
+    all_vertices: &mut BTreeSet<triblespace_core::inline::RawInline>,
     limits: Limits,
 ) -> Result<Segment, Box<dyn Error>> {
     let blob: Blob<SimpleArchive> = reader.get(content)?;
     let mut chunks = blob.bytes.as_ref().chunks_exact(TRIBLE_LEN);
     let mut edges = Vec::new();
+    let mut all_edges = Vec::with_capacity(blob.bytes.len() / TRIBLE_LEN);
 
     for chunk in chunks.by_ref() {
+        let raw: &[u8; TRIBLE_LEN] = chunk
+            .try_into()
+            .expect("chunks_exact yields one complete trible");
+        let trible = Trible::as_transmute_force_raw(raw)
+            .ok_or("invalid entity or attribute in validated SimpleArchive")?;
+        let edge = GraphEdge::from(trible);
+        all_vertices.insert(edge.source);
+        all_vertices.insert(edge.target);
+        all_edges.push(edge);
+
         if chunk[16..32] != BLOCK_PREVIOUS {
             continue;
         }
@@ -473,12 +610,6 @@ fn scan_segment(
             ))));
         }
 
-        let raw: &[u8; TRIBLE_LEN] = chunk
-            .try_into()
-            .expect("chunks_exact yields one complete trible");
-        let trible = Trible::as_transmute_force_raw(raw)
-            .ok_or("invalid entity or attribute in validated SimpleArchive")?;
-        let edge = GraphEdge::from(trible);
         vertices.insert(edge.source);
         vertices.insert(edge.target);
         if vertices.len() > limits.vertices {
@@ -497,7 +628,79 @@ fn scan_segment(
     Ok(Segment {
         content_tribles: blob.bytes.len() / TRIBLE_LEN,
         edges,
+        all_edges,
     })
+}
+
+fn previous_plus_component_count(
+    vertices: &BTreeSet<triblespace_core::inline::RawInline>,
+    edges: impl IntoIterator<Item = GraphEdge>,
+) -> usize {
+    let vertices = vertices.iter().copied().collect::<Vec<_>>();
+    let mut adjacency = vec![Vec::<u32>::new(); vertices.len() * 2];
+    for edge in edges {
+        let source = vertices
+            .binary_search(&edge.source)
+            .expect("matched source belongs to support");
+        let target = vertices
+            .binary_search(&edge.target)
+            .expect("matched target belongs to support");
+        adjacency[source * 2].push((target * 2 + 1) as u32);
+        adjacency[source * 2 + 1].push((target * 2 + 1) as u32);
+    }
+    strongly_connected_component_count(&adjacency)
+}
+
+fn strongly_connected_component_count(adjacency: &[Vec<u32>]) -> usize {
+    let mut reverse = vec![Vec::<u32>::new(); adjacency.len()];
+    for (source, targets) in adjacency.iter().enumerate() {
+        for &target in targets {
+            reverse[target as usize].push(source as u32);
+        }
+    }
+
+    let mut seen = vec![false; adjacency.len()];
+    let mut postorder = Vec::with_capacity(adjacency.len());
+    for root in 0..adjacency.len() {
+        if seen[root] {
+            continue;
+        }
+        seen[root] = true;
+        let mut stack = vec![(root as u32, 0usize)];
+        while let Some((node, next_edge)) = stack.last_mut() {
+            if *next_edge < adjacency[*node as usize].len() {
+                let target = adjacency[*node as usize][*next_edge];
+                *next_edge += 1;
+                if !seen[target as usize] {
+                    seen[target as usize] = true;
+                    stack.push((target, 0));
+                }
+            } else {
+                postorder.push(*node);
+                stack.pop();
+            }
+        }
+    }
+
+    let mut component_of = vec![u32::MAX; adjacency.len()];
+    let mut component_count = 0usize;
+    for &root in postorder.iter().rev() {
+        if component_of[root as usize] != u32::MAX {
+            continue;
+        }
+        component_of[root as usize] = component_count as u32;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            for &predecessor in &reverse[node as usize] {
+                if component_of[predecessor as usize] == u32::MAX {
+                    component_of[predecessor as usize] = component_count as u32;
+                    stack.push(predecessor);
+                }
+            }
+        }
+        component_count += 1;
+    }
+    component_count
 }
 
 fn previous_one_or_more() -> Automaton {
