@@ -36,6 +36,7 @@ use triblespace_core::inline::{RawInline, Inline};
 use crate::bm25::BM25Index;
 use crate::schemas::Embedding;
 use triblespace_core::query::Mask;
+use triblespace_core::query::ProposalBuffer;
 
 /// Minimum surface a BM25 index must expose for the
 /// [`BM25Filter`] constraint to work against it. Implemented
@@ -344,7 +345,7 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.doc.index {
             return;
         }
@@ -538,7 +539,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         }
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -703,7 +704,7 @@ impl<'a> Constraint<'a> for SimilarTo {
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.var.index {
             return;
         }
@@ -811,7 +812,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let binding = Binding::default();
-        let mut props: Vec<RawInline> = Vec::new();
+        let mut props = ProposalBuffer::new();
         c.propose(doc.index, &binding, &mut props);
         assert_eq!(props.len(), 2);
 
@@ -832,15 +833,14 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let binding = Binding::default();
-        let mut props: Vec<RawInline> = vec![
-            id_to_raw_value(id(1)),
-            id_to_raw_value(id(2)),
-            id_to_raw_value(id(3)),
-        ];
+        let mut props = ProposalBuffer::new();
+        props.push(id_to_raw_value(id(1)));
+        props.push(id_to_raw_value(id(2)));
+        props.push(id_to_raw_value(id(3)));
         let mut mask = Mask::new();
         mask.reset(props.len());
         c.confirm(doc.index, &binding, &props, &mut mask);
-        mask.compact(&mut props, 0);
+        props.compact(&mask, 0);
         let ids: HashSet<Id> = props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&id(1)));
@@ -878,7 +878,7 @@ mod tests {
         let terms = hash_tokens("quick fox");
         let c = idx.matches(doc, &terms, 0.0);
 
-        let mut props = Vec::new();
+        let mut props = ProposalBuffer::new();
         c.propose(doc.index, &Binding::default(), &mut props);
         let ids: HashSet<Id> = props
             .iter()
@@ -902,8 +902,8 @@ mod tests {
         let explicit = idx.matches(doc_a, &hash_tokens("quick fox"), 0.0);
         let sugar = idx.matches_text(doc_b, "quick fox", 0.0);
 
-        let mut props_a = Vec::new();
-        let mut props_b = Vec::new();
+        let mut props_a = ProposalBuffer::new();
+        let mut props_b = ProposalBuffer::new();
         explicit.propose(doc_a.index, &Binding::default(), &mut props_a);
         sugar.propose(doc_b.index, &Binding::default(), &mut props_b);
 
@@ -954,14 +954,14 @@ mod tests {
         let c_low = idx.matches(doc, &terms, 0.0);
         let c_mid = idx.matches(doc, &terms, (s1 + s2) / 2.0);
 
-        let mut low_props = Vec::new();
+        let mut low_props = ProposalBuffer::new();
         c_low.propose(doc.index, &Binding::default(), &mut low_props);
         let low_ids: HashSet<Id> =
             low_props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
         assert!(low_ids.contains(&id(1)));
         assert!(low_ids.contains(&id(2)));
 
-        let mut mid_props = Vec::new();
+        let mut mid_props = ProposalBuffer::new();
         c_mid.propose(doc.index, &Binding::default(), &mut mid_props);
         let mid_ids: HashSet<Id> =
             mid_props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
@@ -1012,7 +1012,7 @@ mod tests {
 
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
 
-        let mut props = Vec::new();
+        let mut props = ProposalBuffer::new();
         c.propose(doc.index, &Binding::default(), &mut props);
         assert!(props.is_empty());
     }
@@ -1026,7 +1026,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
-        let mut props = Vec::new();
+        let mut props = ProposalBuffer::new();
         c.propose(doc.index, &Binding::default(), &mut props);
         assert!(props.is_empty());
     }
@@ -1080,7 +1080,7 @@ mod tests {
         let mut binding = Binding::default();
         binding.set(a.index, &handles[0].raw);
 
-        let mut props = Vec::new();
+        let mut props = ProposalBuffer::new();
         c.propose(b.index, &binding, &mut props);
         let got: HashSet<RawInline> = props.iter().copied().collect();
         assert!(got.contains(&handles[0].raw));
@@ -1102,7 +1102,7 @@ mod tests {
         let mut binding = Binding::default();
         binding.set(b.index, &handles[2].raw);
 
-        let mut props = Vec::new();
+        let mut props = ProposalBuffer::new();
         c.propose(a.index, &binding, &mut props);
         let got: HashSet<RawInline> = props.iter().copied().collect();
         assert!(got.contains(&handles[0].raw));
@@ -1145,7 +1145,7 @@ mod tests {
         let mut binding = Binding::default();
         binding.set(a.index, &handles[0].raw);
 
-        let mut props = Vec::new();
+        let mut props = ProposalBuffer::new();
         c.propose(b.index, &binding, &mut props);
         let got: HashSet<RawInline> = props.iter().copied().collect();
         assert!(got.contains(&handles[0].raw));

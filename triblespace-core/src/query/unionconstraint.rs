@@ -72,7 +72,7 @@ where
     /// deduplicates. Dead variants (where [`satisfied`](Constraint::satisfied)
     /// returns `false`) are skipped so their stale bindings cannot inject
     /// values that no live variant would produce.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         self.constraints
             .iter()
             .filter(|c| c.satisfied(binding))

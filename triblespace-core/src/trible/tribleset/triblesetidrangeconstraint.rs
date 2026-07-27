@@ -12,6 +12,7 @@ use crate::trible::TribleSet;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::RawInline;
 use crate::query::Mask;
+use crate::query::ProposalBuffer;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
 /// to propose only entity IDs in a byte-lexicographic range.
@@ -60,7 +61,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         Some(count.min(usize::MAX as u64) as usize)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.variable_e {
             return;
         }
@@ -148,7 +149,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         Some(count.min(usize::MAX as u64) as usize)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.variable_a {
             return;
         }

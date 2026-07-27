@@ -2,6 +2,7 @@ use super::*;
 use crate::query::Binding;
 use crate::query::Constraint;
 use crate::query::Mask;
+use crate::query::ProposalBuffer;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -91,7 +92,7 @@ where
         Some(self.cached_estimate)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.variable_v {
             return;
         }

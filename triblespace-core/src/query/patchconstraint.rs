@@ -14,6 +14,7 @@ use super::Variable;
 use super::VariableId;
 use super::VariableSet;
 use crate::query::Mask;
+use crate::query::ProposalBuffer;
 
 /// Constrains a variable to full-width values present in a [`PATCH`].
 ///
@@ -43,7 +44,7 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if self.variable.index == variable {
             self.patch
                 .infixes(&[0; 0], &mut |&k: &[u8; 32]| proposals.push(k));
@@ -114,7 +115,7 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if self.variable.index == variable {
             self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
                 proposals.push(id_into_value(id))

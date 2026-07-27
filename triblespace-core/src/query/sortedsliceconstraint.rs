@@ -93,7 +93,7 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if self.variable.index == variable {
             proposals.extend(self.slice.0.iter().map(|v| IntoInline::to_inline(v).raw));
         }

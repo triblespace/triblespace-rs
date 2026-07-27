@@ -14,6 +14,7 @@ use triblespace_core::inline::{RawInline, IntoInline, Inline};
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;
+use triblespace_core::query::ProposalBuffer;
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
@@ -63,7 +64,7 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
     // `propose` should yield the intersection of the two posting
     // lists. "fox" is in docs {1,3}; "quick" is in docs {1,3};
     // both sets happen to be identical → proposes both.
-    let mut props: Vec<RawInline> = Vec::new();
+    let mut props = ProposalBuffer::new();
     intersection.propose(doc.index, &binding, &mut props);
     let ids: std::collections::HashSet<Id> =
         props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
@@ -96,7 +97,7 @@ fn intersection_with_absent_term_proposes_nothing() {
     // intersection's minimum-estimate is 0.
     assert_eq!(intersection.estimate(doc.index, &binding), Some(0));
 
-    let mut props = Vec::new();
+    let mut props = ProposalBuffer::new();
     intersection.propose(doc.index, &binding, &mut props);
     assert!(
         props.is_empty(),

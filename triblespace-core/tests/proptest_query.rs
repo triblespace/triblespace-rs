@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
-    Binding, Constraint, ContainsConstraint, Mask, TriblePattern, Variable, VariableContext,
+    Binding, Constraint, ContainsConstraint, Mask, ProposalBuffer, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -59,7 +59,7 @@ proptest! {
         let estimate = constraint.estimate(e.index, &binding).unwrap();
 
         // Estimate should be >= actual distinct entity count
-        let mut proposals = Vec::new();
+        let mut proposals = ProposalBuffer::new();
         constraint.propose(e.index, &binding, &mut proposals);
         prop_assert!(estimate >= proposals.len(),
             "estimate {} < actual proposals {}", estimate, proposals.len());
@@ -74,7 +74,7 @@ proptest! {
         let constraint = set.pattern(e, a, v);
 
         let binding = Binding::default();
-        let mut proposals = Vec::new();
+        let mut proposals = ProposalBuffer::new();
         constraint.propose(e.index, &binding, &mut proposals);
 
         // Every proposed entity must appear in at least one trible
@@ -291,7 +291,7 @@ proptest! {
 
         prop_assert_eq!(c.estimate(0, &binding), Some(1));
 
-        let mut proposals = Vec::new();
+        let mut proposals = ProposalBuffer::new();
         c.propose(0, &binding, &mut proposals);
         prop_assert_eq!(proposals.len(), 1);
         prop_assert_eq!(proposals[0], val);
@@ -310,11 +310,12 @@ proptest! {
         );
         let binding = Binding::default();
 
-        let mut proposals = vec![candidate];
+        let mut proposals = ProposalBuffer::new();
+        proposals.push(candidate);
         let mut mask = Mask::new();
         mask.reset(proposals.len());
         c.confirm(0, &binding, &proposals, &mut mask);
-        mask.compact(&mut proposals, 0);
+        proposals.compact(&mask, 0);
 
         if constant == candidate {
             prop_assert_eq!(proposals.len(), 1);
@@ -644,7 +645,7 @@ proptest! {
         prop_assert_eq!(eq.estimate(1, &binding), Some(1));
 
         // Propose should yield the peer's value
-        let mut proposals = Vec::new();
+        let mut proposals = ProposalBuffer::new();
         eq.propose(1, &binding, &mut proposals);
         prop_assert_eq!(proposals.len(), 1);
         prop_assert_eq!(proposals[0], val);
@@ -661,11 +662,13 @@ proptest! {
         let mut binding = Binding::default();
         binding.set(0, &peer_val);
 
-        let mut proposals = vec![peer_val, other_val];
+        let mut proposals = ProposalBuffer::new();
+        proposals.push(peer_val);
+        proposals.push(other_val);
         let mut mask = Mask::new();
         mask.reset(proposals.len());
         eq.confirm(1, &binding, &proposals, &mut mask);
-        mask.compact(&mut proposals, 0);
+        proposals.compact(&mask, 0);
 
         if peer_val == other_val {
             prop_assert_eq!(proposals.len(), 2); // both match
@@ -717,16 +720,16 @@ proptest! {
         // Bind a=val, propose for b → val
         let mut binding_a = Binding::default();
         binding_a.set(0, &val);
-        let mut props_b = Vec::new();
+        let mut props_b = ProposalBuffer::new();
         eq.propose(1, &binding_a, &mut props_b);
 
         // Bind b=val, propose for a → val
         let mut binding_b = Binding::default();
         binding_b.set(1, &val);
-        let mut props_a = Vec::new();
+        let mut props_a = ProposalBuffer::new();
         eq.propose(0, &binding_b, &mut props_a);
 
-        prop_assert_eq!(props_a, props_b);
+        prop_assert_eq!(&props_a[..], &props_b[..]);
     }
 
     #[test]

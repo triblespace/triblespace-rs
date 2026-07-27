@@ -60,7 +60,7 @@ impl<'a> Constraint<'a> for InlineRange {
     }
 
     /// Does not propose — the paired TribleSet constraint handles proposals.
-    fn propose(&self, _variable: VariableId, _binding: &Binding, _proposals: &mut Vec<RawInline>) {
+    fn propose(&self, _variable: VariableId, _binding: &Binding, _proposals: &mut ProposalBuffer) {
         // Intentionally empty: this constraint only confirms.
     }
 

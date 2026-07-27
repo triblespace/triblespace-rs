@@ -36,7 +36,7 @@ impl<'a> Constraint<'a> for ConstantConstraint {
     }
 
     /// Pushes the single constant value.
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if self.variable == variable {
             proposals.push(self.constant);
         }

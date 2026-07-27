@@ -10,7 +10,7 @@ The macros fall into three layers:
 - **Encoding definition**: `attributes!`
 - **Fact construction**: `entity!`
 - **Query construction**: `find!`, `exists!`, `pattern!`, `pattern_changes!`,
-  `path!`, `and!`, `or!`, `temp!`, `ignore!`
+  `and!`, `or!`, `temp!`, `ignore!`
 
 ## Define attributes with `attributes!`
 
@@ -264,58 +264,6 @@ Reach for this macro when:
 
 See [Incremental Queries](incremental-queries.md) for the full workflow.
 
-## Traverse edges with `path!`
-
-Use [`path!`](triblespace::core::macros::path) when a relationship is recursive or
-variable-length.
-
-```rust
-# use triblespace::prelude::*;
-# mod social {
-#     use triblespace::prelude::*;
-#     attributes! {
-#         "B74AA63539354CDA47F387A4C3A8D54C" as pub friend: inlineencodings::GenId;
-#     }
-# }
-# let mut kb = TribleSet::new();
-# let alice = fucid();
-# let bob = fucid();
-# let carol = fucid();
-# kb += entity! { &alice @ social::friend: &bob };
-# kb += entity! { &bob @ social::friend: &carol };
-let results: Vec<(Id, Id)> = find!(
-    (src: Id, dst: Id),
-    path!(kb.clone(), src social::friend+ dst)
-).collect();
-
-assert!(results.contains(&(alice.id, bob.id)));
-assert!(results.contains(&(alice.id, carol.id)));
-assert!(results.contains(&(bob.id, carol.id)));
-```
-
-The middle part is a small regular language over attributes:
-
-- adjacency means concatenation
-- `|` means alternation
-- `*` means zero or more
-- `+` means one or more
-- `?` means zero or one
-- `^p` reverses the direction of an attribute (or path-element) —
-  `^p` followed by `?`/`*`/`+` binds the modifier *inside* the
-  inversion: `^p+` is `^(p+)`, matching SPARQL 1.1 §17.5
-- `!p` matches any attribute *other than* `p` (negated
-  property set, single-attribute form)
-- parentheses group
-
-Example:
-
-```rust,ignore
-path!(kb.clone(), start (social::friend | social::colleague)+ end)
-```
-
-Use `path!` when a fixed number of `pattern!` clauses would be awkward or
-impossible.
-
 ## Combine constraints with `and!` and `or!`
 
 Use [`and!`](triblespace::core::prelude::and) when every clause must hold:
@@ -393,7 +341,6 @@ If you are:
 - matching only newly added results: use `pattern_changes!`
 - asking for rows back: use `find!`
 - asking for a boolean: use `exists!`
-- traversing recursive edges: use `path!`
 - requiring all clauses: use `and!`
 - allowing alternatives: use `or!`
 - introducing a fresh helper variable: use `temp!`

@@ -8,6 +8,7 @@ pub mod query {
     use std::cell::RefCell;
     use std::rc::Rc;
     use crate::query::Mask;
+use crate::query::ProposalBuffer;
 
     /// Constraint wrapper that records which variables are proposed during query execution.
     pub struct DebugConstraint<C> {
@@ -33,7 +34,7 @@ pub mod query {
             self.constraint.estimate(variable, binding)
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
             self.record.borrow_mut().push(variable);
             self.constraint.propose(variable, binding, proposals);
         }
@@ -93,7 +94,7 @@ pub mod query {
             self.estimates[variable].or_else(|| self.constraint.estimate(variable, binding))
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
             self.constraint.propose(variable, binding, proposals);
         }
 

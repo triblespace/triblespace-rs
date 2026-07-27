@@ -61,7 +61,7 @@ where
     /// length onward) is confirmed and compacted, so proposals appended by
     /// sibling constraints in an enclosing composite are never filtered
     /// through this intersection's children.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
@@ -82,7 +82,7 @@ where
         relevant_constraints[1..]
             .iter()
             .for_each(|(_, c)| c.confirm(variable, binding, &proposals[base..], &mut mask));
-        mask.compact(proposals, base);
+        proposals.compact(&mask, base);
     }
 
     /// Confirms proposals through all children that constrain `variable`,

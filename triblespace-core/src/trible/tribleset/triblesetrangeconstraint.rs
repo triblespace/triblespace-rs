@@ -9,6 +9,7 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::INLINE_LEN;
 use crate::query::Mask;
+use crate::query::ProposalBuffer;
 /// A value-range-aware constraint that uses the TribleSet's AVE index
 /// to propose only values in a byte-lexicographic range.
 ///
@@ -71,7 +72,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         Some(self.cached_estimate)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.variable_v {
             return;
         }

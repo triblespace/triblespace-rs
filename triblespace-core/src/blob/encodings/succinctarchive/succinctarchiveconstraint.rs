@@ -6,6 +6,7 @@ use crate::query::*;
 use crate::inline::encodings::genid::GenId;
 use jerky::bit_vector::Select;
 use crate::query::Mask;
+use crate::query::ProposalBuffer;
 
 pub struct SuccinctArchiveConstraint<'a, U>
 where
@@ -162,7 +163,7 @@ where
         })
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;

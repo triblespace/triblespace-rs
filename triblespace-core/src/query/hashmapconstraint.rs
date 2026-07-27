@@ -15,6 +15,7 @@ use crate::inline::TryFromInline;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::query::Mask;
+use crate::query::ProposalBuffer;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///
@@ -60,7 +61,7 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if self.variable.index == variable {
             proposals.extend(self.map.keys().map(|k| IntoInline::to_inline(k).raw));
         }

@@ -242,6 +242,118 @@ impl Default for Binding {
     }
 }
 
+/// Growable buffer of candidate values for one variable at one search level
+/// — the write target of [`Constraint::propose`].
+///
+/// Entries are plain `RawInline` (fixed-stride 32-byte POD), stored
+/// contiguously; the buffer derefs to `[RawInline]` for reading. This type is
+/// the allocation seam for GPU sharing: constraints and the engine speak only
+/// this API, so swapping the plain `Vec` backing for a persistently-mapped
+/// wgpu storage buffer (`MAPPABLE_PRIMARY_BUFFERS`; unified memory on Metal)
+/// changes nothing above this line.
+#[derive(Clone, Debug, Default)]
+pub struct ProposalBuffer {
+    entries: Vec<RawInline>,
+}
+
+impl ProposalBuffer {
+    /// Creates an empty buffer.
+    pub fn new() -> Self {
+        ProposalBuffer {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Appends a candidate.
+    pub fn push(&mut self, value: RawInline) {
+        self.entries.push(value);
+    }
+
+    /// Appends every candidate from `iter`.
+    pub fn extend(&mut self, iter: impl IntoIterator<Item = RawInline>) {
+        self.entries.extend(iter);
+    }
+
+    /// Appends every candidate from `slice`.
+    pub fn extend_from_slice(&mut self, slice: &[RawInline]) {
+        self.entries.extend_from_slice(slice);
+    }
+
+    /// Removes and returns the last candidate.
+    pub fn pop(&mut self) -> Option<RawInline> {
+        self.entries.pop()
+    }
+
+    /// Drops all candidates, keeping capacity.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Current capacity in entries.
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    /// Reserves capacity for exactly `additional` further entries.
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.entries.reserve_exact(additional);
+    }
+
+    /// Shortens the buffer to `len` entries.
+    pub fn truncate(&mut self, len: usize) {
+        self.entries.truncate(len);
+    }
+
+    /// Removes consecutive duplicates (pair with a sort for set-ness).
+    pub fn dedup(&mut self) {
+        self.entries.dedup();
+    }
+
+    /// Splits off and returns the tail starting at `at`.
+    pub fn split_off(&mut self, at: usize) -> ProposalBuffer {
+        ProposalBuffer {
+            entries: self.entries.split_off(at),
+        }
+    }
+
+    /// Compacts the tail region `[base..]` in place, keeping the entries
+    /// `mask` marks live (mask index 0 = entry `base`).
+    pub fn compact(&mut self, mask: &Mask, base: usize) {
+        debug_assert_eq!(mask.len(), self.entries.len() - base);
+        let mut write = base;
+        for i in 0..mask.len() {
+            if mask.live(i) {
+                self.entries[write] = self.entries[base + i];
+                write += 1;
+            }
+        }
+        self.entries.truncate(write);
+    }
+}
+
+impl std::ops::Deref for ProposalBuffer {
+    type Target = [RawInline];
+
+    fn deref(&self) -> &[RawInline] {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for ProposalBuffer {
+    fn deref_mut(&mut self) -> &mut [RawInline] {
+        &mut self.entries
+    }
+}
+
+impl<'a> IntoIterator for &'a ProposalBuffer {
+    type Item = &'a RawInline;
+    type IntoIter = std::slice::Iter<'a, RawInline>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
 /// Survival mask over a proposal slice — the write target of
 /// [`Constraint::confirm`].
 ///
@@ -330,19 +442,6 @@ impl Mask {
         }
     }
 
-    /// Compacts the tail region `proposals[base..]` in place, keeping the
-    /// entries this mask marks live (mask index 0 = `proposals[base]`).
-    pub fn compact(&self, proposals: &mut Vec<RawInline>, base: usize) {
-        debug_assert_eq!(self.words.len(), proposals.len() - base);
-        let mut write = base;
-        for (i, w) in self.words.iter().enumerate() {
-            if *w != 0 {
-                proposals[write] = proposals[base + i];
-                write += 1;
-            }
-        }
-        proposals.truncate(write);
-    }
 }
 
 impl Default for Mask {
@@ -425,11 +524,12 @@ pub trait Constraint<'a> {
     /// Enumerates candidate values for `variable` into `proposals`.
     ///
     /// Called on the constraint with the lowest estimate for the variable
-    /// being bound. Values are appended to `proposals`; the engine may
-    /// already have values in the vector from a previous round.
+    /// being bound. Values are appended to `proposals`; entries appended by
+    /// an enclosing composite's other children may precede them, and must
+    /// be left untouched.
     ///
     /// Does nothing when `variable` is not constrained by this constraint.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>);
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer);
 
     /// Kills [`Mask`] entries for `proposals` values of `variable` that
     /// violate this constraint.
@@ -498,7 +598,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.estimate(variable, binding)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         let inner: &T = self;
         inner.propose(variable, binding, proposals)
     }
@@ -536,7 +636,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.estimate(variable, binding)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         let inner: &T = self;
         inner.propose(variable, binding, proposals)
     }
@@ -588,7 +688,7 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     touched_variables: VariableSet,
     stack: ArrayVec<VariableId, 128>,
     unbound: ArrayVec<VariableId, 128>,
-    values: ArrayVec<Option<Vec<RawInline>>, 128>,
+    values: ArrayVec<Option<ProposalBuffer>, 128>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -656,7 +756,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let variable = self.unbound.pop().expect("non-empty unbound");
         let estimate = self.estimates[variable];
         self.stack.push(variable);
-        let values = self.values[variable].get_or_insert(Vec::new());
+        let values = self.values[variable].get_or_insert(ProposalBuffer::new());
         values.clear();
         values.reserve_exact(estimate.saturating_sub(values.capacity()));
         self.constraint.propose(variable, &self.binding, values);
@@ -971,7 +1071,7 @@ mod parallel {
                         // stealing pressure.
                         let vals = q.values[top].as_mut().unwrap();
                         let mid = vals.len() / 2;
-                        let right_vals: Vec<RawInline> = vals.drain(mid..).collect();
+                        let right_vals = vals.split_off(mid);
                         let mut right = q.clone();
                         right.values[top] = Some(right_vals);
 

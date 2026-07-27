@@ -51,7 +51,7 @@ The system is organised into a small set of layers that compose cleanly:
 ```text
 ┌─────────────────────────────────────────────┐
 │  Application                                │
-│  find!, pattern!, entity!, path!            │
+│  find!, pattern!, entity!            │
 ├─────────────────────────────────────────────┤
 │  Workspace                                  │
 │  in-memory editing surface, blob read/write │

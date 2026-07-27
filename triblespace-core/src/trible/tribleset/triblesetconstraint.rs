@@ -14,6 +14,7 @@ use crate::inline::RawInline;
 use crate::inline::InlineEncoding;
 use crate::inline::INLINE_LEN;
 use crate::query::Mask;
+use crate::query::ProposalBuffer;
 
 /// A triple-pattern lookup against a [`TribleSet`].
 ///
@@ -199,7 +200,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// Enumerates matching values from the most selective covering index
     /// via `infixes`. The index is chosen to match the bound positions,
     /// so proposals are generated directly from a prefix scan.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         let e_var = self.variable_e == variable;
         let a_var = self.variable_a == variable;
         let v_var = self.variable_v == variable;

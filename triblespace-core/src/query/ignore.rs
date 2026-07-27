@@ -41,7 +41,7 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
     }
 
     /// Delegates to the inner constraint.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         self.constraint.propose(variable, binding, proposals);
     }
 

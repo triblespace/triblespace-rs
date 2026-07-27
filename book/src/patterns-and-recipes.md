@@ -72,15 +72,9 @@ attributes! {
 change += entity! { &child @ tree::parent: &parent_node };
 ```
 
-For recursive traversal (all ancestors, all descendants), use `path!`:
-
-```rust,ignore
-// All ancestors of this node
-find!(ancestor: Id, path!(&catalog, node_id tree::parent+ ancestor))
-
-// All descendants (reverse: who has me as ancestor?)
-find!(desc: Id, path!(&catalog, desc tree::parent+ node_id))
-```
+Recursive traversal (all ancestors, all descendants) is closure-shaped
+work: iterate single-hop `pattern!` queries to a fixpoint, or query a
+materialized closure index.
 
 ## Entity classification with tags
 
