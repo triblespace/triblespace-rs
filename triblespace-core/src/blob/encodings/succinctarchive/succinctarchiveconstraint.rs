@@ -86,6 +86,93 @@ where
     }
 }
 
+/// Live-candidate count at or above which a confirm collects its wavelet
+/// probes and runs them as one batched descent.
+///
+/// Below this the region is too small for the collection pass to pay for
+/// itself — and small is the common case: over real DBLP joins the median
+/// confirm region holds a single candidate. Jerky applies the same floor
+/// internally; this one exists to skip building the probe vectors at all.
+const MIN_BATCHED_CONFIRM: usize = 8;
+
+/// Kills every candidate that does not occur within row range `r` of `c`.
+///
+/// This is the terminal step of every range-restricting `confirm` arm, and
+/// it is deliberately NOT `restrict_range`. That helper answers "which
+/// sub-range does this value occupy?" as `base + rank(s) .. base + rank(e)`,
+/// but a confirm only ever asks whether the result is empty — and:
+///
+/// - `base` cancels out of that comparison, so the prefix-bitvector
+///   `select1` it costs is pure waste here;
+/// - emptiness is `rank_range(s..e, d) == 0`, which is ONE wavelet descent
+///   carrying both endpoints, where two `rank` calls are two descents for
+///   twice the memory traffic.
+///
+/// Above [`MIN_BATCHED_CONFIRM`] live candidates the descents also run
+/// batched. A wavelet descent is a serial chain of dependent loads — each
+/// layer's position is the previous layer's rank result — so on an archive
+/// larger than last-level cache it is a row of full memory round trips with
+/// the core idle between them. Probes are independent of one another, and
+/// overlapping them is the only way to keep the memory system busy.
+fn retain_occurring_in<U>(
+    domain: &U,
+    c: &WaveletMatrix<Rank9SelIndex>,
+    r: &Range<usize>,
+    cands: &mut Candidates<'_>,
+) where
+    U: Universe,
+{
+    if r.start >= r.end {
+        cands.kill_all();
+        return;
+    }
+
+    let live = (0..cands.len()).filter(|&i| cands.is_live(i)).count();
+    if live < MIN_BATCHED_CONFIRM {
+        cands.retain(|v| match domain.search(v) {
+            Some(d) => c.rank_range(r.clone(), d).unwrap_or(0) != 0,
+            None => false,
+        });
+        return;
+    }
+
+    // Resolve every live candidate to a domain index first, so the batched
+    // descent sees one contiguous probe stream.
+    let mut idx = Vec::with_capacity(live);
+    let mut ds = Vec::with_capacity(live);
+    let mut absent = Vec::new();
+    {
+        let values = cands.values();
+        for i in 0..values.len() {
+            if !cands.is_live(i) {
+                continue;
+            }
+            match domain.search(&values[i]) {
+                Some(d) => {
+                    idx.push(i);
+                    ds.push(d);
+                }
+                None => absent.push(i),
+            }
+        }
+    }
+
+    let starts = vec![r.start; ds.len()];
+    let ends = vec![r.end; ds.len()];
+    let mut out = vec![None; ds.len()];
+    c.rank_range_batch_into(&starts, &ends, &ds, &mut out)
+        .expect("probe slices are built with equal lengths");
+
+    for i in absent {
+        cands.kill(i);
+    }
+    for (k, &i) in idx.iter().enumerate() {
+        if out[k].unwrap_or(0) == 0 {
+            cands.kill(i);
+        }
+    }
+}
+
 impl<'a, U> Constraint<'a> for SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -371,87 +458,27 @@ where
             }
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                cands.retain(|a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.eva_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.eva_c, &r, cands);
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                cands.retain(|v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.eav_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.eav_c, &r, cands);
             }
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                cands.retain(|e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.ave_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.ave_c, &r, cands);
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                cands.retain(|v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.aev_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.aev_c, &r, cands);
             }
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                cands.retain(|e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.vae_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.vae_c, &r, cands);
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                cands.retain(|a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.vea_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.vea_c, &r, cands);
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
@@ -462,17 +489,7 @@ where
                     v,
                     &r,
                 );
-                cands.retain(|e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.vae_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.vae_c, &r, cands);
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
@@ -483,17 +500,7 @@ where
                     v,
                     &r,
                 );
-                cands.retain(|a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.vea_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.vea_c, &r, cands);
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
@@ -504,17 +511,7 @@ where
                     a,
                     &r,
                 );
-                cands.retain(|v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.aev_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_in(&self.archive.domain, &self.archive.aev_c, &r, cands);
             }
             _ => unreachable!("invalid trible constraint state"),
         }
