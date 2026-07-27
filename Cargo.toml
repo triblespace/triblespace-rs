@@ -56,6 +56,11 @@ url = "2.5.0"
 serde_json = "1.0"
 f256 = "0.7.0"
 blake3 = "1.5"
+# The `suite` bench (vendored SPARQLoscope query library): regex for the
+# FILTER REGEX translations; hifitime matches triblespace-core's version so
+# `Epoch` is one type across the boundary.
+regex = "1"
+hifitime = "4.1.2"
 
 [features]
 default = ["triblespace-core/proptest", "wasm", "object-store", "parallel"]
@@ -73,6 +78,10 @@ telemetry = [
 ]
 net = ["dep:triblespace-net"]
 parallel = ["triblespace-core/parallel"]
+# Placeholder gate for the `suite` bench's four transitive-path (RPQ)
+# translations. NEVER in default: the current engine has no regular-path
+# constraint, so enabling this only compiles once path support returns.
+rpq = []
 
 [[bench]]
 name = "benchmark"
@@ -132,4 +141,9 @@ harness = false
 
 [[bench]]
 name = "portable_bench_lsm"
+harness = false
+
+[[bench]]
+name = "suite"
+path = "benches/suite/main.rs"
 harness = false
