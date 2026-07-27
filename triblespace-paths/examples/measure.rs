@@ -21,7 +21,9 @@ use triblespace_paths::{
 const ATTRIBUTE: RawId = [0x5a; 16];
 const REPETITIONS: usize = 5;
 const SEGMENTS: usize = 4;
-const SCALES: [usize; 3] = [16, 32, 64];
+const SCALES: [usize; 5] = [16, 32, 64, 128, 256];
+const BRIDGE_FAN_WIDTHS: [usize; 3] = [32, 64, 128];
+const GPU_CROSSOVER_REFERENCE_CELLS: usize = 16_384;
 
 #[derive(Clone, Copy)]
 enum GraphFamily {
@@ -76,24 +78,46 @@ struct Measurement {
 }
 
 fn main() {
+    let include_large = matches!(std::env::var("PATHS_MEASURE_LARGE"), Ok(value) if value == "1");
     println!("triblespace-paths deterministic measurement harness");
     println!(
         "configuration repetitions={REPETITIONS} warmups=1 segments={SEGMENTS} scales={SCALES:?}"
     );
+    println!(
+        "bridge_fan rectangle_sides={BRIDGE_FAN_WIDTHS:?} side_256={} (enable with PATHS_MEASURE_LARGE=1)",
+        if include_large { "enabled" } else { "staged" }
+    );
     println!("leaf distributions are sorted values with one observation per segment");
-    println!("rectangle_log2 histograms use k:count for areas in 2^k..2^(k+1)");
+    println!("rectangle_log2 histograms use k:insertions/cells for areas in 2^k..2^(k+1)");
+    println!(
+        "gpu_crossover_reference={GPU_CROSSOVER_REFERENCE_CELLS} cells (current triblespace-gpu reference, observational only; not path-engine policy)"
+    );
 
     for family in GraphFamily::ALL {
         for scale in SCALES {
             let edges = family.edges(scale);
-            let measurement = measure(&edges);
-            report(family, scale, edges.len(), &measurement);
+            let batches = partition(&edges, SEGMENTS);
+            let measurement = measure(&edges, &batches, &one_or_more());
+            report(family.name(), scale, edges.len(), &measurement);
         }
+    }
+
+    for width in BRIDGE_FAN_WIDTHS
+        .into_iter()
+        .chain(include_large.then_some(256))
+    {
+        let (edges, batches) = bridge_fan(width);
+        let measurement = measure(&edges, &batches, &transitive_closure());
+        assert_eq!(measurement.merge_stats.largest_rectangle, width * width);
+        assert_eq!(
+            measurement.monolithic_stats.largest_rectangle,
+            width * width
+        );
+        report("bridge_fan", width, edges.len(), &measurement);
     }
 }
 
-fn measure(edges: &[GraphEdge]) -> Measurement {
-    let batches = partition(edges, SEGMENTS);
+fn measure(edges: &[GraphEdge], batches: &[Vec<GraphEdge>], automaton: &Automaton) -> Measurement {
     let batch_sizes = batches.iter().map(Vec::len).collect::<Vec<_>>();
     let mut leaf_samples = Vec::with_capacity(REPETITIONS);
     let mut merge_samples = Vec::with_capacity(REPETITIONS);
@@ -103,8 +127,6 @@ fn measure(edges: &[GraphEdge]) -> Measurement {
     // The first iteration warms allocator and instruction-cache paths but is
     // still checked for exact equivalence with the monolithic construction.
     for iteration in 0..=REPETITIONS {
-        let automaton = one_or_more();
-
         let started = Instant::now();
         let monolithic = PathIndex::from_edges(automaton.clone(), edges.iter().copied());
         let monolithic_ns = started.elapsed().as_nanos();
@@ -154,7 +176,7 @@ fn measure(edges: &[GraphEdge]) -> Measurement {
     }
 }
 
-fn report(family: GraphFamily, scale: usize, edge_count: usize, result: &Measurement) {
+fn report(family: &str, scale: usize, edge_count: usize, result: &Measurement) {
     let metrics = result.metrics;
     let accepted_density = density(
         metrics.accepted_pairs,
@@ -164,7 +186,7 @@ fn report(family: GraphFamily, scale: usize, edge_count: usize, result: &Measure
     println!();
     println!(
         "case family={} scale={} edges={} segments={}",
-        family.name(),
+        family,
         scale,
         edge_count,
         result.batch_sizes.len()
@@ -208,8 +230,20 @@ fn report(family: GraphFamily, scale: usize, edge_count: usize, result: &Measure
     println!(
         "  rectangle_log2 leaf_aggregate={} merge={} monolithic={}",
         aggregate_rectangle_histogram(&result.leaf_stats),
-        format_rectangle_histogram(&result.merge_stats.rectangle_log2_counts),
-        format_rectangle_histogram(&result.monolithic_stats.rectangle_log2_counts),
+        format_rectangle_histogram(
+            &result.merge_stats.rectangle_log2_counts,
+            &result.merge_stats.rectangle_log2_cells,
+        ),
+        format_rectangle_histogram(
+            &result.monolithic_stats.rectangle_log2_counts,
+            &result.monolithic_stats.rectangle_log2_cells,
+        ),
+    );
+    println!(
+        "  gpu_reference_ge_{GPU_CROSSOVER_REFERENCE_CELLS} leaf={} merge={} monolithic={}",
+        format_crossover(&result.leaf_stats),
+        format_crossover(std::slice::from_ref(&result.merge_stats)),
+        format_crossover(std::slice::from_ref(&result.monolithic_stats)),
     );
     println!(
         "  relation vertices={} automaton_states={} product_points={} product_pairs={} product_density={:.6} accepted_pairs={} accepted_density={:.6}",
@@ -239,6 +273,23 @@ fn partition(edges: &[GraphEdge], requested_segments: usize) -> Vec<Vec<GraphEdg
     segments
 }
 
+fn bridge_fan(width: usize) -> (Vec<GraphEdge>, Vec<Vec<GraphEdge>>) {
+    let fan_width = width - 1;
+    // The right hub sorts before the left hub so canonical merge seeding
+    // installs both fans before the bridge. The bridge therefore presents one
+    // `width × width` predecessor × successor rectangle to the closure kernel
+    // (each side contains `width - 1` fan vertices plus its hub).
+    let right_hub = fan_width;
+    let left_hub = fan_width + 1;
+    let outer = (0..fan_width)
+        .map(|source| edge(source, left_hub))
+        .chain((0..fan_width).map(|offset| edge(right_hub, fan_width + 2 + offset)))
+        .collect::<Vec<_>>();
+    let bridge = vec![edge(left_hub, right_hub)];
+    let edges = outer.iter().chain(&bridge).copied().collect::<Vec<_>>();
+    (edges, vec![outer, bridge])
+}
+
 fn one_or_more() -> Automaton {
     Automaton::new(
         2,
@@ -248,6 +299,16 @@ fn one_or_more() -> Automaton {
             Transition::new(0, 1, Step::Forward(ATTRIBUTE)),
             Transition::new(1, 1, Step::Forward(ATTRIBUTE)),
         ],
+    )
+    .expect("the fixed automaton is valid")
+}
+
+fn transitive_closure() -> Automaton {
+    Automaton::new(
+        1,
+        [0],
+        [0],
+        [Transition::new(0, 0, Step::Forward(ATTRIBUTE))],
     )
     .expect("the fixed automaton is valid")
 }
@@ -312,23 +373,66 @@ fn format_stats(stats: BuildStats) -> String {
 
 fn aggregate_rectangle_histogram(stats: &[BuildStats]) -> String {
     let mut counts = vec![0usize; usize::BITS as usize];
+    let mut cells = vec![0usize; usize::BITS as usize];
     for stats in stats {
-        for (total, count) in counts.iter_mut().zip(stats.rectangle_log2_counts) {
-            *total = total.saturating_add(count);
+        for ((total_count, total_cells), (count, bucket_cells)) in
+            counts.iter_mut().zip(&mut cells).zip(
+                stats
+                    .rectangle_log2_counts
+                    .into_iter()
+                    .zip(stats.rectangle_log2_cells),
+            )
+        {
+            *total_count = total_count.saturating_add(count);
+            *total_cells = total_cells.saturating_add(bucket_cells);
         }
     }
-    format_rectangle_histogram(&counts)
+    format_rectangle_histogram(&counts, &cells)
 }
 
-fn format_rectangle_histogram(counts: &[usize]) -> String {
+fn format_rectangle_histogram(counts: &[usize], cells: &[usize]) -> String {
     let buckets = counts
         .iter()
+        .zip(cells)
         .enumerate()
-        .filter(|(_, count)| **count != 0)
-        .map(|(bucket, count)| format!("{bucket}:{count}"))
+        .filter(|(_, (count, _))| **count != 0)
+        .map(|(bucket, (count, cells))| format!("{bucket}:{count}/{cells}"))
         .collect::<Vec<_>>()
         .join(",");
     format!("[{buckets}]")
+}
+
+fn format_crossover(stats: &[BuildStats]) -> String {
+    let first_bucket = GPU_CROSSOVER_REFERENCE_CELLS.ilog2() as usize;
+    let insertions = stats
+        .iter()
+        .map(|stats| stats.effective_insertions)
+        .sum::<usize>();
+    let cells = stats
+        .iter()
+        .map(|stats| stats.rectangle_cells_considered)
+        .sum::<usize>();
+    let covered_insertions = stats
+        .iter()
+        .flat_map(|stats| stats.rectangle_log2_counts[first_bucket..].iter())
+        .sum::<usize>();
+    let covered_cells = stats
+        .iter()
+        .flat_map(|stats| stats.rectangle_log2_cells[first_bucket..].iter())
+        .sum::<usize>();
+    format!(
+        "insertions={covered_insertions}/{insertions}({:.3}%) cells={covered_cells}/{cells}({:.3}%)",
+        percentage(covered_insertions, insertions),
+        percentage(covered_cells, cells),
+    )
+}
+
+fn percentage(part: usize, whole: usize) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / whole as f64
+    }
 }
 
 fn density(count: usize, possible: usize) -> f64 {
