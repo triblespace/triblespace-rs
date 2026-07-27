@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::time::Instant;
@@ -97,7 +97,9 @@ pub struct BuildStats {
     pub batch_propagation_ns: u128,
     /// Exact product-pair cardinality scan over component bitsets.
     pub batch_pair_count_ns: u128,
-    /// Accepted-pair and query-fiber materialization time.
+    /// Words retained by the experimental accepted-endpoint bitrelation.
+    pub accepted_bitset_words: usize,
+    /// Experimental accepted-endpoint bitrelation construction time.
     pub projection_ns: u128,
 }
 
@@ -121,6 +123,7 @@ impl Default for BuildStats {
             batch_scc_ns: 0,
             batch_propagation_ns: 0,
             batch_pair_count_ns: 0,
+            accepted_bitset_words: 0,
             projection_ns: 0,
         }
     }
@@ -163,13 +166,117 @@ pub struct PathIndex {
     automaton: Automaton,
     vertices: Vec<RawInline>,
     closure: Closure,
-    accepted: BTreeSet<(RawInline, RawInline)>,
-    forward: BTreeMap<RawInline, Vec<RawInline>>,
-    reverse: BTreeMap<RawInline, Vec<RawInline>>,
-    starts: Vec<RawInline>,
-    ends: Vec<RawInline>,
-    diagonal: Vec<RawInline>,
+    accepted: AcceptedRelation,
     build_stats: BuildStats,
+}
+
+/// Row-major accepted endpoint relation over `PathIndex::vertices`.
+///
+/// This is the sole retained endpoint projection. Forward fibers are set-bit
+/// views; reverse fibers and the small domain views scan this canonical
+/// relation lazily instead of retaining trees or copied value vectors.
+#[derive(Clone, Debug)]
+struct AcceptedRelation {
+    vertex_count: usize,
+    row_words: usize,
+    words: Vec<u64>,
+    pair_count: usize,
+}
+
+impl AcceptedRelation {
+    fn from_closure(automaton: &Automaton, vertex_count: usize, closure: &Closure) -> Self {
+        let row_words = vertex_count.div_ceil(u64::BITS as usize);
+        let mut words = vec![0u64; vertex_count.saturating_mul(row_words)];
+        let mut pair_count = 0usize;
+        let state_count = automaton.state_count() as usize;
+        let initial = automaton
+            .initial_states()
+            .map(|state| state as usize)
+            .collect::<Vec<_>>();
+
+        for source in 0..vertex_count {
+            let row = source * row_words;
+            for &initial_state in &initial {
+                for target in
+                    closure.reachable_indices_unordered(source * state_count + initial_state)
+                {
+                    if !automaton.is_accepting((target % state_count) as StateId) {
+                        continue;
+                    }
+                    let target = target / state_count;
+                    words[row + target / u64::BITS as usize] |=
+                        1u64 << (target % u64::BITS as usize);
+                }
+            }
+            pair_count += words[row..row + row_words]
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum::<usize>();
+        }
+
+        Self {
+            vertex_count,
+            row_words,
+            words,
+            pair_count,
+        }
+    }
+
+    fn row(&self, source: usize) -> &[u64] {
+        let start = source * self.row_words;
+        &self.words[start..start + self.row_words]
+    }
+
+    fn contains(&self, source: usize, target: usize) -> bool {
+        self.row(source)[target / u64::BITS as usize] & (1u64 << (target % u64::BITS as usize)) != 0
+    }
+
+    fn row_indices(&self, source: usize) -> BitIndexes<'_> {
+        BitIndexes::new(self.row(source))
+    }
+
+    fn row_is_empty(&self, source: usize) -> bool {
+        self.row(source).iter().all(|&word| word == 0)
+    }
+
+    fn column_is_empty(&self, target: usize) -> bool {
+        (0..self.vertex_count).all(|source| !self.contains(source, target))
+    }
+}
+
+struct BitIndexes<'a> {
+    words: &'a [u64],
+    next_word: usize,
+    current_word_index: usize,
+    current_word: u64,
+}
+
+impl<'a> BitIndexes<'a> {
+    fn new(words: &'a [u64]) -> Self {
+        Self {
+            words,
+            next_word: 0,
+            current_word_index: 0,
+            current_word: 0,
+        }
+    }
+}
+
+impl Iterator for BitIndexes<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current_word != 0 {
+                let bit = self.current_word.trailing_zeros() as usize;
+                self.current_word &= self.current_word - 1;
+                return Some(self.current_word_index * u64::BITS as usize + bit);
+            }
+            self.current_word = *self.words.get(self.next_word)?;
+            self.current_word_index = self.next_word;
+            self.next_word += 1;
+        }
+    }
 }
 
 /// Segment summaries cannot be combined under these conditions.
@@ -296,34 +403,8 @@ impl PathIndex {
         mut build_stats: BuildStats,
     ) -> Self {
         let projection_started = Instant::now();
-        let mut accepted = BTreeSet::new();
-        for &vertex in &vertices {
-            for state in automaton.initial_states() {
-                let source = ProductPoint { vertex, state };
-                let source = closure
-                    .point_index(source)
-                    .expect("the full product carrier contains every initial point");
-                for target in closure.row(source) {
-                    let target = closure.point(target);
-                    if automaton.is_accepting(target.state) {
-                        accepted.insert((vertex, target.vertex));
-                    }
-                }
-            }
-        }
-
-        let mut forward = BTreeMap::<_, Vec<_>>::new();
-        let mut reverse = BTreeMap::<_, Vec<_>>::new();
-        let mut diagonal = Vec::new();
-        for &(source, target) in &accepted {
-            forward.entry(source).or_default().push(target);
-            reverse.entry(target).or_default().push(source);
-            if source == target {
-                diagonal.push(source);
-            }
-        }
-        let starts = forward.keys().copied().collect();
-        let ends = reverse.keys().copied().collect();
+        let accepted = AcceptedRelation::from_closure(&automaton, vertices.len(), &closure);
+        build_stats.accepted_bitset_words = accepted.words.len();
         build_stats.projection_ns = projection_started.elapsed().as_nanos();
 
         Self {
@@ -331,11 +412,6 @@ impl PathIndex {
             vertices,
             closure,
             accepted,
-            forward,
-            reverse,
-            starts,
-            ends,
-            diagonal,
             build_stats,
         }
     }
@@ -347,22 +423,53 @@ impl PathIndex {
 
     /// Whether the automaton accepts a path from `source` to `target`.
     pub fn contains(&self, source: &RawInline, target: &RawInline) -> bool {
-        self.accepted.contains(&(*source, *target))
+        let Ok(source) = self.vertices.binary_search(source) else {
+            return false;
+        };
+        let Ok(target) = self.vertices.binary_search(target) else {
+            return false;
+        };
+        self.accepted.contains(source, target)
     }
 
     /// Sorted, duplicate-free accepted endpoint pairs.
     pub fn accepted_pairs(&self) -> impl Iterator<Item = (RawInline, RawInline)> + '_ {
-        self.accepted.iter().copied()
+        self.vertices
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(move |(source_index, source)| {
+                self.accepted
+                    .row_indices(source_index)
+                    .map(move |target_index| (source, self.vertices[target_index]))
+            })
     }
 
     /// Sorted, duplicate-free accepted targets for one source.
-    pub fn reachable_from(&self, source: &RawInline) -> &[RawInline] {
-        self.forward.get(source).map(Vec::as_slice).unwrap_or(&[])
+    pub fn reachable_from<'a>(
+        &'a self,
+        source: &RawInline,
+    ) -> impl Iterator<Item = RawInline> + 'a {
+        let row = self
+            .vertices
+            .binary_search(source)
+            .ok()
+            .map(|source| self.accepted.row(source))
+            .unwrap_or(&[]);
+        BitIndexes::new(row).map(|target| self.vertices[target])
     }
 
     /// Sorted, duplicate-free accepted sources for one target.
-    pub fn reaching(&self, target: &RawInline) -> &[RawInline] {
-        self.reverse.get(target).map(Vec::as_slice).unwrap_or(&[])
+    pub fn reaching<'a>(&'a self, target: &RawInline) -> impl Iterator<Item = RawInline> + 'a {
+        let target = self.vertices.binary_search(target).ok();
+        self.vertices
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(move |(source, _)| {
+                target.is_some_and(|target| self.accepted.contains(*source, target))
+            })
+            .map(|(_, source)| source)
     }
 
     /// Whether one product point reaches another, including reflexive
@@ -389,19 +496,34 @@ impl PathIndex {
             automaton_states: self.automaton.state_count() as usize,
             product_points: self.vertices.len() * self.automaton.state_count() as usize,
             product_pairs: self.closure.pair_count(),
-            accepted_pairs: self.accepted.len(),
+            accepted_pairs: self.accepted.pair_count,
         }
     }
 
-    pub(crate) fn starts(&self) -> &[RawInline] {
-        &self.starts
+    pub(crate) fn starts(&self) -> impl Iterator<Item = RawInline> + '_ {
+        self.vertices
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(source, _)| !self.accepted.row_is_empty(*source))
+            .map(|(_, source)| source)
     }
 
-    pub(crate) fn ends(&self) -> &[RawInline] {
-        &self.ends
+    pub(crate) fn ends(&self) -> impl Iterator<Item = RawInline> + '_ {
+        self.vertices
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(target, _)| !self.accepted.column_is_empty(*target))
+            .map(|(_, target)| target)
     }
 
-    pub(crate) fn diagonal(&self) -> &[RawInline] {
-        &self.diagonal
+    pub(crate) fn diagonal(&self) -> impl Iterator<Item = RawInline> + '_ {
+        self.vertices
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(vertex, _)| self.accepted.contains(*vertex, *vertex))
+            .map(|(_, vertex)| vertex)
     }
 }

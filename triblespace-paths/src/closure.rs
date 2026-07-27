@@ -18,6 +18,7 @@ pub(crate) struct Closure {
     position: BTreeMap<ProductPoint, usize>,
     direct_pairs: Vec<(ProductPoint, ProductPoint)>,
     component_of: Vec<usize>,
+    component_members: Vec<Vec<usize>>,
     component_reach: Vec<Vec<u64>>,
     pair_count: usize,
 }
@@ -105,11 +106,8 @@ impl Closure {
         let reachable_members = component_reach
             .iter()
             .map(|row| {
-                component_members
-                    .iter()
-                    .enumerate()
-                    .filter(|(component, _)| bit_is_set(row, *component))
-                    .map(|(_, members)| members.len())
+                set_bits(row)
+                    .map(|component| component_members[component].len())
                     .sum::<usize>()
             })
             .collect::<Vec<_>>();
@@ -126,6 +124,7 @@ impl Closure {
             position,
             direct_pairs,
             component_of,
+            component_members,
             component_reach,
             pair_count,
         }
@@ -142,14 +141,14 @@ impl Closure {
         let Some(&target) = self.position.get(&target) else {
             return false;
         };
+        self.reaches_index(source, target)
+    }
+
+    pub(crate) fn reaches_index(&self, source: usize, target: usize) -> bool {
         bit_is_set(
             &self.component_reach[self.component_of[source]],
             self.component_of[target],
         )
-    }
-
-    pub(crate) fn point_index(&self, point: ProductPoint) -> Option<usize> {
-        self.position.get(&point).copied()
     }
 
     pub(crate) fn row(&self, source: usize) -> impl Iterator<Item = usize> + '_ {
@@ -160,8 +159,17 @@ impl Closure {
         (0..self.points.len()).filter(move |&target| bit_is_set(reach, self.component_of[target]))
     }
 
-    pub(crate) fn point(&self, index: usize) -> ProductPoint {
-        self.points[index]
+    /// Reachable point indices in SCC order.
+    ///
+    /// This deliberately makes no ordering promise: it is the cheap internal
+    /// path for constructing a bitset projection, whose result establishes
+    /// its own canonical order. Public product rows continue to use `row`.
+    pub(crate) fn reachable_indices_unordered(
+        &self,
+        source: usize,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let reach = &self.component_reach[self.component_of[source]];
+        set_bits(reach).flat_map(|component| self.component_members[component].iter().copied())
     }
 
     pub(crate) fn pair_count(&self) -> usize {
@@ -279,6 +287,23 @@ fn set_bit(words: &mut [u64], bit: usize) {
 
 fn bit_is_set(words: &[u64], bit: usize) -> bool {
     words[bit / u64::BITS as usize] & (1u64 << (bit % u64::BITS as usize)) != 0
+}
+
+fn set_bits(words: &[u64]) -> impl Iterator<Item = usize> + '_ {
+    words
+        .iter()
+        .copied()
+        .enumerate()
+        .flat_map(|(word_index, mut word)| {
+            std::iter::from_fn(move || {
+                if word == 0 {
+                    return None;
+                }
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                Some(word_index * u64::BITS as usize + bit)
+            })
+        })
 }
 
 /// Keeps the pre-ablation work-accounting surface internally consistent. The

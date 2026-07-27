@@ -394,4 +394,33 @@ fn same_variable_and_constant_endpoints_keep_relational_semantics() {
         Inline::<UnknownInline>::new(vertex(1)),
     );
     assert!(!absent.satisfied(&Binding::default()));
+
+    let nullable = Automaton::new(1, [0], [0], []).unwrap();
+    let nullable = PathIndex::from_edges(nullable, [edge(3, 99, 1)]);
+    let diagonal = nullable.constraint(variable, variable);
+    assert_eq!(
+        diagonal.estimate(variable.index, &Binding::default()),
+        Some(2)
+    );
+
+    let mut proposals = ProposalBuffer::new();
+    let mut cursor = ProposeCursor::default();
+    assert!(diagonal.propose_chunk(
+        variable.index,
+        &Binding::default(),
+        &mut cursor,
+        1,
+        &mut proposals,
+    ));
+    assert!(!diagonal.propose_chunk(
+        variable.index,
+        &Binding::default(),
+        &mut cursor,
+        1,
+        &mut proposals,
+    ));
+    assert_eq!(
+        proposals.live_values(0).copied().collect::<Vec<_>>(),
+        vec![vertex(1), vertex(3)]
+    );
 }
