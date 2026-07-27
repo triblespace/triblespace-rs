@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`triblespace-paths` starts as a standalone exact RPQ experiment.** A fixed,
+  epsilon-free automaton is evaluated over graph edges by a theorem-sized
+  rank-one transitive-closure kernel. Segment summaries retain every product
+  state and merge by closing the union of their relations, so paths may
+  alternate between segments without changing the small classic query engine.
+  The resulting binary relation implements the public `Constraint` protocol;
+  persistence, port elimination, and accelerator backends remain deliberately
+  outside this reference implementation until its state growth is measured.
+
 ### Changed
 
 - **Pattern constants are Term-native again — `or!(pattern!, pattern!)`
