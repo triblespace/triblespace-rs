@@ -26,8 +26,12 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
 use triblespace_core::id::{Id, RawId};
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::Inline;
 use triblespace_core::prelude::*;
+use triblespace_core::query::{
+    Binding, Constraint, ProposalBuffer, ProposeCursor, Variable, VariableId,
+};
 use triblespace_core::repo::pile::{Pile, PileReader};
 use triblespace_core::repo::{self, PinStore};
 use triblespace_core::trible::{Trible, TribleSet, TRIBLE_LEN};
@@ -191,9 +195,109 @@ fn main() -> Result<(), Box<dyn Error>> {
             stats.batch_pair_count_ns as f64 / 1_000_000.0,
             stats.projection_ns as f64 / 1_000_000.0,
         );
+        report_query_views(&merged);
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidateTimings {
+    count: usize,
+    estimate_us: f64,
+    propose_us: f64,
+    ttfr_us: f64,
+}
+
+fn report_query_views(index: &PathIndex) {
+    let Some((source, target)) = index.accepted_pairs().next() else {
+        println!("        views=(empty accepted relation)");
+        return;
+    };
+    let start = Variable::<UnknownInline>::new(0);
+    let end = Variable::<UnknownInline>::new(1);
+    let relation = index.constraint(start, end);
+    let diagonal = index.constraint(start, start);
+
+    let unbound = Binding::default();
+    let mut source_bound = Binding::default();
+    source_bound.set(start.index, &source);
+    let mut target_bound = Binding::default();
+    target_bound.set(end.index, &target);
+
+    let contains_us = median_us(|| {
+        std::hint::black_box(index.contains(&source, &target));
+    });
+    let forward = candidate_timings(&relation, end.index, &source_bound);
+    let reverse = candidate_timings(&relation, start.index, &target_bound);
+    let starts = candidate_timings(&relation, start.index, &unbound);
+    let ends = candidate_timings(&relation, end.index, &unbound);
+    let diagonal = candidate_timings(&diagonal, start.index, &unbound);
+
+    println!("        query_us contains_hit={contains_us:.3}");
+    for (name, timing) in [
+        ("forward", forward),
+        ("reverse", reverse),
+        ("starts", starts),
+        ("ends", ends),
+        ("diagonal", diagonal),
+    ] {
+        println!(
+            "        query_us {name:<8} count={:<5} estimate={:<9.3} propose={:<9.3} ttfr={:.3}",
+            timing.count, timing.estimate_us, timing.propose_us, timing.ttfr_us,
+        );
+    }
+}
+
+fn candidate_timings<'a, C: Constraint<'a>>(
+    constraint: &C,
+    variable: VariableId,
+    binding: &Binding,
+) -> CandidateTimings {
+    let count = constraint
+        .estimate(variable, binding)
+        .expect("the measured variable belongs to the path constraint");
+    let estimate_us = median_us(|| {
+        std::hint::black_box(constraint.estimate(variable, binding));
+    });
+
+    let mut proposals = ProposalBuffer::new();
+    let propose_us = median_us(|| {
+        proposals.clear();
+        constraint.propose(variable, binding, &mut proposals);
+        std::hint::black_box(proposals.len());
+    });
+    let ttfr_us = median_us(|| {
+        proposals.clear();
+        let mut cursor = ProposeCursor::default();
+        std::hint::black_box(constraint.propose_chunk(
+            variable,
+            binding,
+            &mut cursor,
+            1,
+            &mut proposals,
+        ));
+    });
+
+    CandidateTimings {
+        count,
+        estimate_us,
+        propose_us,
+        ttfr_us,
+    }
+}
+
+fn median_us(mut measured: impl FnMut()) -> f64 {
+    const REPETITIONS: usize = 9;
+    let mut samples = [0u128; REPETITIONS];
+    measured();
+    for sample in &mut samples {
+        let started = Instant::now();
+        measured();
+        *sample = started.elapsed().as_nanos();
+    }
+    samples.sort_unstable();
+    samples[REPETITIONS / 2] as f64 / 1_000.0
 }
 
 /// Open the original pile without constructing a `Repository` (which would
