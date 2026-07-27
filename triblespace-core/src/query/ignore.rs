@@ -45,6 +45,19 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
         self.constraint.propose(variable, binding, proposals);
     }
 
+    /// Delegates to the inner constraint, preserving its chunking.
+    fn propose_chunk(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
+        self.constraint
+            .propose_chunk(variable, binding, cursor, budget, proposals)
+    }
+
     /// Delegates to the inner constraint.
     fn confirm(
         &self,

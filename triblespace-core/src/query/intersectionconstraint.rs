@@ -62,20 +62,38 @@ where
     /// sibling constraints in an enclosing composite are never filtered
     /// through this intersection's children.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+        let mut cursor = ProposeCursor::default();
+        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
+    }
+
+    /// Chunked propose: the tightest child delivers its next chunk and the
+    /// remaining children chunk-confirm it through a mask before it reaches
+    /// the caller — candidates never sit unconfirmed in the buffer. The
+    /// cursor is threaded straight to the tightest child; the child choice
+    /// is stable across one level's chunk sequence because estimates only
+    /// depend on the binding, which is fixed while a level enumerates.
+    fn propose_chunk(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
             .filter_map(|c| Some((c.estimate(variable, binding)?, c)))
             .collect();
         if relevant_constraints.is_empty() {
-            return;
+            return false;
         }
         relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
 
         let base = proposals.len();
-        relevant_constraints[0]
+        let more = relevant_constraints[0]
             .1
-            .propose(variable, binding, proposals);
+            .propose_chunk(variable, binding, cursor, budget, proposals);
 
         let mut mask = Mask::new();
         mask.reset(proposals.len() - base);
@@ -83,6 +101,7 @@ where
             .iter()
             .for_each(|(_, c)| c.confirm(variable, binding, &proposals[base..], &mut mask));
         proposals.compact(&mask, base);
+        more
     }
 
     /// Confirms proposals through all children that constrain `variable`,

@@ -242,6 +242,35 @@ impl Default for Binding {
     }
 }
 
+/// Resume state for chunked proposing — plain data held by the engine,
+/// interpreted by the proposing constraint.
+///
+/// Constraints stay stateless: instead of retaining a live enumeration (which
+/// would borrow the constraint into the engine — the self-referential trap the
+/// stateless protocol exists to avoid), the source re-finds its place from
+/// this cursor on every [`propose_chunk`](Constraint::propose_chunk) call.
+/// `key` is 32 opaque bytes the source owns (a last-delivered value, a rank
+/// offset — its choice); `started` distinguishes "not begun" from "resumed at
+/// the zero key". Plain data means the cursor survives `Query::clone` and the
+/// rayon splitter for free.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProposeCursor {
+    /// Whether any chunk has been requested yet.
+    pub started: bool,
+    /// Source-interpreted resume state.
+    pub key: RawInline,
+}
+
+/// First chunk size requested from [`Constraint::propose_chunk`] at a fresh
+/// level. Small on purpose: time-to-first-result at a wide level is bounded
+/// by the first chunk, not the level's cardinality.
+const INITIAL_CHUNK: usize = 64;
+
+/// Geometric growth factor between successive chunks at one level. Total
+/// enumeration work stays within a constant factor of eager proposing while
+/// the number of refill calls stays logarithmic.
+const WIDEN_FACTOR: usize = 4;
+
 /// Growable buffer of candidate values for one variable at one search level
 /// — the write target of [`Constraint::propose`].
 ///
@@ -531,6 +560,34 @@ pub trait Constraint<'a> {
     /// Does nothing when `variable` is not constrained by this constraint.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer);
 
+    /// Chunked, resumable [`propose`](Constraint::propose): appends up to
+    /// `budget` further candidates for `variable`, advancing `cursor`, and
+    /// returns `true` while more may remain (`false` = exhausted, never call
+    /// again). Delivering a value twice across the calls of one enumeration
+    /// is a semantics error — it would inflate bag multiplicity — and every
+    /// call with nonzero budget must advance the cursor, so a caller looping
+    /// on refill always terminates.
+    ///
+    /// The default delivers everything on the first call and reports
+    /// exhaustion. Sources with seekable enumerations override this to bound
+    /// time-to-first-result at wide levels; composites forward or compose it
+    /// (an intersection chunk-confirms each slice as it arrives).
+    fn propose_chunk(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
+        let _ = budget;
+        if !cursor.started {
+            cursor.started = true;
+            self.propose(variable, binding, proposals);
+        }
+        false
+    }
+
     /// Kills [`Mask`] entries for `proposals` values of `variable` that
     /// violate this constraint.
     ///
@@ -603,6 +660,18 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.propose(variable, binding, proposals)
     }
 
+    fn propose_chunk(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
+        let inner: &T = self;
+        inner.propose_chunk(variable, binding, cursor, budget, proposals)
+    }
+
     fn confirm(
         &self,
         variable: VariableId,
@@ -641,6 +710,18 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.propose(variable, binding, proposals)
     }
 
+    fn propose_chunk(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
+        let inner: &T = self;
+        inner.propose_chunk(variable, binding, cursor, budget, proposals)
+    }
+
     fn confirm(
         &self,
         variable: VariableId,
@@ -660,6 +741,29 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn influence(&self, variable: VariableId) -> VariableSet {
         let inner: &T = self;
         inner.influence(variable)
+    }
+}
+
+/// Per-variable enumeration state for one search level: the materialized
+/// candidates, the resume cursor for the unmaterialized tail, whether more
+/// may remain, and the next chunk budget. Slots are reused across sibling
+/// levels for their buffer capacity, exactly as the plain buffers were.
+#[derive(Clone, Debug)]
+struct LevelValues {
+    buffer: ProposalBuffer,
+    cursor: ProposeCursor,
+    more: bool,
+    widen: usize,
+}
+
+impl Default for LevelValues {
+    fn default() -> Self {
+        LevelValues {
+            buffer: ProposalBuffer::new(),
+            cursor: ProposeCursor::default(),
+            more: false,
+            widen: INITIAL_CHUNK,
+        }
     }
 }
 
@@ -688,7 +792,7 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     touched_variables: VariableSet,
     stack: ArrayVec<VariableId, 128>,
     unbound: ArrayVec<VariableId, 128>,
-    values: ArrayVec<Option<ProposalBuffer>, 128>,
+    values: ArrayVec<Option<LevelValues>, 128>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -756,10 +860,36 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let variable = self.unbound.pop().expect("non-empty unbound");
         let estimate = self.estimates[variable];
         self.stack.push(variable);
-        let values = self.values[variable].get_or_insert(ProposalBuffer::new());
-        values.clear();
-        values.reserve_exact(estimate.saturating_sub(values.capacity()));
-        self.constraint.propose(variable, &self.binding, values);
+        let slot = self.values[variable].get_or_insert_with(LevelValues::default);
+        slot.buffer.clear();
+        slot.cursor = ProposeCursor::default();
+        slot.widen = INITIAL_CHUNK;
+        slot.buffer
+            .reserve_exact(estimate.min(INITIAL_CHUNK).saturating_sub(slot.buffer.capacity()));
+        slot.more = self.constraint.propose_chunk(
+            variable,
+            &self.binding,
+            &mut slot.cursor,
+            slot.widen,
+            &mut slot.buffer,
+        );
+    }
+
+    /// Requests the next geometric chunk for `variable`'s level. Returns
+    /// whether the level may still produce more after this call.
+    fn widen_level(&mut self, variable: VariableId) -> bool {
+        let slot = self.values[variable]
+            .as_mut()
+            .expect("values should be initialized");
+        slot.widen = slot.widen.saturating_mul(WIDEN_FACTOR);
+        slot.more = self.constraint.propose_chunk(
+            variable,
+            &self.binding,
+            &mut slot.cursor,
+            slot.widen,
+            &mut slot.buffer,
+        );
+        slot.more
     }
 
     /// Create a new query.
@@ -853,14 +983,18 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 }
                 Search::NextValue => {
                     if let Some(&variable) = self.stack.last() {
-                        if let Some(assignment) = self.values[variable]
+                        let slot = self.values[variable]
                             .as_mut()
-                            .expect("values should be initialized")
-                            .pop()
-                        {
+                            .expect("values should be initialized");
+                        if let Some(assignment) = slot.buffer.pop() {
                             self.binding.set(variable, &assignment);
                             self.touched_variables.set(variable);
                             self.mode = Search::NextVariable;
+                        } else if slot.more {
+                            // Materialized candidates ran dry but the source
+                            // has (or may have) more: request the next
+                            // geometric chunk and re-enter this arm.
+                            self.widen_level(variable);
                         } else {
                             self.mode = Search::Backtrack;
                         }
@@ -1047,33 +1181,56 @@ mod parallel {
                 }
 
                 // mode == NextValue. Inspect top-of-stack's remaining
-                // proposals.
+                // proposals. With chunked proposing, "single remaining
+                // value" only licenses a descend when the level is also
+                // exhausted — descending through a level with a live
+                // cursor would clone that cursor into the right half at a
+                // later bisect and double-enumerate its tail. Non-exhausted
+                // levels are bisected instead: the right half takes the
+                // materialized candidates (marked exhausted), the left
+                // half keeps the cursor.
                 let Some(&top) = q.stack.last() else {
                     return (self, None);
                 };
-                let top_len = q.values[top].as_ref().map_or(0, |v| v.len());
-                match top_len {
-                    0 => q.mode = Search::Backtrack,
-                    1 => {
+                let (top_len, top_more) = q.values[top]
+                    .as_ref()
+                    .map_or((0, false), |s| (s.buffer.len(), s.more));
+                match (top_len, top_more) {
+                    (0, false) => q.mode = Search::Backtrack,
+                    (0, true) => {
+                        // Nothing materialized but the source has more:
+                        // pull the next chunk, then re-inspect.
+                        q.widen_level(top);
+                    }
+                    (1, false) => {
                         // Descend: pop the single value, bind it,
                         // transition to NextVariable so the outer loop
                         // runs propose.
-                        let assignment = q.values[top].as_mut().unwrap().pop().unwrap();
+                        let assignment =
+                            q.values[top].as_mut().unwrap().buffer.pop().unwrap();
                         q.binding.set(top, &assignment);
                         q.touched_variables.set(top);
                         q.mode = Search::NextVariable;
                     }
                     _ => {
-                        // Bisect the remaining proposals; clone the rest
-                        // of the query state into the right half. Clone
-                        // cost is one ~15 KB arraycopy per
+                        // Bisect the materialized proposals; clone the
+                        // rest of the query state into the right half.
+                        // Clone cost is one ~15 KB arraycopy per
                         // rayon-requested split — rayon only asks under
-                        // stealing pressure.
-                        let vals = q.values[top].as_mut().unwrap();
-                        let mid = vals.len() / 2;
-                        let right_vals = vals.split_off(mid);
+                        // stealing pressure. The right half never drives
+                        // the cursor (its slice is fixed); the left half
+                        // retains it, so every unmaterialized candidate
+                        // still has exactly one owner.
+                        let slot = q.values[top].as_mut().unwrap();
+                        let mid = slot.buffer.len() / 2;
+                        let right_vals = slot.buffer.split_off(mid);
                         let mut right = q.clone();
-                        right.values[top] = Some(right_vals);
+                        right.values[top] = Some(LevelValues {
+                            buffer: right_vals,
+                            cursor: ProposeCursor::default(),
+                            more: false,
+                            widen: INITIAL_CHUNK,
+                        });
 
                         let left_budget = self.split_budget / 2;
                         let right_budget = self.split_budget - left_budget;

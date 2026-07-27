@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
-    Binding, Constraint, ContainsConstraint, Mask, ProposalBuffer, TriblePattern, Variable, VariableContext,
+    Binding, Constraint, ContainsConstraint, Mask, ProposalBuffer, ProposeCursor, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -826,4 +826,133 @@ proptest! {
         prop_assert_eq!(binding.get(j), Some(&vj)); // j unaffected
     }
 
+}
+
+/// Test-only constraint that delivers a fixed sorted value set in cursor-
+/// resumable chunks — exercises the widening path end to end (the library
+/// sources all default to one-shot delivery today).
+struct ChunkedValues {
+    variable: usize,
+    values: Vec<[u8; 32]>,
+}
+
+impl<'a> Constraint<'a> for ChunkedValues {
+    fn variables(&self) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        set.set(self.variable);
+        set
+    }
+
+    fn estimate(&self, variable: usize, _binding: &Binding) -> Option<usize> {
+        (variable == self.variable).then_some(self.values.len())
+    }
+
+    fn propose(&self, variable: usize, binding: &Binding, proposals: &mut ProposalBuffer) {
+        let mut cursor = ProposeCursor::default();
+        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
+    }
+
+    fn propose_chunk(
+        &self,
+        variable: usize,
+        _binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        let mut delivered = u64::from_le_bytes(cursor.key[0..8].try_into().unwrap()) as usize;
+        if !cursor.started {
+            cursor.started = true;
+            delivered = 0;
+        }
+        let take = budget.min(self.values.len() - delivered);
+        proposals.extend_from_slice(&self.values[delivered..delivered + take]);
+        let delivered = delivered + take;
+        cursor.key[0..8].copy_from_slice(&(delivered as u64).to_le_bytes());
+        delivered < self.values.len()
+    }
+
+    fn confirm(
+        &self,
+        variable: usize,
+        _binding: &Binding,
+        proposals: &[triblespace_core::inline::RawInline],
+        mask: &mut Mask,
+    ) {
+        if variable == self.variable {
+            mask.retain(proposals, |v| self.values.binary_search(v).is_ok());
+        }
+    }
+}
+
+proptest! {
+    #[test]
+    fn chunked_proposing_matches_eager(
+        seed_values in vec(prop::array::uniform32(any::<u8>()), 1..600),
+        allowed in vec(prop::array::uniform32(any::<u8>()), 0..40),
+    ) {
+        // Values large enough to span several geometric chunks (64, 256, ...).
+        let mut values: Vec<[u8; 32]> = seed_values;
+        // Guarantee some accepted candidates so the query has results.
+        values.extend(allowed.iter().copied());
+        values.sort_unstable();
+        values.dedup();
+
+        let mut accept: Vec<[u8; 32]> = allowed;
+        accept.sort_unstable();
+        accept.dedup();
+
+        let chunked = ChunkedValues { variable: 0, values: values.clone() };
+        // Byte-lexicographic band as the confirmer: estimate usize::MAX, so
+        // the chunked source is always the proposer and the range confirms
+        // each chunk through the mask path.
+        let lo = accept.first().copied().unwrap_or([0x40; 32]);
+        let hi = accept.last().copied().unwrap_or([0xC0; 32]);
+        let range = triblespace_core::query::rangeconstraint::InlineRange::new(
+            Variable::<UnknownInline>::new(0),
+            Inline::<UnknownInline>::new(lo),
+            Inline::<UnknownInline>::new(hi),
+        );
+
+        // Chunked source joined with the range filter, driven by the engine.
+        let results: HashSet<[u8; 32]> = triblespace_core::query::Query::new(
+            triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+                Box::new(chunked) as Box<dyn Constraint + Send + Sync>,
+                Box::new(range),
+            ]),
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .collect();
+
+        // Eager oracle: plain filter.
+        let expected: HashSet<[u8; 32]> = values
+            .iter()
+            .filter(|v| **v >= lo && **v <= hi)
+            .copied()
+            .collect();
+        prop_assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn chunked_proposing_no_duplicate_delivery(
+        seed_values in vec(prop::array::uniform32(any::<u8>()), 1..600),
+    ) {
+        let mut values: Vec<[u8; 32]> = seed_values;
+        values.sort_unstable();
+        values.dedup();
+        let expected = values.len();
+
+        let chunked = ChunkedValues { variable: 0, values };
+        // Bag semantics: each complete binding must surface exactly once —
+        // duplicate chunk delivery would inflate this count.
+        let results: Vec<[u8; 32]> = triblespace_core::query::Query::new(
+            chunked,
+            |binding: &Binding| binding.get(0).copied(),
+        )
+        .collect();
+        prop_assert_eq!(results.len(), expected);
+    }
 }
