@@ -90,6 +90,8 @@ pub struct BuildStats {
     pub batch_scc_ns: u128,
     /// Reverse-topological bitset propagation time.
     pub batch_propagation_ns: u128,
+    /// Exact product-pair cardinality scan over component bitsets.
+    pub batch_pair_count_ns: u128,
     /// Accepted-pair and query-fiber materialization time.
     pub projection_ns: u128,
 }
@@ -113,6 +115,7 @@ impl Default for BuildStats {
             batch_setup_ns: 0,
             batch_scc_ns: 0,
             batch_propagation_ns: 0,
+            batch_pair_count_ns: 0,
             projection_ns: 0,
         }
     }

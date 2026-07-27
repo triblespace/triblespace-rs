@@ -89,6 +89,7 @@ struct BatchPhases {
     setup_ns: u128,
     scc_ns: u128,
     propagation_ns: u128,
+    pair_count_ns: u128,
     projection_ns: u128,
 }
 
@@ -496,7 +497,7 @@ fn format_stats(stats: BuildStats) -> String {
 fn format_batch_stats(stats: &[BuildStats], phases: BatchPhases) -> String {
     let sum = |field: fn(&BuildStats) -> usize| stats.iter().map(field).sum::<usize>();
     format!(
-        "components={} dag_edges={} bitset_words={} word_ors={} phase_us={:.3}/{:.3}/{:.3}/{:.3}",
+        "components={} dag_edges={} bitset_words={} word_ors={} phase_us(setup/scc/propagation/pair_count/projection)={:.3}/{:.3}/{:.3}/{:.3}/{:.3}",
         sum(|stats| stats.batch_components),
         sum(|stats| stats.batch_condensation_edges),
         sum(|stats| stats.batch_bitset_words),
@@ -504,6 +505,7 @@ fn format_batch_stats(stats: &[BuildStats], phases: BatchPhases) -> String {
         phases.setup_ns as f64 / 1_000.0,
         phases.scc_ns as f64 / 1_000.0,
         phases.propagation_ns as f64 / 1_000.0,
+        phases.pair_count_ns as f64 / 1_000.0,
         phases.projection_ns as f64 / 1_000.0,
     )
 }
@@ -514,6 +516,7 @@ fn batch_phases(stats: &[BuildStats]) -> BatchPhases {
         setup_ns: sum(|stats| stats.batch_setup_ns),
         scc_ns: sum(|stats| stats.batch_scc_ns),
         propagation_ns: sum(|stats| stats.batch_propagation_ns),
+        pair_count_ns: sum(|stats| stats.batch_pair_count_ns),
         projection_ns: sum(|stats| stats.projection_ns),
     }
 }
@@ -523,6 +526,7 @@ fn summarize_phases(samples: Vec<BatchPhases>) -> BatchPhases {
         setup_ns: median(samples.iter().map(|sample| sample.setup_ns)),
         scc_ns: median(samples.iter().map(|sample| sample.scc_ns)),
         propagation_ns: median(samples.iter().map(|sample| sample.propagation_ns)),
+        pair_count_ns: median(samples.iter().map(|sample| sample.pair_count_ns)),
         projection_ns: median(samples.iter().map(|sample| sample.projection_ns)),
     }
 }

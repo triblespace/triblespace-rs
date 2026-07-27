@@ -102,6 +102,7 @@ impl Closure {
         stats.batch_word_ors = stats.batch_condensation_edges.saturating_mul(word_count);
         stats.batch_propagation_ns = propagation_started.elapsed().as_nanos();
 
+        let pair_count_started = Instant::now();
         let reachable_members = component_reach
             .iter()
             .map(|row| {
@@ -118,6 +119,7 @@ impl Closure {
             .enumerate()
             .map(|(component, members)| members.len().saturating_mul(reachable_members[component]))
             .sum();
+        stats.batch_pair_count_ns = pair_count_started.elapsed().as_nanos();
         record_compatibility_work(stats, point_count, pair_count);
 
         Self {
