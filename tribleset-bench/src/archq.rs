@@ -299,6 +299,42 @@ where
             .collect()
     }
 
+    /// Share of confirm WORK — live candidates, not confirm calls — falling
+    /// in each region-size band.
+    ///
+    /// The median region holds one candidate, so a census that reports only
+    /// counts makes the confirm path look uniformly tiny. It is not: a
+    /// single 268k-candidate region outweighs a hundred thousand
+    /// single-candidate ones. An optimization that needs a batch to amortize
+    /// can only ever pay on the work in its band, so the work distribution —
+    /// not the count distribution — is what decides whether a CPU batch tier
+    /// between the scalar probes and the GPU's 16 384-candidate floor has
+    /// anything to do.
+    ///
+    /// Returns `(label, confirms, live candidates)` per band, in order.
+    pub fn work_by_band(&self) -> Vec<(&'static str, u64, u64)> {
+        // Upper bound (exclusive) of each band, and its label.
+        const BANDS: &[(u64, &str)] = &[
+            (2, "1"),
+            (4, "2-3"),
+            (64, "4-63"),
+            (1024, "64-1023"),
+            (CONFIRM_THRESHOLD as u64, "1k-16k"),
+            (u64::MAX, ">=16384"),
+        ];
+        let hist = self.hist.lock().expect("region histogram");
+        BANDS
+            .iter()
+            .scan(0u64, |lower, &(upper, label)| {
+                let lo = *lower;
+                *lower = upper;
+                let confirms = hist.range(lo..upper).map(|(_, &n)| n).sum();
+                let live = hist.range(lo..upper).map(|(&v, &n)| v * n).sum();
+                Some((label, confirms, live))
+            })
+            .collect()
+    }
+
     /// Give the wrapped CPU archive back (the timed arms take it from
     /// here — the census builds the archive exactly once).
     pub fn into_archive(self) -> SuccinctArchive<U> {

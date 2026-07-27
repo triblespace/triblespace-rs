@@ -513,6 +513,23 @@ fn run_arch_queries(
                         answer.value,
                         ds.facts.top_regions(4)
                     );
+                    // Where the WORK is, as opposed to where the confirm
+                    // calls are — the two distributions disagree violently
+                    // and only the first bounds what a batch tier can win.
+                    let bands = ds.facts.work_by_band();
+                    let live: u64 = bands.iter().map(|&(_, _, l)| l).sum();
+                    if live > 0 {
+                        let cells: Vec<String> = bands
+                            .iter()
+                            .map(|&(label, confirms, l)| {
+                                format!(
+                                    "{label} {:.1}% ({confirms})",
+                                    100.0 * l as f64 / live as f64
+                                )
+                            })
+                            .collect();
+                        println!("      work by region size: {}", cells.join(" | "));
+                    }
                 }
             }
         }
