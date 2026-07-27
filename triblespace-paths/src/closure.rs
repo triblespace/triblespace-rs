@@ -71,10 +71,16 @@ impl Closure {
 
         let predecessors = self.columns[source].clone();
         let successors = self.rows[target].clone();
+        let rectangle_area = predecessors.len().saturating_mul(successors.len());
         stats.effective_insertions += 1;
-        stats.largest_rectangle = stats
-            .largest_rectangle
-            .max(predecessors.len().saturating_mul(successors.len()));
+        stats.largest_rectangle = stats.largest_rectangle.max(rectangle_area);
+        stats.rectangle_cells_considered = stats
+            .rectangle_cells_considered
+            .saturating_add(rectangle_area);
+        let rectangle_bucket = rectangle_area.ilog2() as usize;
+        stats.rectangle_log2_counts[rectangle_bucket] += 1;
+        stats.rectangle_log2_cells[rectangle_bucket] =
+            stats.rectangle_log2_cells[rectangle_bucket].saturating_add(rectangle_area);
 
         let mut added = 0usize;
         for predecessor in predecessors {

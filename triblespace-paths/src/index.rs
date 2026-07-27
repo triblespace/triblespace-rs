@@ -10,6 +10,10 @@ use triblespace_core::trible::Trible;
 use crate::automaton::{Automaton, StateId};
 use crate::closure::Closure;
 
+/// Number of power-of-two buckets needed to classify every nonzero `usize`
+/// rectangle area.
+pub const RECTANGLE_LOG2_BUCKETS: usize = usize::BITS as usize;
+
 /// One directed, attribute-labeled graph edge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct GraphEdge {
@@ -47,7 +51,7 @@ pub struct ProductPoint {
 }
 
 /// Work performed while constructing one exact closure.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildStats {
     /// Distinct graph edges supplied to a leaf build.
     pub graph_edges: usize,
@@ -61,6 +65,40 @@ pub struct BuildStats {
     pub derived_pairs: usize,
     /// Largest `|pred(u)| × |succ(v)|` rectangle considered by one update.
     pub largest_rectangle: usize,
+    /// Sum of all `|pred(u)| × |succ(v)|` rectangle areas considered.
+    ///
+    /// This is the kernel's exact inner-loop work before accounting for the
+    /// ordered-set implementation used by this reference version.
+    pub rectangle_cells_considered: usize,
+    /// Number of effective insertions by rectangle-area scale.
+    ///
+    /// Bucket `k` counts areas in `2^k..2^(k+1)`. Since every effective
+    /// insertion has a nonempty predecessor and successor set, area zero
+    /// needs no bucket. The distribution reveals whether closure work arrives
+    /// in accelerator-sized rectangles without changing execution policy.
+    pub rectangle_log2_counts: [usize; RECTANGLE_LOG2_BUCKETS],
+    /// Sum of rectangle areas in each [`BuildStats::rectangle_log2_counts`]
+    /// bucket.
+    ///
+    /// Counts reveal launch frequency; these cell totals reveal what fraction
+    /// of the kernel's actual inner-loop work those launches could cover.
+    pub rectangle_log2_cells: [usize; RECTANGLE_LOG2_BUCKETS],
+}
+
+impl Default for BuildStats {
+    fn default() -> Self {
+        Self {
+            graph_edges: 0,
+            seed_pairs_considered: 0,
+            effective_insertions: 0,
+            pairs_added: 0,
+            derived_pairs: 0,
+            largest_rectangle: 0,
+            rectangle_cells_considered: 0,
+            rectangle_log2_counts: [0; RECTANGLE_LOG2_BUCKETS],
+            rectangle_log2_cells: [0; RECTANGLE_LOG2_BUCKETS],
+        }
+    }
 }
 
 /// Size of the retained product relation and its user-visible projection.

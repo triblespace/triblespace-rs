@@ -18,4 +18,7 @@ mod index;
 
 pub use automaton::{Automaton, AutomatonError, StateId, Step, Transition};
 pub use constraint::PathConstraint;
-pub use index::{BuildStats, GraphEdge, IndexMetrics, MergeError, PathIndex, ProductPoint};
+pub use index::{
+    BuildStats, GraphEdge, IndexMetrics, MergeError, PathIndex, ProductPoint,
+    RECTANGLE_LOG2_BUCKETS,
+};

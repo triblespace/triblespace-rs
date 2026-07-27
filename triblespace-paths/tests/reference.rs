@@ -158,7 +158,17 @@ fn one_bridge_can_create_a_quadratic_number_of_answers() {
         })
         .count();
     assert_eq!(cross_pairs, usize::from(N) * usize::from(N));
-    assert!(merged.build_stats().derived_pairs >= cross_pairs);
+    let stats = merged.build_stats();
+    assert!(stats.derived_pairs >= cross_pairs);
+    assert!(stats.rectangle_cells_considered >= stats.pairs_added);
+    assert_eq!(
+        stats.rectangle_log2_counts.iter().sum::<usize>(),
+        stats.effective_insertions
+    );
+    assert_eq!(
+        stats.rectangle_log2_cells.iter().sum::<usize>(),
+        stats.rectangle_cells_considered
+    );
 }
 
 #[test]

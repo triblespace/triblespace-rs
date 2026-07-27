@@ -10,6 +10,9 @@
 //! are reported as min/median/max over repeated runs and will naturally vary
 //! between machines. Leaf distributions contain one sorted value per segment.
 
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::time::Instant;
 
 use triblespace_core::id::RawId;
@@ -24,6 +27,7 @@ const SEGMENTS: usize = 4;
 const SCALES: [usize; 5] = [16, 32, 64, 128, 256];
 const BRIDGE_FAN_WIDTHS: [usize; 3] = [32, 64, 128];
 const GPU_CROSSOVER_REFERENCE_CELLS: usize = 16_384;
+const DEFAULT_EDGE_FILE_LIMIT: usize = 4_096;
 
 #[derive(Clone, Copy)]
 enum GraphFamily {
@@ -115,6 +119,77 @@ fn main() {
         );
         report("bridge_fan", width, edges.len(), &measurement);
     }
+
+    if let Ok(paths) = std::env::var("PATHS_MEASURE_EDGE_FILES") {
+        let limit = std::env::var("PATHS_MEASURE_EDGE_LIMIT")
+            .ok()
+            .map(|value| {
+                value
+                    .parse()
+                    .expect("PATHS_MEASURE_EDGE_LIMIT is an integer")
+            })
+            .unwrap_or(DEFAULT_EDGE_FILE_LIMIT);
+        for path in paths.split(',').filter(|path| !path.is_empty()) {
+            let edges = load_pipe_edges(Path::new(path), limit);
+            let batches = partition(&edges, SEGMENTS);
+            let measurement = measure(&edges, &batches, &one_or_more());
+            let name = Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("edge_file");
+            report(name, edges.len(), edges.len(), &measurement);
+        }
+    }
+}
+
+fn load_pipe_edges(path: &Path, limit: usize) -> Vec<GraphEdge> {
+    let file = File::open(path)
+        .unwrap_or_else(|error| panic!("failed to open {}: {error}", path.display()));
+    let mut lines = BufReader::new(file).lines();
+    lines
+        .next()
+        .transpose()
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+
+    lines
+        .take(limit)
+        .enumerate()
+        .map(|(index, line)| {
+            let line = line.unwrap_or_else(|error| {
+                panic!(
+                    "failed to read {} line {}: {error}",
+                    path.display(),
+                    index + 2
+                )
+            });
+            let (source, target) = line.split_once('|').unwrap_or_else(|| {
+                panic!(
+                    "{} line {} has no pipe delimiter",
+                    path.display(),
+                    index + 2
+                )
+            });
+            let source = source.parse::<u64>().unwrap_or_else(|error| {
+                panic!(
+                    "{} line {} has invalid source: {error}",
+                    path.display(),
+                    index + 2
+                )
+            });
+            let target = target.parse::<u64>().unwrap_or_else(|error| {
+                panic!(
+                    "{} line {} has invalid target: {error}",
+                    path.display(),
+                    index + 2
+                )
+            });
+            GraphEdge {
+                source: vertex_u64(source),
+                attribute: ATTRIBUTE,
+                target: vertex_u64(target),
+            }
+        })
+        .collect()
 }
 
 fn measure(edges: &[GraphEdge], batches: &[Vec<GraphEdge>], automaton: &Automaton) -> Measurement {
@@ -322,8 +397,12 @@ fn edge(source: usize, target: usize) -> GraphEdge {
 }
 
 fn vertex(value: usize) -> RawInline {
+    vertex_u64(value as u64)
+}
+
+fn vertex_u64(value: u64) -> RawInline {
     let mut raw = [0; 32];
-    raw[..8].copy_from_slice(&(value as u64).to_be_bytes());
+    raw[..8].copy_from_slice(&value.to_be_bytes());
     raw
 }
 
