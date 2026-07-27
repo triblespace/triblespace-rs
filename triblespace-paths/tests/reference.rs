@@ -47,6 +47,26 @@ fn product(index: &PathIndex) -> BTreeSet<(ProductPoint, ProductPoint)> {
 }
 
 #[test]
+fn product_pairs_stay_globally_sorted_across_noncontiguous_scc_members() {
+    let automaton = Automaton::new(
+        1,
+        [0],
+        [0],
+        [Transition::new(0, 0, Step::Forward(attribute(13)))],
+    )
+    .unwrap();
+    // Points 0 and 2 form one SCC and both reach point 1. Grouping a row by
+    // Kosaraju component number would emit targets 0, 2, 1 instead of the
+    // baseline's global point order 0, 1, 2.
+    let index = PathIndex::from_edges(automaton, [edge(0, 13, 2), edge(2, 13, 0), edge(0, 13, 1)]);
+    let actual = index.product_pairs().collect::<Vec<_>>();
+    let mut sorted = actual.clone();
+    sorted.sort_unstable();
+
+    assert_eq!(actual, sorted);
+}
+
+#[test]
 fn segment_merge_closes_cross_segment_reentry() {
     let automaton = plus(9);
     let first = PathIndex::from_edges(automaton.clone(), [edge(1, 9, 2), edge(3, 9, 4)]);

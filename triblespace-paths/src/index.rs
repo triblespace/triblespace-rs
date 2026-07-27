@@ -52,6 +52,11 @@ pub struct ProductPoint {
 }
 
 /// Work performed while constructing one exact closure.
+///
+/// The `rectangle_*` fields on this SCC ablation branch are non-semantic
+/// compatibility accounting for the pre-existing measurement harness. They
+/// do not describe executed SCC/bitset work and are not a production API
+/// proposal; the `batch_*` fields describe the actual ablation kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildStats {
     /// Distinct graph edges supplied to a leaf build.
@@ -366,7 +371,8 @@ impl PathIndex {
         self.closure.reaches(source, target)
     }
 
-    /// Complete product relation, including identity.
+    /// Complete product relation, including identity, sorted by source and
+    /// then target product point.
     pub fn product_pairs(&self) -> impl Iterator<Item = (ProductPoint, ProductPoint)> + '_ {
         self.closure.pairs()
     }

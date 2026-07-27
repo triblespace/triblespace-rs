@@ -18,7 +18,6 @@ pub(crate) struct Closure {
     position: BTreeMap<ProductPoint, usize>,
     direct_pairs: Vec<(ProductPoint, ProductPoint)>,
     component_of: Vec<usize>,
-    component_members: Vec<Vec<usize>>,
     component_reach: Vec<Vec<u64>>,
     pair_count: usize,
 }
@@ -90,8 +89,8 @@ impl Closure {
         let propagation_started = Instant::now();
         let word_count = component_count.div_ceil(u64::BITS as usize);
         let mut component_reach = vec![vec![0u64; word_count]; component_count];
-        for component in 0..component_count {
-            set_bit(&mut component_reach[component], component);
+        for (component, row) in component_reach.iter_mut().enumerate() {
+            set_bit(row, component);
         }
         for &component in topological.iter().rev() {
             for &successor in &component_edges[component] {
@@ -127,7 +126,6 @@ impl Closure {
             position,
             direct_pairs,
             component_of,
-            component_members,
             component_reach,
             pair_count,
         }
@@ -156,11 +154,10 @@ impl Closure {
 
     pub(crate) fn row(&self, source: usize) -> impl Iterator<Item = usize> + '_ {
         let reach = &self.component_reach[self.component_of[source]];
-        self.component_members
-            .iter()
-            .enumerate()
-            .filter(move |(component, _)| bit_is_set(reach, *component))
-            .flat_map(|(_, members)| members.iter().copied())
+        // Component numbering is an SCC-algorithm detail and can interleave
+        // globally ordered points. Filter canonical point indices so callers
+        // retain the baseline's ascending row order.
+        (0..self.points.len()).filter(move |&target| bit_is_set(reach, self.component_of[target]))
     }
 
     pub(crate) fn point(&self, index: usize) -> ProductPoint {
