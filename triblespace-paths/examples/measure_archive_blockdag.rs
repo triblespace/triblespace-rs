@@ -1,7 +1,7 @@
 //! Read-only staged measurement of `block::previous+` over the local archive pile.
 //!
 //! The example walks the archive branch's linear commit history using commit
-//! metadata, then scans only the oldest 1/2/4/8/16 content blobs. Content is
+//! metadata, then scans only the oldest 1/2/4/8/16/32 content blobs. Content is
 //! kept mmap-backed as `SimpleArchive` bytes: unrelated tribles never enter a
 //! `TribleSet` or `PathIndex`.
 //!
@@ -39,7 +39,7 @@ const ARCHIVE_BRANCH_ID: &str = "2C5B9785352E962368F3089A9CAEA386";
 const BLOCK_PREVIOUS: RawId = [
     0x9B, 0x8F, 0x69, 0x3B, 0xE9, 0x59, 0x13, 0x6E, 0x90, 0xC3, 0x4C, 0xF0, 0x54, 0xF9, 0x03, 0x3F,
 ];
-const RUNGS: [usize; 5] = [1, 2, 4, 8, 16];
+const RUNGS: [usize; 6] = [1, 2, 4, 8, 16, 32];
 
 // With two automaton states the vertex default bounds the dense product
 // relation to 4,194,304 pairs. The actual `previous+` relation should be much
