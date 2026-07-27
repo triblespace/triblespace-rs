@@ -129,7 +129,11 @@ fn main() {
     // resolves — the confirm path's common case.
     let mut rng = Rng(0x1234_5678_9abc_def0);
     let values: Vec<RawInline> = (0..cands)
-        .map(|_| archive.domain.access((rng.next() as usize) % archive.domain.len()))
+        .map(|_| {
+            archive
+                .domain
+                .access((rng.next() as usize) % archive.domain.len())
+        })
         .collect();
 
     // Component 1: the whole inner loop, exactly as confirm runs it today.
@@ -219,17 +223,15 @@ fn main() {
     }
 
     // Component 7: both levers at once — one descent per candidate, batched.
-    let starts = vec![r_start; cands];
-    let ends = vec![r_end; cands];
     let mut rout = vec![None; cands];
     archive
         .ave_c
-        .rank_range_batch_into(&starts, &ends, &ds, &mut rout)
+        .rank_range_batch_into(r_start..r_end, &ds, &mut rout)
         .unwrap();
     let t = Instant::now();
     archive
         .ave_c
-        .rank_range_batch_into(&starts, &ends, &ds, &mut rout)
+        .rank_range_batch_into(r_start..r_end, &ds, &mut rout)
         .unwrap();
     let range_batch = t.elapsed();
     for (i, &d) in ds.iter().enumerate() {
@@ -250,12 +252,10 @@ fn main() {
             dsb.push(d);
         }
     }
-    let starts2 = vec![r_start; dsb.len()];
-    let ends2 = vec![r_end; dsb.len()];
     let mut out2 = vec![None; dsb.len()];
     archive
         .ave_c
-        .rank_range_batch_into(&starts2, &ends2, &dsb, &mut out2)
+        .rank_range_batch_into(r_start..r_end, &dsb, &mut out2)
         .unwrap();
     let mut kept = 0usize;
     for o in &out2 {
