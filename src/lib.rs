@@ -19,13 +19,13 @@ pub use triblespace_search as search;
 pub mod macros {
     pub use triblespace_core::macros::id_hex;
     pub use triblespace_macros::{
-        attributes, entity, exists, find, path, pattern, pattern_changes, value_formatter,
+        attributes, entity, exists, find, pattern, pattern_changes, value_formatter,
     };
 }
 
 pub mod prelude {
     pub use crate::macros::{
-        attributes, entity, exists, find, id_hex, path, pattern, pattern_changes, value_formatter,
+        attributes, entity, exists, find, id_hex, pattern, pattern_changes, value_formatter,
     };
     pub use triblespace_core::prelude::*;
 }

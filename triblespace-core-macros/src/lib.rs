@@ -22,12 +22,6 @@ pub fn attributes(input: TokenStream) -> TokenStream {
     ))
 }
 
-#[proc_macro]
-pub fn path(input: TokenStream) -> TokenStream {
-    let base_path = core_base_path();
-    let tokens = TokenStream2::from(input);
-    expand(triblespace_macros_common::path_impl(tokens, &base_path))
-}
 
 #[proc_macro]
 pub fn pattern(input: TokenStream) -> TokenStream {

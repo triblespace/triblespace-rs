@@ -31,8 +31,6 @@ pub mod intersectionconstraint;
 pub mod patchconstraint;
 /// [`InlineRange`](rangeconstraint::InlineRange) — restricts a variable to a byte-lexicographic range.
 pub mod rangeconstraint;
-/// [`RegularPathConstraint`] — regular path expressions over graphs.
-pub mod regularpathconstraint;
 /// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
 pub mod sortedsliceconstraint;
 /// [`UnionConstraint`](unionconstraint::UnionConstraint) — logical OR.
@@ -54,10 +52,6 @@ use crate::inline::RawInline;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 
-/// Re-export of [`PathOp`].
-pub use regularpathconstraint::PathOp;
-/// Re-export of [`RegularPathConstraint`].
-pub use regularpathconstraint::RegularPathConstraint;
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
 

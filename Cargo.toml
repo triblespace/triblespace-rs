@@ -110,9 +110,6 @@ harness = false
 name = "number_format"
 harness = false
 
-[[bench]]
-name = "path_query"
-harness = false
 [profile.bench]
 debug = true
 opt-level = 3

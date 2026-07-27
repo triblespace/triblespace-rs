@@ -26,7 +26,7 @@ use syn::Type;
 use syn::Visibility;
 
 use triblespace_macros_common::{
-    attributes_impl, entity_impl, path_impl, pattern_changes_impl, pattern_impl,
+    attributes_impl, entity_impl, pattern_changes_impl, pattern_impl,
     value_formatter_impl,
 };
 
@@ -322,37 +322,6 @@ pub fn attributes(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Builds a regular-path constraint over attribute edges.
-///
-/// The syntax is:
-///
-/// `path!(set_expr, start regex end)`
-///
-/// where `start` and `end` are query variables and `regex` is a path
-/// expression over attribute names using:
-///
-/// - adjacency for concatenation
-/// - `|` for alternation
-/// - `*` and `+` for repetition
-/// - parentheses for grouping
-///
-/// ```rust,ignore
-/// find!(
-///     (src: Inline<_>, dst: Inline<_>),
-///     path!(kb.clone(), src (social::follows | social::likes)+ dst)
-/// )
-/// ```
-#[proc_macro]
-pub fn path(input: TokenStream) -> TokenStream {
-    let clone = input.clone();
-    emit_metadata("path", &clone, |_context| {});
-    let base_path: TokenStream2 = quote!(::triblespace::core);
-    let tokens = TokenStream2::from(input);
-    match path_impl(tokens, &base_path) {
-        Ok(ts) => TokenStream::from(ts),
-        Err(e) => e.to_compile_error().into(),
-    }
-}
 
 /// Expands a bracketed trible pattern into a query constraint.
 ///
