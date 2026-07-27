@@ -79,11 +79,25 @@ struct Measurement {
     merge_stats: BuildStats,
     monolithic_stats: BuildStats,
     metrics: IndexMetrics,
+    leaf_phases: BatchPhases,
+    merge_phases: BatchPhases,
+    monolithic_phases: BatchPhases,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BatchPhases {
+    setup_ns: u128,
+    scc_ns: u128,
+    propagation_ns: u128,
+    projection_ns: u128,
 }
 
 fn main() {
     let include_large = matches!(std::env::var("PATHS_MEASURE_LARGE"), Ok(value) if value == "1");
     println!("triblespace-paths deterministic measurement harness");
+    println!(
+        "ablation=scc_condensation_reverse_topological_bitsets (single batch; no rank-one updates)"
+    );
     println!(
         "configuration repetitions={REPETITIONS} warmups=1 segments={SEGMENTS} scales={SCALES:?}"
     );
@@ -92,7 +106,9 @@ fn main() {
         if include_large { "enabled" } else { "staged" }
     );
     println!("leaf distributions are sorted values with one observation per segment");
-    println!("rectangle_log2 histograms use k:insertions/cells for areas in 2^k..2^(k+1)");
+    println!(
+        "rectangle_log2 histograms are compatibility accounting, not executed kernel rectangles"
+    );
     println!(
         "gpu_crossover_reference={GPU_CROSSOVER_REFERENCE_CELLS} cells (current triblespace-gpu reference, observational only; not path-engine policy)"
     );
@@ -197,6 +213,9 @@ fn measure(edges: &[GraphEdge], batches: &[Vec<GraphEdge>], automaton: &Automato
     let mut leaf_samples = Vec::with_capacity(REPETITIONS);
     let mut merge_samples = Vec::with_capacity(REPETITIONS);
     let mut monolithic_samples = Vec::with_capacity(REPETITIONS);
+    let mut leaf_phase_samples = Vec::with_capacity(REPETITIONS);
+    let mut merge_phase_samples = Vec::with_capacity(REPETITIONS);
+    let mut monolithic_phase_samples = Vec::with_capacity(REPETITIONS);
     let mut snapshot = None;
 
     // The first iteration warms allocator and instruction-cache paths but is
@@ -221,11 +240,17 @@ fn measure(edges: &[GraphEdge], batches: &[Vec<GraphEdge>], automaton: &Automato
         assert!(merged.accepted_pairs().eq(monolithic.accepted_pairs()));
         assert!(merged.product_pairs().eq(monolithic.product_pairs()));
 
+        let leaf_stats = leaves
+            .iter()
+            .map(PathIndex::build_stats)
+            .collect::<Vec<_>>();
+        let merge_stats = merged.build_stats();
+        let monolithic_stats = monolithic.build_stats();
         if snapshot.is_none() {
             snapshot = Some((
-                leaves.iter().map(PathIndex::build_stats).collect(),
-                merged.build_stats(),
-                monolithic.build_stats(),
+                leaf_stats.clone(),
+                merge_stats,
+                monolithic_stats,
                 merged.metrics(),
             ));
         }
@@ -234,6 +259,9 @@ fn measure(edges: &[GraphEdge], batches: &[Vec<GraphEdge>], automaton: &Automato
             leaf_samples.push(leaf_ns);
             merge_samples.push(merge_ns);
             monolithic_samples.push(monolithic_ns);
+            leaf_phase_samples.push(batch_phases(&leaf_stats));
+            merge_phase_samples.push(batch_phases(std::slice::from_ref(&merge_stats)));
+            monolithic_phase_samples.push(batch_phases(std::slice::from_ref(&monolithic_stats)));
         }
     }
 
@@ -248,6 +276,9 @@ fn measure(edges: &[GraphEdge], batches: &[Vec<GraphEdge>], automaton: &Automato
         merge_stats,
         monolithic_stats,
         metrics,
+        leaf_phases: summarize_phases(leaf_phase_samples),
+        merge_phases: summarize_phases(merge_phase_samples),
+        monolithic_phases: summarize_phases(monolithic_phase_samples),
     }
 }
 
@@ -271,6 +302,18 @@ fn report(family: &str, scale: usize, edge_count: usize, result: &Measurement) {
         format_times(&result.leaf_build),
         format_times(&result.merge),
         format_times(&result.monolithic_build),
+    );
+    println!(
+        "  batch leaf={} merge={} monolithic={}",
+        format_batch_stats(&result.leaf_stats, result.leaf_phases),
+        format_batch_stats(
+            std::slice::from_ref(&result.merge_stats),
+            result.merge_phases,
+        ),
+        format_batch_stats(
+            std::slice::from_ref(&result.monolithic_stats),
+            result.monolithic_phases,
+        ),
     );
     println!(
         "  leaf_distribution batch_edges={} seed_pairs={} effective_insertions={} pairs_added={} derived_pairs={} rectangle_cells={} largest_rectangle={}",
@@ -448,6 +491,46 @@ fn format_stats(stats: BuildStats) -> String {
         stats.rectangle_cells_considered,
         stats.largest_rectangle,
     )
+}
+
+fn format_batch_stats(stats: &[BuildStats], phases: BatchPhases) -> String {
+    let sum = |field: fn(&BuildStats) -> usize| stats.iter().map(field).sum::<usize>();
+    format!(
+        "components={} dag_edges={} bitset_words={} word_ors={} phase_us={:.3}/{:.3}/{:.3}/{:.3}",
+        sum(|stats| stats.batch_components),
+        sum(|stats| stats.batch_condensation_edges),
+        sum(|stats| stats.batch_bitset_words),
+        sum(|stats| stats.batch_word_ors),
+        phases.setup_ns as f64 / 1_000.0,
+        phases.scc_ns as f64 / 1_000.0,
+        phases.propagation_ns as f64 / 1_000.0,
+        phases.projection_ns as f64 / 1_000.0,
+    )
+}
+
+fn batch_phases(stats: &[BuildStats]) -> BatchPhases {
+    let sum = |field: fn(&BuildStats) -> u128| stats.iter().map(field).sum::<u128>();
+    BatchPhases {
+        setup_ns: sum(|stats| stats.batch_setup_ns),
+        scc_ns: sum(|stats| stats.batch_scc_ns),
+        propagation_ns: sum(|stats| stats.batch_propagation_ns),
+        projection_ns: sum(|stats| stats.projection_ns),
+    }
+}
+
+fn summarize_phases(samples: Vec<BatchPhases>) -> BatchPhases {
+    BatchPhases {
+        setup_ns: median(samples.iter().map(|sample| sample.setup_ns)),
+        scc_ns: median(samples.iter().map(|sample| sample.scc_ns)),
+        propagation_ns: median(samples.iter().map(|sample| sample.propagation_ns)),
+        projection_ns: median(samples.iter().map(|sample| sample.projection_ns)),
+    }
+}
+
+fn median(values: impl IntoIterator<Item = u128>) -> u128 {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 fn aggregate_rectangle_histogram(stats: &[BuildStats]) -> String {

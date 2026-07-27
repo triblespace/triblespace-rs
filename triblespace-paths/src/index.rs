@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::time::Instant;
 
 use triblespace_core::id::RawId;
 use triblespace_core::inline::encodings::UnknownInline;
@@ -57,32 +58,40 @@ pub struct BuildStats {
     pub graph_edges: usize,
     /// Product arcs or child-summary pairs offered to the closure kernel.
     pub seed_pairs_considered: usize,
-    /// Offered pairs that were not already reachable.
+    /// Distinct non-identity direct product arcs entering the batch kernel.
     pub effective_insertions: usize,
-    /// Total novel product pairs written by rank-one updates.
+    /// Total non-identity product pairs in the completed closure.
     pub pairs_added: usize,
-    /// Novel pairs other than each insertion's direct pair.
+    /// Closure pairs other than the distinct direct product arcs.
     pub derived_pairs: usize,
-    /// Largest `|pred(u)| × |succ(v)|` rectangle considered by one update.
+    /// Compatibility view of the largest logical batch of closure work.
+    ///
+    /// The SCC ablation performs no rank-one updates. It charges direct arcs
+    /// one cell each and all derived pairs to one aggregate batch so existing
+    /// observational consumers remain internally additive.
     pub largest_rectangle: usize,
-    /// Sum of all `|pred(u)| × |succ(v)|` rectangle areas considered.
-    ///
-    /// This is the kernel's exact inner-loop work before accounting for the
-    /// ordered-set implementation used by this reference version.
+    /// Compatibility work cells; equal to [`BuildStats::pairs_added`].
     pub rectangle_cells_considered: usize,
-    /// Number of effective insertions by rectangle-area scale.
-    ///
-    /// Bucket `k` counts areas in `2^k..2^(k+1)`. Since every effective
-    /// insertion has a nonempty predecessor and successor set, area zero
-    /// needs no bucket. The distribution reveals whether closure work arrives
-    /// in accelerator-sized rectangles without changing execution policy.
+    /// Compatibility logical batches by power-of-two work scale.
     pub rectangle_log2_counts: [usize; RECTANGLE_LOG2_BUCKETS],
-    /// Sum of rectangle areas in each [`BuildStats::rectangle_log2_counts`]
-    /// bucket.
-    ///
-    /// Counts reveal launch frequency; these cell totals reveal what fraction
-    /// of the kernel's actual inner-loop work those launches could cover.
+    /// Compatibility work cells in each logical-batch bucket.
     pub rectangle_log2_cells: [usize; RECTANGLE_LOG2_BUCKETS],
+    /// Strongly connected components in the direct product graph.
+    pub batch_components: usize,
+    /// Edges in the SCC condensation DAG.
+    pub batch_condensation_edges: usize,
+    /// Words retained by the dense component-reachability matrix.
+    pub batch_bitset_words: usize,
+    /// Word ORs performed during reverse-topological propagation.
+    pub batch_word_ors: usize,
+    /// Product-carrier and direct-adjacency setup time.
+    pub batch_setup_ns: u128,
+    /// SCC and condensation construction time.
+    pub batch_scc_ns: u128,
+    /// Reverse-topological bitset propagation time.
+    pub batch_propagation_ns: u128,
+    /// Accepted-pair and query-fiber materialization time.
+    pub projection_ns: u128,
 }
 
 impl Default for BuildStats {
@@ -97,6 +106,14 @@ impl Default for BuildStats {
             rectangle_cells_considered: 0,
             rectangle_log2_counts: [0; RECTANGLE_LOG2_BUCKETS],
             rectangle_log2_cells: [0; RECTANGLE_LOG2_BUCKETS],
+            batch_components: 0,
+            batch_condensation_edges: 0,
+            batch_bitset_words: 0,
+            batch_word_ors: 0,
+            batch_setup_ns: 0,
+            batch_scc_ns: 0,
+            batch_propagation_ns: 0,
+            projection_ns: 0,
         }
     }
 }
@@ -178,12 +195,11 @@ impl PathIndex {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let mut closure = Closure::new(&vertices, automaton.state_count());
         let mut build_stats = BuildStats {
             graph_edges: edges.len(),
             ..BuildStats::default()
         };
-
+        let mut product_pairs = Vec::new();
         for edge in edges {
             for transition in automaton.transitions() {
                 if !transition.step.matches(&edge.attribute) {
@@ -194,7 +210,7 @@ impl PathIndex {
                 } else {
                     (edge.source, edge.target)
                 };
-                closure.insert(
+                product_pairs.push((
                     ProductPoint {
                         vertex: source,
                         state: transition.from,
@@ -203,10 +219,15 @@ impl PathIndex {
                         vertex: target,
                         state: transition.to,
                     },
-                    &mut build_stats,
-                );
+                ));
             }
         }
+        let closure = Closure::from_pairs(
+            &vertices,
+            automaton.state_count(),
+            product_pairs,
+            &mut build_stats,
+        );
 
         Self::finish(automaton, vertices, closure, build_stats)
     }
@@ -245,21 +266,17 @@ impl PathIndex {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let mut closure = Closure::new(&vertices, automaton.state_count());
         let mut build_stats = BuildStats::default();
 
-        // A child closure already contains identity. The new carrier supplies
-        // identity itself. Canonicalizing the union first makes work counters
-        // independent of child order; every remaining pair is then a seed
-        // relation closed incrementally by the rank-one theorem.
+        // Retaining direct product arcs makes the semilattice union
+        // constructional: recompute one closure over their canonical union
+        // instead of feeding every transitive child pair back as adjacency.
         let seeds = indexes
             .iter()
-            .flat_map(|index| index.closure.pairs())
-            .filter(|(source, target)| source != target)
+            .flat_map(|index| index.closure.direct_pairs())
             .collect::<BTreeSet<_>>();
-        for (source, target) in seeds {
-            closure.insert(source, target, &mut build_stats);
-        }
+        let closure =
+            Closure::from_pairs(&vertices, automaton.state_count(), seeds, &mut build_stats);
 
         Ok(Self::finish(automaton, vertices, closure, build_stats))
     }
@@ -268,8 +285,9 @@ impl PathIndex {
         automaton: Automaton,
         vertices: Vec<RawInline>,
         closure: Closure,
-        build_stats: BuildStats,
+        mut build_stats: BuildStats,
     ) -> Self {
+        let projection_started = Instant::now();
         let mut accepted = BTreeSet::new();
         for &vertex in &vertices {
             for state in automaton.initial_states() {
@@ -277,7 +295,7 @@ impl PathIndex {
                 let source = closure
                     .point_index(source)
                     .expect("the full product carrier contains every initial point");
-                for &target in closure.row(source) {
+                for target in closure.row(source) {
                     let target = closure.point(target);
                     if automaton.is_accepting(target.state) {
                         accepted.insert((vertex, target.vertex));
@@ -298,6 +316,7 @@ impl PathIndex {
         }
         let starts = forward.keys().copied().collect();
         let ends = reverse.keys().copied().collect();
+        build_stats.projection_ns = projection_started.elapsed().as_nanos();
 
         Self {
             automaton,
