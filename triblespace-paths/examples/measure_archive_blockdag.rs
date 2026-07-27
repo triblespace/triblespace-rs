@@ -1,18 +1,16 @@
 //! Read-only scale probe for `block::previous+` over the local archive pile.
 //!
-//! The probe walks the archive branch's linear commit history and scans only
-//! the oldest selected content blobs. Content stays mmap-backed as
-//! `SimpleArchive` bytes: unrelated tribles never enter a `TribleSet` or path
-//! index. It measures the three public construction stages independently:
-//! leaf [`PathSummary`] lowering, canonical summary union, and
-//! [`PathIndex::from_summary`].
+//! The probe walks the archive branch's linear commit history and scans the
+//! oldest selected content blobs. Content stays mmap-backed as
+//! `SimpleArchive` bytes. Every source trible is passed to the production
+//! [`PathSummary`] lowering; the fixed non-nullable automaton internally
+//! retains only matched-edge support. A separately prefiltered reference is
+//! built alongside it. Every rung asserts that the two summaries, canonical
+//! blobs, and accepted endpoint relations are identical.
 //!
-//! The `universe_audit` line also contrasts that selective workload with the
-//! current production lowering, which retains endpoints of every source
-//! trible even when its attribute cannot drive the fixed automaton. For rungs
-//! 32 and above the probe constructs both indexes (under a separate cap),
-//! checks their accepted endpoint relations byte-for-byte by digest, and
-//! reports the current carrier's exact SCC propagation allocation.
+//! The `full_carrier_counterfactual` line records what the superseded lowering
+//! would have allocated had it retained endpoints of every source trible. It
+//! is a pre-fix counterfactual, not a description of current production.
 //!
 //! Before closing a summary, the probe bounds the endpoint-quotient propagation
 //! matrix by
@@ -36,28 +34,28 @@
 //! `PATHS_BLOCKDAG_PILE` may name another copy of the same pile. The sweep can
 //! be constrained with `PATHS_BLOCKDAG_MAX_RUNG`, `PATHS_BLOCKDAG_MAX_EDGES`,
 //! `PATHS_BLOCKDAG_MAX_VERTICES`, and `PATHS_BLOCKDAG_MAX_SCRATCH_BYTES`.
-//! `PATHS_BLOCKDAG_MAX_CURRENT_SCRATCH_BYTES` independently guards the
-//! all-source-trible production-summary comparison.
 
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, RawId};
-use triblespace_core::inline::encodings::hash::{Blake3, Handle};
-use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::Inline;
+use triblespace_core::inline::encodings::UnknownInline;
+use triblespace_core::inline::encodings::hash::{Blake3, Handle};
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
-    Binding, Constraint, ProposalBuffer, ProposeCursor, Variable, VariableId,
+    Binding, BindingStore, Constraint, ProposalBuffer, ProposeCursor, Variable, VariableId,
 };
 use triblespace_core::repo::pile::{Pile, PileReader};
 use triblespace_core::repo::{self, PinStore};
-use triblespace_core::trible::{Trible, TribleSet, TRIBLE_LEN};
-use triblespace_paths::{Automaton, GraphEdge, PathIndex, PathSummary, Step, Transition};
+use triblespace_core::trible::{TRIBLE_LEN, Trible, TribleSet};
+use triblespace_paths::{
+    Automaton, GraphEdge, PathIndex, PathSummary, PathSummaryBlob, Step, Transition,
+};
 
 type CommitHandle = Inline<Handle<SimpleArchive>>;
 
@@ -91,7 +89,6 @@ struct Limits {
     edges: usize,
     vertices: usize,
     scratch_bytes: usize,
-    current_scratch_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -117,18 +114,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             "PATHS_BLOCKDAG_MAX_SCRATCH_BYTES",
             DEFAULT_MAX_SCRATCH_BYTES,
         )?,
-        current_scratch_bytes: env_limit(
-            "PATHS_BLOCKDAG_MAX_CURRENT_SCRATCH_BYTES",
-            8 * 1024 * 1024 * 1024,
-        )?,
     };
 
     println!("archive block-DAG endpoint-quotient scale probe (read-only)");
     println!("pile             : {}", pile_path.display());
     println!("rungs            : {RUNGS:?} (maximum {})", limits.max_rung);
     println!(
-        "pre-build limits : edges={} vertices={} endpoint_quotient_scratch_bytes={} current_summary_scratch_bytes={}",
-        limits.edges, limits.vertices, limits.scratch_bytes, limits.current_scratch_bytes
+        "pre-build limits : edges={} vertices={} endpoint_quotient_scratch_bytes={}",
+        limits.edges, limits.vertices, limits.scratch_bytes
     );
 
     let (reader, head) = open_reader_and_head(&pile_path)?;
@@ -137,8 +130,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let automaton = previous_one_or_more();
     let mut segments = Vec::<Segment>::new();
-    let mut leaves = Vec::<PathSummary>::new();
-    let mut leaf_times = Vec::<Duration>::new();
+    let mut production_leaves = Vec::<PathSummary>::new();
+    let mut reference_leaves = Vec::<PathSummary>::new();
+    let mut production_leaf_times = Vec::<Duration>::new();
+    let mut reference_leaf_times = Vec::<Duration>::new();
     let mut vertices = BTreeSet::new();
     let mut all_vertices = BTreeSet::new();
     let mut matched_edges = 0usize;
@@ -196,19 +191,42 @@ fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        while leaves.len() < rung {
-            let segment = &segments[leaves.len()];
+        while production_leaves.len() < rung {
+            let segment = &segments[production_leaves.len()];
+
             let started = Instant::now();
-            leaves.push(PathSummary::from_edges(
-                automaton.clone(),
-                segment.edges.iter().copied(),
-            ));
-            leaf_times.push(started.elapsed());
+            let production =
+                PathSummary::from_edges(automaton.clone(), segment.all_edges.iter().copied());
+            production_leaf_times.push(started.elapsed());
+
+            let started = Instant::now();
+            let reference =
+                PathSummary::from_edges(automaton.clone(), segment.edges.iter().copied());
+            reference_leaf_times.push(started.elapsed());
+
+            assert_eq!(production, reference);
+            assert_eq!(
+                canonical_summary_blob_bytes(&production)?,
+                canonical_summary_blob_bytes(&reference)?,
+            );
+            production_leaves.push(production);
+            reference_leaves.push(reference);
         }
 
         let merge_started = Instant::now();
-        let merged = PathSummary::merge_all(leaves[..rung].iter())?;
+        let merged = PathSummary::merge_all(production_leaves[..rung].iter())?;
         let merge_time = merge_started.elapsed();
+        let reference_merged = PathSummary::merge_all(reference_leaves[..rung].iter())?;
+        assert_eq!(merged, reference_merged);
+        let production_blob = canonical_summary_blob_bytes(&merged)?
+            .expect("a measured rung contains at least one previous edge");
+        let reference_blob = canonical_summary_blob_bytes(&reference_merged)?
+            .expect("a measured rung contains at least one previous edge");
+        assert_eq!(production_blob, reference_blob);
+        let summary_blob_signature = bytes_signature(
+            b"triblespace-paths/canonical-summary-blob/v1\0",
+            &production_blob,
+        );
         let merged_vertices = merged.vertices().len();
         let direct_arcs = merged.direct_arc_count();
         assert_eq!(merged_vertices, vertices.len());
@@ -220,7 +238,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         let accepted_pairs = first.accepted_pair_count();
         let signature = closure_signature(&first, direct_arcs);
         let query_report = query_views(&first);
+        let production_relation_signature = accepted_relation_signature(&first);
         drop(first);
+
+        let reference = PathIndex::from_summary(reference_merged)?;
+        assert_eq!(reference.accepted_pair_count(), accepted_pairs);
+        let reference_relation_signature = accepted_relation_signature(&reference);
+        assert_eq!(production_relation_signature, reference_relation_signature);
+        drop(reference);
 
         let warm_repetitions = if rung >= 32 { WARM_REPETITIONS } else { 1 };
         let mut warm_closes = Vec::with_capacity(warm_repetitions);
@@ -237,7 +262,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|segment| segment.content_tribles)
             .sum::<usize>();
-        let leaf_time = leaf_times[..rung].iter().copied().sum::<Duration>();
+        let production_leaf_time = production_leaf_times[..rung]
+            .iter()
+            .copied()
+            .sum::<Duration>();
+        let reference_leaf_time = reference_leaf_times[..rung]
+            .iter()
+            .copied()
+            .sum::<Duration>();
         let warm_millis = warm_closes
             .iter()
             .map(|duration| format!("{:.3}", millis(*duration)))
@@ -252,31 +284,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .flat_map(|segment| segment.edges.iter().copied()),
         );
         let unmatched_vertices = all_vertices.len() - vertices.len();
-        let current_components = support_components
+        let full_carrier_components = support_components
             .checked_add(
                 unmatched_vertices
                     .checked_mul(automaton.state_count() as usize)
-                    .ok_or("current component count overflow")?,
+                    .ok_or("full-carrier component count overflow")?,
             )
-            .ok_or("current component count overflow")?;
-        let current_product_points = all_vertices
+            .ok_or("full-carrier component count overflow")?;
+        let full_carrier_product_points = all_vertices
             .len()
             .checked_mul(automaton.state_count() as usize)
-            .ok_or("current product-point count overflow")?;
-        let current_row_words = all_vertices.len().div_ceil(u64::BITS as usize);
-        let current_scratch_bytes = current_components
-            .checked_mul(current_row_words)
+            .ok_or("full-carrier product-point count overflow")?;
+        let full_carrier_row_words = all_vertices.len().div_ceil(u64::BITS as usize);
+        let full_carrier_scratch_bytes = full_carrier_components
+            .checked_mul(full_carrier_row_words)
             .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
-            .ok_or("current exact scratch size overflow")?;
-        let current_blob_bytes = 48usize
+            .ok_or("full-carrier exact scratch size overflow")?;
+        let full_carrier_blob_bytes = 48usize
             .checked_add(
                 all_vertices
                     .len()
                     .checked_mul(32)
-                    .ok_or("current blob size overflow")?,
+                    .ok_or("full-carrier blob size overflow")?,
             )
             .and_then(|bytes| bytes.checked_add(direct_arcs.checked_mul(8)?))
-            .ok_or("current blob size overflow")?;
+            .ok_or("full-carrier blob size overflow")?;
         let support_blob_bytes = 48usize
             .checked_add(
                 merged_vertices
@@ -288,21 +320,31 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         println!(
             "rung={rung:>3} content_tribles={content_tribles:<9} previous_edges={matched_edges:<6} vertices={merged_vertices:<6} product_points={product_points:<6} direct_arcs={direct_arcs:<6} accepted_pairs={accepted_pairs:<10} scratch_bound_bytes={scratch_bytes:<10} leaf_lower_ms={:<9.3} summary_merge_ms={:<9.3} close_first_ms={:<9.3} signature={signature}",
-            millis(leaf_time),
+            millis(production_leaf_time),
             millis(merge_time),
             millis(first_close),
         );
         println!(
-            "        universe_audit all_vertices={} matched_support={} unmatched={} current_product_points={} support_components={} current_components={} current_exact_scratch_bytes={} support_exact_scratch_bytes={} current_blob_bytes={} support_blob_bytes={}",
+            "        production_all_tribles input_vertices={} retained_matched_support={} reference_prefilter_equal=true all_trible_lower_ms={:.3} prefiltered_lower_ms={:.3} canonical_blob_bytes={} canonical_blob_signature={} relation_signature={}",
+            all_vertices.len(),
+            merged_vertices,
+            millis(production_leaf_time),
+            millis(reference_leaf_time),
+            production_blob.len(),
+            summary_blob_signature,
+            production_relation_signature,
+        );
+        println!(
+            "        full_carrier_counterfactual pre_fix=true universe_vertices={} matched_support={} unmatched={} product_points={} support_components={} full_carrier_components={} full_carrier_exact_scratch_bytes={} support_exact_scratch_bytes={} full_carrier_blob_bytes={} support_blob_bytes={}",
             all_vertices.len(),
             merged_vertices,
             unmatched_vertices,
-            current_product_points,
+            full_carrier_product_points,
             support_components,
-            current_components,
-            current_scratch_bytes,
+            full_carrier_components,
+            full_carrier_scratch_bytes,
             support_components * row_words * std::mem::size_of::<u64>(),
-            current_blob_bytes,
+            full_carrier_blob_bytes,
             support_blob_bytes,
         );
         println!(
@@ -313,46 +355,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             millis(warm_max),
         );
         println!("        {query_report}");
-
-        if rung >= 32 {
-            if current_scratch_bytes > limits.current_scratch_bytes {
-                println!(
-                    "        current_summary_close=SKIPPED exact scratch {} exceeds cap {}",
-                    current_scratch_bytes, limits.current_scratch_bytes
-                );
-            } else {
-                let lower_started = Instant::now();
-                let current_summary = PathSummary::from_edges(
-                    automaton.clone(),
-                    segments[..rung]
-                        .iter()
-                        .flat_map(|segment| segment.all_edges.iter().copied()),
-                );
-                let current_lower = lower_started.elapsed();
-                assert_eq!(current_summary.vertices().len(), all_vertices.len());
-                assert_eq!(current_summary.direct_arc_count(), direct_arcs);
-
-                let close_started = Instant::now();
-                let current = PathIndex::from_summary(current_summary)?;
-                let current_close = close_started.elapsed();
-                assert_eq!(current.accepted_pair_count(), accepted_pairs);
-                let current_relation_signature = accepted_relation_signature(&current);
-
-                let support = PathIndex::from_summary(merged.clone())?;
-                let support_relation_signature = accepted_relation_signature(&support);
-                assert_eq!(current_relation_signature, support_relation_signature);
-                println!(
-                    "        current_summary_close lower_ms={:.3} close_ms={:.3} accepted_pairs={} relation_signature={}",
-                    millis(current_lower),
-                    millis(current_close),
-                    current.accepted_pair_count(),
-                    current_relation_signature,
-                );
-            }
-        }
     }
 
     Ok(())
+}
+
+fn canonical_summary_blob_bytes(summary: &PathSummary) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    if summary.vertices().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        PathSummaryBlob::encode(summary)?.bytes.as_ref().to_vec(),
+    ))
+}
+
+fn bytes_signature(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = Blake3::new();
+    hasher.update(domain);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    hex(&hasher.finalize())
 }
 
 fn accepted_relation_signature(index: &PathIndex) -> String {
@@ -402,10 +424,12 @@ fn query_views(index: &PathIndex) -> String {
     let diagonal = index.constraint(start, start);
 
     let unbound = Binding::default();
-    let mut source_bound = Binding::default();
-    source_bound.set(start.index, &source);
-    let mut target_bound = Binding::default();
-    target_bound.set(end.index, &target);
+    let mut source_store = BindingStore::new();
+    source_store.bind(start.index, &source);
+    let source_bound = source_store.view();
+    let mut target_store = BindingStore::new();
+    target_store.bind(end.index, &target);
+    let target_bound = target_store.view();
 
     let contains_us = median_us(|| {
         std::hint::black_box(index.contains(&source, &target));
