@@ -4,7 +4,6 @@ use triblespace_core::query::{
     VariableSet,
 };
 
-use crate::index::bit_count;
 use crate::PathIndex;
 
 /// A two-endpoint view of a [`PathIndex`] for the classic query solver.
@@ -29,19 +28,23 @@ impl<'a> PathConstraint<'a> {
         }
     }
 
-    fn candidate_bits<'b>(&'b self, variable: VariableId, binding: &Binding) -> Option<&'b [u64]> {
+    fn candidate_ordinals<'b>(
+        &'b self,
+        variable: VariableId,
+        binding: &Binding,
+    ) -> Option<&'b [u32]> {
         let at_start = self.start.is_var(variable);
         let at_end = self.end.is_var(variable);
         match (at_start, at_end) {
             (false, false) => None,
-            (true, true) => Some(self.index.diagonal_bits()),
+            (true, true) => Some(self.index.diagonal_ordinals()),
             (true, false) => Some(match self.end.position_value(binding) {
-                Some(end) => self.index.reverse_bits(end),
-                None => self.index.starts_bits(),
+                Some(end) => self.index.reverse_ordinals(end),
+                None => self.index.starts_ordinals(),
             }),
             (false, true) => Some(match self.start.position_value(binding) {
-                Some(start) => self.index.forward_bits(start),
-                None => self.index.ends_bits(),
+                Some(start) => self.index.forward_ordinals(start),
+                None => self.index.ends_ordinals(),
             }),
         }
     }
@@ -65,12 +68,12 @@ impl<'a> Constraint<'a> for PathConstraint<'a> {
     }
 
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        self.candidate_bits(variable, binding).map(bit_count)
+        self.candidate_ordinals(variable, binding).map(<[u32]>::len)
     }
 
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        if let Some(bits) = self.candidate_bits(variable, binding) {
-            proposals.extend(self.index.values(bits));
+        if let Some(ordinals) = self.candidate_ordinals(variable, binding) {
+            proposals.extend(self.index.values(ordinals));
         }
     }
 
@@ -82,15 +85,15 @@ impl<'a> Constraint<'a> for PathConstraint<'a> {
         budget: usize,
         proposals: &mut ProposalBuffer,
     ) -> bool {
-        let Some(bits) = self.candidate_bits(variable, binding) else {
+        let Some(ordinals) = self.candidate_ordinals(variable, binding) else {
             return false;
         };
-        propose_chunk_from(self.index.values(bits), cursor, budget, proposals)
+        propose_chunk_from(self.index.values(ordinals), cursor, budget, proposals)
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
-        if let Some(bits) = self.candidate_bits(variable, binding) {
-            cands.retain(|candidate| self.index.bits_contain(bits, candidate));
+        if let Some(ordinals) = self.candidate_ordinals(variable, binding) {
+            cands.retain(|candidate| self.index.ordinals_contain(ordinals, candidate));
         }
     }
 
@@ -99,10 +102,10 @@ impl<'a> Constraint<'a> for PathConstraint<'a> {
         let end = self.end.position_value(binding);
         match (start, end) {
             (Some(start), Some(end)) => self.index.contains(start, end),
-            (Some(start), None) => bit_count(self.index.forward_bits(start)) != 0,
-            (None, Some(end)) => bit_count(self.index.reverse_bits(end)) != 0,
+            (Some(start), None) => !self.index.forward_ordinals(start).is_empty(),
+            (None, Some(end)) => !self.index.reverse_ordinals(end).is_empty(),
             (None, None) if self.is_same_unbound_variable(binding) => {
-                bit_count(self.index.diagonal_bits()) != 0
+                !self.index.diagonal_ordinals().is_empty()
             }
             (None, None) => self.index.metrics().accepted_pairs != 0,
         }

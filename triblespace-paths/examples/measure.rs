@@ -497,12 +497,12 @@ fn format_stats(stats: BuildStats) -> String {
 fn format_batch_stats(stats: &[BuildStats], phases: BatchPhases) -> String {
     let sum = |field: fn(&BuildStats) -> usize| stats.iter().map(field).sum::<usize>();
     format!(
-        "components={} dag_edges={} closure_words={} accepted_words={} accepted_accelerator_words={} word_ors={} phase_us(setup/scc/propagation/pair_count/accepted_bitset)={:.3}/{:.3}/{:.3}/{:.3}/{:.3}",
+        "components={} dag_edges={} closure_words={} accepted_canonical_bytes={} accepted_accelerator_bytes={} word_ors={} phase_us(setup/scc/propagation/pair_count/accepted_csr)={:.3}/{:.3}/{:.3}/{:.3}/{:.3}",
         sum(|stats| stats.batch_components),
         sum(|stats| stats.batch_condensation_edges),
         sum(|stats| stats.batch_bitset_words),
-        sum(|stats| stats.accepted_bitset_words),
-        sum(|stats| stats.accepted_accelerator_words),
+        sum(|stats| stats.accepted_canonical_bytes),
+        sum(|stats| stats.accepted_accelerator_bytes),
         sum(|stats| stats.batch_word_ors),
         phases.setup_ns as f64 / 1_000.0,
         phases.scc_ns as f64 / 1_000.0,

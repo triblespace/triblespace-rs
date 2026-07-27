@@ -97,11 +97,11 @@ pub struct BuildStats {
     pub batch_propagation_ns: u128,
     /// Exact product-pair cardinality scan over component bitsets.
     pub batch_pair_count_ns: u128,
-    /// Words retained by the experimental accepted-endpoint bitrelation.
-    pub accepted_bitset_words: usize,
-    /// Words retained by its derived transpose and domain accelerators.
-    pub accepted_accelerator_words: usize,
-    /// Experimental accepted-endpoint bitrelation construction time.
+    /// Bytes retained by the canonical forward accepted-endpoint CSR.
+    pub accepted_canonical_bytes: usize,
+    /// Bytes retained by the derived reverse CSR and domain accelerators.
+    pub accepted_accelerator_bytes: usize,
+    /// Accepted-endpoint CSR and accelerator construction time.
     pub projection_ns: u128,
 }
 
@@ -125,8 +125,8 @@ impl Default for BuildStats {
             batch_scc_ns: 0,
             batch_propagation_ns: 0,
             batch_pair_count_ns: 0,
-            accepted_bitset_words: 0,
-            accepted_accelerator_words: 0,
+            accepted_canonical_bytes: 0,
+            accepted_accelerator_bytes: 0,
             projection_ns: 0,
         }
     }
@@ -173,40 +173,41 @@ pub struct PathIndex {
     build_stats: BuildStats,
 }
 
-/// Row-major accepted endpoint relation over `PathIndex::vertices`.
+/// Sorted accepted endpoint fibers over `PathIndex::vertices`.
 ///
-/// `forward` is the sole endpoint denotation. `reverse` and the three domain
-/// masks are explicitly derived accelerators over the same bits; none can
-/// affect merge semantics.
+/// `forward` is the sole endpoint denotation. `reverse` and the three domains
+/// are explicitly derived accelerators over the same pairs; none can affect
+/// merge semantics.
 #[derive(Clone, Debug)]
 struct AcceptedRelation {
-    row_words: usize,
-    forward: Vec<u64>,
-    reverse: Vec<u64>,
-    starts: Vec<u64>,
-    ends: Vec<u64>,
-    diagonal: Vec<u64>,
-    pair_count: usize,
+    forward: Csr,
+    reverse: Csr,
+    starts: Vec<u32>,
+    ends: Vec<u32>,
+    diagonal: Vec<u32>,
+}
+
+/// Compressed sparse rows with sorted, duplicate-free `u32` ordinals.
+#[derive(Clone, Debug)]
+struct Csr {
+    offsets: Vec<usize>,
+    ordinals: Vec<u32>,
 }
 
 impl AcceptedRelation {
     fn from_closure(automaton: &Automaton, vertex_count: usize, closure: &Closure) -> Self {
-        let row_words = vertex_count.div_ceil(u64::BITS as usize);
-        let relation_words = vertex_count.saturating_mul(row_words);
-        let mut forward = vec![0u64; relation_words];
-        let mut reverse = vec![0u64; relation_words];
-        let mut starts = vec![0u64; row_words];
-        let mut ends = vec![0u64; row_words];
-        let mut diagonal = vec![0u64; row_words];
-        let mut pair_count = 0usize;
         let state_count = automaton.state_count() as usize;
         let initial = automaton
             .initial_states()
             .map(|state| state as usize)
             .collect::<Vec<_>>();
+        let mut offsets = Vec::with_capacity(vertex_count + 1);
+        let mut ordinals = Vec::new();
+        let mut row = Vec::new();
+        offsets.push(0);
 
         for source in 0..vertex_count {
-            let row = source * row_words;
+            row.clear();
             for &initial_state in &initial {
                 for target in
                     closure.reachable_indices_unordered(source * state_count + initial_state)
@@ -215,85 +216,93 @@ impl AcceptedRelation {
                         continue;
                     }
                     let target = target / state_count;
-                    if !insert_bit(&mut forward[row..row + row_words], target) {
-                        continue;
-                    }
-                    insert_bit(
-                        &mut reverse[target * row_words..(target + 1) * row_words],
-                        source,
-                    );
-                    pair_count += 1;
-                    insert_bit(&mut starts, source);
-                    insert_bit(&mut ends, target);
-                    if source == target {
-                        insert_bit(&mut diagonal, source);
-                    }
+                    row.push(u32::try_from(target).expect("path vertex ordinal exceeds u32"));
                 }
             }
+            row.sort_unstable();
+            row.dedup();
+            ordinals.extend_from_slice(&row);
+            offsets.push(ordinals.len());
         }
 
+        let forward = Csr { offsets, ordinals };
+        let reverse = forward.transpose(vertex_count);
+        let starts = forward.nonempty_rows();
+        let ends = reverse.nonempty_rows();
+        let diagonal = (0..vertex_count)
+            .filter(|&vertex| {
+                let vertex = u32::try_from(vertex).expect("path vertex ordinal exceeds u32");
+                forward.row(vertex as usize).binary_search(&vertex).is_ok()
+            })
+            .map(|vertex| u32::try_from(vertex).expect("path vertex ordinal exceeds u32"))
+            .collect();
+
         Self {
-            row_words,
             forward,
             reverse,
             starts,
             ends,
             diagonal,
-            pair_count,
         }
-    }
-
-    fn row(&self, source: usize) -> &[u64] {
-        let start = source * self.row_words;
-        &self.forward[start..start + self.row_words]
-    }
-
-    fn reverse_row(&self, target: usize) -> &[u64] {
-        let start = target * self.row_words;
-        &self.reverse[start..start + self.row_words]
     }
 
     fn contains(&self, source: usize, target: usize) -> bool {
-        self.row(source)[target / u64::BITS as usize] & (1u64 << (target % u64::BITS as usize)) != 0
-    }
-
-    fn row_indices(&self, source: usize) -> BitIndexes<'_> {
-        BitIndexes::new(self.row(source))
+        let Ok(target) = u32::try_from(target) else {
+            return false;
+        };
+        self.forward.row(source).binary_search(&target).is_ok()
     }
 }
 
-struct BitIndexes<'a> {
-    words: &'a [u64],
-    next_word: usize,
-    current_word_index: usize,
-    current_word: u64,
-}
+impl Csr {
+    fn row(&self, row: usize) -> &[u32] {
+        &self.ordinals[self.offsets[row]..self.offsets[row + 1]]
+    }
 
-impl<'a> BitIndexes<'a> {
-    fn new(words: &'a [u64]) -> Self {
-        Self {
-            words,
-            next_word: 0,
-            current_word_index: 0,
-            current_word: 0,
+    fn transpose(&self, row_count: usize) -> Self {
+        let mut counts = vec![0usize; row_count];
+        for &target in &self.ordinals {
+            counts[target as usize] += 1;
         }
-    }
-}
 
-impl Iterator for BitIndexes<'_> {
-    type Item = usize;
+        let mut offsets = Vec::with_capacity(row_count + 1);
+        offsets.push(0);
+        for count in counts {
+            offsets.push(offsets.last().copied().unwrap_or(0) + count);
+        }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.current_word != 0 {
-                let bit = self.current_word.trailing_zeros() as usize;
-                self.current_word &= self.current_word - 1;
-                return Some(self.current_word_index * u64::BITS as usize + bit);
+        let mut next = offsets[..row_count].to_vec();
+        let mut ordinals = vec![0u32; self.ordinals.len()];
+        for source in 0..row_count {
+            let source = u32::try_from(source).expect("path vertex ordinal exceeds u32");
+            for &target in self.row(source as usize) {
+                let slot = &mut next[target as usize];
+                ordinals[*slot] = source;
+                *slot += 1;
             }
-            self.current_word = *self.words.get(self.next_word)?;
-            self.current_word_index = self.next_word;
-            self.next_word += 1;
         }
+
+        Self { offsets, ordinals }
+    }
+
+    fn nonempty_rows(&self) -> Vec<u32> {
+        self.offsets
+            .windows(2)
+            .enumerate()
+            .filter(|(_, range)| range[0] != range[1])
+            .map(|(row, _)| u32::try_from(row).expect("path vertex ordinal exceeds u32"))
+            .collect()
+    }
+
+    fn storage_bytes(&self) -> usize {
+        self.offsets
+            .len()
+            .saturating_mul(std::mem::size_of::<usize>())
+            .saturating_add(
+                self.ordinals
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
     }
 }
 
@@ -422,13 +431,28 @@ impl PathIndex {
     ) -> Self {
         let projection_started = Instant::now();
         let accepted = AcceptedRelation::from_closure(&automaton, vertices.len(), &closure);
-        build_stats.accepted_bitset_words = accepted.forward.len();
-        build_stats.accepted_accelerator_words = accepted
+        build_stats.accepted_canonical_bytes = accepted.forward.storage_bytes();
+        build_stats.accepted_accelerator_bytes = accepted
             .reverse
-            .len()
-            .saturating_add(accepted.starts.len())
-            .saturating_add(accepted.ends.len())
-            .saturating_add(accepted.diagonal.len());
+            .storage_bytes()
+            .saturating_add(
+                accepted
+                    .starts
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                accepted
+                    .ends
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                accepted
+                    .diagonal
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
         build_stats.projection_ns = projection_started.elapsed().as_nanos();
 
         Self {
@@ -464,8 +488,10 @@ impl PathIndex {
             .enumerate()
             .flat_map(move |(source_index, source)| {
                 self.accepted
-                    .row_indices(source_index)
-                    .map(move |target_index| (source, self.vertices[target_index]))
+                    .forward
+                    .row(source_index)
+                    .iter()
+                    .map(move |&target_index| (source, self.vertices[target_index as usize]))
             })
     }
 
@@ -474,12 +500,12 @@ impl PathIndex {
         &'a self,
         source: &RawInline,
     ) -> impl Iterator<Item = RawInline> + 'a {
-        self.values(self.forward_bits(source))
+        self.values(self.forward_ordinals(source))
     }
 
     /// Sorted, duplicate-free accepted sources for one target.
     pub fn reaching<'a>(&'a self, target: &RawInline) -> impl Iterator<Item = RawInline> + 'a {
-        self.values(self.reverse_bits(target))
+        self.values(self.reverse_ordinals(target))
     }
 
     /// Whether one product point reaches another, including reflexive
@@ -506,63 +532,52 @@ impl PathIndex {
             automaton_states: self.automaton.state_count() as usize,
             product_points: self.vertices.len() * self.automaton.state_count() as usize,
             product_pairs: self.closure.pair_count(),
-            accepted_pairs: self.accepted.pair_count,
+            accepted_pairs: self.accepted.forward.ordinals.len(),
         }
     }
 
-    pub(crate) fn forward_bits(&self, source: &RawInline) -> &[u64] {
+    pub(crate) fn forward_ordinals(&self, source: &RawInline) -> &[u32] {
         self.vertices
             .binary_search(source)
             .ok()
-            .map(|source| self.accepted.row(source))
+            .map(|source| self.accepted.forward.row(source))
             .unwrap_or(&[])
     }
 
-    pub(crate) fn reverse_bits(&self, target: &RawInline) -> &[u64] {
+    pub(crate) fn reverse_ordinals(&self, target: &RawInline) -> &[u32] {
         self.vertices
             .binary_search(target)
             .ok()
-            .map(|target| self.accepted.reverse_row(target))
+            .map(|target| self.accepted.reverse.row(target))
             .unwrap_or(&[])
     }
 
-    pub(crate) fn starts_bits(&self) -> &[u64] {
+    pub(crate) fn starts_ordinals(&self) -> &[u32] {
         &self.accepted.starts
     }
 
-    pub(crate) fn ends_bits(&self) -> &[u64] {
+    pub(crate) fn ends_ordinals(&self) -> &[u32] {
         &self.accepted.ends
     }
 
-    pub(crate) fn diagonal_bits(&self) -> &[u64] {
+    pub(crate) fn diagonal_ordinals(&self) -> &[u32] {
         &self.accepted.diagonal
     }
 
-    pub(crate) fn values<'a>(&'a self, bits: &'a [u64]) -> impl Iterator<Item = RawInline> + 'a {
-        BitIndexes::new(bits).map(|vertex| self.vertices[vertex])
+    pub(crate) fn values<'a>(
+        &'a self,
+        ordinals: &'a [u32],
+    ) -> impl Iterator<Item = RawInline> + 'a {
+        ordinals
+            .iter()
+            .map(|&vertex| self.vertices[vertex as usize])
     }
 
-    pub(crate) fn bits_contain(&self, bits: &[u64], value: &RawInline) -> bool {
+    pub(crate) fn ordinals_contain(&self, ordinals: &[u32], value: &RawInline) -> bool {
         self.vertices
             .binary_search(value)
-            .is_ok_and(|vertex| bit_is_set(bits, vertex))
+            .ok()
+            .and_then(|vertex| u32::try_from(vertex).ok())
+            .is_some_and(|vertex| ordinals.binary_search(&vertex).is_ok())
     }
-}
-
-fn insert_bit(words: &mut [u64], bit: usize) -> bool {
-    let mask = 1u64 << (bit % u64::BITS as usize);
-    let word = &mut words[bit / u64::BITS as usize];
-    let inserted = *word & mask == 0;
-    *word |= mask;
-    inserted
-}
-
-pub(crate) fn bit_is_set(words: &[u64], bit: usize) -> bool {
-    words
-        .get(bit / u64::BITS as usize)
-        .is_some_and(|word| word & (1u64 << (bit % u64::BITS as usize)) != 0)
-}
-
-pub(crate) fn bit_count(words: &[u64]) -> usize {
-    words.iter().map(|word| word.count_ones() as usize).sum()
 }
