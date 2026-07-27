@@ -67,6 +67,7 @@ const DEFAULT_MAX_RUNG: usize = 128;
 const DEFAULT_MAX_EDGES: usize = 20_000;
 const DEFAULT_MAX_VERTICES: usize = 13_000;
 const DEFAULT_MAX_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
+const WARM_REPETITIONS: usize = 21;
 
 #[derive(Debug)]
 struct Segment {
@@ -198,7 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let query_report = query_views(&first);
         drop(first);
 
-        let warm_repetitions = if rung >= 32 { 3 } else { 1 };
+        let warm_repetitions = if rung >= 32 { WARM_REPETITIONS } else { 1 };
         let mut warm_closes = Vec::with_capacity(warm_repetitions);
         for _ in 0..warm_repetitions {
             let input = merged.clone();
@@ -219,14 +220,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|duration| format!("{:.3}", millis(*duration)))
             .collect::<Vec<_>>()
             .join(",");
-        let warm_median = median_duration(&warm_closes);
+        let (warm_min, warm_p50, warm_p95, warm_max) = duration_distribution(&warm_closes);
 
         println!(
-            "rung={rung:>3} content_tribles={content_tribles:<9} previous_edges={matched_edges:<6} vertices={merged_vertices:<6} product_points={product_points:<6} direct_arcs={direct_arcs:<6} accepted_pairs={accepted_pairs:<10} scratch_bound_bytes={scratch_bytes:<10} leaf_lower_ms={:<9.3} summary_merge_ms={:<9.3} close_first_ms={:<9.3} close_warm_ms=[{warm_millis}] close_warm_median_ms={:<9.3} signature={signature}",
+            "rung={rung:>3} content_tribles={content_tribles:<9} previous_edges={matched_edges:<6} vertices={merged_vertices:<6} product_points={product_points:<6} direct_arcs={direct_arcs:<6} accepted_pairs={accepted_pairs:<10} scratch_bound_bytes={scratch_bytes:<10} leaf_lower_ms={:<9.3} summary_merge_ms={:<9.3} close_first_ms={:<9.3} signature={signature}",
             millis(leaf_time),
             millis(merge_time),
             millis(first_close),
-            millis(warm_median),
+        );
+        println!(
+            "        close_warm_ms=[{warm_millis}] min={:.3} p50={:.3} p95={:.3} max={:.3}",
+            millis(warm_min),
+            millis(warm_p50),
+            millis(warm_p95),
+            millis(warm_max),
         );
         println!("        {query_report}");
     }
@@ -357,10 +364,18 @@ fn median_us(mut measured: impl FnMut()) -> f64 {
     samples[REPETITIONS / 2] as f64 / BATCH as f64 / 1_000.0
 }
 
-fn median_duration(samples: &[Duration]) -> Duration {
+fn duration_distribution(samples: &[Duration]) -> (Duration, Duration, Duration, Duration) {
+    assert!(!samples.is_empty());
     let mut samples = samples.to_vec();
     samples.sort_unstable();
-    samples[samples.len() / 2]
+    let p50 = samples.len() / 2;
+    let p95 = (samples.len() * 95).div_ceil(100).saturating_sub(1);
+    (
+        samples[0],
+        samples[p50],
+        samples[p95],
+        samples[samples.len() - 1],
+    )
 }
 
 /// Open the pile only long enough to acquire an immutable mmap snapshot. No
