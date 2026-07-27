@@ -290,15 +290,20 @@ fn candidate_timings<'a, C: Constraint<'a>>(
 
 fn median_us(mut measured: impl FnMut()) -> f64 {
     const REPETITIONS: usize = 9;
+    const BATCH: usize = 256;
     let mut samples = [0u128; REPETITIONS];
-    measured();
+    for _ in 0..BATCH {
+        measured();
+    }
     for sample in &mut samples {
         let started = Instant::now();
-        measured();
+        for _ in 0..BATCH {
+            measured();
+        }
         *sample = started.elapsed().as_nanos();
     }
     samples.sort_unstable();
-    samples[REPETITIONS / 2] as f64 / 1_000.0
+    samples[REPETITIONS / 2] as f64 / BATCH as f64 / 1_000.0
 }
 
 /// Open the original pile without constructing a `Repository` (which would
