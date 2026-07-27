@@ -8,6 +8,7 @@ use crate::inline::RawInline;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::INLINE_LEN;
+use crate::query::Mask;
 /// A value-range-aware constraint that uses the TribleSet's AVE index
 /// to propose only values in a byte-lexicographic range.
 ///
@@ -85,9 +86,15 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
             });
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if variable == self.variable_v {
-            proposals.retain(|v| *v >= self.min && *v <= self.max);
+            mask.retain(proposals, |v| *v >= self.min && *v <= self.max);
         }
     }
 

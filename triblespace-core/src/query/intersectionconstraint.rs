@@ -53,8 +53,14 @@ where
     }
 
     /// Sorts children by estimate, lets the tightest one propose, then
-    /// confirms through the rest in ascending estimate order. Children
-    /// that return `None` for this variable are skipped entirely.
+    /// confirms through the rest in ascending estimate order and compacts
+    /// the survivors once. Children that return `None` for this variable
+    /// are skipped entirely.
+    ///
+    /// Only the tail region this call appended (from the incoming buffer
+    /// length onward) is confirmed and compacted, so proposals appended by
+    /// sibling constraints in an enclosing composite are never filtered
+    /// through this intersection's children.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
@@ -66,18 +72,28 @@ where
         }
         relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
 
+        let base = proposals.len();
         relevant_constraints[0]
             .1
             .propose(variable, binding, proposals);
 
+        let mut mask = Mask::new();
+        mask.reset(proposals.len() - base);
         relevant_constraints[1..]
             .iter()
-            .for_each(|(_, c)| c.confirm(variable, binding, proposals));
+            .for_each(|(_, c)| c.confirm(variable, binding, &proposals[base..], &mut mask));
+        mask.compact(proposals, base);
     }
 
     /// Confirms proposals through all children that constrain `variable`,
-    /// in order of increasing estimate.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    /// in order of increasing estimate, all killing into the shared mask.
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
@@ -87,7 +103,7 @@ where
 
         relevant_constraints
             .iter()
-            .for_each(|(_, c)| c.confirm(variable, binding, proposals));
+            .for_each(|(_, c)| c.confirm(variable, binding, proposals, mask));
     }
 
     /// Returns `true` only when **every** child is satisfied.

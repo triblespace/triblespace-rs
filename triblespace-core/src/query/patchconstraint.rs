@@ -13,6 +13,7 @@ use super::ContainsConstraint;
 use super::Variable;
 use super::VariableId;
 use super::VariableSet;
+use crate::query::Mask;
 
 /// Constrains a variable to full-width values present in a [`PATCH`].
 ///
@@ -49,9 +50,19 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if self.variable.index == variable {
-            proposals.retain(|v| self.patch.has_prefix(v));
+            for (i, v) in proposals.iter().enumerate() {
+                if mask.live(i) && !self.patch.has_prefix(v) {
+                    mask.kill(i);
+                }
+            }
         }
     }
 }
@@ -111,14 +122,26 @@ where
         }
     }
 
-    fn confirm(&self, _variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        proposals.retain(|v| {
-            if let Some(id) = id_from_value(v) {
+    fn confirm(
+        &self,
+        _variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
+        for (i, v) in proposals.iter().enumerate() {
+            if !mask.live(i) {
+                continue;
+            }
+            let keep = if let Some(id) = id_from_value(v) {
                 self.patch.has_prefix(&id)
             } else {
                 false
+            };
+            if !keep {
+                mask.kill(i);
             }
-        });
+        }
     }
 }
 

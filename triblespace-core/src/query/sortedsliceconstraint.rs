@@ -99,14 +99,26 @@ where
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if self.variable.index == variable {
-            proposals.retain(|v| {
-                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
+            for (i, v) in proposals.iter().enumerate() {
+                if !mask.live(i) {
+                    continue;
+                }
+                let keep = match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
                     Ok(t) => self.slice.0.binary_search(&t).is_ok(),
                     Err(_) => false,
+                };
+                if !keep {
+                    mask.kill(i);
                 }
-            });
+            }
         }
     }
 }

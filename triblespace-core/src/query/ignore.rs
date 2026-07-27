@@ -46,8 +46,14 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
     }
 
     /// Delegates to the inner constraint.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        self.constraint.confirm(variable, binding, proposals)
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
+        self.constraint.confirm(variable, binding, proposals, mask)
     }
 }
 

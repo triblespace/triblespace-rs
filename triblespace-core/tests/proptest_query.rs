@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
-    Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
+    Binding, Constraint, ContainsConstraint, Mask, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -311,7 +311,10 @@ proptest! {
         let binding = Binding::default();
 
         let mut proposals = vec![candidate];
-        c.confirm(0, &binding, &mut proposals);
+        let mut mask = Mask::new();
+        mask.reset(proposals.len());
+        c.confirm(0, &binding, &proposals, &mut mask);
+        mask.compact(&mut proposals, 0);
 
         if constant == candidate {
             prop_assert_eq!(proposals.len(), 1);
@@ -659,7 +662,10 @@ proptest! {
         binding.set(0, &peer_val);
 
         let mut proposals = vec![peer_val, other_val];
-        eq.confirm(1, &binding, &mut proposals);
+        let mut mask = Mask::new();
+        mask.reset(proposals.len());
+        eq.confirm(1, &binding, &proposals, &mut mask);
+        mask.compact(&mut proposals, 0);
 
         if peer_val == other_val {
             prop_assert_eq!(proposals.len(), 2); // both match

@@ -8,6 +8,7 @@ use triblespace::core::query::VariableContext;
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::prelude::*;
+use triblespace::core::query::Mask;
 
 #[test]
 fn propose_and_confirm() {
@@ -50,7 +51,10 @@ fn propose_and_confirm() {
     );
 
     proposals.push(GenId::inline_from(e1).raw);
-    constraint.confirm(a_var.index, &binding, &mut proposals);
+    let mut mask = Mask::new();
+    mask.reset(proposals.len());
+    constraint.confirm(a_var.index, &binding, &proposals, &mut mask);
+    mask.compact(&mut proposals, 0);
     assert_eq!(proposals.len(), 2);
 }
 
@@ -94,7 +98,10 @@ fn propose_and_confirm_bound_attribute() {
         [GenId::inline_from(e1).raw, GenId::inline_from(e2).raw].into_iter().collect()
     );
 
-    constraint.confirm(e_var.index, &binding, &mut proposals);
+    let mut mask = Mask::new();
+    mask.reset(proposals.len());
+    constraint.confirm(e_var.index, &binding, &proposals, &mut mask);
+    mask.compact(&mut proposals, 0);
     assert_eq!(proposals.len(), 2);
 }
 
@@ -135,7 +142,10 @@ fn propose_and_confirm_bound_value() {
     let ents: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(ents, [GenId::inline_from(e1).raw].into_iter().collect());
 
-    constraint.confirm(e_var.index, &binding, &mut proposals);
+    let mut mask = Mask::new();
+    mask.reset(proposals.len());
+    constraint.confirm(e_var.index, &binding, &proposals, &mut mask);
+    mask.compact(&mut proposals, 0);
     assert_eq!(proposals.len(), 1);
 }
 
@@ -178,7 +188,10 @@ fn propose_and_confirm_two_bound() {
     let values: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(values, [v1.raw, v2.raw].into_iter().collect());
 
-    constraint.confirm(v_var.index, &binding, &mut proposals);
+    let mut mask = Mask::new();
+    mask.reset(proposals.len());
+    constraint.confirm(v_var.index, &binding, &proposals, &mut mask);
+    mask.compact(&mut proposals, 0);
     assert_eq!(proposals.len(), 2);
 
     // entity and value bound -> expect attributes
@@ -190,7 +203,10 @@ fn propose_and_confirm_two_bound() {
     constraint.propose(a_var.index, &binding, &mut proposals);
     assert_eq!(proposals, vec![GenId::inline_from(a2).raw]);
 
-    constraint.confirm(a_var.index, &binding, &mut proposals);
+    let mut mask = Mask::new();
+    mask.reset(proposals.len());
+    constraint.confirm(a_var.index, &binding, &proposals, &mut mask);
+    mask.compact(&mut proposals, 0);
     assert_eq!(proposals.len(), 1);
 
     // attribute and value bound -> expect entities
@@ -202,6 +218,9 @@ fn propose_and_confirm_two_bound() {
     constraint.propose(e_var.index, &binding, &mut proposals);
     assert_eq!(proposals, vec![GenId::inline_from(e2).raw]);
 
-    constraint.confirm(e_var.index, &binding, &mut proposals);
+    let mut mask = Mask::new();
+    mask.reset(proposals.len());
+    constraint.confirm(e_var.index, &binding, &proposals, &mut mask);
+    mask.compact(&mut proposals, 0);
     assert_eq!(proposals.len(), 1);
 }

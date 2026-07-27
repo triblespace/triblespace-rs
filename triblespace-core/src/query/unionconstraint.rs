@@ -81,27 +81,29 @@ where
         proposals.dedup();
     }
 
-    /// Confirms proposals against every *satisfied* variant independently,
-    /// then merges the per-variant survivors via
-    /// [`kmerge`](itertools::Itertools::kmerge) and deduplicates. A value
-    /// passes if *any* live variant confirms it.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        proposals.sort_unstable();
-
-        let union: Vec<_> = self
-            .constraints
+    /// Confirms proposals against every *satisfied* variant independently
+    /// (each on a scratch copy of the incoming mask) and ors the per-variant
+    /// survivors together. A value passes if *any* live variant confirms it.
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
+        let mut any = Mask::new();
+        any.reset(mask.len());
+        any.clear_all();
+        let mut scratch = Mask::new();
+        self.constraints
             .iter()
             .filter(|c| c.satisfied(binding))
-            .map(|c| {
-                let mut proposals = proposals.clone();
-                c.confirm(variable, binding, &mut proposals);
-                proposals
-            })
-            .kmerge()
-            .dedup()
-            .collect();
-
-        _ = mem::replace(proposals, union);
+            .for_each(|c| {
+                scratch.copy_from(mask);
+                c.confirm(variable, binding, proposals, &mut scratch);
+                any.or_from(&scratch);
+            });
+        mask.and_from(&any);
     }
 
     /// Returns `true` when **at least one** variant is satisfied.

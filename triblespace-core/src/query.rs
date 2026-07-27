@@ -242,6 +242,116 @@ impl Default for Binding {
     }
 }
 
+/// Survival mask over a proposal slice — the write target of
+/// [`Constraint::confirm`].
+///
+/// One `u32` word per candidate: nonzero = live, zero = dead. Confirmers may
+/// only *kill* entries, never revive them, so running several confirmers over
+/// the same mask computes their conjunction. The engine (or a composite
+/// constraint) compacts the proposal buffer once afterwards via
+/// [`compact`](Mask::compact).
+///
+/// The word-per-candidate layout is the deliberate baseline: every lane —
+/// CPU or GPU — writes its own word with no read-modify-write contention,
+/// and the mask doubles as the scan array for prefix-sum compaction. A
+/// bit-packed representation is a planned alternative behind this same API,
+/// to be justified against this baseline.
+pub struct Mask {
+    words: Vec<u32>,
+}
+
+impl Mask {
+    /// Creates an empty mask; call [`reset`](Mask::reset) to size it.
+    pub fn new() -> Self {
+        Mask { words: Vec::new() }
+    }
+
+    /// Resizes to `len` entries, all live.
+    pub fn reset(&mut self, len: usize) {
+        self.words.clear();
+        self.words.resize(len, 1);
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// True when no entries are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// Marks entry `i` dead.
+    pub fn kill(&mut self, i: usize) {
+        self.words[i] = 0;
+    }
+
+    /// Whether entry `i` is still live.
+    pub fn live(&self, i: usize) -> bool {
+        self.words[i] != 0
+    }
+
+    /// Copies `other`'s state into this mask (resizing as needed).
+    pub fn copy_from(&mut self, other: &Mask) {
+        self.words.clear();
+        self.words.extend_from_slice(&other.words);
+    }
+
+    /// Kills every entry.
+    pub fn clear_all(&mut self) {
+        self.words.fill(0);
+    }
+
+    /// Ors `other` into this mask (disjunction of live sets).
+    pub fn or_from(&mut self, other: &Mask) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        for (w, o) in self.words.iter_mut().zip(other.words.iter()) {
+            *w |= *o;
+        }
+    }
+
+    /// Kills every live entry whose proposal fails `keep` — the mask-side
+    /// equivalent of `Vec::retain`. Entries already dead are skipped.
+    pub fn retain(&mut self, proposals: &[RawInline], mut keep: impl FnMut(&RawInline) -> bool) {
+        debug_assert_eq!(self.words.len(), proposals.len());
+        for (i, v) in proposals.iter().enumerate() {
+            if self.words[i] != 0 && !keep(v) {
+                self.words[i] = 0;
+            }
+        }
+    }
+
+    /// Ands `other` into this mask (conjunction of live sets).
+    pub fn and_from(&mut self, other: &Mask) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        for (w, o) in self.words.iter_mut().zip(other.words.iter()) {
+            *w &= *o;
+        }
+    }
+
+    /// Compacts the tail region `proposals[base..]` in place, keeping the
+    /// entries this mask marks live (mask index 0 = `proposals[base]`).
+    pub fn compact(&self, proposals: &mut Vec<RawInline>, base: usize) {
+        debug_assert_eq!(self.words.len(), proposals.len() - base);
+        let mut write = base;
+        for (i, w) in self.words.iter().enumerate() {
+            if *w != 0 {
+                proposals[write] = proposals[base + i];
+                write += 1;
+            }
+        }
+        proposals.truncate(write);
+    }
+}
+
+impl Default for Mask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
 /// The cooperative protocol that every query participant implements.
 ///
 /// A constraint restricts the values that can be assigned to query variables.
@@ -321,15 +431,24 @@ pub trait Constraint<'a> {
     /// Does nothing when `variable` is not constrained by this constraint.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>);
 
-    /// Filters `proposals` to remove values for `variable` that violate
-    /// this constraint.
+    /// Kills [`Mask`] entries for `proposals` values of `variable` that
+    /// violate this constraint.
     ///
     /// Called on every constraint *except* the one that proposed, in order
-    /// of increasing estimate. Implementations remove entries from
-    /// `proposals` that are inconsistent with the current `binding`.
+    /// of increasing estimate, all writing into the same mask — sequential
+    /// kills compute the conjunction. Implementations may only kill entries,
+    /// never revive them, and may skip entries that are already dead. The
+    /// caller compacts the proposal buffer afterwards; `mask` index `i`
+    /// corresponds to `proposals[i]`.
     ///
     /// Does nothing when `variable` is not constrained by this constraint.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>);
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    );
 
     /// Returns whether this constraint is consistent with the current
     /// `binding`.
@@ -384,9 +503,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.propose(variable, binding, proposals)
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         let inner: &T = self;
-        inner.confirm(variable, binding, proposals)
+        inner.confirm(variable, binding, proposals, mask)
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
@@ -416,9 +541,15 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.propose(variable, binding, proposals)
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposal: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         let inner: &T = self;
-        inner.confirm(variable, binding, proposal)
+        inner.confirm(variable, binding, proposals, mask)
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {

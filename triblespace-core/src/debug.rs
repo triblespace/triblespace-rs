@@ -7,6 +7,7 @@ pub mod query {
     use crate::inline::RawInline;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use crate::query::Mask;
 
     /// Constraint wrapper that records which variables are proposed during query execution.
     pub struct DebugConstraint<C> {
@@ -37,8 +38,14 @@ pub mod query {
             self.constraint.propose(variable, binding, proposals);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-            self.constraint.confirm(variable, binding, proposals);
+        fn confirm(
+            &self,
+            variable: VariableId,
+            binding: &Binding,
+            proposals: &[RawInline],
+            mask: &mut Mask,
+        ) {
+            self.constraint.confirm(variable, binding, proposals, mask);
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {
@@ -90,8 +97,14 @@ pub mod query {
             self.constraint.propose(variable, binding, proposals);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-            self.constraint.confirm(variable, binding, proposals);
+        fn confirm(
+            &self,
+            variable: VariableId,
+            binding: &Binding,
+            proposals: &[RawInline],
+            mask: &mut Mask,
+        ) {
+            self.constraint.confirm(variable, binding, proposals, mask);
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {

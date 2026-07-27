@@ -11,6 +11,7 @@ use crate::query::VariableSet;
 use crate::trible::TribleSet;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::RawInline;
+use crate::query::Mask;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
 /// to propose only entity IDs in a byte-lexicographic range.
@@ -70,9 +71,15 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
             });
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if variable == self.variable_e {
-            proposals.retain(|v| {
+            mask.retain(proposals, |v| {
                 let Some(id) = id_from_value(v) else {
                     return false;
                 };
@@ -152,9 +159,15 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
             });
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if variable == self.variable_a {
-            proposals.retain(|v| {
+            mask.retain(proposals, |v| {
                 let Some(id) = id_from_value(v) else {
                     return false;
                 };

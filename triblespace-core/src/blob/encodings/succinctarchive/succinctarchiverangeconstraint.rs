@@ -1,6 +1,7 @@
 use super::*;
 use crate::query::Binding;
 use crate::query::Constraint;
+use crate::query::Mask;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -101,9 +102,15 @@ where
         );
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if variable == self.variable_v {
-            proposals.retain(|v| *v >= self.min && *v <= self.max);
+            mask.retain(proposals, |v| *v >= self.min && *v <= self.max);
         }
     }
 

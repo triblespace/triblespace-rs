@@ -35,6 +35,7 @@ use triblespace_core::inline::{RawInline, Inline};
 
 use crate::bm25::BM25Index;
 use crate::schemas::Embedding;
+use triblespace_core::query::Mask;
 
 /// Minimum surface a BM25 index must expose for the
 /// [`BM25Filter`] constraint to work against it. Implemented
@@ -350,12 +351,18 @@ where
         proposals.extend_from_slice(&self.entries);
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if variable != self.doc.index {
             return;
         }
         let valid: HashSet<RawInline> = self.entries.iter().copied().collect();
-        proposals.retain(|raw| valid.contains(raw));
+        mask.retain(proposals, |raw| valid.contains(raw));
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
@@ -553,7 +560,13 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         }
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -575,7 +588,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
             .into_iter()
             .map(|h| h.raw)
             .collect();
-        proposals.retain(|raw| allowed.contains(raw));
+        mask.retain(proposals, |raw| allowed.contains(raw));
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
@@ -699,12 +712,18 @@ impl<'a> Constraint<'a> for SimilarTo {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if variable != self.var.index {
             return;
         }
         let allowed: HashSet<RawInline> = self.candidates.iter().copied().collect();
-        proposals.retain(|raw| allowed.contains(raw));
+        mask.retain(proposals, |raw| allowed.contains(raw));
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
@@ -818,7 +837,10 @@ mod tests {
             id_to_raw_value(id(2)),
             id_to_raw_value(id(3)),
         ];
-        c.confirm(doc.index, &binding, &mut props);
+        let mut mask = Mask::new();
+        mask.reset(props.len());
+        c.confirm(doc.index, &binding, &props, &mut mask);
+        mask.compact(&mut props, 0);
         let ids: HashSet<Id> = props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&id(1)));

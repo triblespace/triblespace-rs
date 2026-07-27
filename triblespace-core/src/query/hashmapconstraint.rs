@@ -14,6 +14,7 @@ use crate::inline::IntoInline;
 use crate::inline::TryFromInline;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
+use crate::query::Mask;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///
@@ -65,16 +66,26 @@ where
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if self.variable.index == variable {
-            proposals.retain(|v| {
-                self.map.contains_key(&match TryFromInline::try_from_inline(
-                    Inline::<S>::as_transmute_raw(v),
-                ) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                })
-            });
+            for (i, v) in proposals.iter().enumerate() {
+                if !mask.live(i) {
+                    continue;
+                }
+                let keep = match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
+                    Ok(key) => self.map.contains_key(&key),
+                    Err(_) => false,
+                };
+                if !keep {
+                    mask.kill(i);
+                }
+            }
         }
     }
 }

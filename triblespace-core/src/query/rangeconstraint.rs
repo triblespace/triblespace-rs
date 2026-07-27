@@ -65,9 +65,19 @@ impl<'a> Constraint<'a> for InlineRange {
     }
 
     /// Retains only proposals whose raw bytes fall within [min, max] inclusive.
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if self.variable == variable {
-            proposals.retain(|v| *v >= self.min && *v <= self.max);
+            for (i, v) in proposals.iter().enumerate() {
+                if mask.live(i) && !(*v >= self.min && *v <= self.max) {
+                    mask.kill(i);
+                }
+            }
         }
     }
 

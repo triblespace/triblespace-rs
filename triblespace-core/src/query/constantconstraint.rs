@@ -43,9 +43,19 @@ impl<'a> Constraint<'a> for ConstantConstraint {
     }
 
     /// Retains only proposals that match the constant exactly.
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
         if self.variable == variable {
-            proposals.retain(|v| *v == self.constant);
+            for (i, v) in proposals.iter().enumerate() {
+                if mask.live(i) && *v != self.constant {
+                    mask.kill(i);
+                }
+            }
         }
     }
 

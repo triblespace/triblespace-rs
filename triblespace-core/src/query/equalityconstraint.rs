@@ -69,14 +69,25 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     }
 
     /// Retains only proposals that match the peer variable's binding.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if variable == self.a {
-            if let Some(peer) = binding.get(self.b) {
-                proposals.retain(|v| v == peer);
-            }
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
+    ) {
+        let peer = if variable == self.a {
+            binding.get(self.b)
         } else if variable == self.b {
-            if let Some(peer) = binding.get(self.a) {
-                proposals.retain(|v| v == peer);
+            binding.get(self.a)
+        } else {
+            return;
+        };
+        if let Some(peer) = peer {
+            for (i, v) in proposals.iter().enumerate() {
+                if mask.live(i) && v != peer {
+                    mask.kill(i);
+                }
             }
         }
     }
