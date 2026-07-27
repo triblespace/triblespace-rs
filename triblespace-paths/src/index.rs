@@ -99,6 +99,8 @@ pub struct BuildStats {
     pub batch_pair_count_ns: u128,
     /// Words retained by the experimental accepted-endpoint bitrelation.
     pub accepted_bitset_words: usize,
+    /// Words retained by its derived transpose and domain accelerators.
+    pub accepted_accelerator_words: usize,
     /// Experimental accepted-endpoint bitrelation construction time.
     pub projection_ns: u128,
 }
@@ -124,6 +126,7 @@ impl Default for BuildStats {
             batch_propagation_ns: 0,
             batch_pair_count_ns: 0,
             accepted_bitset_words: 0,
+            accepted_accelerator_words: 0,
             projection_ns: 0,
         }
     }
@@ -172,21 +175,29 @@ pub struct PathIndex {
 
 /// Row-major accepted endpoint relation over `PathIndex::vertices`.
 ///
-/// This is the sole retained endpoint projection. Forward fibers are set-bit
-/// views; reverse fibers and the small domain views scan this canonical
-/// relation lazily instead of retaining trees or copied value vectors.
+/// `forward` is the sole endpoint denotation. `reverse` and the three domain
+/// masks are explicitly derived accelerators over the same bits; none can
+/// affect merge semantics.
 #[derive(Clone, Debug)]
 struct AcceptedRelation {
-    vertex_count: usize,
     row_words: usize,
-    words: Vec<u64>,
+    forward: Vec<u64>,
+    reverse: Vec<u64>,
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    diagonal: Vec<u64>,
     pair_count: usize,
 }
 
 impl AcceptedRelation {
     fn from_closure(automaton: &Automaton, vertex_count: usize, closure: &Closure) -> Self {
         let row_words = vertex_count.div_ceil(u64::BITS as usize);
-        let mut words = vec![0u64; vertex_count.saturating_mul(row_words)];
+        let relation_words = vertex_count.saturating_mul(row_words);
+        let mut forward = vec![0u64; relation_words];
+        let mut reverse = vec![0u64; relation_words];
+        let mut starts = vec![0u64; row_words];
+        let mut ends = vec![0u64; row_words];
+        let mut diagonal = vec![0u64; row_words];
         let mut pair_count = 0usize;
         let state_count = automaton.state_count() as usize;
         let initial = automaton
@@ -204,27 +215,42 @@ impl AcceptedRelation {
                         continue;
                     }
                     let target = target / state_count;
-                    words[row + target / u64::BITS as usize] |=
-                        1u64 << (target % u64::BITS as usize);
+                    if !insert_bit(&mut forward[row..row + row_words], target) {
+                        continue;
+                    }
+                    insert_bit(
+                        &mut reverse[target * row_words..(target + 1) * row_words],
+                        source,
+                    );
+                    pair_count += 1;
+                    insert_bit(&mut starts, source);
+                    insert_bit(&mut ends, target);
+                    if source == target {
+                        insert_bit(&mut diagonal, source);
+                    }
                 }
             }
-            pair_count += words[row..row + row_words]
-                .iter()
-                .map(|word| word.count_ones() as usize)
-                .sum::<usize>();
         }
 
         Self {
-            vertex_count,
             row_words,
-            words,
+            forward,
+            reverse,
+            starts,
+            ends,
+            diagonal,
             pair_count,
         }
     }
 
     fn row(&self, source: usize) -> &[u64] {
         let start = source * self.row_words;
-        &self.words[start..start + self.row_words]
+        &self.forward[start..start + self.row_words]
+    }
+
+    fn reverse_row(&self, target: usize) -> &[u64] {
+        let start = target * self.row_words;
+        &self.reverse[start..start + self.row_words]
     }
 
     fn contains(&self, source: usize, target: usize) -> bool {
@@ -233,14 +259,6 @@ impl AcceptedRelation {
 
     fn row_indices(&self, source: usize) -> BitIndexes<'_> {
         BitIndexes::new(self.row(source))
-    }
-
-    fn row_is_empty(&self, source: usize) -> bool {
-        self.row(source).iter().all(|&word| word == 0)
-    }
-
-    fn column_is_empty(&self, target: usize) -> bool {
-        (0..self.vertex_count).all(|source| !self.contains(source, target))
     }
 }
 
@@ -404,7 +422,13 @@ impl PathIndex {
     ) -> Self {
         let projection_started = Instant::now();
         let accepted = AcceptedRelation::from_closure(&automaton, vertices.len(), &closure);
-        build_stats.accepted_bitset_words = accepted.words.len();
+        build_stats.accepted_bitset_words = accepted.forward.len();
+        build_stats.accepted_accelerator_words = accepted
+            .reverse
+            .len()
+            .saturating_add(accepted.starts.len())
+            .saturating_add(accepted.ends.len())
+            .saturating_add(accepted.diagonal.len());
         build_stats.projection_ns = projection_started.elapsed().as_nanos();
 
         Self {
@@ -450,26 +474,12 @@ impl PathIndex {
         &'a self,
         source: &RawInline,
     ) -> impl Iterator<Item = RawInline> + 'a {
-        let row = self
-            .vertices
-            .binary_search(source)
-            .ok()
-            .map(|source| self.accepted.row(source))
-            .unwrap_or(&[]);
-        BitIndexes::new(row).map(|target| self.vertices[target])
+        self.values(self.forward_bits(source))
     }
 
     /// Sorted, duplicate-free accepted sources for one target.
     pub fn reaching<'a>(&'a self, target: &RawInline) -> impl Iterator<Item = RawInline> + 'a {
-        let target = self.vertices.binary_search(target).ok();
-        self.vertices
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(move |(source, _)| {
-                target.is_some_and(|target| self.accepted.contains(*source, target))
-            })
-            .map(|(_, source)| source)
+        self.values(self.reverse_bits(target))
     }
 
     /// Whether one product point reaches another, including reflexive
@@ -500,30 +510,59 @@ impl PathIndex {
         }
     }
 
-    pub(crate) fn starts(&self) -> impl Iterator<Item = RawInline> + '_ {
+    pub(crate) fn forward_bits(&self, source: &RawInline) -> &[u64] {
         self.vertices
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(source, _)| !self.accepted.row_is_empty(*source))
-            .map(|(_, source)| source)
+            .binary_search(source)
+            .ok()
+            .map(|source| self.accepted.row(source))
+            .unwrap_or(&[])
     }
 
-    pub(crate) fn ends(&self) -> impl Iterator<Item = RawInline> + '_ {
+    pub(crate) fn reverse_bits(&self, target: &RawInline) -> &[u64] {
         self.vertices
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(target, _)| !self.accepted.column_is_empty(*target))
-            .map(|(_, target)| target)
+            .binary_search(target)
+            .ok()
+            .map(|target| self.accepted.reverse_row(target))
+            .unwrap_or(&[])
     }
 
-    pub(crate) fn diagonal(&self) -> impl Iterator<Item = RawInline> + '_ {
-        self.vertices
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(vertex, _)| self.accepted.contains(*vertex, *vertex))
-            .map(|(_, vertex)| vertex)
+    pub(crate) fn starts_bits(&self) -> &[u64] {
+        &self.accepted.starts
     }
+
+    pub(crate) fn ends_bits(&self) -> &[u64] {
+        &self.accepted.ends
+    }
+
+    pub(crate) fn diagonal_bits(&self) -> &[u64] {
+        &self.accepted.diagonal
+    }
+
+    pub(crate) fn values<'a>(&'a self, bits: &'a [u64]) -> impl Iterator<Item = RawInline> + 'a {
+        BitIndexes::new(bits).map(|vertex| self.vertices[vertex])
+    }
+
+    pub(crate) fn bits_contain(&self, bits: &[u64], value: &RawInline) -> bool {
+        self.vertices
+            .binary_search(value)
+            .is_ok_and(|vertex| bit_is_set(bits, vertex))
+    }
+}
+
+fn insert_bit(words: &mut [u64], bit: usize) -> bool {
+    let mask = 1u64 << (bit % u64::BITS as usize);
+    let word = &mut words[bit / u64::BITS as usize];
+    let inserted = *word & mask == 0;
+    *word |= mask;
+    inserted
+}
+
+pub(crate) fn bit_is_set(words: &[u64], bit: usize) -> bool {
+    words
+        .get(bit / u64::BITS as usize)
+        .is_some_and(|word| word & (1u64 << (bit % u64::BITS as usize)) != 0)
+}
+
+pub(crate) fn bit_count(words: &[u64]) -> usize {
+    words.iter().map(|word| word.count_ones() as usize).sum()
 }

@@ -183,11 +183,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             format_rectangle_histogram(&stats.rectangle_log2_counts, &stats.rectangle_log2_cells,)
         );
         println!(
-            "        batch components={} dag_edges={} closure_words={} accepted_words={} word_ors={} phase_ms(setup/scc/propagation/pair_count/accepted_bitset)={:.3}/{:.3}/{:.3}/{:.3}/{:.3}",
+            "        batch components={} dag_edges={} closure_words={} accepted_words={} accepted_accelerator_words={} word_ors={} phase_ms(setup/scc/propagation/pair_count/accepted_bitset)={:.3}/{:.3}/{:.3}/{:.3}/{:.3}",
             stats.batch_components,
             stats.batch_condensation_edges,
             stats.batch_bitset_words,
             stats.accepted_bitset_words,
+            stats.accepted_accelerator_words,
             stats.batch_word_ors,
             stats.batch_setup_ns as f64 / 1_000_000.0,
             stats.batch_scc_ns as f64 / 1_000_000.0,

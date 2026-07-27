@@ -4,6 +4,7 @@ use triblespace_core::query::{
     VariableSet,
 };
 
+use crate::index::bit_count;
 use crate::PathIndex;
 
 /// A two-endpoint view of a [`PathIndex`] for the classic query solver.
@@ -12,15 +13,6 @@ pub struct PathConstraint<'a> {
     index: &'a PathIndex,
     start: RawTerm,
     end: RawTerm,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum CandidateKind {
-    Diagonal,
-    Reaching(RawInline),
-    Starts,
-    ReachableFrom(RawInline),
-    Ends,
 }
 
 impl<'a> PathConstraint<'a> {
@@ -37,76 +29,20 @@ impl<'a> PathConstraint<'a> {
         }
     }
 
-    fn candidate_kind(&self, variable: VariableId, binding: &Binding) -> Option<CandidateKind> {
+    fn candidate_bits<'b>(&'b self, variable: VariableId, binding: &Binding) -> Option<&'b [u64]> {
         let at_start = self.start.is_var(variable);
         let at_end = self.end.is_var(variable);
         match (at_start, at_end) {
             (false, false) => None,
-            (true, true) => Some(CandidateKind::Diagonal),
-            (true, false) => Some(match self.end.position_value(binding).copied() {
-                Some(end) => CandidateKind::Reaching(end),
-                None => CandidateKind::Starts,
+            (true, true) => Some(self.index.diagonal_bits()),
+            (true, false) => Some(match self.end.position_value(binding) {
+                Some(end) => self.index.reverse_bits(end),
+                None => self.index.starts_bits(),
             }),
-            (false, true) => Some(match self.start.position_value(binding).copied() {
-                Some(start) => CandidateKind::ReachableFrom(start),
-                None => CandidateKind::Ends,
+            (false, true) => Some(match self.start.position_value(binding) {
+                Some(start) => self.index.forward_bits(start),
+                None => self.index.ends_bits(),
             }),
-        }
-    }
-
-    fn candidate_count(&self, kind: CandidateKind) -> usize {
-        match kind {
-            CandidateKind::Diagonal => self.index.diagonal().count(),
-            CandidateKind::Reaching(end) => self.index.reaching(&end).count(),
-            CandidateKind::Starts => self.index.starts().count(),
-            CandidateKind::ReachableFrom(start) => self.index.reachable_from(&start).count(),
-            CandidateKind::Ends => self.index.ends().count(),
-        }
-    }
-
-    fn propose_candidates(&self, kind: CandidateKind, proposals: &mut ProposalBuffer) {
-        match kind {
-            CandidateKind::Diagonal => proposals.extend(self.index.diagonal()),
-            CandidateKind::Reaching(end) => proposals.extend(self.index.reaching(&end)),
-            CandidateKind::Starts => proposals.extend(self.index.starts()),
-            CandidateKind::ReachableFrom(start) => {
-                proposals.extend(self.index.reachable_from(&start));
-            }
-            CandidateKind::Ends => proposals.extend(self.index.ends()),
-        }
-    }
-
-    fn candidate_contains(&self, kind: CandidateKind, candidate: &RawInline) -> bool {
-        match kind {
-            CandidateKind::Diagonal => self.index.contains(candidate, candidate),
-            CandidateKind::Reaching(end) => self.index.contains(candidate, &end),
-            CandidateKind::Starts => self.index.reachable_from(candidate).next().is_some(),
-            CandidateKind::ReachableFrom(start) => self.index.contains(&start, candidate),
-            CandidateKind::Ends => self.index.reaching(candidate).next().is_some(),
-        }
-    }
-
-    fn propose_candidate_chunk(
-        &self,
-        kind: CandidateKind,
-        cursor: &mut ProposeCursor,
-        budget: usize,
-        proposals: &mut ProposalBuffer,
-    ) -> bool {
-        match kind {
-            CandidateKind::Diagonal => {
-                propose_chunk_from(self.index.diagonal(), cursor, budget, proposals)
-            }
-            CandidateKind::Reaching(end) => {
-                propose_chunk_from(self.index.reaching(&end), cursor, budget, proposals)
-            }
-            CandidateKind::Starts => {
-                propose_chunk_from(self.index.starts(), cursor, budget, proposals)
-            }
-            CandidateKind::ReachableFrom(start) => {
-                propose_chunk_from(self.index.reachable_from(&start), cursor, budget, proposals)
-            }
-            CandidateKind::Ends => propose_chunk_from(self.index.ends(), cursor, budget, proposals),
         }
     }
 
@@ -129,13 +65,12 @@ impl<'a> Constraint<'a> for PathConstraint<'a> {
     }
 
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        self.candidate_kind(variable, binding)
-            .map(|kind| self.candidate_count(kind))
+        self.candidate_bits(variable, binding).map(bit_count)
     }
 
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        if let Some(kind) = self.candidate_kind(variable, binding) {
-            self.propose_candidates(kind, proposals);
+        if let Some(bits) = self.candidate_bits(variable, binding) {
+            proposals.extend(self.index.values(bits));
         }
     }
 
@@ -147,15 +82,15 @@ impl<'a> Constraint<'a> for PathConstraint<'a> {
         budget: usize,
         proposals: &mut ProposalBuffer,
     ) -> bool {
-        let Some(kind) = self.candidate_kind(variable, binding) else {
+        let Some(bits) = self.candidate_bits(variable, binding) else {
             return false;
         };
-        self.propose_candidate_chunk(kind, cursor, budget, proposals)
+        propose_chunk_from(self.index.values(bits), cursor, budget, proposals)
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
-        if let Some(kind) = self.candidate_kind(variable, binding) {
-            cands.retain(|candidate| self.candidate_contains(kind, candidate));
+        if let Some(bits) = self.candidate_bits(variable, binding) {
+            cands.retain(|candidate| self.index.bits_contain(bits, candidate));
         }
     }
 
@@ -164,10 +99,10 @@ impl<'a> Constraint<'a> for PathConstraint<'a> {
         let end = self.end.position_value(binding);
         match (start, end) {
             (Some(start), Some(end)) => self.index.contains(start, end),
-            (Some(start), None) => self.index.reachable_from(start).next().is_some(),
-            (None, Some(end)) => self.index.reaching(end).next().is_some(),
+            (Some(start), None) => bit_count(self.index.forward_bits(start)) != 0,
+            (None, Some(end)) => bit_count(self.index.reverse_bits(end)) != 0,
             (None, None) if self.is_same_unbound_variable(binding) => {
-                self.index.diagonal().next().is_some()
+                bit_count(self.index.diagonal_bits()) != 0
             }
             (None, None) => self.index.metrics().accepted_pairs != 0,
         }
