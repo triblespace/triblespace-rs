@@ -91,6 +91,14 @@ where
     /// deduplicates. Dead variants (where [`satisfied`](Constraint::satisfied)
     /// returns `false`) are skipped so their stale bindings cannot inject
     /// values that no live variant would produce.
+    ///
+    /// The union deliberately keeps the row-at-a-time shape and inherits
+    /// the default batched lift. Its variant filter is
+    /// `satisfied(binding)` — a *per-row* predicate, since two rows of one
+    /// batch can have different live variants — so a batched override would
+    /// have to re-derive that per row anyway. The default loop does exactly
+    /// that, and the segments it produces are what a batch-aware sibling
+    /// then confirms in one go.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         let base = proposals.len();
         self.constraints

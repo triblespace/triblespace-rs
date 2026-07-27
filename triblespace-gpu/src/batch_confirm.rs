@@ -47,7 +47,7 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{InlineEncoding, RawInline};
 use triblespace_core::query::{
-    and_words, Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, RawTerm, Term,
+    and_words, Binding, Candidates, Constraint, Frontier, ProposalBuffer, RawTerm, Term,
     TriblePattern, VariableId, VariableSet,
 };
 
@@ -802,16 +802,13 @@ where
         self.inner.propose(variable, binding, proposals)
     }
 
-    fn propose_chunk(
+    fn propose_frontier(
         &self,
         variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
-        self.inner
-            .propose_chunk(variable, binding, cursor, budget, proposals)
+    ) {
+        self.inner.propose_frontier(variable, frontier, proposals)
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
@@ -836,6 +833,69 @@ where
                 self.gpu.stats.record_error();
                 self.inner.confirm(variable, binding, cands);
             }
+        }
+    }
+
+    /// Batched confirm. The **membership** arm — no other position bound —
+    /// is binding-independent: every candidate's verdict is "is this value
+    /// in the universe, and does it occur on this axis?", which does not
+    /// depend on which parent proposed it. So a whole batched region goes
+    /// to one kernel regardless of how many parents it spans, and the
+    /// routing threshold is now met at every level instead of only at the
+    /// root.
+    ///
+    /// The **range** arms compute a row range from the bound positions,
+    /// which differ per parent, so they stay per segment — each segment
+    /// still routes to the device on its own merits. Lifting those to one
+    /// dispatch needs a per-candidate range buffer (the parent tag is
+    /// already available via [`Candidates::parent_row`]); deliberately not
+    /// built here, since it is a kernel change rather than a protocol one.
+    fn confirm_frontier(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+        if !e_var && !a_var && !v_var {
+            return;
+        }
+
+        // Every position other than the confirmed variable is a constant or
+        // an unbound variable in EVERY row (rows of one frontier share their
+        // bound set), so "is this the membership arm?" is a per-batch
+        // question. Sampling row 0 answers it for the whole batch.
+        let membership = frontier.len() > 0 && {
+            let binding = frontier.row(0);
+            self.term_e.position_value(&binding).is_none()
+                && self.term_a.position_value(&binding).is_none()
+                && self.term_v.position_value(&binding).is_none()
+        };
+
+        if membership && count_live(cands) >= self.gpu.min_confirm_batch {
+            let axis = if e_var {
+                Axis::Entity
+            } else if a_var {
+                Axis::Attribute
+            } else {
+                Axis::Value
+            };
+            match self.gpu.confirm_membership_gpu(axis, cands) {
+                Ok(()) => {
+                    self.gpu.stats.record_gpu(cands.len());
+                    return;
+                }
+                Err(_) => {
+                    self.gpu.stats.record_error();
+                }
+            }
+        }
+
+        for s in 0..cands.segments() {
+            let (row, mut segment) = cands.segment(s);
+            self.confirm(variable, &frontier.row(row), &mut segment);
         }
     }
 

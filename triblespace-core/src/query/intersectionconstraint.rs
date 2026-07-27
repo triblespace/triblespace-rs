@@ -62,44 +62,72 @@ where
     /// sibling constraints in an enclosing composite are never filtered
     /// through this intersection's children.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        let mut cursor = ProposeCursor::default();
-        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
-    }
-
-    /// Chunked propose: the tightest child delivers its next chunk and the
-    /// remaining children chunk-confirm it through a mask before it reaches
-    /// the caller — candidates never sit unconfirmed in the buffer. The
-    /// cursor is threaded straight to the tightest child; the child choice
-    /// is stable across one level's chunk sequence because estimates only
-    /// depend on the binding, which is fixed while a level enumerates.
-    fn propose_chunk(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
-        proposals: &mut ProposalBuffer,
-    ) -> bool {
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
             .filter_map(|c| Some((c.estimate(variable, binding)?, c)))
             .collect();
         if relevant_constraints.is_empty() {
-            return false;
+            return;
         }
         relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
 
         let base = proposals.len();
-        let more = relevant_constraints[0]
+        relevant_constraints[0]
             .1
-            .propose_chunk(variable, binding, cursor, budget, proposals);
+            .propose(variable, binding, proposals);
 
         let mut region = proposals.region(base);
         for (_, c) in relevant_constraints[1..].iter() {
             c.confirm(variable, binding, &mut region);
         }
-        more
+    }
+
+    /// Batched propose: the tightest child proposes for the **whole
+    /// batch** and the remaining children confirm the whole region before
+    /// it reaches the caller — candidates never sit unconfirmed in the
+    /// buffer, and every confirmer sees a region as wide as the frontier
+    /// rather than one parent's handful.
+    ///
+    /// The proposer is chosen once per batch from
+    /// [`frontier_estimate`](Constraint::frontier_estimate) (a sampled
+    /// aggregate) rather than once per row. Which children are *relevant*
+    /// is not a sampling question at all: `estimate` returns `None` exactly
+    /// outside a constraint's [`VariableSet`], which is binding-independent,
+    /// so the relevant set is the same for every row. Only the ordering is
+    /// sampled, and ordering is a performance heuristic — confirm is
+    /// kill-only, so any order computes the same conjunction.
+    fn propose_frontier(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
+            .constraints
+            .iter()
+            .filter_map(|c| Some((c.frontier_estimate(variable, frontier)?, c)))
+            .collect();
+        if relevant_constraints.is_empty() {
+            // No child constrains this variable, but the segment-per-row
+            // shape is still owed to the caller.
+            for _ in 0..frontier.len() {
+                proposals.open_row();
+            }
+            return;
+        }
+        relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
+
+        let base = proposals.len();
+        let segment_base = proposals.segments();
+        relevant_constraints[0]
+            .1
+            .propose_frontier(variable, frontier, proposals);
+
+        let mut region = proposals.region_since(base, segment_base);
+        for (_, c) in relevant_constraints[1..].iter() {
+            c.confirm_frontier(variable, frontier, &mut region);
+        }
     }
 
     /// Confirms proposals through all children that constrain `variable`,
@@ -114,6 +142,32 @@ where
 
         for (_, c) in relevant_constraints.iter() {
             c.confirm(variable, binding, cands);
+        }
+    }
+
+    /// Batched confirm: every child that constrains `variable` judges the
+    /// whole region, in sampled-estimate order, all killing into the shared
+    /// liveness words.
+    ///
+    /// Passing the region through intact rather than per segment is the
+    /// point: it is what lets a batch-aware child (the GPU archive) see a
+    /// region wide enough to be worth a device dispatch at *every* level,
+    /// not just at the root.
+    fn confirm_frontier(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
+        let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
+            .constraints
+            .iter()
+            .filter_map(|c| Some((c.frontier_estimate(variable, frontier)?, c)))
+            .collect();
+        relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
+
+        for (_, c) in relevant_constraints.iter() {
+            c.confirm_frontier(variable, frontier, cands);
         }
     }
 

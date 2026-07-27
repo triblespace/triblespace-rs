@@ -1,7 +1,6 @@
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, RawTerm, Term, VariableId,
-    VariableSet,
+    Binding, Candidates, Constraint, ProposalBuffer, RawTerm, Term, VariableId, VariableSet,
 };
 
 use crate::PathIndex;
@@ -70,34 +69,6 @@ impl<'a> Constraint<'a> for PathConstraint<'a> {
         if let Some(ordinals) = self.candidates(variable, binding) {
             proposals.extend(self.index.values(ordinals));
         }
-    }
-
-    fn propose_chunk(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
-        proposals: &mut ProposalBuffer,
-    ) -> bool {
-        let Some(ordinals) = self.candidates(variable, binding) else {
-            return false;
-        };
-        let start = if cursor.started {
-            ordinals.partition_point(|&ordinal| self.index.value(ordinal) <= cursor.key)
-        } else {
-            0
-        };
-        if budget == 0 {
-            return start < ordinals.len();
-        }
-        cursor.started = true;
-        let end = start.saturating_add(budget).min(ordinals.len());
-        for value in self.index.values(&ordinals[start..end]) {
-            cursor.key = value;
-            proposals.push(value);
-        }
-        end < ordinals.len()
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, candidates: &mut Candidates<'_>) {

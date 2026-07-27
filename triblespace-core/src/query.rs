@@ -320,17 +320,19 @@ impl<T: InlineEncoding> Variable<T> {
 /// buffers it indexes into — constructed for the duration of one
 /// constraint call. [`BindingStore`] owns both halves.
 ///
-/// The payoff is size: an assignment is 128 `u32`s (512 bytes) instead of
-/// 128 raw inline values (4 KiB), a bind is a 4-byte write instead of a
-/// 32-byte copy, cloning the search state no longer memcpies the values,
-/// and a *batch* of bindings becomes a small integer matrix over shared
-/// buffers rather than a pile of value copies.
+/// The payoff is size: an assignment is one `u32` per variable slot
+/// instead of a 32-byte raw value each, a bind is a 4-byte write instead
+/// of a 32-byte copy, cloning the search state no longer memcpies the
+/// values, and a *batch* of bindings — a [`Frontier`] — is a small
+/// integer matrix over shared buffers rather than a pile of value
+/// copies. That last property is what makes a wide frontier affordable
+/// at all: widening the batch costs `stride` `u32`s per row, not 4 KiB.
 #[derive(Clone, Copy)]
 pub struct Binding<'a> {
     /// Bitset tracking which variables have been assigned a value.
     pub bound: VariableSet,
-    indexes: &'a [u32; 128],
-    levels: &'a [LevelValues; 128],
+    indexes: &'a [u32],
+    levels: &'a [ProposalBuffer],
 }
 
 impl fmt::Debug for Binding<'_> {
@@ -348,7 +350,7 @@ impl<'a> Binding<'a> {
     /// unbound — resolved through `variable`'s level buffer.
     pub fn get(&self, variable: VariableId) -> Option<&'a RawInline> {
         if self.bound.is_set(variable) {
-            Some(&self.levels[variable].buffer[self.indexes[variable] as usize])
+            Some(&self.levels[variable][self.indexes[variable] as usize])
         } else {
             None
         }
@@ -357,7 +359,7 @@ impl<'a> Binding<'a> {
 
 /// Backing for the empty [`Binding`]: nothing is bound, so nothing ever
 /// resolves through them, but a view needs something to point at.
-static NO_LEVELS: [LevelValues; 128] = [const { LevelValues::empty() }; 128];
+static NO_LEVELS: [ProposalBuffer; 128] = [const { ProposalBuffer::empty() }; 128];
 static NO_INDEXES: [u32; 128] = [0; 128];
 
 impl Default for Binding<'_> {
@@ -371,17 +373,114 @@ impl Default for Binding<'_> {
     }
 }
 
+/// A **batch of parent bindings** — the collection that
+/// [`propose_frontier`](Constraint::propose_frontier) expands and
+/// [`confirm_frontier`](Constraint::confirm_frontier) filters against.
+///
+/// Every row is at the same point in the search — they share
+/// [`bound`](Frontier::bound) and differ only in which values they took —
+/// so a frontier is an *index matrix*, not a pile of copied assignments:
+/// `stride` `u32`s per row over the level buffers those indexes point
+/// into. Today's single-binding call sites become a frontier of one (see
+/// [`BindingStore::frontier`]) and behave identically.
+///
+/// This is the whole point of the batched protocol. With a width-1
+/// frontier only the root level's propose is wide; every deeper level
+/// confirms a handful of candidates for one parent. Expanding `W` parents
+/// together makes *every* level's region `W` segments wide, which is what
+/// puts the GPU and SIMD confirm tiers in play throughout a query rather
+/// than once at the top. Expanding `N` prefixes together is the same
+/// total work as expanding them one at a time — the AGM bound is about
+/// output, not traversal order — so worst-case optimality is untouched;
+/// what it costs is frontier memory, which the engine caps at
+/// [`FRONTIER_WIDTH`] rows per level.
+#[derive(Clone, Copy)]
+pub struct Frontier<'a> {
+    bound: VariableSet,
+    indexes: &'a [u32],
+    stride: usize,
+    levels: &'a [ProposalBuffer],
+}
+
+impl fmt::Debug for Frontier<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.rows()).finish()
+    }
+}
+
+impl<'a> Frontier<'a> {
+    /// Number of parent bindings in this batch.
+    pub fn len(&self) -> usize {
+        self.indexes.len() / self.stride
+    }
+
+    /// True when the batch has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
+    }
+
+    /// The variables bound in *every* row of this batch.
+    pub fn bound(&self) -> VariableSet {
+        self.bound
+    }
+
+    /// The binding of row `row`.
+    pub fn row(&self, row: usize) -> Binding<'a> {
+        Binding {
+            bound: self.bound,
+            indexes: &self.indexes[row * self.stride..(row + 1) * self.stride],
+            levels: self.levels,
+        }
+    }
+
+    /// Iterates the batch's bindings in row order.
+    pub fn rows(&self) -> impl Iterator<Item = Binding<'a>> + '_ {
+        (0..self.len()).map(|row| self.row(row))
+    }
+
+    /// Row numbers of a bounded, evenly-spread sample of this batch.
+    ///
+    /// Used wherever a batch needs *one* number per variable or per child
+    /// constraint — the engine's variable choice, an intersection's
+    /// proposer choice — instead of one per row. Asking every row would
+    /// make the decision cost proportional to the batch, which is exactly
+    /// the cost the batch exists to amortise. [`ESTIMATE_SAMPLE`] rows are
+    /// plenty because both decisions consume the estimate through a
+    /// *coarse* key (see the note on [`Query`]'s ordering key), so the
+    /// sample only has to resolve which power-of-two bucket the batch
+    /// sits in, not the exact cardinality.
+    pub fn sample(&self) -> impl Iterator<Item = usize> + '_ {
+        let rows = self.len();
+        let taken = rows.min(ESTIMATE_SAMPLE);
+        // Spread the sample across the batch rather than taking a prefix:
+        // frontier rows arrive in the proposer's value order, which is
+        // often correlated with degree.
+        let step = if taken == 0 { 1 } else { rows / taken };
+        (0..taken).map(move |i| i * step)
+    }
+}
+
 /// Owns what a [`Binding`] is a view of: the per-variable level buffers
-/// and the index row that picks one entry out of each.
+/// and the stack of frontier index matrices that pick entries out of
+/// them.
 ///
 /// This is the query engine's search state. It is also how code outside
 /// the engine builds a binding over values it picked itself — see
-/// [`bind`](BindingStore::bind).
+/// [`bind`](BindingStore::bind) — in which case the store holds a single
+/// frontier of a single row.
 #[derive(Clone)]
 pub struct BindingStore {
     bound: VariableSet,
-    indexes: [u32; 128],
-    levels: [LevelValues; 128],
+    /// Index-row width. Row `r` of a frontier occupies
+    /// `[r * stride .. (r + 1) * stride)`; slot `v` of a row is
+    /// variable `v`'s entry index.
+    stride: usize,
+    /// One index matrix per search depth. `frontiers[0]` is the root: a
+    /// single row binding nothing. `frontiers[d + 1]` is the batch that
+    /// results from expanding `frontiers[d]` by one variable, so
+    /// backtracking to a shallower batch is a `pop`, not a rebuild.
+    frontiers: Vec<Vec<u32>>,
+    levels: [ProposalBuffer; 128],
 }
 
 impl fmt::Debug for BindingStore {
@@ -392,25 +491,47 @@ impl fmt::Debug for BindingStore {
 
 impl Default for BindingStore {
     fn default() -> Self {
-        BindingStore {
-            bound: VariableSet::new_empty(),
-            indexes: [0; 128],
-            levels: std::array::from_fn(|_| LevelValues::default()),
-        }
+        Self::with_stride(128)
     }
 }
 
 impl BindingStore {
-    /// An empty store: nothing bound, every level empty.
+    /// An empty store: nothing bound, every level empty, one root row
+    /// wide enough for any of the 128 variable slots.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The current assignment, as constraints see it.
+    /// An empty store whose index rows carry `stride` slots — the engine
+    /// sizes this to the query's variable count so a wide frontier costs
+    /// `stride` `u32`s per row instead of the full 128.
+    pub(crate) fn with_stride(stride: usize) -> Self {
+        BindingStore {
+            bound: VariableSet::new_empty(),
+            stride,
+            frontiers: vec![vec![0u32; stride]],
+            levels: std::array::from_fn(|_| ProposalBuffer::new()),
+        }
+    }
+
+    /// The current assignment, as [`satisfied`](Constraint::satisfied)
+    /// and result post-processing see it: row 0 of the current frontier.
     pub fn view(&self) -> Binding<'_> {
-        Binding {
+        self.frontier().row(0)
+    }
+
+    /// The current batch of assignments, as
+    /// [`propose_frontier`](Constraint::propose_frontier) and
+    /// [`confirm_frontier`](Constraint::confirm_frontier) see it.
+    ///
+    /// For a store built with [`new`](BindingStore::new) this is a
+    /// frontier of one — the bridge that lets every single-binding caller
+    /// drive the batched protocol unchanged.
+    pub fn frontier(&self) -> Frontier<'_> {
+        Frontier {
             bound: self.bound,
-            indexes: &self.indexes,
+            indexes: self.frontiers.last().expect("non-empty frontier stack"),
+            stride: self.stride,
             levels: &self.levels,
         }
     }
@@ -424,9 +545,11 @@ impl BindingStore {
     /// of their own choosing.
     pub fn bind(&mut self, variable: VariableId, value: &RawInline) {
         let level = &mut self.levels[variable];
-        let index = level.buffer.len();
-        level.buffer.push(*value);
-        self.indexes[variable] = index as u32;
+        let index = level.len();
+        level.push(*value);
+        let stride = self.stride;
+        self.frontiers.last_mut().expect("non-empty frontier stack")[variable] = index as u32;
+        debug_assert!(variable < stride);
         self.bound.set(variable);
     }
 
@@ -440,184 +563,179 @@ impl BindingStore {
         self.bound
     }
 
-    /// Live candidates still pending at `variable`'s level.
-    #[cfg(feature = "parallel")]
-    fn pending(&self, variable: VariableId) -> usize {
+    /// Entry count of `variable`'s level buffer.
+    fn level_len(&self, variable: VariableId) -> usize {
+        self.levels[variable].len()
+    }
+
+    /// Appends up to `width` live entry indexes of `variable`'s level,
+    /// starting at `from`, to `out`. Returns the position to resume from.
+    fn draw(&self, variable: VariableId, from: usize, width: usize, out: &mut Vec<u32>) -> usize {
         let level = &self.levels[variable];
-        level.buffer.count_live(level.pos)
-    }
-
-    /// Whether `variable`'s source may still deliver candidates beyond
-    /// what is materialized.
-    fn more(&self, variable: VariableId) -> bool {
-        self.levels[variable].more
-    }
-
-    /// Consumes the next live candidate at `variable`'s level and binds
-    /// `variable` to it. Returns `false` when the materialized region is
-    /// spent.
-    fn advance(&mut self, variable: VariableId) -> bool {
-        let level = &mut self.levels[variable];
-        match level.buffer.next_live(level.pos) {
-            Some(i) => {
-                level.pos = i + 1;
-                self.indexes[variable] = i as u32;
-                self.bound.set(variable);
-                true
+        let mut pos = from;
+        while out.len() < width {
+            match level.next_live(pos) {
+                Some(i) => {
+                    out.push(i as u32);
+                    pos = i + 1;
+                }
+                None => return level.len(),
             }
-            None => false,
         }
+        pos
     }
 
-    /// Clears `variable`'s level and refills it from `propose`.
+    /// Clears `variable`'s level and refills it by proposing over the
+    /// current frontier.
+    ///
+    /// This is the **only** primitive that writes a level buffer. The
+    /// resumable-narrowing path used to be a second one, and it was the
+    /// only reason a level could be appended to while its variable was
+    /// still bound — which forced a detached-buffer special case and
+    /// falsified "a bound variable's buffer is stable for the lifetime of
+    /// its binding". With it gone the invariant holds unconditionally,
+    /// and the `debug_assert` below is that invariant made checkable.
     ///
     /// The level is moved *out* of the array for the duration of the
     /// call, so `propose` gets `&mut` on it while the remaining levels
-    /// lend immutably through the [`Binding`] view — the borrow split the
+    /// lend immutably through the [`Frontier`] view — the borrow split the
     /// search needs, with no `unsafe` and no second copy of the
-    /// candidates. This is sound precisely because the engine only ever
-    /// refills the level of a variable it is about to push, which is by
-    /// construction unbound: nothing can be resolving through this level
-    /// while it is away.
+    /// candidates.
     fn refill(
         &mut self,
         variable: VariableId,
-        reserve: usize,
-        propose: impl FnOnce(&Binding<'_>, &mut ProposeCursor, usize, &mut ProposalBuffer) -> bool,
+        propose: impl FnOnce(&Frontier<'_>, &mut ProposalBuffer),
     ) {
         debug_assert!(
             !self.bound.is_set(variable),
             "refilling a bound variable's level would strand its binding"
         );
-        let mut level = std::mem::take(&mut self.levels[variable]);
-        level.buffer.clear();
-        level.pos = 0;
-        level.cursor = ProposeCursor::default();
-        level.widen = INITIAL_CHUNK;
-        level
-            .buffer
-            .reserve_exact(reserve.saturating_sub(level.buffer.capacity()));
-        level.more = propose(
-            &Binding {
-                bound: self.bound,
-                indexes: &self.indexes,
-                levels: &self.levels,
-            },
-            &mut level.cursor,
-            level.widen,
-            &mut level.buffer,
+        let mut buffer = std::mem::take(&mut self.levels[variable]);
+        buffer.clear();
+        let frontier = Frontier {
+            bound: self.bound,
+            indexes: self.frontiers.last().expect("non-empty frontier stack"),
+            stride: self.stride,
+            levels: &self.levels,
+        };
+        propose(&frontier, &mut buffer);
+        debug_assert_eq!(
+            buffer.segments(),
+            frontier.len(),
+            "propose_frontier must open exactly one segment per frontier row"
         );
-        self.levels[variable] = level;
+        self.levels[variable] = buffer;
     }
 
-    /// Requests the next geometric chunk for `variable`'s level and
-    /// appends it to what is already materialized. Returns whether the
-    /// level may still produce more.
+    /// Pushes the batch that results from binding `variable` to each of
+    /// `entries` (entry indexes into `variable`'s level buffer).
     ///
-    /// Unlike [`refill`](BindingStore::refill) the level stays in the
-    /// array, because widening *can* happen while `variable` is still
-    /// bound: the engine reaches here by backtracking into a level whose
-    /// materialized region ran dry, and that binding has to keep
-    /// resolving while the source is asked for more. The chunk is
-    /// therefore proposed into a detached buffer and appended, which
-    /// leaves every existing index — including the bound one — pointing
-    /// at the same entry.
-    fn widen(
-        &mut self,
-        variable: VariableId,
-        propose: impl FnOnce(&Binding<'_>, &mut ProposeCursor, usize, &mut ProposalBuffer) -> bool,
-    ) -> bool {
-        let widen = self.levels[variable].widen.saturating_mul(WIDEN_FACTOR);
-        let mut cursor = self.levels[variable].cursor;
-        let mut chunk = ProposalBuffer::new();
-        let more = propose(
-            &Binding {
-                bound: self.bound,
-                indexes: &self.indexes,
-                levels: &self.levels,
-            },
-            &mut cursor,
-            widen,
-            &mut chunk,
-        );
-        let level = &mut self.levels[variable];
-        level.widen = widen;
-        level.cursor = cursor;
-        level.more = more;
-        level.buffer.append(&mut chunk);
-        more
-    }
-
-    /// Bisects `variable`'s materialized region, returning the tail as a
-    /// fresh level for the right half of a parallel split.
-    ///
-    /// The left half keeps entries `[0..mid)`, and every consumed entry
-    /// (and hence every index any binding holds for this level) sits
-    /// below `pos <= mid` — so the left half's indexes stay valid. The
-    /// returned tail re-indexes from zero, which is why the right half
-    /// must [`unset`](BindingStore::unset) `variable` when it installs
-    /// it.
-    #[cfg(feature = "parallel")]
-    fn bisect(&mut self, variable: VariableId) -> LevelValues {
-        let level = &mut self.levels[variable];
-        let pending_start = level
-            .buffer
-            .next_live(level.pos)
-            .expect("bisect requires pending candidates");
-        let mid = pending_start + (level.buffer.len() - pending_start) / 2;
-        LevelValues {
-            buffer: level.buffer.split_off(mid),
-            pos: 0,
-            cursor: ProposeCursor::default(),
-            more: false,
-            widen: INITIAL_CHUNK,
+    /// Each new row inherits its parent row verbatim — the parent is the
+    /// frontier row whose segment the entry sits in — and overwrites one
+    /// slot. That is the whole descent step: one `stride`-wide memcpy and
+    /// one `u32` store per row, no value ever copied.
+    fn push_frontier(&mut self, variable: VariableId, entries: &[u32]) {
+        let stride = self.stride;
+        let parent = self.frontiers.last().expect("non-empty frontier stack");
+        let bounds = self.levels[variable].bounds();
+        let mut rows = Vec::with_capacity(entries.len() * stride);
+        for &entry in entries {
+            // Segments are ascending and cover the buffer, so the segment
+            // holding `entry` is the last one starting at or before it.
+            let row = bounds.partition_point(|&start| start <= entry) - 1;
+            rows.extend_from_slice(&parent[row * stride..(row + 1) * stride]);
+            let last = rows.len() - stride;
+            rows[last + variable] = entry;
         }
+        self.frontiers.push(rows);
+        self.bound.set(variable);
     }
 
-    /// Installs `level` as `variable`'s level and unbinds `variable`:
-    /// the incoming buffer has its own coordinates, so any index the
-    /// index row still holds for it is meaningless.
-    #[cfg(feature = "parallel")]
-    fn install(&mut self, variable: VariableId, level: LevelValues) {
-        self.levels[variable] = level;
+    /// Drops the deepest batch, returning to its parent — the engine's
+    /// backtracking step.
+    fn pop_frontier(&mut self, variable: VariableId) {
+        self.frontiers.pop();
         self.bound.unset(variable);
+    }
+
+    /// Splits the current batch's rows `[from..]` in half, returning the
+    /// tail rows for the right half of a parallel split.
+    ///
+    /// Indexes stay valid across the split without any re-indexing: both
+    /// halves keep element-wise identical copies of the level buffers
+    /// (the clone is verbatim), so a row's entry indexes resolve to the
+    /// same values in either half. Only *rows* are partitioned.
+    #[cfg(feature = "parallel")]
+    fn split_frontier(&mut self, from: usize) -> Option<Vec<u32>> {
+        let stride = self.stride;
+        let top = self.frontiers.last_mut()?;
+        let rows = top.len() / stride;
+        if rows.saturating_sub(from) < 2 {
+            return None;
+        }
+        let mid = from + (rows - from) / 2;
+        Some(top.split_off(mid * stride))
+    }
+
+    /// Replaces the current batch's rows (the right half of a split
+    /// installing the tail it was handed, or emptying its batch when it
+    /// is taking only the undrawn tails).
+    #[cfg(feature = "parallel")]
+    fn set_frontier(&mut self, rows: Vec<u32>) {
+        *self.frontiers.last_mut().expect("non-empty frontier stack") = rows;
     }
 }
 
 type ProjectionKey = Box<[RawInline]>;
 
-/// Resume state for chunked proposing — plain data held by the engine,
-/// interpreted by the proposing constraint.
+/// Maximum number of parent bindings the engine expands in one batch.
 ///
-/// Constraints stay stateless: instead of retaining a live enumeration (which
-/// would borrow the constraint into the engine — the self-referential trap the
-/// stateless protocol exists to avoid), the source re-finds its place from
-/// this cursor on every [`propose_chunk`](Constraint::propose_chunk) call.
-/// `key` is 32 opaque bytes the source owns (a last-delivered value, a rank
-/// offset — its choice); `started` distinguishes "not begun" from "resumed at
-/// the zero key". Plain data means the cursor survives `Query::clone` and the
-/// rayon splitter for free.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProposeCursor {
-    /// Whether any chunk has been requested yet.
-    pub started: bool,
-    /// Source-interpreted resume state.
-    pub key: RawInline,
-}
+/// The rationale is measured, not aesthetic. A census of confirm-region
+/// sizes over real dblp data found the median region to be 1–7 candidates
+/// at *every* scale, p95 ~200, with only a handful of 63k–268k regions —
+/// all of them at the root. The cause was the width-1 frontier: only the
+/// root's propose is wide, and every deeper level confirms a handful of
+/// candidates for one parent. Batched-confirm tiers with a fixed dispatch
+/// cost therefore engaged exactly once per query.
+///
+/// 16384 is where a batch becomes worth a device dispatch: it is
+/// `triblespace-gpu`'s own `DEFAULT_MIN_CONFIRM_BATCH`, itself a measured
+/// CPU/GPU crossover. At that width even a median fan-out of one puts
+/// every level's region at or above the routing threshold, which is the
+/// whole point of the change. One constant, trivially tunable: peak level
+/// memory is `FRONTIER_WIDTH * fan-out * 36` bytes, so halving it halves
+/// the engine's high-water mark.
+pub const FRONTIER_WIDTH: usize = 16384;
 
-/// First chunk size requested from [`Constraint::propose_chunk`] at a fresh
-/// level. Small on purpose: time-to-first-result at a wide level is bounded
-/// by the first chunk, not the level's cardinality.
-const INITIAL_CHUNK: usize = 64;
+/// Width of the *first* batch at a level; batches then grow by
+/// [`FRONTIER_RAMP`] up to [`FRONTIER_WIDTH`].
+///
+/// Starting at one keeps time-to-first-result identical to plain DFS: a
+/// query that is stopped after one row (`exists!`, `.next()`, `.take(n)`)
+/// does exactly the work DFS did, because its first batch at every level
+/// *is* a single row. A full drain reaches full width after
+/// `log2(FRONTIER_WIDTH)` batches, so the ramp costs a logarithmic number
+/// of extra propose calls at the top of the tree and no extra per-candidate
+/// work at all.
+const INITIAL_FRONTIER_WIDTH: usize = 1;
 
-/// Geometric growth factor between successive chunks at one level. Total
-/// enumeration work stays within a constant factor of eager proposing while
-/// the number of refill calls stays logarithmic.
-const WIDEN_FACTOR: usize = 4;
+/// Growth factor of the frontier-width ramp.
+const FRONTIER_RAMP: usize = 2;
 
-/// Growable buffer of candidate values for one variable at one search level
-/// — the write target of [`Constraint::propose`] and the engine's per-level
-/// candidate store.
+/// Rows sampled by [`Frontier::sample`] when a batch has to be summarised
+/// by one number.
+///
+/// 32 is generous: both consumers (the engine's variable choice, an
+/// intersection's proposer choice) reduce the estimate to a coarse
+/// power-of-two bucket, so the sample only has to identify the bucket the
+/// batch sits in. Sampling rather than polling every row keeps the
+/// decision O(1) in the batch width, which is what makes widening the
+/// batch free.
+pub const ESTIMATE_SAMPLE: usize = 32;
+
+/// Growable, **segmented** buffer of candidate values — the write target of
+/// [`Constraint::propose_frontier`] and the engine's per-level candidate
+/// store.
 ///
 /// Entries are plain `RawInline` (fixed-stride 32-byte POD), stored
 /// contiguously and **write-once**: nothing ever moves or rewrites a stored
@@ -631,19 +749,58 @@ const WIDEN_FACTOR: usize = 4;
 /// lane — CPU or GPU — writes its own word with no read-modify-write
 /// contention. A bit-packed representation is a planned alternative behind
 /// this same API, to be justified against this baseline.
+///
+/// # Segments
+///
+/// One buffer now holds the candidates of a whole [`Frontier`], so it
+/// records where each parent row's run begins:
+/// [`open_row`](ProposalBuffer::open_row) starts the next row's segment and
+/// everything pushed afterwards belongs to it. Segment `s` is parent row
+/// `s`. Boundaries are *starts only* — the last segment runs to the end of
+/// the buffer — so nothing has to be sealed and a nested composite can take
+/// a region of its own freshly-appended segments at any time.
 #[derive(Clone, Debug, Default)]
 pub struct ProposalBuffer {
     entries: Vec<RawInline>,
     live: Vec<u32>,
+    /// Start of each parent row's segment. `bounds.len()` is the number of
+    /// rows proposed for so far.
+    bounds: Vec<u32>,
 }
 
 impl ProposalBuffer {
     /// Creates an empty buffer.
     pub fn new() -> Self {
+        Self::empty()
+    }
+
+    /// `const` constructor so the empty [`Binding`] can borrow a `static`
+    /// array of level buffers.
+    pub(crate) const fn empty() -> Self {
         ProposalBuffer {
             entries: Vec::new(),
             live: Vec::new(),
+            bounds: Vec::new(),
         }
+    }
+
+    /// Starts the segment of the next parent row. Every batched proposer
+    /// calls this exactly once per [`Frontier`] row, in row order, before
+    /// pushing that row's candidates — including for rows it has no
+    /// candidates for, which get an empty segment.
+    pub fn open_row(&mut self) {
+        self.bounds.push(self.entries.len() as u32);
+    }
+
+    /// Number of parent rows proposed for so far.
+    pub fn segments(&self) -> usize {
+        self.bounds.len()
+    }
+
+    /// Segment starts, ascending; segment `s` runs from `bounds()[s]` to
+    /// `bounds()[s + 1]`, or to the end of the buffer for the last one.
+    pub(crate) fn bounds(&self) -> &[u32] {
+        &self.bounds
     }
 
     /// Appends a candidate, live.
@@ -665,10 +822,11 @@ impl ProposalBuffer {
         self.live.resize(self.entries.len(), 1);
     }
 
-    /// Drops all candidates, keeping capacity.
+    /// Drops all candidates and segments, keeping capacity.
     pub fn clear(&mut self) {
         self.entries.clear();
         self.live.clear();
+        self.bounds.clear();
     }
 
     /// Current capacity in entries.
@@ -713,30 +871,36 @@ impl ProposalBuffer {
             .map(|(v, _)| v)
     }
 
-    /// The confirmable region from `base` onward: entry values paired with
-    /// their killable liveness words.
+    /// The confirmable region from `base` onward as a **single** segment:
+    /// entry values paired with their killable liveness words.
+    ///
+    /// This is the single-binding shape — what a row-at-a-time proposer
+    /// hands its siblings. Use
+    /// [`region_since`](ProposalBuffer::region_since) for the batched
+    /// shape.
     pub fn region(&mut self, base: usize) -> Candidates<'_> {
         Candidates {
             values: &self.entries[base..],
             live: &mut self.live[base..],
+            bounds: None,
+            base,
+            row0: 0,
         }
     }
 
-    /// Moves every entry of `other` (values and liveness together) onto
-    /// the end of this buffer, leaving `other` empty. Existing entries —
-    /// and therefore every index a binding holds into them — are
-    /// untouched.
-    pub fn append(&mut self, other: &mut ProposalBuffer) {
-        self.entries.append(&mut other.entries);
-        self.live.append(&mut other.live);
-    }
-
-    /// Splits off and returns the tail starting at `at` (values and
-    /// liveness together).
-    pub fn split_off(&mut self, at: usize) -> ProposalBuffer {
-        ProposalBuffer {
-            entries: self.entries.split_off(at),
-            live: self.live.split_off(at),
+    /// The confirmable region a batched proposer just appended: entries
+    /// from `base` onward, carved into the segments opened from
+    /// `segment_base` onward.
+    ///
+    /// Segment `s` of the result is frontier row `s`, which is what lets a
+    /// confirmer recover the parent binding each candidate belongs to.
+    pub fn region_since(&mut self, base: usize, segment_base: usize) -> Candidates<'_> {
+        Candidates {
+            values: &self.entries[base..],
+            live: &mut self.live[base..],
+            bounds: Some(&self.bounds[segment_base..]),
+            base,
+            row0: 0,
         }
     }
 
@@ -773,22 +937,93 @@ impl<'a> IntoIterator for &'a ProposalBuffer {
 }
 
 /// A confirmable view over one proposal region: entry values read-only,
-/// liveness killable — the argument of [`Constraint::confirm`].
+/// liveness killable — the argument of [`Constraint::confirm`] and
+/// [`Constraint::confirm_frontier`].
 ///
 /// Confirmers may only kill entries, never revive them, so any number of
 /// confirmers writing into the same region compute their conjunction —
 /// sequentially (each skipping already-dead entries) or in parallel over
 /// copies merged with [`and_words`]/[`or_words`]. Index `i` refers to
 /// `values()[i]`.
+///
+/// # Parent tags
+///
+/// A batched region holds the candidates of a whole [`Frontier`], so every
+/// candidate carries the parent binding it was proposed for. The tag is
+/// carried structurally, as segment boundaries rather than a word per
+/// entry: [`segments`](Candidates::segments) counts the runs,
+/// [`segment`](Candidates::segment) hands out one run at a time together
+/// with its frontier row, and [`parent_row`](Candidates::parent_row)
+/// answers the same question per entry for a confirmer that wants to work
+/// across segments (a device kernel building per-candidate probe ranges,
+/// say). Segment boundaries are `rows + 1` words for the whole region
+/// instead of one word per candidate, and they are what every in-tree
+/// confirmer actually wants — the parent binding is needed once per run,
+/// not once per value.
+///
+/// A single-segment region (the row-at-a-time shape) carries no bounds at
+/// all and reports one segment.
 pub struct Candidates<'a> {
     values: &'a [RawInline],
     live: &'a mut [u32],
+    /// Absolute segment starts, or `None` for a single-segment region.
+    bounds: Option<&'a [u32]>,
+    /// Absolute index of `values[0]`, so bounds can stay absolute.
+    base: usize,
+    /// Frontier row of this region's first segment.
+    row0: usize,
 }
 
 impl<'a> Candidates<'a> {
     /// The candidate values of this region.
     pub fn values(&self) -> &[RawInline] {
         self.values
+    }
+
+    /// Number of parent segments in this region (1 when it is a single
+    /// segment).
+    pub fn segments(&self) -> usize {
+        self.bounds.map_or(1, <[u32]>::len)
+    }
+
+    /// Segment `s` as its own single-segment region, together with the
+    /// [`Frontier`] row it was proposed for.
+    ///
+    /// Taking segments one at a time is how a row-at-a-time confirmer is
+    /// lifted to a batch — see the default
+    /// [`confirm_frontier`](Constraint::confirm_frontier).
+    pub fn segment(&mut self, s: usize) -> (usize, Candidates<'_>) {
+        let Some(bounds) = self.bounds else {
+            debug_assert_eq!(s, 0, "a single-segment region has only segment 0");
+            let row = self.row0;
+            return (row, self.reborrow());
+        };
+        let base = self.base;
+        let lo = bounds[s] as usize - base;
+        let hi = bounds
+            .get(s + 1)
+            .map_or(self.values.len(), |end| *end as usize - base);
+        let row = self.row0 + s;
+        (
+            row,
+            Candidates {
+                values: &self.values[lo..hi],
+                live: &mut self.live[lo..hi],
+                bounds: None,
+                base: base + lo,
+                row0: row,
+            },
+        )
+    }
+
+    /// The [`Frontier`] row entry `i` was proposed for.
+    pub fn parent_row(&self, i: usize) -> usize {
+        match self.bounds {
+            None => self.row0,
+            Some(bounds) => {
+                self.row0 + bounds.partition_point(|&start| (start as usize) <= self.base + i) - 1
+            }
+        }
     }
 
     /// Number of entries (live and dead) in this region.
@@ -834,6 +1069,9 @@ impl<'a> Candidates<'a> {
         Candidates {
             values: self.values,
             live: self.live,
+            bounds: self.bounds,
+            base: self.base,
+            row0: self.row0,
         }
     }
 
@@ -848,8 +1086,9 @@ impl<'a> Candidates<'a> {
         self.live.copy_from_slice(words);
     }
 
-    /// A detached scratch region over `words` with the same values —
-    /// used by OR-composition to collect per-variant verdicts.
+    /// A detached scratch region over `words` with the same values and
+    /// segmentation — used by OR-composition to collect per-variant
+    /// verdicts.
     pub fn scratch<'b>(&self, words: &'b mut [u32]) -> Candidates<'b>
     where
         'a: 'b,
@@ -857,6 +1096,9 @@ impl<'a> Candidates<'a> {
         Candidates {
             values: self.values,
             live: words,
+            bounds: self.bounds,
+            base: self.base,
+            row0: self.row0,
         }
     }
 }
@@ -904,6 +1146,31 @@ pub fn or_words(words: &mut [u32], other: &[u32]) {
 ///
 /// [`influence`](Constraint::influence) completes the picture by telling the
 /// engine which estimates to refresh when a variable is bound or unbound.
+///
+/// # Batching
+///
+/// The engine does not walk one binding at a time. It maintains a
+/// [`Frontier`] — a batch of up to [`FRONTIER_WIDTH`] parent bindings —
+/// and drives [`propose_frontier`](Constraint::propose_frontier) and
+/// [`confirm_frontier`](Constraint::confirm_frontier), which expand and
+/// filter the whole batch in one call.
+///
+/// Those two are *provided* methods. The obligation a data source takes on
+/// is still the single-binding pair [`propose`](Constraint::propose) and
+/// [`confirm`](Constraint::confirm), and the defaults lift them to a batch
+/// by walking rows and segments. That split is deliberate: it keeps the
+/// mandatory protocol at "iterate, and answer a point query", which is why
+/// a hash map, a PATCH, a succinct archive and a GPU-resident structure can
+/// all be sources. A batch-aware source (one that can ship a whole region
+/// to a device, or vectorise a probe across candidates) overrides the
+/// frontier methods and gets a region `W` segments wide to work on; a
+/// source that cannot loses nothing.
+///
+/// Note what is *not* required: no seek, no leapfrog, no
+/// resume-from-a-key. Requiring those would disqualify half the source
+/// types above. (Galloping intersection remains a deliberately deferred
+/// option, and it would be an *additional* capability, not a new
+/// obligation.)
 ///
 /// # Statelessness
 ///
@@ -958,32 +1225,31 @@ pub trait Constraint<'a> {
     /// Does nothing when `variable` is not constrained by this constraint.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer);
 
-    /// Chunked, resumable [`propose`](Constraint::propose): appends up to
-    /// `budget` further candidates for `variable`, advancing `cursor`, and
-    /// returns `true` while more may remain (`false` = exhausted, never call
-    /// again). Delivering a value twice across the calls of one enumeration
-    /// is a semantics error — it would inflate bag multiplicity — and every
-    /// call with nonzero budget must advance the cursor, so a caller looping
-    /// on refill always terminates.
+    /// Enumerates candidate values for `variable` for **every row** of
+    /// `frontier`, one segment per row.
     ///
-    /// The default delivers everything on the first call and reports
-    /// exhaustion. Sources with seekable enumerations override this to bound
-    /// time-to-first-result at wide levels; composites forward or compose it
-    /// (an intersection chunk-confirms each slice as it arrives).
-    fn propose_chunk(
+    /// The contract is exactly [`propose`](Constraint::propose) repeated
+    /// across a batch, and the default is that repetition: open row `r`'s
+    /// segment, propose for `frontier.row(r)`, in row order. Overriders
+    /// must keep that shape — exactly one
+    /// [`open_row`](ProposalBuffer::open_row) per frontier row, in order,
+    /// including for rows with no candidates — because the engine reads
+    /// the segments back as parent tags.
+    ///
+    /// Override this when a source can enumerate a batch of parents more
+    /// cheaply than one at a time. Delivering a value twice within one
+    /// row's segment is a semantics error: it would inflate bag
+    /// multiplicity.
+    fn propose_frontier(
         &self,
         variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
-        let _ = budget;
-        if !cursor.started {
-            cursor.started = true;
-            self.propose(variable, binding, proposals);
+    ) {
+        for row in 0..frontier.len() {
+            proposals.open_row();
+            self.propose(variable, &frontier.row(row), proposals);
         }
-        false
     }
 
     /// Kills [`Candidates`] entries whose values for `variable` violate
@@ -998,6 +1264,49 @@ pub trait Constraint<'a> {
     ///
     /// Does nothing when `variable` is not constrained by this constraint.
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>);
+
+    /// Kills entries of a **batched** region — one segment per row of
+    /// `frontier` — whose values violate this constraint under the parent
+    /// binding they were proposed for.
+    ///
+    /// The default walks the segments and calls
+    /// [`confirm`](Constraint::confirm) with each segment's own binding,
+    /// which is exactly the single-binding behaviour repeated. Override it
+    /// when the whole region can be judged at once (the GPU archive ships
+    /// a region to one kernel); the kill-only contract makes that safe —
+    /// however the verdicts are computed, merging them can only clear
+    /// liveness bits.
+    fn confirm_frontier(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
+        for s in 0..cands.segments() {
+            let (row, mut segment) = cands.segment(s);
+            self.confirm(variable, &frontier.row(row), &mut segment);
+        }
+    }
+
+    /// Estimate for `variable` aggregated over a sample of `frontier`'s
+    /// rows — the batch-level analogue of
+    /// [`estimate`](Constraint::estimate), and the number composites use
+    /// to pick a proposer for a whole batch.
+    ///
+    /// Returns `None` exactly when `estimate` does, i.e. when `variable` is
+    /// not one of this constraint's [`variables`](Constraint::variables).
+    /// That is a binding-independent property, which is what makes "which
+    /// children are relevant" a per-batch question rather than a per-row
+    /// one.
+    fn frontier_estimate(&self, variable: VariableId, frontier: &Frontier<'_>) -> Option<usize> {
+        let mut total: usize = 0;
+        let mut sampled = false;
+        for row in frontier.sample() {
+            total = total.saturating_add(self.estimate(variable, &frontier.row(row))?);
+            sampled = true;
+        }
+        sampled.then_some(total)
+    }
 
     /// Returns whether this constraint is consistent with the current
     /// `binding`.
@@ -1052,21 +1361,34 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.propose(variable, binding, proposals)
     }
 
-    fn propose_chunk(
+    fn propose_frontier(
         &self,
         variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
+    ) {
         let inner: &T = self;
-        inner.propose_chunk(variable, binding, cursor, budget, proposals)
+        inner.propose_frontier(variable, frontier, proposals)
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         let inner: &T = self;
         inner.confirm(variable, binding, cands)
+    }
+
+    fn confirm_frontier(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
+        let inner: &T = self;
+        inner.confirm_frontier(variable, frontier, cands)
+    }
+
+    fn frontier_estimate(&self, variable: VariableId, frontier: &Frontier<'_>) -> Option<usize> {
+        let inner: &T = self;
+        inner.frontier_estimate(variable, frontier)
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
@@ -1096,21 +1418,34 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.propose(variable, binding, proposals)
     }
 
-    fn propose_chunk(
+    fn propose_frontier(
         &self,
         variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
+    ) {
         let inner: &T = self;
-        inner.propose_chunk(variable, binding, cursor, budget, proposals)
+        inner.propose_frontier(variable, frontier, proposals)
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         let inner: &T = self;
         inner.confirm(variable, binding, cands)
+    }
+
+    fn confirm_frontier(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
+        let inner: &T = self;
+        inner.confirm_frontier(variable, frontier, cands)
+    }
+
+    fn frontier_estimate(&self, variable: VariableId, frontier: &Frontier<'_>) -> Option<usize> {
+        let inner: &T = self;
+        inner.frontier_estimate(variable, frontier)
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
@@ -1121,47 +1456,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn influence(&self, variable: VariableId) -> VariableSet {
         let inner: &T = self;
         inner.influence(variable)
-    }
-}
-
-/// Per-variable enumeration state for one search level: the materialized
-/// candidates, the resume cursor for the unmaterialized tail, whether more
-/// may remain, and the next chunk budget. Slots are reused across sibling
-/// levels for their buffer capacity, exactly as the plain buffers were.
-#[derive(Clone, Debug)]
-struct LevelValues {
-    buffer: ProposalBuffer,
-    /// Consumption position: entries before it are consumed, live entries at
-    /// or after it are pending. Dead entries are skipped, never moved.
-    pos: usize,
-    cursor: ProposeCursor,
-    more: bool,
-    widen: usize,
-}
-
-impl LevelValues {
-    /// An empty level, const-constructible so the empty [`Binding`] can
-    /// borrow a `static` array of them.
-    const fn empty() -> Self {
-        LevelValues {
-            buffer: ProposalBuffer {
-                entries: Vec::new(),
-                live: Vec::new(),
-            },
-            pos: 0,
-            cursor: ProposeCursor {
-                started: false,
-                key: [0; 32],
-            },
-            more: false,
-            widen: INITIAL_CHUNK,
-        }
-    }
-}
-
-impl Default for LevelValues {
-    fn default() -> Self {
-        Self::empty()
     }
 }
 
@@ -1188,8 +1482,26 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     influences: [VariableSet; 128],
     estimates: [usize; 128],
     touched_variables: VariableSet,
-    stack: ArrayVec<VariableId, 128>,
+    stack: ArrayVec<Level, 128>,
     unbound: ArrayVec<VariableId, 128>,
+    /// Row cursor while the deepest batch is being emitted.
+    emit: usize,
+    /// Reusable scratch for the entry indexes of one drawn batch.
+    drawn: Vec<u32>,
+}
+
+/// One search level: the variable it binds, how far its candidate buffer
+/// has been drawn into batches, and how wide the next batch may be.
+///
+/// The buffer itself lives in the [`BindingStore`] (keyed by variable, not
+/// by depth) because that is what a [`Binding`]'s indexes resolve through.
+#[derive(Clone, Debug)]
+struct Level {
+    variable: VariableId,
+    /// Entries before this position have been drawn into a batch already.
+    pos: usize,
+    /// Width of the next batch drawn here.
+    width: usize,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -1211,20 +1523,36 @@ where
             touched_variables: self.touched_variables,
             stack: self.stack.clone(),
             unbound: self.unbound.clone(),
+            emit: self.emit,
+            drawn: Vec::new(),
         }
     }
 }
 
 impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> {
-    /// Picks the next unbound variable, refreshes estimates touched by
-    /// the most recent binding, re-sorts `unbound`, pushes the chosen
-    /// variable onto the stack, and fills its proposal vector via
-    /// [`Constraint::propose`]. Leaves `mode = NextValue`. The caller is
-    /// responsible for ensuring `unbound` is non-empty.
+    /// Picks the next unbound variable, refreshes the estimates the last
+    /// batch change invalidated, re-sorts `unbound`, pushes a level, and
+    /// proposes for the **whole current batch** via
+    /// [`Constraint::propose_frontier`]. Leaves `mode = Draw`. The caller
+    /// is responsible for ensuring `unbound` is non-empty.
     ///
-    /// Shared between [`Iterator::next`]'s `NextVariable` branch and the
-    /// [`UnindexedProducer::split`](crate::query::QueryParIter) implementation
-    /// — the "push + propose" dance is identical in both.
+    /// The next variable is chosen **once per batch**, not once per row.
+    /// That is licensed by how coarse the ordering key is: variables are
+    /// ranked by `ilog2(estimate) + 1`, so two rows disagree about the next
+    /// variable only when their estimates fall in different powers of two.
+    /// Sibling rows under one parent are normally within a factor of two of
+    /// each other, so they agree by construction; genuine disagreement
+    /// needs genuine skew (a hub row against uniform rows), not ordinary
+    /// variation. The coarse key was originally chosen for cheapness, and
+    /// it turns out to buy robustness under a design change it predates —
+    /// worth knowing before anyone "improves" it into an exact-cardinality
+    /// comparison, which would make sibling rows disagree constantly and
+    /// force the frontier to be fragmented by shape.
+    ///
+    /// If that ever does become the bottleneck, the seam is right here:
+    /// sample the batch, and when no bucket holds a large majority,
+    /// partition the frontier by bucket and expand the parts separately.
+    /// Deliberately not built — it is the escape hatch, not the design.
     fn push_next_variable(&mut self) {
         let mut stale_estimates = VariableSet::new_empty();
         while let Some(variable) = self.touched_variables.drain_next_ascending() {
@@ -1235,10 +1563,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 
         if !stale_estimates.is_empty() {
             while let Some(v) = stale_estimates.drain_next_ascending() {
-                self.estimates[v] = self
-                    .constraint
-                    .estimate(v, &self.bindings.view())
-                    .expect("unconstrained variable in query");
+                self.estimates[v] = self.batch_estimate(v);
             }
             self.unbound.sort_unstable_by_key(|v| {
                 (
@@ -1254,26 +1579,130 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         }
 
         let variable = self.unbound.pop().expect("non-empty unbound");
-        let estimate = self.estimates[variable];
-        self.stack.push(variable);
-        let constraint = &self.constraint;
-        self.bindings.refill(
+        self.stack.push(Level {
             variable,
-            estimate.min(INITIAL_CHUNK),
-            |binding, cursor, budget, proposals| {
-                constraint.propose_chunk(variable, binding, cursor, budget, proposals)
-            },
-        );
+            pos: 0,
+            width: INITIAL_FRONTIER_WIDTH,
+        });
+        let constraint = &self.constraint;
+        self.bindings.refill(variable, |frontier, proposals| {
+            constraint.propose_frontier(variable, frontier, proposals)
+        });
+        self.mode = Search::Draw;
     }
 
-    /// Requests the next geometric chunk for `variable`'s level. Returns
-    /// whether the level may still produce more after this call.
-    fn widen_level(&mut self, variable: VariableId) -> bool {
-        let constraint = &self.constraint;
-        self.bindings
-            .widen(variable, |binding, cursor, budget, proposals| {
-                constraint.propose_chunk(variable, binding, cursor, budget, proposals)
-            })
+    /// One estimate for `variable` over the whole current batch: the
+    /// **modal power-of-two bucket** across a sample of rows.
+    ///
+    /// The mode rather than the mean or the sum, because the number is only
+    /// ever consumed through `ilog2`: what the ordering needs is the bucket
+    /// the typical row sits in, and a mean would let one hub row drag the
+    /// whole batch's ordering with it. Returned as a representative
+    /// estimate from that bucket so the value keeps its usual meaning.
+    fn batch_estimate(&self, variable: VariableId) -> usize {
+        let frontier = self.bindings.frontier();
+        // Bucket 0 is "estimate 0"; buckets are ilog2(e) + 1 thereafter, so
+        // 65 buckets cover every usize.
+        let mut counts = [0usize; 65];
+        let mut representative = [0usize; 65];
+        let mut sampled = false;
+        for row in frontier.sample() {
+            let estimate = self
+                .constraint
+                .estimate(variable, &frontier.row(row))
+                .expect("unconstrained variable in query");
+            let bucket = estimate
+                .checked_ilog2()
+                .map(|magnitude| magnitude as usize + 1)
+                .unwrap_or(0);
+            counts[bucket] += 1;
+            representative[bucket] = representative[bucket].max(estimate);
+            sampled = true;
+        }
+        if !sampled {
+            return 0;
+        }
+        let modal = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(bucket, count)| (**count, Reverse(*bucket)))
+            .map(|(bucket, _)| bucket)
+            .expect("non-empty bucket table");
+        representative[modal]
+    }
+
+    /// Draws the next batch of live candidates at the top level and
+    /// descends into it. Leaves `mode = Expand` on success and
+    /// `mode = Pop` when the level's buffer is spent.
+    fn draw_batch(&mut self) {
+        let level = self.stack.last().expect("non-empty stack");
+        let (variable, from, width) = (level.variable, level.pos, level.width);
+        let mut drawn = std::mem::take(&mut self.drawn);
+        drawn.clear();
+        let pos = self.bindings.draw(variable, from, width, &mut drawn);
+        let level = self.stack.last_mut().expect("non-empty stack");
+        level.pos = pos;
+        level.width = width.saturating_mul(FRONTIER_RAMP).min(FRONTIER_WIDTH);
+        if drawn.is_empty() {
+            self.mode = Search::Pop;
+        } else {
+            self.bindings.push_frontier(variable, &drawn);
+            self.touched_variables.set(variable);
+            self.mode = Search::Expand;
+        }
+        self.drawn = drawn;
+    }
+
+    /// Returns to the parent batch after the current one is exhausted, and
+    /// asks its level for the next batch.
+    fn retreat(&mut self) {
+        match self.stack.last() {
+            Some(level) => {
+                let variable = level.variable;
+                self.bindings.pop_frontier(variable);
+                self.touched_variables.set(variable);
+                self.mode = Search::Draw;
+            }
+            None => self.mode = Search::Done,
+        }
+    }
+
+    /// Abandons the top level (its buffer is spent) and hands control back
+    /// to the level above.
+    fn pop_level(&mut self) {
+        match self.stack.pop() {
+            Some(level) => {
+                self.unbound.push(level.variable);
+                // Restore the estimates of everything this level influenced
+                // to their pre-binding state.
+                self.touched_variables.set(level.variable);
+                if self.stack.is_empty() {
+                    self.mode = Search::Done;
+                } else {
+                    self.mode = Search::Retreat;
+                }
+            }
+            None => self.mode = Search::Done,
+        }
+    }
+
+    /// Whether any level still holds candidates that have not been drawn
+    /// into a batch.
+    #[cfg(feature = "parallel")]
+    fn has_undrawn(&self) -> bool {
+        self.stack
+            .iter()
+            .any(|level| level.pos < self.bindings.level_len(level.variable))
+    }
+
+    /// Marks every level's candidates as fully drawn — the left half of a
+    /// split explores only the batch it is holding, because the right half
+    /// has taken ownership of every undrawn candidate above it.
+    #[cfg(feature = "parallel")]
+    fn seal_levels(&mut self) {
+        for level in self.stack.iter_mut() {
+            level.pos = self.bindings.level_len(level.variable);
+        }
     }
 
     /// Create a new query.
@@ -1292,7 +1721,15 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                 VariableSet::new_empty()
             }
         });
-        let bindings = BindingStore::new();
+        // Index rows only need a slot per variable the query actually
+        // mentions. At `FRONTIER_WIDTH` rows that is the difference between
+        // a 0.5 MiB batch for a four-variable query and an 8 MiB one.
+        let stride = variables
+            .into_iter()
+            .max()
+            .map(|highest| highest + 1)
+            .unwrap_or(1);
+        let bindings = BindingStore::with_stride(stride);
         let estimates = std::array::from_fn(|v| {
             if variables.is_set(v) {
                 constraint
@@ -1324,7 +1761,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         // subtree; constraints with unbound variables answer an optimistic
         // `true` here and are validated by the search as usual.
         let mode = if constraint.satisfied(&bindings.view()) {
-            Search::NextVariable
+            Search::Expand
         } else {
             Search::Done
         };
@@ -1339,24 +1776,43 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             touched_variables: VariableSet::new_empty(),
             stack: ArrayVec::new(),
             unbound,
+            emit: 0,
+            drawn: Vec::new(),
         }
     }
 }
 
 /// The search mode of the query engine.
-/// The query engine uses a depth-first search to find solutions to the query,
-/// proposing values for the variables and backtracking when it reaches a dead end.
-/// The search mode is used to keep track of the current state of the search.
-/// The search mode can be one of the following:
-/// - `NextVariable` - The query engine is looking for the next variable to assign a value to.
-/// - `NextValue` - The query engine is looking for the next value to assign to a variable.
-/// - `Backtrack` - The query engine is backtracking to try a different value for a variable.
-/// - `Done` - The query engine has finished the search and there are no more results.
+///
+/// The engine is still a depth-first search; what changed is the unit of
+/// descent. Instead of binding one value and recursing, it draws a *batch*
+/// of up to [`FRONTIER_WIDTH`] candidates and expands all of them together,
+/// so each level's propose/confirm sees a region as wide as the batch.
+///
+/// - `Expand` — a batch is current; choose the next variable and propose
+///   for every one of its rows.
+/// - `Draw` — a level's candidates are materialised; take the next batch of
+///   live ones and descend into it.
+/// - `Emit` — every variable is bound; the current batch *is* a block of
+///   results, yielded one row at a time.
+/// - `Retreat` — the current batch is finished; drop it and ask its level
+///   for the next one.
+/// - `Pop` — a level's candidates are spent; abandon it.
+/// - `Done` — the search is over.
+///
+/// Bag semantics are unchanged and are what the batching has to preserve:
+/// one row per complete binding, no deduplication. Every candidate is drawn
+/// into exactly one batch (`pos` only moves forward) and every batch row
+/// becomes exactly one emitted row, so batching partitions the same result
+/// multiset the one-at-a-time search produced. Only the *order* differs,
+/// which the engine has never promised.
 #[derive(Copy, Clone, Debug)]
 enum Search {
-    NextVariable,
-    NextValue,
-    Backtrack,
+    Expand,
+    Draw,
+    Emit,
+    Retreat,
+    Pop,
     Done,
 }
 
@@ -1365,71 +1821,41 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Qu
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match &self.mode {
-                Search::NextVariable => {
-                    self.mode = Search::NextValue;
+            match self.mode {
+                Search::Expand => {
                     if self.unbound.is_empty() {
-                        if let Some(result) = (self.postprocessing)(&self.bindings.view()) {
-                            return Some(result);
-                        }
-                        // Post-processing rejected this binding; continue
-                        // searching (mode is already NextValue).
+                        self.emit = 0;
+                        self.mode = Search::Emit;
                         continue;
                     }
                     self.push_next_variable();
                 }
-                Search::NextValue => {
-                    if let Some(&variable) = self.stack.last() {
-                        if self.bindings.advance(variable) {
-                            self.touched_variables.set(variable);
-                            self.mode = Search::NextVariable;
-                        } else if self.bindings.more(variable) {
-                            // Materialized candidates ran dry but the source
-                            // has (or may have) more: request the next
-                            // geometric chunk and re-enter this arm.
-                            self.widen_level(variable);
-                        } else {
-                            self.mode = Search::Backtrack;
+                Search::Draw => self.draw_batch(),
+                Search::Emit => {
+                    let frontier = self.bindings.frontier();
+                    while self.emit < frontier.len() {
+                        let row = frontier.row(self.emit);
+                        self.emit += 1;
+                        if let Some(result) = (self.postprocessing)(&row) {
+                            return Some(result);
                         }
-                    } else {
-                        self.mode = Search::Done;
-                        return None;
+                        // Post-processing rejected this row; try the next.
                     }
+                    self.mode = Search::Retreat;
                 }
-                Search::Backtrack => {
-                    if let Some(variable) = self.stack.pop() {
-                        self.bindings.unset(variable);
-                        // Note that we did not update estiamtes for the unbound variables
-                        // as we are backtracking, so the estimates are still valid.
-                        // Since we choose this variable before, we know that it would
-                        // still go last in the unbound list.
-                        self.unbound.push(variable);
-
-                        // However, we need to update the touched variables,
-                        // as we are backtracking and the variable is no longer bound.
-                        // We're essentially restoring the estimate of the touched variables
-                        // to the state before we bound this variable.
-                        self.touched_variables.set(variable);
-                        self.mode = Search::NextValue;
-                    } else {
-                        self.mode = Search::Done;
-                        return None;
-                    }
-                }
-                Search::Done => {
-                    return None;
-                }
+                Search::Retreat => self.retreat(),
+                Search::Pop => self.pop_level(),
+                Search::Done => return None,
             }
         }
     }
 }
-
 impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for Query<C, P, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Query")
             .field("constraint", &std::any::type_name::<C>())
             .field("mode", &self.mode)
-            .field("binding", &self.bindings.view())
+            .field("frontier", &self.bindings.frontier())
             .field("stack", &self.stack)
             .field("unbound", &self.unbound)
             .finish()
@@ -1447,12 +1873,21 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 //
 // Usage: `find!(...).into_par_iter().map(...).collect::<Vec<_>>()`.
 //
-// The producer's `split` uses the "split-or-descend" rule: while the current
-// top-of-stack has a single remaining proposal, bind it and descend one level;
-// when the top has ≥2 remaining, bisect them between two sub-queries. This
-// keeps the invariant that every non-top stack level has zero remaining
-// proposals, so backtracking out of a sub-search unwinds cleanly to done
-// without any re-enumeration across clones.
+// The producer's `split` divides a FRONTIER. It first settles the state
+// machine onto a batch (descending through levels whose batch is too
+// narrow to divide), then either bisects that batch's rows between two
+// sub-queries, or — when the batch is a single row — hands the right half
+// every level's *undrawn* candidates and seals the left half so it
+// explores only the batch it is holding. Either way the two halves
+// partition the remaining search exactly: no candidate is drawn twice and
+// none is dropped.
+//
+// Bindings are indexes into the level buffers, and a split does not
+// disturb them. `Query::clone` copies those buffers element for element,
+// so a row's indexes resolve to the same values in either half; splitting
+// partitions ROWS and never re-indexes an entry. (The one-at-a-time
+// splitter had to bisect a level's buffer and re-base the tail, which is
+// why it needed a matching `unset`.)
 //
 // `fold_with` is the terminal leaf: it just drives the existing sequential
 // `Iterator::next()` and feeds results into the folder. No duplicated
@@ -1495,6 +1930,24 @@ mod parallel {
         split_budget: usize,
     }
 
+    impl<C, P: Fn(&Binding<'_>) -> Option<R>, R> QueryParIter<C, P, R> {
+        /// Splits the remaining split budget between this producer and
+        /// `right`, and packages the pair rayon expects.
+        fn hand_off(mut self, right: Query<C, P, R>) -> (Self, Option<Self>) {
+            self.split_budget -= 1;
+            let left_budget = self.split_budget / 2;
+            let right_budget = self.split_budget - left_budget;
+            self.split_budget = left_budget;
+            (
+                self,
+                Some(QueryParIter {
+                    inner: Box::new(right),
+                    split_budget: right_budget,
+                }),
+            )
+        }
+    }
+
     impl<'a, C, P, R> IntoParallelIterator for Query<C, P, R>
     where
         C: Constraint<'a> + Clone + Send + 'a,
@@ -1527,114 +1980,77 @@ mod parallel {
     {
         type Item = R;
 
-        /// Advance the Query's state machine until either the current
-        /// top-of-stack has ≥2 remaining proposals (bisect, return a
-        /// right half) or the sub-query is exhausted (return `None`,
-        /// leaving `self` as a leaf that `fold_with` will fold
-        /// sequentially). Single-value levels are descended through —
-        /// see the module doc comment for why this preserves correctness
-        /// without re-enumeration.
+        /// Settle the state machine onto a batch, then divide it.
+        ///
+        /// Returns a right half whenever the remaining search can be cut in
+        /// two, and `(self, None)` when it cannot — leaving `self` as a leaf
+        /// that `fold_with` folds sequentially.
         fn split(mut self) -> (Self, Option<Self>) {
             if self.split_budget == 0 {
                 return (self, None);
             }
-            self.split_budget -= 1;
             let q = &mut *self.inner;
             loop {
-                // Advance the state machine until we're in NextValue with
-                // a populated top — the only state where split-or-descend
-                // makes sense.
-                while !matches!(q.mode, Search::NextValue) {
-                    match q.mode {
-                        Search::NextVariable => {
-                            q.mode = Search::NextValue;
-                            if q.unbound.is_empty() {
-                                // All variables bound. Leaf — fold_with
-                                // will drive sequential `next()` to yield
-                                // the one postprocessed result.
-                                q.mode = Search::NextVariable;
-                                return (self, None);
-                            }
-                            q.push_next_variable();
-                        }
-                        Search::Backtrack => {
-                            if let Some(variable) = q.stack.pop() {
-                                q.bindings.unset(variable);
-                                q.unbound.push(variable);
-                                q.touched_variables.set(variable);
-                                q.mode = Search::NextValue;
-                            } else {
-                                q.mode = Search::Done;
-                                return (self, None);
-                            }
-                        }
-                        Search::Done => return (self, None),
-                        Search::NextValue => unreachable!(),
+                // Settle onto a batch: `Expand` and `Emit` are the two modes
+                // where the deepest frontier IS the live batch. The others
+                // are transitions, and stepping through them is ordinary
+                // search work that has to happen anyway.
+                match q.mode {
+                    Search::Draw => {
+                        q.draw_batch();
+                        continue;
                     }
+                    Search::Retreat => {
+                        q.retreat();
+                        continue;
+                    }
+                    Search::Pop => {
+                        q.pop_level();
+                        continue;
+                    }
+                    Search::Done => return (self, None),
+                    Search::Expand | Search::Emit => {}
                 }
 
-                // mode == NextValue. Inspect top-of-stack's remaining
-                // proposals. With chunked proposing, "single remaining
-                // value" only licenses a descend when the level is also
-                // exhausted — descending through a level with a live
-                // cursor would clone that cursor into the right half at a
-                // later bisect and double-enumerate its tail. Non-exhausted
-                // levels are bisected instead: the right half takes the
-                // materialized candidates (marked exhausted), the left
-                // half keeps the cursor.
-                let Some(&top) = q.stack.last() else {
-                    return (self, None);
+                // Rows already emitted from this batch must stay with the
+                // left half.
+                let from = if matches!(q.mode, Search::Emit) {
+                    q.emit
+                } else {
+                    0
                 };
-                let (top_live, top_more) = (q.bindings.pending(top), q.bindings.more(top));
-                match (top_live, top_more) {
-                    (0, false) => q.mode = Search::Backtrack,
-                    (0, true) => {
-                        // Nothing pending but the source has more:
-                        // pull the next chunk, then re-inspect.
-                        q.widen_level(top);
-                    }
-                    (1, false) => {
-                        // Descend: consume the single pending value, bind
-                        // it, transition to NextVariable so the outer loop
-                        // runs propose.
-                        let advanced = q.bindings.advance(top);
-                        debug_assert!(advanced, "a pending candidate must bind");
-                        q.touched_variables.set(top);
-                        q.mode = Search::NextVariable;
-                    }
-                    _ => {
-                        // Bisect the materialized proposals; clone the
-                        // rest of the query state into the right half.
-                        // Clone cost is one ~11 KB arraycopy per
-                        // rayon-requested split — rayon only asks under
-                        // stealing pressure. The right half never drives
-                        // the cursor (its slice is fixed); the left half
-                        // retains it, so every unmaterialized candidate
-                        // still has exactly one owner.
-                        //
-                        // Bindings are indexes into the level buffers, so
-                        // the halves' coordinate systems matter here. The
-                        // left half keeps entries [0..mid) and every
-                        // consumed entry sits below `pos <= mid`, so its
-                        // indexes still resolve to the same values. The
-                        // right half's buffer re-indexes from zero, which
-                        // is why `install` unbinds `top` there — it is
-                        // about to be re-bound out of the tail anyway.
-                        let right_level = q.bindings.bisect(top);
-                        let mut right = q.clone();
-                        right.bindings.install(top, right_level);
 
-                        let left_budget = self.split_budget / 2;
-                        let right_budget = self.split_budget - left_budget;
-                        self.split_budget = left_budget;
-                        return (
-                            self,
-                            Some(QueryParIter {
-                                inner: Box::new(right),
-                                split_budget: right_budget,
-                            }),
-                        );
-                    }
+                // Preferred cut: halve the live batch. Both halves keep
+                // element-wise identical level buffers, so the tail rows'
+                // indexes resolve unchanged — only rows move.
+                if let Some(tail) = q.bindings.split_frontier(from) {
+                    let mut right = q.clone();
+                    right.bindings.set_frontier(tail);
+                    right.emit = 0;
+                    // The left half explores only the rows it kept.
+                    q.seal_levels();
+                    return self.hand_off(right);
+                }
+
+                // Fallback cut: the batch is one row, but levels above may
+                // still hold undrawn candidates. Give those to the right
+                // half and let the left finish the single row it holds.
+                if q.has_undrawn() {
+                    let mut right = q.clone();
+                    // The right half owns no part of the current batch; it
+                    // retreats straight into the next one.
+                    right.bindings.set_frontier(Vec::new());
+                    right.emit = 0;
+                    right.mode = Search::Retreat;
+                    q.seal_levels();
+                    return self.hand_off(right);
+                }
+
+                // Nothing to divide here. Descend if there is anywhere to
+                // descend to, otherwise this producer is a leaf.
+                match q.mode {
+                    Search::Expand if !q.unbound.is_empty() => q.push_next_variable(),
+                    _ => return (self, None),
                 }
             }
         }
