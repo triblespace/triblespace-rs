@@ -58,12 +58,14 @@ const BLOCK_PREVIOUS: RawId = [
 ];
 const RUNGS: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
-// These defaults admit the known 3,375-vertex rung 32, should admit rung 64
-// if its historical growth continues, and stop before the projected ~30k
-// vertex rung 128. They can be raised deliberately on a larger machine.
+// These defaults admit the measured 12,170-vertex rung 64 and stop before the
+// next steep growth. At the vertex cap, even an adversarially full forward and
+// reverse endpoint CSR would retain about 1.26 GiB of u32 values; the measured
+// rung 64 is far smaller. The limits can be raised deliberately on a larger
+// machine.
 const DEFAULT_MAX_RUNG: usize = 128;
 const DEFAULT_MAX_EDGES: usize = 20_000;
-const DEFAULT_MAX_VERTICES: usize = 12_000;
+const DEFAULT_MAX_VERTICES: usize = 13_000;
 const DEFAULT_MAX_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
