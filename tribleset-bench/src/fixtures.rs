@@ -45,7 +45,7 @@ use subject::core::prelude::*;
 // hand-written `Constraint` wrapper, F12's programmatic chain, and F13's
 // hand-rolled variable context.
 use subject::core::query::{
-    Binding, Constraint, ProposalBuffer, ProposeCursor, VariableContext, VariableId, VariableSet,
+    Binding, Constraint, ProposalBuffer, VariableContext, VariableId, VariableSet,
 };
 // `Candidates` is the post-owned-mask confirm region; only F11's hand-written
 // Constraint impl names it, and it does not exist on older subjects.
@@ -1011,19 +1011,14 @@ pub fn f9_total(set: &TribleSet) -> usize {
 // which is the property routing may never change. Timings across the
 // boundary are the interesting signal but are not a gate.
 //
-// !!! SIZING CAVEAT, to be revisited when leaf sources gain
-// `propose_chunk` overrides (see F14). Today no source overrides it, so
-// the default ships a whole level in one call and the confirm region
-// `IntersectionConstraint` hands its siblings IS the level size — which
-// is why a level of `F10_BELOW` / `F10_ABOVE` candidates straddles the
-// threshold exactly. Once sources chunk, the regions become the engine's
-// geometric budgets (`INITIAL_CHUNK` 64, then x`WIDEN_FACTOR`: 256,
-// 1024, 4096, 16384, ...), and a level only produces a full
-// 16384-entry region once it exceeds 64 + 256 + 1024 + 4096 = 5440
-// candidates *plus* the threshold, i.e. 21 824. At that point these two
-// levels would BOTH sit below the routing boundary and the fixture would
-// silently stop straddling anything: re-derive `F10_BELOW` /
-// `F10_ABOVE` from the chunk schedule rather than from the level size.
+// SIZING NOTE. A level is proposed in ONE call — the resumable-narrowing
+// path that would have fragmented it into geometric chunks is gone — so
+// the confirm region `IntersectionConstraint` hands its siblings IS the
+// level size, and a level of `F10_BELOW` / `F10_ABOVE` candidates
+// straddles the routing threshold exactly. Both queries here have a
+// single variable, so the frontier is the root's one row and the region
+// is one segment wide; with a wider frontier a region is the SUM over the
+// batch's rows, which only ever pushes it further above the threshold.
 // ---------------------------------------------------------------------------
 
 /// F10: the routing threshold, read from the engine so this fixture
@@ -1145,18 +1140,6 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for LyingEstimate<C> {
 
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         self.inner.propose(variable, binding, proposals)
-    }
-
-    fn propose_chunk(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
-        proposals: &mut ProposalBuffer,
-    ) -> bool {
-        self.inner
-            .propose_chunk(variable, binding, cursor, budget, proposals)
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
@@ -1471,17 +1454,19 @@ pub fn f13_total(set: &TribleSet) -> usize {
 //
 // INTERROGATES: time-to-first-result at a very wide level.
 //
-// The engine already has the machinery for lazy proposing —
-// `propose_chunk`, `ProposeCursor`, `INITIAL_CHUNK` = 64 and a x4
-// geometric widen — but no leaf SOURCE overrides `propose_chunk` yet, so
-// the default ships the entire level on the first call and TTFR at a
-// wide level costs a full enumeration. This is THE fixture that will
-// measure that when sources gain overrides: the survivors are minted
-// with order byte 0x00 so they sort FIRST in the proposer's value order,
-// which means a chunked proposer could answer from its first 64-entry
-// chunk while an eager one must materialize and mask all
-// `F14_REGION` candidates first. `ttfr` and `total` are recorded
-// separately precisely so that gap becomes visible when it opens.
+// A level is proposed in one call, so TTFR at a wide level costs a full
+// enumeration of that level: the survivors are minted with order byte
+// 0x00 so they sort FIRST in the proposer's value order, and an eager
+// proposer must still materialize and mask all `F14_REGION` candidates
+// before yielding the first of them. `ttfr` and `total` stay recorded
+// separately so that gap remains visible.
+//
+// What bounds TTFR in the batched engine is the FRONTIER ramp, not a
+// chunked proposer: the first batch at every level is one row, so a query
+// stopped after one row does exactly the work the one-at-a-time search
+// did. That is a property of the search order, and this single-variable
+// fixture — whose root level is one batch of one row either way — is
+// deliberately insensitive to it.
 //
 // As in F9, both sides carry identical cardinality so the selectivity
 // cannot be laundered into the plan.

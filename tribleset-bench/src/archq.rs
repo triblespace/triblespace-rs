@@ -51,7 +51,7 @@ use subject::core::prelude::BlobStore;
 use subject::core::prelude::TribleSet;
 #[cfg(feature = "protocol-v2")]
 use subject::core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, Term, VariableId, VariableSet,
+    Binding, Candidates, Constraint, ProposalBuffer, Term, VariableId, VariableSet,
 };
 use subject::core::query::TriblePattern;
 
@@ -364,18 +364,6 @@ where
 
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         self.inner.propose(variable, binding, proposals)
-    }
-
-    fn propose_chunk(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
-        proposals: &mut ProposalBuffer,
-    ) -> bool {
-        self.inner
-            .propose_chunk(variable, binding, cursor, budget, proposals)
     }
 
     /// Records the region's LIVE count, then confirms exactly as the
