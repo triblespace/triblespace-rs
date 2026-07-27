@@ -144,12 +144,18 @@ struct TelemetrySpanData {
 #[derive(Default)]
 struct FieldCapture {
     source: Option<String>,
+    name: Option<String>,
 }
 
 impl tracing::field::Visit for FieldCapture {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         match field.name() {
             "source" if !value.is_empty() => self.source = Some(value.to_string()),
+            // A recorded `name` field overrides the span's static metadata
+            // name — tracing span names are compile-time constants, so
+            // dynamic workload names (one span per query, per fixture, per
+            // imported file, …) ride in as a field by convention.
+            "name" if !value.is_empty() => self.name = Some(value.to_string()),
             _ => {}
         }
     }
@@ -255,7 +261,7 @@ where
             parent,
             start_ns,
             category,
-            meta.name(),
+            fields.name.as_deref().unwrap_or(meta.name()),
             fields.source,
         );
     }
@@ -298,6 +304,12 @@ impl Telemetry {
     /// This does **not** install a tracing subscriber. Embed the returned layer into your
     /// application's subscriber, and keep the returned [`Telemetry`] guard alive to
     /// flush and close the sink on shutdown.
+    /// The id of this sink's session entity — callers may attach further
+    /// facts to it (a bench run's commit hash, an importer's source path).
+    pub fn session_id(&self) -> Id {
+        self.inner.session
+    }
+
     pub fn layer_from_env(session_name: &str) -> Option<(TelemetryLayer, Self)> {
         let pile_path = std::env::var(ENV_TELEMETRY_PILE)
             .ok()
