@@ -143,7 +143,3 @@ harness = false
 name = "portable_bench_lsm"
 harness = false
 
-[[bench]]
-name = "suite"
-path = "benches/suite/main.rs"
-harness = false
