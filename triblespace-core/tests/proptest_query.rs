@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
-    Binding, BindingStore, Candidates, Constraint, ContainsConstraint, ProposalBuffer, ProposeCursor, TriblePattern, Variable, VariableContext,
+    Binding, BindingStore, Candidates, Constraint, ContainsConstraint, ProposalBuffer, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -822,15 +822,17 @@ proptest! {
 
 }
 
-/// Test-only constraint that delivers a fixed sorted value set in cursor-
-/// resumable chunks — exercises the widening path end to end (the library
-/// sources all default to one-shot delivery today).
-struct ChunkedValues {
+/// Test-only constraint that delivers a fixed sorted value set for one
+/// variable, and records how wide the regions its `confirm_frontier` sees
+/// are — the property the batched protocol exists to produce.
+struct WideValues {
     variable: usize,
     values: Vec<[u8; 32]>,
+    /// One entry per `confirm_frontier` call: (segments, entries).
+    regions: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
 }
 
-impl<'a> Constraint<'a> for ChunkedValues {
+impl<'a> Constraint<'a> for WideValues {
     fn variables(&self) -> triblespace_core::query::VariableSet {
         let mut set = triblespace_core::query::VariableSet::new_empty();
         set.set(self.variable);
@@ -841,32 +843,10 @@ impl<'a> Constraint<'a> for ChunkedValues {
         (variable == self.variable).then_some(self.values.len())
     }
 
-    fn propose(&self, variable: usize, binding: &Binding, proposals: &mut ProposalBuffer) {
-        let mut cursor = ProposeCursor::default();
-        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
-    }
-
-    fn propose_chunk(
-        &self,
-        variable: usize,
-        _binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
-        proposals: &mut ProposalBuffer,
-    ) -> bool {
-        if variable != self.variable {
-            return false;
+    fn propose(&self, variable: usize, _binding: &Binding, proposals: &mut ProposalBuffer) {
+        if variable == self.variable {
+            proposals.extend_from_slice(&self.values);
         }
-        let mut delivered = u64::from_le_bytes(cursor.key[0..8].try_into().unwrap()) as usize;
-        if !cursor.started {
-            cursor.started = true;
-            delivered = 0;
-        }
-        let take = budget.min(self.values.len() - delivered);
-        proposals.extend_from_slice(&self.values[delivered..delivered + take]);
-        let delivered = delivered + take;
-        cursor.key[0..8].copy_from_slice(&(delivered as u64).to_le_bytes());
-        delivered < self.values.len()
     }
 
     fn confirm(&self, variable: usize, _binding: &Binding, cands: &mut Candidates<'_>) {
@@ -874,147 +854,156 @@ impl<'a> Constraint<'a> for ChunkedValues {
             cands.retain(|v| self.values.binary_search(v).is_ok());
         }
     }
-}
 
-proptest! {
-    #[test]
-    fn chunked_proposing_matches_eager(
-        seed_values in vec(prop::array::uniform32(any::<u8>()), 1..600),
-        allowed in vec(prop::array::uniform32(any::<u8>()), 0..40),
-    ) {
-        // Values large enough to span several geometric chunks (64, 256, ...).
-        let mut values: Vec<[u8; 32]> = seed_values;
-        // Guarantee some accepted candidates so the query has results.
-        values.extend(allowed.iter().copied());
-        values.sort_unstable();
-        values.dedup();
-
-        let mut accept: Vec<[u8; 32]> = allowed;
-        accept.sort_unstable();
-        accept.dedup();
-
-        let chunked = ChunkedValues { variable: 0, values: values.clone() };
-        // Byte-lexicographic band as the confirmer: estimate usize::MAX, so
-        // the chunked source is always the proposer and the range confirms
-        // each chunk through the mask path.
-        let lo = accept.first().copied().unwrap_or([0x40; 32]);
-        let hi = accept.last().copied().unwrap_or([0xC0; 32]);
-        let range = triblespace_core::query::rangeconstraint::InlineRange::new(
-            Variable::<UnknownInline>::new(0),
-            Inline::<UnknownInline>::new(lo),
-            Inline::<UnknownInline>::new(hi),
-        );
-
-        // Chunked source joined with the range filter, driven by the engine.
-        let results: HashSet<[u8; 32]> = triblespace_core::query::Query::new(
-            triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
-                Box::new(chunked) as Box<dyn Constraint + Send + Sync>,
-                Box::new(range),
-            ]),
-            |binding: &Binding| binding.get(0).copied(),
-        )
-        .collect();
-
-        // Eager oracle: plain filter.
-        let expected: HashSet<[u8; 32]> = values
-            .iter()
-            .filter(|v| **v >= lo && **v <= hi)
-            .copied()
-            .collect();
-        prop_assert_eq!(results, expected);
-    }
-
-    #[test]
-    fn chunked_proposing_no_duplicate_delivery(
-        seed_values in vec(prop::array::uniform32(any::<u8>()), 1..600),
-    ) {
-        let mut values: Vec<[u8; 32]> = seed_values;
-        values.sort_unstable();
-        values.dedup();
-        let expected = values.len();
-
-        let chunked = ChunkedValues { variable: 0, values };
-        // Bag semantics: each complete binding must surface exactly once —
-        // duplicate chunk delivery would inflate this count.
-        let results: Vec<[u8; 32]> = triblespace_core::query::Query::new(
-            chunked,
-            |binding: &Binding| binding.get(0).copied(),
-        )
-        .collect();
-        prop_assert_eq!(results.len(), expected);
-    }
-}
-
-/// Chunked source that records what the binding resolved to for its own
-/// variable on every `propose_chunk` call.
-///
-/// Bindings are indexes into the per-level proposal buffers, so the level
-/// a widen request appends to is the same one the current binding reads
-/// through. This constraint pins that: the engine reaches a widen by
-/// consuming the materialized region dry, which leaves the level's
-/// variable bound to the last entry it handed out.
-struct WidenObserver {
-    variable: usize,
-    values: Vec<[u8; 32]>,
-    seen: std::sync::Arc<std::sync::Mutex<Vec<Option<[u8; 32]>>>>,
-}
-
-impl<'a> Constraint<'a> for WidenObserver {
-    fn variables(&self) -> triblespace_core::query::VariableSet {
-        let mut set = triblespace_core::query::VariableSet::new_empty();
-        set.set(self.variable);
-        set
-    }
-
-    fn estimate(&self, variable: usize, _binding: &Binding) -> Option<usize> {
-        (variable == self.variable).then_some(self.values.len())
-    }
-
-    fn propose(&self, variable: usize, binding: &Binding, proposals: &mut ProposalBuffer) {
-        let mut cursor = ProposeCursor::default();
-        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
-    }
-
-    fn propose_chunk(
+    fn confirm_frontier(
         &self,
         variable: usize,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
-        proposals: &mut ProposalBuffer,
-    ) -> bool {
-        if variable != self.variable {
-            return false;
-        }
-        // The observation under test: resolving the binding for the very
-        // variable being proposed for, mid-propose.
-        self.seen
+        frontier: &triblespace_core::query::Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
+        self.regions
             .lock()
             .unwrap()
-            .push(binding.get(variable).copied());
-        let mut delivered = u64::from_le_bytes(cursor.key[0..8].try_into().unwrap()) as usize;
-        if !cursor.started {
-            cursor.started = true;
-            delivered = 0;
+            .push((cands.segments(), cands.len()));
+        for s in 0..cands.segments() {
+            let (row, mut segment) = cands.segment(s);
+            self.confirm(variable, &frontier.row(row), &mut segment);
         }
-        let take = budget.min(self.values.len() - delivered);
-        proposals.extend_from_slice(&self.values[delivered..delivered + take]);
-        let delivered = delivered + take;
-        cursor.key[0..8].copy_from_slice(&(delivered as u64).to_le_bytes());
-        delivered < self.values.len()
+    }
+}
+
+/// Test-only constraint over an explicit relation: for each value of
+/// `parent`, the set of `child` values it admits. Its `confirm` is the
+/// per-row membership test, so a batched region can only be filtered
+/// correctly if each candidate is matched against the parent binding it
+/// was actually proposed for.
+struct Relation {
+    parent: usize,
+    child: usize,
+    edges: Vec<([u8; 32], [u8; 32])>,
+}
+
+impl Relation {
+    fn children(&self, parent: &[u8; 32]) -> Vec<[u8; 32]> {
+        self.edges
+            .iter()
+            .filter(|(p, _)| p == parent)
+            .map(|(_, c)| *c)
+            .collect()
     }
 
-    fn confirm(&self, variable: usize, _binding: &Binding, cands: &mut Candidates<'_>) {
-        if variable == self.variable {
-            cands.retain(|v| self.values.binary_search(v).is_ok());
+    fn parents(&self, child: &[u8; 32]) -> Vec<[u8; 32]> {
+        let mut parents: Vec<[u8; 32]> = self
+            .edges
+            .iter()
+            .filter(|(_, c)| c == child)
+            .map(|(p, _)| *p)
+            .collect();
+        parents.sort_unstable();
+        parents.dedup();
+        parents
+    }
+
+    fn all_parents(&self) -> Vec<[u8; 32]> {
+        let mut parents: Vec<[u8; 32]> = self.edges.iter().map(|(p, _)| *p).collect();
+        parents.sort_unstable();
+        parents.dedup();
+        parents
+    }
+
+    fn all_children(&self) -> Vec<[u8; 32]> {
+        let mut children: Vec<[u8; 32]> = self.edges.iter().map(|(_, c)| *c).collect();
+        children.sort_unstable();
+        children.dedup();
+        children
+    }
+}
+
+impl<'a> Constraint<'a> for Relation {
+    fn variables(&self) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        set.set(self.parent);
+        set.set(self.child);
+        set
+    }
+
+    fn estimate(&self, variable: usize, binding: &Binding) -> Option<usize> {
+        if variable == self.parent {
+            Some(match binding.get(self.child) {
+                Some(c) => self.parents(c).len(),
+                None => self.all_parents().len(),
+            })
+        } else if variable == self.child {
+            Some(match binding.get(self.parent) {
+                Some(p) => self.children(p).len(),
+                None => self.all_children().len(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn propose(&self, variable: usize, binding: &Binding, proposals: &mut ProposalBuffer) {
+        if variable == self.parent {
+            match binding.get(self.child) {
+                Some(c) => proposals.extend(self.parents(c)),
+                None => proposals.extend(self.all_parents()),
+            }
+        } else if variable == self.child {
+            match binding.get(self.parent) {
+                Some(p) => proposals.extend(self.children(p)),
+                None => proposals.extend(self.all_children()),
+            }
+        }
+    }
+
+    fn confirm(&self, variable: usize, binding: &Binding, cands: &mut Candidates<'_>) {
+        if variable == self.child {
+            if let Some(p) = binding.get(self.parent) {
+                let admitted = self.children(p);
+                cands.retain(|v| admitted.contains(v));
+            }
+        } else if variable == self.parent {
+            if let Some(c) = binding.get(self.child) {
+                let admitted = self.parents(c);
+                cands.retain(|v| admitted.contains(v));
+            }
         }
     }
 }
 
 #[test]
-fn widening_a_level_keeps_its_variable_resolvable() {
-    // Enough values to span the 64 / 256 / 1024 geometric chunk ladder.
-    let mut values: Vec<[u8; 32]> = (0..500u32)
+fn a_batch_of_one_matches_the_frontier_protocol() {
+    // The migration invariant: today's single-binding call sites are a
+    // frontier of one and must behave identically.
+    let values: Vec<[u8; 32]> = (0..40u32)
+        .map(|i| {
+            let mut v = [0u8; 32];
+            v[28..32].copy_from_slice(&i.to_be_bytes());
+            v
+        })
+        .collect();
+    let source = WideValues {
+        variable: 0,
+        values: values.clone(),
+        regions: Default::default(),
+    };
+
+    let store = BindingStore::new();
+    let mut one = ProposalBuffer::new();
+    source.propose(0, &store.view(), &mut one);
+    let mut batched = ProposalBuffer::new();
+    source.propose_frontier(0, &store.frontier(), &mut batched);
+
+    assert_eq!(batched.segments(), 1, "a frontier of one has one segment");
+    assert_eq!(&one[..], &batched[..]);
+}
+
+#[test]
+fn every_binding_surfaces_exactly_once() {
+    // Bag semantics: batching partitions the same result multiset, it does
+    // not deduplicate and does not double-deliver.
+    let mut values: Vec<[u8; 32]> = (0..600u32)
         .map(|i| {
             let mut v = [0u8; 32];
             v[28..32].copy_from_slice(&i.to_be_bytes());
@@ -1023,34 +1012,109 @@ fn widening_a_level_keeps_its_variable_resolvable() {
         .collect();
     values.sort_unstable();
 
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let source = WidenObserver {
+    let source = WideValues {
         variable: 0,
         values: values.clone(),
-        seen: std::sync::Arc::clone(&seen),
+        regions: Default::default(),
+    };
+    let mut results: Vec<[u8; 32]> =
+        triblespace_core::query::Query::new(source, |binding: &Binding| binding.get(0).copied())
+            .collect();
+    assert_eq!(results.len(), values.len());
+    results.sort_unstable();
+    assert_eq!(results, values);
+}
+
+#[test]
+fn candidates_are_confirmed_against_their_own_parent() {
+    // Three parents with disjoint child sets. If the batched region lost
+    // track of which parent proposed which candidate, children would leak
+    // across parents and the row count would blow up.
+    let key = |i: u32| {
+        let mut v = [0u8; 32];
+        v[28..32].copy_from_slice(&i.to_be_bytes());
+        v
+    };
+    let mut edges = Vec::new();
+    for parent in 0..3u32 {
+        for child in 0..4u32 {
+            edges.push((key(parent), key(100 + parent * 10 + child)));
+        }
+    }
+    let expected: HashSet<([u8; 32], [u8; 32])> = edges.iter().copied().collect();
+
+    let relation = Relation {
+        parent: 0,
+        child: 1,
+        edges,
+    };
+    let rows: Vec<([u8; 32], [u8; 32])> = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(relation) as Box<dyn Constraint + Send + Sync>,
+        ]),
+        |binding: &Binding| Some((*binding.get(0).unwrap(), *binding.get(1).unwrap())),
+    )
+    .collect();
+
+    assert_eq!(rows.len(), 12, "one row per edge, no cross-parent leakage");
+    assert_eq!(rows.into_iter().collect::<HashSet<_>>(), expected);
+}
+
+#[test]
+fn deeper_levels_see_regions_as_wide_as_the_batch() {
+    // The measured problem this design answers: with a width-1 frontier
+    // only the root's propose is wide, so a batched confirmer engages once
+    // per query. With a frontier, the confirmer at the DEEPER level sees a
+    // region spanning many parents at once.
+    let key = |i: u32| {
+        let mut v = [0u8; 32];
+        v[28..32].copy_from_slice(&i.to_be_bytes());
+        v
+    };
+    // 64 parents with 4 private children each: 64 parents vs 256 children,
+    // so the parent is the shallow level and the child level is where the
+    // confirmer runs.
+    let mut edges = Vec::new();
+    let mut children = Vec::new();
+    for parent in 0..64u32 {
+        for child in 0..4u32 {
+            let c = key(1000 + parent * 4 + child);
+            edges.push((key(parent), c));
+            children.push(c);
+        }
+    }
+    let regions: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>> = Default::default();
+    // The witness admits every child, plus decoys so its estimate is the
+    // larger one and it is always the CONFIRMER — the role whose region
+    // width this test is about.
+    let mut witness_values = children;
+    witness_values.extend((0..2000u32).map(|i| key(500_000 + i)));
+    witness_values.sort_unstable();
+    let witness = WideValues {
+        variable: 1,
+        values: witness_values,
+        regions: std::sync::Arc::clone(&regions),
+    };
+    let relation = Relation {
+        parent: 0,
+        child: 1,
+        edges,
     };
 
-    let results: Vec<[u8; 32]> = triblespace_core::query::Query::new(source, |binding: &Binding| {
-        binding.get(0).copied()
-    })
-    .collect();
-    assert_eq!(results, values);
+    let rows = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(relation) as Box<dyn Constraint + Send + Sync>,
+            Box::new(witness),
+        ]),
+        |_: &Binding| Some(()),
+    )
+    .count();
+    assert_eq!(rows, 256);
 
-    let seen = seen.lock().unwrap();
-    // 500 values over budgets 64, 256, 1024 — three calls, the last of
-    // which reports exhaustion.
-    assert!(seen.len() >= 3, "expected several chunks, got {}", seen.len());
-    // The level is pushed while its variable is unbound...
-    assert_eq!(seen[0], None);
-    // ...and every widen after that happens with the variable still bound
-    // to the last entry the level handed out.
-    let mut consumed = 0usize;
-    for (chunk, observed) in seen[1..].iter().enumerate() {
-        consumed += [64usize, 256, 1024][chunk].min(values.len() - consumed);
-        assert_eq!(
-            *observed,
-            Some(values[consumed - 1]),
-            "widen #{chunk} should resolve the level's current binding"
-        );
-    }
+    let regions = regions.lock().unwrap();
+    let widest = regions.iter().map(|(segments, _)| *segments).max().unwrap();
+    assert!(
+        widest > 1,
+        "the child level should confirm several parents at once, saw {regions:?}"
+    );
 }

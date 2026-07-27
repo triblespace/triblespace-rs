@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    Binding, BindingStore, Constraint, ProposalBuffer, ProposeCursor, Query, Variable,
+    Binding, BindingStore, Constraint, ProposalBuffer, Query, Variable,
 };
 use triblespace_paths::{
     Automaton, GraphEdge, PathConstraint, PathIndex, PathSummary, Step, Transition,
@@ -408,7 +408,7 @@ fn endpoint_views_are_sorted_exact_and_mutually_derived() {
 }
 
 #[test]
-fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
+fn constraint_supports_constants_and_repeated_variables() {
     let index =
         PathIndex::from_edges(plus(6), [edge(1, 6, 2), edge(2, 6, 3), edge(3, 6, 4)]).unwrap();
     let start = Variable::<UnknownInline>::new(0);
@@ -419,14 +419,19 @@ fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
     assert_eq!(constraint.estimate(start.index, &binding.view()), Some(3));
     binding.bind(start.index, &vertex(1));
     assert_eq!(constraint.estimate(end.index, &binding.view()), Some(3));
-    let mut chunked = ProposalBuffer::new();
-    let mut cursor = ProposeCursor::default();
-    assert!(constraint.propose_chunk(end.index, &binding.view(), &mut cursor, 0, &mut chunked));
-    assert!(!cursor.started);
-    while constraint.propose_chunk(end.index, &binding.view(), &mut cursor, 1, &mut chunked) {}
+    let mut proposed = ProposalBuffer::new();
+    constraint.propose(end.index, &binding.view(), &mut proposed);
     assert_eq!(
-        chunked.live_values(0).copied().collect::<Vec<_>>(),
+        proposed.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(2), vertex(3), vertex(4)]
+    );
+    // The batched form is the same enumeration, segmented by parent row.
+    let mut batched = ProposalBuffer::new();
+    constraint.propose_frontier(end.index, &binding.frontier(), &mut batched);
+    assert_eq!(batched.segments(), 1);
+    assert_eq!(
+        batched.live_values(0).copied().collect::<Vec<_>>(),
+        proposed.live_values(0).copied().collect::<Vec<_>>()
     );
 
     binding.unset(start.index);
@@ -462,43 +467,6 @@ fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
     assert_eq!(
         proposals.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(1), vertex(2)]
-    );
-}
-
-#[test]
-fn zero_inline_is_not_confused_with_an_unstarted_chunk_cursor() {
-    let index = PathIndex::from_edges(
-        plus(6),
-        [GraphEdge {
-            source: [0; 32],
-            attribute: attribute(6),
-            target: vertex(1),
-        }],
-    )
-    .unwrap();
-    let start = Variable::<UnknownInline>::new(0);
-    let constraint = index.constraint(start, Inline::<UnknownInline>::new(vertex(1)));
-    let mut cursor = ProposeCursor::default();
-    let mut proposals = ProposalBuffer::new();
-
-    assert!(constraint.propose_chunk(
-        start.index,
-        &Binding::default(),
-        &mut cursor,
-        0,
-        &mut proposals,
-    ));
-    assert!(!cursor.started);
-    assert!(!constraint.propose_chunk(
-        start.index,
-        &Binding::default(),
-        &mut cursor,
-        1,
-        &mut proposals,
-    ));
-    assert_eq!(
-        proposals.live_values(0).copied().collect::<Vec<_>>(),
-        vec![[0; 32]]
     );
 }
 
