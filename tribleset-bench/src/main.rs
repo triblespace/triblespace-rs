@@ -31,9 +31,11 @@
 //! - `harkonnen/F{6..15}/…` — the R2 white-box fixtures, one engine
 //!   decision each. All run everywhere except F10, which is gpu-gated
 //!   because it reads the routing threshold out of `triblespace-gpu`.
-//! - `sparqloscope/<query>/total` — the vendored TRANSLATED registry;
-//!   without a wd Dataset every query records SKIP "dataset absent"
-//!   (the census still lands in the pile).
+//! - `sparqloscope/<query>/total` — the vendored TRANSLATED registry,
+//!   run against the `--data` pile's v2 dataset (resolved through its
+//!   `manifest` branch by [`wd_load`], bounded by `--rung`). A pile
+//!   with no v2 manifest, or no `--data` at all, records SKIP for every
+//!   query (the census still lands in the pile).
 //!
 //! Panics in any measure are caught (`quiet_catch`) and recorded as
 //! `panic:<reason>` outcomes; the run continues.
@@ -57,6 +59,9 @@ mod ledger;
 
 #[path = "../queries/wd_schema.rs"]
 mod wd_schema;
+
+#[path = "../queries/wd_load.rs"]
+mod wd_load;
 
 #[path = "../queries/sparqloscope.rs"]
 mod queries;
@@ -738,6 +743,120 @@ fn run_arch_queries(
     cross_arm_failure
 }
 
+// ---------------------------------------------------------------------------
+// SPARQLoscope arm
+// ---------------------------------------------------------------------------
+
+/// Record `reason` against every measure the sparqloscope arm would
+/// have produced, and print the per-`Kind` census. An absent measure
+/// and a skipped measure are different facts, so the registry lands in
+/// the pile either way.
+fn skip_sparqloscope(led: &mut ledger::ResultsLedger, reason: &str) {
+    let (mut engine_kind, mut fold_kind, mut periphery_kind) = (0usize, 0usize, 0usize);
+    for t in queries::TRANSLATED {
+        match t.kind {
+            queries::Kind::Engine => engine_kind += 1,
+            queries::Kind::Fold => fold_kind += 1,
+            queries::Kind::Periphery => periphery_kind += 1,
+        }
+        led.outcome(&format!("sparqloscope/{}/total", t.name), reason, None);
+    }
+    println!(
+        "  sparqloscope census              {} {reason} ({engine_kind} engine / {fold_kind} fold / {periphery_kind} periphery)",
+        queries::TRANSLATED.len(),
+    );
+}
+
+/// Stable fold of a query's answer VALUE, used as its cross-iteration
+/// identity.
+///
+/// `Answer::rows` is 1 for the scalar aggregates that make up most of
+/// the registry, so gating on rows would be vacuous — the answer could
+/// change between iterations (or between engine revs) with the gate
+/// still green. The value string is the actual result, so that is what
+/// is held identical.
+fn answer_ident(value: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut h);
+    h.finish() as usize
+}
+
+/// Load the `--data` dataset pile and run the vendored TRANSLATED
+/// registry against it, one measure per query
+/// (`sparqloscope/<query>/total`).
+///
+/// Iteration counts come from `--arch-iters`/`--arch-warmup`, the same
+/// knobs the archive arm uses: one pass of a wide join over a real
+/// dataset costs orders of magnitude more than a synthetic fixture.
+fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) {
+    // The rpq translations are held out of the registry entirely, so
+    // they skip regardless of whether a dataset loaded.
+    for name in queries::SKIPPED_PATHS {
+        led.outcome(&format!("sparqloscope/{name}/total"), "skip:rpq", None);
+    }
+
+    let Some(path) = &cfg.data else {
+        skip_sparqloscope(led, "skip:no-data");
+        return;
+    };
+
+    // The PATCH load is bounded by the same `--rung` the ladder arm
+    // uses, capped by MAX_RAM: a v2 dataset pile holds hundreds of
+    // millions of tribles, of which only a prefix fits in a resident
+    // TribleSet.
+    let budget = cfg.rung.min(MAX_RAM);
+    let loaded = match fixtures::quiet_catch(|| {
+        wd_schema::Dataset::load_pile_patch(path, budget)
+    }) {
+        Ok(Ok(l)) => l,
+        Ok(Err(e)) => {
+            println!("  sparqloscope: no dataset in {}: {e}", path.display());
+            skip_sparqloscope(led, "skip:no-dataset");
+            return;
+        }
+        Err(msg) => {
+            println!("  sparqloscope: dataset load panicked: {msg}");
+            skip_sparqloscope(led, "panic:load");
+            return;
+        }
+    };
+    let ds = &loaded.dataset;
+    // State the fraction, not just the size: the queries answer over
+    // the loaded prefix, and a count from a prefix must never be read
+    // as a count over the dataset.
+    println!(
+        "sparql   : loaded {} tribles ({} commits, {:.2}s) of {} in the whole dataset ({} source triples)",
+        ds.tribles, loaded.commits, loaded.load_secs, loaded.manifest_tribles, ds.triples
+    );
+
+    let (mut engine_kind, mut fold_kind, mut periphery_kind) = (0usize, 0usize, 0usize);
+    let mut panicked = 0usize;
+    for t in queries::TRANSLATED {
+        match t.kind {
+            queries::Kind::Engine => engine_kind += 1,
+            queries::Kind::Fold => fold_kind += 1,
+            queries::Kind::Periphery => periphery_kind += 1,
+        }
+        let mut m = Measure::new(format!("sparqloscope/{}/total", t.name));
+        for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
+            let recording = i >= cfg.arch_warmup;
+            m.iterate(recording, base, || answer_ident(&(t.run)(ds).value));
+        }
+        if m.panicked.is_some() {
+            panicked += 1;
+        }
+        // `rows_meaningful: false` — the identity is the answer digest,
+        // not a cardinality, so it is not telemetry to report as rows.
+        m.emit(led, false);
+    }
+    println!(
+        "  sparqloscope census              {} ran, {panicked} panicked ({engine_kind} engine / {fold_kind} fold / {periphery_kind} periphery) + {} rpq",
+        queries::TRANSLATED.len() - panicked,
+        queries::SKIPPED_PATHS.len()
+    );
+}
+
 fn main() {
     let cfg = parse_cfg();
 
@@ -1133,31 +1252,13 @@ fn main() {
     );
 
     // -- sparqloscope ------------------------------------------------------
-    // No wd Dataset loader is vendored (the pile manifest schema and
-    // loaders stay in sparqloscope-bench, and no wd dataset exists on
-    // this machine), so the whole registry records SKIP — the census
-    // itself is the deliverable and must land in the pile.
-    let (mut engine_kind, mut fold_kind, mut periphery_kind) = (0usize, 0usize, 0usize);
-    for t in queries::TRANSLATED {
-        match t.kind {
-            queries::Kind::Engine => engine_kind += 1,
-            queries::Kind::Fold => fold_kind += 1,
-            queries::Kind::Periphery => periphery_kind += 1,
-        }
-        led.outcome(
-            &format!("sparqloscope/{}/total", t.name),
-            "skip:dataset-absent",
-            None,
-        );
-    }
-    for name in queries::SKIPPED_PATHS {
-        led.outcome(&format!("sparqloscope/{name}/total"), "skip:rpq", None);
-    }
-    println!(
-        "  sparqloscope census              {} dataset-absent ({engine_kind} engine / {fold_kind} fold / {periphery_kind} periphery) + {} rpq",
-        queries::TRANSLATED.len(),
-        queries::SKIPPED_PATHS.len()
-    );
+    // The registry runs against a v2 DATASET pile (`--data`), which is
+    // not the same shape as a ladder pile: its data branch is anonymous
+    // and reachable only through the `manifest` branch, so this arm
+    // resolves its own dataset rather than reusing the ladder set above
+    // (see `wd_load`). Without one the whole registry records SKIP —
+    // the census itself is the deliverable and must land in the pile.
+    run_sparqloscope(&mut led, &cfg, &base);
 
     // -- close -------------------------------------------------------------
     let end_ns = base.elapsed().as_nanos() as u64;
