@@ -525,9 +525,17 @@ impl<K: IndexKind> Manifest<K> {
     /// discarded.
     ///
     /// Retaining them makes the ranges a *pool to choose from* rather than a
-    /// partition, and selection becomes mandatory: the root and its inputs
-    /// both cover the same commits, so unioning both would count every trible
-    /// twice. This is that selection. With it, "monolithic" and "tiered"
+    /// partition. Selection is then a COST question, not a correctness one:
+    /// `UnionConstraint` sort-dedups its proposals on `(row, value)`, so
+    /// overlapping segments yield the right rows — they just make the engine
+    /// read the same tribles from several artifacts to do it. This is that
+    /// selection.
+    ///
+    /// That distinction is what keeps the problem tractable. Requiring a
+    /// disjoint cover would be Exact Cover, NP-complete, and a suboptimal
+    /// answer would be WRONG. Because overlap is merely wasteful, any cover
+    /// is correct and a suboptimal one is only slower — so a greedy choice
+    /// needs no apology. With it, "monolithic" and "tiered"
     /// stop being different artifacts and become different covers of one —
     /// the root alone, or its leaves — and a historical query is a cover of
     /// an ancestor prefix rather than a replay.
