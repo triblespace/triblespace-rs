@@ -316,11 +316,18 @@ sibling:
   becomes a one-row child frontier and the search descends.
 - When the top has two or more pending candidates, bisect them and hand the
   tail to a sibling. A candidate's parent tag names a row of the *parent*
-  frontier, and the sibling is a whole-state clone that keeps that frontier
-  verbatim — its matrices sit behind `Arc`, so the clone is refcounts rather
-  than megabytes — so the tags address exactly the same rows on both sides. The
-  left half keeps entries `[0..mid)` and every consumed entry sits below its
+  frontier, which the sibling keeps verbatim — its matrices sit behind `Arc`,
+  so the clone is refcounts rather than megabytes — so the tags address exactly
+  the same rows on both sides. Level buffers are deep-cloned because those rows
+  contain indexes into them and either half may refill a level later. The left
+  half keeps entries `[0..mid)` and every consumed entry sits below its
   consumption watermark, so its own indexes still resolve to the same values.
+- The sibling is **fenced at that source**. It keeps only the current parent
+  frontier and current level; later preferred-variable groups and every
+  ancestor continuation remain owned by the left half. When the sibling's
+  suffix is exhausted it is done, rather than unwinding into work another
+  clone also owns. Applying the same rule to a sibling of a sibling is
+  idempotent: discarded continuation cannot reappear.
 - Splitting narrows the frontier: the two halves each expand a slice of what
   one would have expanded together. That is the deliberate trade — batch width
   buys per-level dispatch size, work-stealing buys core utilisation — and rayon

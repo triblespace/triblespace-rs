@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Parallel query splits own exactly one source suffix.** A rayon sibling is
+  now re-rooted at the current parent frontier and fenced when its source is
+  bisected; later preferred-variable groups and ancestor continuations remain
+  solely with the left half. This makes recursive splitting safe by
+  construction instead of depending on the splitter having happened to drain
+  every surrounding continuation.
 - **Breaking: `propose` and `confirm` operate on a frontier of bindings.** Both
   methods take a `Frontier` — the whole collection of parent bindings at one
   point of the search — instead of a single `Binding`; a single binding is a

@@ -737,9 +737,8 @@ impl BindingStore {
     /// below `pos <= mid` — so the left half's indexes stay valid. The
     /// returned tail re-indexes from zero, which is why the right half
     /// must [`unset`](BindingStore::unset) `variable` when it installs
-    /// it. The parent tags travel with the values, and the right half is
-    /// a whole-state clone, so the tags still address the same frontier
-    /// rows there.
+    /// it. The parent tags travel with the values and still address the
+    /// same fenced parent frontier in the right half.
     #[cfg(feature = "parallel")]
     fn bisect(&mut self, variable: VariableId) -> LevelValues {
         let level = &mut self.levels[variable];
@@ -1725,6 +1724,45 @@ where
     }
 }
 
+#[cfg(feature = "parallel")]
+impl<C, P, R> Query<C, P, R>
+where
+    C: Clone,
+    P: Fn(&Binding<'_>) -> Option<R> + Clone,
+{
+    /// Bisects the pending candidates of the current source, leaving the
+    /// prefix in `self` and returning the suffix as a fenced sibling query.
+    ///
+    /// Only the left query owns the continuation after this source: later
+    /// groups of the parent frontier and every ancestor sibling. The right
+    /// query is re-rooted at the current parent frontier and ends when its
+    /// source suffix is exhausted. This makes split ownership structural
+    /// instead of relying on the splitter having drained every ancestor.
+    ///
+    /// `BindingStore::clone` deliberately deep-copies its level buffers;
+    /// descendants in either half may refill an ancestor variable without
+    /// invalidating the other half's row indexes. Frontier matrices remain
+    /// cheap to share through their `Arc`s.
+    fn split_current_source(&mut self, variable: VariableId) -> Self {
+        let right_level = self.bindings.bisect(variable);
+        let mut right = self.clone();
+        right.bindings.install(variable, right_level);
+
+        let depth = right.depth;
+        drop(right.stack.drain(..depth));
+        drop(right.depths.drain(..depth));
+        right.depth = 0;
+
+        debug_assert_eq!(right.stack[0].variable, variable);
+        let root = &mut right.depths[0];
+        let group = root.group;
+        debug_assert!(group > 0 && group <= root.groups.len());
+        debug_assert_eq!(root.groups[group - 1].0, variable);
+        Arc::make_mut(&mut root.groups).truncate(group);
+        right
+    }
+}
+
 impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> {
     /// Create a new query.
     /// The query takes a constraint and a post-processing function as input,
@@ -2260,18 +2298,18 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // candidates of the top level — the entries that will become the next
 // chunks of the child frontier. While the top has a single pending
 // candidate the producer descends through it; with two or more it cuts the
-// pending region in half and hands the tail to a new sub-query. Every
-// non-top level is left with zero pending candidates, so backtracking out
-// of a sub-search unwinds cleanly to done without any re-enumeration
-// across clones.
+// pending region in half and hands the tail to a new sub-query. That sibling
+// is fenced at the current source: it keeps the current parent frontier and
+// source level, but not later groups or ancestor continuations. The left half
+// is their sole owner, so a sibling cannot replay work when it unwinds.
 //
 // Why the indexes stay valid across the cut: a candidate's parent tag names
-// a row of the *parent frontier*, and the right half is a whole-state clone
-// that keeps that frontier verbatim (its matrices are shared `Arc`s, so the
-// clone is refcounts, not copies), so the tags address exactly the same
-// rows there. The left half keeps entries `[0..mid)` and every consumed
-// entry sits below `pos <= mid`, so its own indexes still resolve to the
-// same values.
+// a row of the *parent frontier*, which the right half keeps verbatim. Its
+// matrices are shared `Arc`s, so the clone is refcounts, not copies; level
+// buffers are deep-cloned because bound row indexes must remain valid if the
+// other half refills a level. The left half keeps entries `[0..mid)` and every
+// consumed entry sits below `pos <= mid`, so its own indexes still resolve to
+// the same values.
 //
 // Splitting narrows the frontier — the two halves each expand a slice of
 // what one would have expanded together. That is the deliberate trade:
@@ -2378,9 +2416,7 @@ mod parallel {
                             q.next_chunk();
                             continue;
                         }
-                        let right_level = q.bindings.bisect(top);
-                        let mut right = q.clone();
-                        right.bindings.install(top, right_level);
+                        let right = q.split_current_source(top);
 
                         let left_budget = self.split_budget / 2;
                         let right_budget = self.split_budget - left_budget;
@@ -2835,5 +2871,154 @@ mod tests {
         const LEAF_VALUE: RawInline = [6; 32];
     }
 
+    #[cfg(feature = "parallel")]
+    mod split_fence {
+        use super::*;
 
+        #[derive(Clone)]
+        struct Fixture(u32);
+
+        impl Fixture {
+            fn value(tag: u8, index: u32) -> RawInline {
+                let mut value = [0; 32];
+                value[0] = tag;
+                value[28..].copy_from_slice(&index.to_be_bytes());
+                value
+            }
+
+            fn count(&self, group: u8, variable: VariableId) -> u32 {
+                match (group, variable) {
+                    (3 | 0, 1) => 0,
+                    (1, 2) => self.0,
+                    _ => 1,
+                }
+            }
+        }
+
+        impl<'a> Constraint<'a> for Fixture {
+            fn variables(&self) -> VariableSet {
+                variable_set(0..4)
+            }
+
+            fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+                let preferred = binding
+                    .get(0)
+                    .map(|anchor| match anchor[31] {
+                        0 => 1,
+                        1 => 2,
+                        2 => 3,
+                        _ => 1,
+                    })
+                    .unwrap_or(0);
+                (variable < 4).then_some(if variable == 0 {
+                    4
+                } else if variable == preferred {
+                    1
+                } else {
+                    8
+                })
+            }
+
+            fn propose(
+                &self,
+                variable: VariableId,
+                frontier: &Frontier<'_>,
+                proposals: &mut ProposalBuffer,
+            ) {
+                for row in 0..frontier.len() {
+                    proposals.open(row as u32);
+                    if variable == 0 {
+                        proposals.extend([3, 0, 1, 2].map(|group| Self::value(0, group)));
+                    } else {
+                        let group = frontier.row(row).get(0).expect("anchor bound")[31];
+                        proposals.extend(
+                            (0..self.count(group, variable))
+                                .map(|index| Self::value(variable as u8, index)),
+                        );
+                    }
+                }
+            }
+
+            fn confirm(
+                &self,
+                _variable: VariableId,
+                _frontier: &Frontier<'_>,
+                _candidates: &mut Candidates<'_>,
+            ) {
+            }
+        }
+
+        type TestQuery = Query<Fixture, fn(&Binding<'_>) -> Option<RawInline>, RawInline>;
+
+        fn project(binding: &Binding<'_>) -> Option<RawInline> {
+            binding.get(0).copied()
+        }
+
+        fn query(fanout: u32) -> TestQuery {
+            Query::new(
+                Fixture(fanout),
+                project as fn(&Binding<'_>) -> Option<RawInline>,
+            )
+            .with_frontier_width(4)
+        }
+
+        fn advance_to_second_of_three_groups(query: &mut TestQuery) {
+            query.plan();
+            query.next_group();
+            query.next_chunk();
+
+            // Exhaust the empty one-row latency frontier, then widen the
+            // root into three anchors with three preferred variables.
+            query.plan();
+            query.next_group();
+            query.next_chunk();
+            query.next_group();
+            query.next_chunk();
+            query.plan();
+            assert_eq!(query.depths[query.depth].groups.len(), 3);
+
+            // Retire the empty first group and stop inside the second.
+            query.next_group();
+            query.next_chunk();
+            query.next_group();
+            assert_eq!(query.depths[query.depth].group, 2);
+            assert_eq!(query.stack.last().unwrap().variable, 2);
+        }
+
+        #[test]
+        fn split_owns_only_its_current_fragmented_group() {
+            const FANOUT: u32 = 64;
+            let mut expected: Vec<_> = query(FANOUT).collect();
+            expected.sort_unstable();
+            assert_eq!(expected.len(), FANOUT as usize + 1);
+
+            let mut left = query(FANOUT);
+            advance_to_second_of_three_groups(&mut left);
+            let mut right = left.split_current_source(2);
+
+            assert_eq!(
+                (right.depth, right.depths.len(), right.stack.len()),
+                (0, 1, 1)
+            );
+            assert_eq!(
+                (right.depths[0].group, right.depths[0].groups.len()),
+                (2, 2)
+            );
+            assert!(Arc::ptr_eq(&left.depths[1].block, &right.depths[0].block));
+            assert!(!std::ptr::eq(
+                left.bindings.levels[0].buffer.entries.as_ptr(),
+                right.bindings.levels[0].buffer.entries.as_ptr(),
+            ));
+
+            // Fencing an already-fenced sibling cannot restore continuation.
+            let rightmost = right.split_current_source(2);
+            assert_eq!((right.depth, right.depths[0].groups.len()), (0, 2));
+            assert_eq!((rightmost.depth, rightmost.depths[0].groups.len()), (0, 2));
+
+            let mut actual: Vec<_> = left.chain(right).chain(rightmost).collect();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "splitting must preserve the exact bag");
+            assert_eq!(actual.iter().filter(|row| row[31] == 2).count(), 1);
+        }
+    }
 }
