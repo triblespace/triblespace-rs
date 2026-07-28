@@ -150,16 +150,21 @@ fn report(branch_id: Id, name: Option<&str>, manifest: &Manifest<SuccinctRollup>
     println!("  recipe   {:?}", manifest.recipe());
     println!("  frontier {} head(s)", manifest.frontier().len());
     println!("  ranges   {}", ranges.len());
+    // Which records are ROOTS matters more than how many exist: with merged
+    // inputs retained a reader attaches only these, and the rest are history
+    // kept queryable.
+    let active: std::collections::HashSet<usize> = manifest.active().into_iter().collect();
     let mut by_level: BTreeMap<u64, usize> = BTreeMap::new();
-    for r in ranges {
+    for (i, r) in ranges.iter().enumerate() {
         *by_level.entry(r.level()).or_default() += 1;
+        let mark = if active.contains(&i) { "*" } else { " " };
         // The commit range is the whole point of a rollup record: it says
         // WHICH HISTORY this artifact is a derivation of. Without it the
         // listing shows that something is indexed but not what, and coverage
         // — the question an operator actually has — is unanswerable.
         let range = r.range();
         println!(
-            "    level {:<3} seq {:<6} artifacts {}  commits {}..{}",
+            "  {mark} level {:<3} seq {:<6} artifacts {}  commits {}..{}",
             r.level(),
             r.seq(),
             r.artifacts().len(),
@@ -167,7 +172,7 @@ fn report(branch_id: Id, name: Option<&str>, manifest: &Manifest<SuccinctRollup>
             frontier_hex(range.end()),
         );
     }
-    println!("  tiers    {by_level:?}");
+    println!("  tiers    {by_level:?}   ({} active, marked *)", active.len());
     // The shape is the whole reason to look. A single range is a monolithic
     // archive wearing a union's clothes — and a benchmark meaning to compare
     // union against monolithic would then measure the same thing twice.
@@ -405,12 +410,15 @@ pub fn compact(
                 }
             }
         };
-        // One range is already a root. Merging it with itself would rewrite
-        // identical bytes under a new entity for no gain, so say so and move
-        // on rather than doing expensive nothing.
-        if manifest.ranges().len() < 2 {
+        // ACTIVE records only. With merged inputs retained, the manifest
+        // holds a root and its children together; merging all of them would
+        // feed the same commits into the root twice. The roots of the forest
+        // are exactly what a compaction consumes.
+        let active = manifest.active();
+        if active.len() < 2 {
             println!(
-                "branch {label}: {} range(s) — already compact",
+                "branch {label}: {} active range(s) of {} total — already compact",
+                active.len(),
                 manifest.ranges().len()
             );
             continue;
@@ -419,17 +427,17 @@ pub fn compact(
         let started = std::time::Instant::now();
         let (merged_range, prepared) = {
             let reader = pile.reader().map_err(|e| anyhow!("reader: {e:?}"))?;
-            let ranges: Vec<_> = manifest
-                .ranges()
+            let ranges: Vec<_> = active
                 .iter()
-                .map(|r| r.range().clone())
+                .map(|&i| manifest.ranges()[i].range().clone())
                 .collect();
             let merged = {
                 let mut dag = StoredCommitDag::new(&reader);
                 convex_union(&mut dag, &ranges).map_err(|e| anyhow!("convex union: {e:?}"))?
             };
             let mut segments = Vec::new();
-            for entry in manifest.ranges() {
+            for &i in &active {
+                let entry = &manifest.ranges()[i];
                 for artifact in entry.artifacts() {
                     segments.push(
                         kind.attach(&reader, artifact)
@@ -467,8 +475,8 @@ pub fn compact(
         write_branch_meta(&mut pile, branch_id, head_set)?;
 
         println!(
-            "branch {label}: compacted {} ranges into 1 in {:.1}s",
-            manifest.ranges().len(),
+            "branch {label}: compacted {} active range(s) into 1 in {:.1}s",
+            active.len(),
             started.elapsed().as_secs_f64()
         );
     }
