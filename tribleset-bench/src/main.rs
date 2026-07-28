@@ -88,6 +88,16 @@ struct Cfg {
     arch_iters: usize,
     arch_warmup: usize,
 
+    /// A pile carrying a SuccinctRollup annotation, queried by attaching a
+    /// cover rather than by loading tribles into memory.
+    rollup: Option<std::path::PathBuf>,
+    /// Which cover: 0 = the coarsest (a single root after a major
+    /// compaction, i.e. the MONOLITHIC arm), 1 = what that root rolled up
+    /// (the UNION arm), deeper = finer tiers.
+    ///
+    /// Both arms answer over the SAME commits out of the SAME pile, so no
+    /// difference between them can come from having built two artifacts.
+    rollup_depth: usize,
     verify: Option<std::path::PathBuf>,
 }
 
@@ -127,6 +137,8 @@ fn parse_cfg() -> Cfg {
         build_warmup: 2,
         arch_iters: 3,
         arch_warmup: 1,
+        rollup: None,
+        rollup_depth: 0,
         verify: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -155,6 +167,8 @@ fn parse_cfg() -> Cfg {
             "--data" => cfg.data = Some(take(&args, &mut i).into()),
             "--branch" => cfg.branch = Some(take(&args, &mut i).to_owned()),
             "--rung" => cfg.rung = take_size(&args, &mut i),
+            "--rollup" => cfg.rollup = Some(take(&args, &mut i).into()),
+            "--rollup-depth" => cfg.rollup_depth = take_size(&args, &mut i),
             "--results" => cfg.results = Some(take(&args, &mut i).into()),
             "--label" => cfg.label = Some(take(&args, &mut i).to_owned()),
             "--iters" => cfg.iters = take_size(&args, &mut i),
@@ -918,6 +932,60 @@ fn run_sparqloscope_arm<B>(
 /// Iteration counts come from `--arch-iters`/`--arch-warmup`, the same
 /// knobs the archive arm uses: one pass of a wide join over a real
 /// dataset costs orders of magnitude more than a synthetic fixture.
+/// The registry against a ROLLUP COVER attached from a pile.
+///
+/// No tribles are loaded into memory: the segments are mmapped, so the whole
+/// dataset is queryable regardless of how much of it would fit resident. The
+/// cover depth chooses the arm — 0 is a compacted root (monolithic), 1 is
+/// what that root rolled up (union) — and both read the same pile, so a
+/// difference between them cannot be an artifact of two builds.
+fn run_rollup_arm(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) -> bool {
+    let Some(path) = &cfg.rollup else {
+        return false;
+    };
+    let attach_started = Instant::now();
+    let ds = match fixtures::quiet_catch(|| {
+        wd_schema::Dataset::<wd_schema::UnionFacts>::load_pile(path, cfg.rollup_depth)
+    }) {
+        Ok(Ok(ds)) => ds,
+        Ok(Err(e)) => {
+            println!("  rollup: attach failed: {e}");
+            return true;
+        }
+        Err(msg) => {
+            println!("  rollup: attach panicked: {msg}");
+            return true;
+        }
+    };
+    // Attach cost is a result, not overhead: it is what a query pays before
+    // reading anything, and the case for compacting is largely that it falls.
+    let attach_ms = attach_started.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "rollup   : attached depth {} in {attach_ms:.0} ms over {} tribles",
+        cfg.rollup_depth, ds.tribles
+    );
+    led.outcome(
+        &format!("rollup_d{}/attach/total", cfg.rollup_depth),
+        "signal",
+        Some(attach_ms as u64),
+    );
+
+    let group = format!("rollup_d{}", cfg.rollup_depth);
+    let (_, panicked, _) = run_sparqloscope_arm(
+        led,
+        cfg,
+        base,
+        &group,
+        queries::TRANSLATED_UNION,
+        &ds,
+        None,
+        |_| {},
+        |_, _, _| {},
+    );
+    println!("  {group} census              100 ran, {panicked} panicked");
+    panicked > 0
+}
+
 fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) -> bool {
     // The rpq translations are held out of the registry entirely, so
     // they skip regardless of whether a dataset loaded.
@@ -1608,7 +1676,13 @@ fn main() {
     // resolves its own dataset rather than reusing the ladder set above
     // (see `wd_load`). Without one the whole registry records SKIP —
     // the census itself is the deliverable and must land in the pile.
-    cross_arm_failure |= run_sparqloscope(&mut led, &cfg, &base);
+    // A rollup run answers over the whole dataset from mmapped segments, so
+    // it replaces the resident arms rather than joining them.
+    if cfg.rollup.is_some() {
+        cross_arm_failure |= run_rollup_arm(&mut led, &cfg, &base);
+    } else {
+        cross_arm_failure |= run_sparqloscope(&mut led, &cfg, &base);
+    }
 
     // -- close -------------------------------------------------------------
     let end_ns = base.elapsed().as_nanos() as u64;

@@ -3173,9 +3173,7 @@ pub fn number_of_literals<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 /// (the runner indexes them in lockstep, and the cross-arm gate
 /// compares row i against row i).
 ///
-/// Vendored from `sparqloscope-bench/src/queries.rs` @ 73df472, minus
-/// its `TRANSLATED_UNION` table: `Dataset<UnionFacts>` has no caller
-/// here (see [`wd_load`](crate::wd_load)).
+/// Vendored from `sparqloscope-bench/src/queries.rs` @ 73df472.
 macro_rules! registry {
     ($( $name:literal / $kind:ident / $f:ident ),+ $(,)?) => {
         /// All translated queries against the PATCH backend
@@ -3191,6 +3189,15 @@ macro_rules! registry {
         /// The same queries against the succinct-archive backend.
         pub static TRANSLATED_ARCHIVE: &[Translated<ArchivedFacts>] = &[
             $( Translated { name: $name, kind: Kind::$kind, run: $f::<ArchivedFacts> } ),+
+        ];
+        /// The same queries against a UNION of rollup segments.
+        ///
+        /// Both arms of a monolithic-versus-tiered comparison run through
+        /// here: a monolithic cover is a union of ONE segment, so the arms
+        /// differ only in which cover was attached, never in the code that
+        /// queries it.
+        pub static TRANSLATED_UNION: &[Translated<crate::wd_schema::UnionFacts>] = &[
+            $( Translated { name: $name, kind: Kind::$kind, run: $f::<crate::wd_schema::UnionFacts> } ),+
         ];
         /// The same queries against the device-wrapped archive.
         #[cfg(feature = "gpu")]
