@@ -5,9 +5,12 @@
 //! [`wd_schema`](crate::wd_schema), which carries the vocabulary and
 //! the [`Dataset`] shell but no way to fill it. This module is exactly
 //! the part that fills it: the `manifest`-branch schema, the branch /
-//! commit-chain walk, and [`Dataset::load_pile_patch`], which bulk-loads
+//! commit-chain walk, [`Dataset::load_pile_patch`], which bulk-loads
 //! the six-PATCH [`TribleSet`] out of a dataset pile's canonical
-//! per-commit `SimpleArchive` blobs.
+//! per-commit `SimpleArchive` blobs, [`Dataset::to_archive`], which
+//! builds the succinct-archive view of that same set, and
+//! [`Dataset::<UnionFacts>::load_pile`], which serves queries from the
+//! data branch's index ANNOTATION instead.
 //!
 //! **Why a dataset pile needs this and not the ladder checkout.** The
 //! two pile layouts this suite sees are structurally different. A
@@ -25,9 +28,6 @@
 //! noted where it lives: the 25 unread provenance attributes are left
 //! behind (see [`manifest`]) and the RSS guard is replaced by a
 //! trible bound (see [`load_pile_patch`](Dataset::load_pile_patch)).
-//! `Dataset<UnionFacts>::load_pile` — the succinct/index-annotation
-//! loader — is not ported at all: the vendored registry is
-//! monomorphized against `Dataset<TribleSet>`, so nothing calls it.
 
 use std::path::Path;
 
@@ -41,7 +41,7 @@ use subject::core::prelude::*;
 use subject::core::repo::pile::PileReader;
 use subject::core::repo;
 
-use crate::wd_schema::{AnyBlobReader, Dataset};
+use crate::wd_schema::{AnyBlobReader, ArchivedFacts, Dataset, UnionFacts};
 
 /// Provenance schema for the pile-backed dataset artifact (v2).
 ///
@@ -87,10 +87,10 @@ pub mod manifest {
 pub struct PileDataset {
     pub data_branch: Id,
     pub meta: TribleSet,
-    /// The manifest's `path!` substrate. Read only by the un-ported
-    /// `Dataset<UnionFacts>::load_pile`; the PATCH loader below uses
-    /// `facts.clone()` for `Dataset::paths`, exactly as upstream does.
-    #[allow(dead_code)]
+    /// The manifest's `path!` substrate. Read by
+    /// [`Dataset::<UnionFacts>::load_pile`]; the PATCH loader below
+    /// uses `facts.clone()` for `Dataset::paths`, exactly as upstream
+    /// does.
     pub paths: TribleSet,
     pub triples: usize,
     /// Manifest's recorded sum over index segments (within-segment
@@ -358,6 +358,79 @@ impl Dataset<TribleSet> {
             commits,
             load_secs,
             manifest_tribles: ds.tribles,
+        })
+    }
+
+    /// Build the succinct-archive view of this dataset. The PATCH set
+    /// stays resident (`paths` — required by `path!` queries and by the
+    /// archive construction itself); blobs and meta are shared.
+    ///
+    /// This is the archive arm's loader: it covers EXACTLY the tribles
+    /// [`load_pile_patch`](Dataset::load_pile_patch) admitted, which is
+    /// what makes the PATCH / archive / device arms comparable row for
+    /// row.
+    pub fn to_archive(&self) -> Dataset<ArchivedFacts> {
+        Dataset {
+            facts: (&self.facts).into(),
+            paths: self.facts.clone(),
+            reader: self.reader.clone(),
+            meta: self.meta.clone(),
+            meta_reader: self.meta_reader.clone(),
+            triples: self.triples,
+            tribles: self.tribles,
+        }
+    }
+}
+
+impl Dataset<UnionFacts> {
+    /// Attach a v2 dataset artifact: resolve the `manifest` branch's
+    /// dataset entity, attach the succinct index ANNOTATION carried by
+    /// the data branch's head (`repo::index_home` manifest — zerocopy
+    /// over the pile mmap), and serve queries from the union of its
+    /// segments. The canonical facts remain available as the commit
+    /// chain's `SimpleArchive` content blobs (see
+    /// [`load_pile_patch`](Dataset::load_pile_patch)).
+    ///
+    /// VENDOR NOTE (adaptation). Upstream leaks the attached segment
+    /// slice (`Box::leak`) because its `UnionArchive<'a, U>` borrows
+    /// them. At this engine rev `UnionArchive` owns an
+    /// `Arc<[SuccinctArchive<U>]>` (commit 6c346e04), so the leak is
+    /// gone and the `Vec` moves straight in.
+    ///
+    /// NOT WIRED INTO THE RUNNER, and the reason is a measurement, not
+    /// an opinion: this loader has no bound to give it. On
+    /// `dblp-574m-v2.pile` the branch head's annotation is ONE range
+    /// holding ONE shard of 561,475,905 rows — the whole dump — while
+    /// `load_pile_patch` at the documented `--rung` holds the first
+    /// commit's 4,064,802. Two arms over different graphs cannot be
+    /// row-compared, and the acceptance gate for this work is that the
+    /// backings agree row for row, so the archive arm is built from the
+    /// bounded PATCH set by [`to_archive`](Dataset::to_archive)
+    /// instead. Attaching costs ~19 s and is memory-cheap (mmap
+    /// zerocopy); it is running 100 translations over 561 M rows that
+    /// is out of reach, not the attach.
+    #[allow(dead_code)]
+    pub fn load_pile(path: &Path) -> Result<Self, String> {
+        use subject::core::repo::index_home::{IndexHome, SuccinctRollup};
+
+        let mut pile = Pile::open(path).map_err(|e| format!("open {}: {e:?}", path.display()))?;
+        let reader = pile.reader().map_err(|e| format!("pile reader: {e:?}"))?;
+        let ds = resolve_dataset(&mut pile, &reader)?;
+        let segments = {
+            let mut home = IndexHome::new(&mut pile, ds.data_branch, SuccinctRollup::new());
+            home.attach_all()
+                .map_err(|e| format!("attach index annotation: {e:?}"))?
+        };
+        let facts = UnionFacts::new(segments);
+        pile.close().map_err(|e| format!("close pile: {e:?}"))?;
+        Ok(Dataset {
+            facts,
+            paths: ds.paths,
+            reader: AnyBlobReader::Pile(reader.clone()),
+            meta: ds.meta,
+            meta_reader: AnyBlobReader::Pile(reader),
+            triples: ds.triples,
+            tribles: ds.tribles,
         })
     }
 }
