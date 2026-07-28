@@ -25,8 +25,10 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::index_home::{
-    strip_recipe_manifest, IndexHome, Manifest, SuccinctRollup,
+    append_stored_range, store_artifact, strip_recipe_manifest, IndexHome, IndexKind, Manifest,
+    SuccinctRollup,
 };
+use triblespace_core::repo::index_range::{convex_union, StoredCommitDag};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::trible::TribleSet;
 
@@ -214,14 +216,99 @@ pub fn build(
 }
 
 pub fn compact(
-    _pile_path: PathBuf,
-    _branch: Option<String>,
-    _signing_key: Option<PathBuf>,
+    pile_path: PathBuf,
+    branch: Option<String>,
+    signing_key: Option<PathBuf>,
 ) -> Result<()> {
-    Err(anyhow!(
-        "rollup archive compact is not implemented yet.\n\
-         It needs to attach every range, merge_ordered_archives them into one \
-         artifact, and replace the manifest with a single range over the convex \
-         union of their commit ranges."
-    ))
+    let _key = load_signing_key(&signing_key)?;
+    let mut pile = super::super::open_refreshed(&pile_path)?;
+    let kind = SuccinctRollup::new();
+
+    for branch_id in branches(&mut pile, branch.as_deref())? {
+        let name = branch_name(&mut pile, branch_id);
+        let label = match &name {
+            Some(n) => format!("{n:?} ({branch_id:X})"),
+            None => format!("{branch_id:X}"),
+        };
+
+        let manifest = {
+            let mut home = IndexHome::new(&mut pile, branch_id, SuccinctRollup::new());
+            match home.read_manifest() {
+                Ok(m) => m,
+                Err(_) => {
+                    println!("branch {label}: no succinct rollup, nothing to compact");
+                    continue;
+                }
+            }
+        };
+        // One range is already a root. Merging it with itself would rewrite
+        // identical bytes under a new entity for no gain, so say so and move
+        // on rather than doing expensive nothing.
+        if manifest.ranges().len() < 2 {
+            println!(
+                "branch {label}: {} range(s) — already compact",
+                manifest.ranges().len()
+            );
+            continue;
+        }
+
+        let started = std::time::Instant::now();
+        let (merged_range, prepared) = {
+            let reader = pile.reader().map_err(|e| anyhow!("reader: {e:?}"))?;
+            let ranges: Vec<_> = manifest
+                .ranges()
+                .iter()
+                .map(|r| r.range().clone())
+                .collect();
+            let merged = {
+                let mut dag = StoredCommitDag::new(&reader);
+                convex_union(&mut dag, &ranges).map_err(|e| anyhow!("convex union: {e:?}"))?
+            };
+            let mut segments = Vec::new();
+            for entry in manifest.ranges() {
+                for artifact in entry.artifacts() {
+                    segments.push(
+                        kind.attach(&reader, artifact)
+                            .map_err(|e| anyhow!("attach artifact: {e:?}"))?,
+                    );
+                }
+            }
+            let prepared = kind
+                .merge(&segments)
+                .map_err(|e| anyhow!("merge segments: {e:?}"))?;
+            (merged, prepared)
+        };
+
+        let mut stored = Vec::with_capacity(prepared.len());
+        for artifact in prepared {
+            stored.push(
+                store_artifact(&mut pile, &kind, artifact)
+                    .map_err(|e| anyhow!("store merged artifact: {e:?}"))?,
+            );
+        }
+
+        let Some(mut head_set) = read_branch_meta(&mut pile, branch_id)? else {
+            continue;
+        };
+        // Replace rather than append: with the old ranges stripped the merged
+        // record lands alone, which is what a root IS. It sits at level 0
+        // because `append_stored_range` assigns levels by carry and there is
+        // nothing to carry against — so a compacted root and a one-shot build
+        // are indistinguishable by level, and neither the tier nor the count
+        // can tell you which happened.
+        let recipe = manifest.recipe();
+        strip_recipe_manifest(&mut head_set, recipe);
+        append_stored_range(&mut pile, &kind, merged_range, stored, &mut head_set)
+            .map_err(|e| anyhow!("append merged range: {e:?}"))?;
+        write_branch_meta(&mut pile, branch_id, head_set)?;
+
+        println!(
+            "branch {label}: compacted {} ranges into 1 in {:.1}s",
+            manifest.ranges().len(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    pile.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+    Ok(())
 }
