@@ -79,6 +79,21 @@ pub enum KindCommand {
         #[arg(long)]
         signing_key: Option<PathBuf>,
     },
+    /// Which segments answer the history up to a commit.
+    ///
+    /// The point of retaining merged inputs: a query "as of an earlier
+    /// commit" is a SELECTION over artifacts that already exist, not a
+    /// replay of the commit chain. This reports the cover — how many
+    /// segments, at which tiers — so the saving is visible before anyone
+    /// builds a query engine on top of it.
+    Cover {
+        pile: PathBuf,
+        /// Commit to look back from (hex prefix of its handle).
+        #[arg(long)]
+        at: String,
+        #[arg(long)]
+        branch: Option<String>,
+    },
     /// Remove this kind's manifest, retaining every commit.
     ///
     /// The commits are the data; a manifest is a derived claim about them,
@@ -108,6 +123,7 @@ pub fn run(cmd: RollupCommand) -> Result<()> {
                 branch,
                 signing_key,
             } => archive::compact(pile, branch, signing_key),
+            KindCommand::Cover { pile, at, branch } => archive::cover(pile, at, branch),
             KindCommand::Drop {
                 pile,
                 branch,

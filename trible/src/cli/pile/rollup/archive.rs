@@ -285,6 +285,70 @@ fn chain_oldest_first(pile: &mut Pile, branch_id: Id) -> Result<Vec<CommitHandle
     Ok(chain)
 }
 
+/// `trible pile rollup archive cover <pile> --at <commit-prefix>`
+pub fn cover(pile_path: PathBuf, at: String, branch: Option<String>) -> Result<()> {
+    let mut pile = super::super::open_refreshed(&pile_path)?;
+    let want_prefix = hex::decode(&at).map_err(|e| anyhow!("commit {at:?}: {e}"))?;
+    let selected = branches(&mut pile, branch.as_deref())?;
+
+    for branch_id in selected {
+        let name = branch_name(&mut pile, branch_id);
+        let label = match &name {
+            Some(n) => format!("{n:?} ({branch_id:X})"),
+            None => format!("{branch_id:X}"),
+        };
+        let chain = chain_oldest_first(&mut pile, branch_id)?;
+        let Some(cut) = chain
+            .iter()
+            .position(|h| h.raw.starts_with(&want_prefix))
+        else {
+            println!("branch {label}: no commit matching {at:?}");
+            continue;
+        };
+
+        // History up to and including that commit — the prefix a historical
+        // query asks about.
+        let mut wanted = triblespace_core::repo::CommitSet::new();
+        for handle in &chain[..=cut] {
+            wanted.insert(&triblespace_core::patch::Entry::new(&handle.raw));
+        }
+
+        let manifest = {
+            let mut home = IndexHome::new(&mut pile, branch_id, SuccinctRollup::new());
+            match home.read_manifest() {
+                Ok(m) => m,
+                Err(_) => {
+                    println!("branch {label}: no succinct rollup");
+                    continue;
+                }
+            }
+        };
+        match manifest.cover(&wanted) {
+            Ok(selection) => {
+                let mut tiers: BTreeMap<u64, usize> = BTreeMap::new();
+                for &i in &selection {
+                    *tiers.entry(manifest.ranges()[i].level()).or_default() += 1;
+                }
+                println!(
+                    "branch {label}: history through commit {} of {} is covered by \
+                     {} segment(s) {tiers:?}",
+                    cut + 1,
+                    chain.len(),
+                    selection.len()
+                );
+                println!(
+                    "  a replay would read {} commit(s); this reads {} artifact(s)",
+                    cut + 1,
+                    selection.len()
+                );
+            }
+            Err(e) => println!("branch {label}: {e}"),
+        }
+    }
+    pile.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+    Ok(())
+}
+
 pub fn build(
     pile_path: PathBuf,
     branch: Option<String>,
