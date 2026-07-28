@@ -642,6 +642,13 @@ impl BindingStore {
         }
     }
 
+    /// How far `variable`'s level cursor has run — the count of entries the
+    /// level has consumed or skipped. With `Level::proposed` this bounds the
+    /// candidates still pending without scanning the liveness words.
+    pub(crate) fn consumed(&self, variable: VariableId) -> usize {
+        self.levels[variable].pos
+    }
+
     /// Consumes up to `width` further live candidates from `variable`'s
     /// level and writes the child frontier's rows into `out`, recording
     /// each child row's parent row number in `parents_out`.
@@ -1523,6 +1530,30 @@ pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 /// shapes that actually occur, and they are exactly protected.
 pub const INITIAL_FRONTIER_WIDTH: usize = 1;
 
+/// Factor a level's chunk width grows by after each chunk, from
+/// [`INITIAL_FRONTIER_WIDTH`] up to the query's ceiling.
+///
+/// # Why a base, and why not two
+///
+/// A ramp's cost is not its number of steps, it is the size of its LAST
+/// chunk. Ramping by `b` consumes `1 + b + b^2 + … + b^k`, of which the
+/// final chunk `b^k` is `(b-1)/b` of the total — so the widest frontier a
+/// level can build is `N - N/b`, and the peak is what batching exists to
+/// produce. At `b = 2` that is `N/2`: doubling throws away half the peak,
+/// which is the whole of the measured 2048 -> 512 that got the geometric
+/// ramp rejected. The failure was the base, not the ramp.
+///
+/// At `b = 8` the peak is `7N/8` and a level reaches a 16384 ceiling in
+/// `log8(16384) ~ 4.7` chunks rather than doubling's fourteen — the
+/// amortised expansion overhead stops mattering well before the peak does.
+///
+/// A base at or above the ceiling reproduces the one-narrow-chunk-then-
+/// ceiling schedule this replaced, which is the control arm to measure
+/// against. Base `1` is NOT that control — `width * 1` never grows, so it
+/// pins the engine to a width-1 frontier and reproduces the pre-batching
+/// engine instead. Both are useful arms; they are not the same arm.
+pub const FRONTIER_RAMP_BASE: usize = 8;
+
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
@@ -2088,10 +2119,39 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                 &mut self.parents,
             )
         };
-        // Widen the next chunk this level hands down: one narrow chunk to
-        // protect the caller who wants a single row, then the ceiling.
+        // Widen the next chunk this level hands down. The first chunk is one
+        // binding, so a caller who stops after one row pays exactly what
+        // depth-first paid; after that the width climbs by
+        // `FRONTIER_RAMP_BASE` to the ceiling, which serves the caller who
+        // wants a handful of rows without surrendering the peak (see
+        // `FRONTIER_RAMP_BASE` for why the base is what decides that).
+        let consumed = self.bindings.consumed(variable);
         if let Some(top) = self.stack.last_mut() {
-            top.width = self.width;
+            let next = top
+                .width
+                .saturating_mul(FRONTIER_RAMP_BASE)
+                .min(self.width);
+            // Never leave a tail smaller than the chunk that would precede
+            // it. `proposed - consumed` over-counts (it cannot see which
+            // entries confirm already killed), so this merges conservatively
+            // — it can decline a merge it should have made, never force one
+            // it should not. Both branches are O(1): the level already knows
+            // how many candidates it proposed and how far the cursor ran.
+            let remaining = top.proposed.saturating_sub(consumed);
+            top.width = if remaining < next.saturating_mul(2) {
+                // `.min(self.width)` is load-bearing, not belt-and-braces:
+                // `remaining` is bounded by the region, not by the ceiling,
+                // so merging a tail without it hands down a chunk up to
+                // twice the width the caller asked for. Measured before the
+                // cap: 134 of 300 registry spans exceeded a 16384 ceiling,
+                // worst at 1.93x — and `width` is a ceiling that the
+                // `O(width · variables · depth)` frontier-memory bound is
+                // stated against. At the ceiling the merge is a no-op, which
+                // is right: a level already running flat has no ramp tail.
+                remaining.max(next).min(self.width)
+            } else {
+                next
+            };
         }
 
         if rows == 0 {

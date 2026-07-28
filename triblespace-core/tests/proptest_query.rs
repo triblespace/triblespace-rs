@@ -951,13 +951,20 @@ fn deep_levels_see_a_wide_frontier() {
     let widths = widths.lock().unwrap();
     assert_eq!(
         widths.as_slice(),
-        &[1, 1, 39],
-        "root, then one narrow chunk, then the remaining 39 in one batch"
+        &[1, 1, 8, 31],
+        "root, one narrow chunk, then the ramp climbing by FRONTIER_RAMP_BASE"
     );
-    // The schedule is a schedule, not a cap — every root candidate is
-    // still expanded exactly once, and the widest batch is within one row
-    // of what a flat full-width engine would have built.
+    // The schedule is a schedule, not a cap — every root candidate is still
+    // expanded exactly once.
     assert_eq!(widths[1..].iter().sum::<usize>(), 40);
+    // And the ramp keeps most of the peak. A ramp's cost is the size of its
+    // LAST chunk: at base 2 the tail is half the level (which is why the
+    // geometric ramp was rejected), at base 8 it is the large majority. 31
+    // of 40 here; the 512-value fixture below shows the asymptote cleanly.
+    assert!(
+        *widths[1..].iter().max().unwrap() * 4 >= 40 * 3,
+        "the ramp must keep at least three quarters of the peak, got {widths:?}"
+    );
 }
 
 #[test]
@@ -1244,12 +1251,19 @@ fn the_short_circuiting_query_still_sees_the_full_width_afterwards() {
     let stats = query.stats();
     assert_eq!(query.count(), 512 * 512);
 
-    // Root, the one-row chunk, then the other 511 in a single batch.
-    assert_eq!(widths.lock().unwrap().as_slice(), &[1, 1, 511]);
+    // Root, the one-row latency chunk, then the ramp: 8, 64, and the rest.
+    assert_eq!(widths.lock().unwrap().as_slice(), &[1, 1, 8, 64, 439]);
+    // This is the number the whole ramp design turns on. A ramp by `b`
+    // spends `(b^k - 1)/(b - 1)` getting up to speed, so the final — and
+    // widest — chunk is `N` minus that. At b = 2 it is N/2, which halves
+    // the peak and is exactly why the geometric ramp lost. At b = 8 the
+    // run-up costs 1 + 8 + 64 = 73 of 512, leaving 439: eighty-six percent
+    // of what a flat full-width engine would have built, for a schedule
+    // that also serves the caller who wanted three rows.
     assert_eq!(
         stats.widest(),
-        511,
-        "the batch must reach the ceiling the fixture allows, not half of it"
+        439,
+        "the ramp must keep the large majority of the peak, not half of it"
     );
 }
 
@@ -1387,4 +1401,28 @@ fn a_fragmented_frontier_keeps_every_row() {
         wide_stats.1,
         wide_stats.0
     );
+}
+
+/// `with_frontier_width` is a CEILING, and the ramp must not lift it.
+///
+/// The tail merge — never leave a remainder smaller than the chunk before
+/// it — reads its remainder off the region, which is bounded by the level's
+/// candidate count and not by the caller's width. Without a cap it handed
+/// down chunks up to twice the ceiling; on the 100-query registry that was
+/// 134 of 300 spans, worst at 1.93x. Nothing else in this suite noticed,
+/// because the ceiling was documented and never asserted.
+#[test]
+fn the_ramp_never_exceeds_the_width_ceiling() {
+    let values: Vec<[u8; 32]> = (0..512u32).map(Chain::node).collect();
+    for ceiling in [1usize, 2, 3, 7, 8, 9, 63, 64, 65, 100, 511, 512, 4096] {
+        let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rows = cross_product_rows(&values, ceiling, std::sync::Arc::clone(&widths));
+        assert_eq!(rows.len(), 512 * 512, "ceiling {ceiling} changed the bag");
+        let widths = widths.lock().unwrap();
+        let worst = *widths.iter().max().unwrap();
+        assert!(
+            worst <= ceiling.max(1),
+            "ceiling {ceiling} exceeded: widest chunk {worst} in {widths:?}"
+        );
+    }
 }
