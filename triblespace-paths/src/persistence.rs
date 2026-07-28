@@ -394,7 +394,14 @@ impl PathRollup {
                 actual: snapshot.manifest().frontier().to_vec(),
             }));
         }
-        let summaries = home.attach_manifest(snapshot.manifest())?;
+        // The ACTIVE cover, not the whole manifest. A carry retains the
+        // records it merged, so a root and its children both sit here and
+        // derive the same commits; attaching all of them would feed the same
+        // edges into `merge_all` from several tiers at once. `active` is the
+        // roots of the forest — exactly one derivation of each commit.
+        let manifest = snapshot.manifest();
+        let active = manifest.active();
+        let summaries = home.attach_selection(manifest, &active)?;
         let summary = if summaries.is_empty() {
             PathSummary::from_edges(self.automaton.clone(), [])
         } else {

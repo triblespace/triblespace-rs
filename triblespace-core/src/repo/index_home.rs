@@ -1375,13 +1375,18 @@ where
         Ok(segments)
     }
 
-    /// Attach every artifact in the manifest.
+    /// Attach every artifact in the manifest, at every tier.
     ///
-    /// Correct only while the manifest's ranges form a PARTITION — which
-    /// holds today because a fanout carry deletes the records it merged. Once
-    /// merged inputs are retained so that historical spans stay queryable,
-    /// this over-counts and [`attach_selection`](Self::attach_selection) with
-    /// a [`Manifest::cover`] is the right call.
+    /// **Almost certainly not what you want.** A carry retains the records it
+    /// merged, so a root and its children both sit in the manifest and derive
+    /// the same commits — this reads each of them once per tier. Rows stay
+    /// correct (`UnionConstraint` dedups) but the waste grows with depth.
+    ///
+    /// [`attach_all`](Self::attach_all) attaches the active cover and is the
+    /// right default; [`attach_selection`](Self::attach_selection) with
+    /// [`Manifest::expand`] or [`Manifest::cover`] chooses a different one.
+    /// This exists for inspecting or repairing a manifest, where seeing every
+    /// record IS the point.
     pub fn attach_manifest(
         &mut self,
         manifest: &Manifest<K>,
