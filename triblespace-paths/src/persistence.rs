@@ -789,11 +789,22 @@ mod tests {
         }
         let reader = storage.reader().unwrap();
         let compacted = Manifest::from_tribles(&manifest, &reader, &rollup).unwrap();
-        assert_eq!(compacted.ranges().len(), 1);
-        assert_eq!(compacted.ranges()[0].level(), 1);
-        assert_eq!(compacted.ranges()[0].range().start(), &[commits[0]]);
-        assert_eq!(compacted.ranges()[0].range().end(), &[commits[FANOUT - 1]]);
-        assert_eq!(compacted.ranges()[0].artifacts().len(), 1);
+        // A carry RETAINS the records it merged, so the manifest holds the
+        // four leaves and the level-1 record over them. What a reader
+        // attaches is the ACTIVE cover — the roots of the forest — and that
+        // is the one merged record.
+        assert_eq!(compacted.ranges().len(), FANOUT + 1);
+        let active = compacted.active();
+        assert_eq!(active.len(), 1, "expected the carry alone to be active");
+        let root = &compacted.ranges()[active[0]];
+        assert_eq!(root.level(), 1);
+        assert_eq!(root.range().start(), &[commits[0]]);
+        assert_eq!(root.range().end(), &[commits[FANOUT - 1]]);
+        assert_eq!(root.artifacts().len(), 1);
+        // The lineage is recorded, not implied: the root names every leaf it
+        // consumed, which is what makes a historical cover a selection rather
+        // than a replay.
+        assert_eq!(root.child_records().len(), FANOUT);
 
         let empty = TribleSet::new();
         let empty_projection = store_commit(&mut storage, &empty, parent);
@@ -807,7 +818,9 @@ mod tests {
         .unwrap();
         let reader = storage.reader().unwrap();
         let with_empty = Manifest::from_tribles(&manifest, &reader, &rollup).unwrap();
-        assert_eq!(with_empty.ranges().len(), 2);
+        // The retained leaves, the carry, and the new empty projection.
+        assert_eq!(with_empty.ranges().len(), FANOUT + 2);
+        assert_eq!(with_empty.active().len(), 2);
         assert!(with_empty.ranges().iter().any(|range| {
             range.range().start() == [empty_projection] && range.artifacts().is_empty()
         }));
