@@ -128,6 +128,11 @@ where
         // contract check is exhaustive here rather than sampled.
         let mut relevant_rows: SmallVec<[usize; 8]> =
             SmallVec::from_elem(0, self.constraints.len());
+        // Row 0's estimates, kept for confirmer ordering below. This loop
+        // already computes every child's estimate on every row and discards
+        // it, so retaining the first row's costs no extra `estimate` call.
+        let mut first_row_estimate: SmallVec<[usize; 8]> =
+            SmallVec::from_elem(usize::MAX, self.constraints.len());
         for row in 0..rows {
             let binding = frontier.row(row);
             let mut best = usize::MAX;
@@ -136,6 +141,9 @@ where
                 if let Some(estimate) = c.estimate(variable, &binding) {
                     relevant[i] = true;
                     relevant_rows[i] += 1;
+                    if row == 0 {
+                        first_row_estimate[i] = estimate;
+                    }
                     if best_child == usize::MAX || estimate < best {
                         best = estimate;
                         best_child = i;
@@ -159,11 +167,19 @@ where
             return;
         }
 
-        let confirmers: SmallVec<[usize; 8]> = relevant
+        let mut confirmers: SmallVec<[usize; 8]> = relevant
             .iter()
             .enumerate()
             .filter_map(|(i, &r)| r.then_some(i))
             .collect();
+        // Cheapest child filters first, so later confirmers see fewer live
+        // entries. Same rule `confirm` applies, for the same reason: kills
+        // conjoin, so confirmer order is a pure cost heuristic and the
+        // batch's first row can supply it for the whole pass. These two
+        // paths previously disagreed — `confirm` sorted, this one ran in
+        // declaration order — which was an undefended inconsistency rather
+        // than a decision.
+        confirmers.sort_unstable_by_key(|&i| first_row_estimate[i]);
 
         let single = choice.iter().all(|&c| c == choice[0]);
         if single {
