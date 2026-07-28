@@ -138,6 +138,35 @@ pub type WgpuContext = GpuContext<WgpuRuntime>;
 /// it can dispatch.
 pub const DEFAULT_MIN_CONFIRM_BATCH: usize = 16384;
 
+/// Live-candidate floor for dispatching a **range** confirm to the device.
+///
+/// Lower than [`DEFAULT_MIN_CONFIRM_BATCH`] because the two arms have
+/// genuinely different cost curves and one constant cannot serve both. A
+/// range confirm carries real per-candidate probe work — a universe search
+/// and, for the double-bound shape, a wavelet rank — which is exactly what
+/// the device absorbs. Membership does one search and one boundary compare
+/// per candidate, with no rank and no per-parent work to move, so it has far
+/// less to gain and needs a much larger region before it gains it.
+///
+/// Measured by `confirm_crossover_sweep` on a 262,135-trible archive
+/// (cpu/gpu, higher is better for the device):
+///
+/// | region | membership | range |
+/// |--------|-----------:|------:|
+/// | 1024   | 0.21       | 0.57  |
+/// | 4096   | 0.59       | 1.61  |
+/// | 16384  | 1.00       | 2.80  |
+/// | 65536  | 1.24       | 3.41  |
+///
+/// Membership breaks even at 16384 almost exactly, so its floor is right
+/// where it was. Range is already winning by 4096, and at the old shared
+/// floor everything between the two was being handed to the CPU while the
+/// device would have been up to 2.8x faster. 8192 is deliberately
+/// conservative rather than the measured ~2.5k crossover: the multi-parent
+/// sweep that motivated device-resolved bands put the range crossover nearer
+/// 6-8k, and 8192 is the value both measurements agree is a win.
+pub const DEFAULT_RANGE_MIN_CONFIRM_BATCH: usize = 8192;
+
 /// Observational dispatch counters for one [`WgpuSuccinctArchive`].
 ///
 /// Counters use relaxed atomics: snapshots taken after query completion are
@@ -623,6 +652,7 @@ where
     /// Resident Ring columns in canonical [`SuccinctRotation`] order.
     ring: [WgpuWaveletMatrix; SuccinctRotation::ALL.len()],
     min_confirm_batch: usize,
+    range_min_confirm_batch: usize,
     stats: ConfirmStats,
 }
 
@@ -712,6 +742,7 @@ where
             v_bounds,
             ring,
             min_confirm_batch: DEFAULT_MIN_CONFIRM_BATCH,
+            range_min_confirm_batch: DEFAULT_RANGE_MIN_CONFIRM_BATCH,
             stats: ConfirmStats::default(),
         })
     }
@@ -720,19 +751,39 @@ where
     ///
     /// Zero forces every routed confirm through WGPU (parity testing);
     /// `usize::MAX` disables the device path without dropping residency.
+    /// Sets the floor for **every** arm. Callers that want the extremes —
+    /// `0` to force the device, `usize::MAX` to force the CPU — get exactly
+    /// that, which is why this stayed a single knob rather than becoming a
+    /// per-arm one.
     pub fn with_min_confirm_batch(mut self, min_confirm_batch: usize) -> Self {
         self.min_confirm_batch = min_confirm_batch;
+        self.range_min_confirm_batch = min_confirm_batch;
         self
     }
 
     /// Changes the minimum live-candidate region size dispatched to the device.
+    /// Sets the floor for **every** arm; see
+    /// [`with_min_confirm_batch`](Self::with_min_confirm_batch).
     pub fn set_min_confirm_batch(&mut self, min_confirm_batch: usize) {
         self.min_confirm_batch = min_confirm_batch;
+        self.range_min_confirm_batch = min_confirm_batch;
     }
 
     /// Returns the minimum live-candidate region size dispatched to the device.
     pub fn min_confirm_batch(&self) -> usize {
         self.min_confirm_batch
+    }
+
+    /// The floor for range confirms, which is separate because the arms'
+    /// cost curves are.
+    pub fn range_min_confirm_batch(&self) -> usize {
+        self.range_min_confirm_batch
+    }
+
+    /// Overrides the range floor alone, leaving membership where it is.
+    pub fn with_range_min_confirm_batch(mut self, batch: usize) -> Self {
+        self.range_min_confirm_batch = batch;
+        self
     }
 
     /// Returns the canonical CPU archive wrapped by this adapter.
@@ -1145,13 +1196,16 @@ where
     /// The device evaluation of one confirm call over a whole frontier,
     /// mirroring the CPU arm dispatch. Returns the number of parent-table
     /// rows the dispatch resolved.
+    /// Dispatches a region whose arm the caller has already resolved. Taking
+    /// the plan rather than the variable keeps the routing decision and the
+    /// dispatch reading the same one, and means `plan` is computed once.
     fn confirm_gpu(
         &self,
-        variable: VariableId,
+        plan: ConfirmPlan,
         frontier: &Frontier<'_>,
         cands: &mut Candidates<'_>,
     ) -> jerky::Result<usize> {
-        match self.plan(variable, &frontier.row(0)) {
+        match plan {
             ConfirmPlan::Membership { axis } => {
                 self.gpu.confirm_membership_gpu(axis, cands)?;
                 Ok(0)
@@ -1219,13 +1273,24 @@ where
         if frontier.is_empty() || cands.is_empty() {
             return;
         }
+        // Resolve the arm before testing the size: `plan` takes no region,
+        // only the variable and which term positions are bound, so it is
+        // free to hoist — and the arms cross over at very different region
+        // sizes, so one floor for both is wrong at both ends.
+        let plan = self.plan(variable, &frontier.row(0));
+        let floor = match plan {
+            ConfirmPlan::Membership { .. } => self.gpu.min_confirm_batch,
+            ConfirmPlan::Base { .. } | ConfirmPlan::Restrict { .. } => {
+                self.gpu.range_min_confirm_batch
+            }
+        };
         let live = count_live(cands);
-        if live < self.gpu.min_confirm_batch {
+        if live < floor {
             self.gpu.stats.record_cpu(cands.len());
             self.inner.confirm(variable, frontier, cands);
             return;
         }
-        match self.confirm_gpu(variable, frontier, cands) {
+        match self.confirm_gpu(plan, frontier, cands) {
             Ok(parents) => self.gpu.stats.record_gpu(cands.len(), parents),
             Err(_) => {
                 // The helpers only write liveness after a complete verdict
