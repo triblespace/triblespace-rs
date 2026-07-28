@@ -1375,46 +1375,19 @@ where
         Ok(segments)
     }
 
-    /// Attach every artifact in the manifest, at every tier.
-    ///
-    /// **Almost certainly not what you want.** A carry retains the records it
-    /// merged, so a root and its children both sit in the manifest and derive
-    /// the same commits — this reads each of them once per tier. Rows stay
-    /// correct (`UnionConstraint` dedups) but the waste grows with depth.
-    ///
-    /// [`attach_all`](Self::attach_all) attaches the active cover and is the
-    /// right default; [`attach_selection`](Self::attach_selection) with
-    /// [`Manifest::expand`] or [`Manifest::cover`] chooses a different one.
-    /// This exists for inspecting or repairing a manifest, where seeing every
-    /// record IS the point.
-    pub fn attach_manifest(
-        &mut self,
-        manifest: &Manifest<K>,
-    ) -> Result<Vec<K::Segment>, IndexError> {
-        let reader = self.storage.reader().map_err(storage_error)?;
-        let mut segments = Vec::new();
-        for range in &manifest.ranges {
-            for artifact in &range.artifacts {
-                segments.push(
-                    self.kind
-                        .attach(&reader, artifact)
-                        .map_err(IndexError::Artifact)?,
-                );
-            }
-        }
-        Ok(segments)
-    }
-
-    /// Parse and attach the current manifest without a source checkout.
     /// Attach the current cover: every record nothing rolled up further.
     ///
-    /// Not the whole manifest. Merged inputs are retained now, so a root and
-    /// its children both sit in the manifest and describe the same commits —
-    /// unioning all of them would read every trible from several artifacts.
-    /// `UnionConstraint` dedups, so that is merely wasteful rather than
-    /// wrong, but it is wasteful in proportion to the tree's depth and there
-    /// is no reason to pay it.
-    pub fn attach_all(&mut self) -> Result<Vec<K::Segment>, IndexError> {
+    /// Named for what it returns rather than for how much of the manifest it
+    /// touches. It was `attach_cover` while a carry deleted the records it
+    /// merged and "every record" and "one derivation of each commit" were
+    /// the same set. Retention split those, and the old name then described
+    /// the wrong one — after a major compaction it would have attached 182
+    /// records where 1 answers the same query.
+    ///
+    /// For a different cover, use [`attach_selection`](Self::attach_selection)
+    /// with [`Manifest::expand`] (coarse to fine) or [`Manifest::cover`] (a
+    /// commit set).
+    pub fn attach_cover(&mut self) -> Result<Vec<K::Segment>, IndexError> {
         let manifest = self.read_manifest()?;
         let active = manifest.active();
         self.attach_selection(&manifest, &active)
@@ -2032,7 +2005,7 @@ mod active_tests {
     }
 
     /// Leaves with nothing above them are all active — the pre-carry state,
-    /// and the case `attach_all` must still get right.
+    /// and the case `attach_cover` must still get right.
     #[test]
     fn unrolled_leaves_are_all_active() {
         let kind = SuccinctRollup::new();

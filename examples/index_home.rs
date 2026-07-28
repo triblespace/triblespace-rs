@@ -46,10 +46,10 @@ fn main() {
     );
 
     // 3) Query WITHOUT a checkout: one branch-head lookup, a bounded number
-    //    of segment fetches (`attach_all`), then a union query across the
+    //    of segment fetches (`attach_cover`), then a union query across the
     //    segments. No commit walk, no materialisation of the branch.
     let mut home = IndexHome::new(repo.storage_mut(), *branch_id, SuccinctRollup::new());
-    let segments = home.attach_all().expect("attach segments");
+    let segments = home.attach_cover().expect("attach segments");
     println!("manifest names {} segment(s)", segments.len());
 
     let union = SuccinctRollup::union(&segments);
