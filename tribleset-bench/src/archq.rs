@@ -5,7 +5,7 @@
 //! Until now the suite BUILT an archive (`arch/build_ram/total`) and
 //! never queried it, so the only evidence about `triblespace-gpu`'s
 //! batched confirm came from F10 — a synthetic fixture *constructed*
-//! to straddle `DEFAULT_MIN_CONFIRM_BATCH`. That says the routing
+//! to straddle `DEFAULT_MIN_CONFIRM_BATCH_RANGE`. That says the routing
 //! works; it says nothing about whether real queries produce regions
 //! that big. This module closes that gap in two independent halves:
 //!
@@ -73,7 +73,7 @@ use crate::wd_schema::{AnyBlobReader, Dataset};
 /// routing happens on that path, and the histogram itself is
 /// threshold-independent.
 #[cfg(feature = "gpu")]
-pub const CONFIRM_THRESHOLD: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH;
+pub const CONFIRM_THRESHOLD: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE;
 /// Reporting-only mirror of the routing threshold; see the gpu-gated
 /// sibling.
 #[cfg(not(feature = "gpu"))]
@@ -258,6 +258,11 @@ pub struct FrontierSummary {
     pub proposals: u64,
     pub inplace_descents: u64,
     pub copied_descents: u64,
+    /// Summed `FrontierStats::variable_groups` — how often a frontier's rows
+    /// disagreed about which variable to bind next. Divided by `expansions`
+    /// this is the fragmentation number: 1.0 means no frontier ever split,
+    /// so there is never more than one group to choose an order among.
+    pub variable_groups: u64,
 }
 
 #[cfg(feature = "frontier")]
@@ -281,6 +286,7 @@ pub fn frontier_summary() -> FrontierSummary {
         out.expansions += s.expansions();
         out.rows += s.rows();
         out.proposals += s.proposals();
+        out.variable_groups += s.variable_groups();
         // The ceiling question needs counters the batched protocol
         // shipped without; a subject that cannot answer reports zero
         // rather than a guess.

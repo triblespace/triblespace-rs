@@ -96,7 +96,7 @@ fn fixture() -> Fixture {
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let gpu = WgpuSuccinctArchive::new(archive)
         .expect("resident wrap succeeds")
-        .with_min_confirm_batch(0);
+        .with_min_confirm_batch_uniform(0);
     Fixture {
         gpu,
         entities: entity_ids.iter().map(id_value).collect(),
@@ -377,7 +377,7 @@ fn all_dead_region_stays_all_dead() {
 #[test]
 fn below_threshold_falls_back_to_cpu() {
     let mut fixture = fixture();
-    fixture.gpu.set_min_confirm_batch(usize::MAX);
+    fixture.gpu.set_min_confirm_batch_uniform(usize::MAX);
     let v = vars();
     let frontier = Frontier::default();
     let candidates = candidate_pool(&fixture, 17, 48);
@@ -445,7 +445,7 @@ fn confirm_crossover_sweep() {
     );
     let gpu = WgpuSuccinctArchive::new(archive)
         .expect("resident wrap succeeds")
-        .with_min_confirm_batch(0);
+        .with_min_confirm_batch_uniform(0);
 
     let absent: Vec<RawInline> = (0..65536).map(|k| free_value(0x20, k)).collect();
     let v = vars();
@@ -537,7 +537,7 @@ fn confirm_crossover_sweep() {
         }
     }
     println!(
-        "\ncurrent DEFAULT_MIN_CONFIRM_BATCH = {}",
-        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH
+        "\ncurrent DEFAULT_MIN_CONFIRM_BATCH_RANGE = {}",
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE
     );
 }

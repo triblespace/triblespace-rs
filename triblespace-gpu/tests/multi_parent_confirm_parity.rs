@@ -93,7 +93,7 @@ fn multi_parent_gpu_confirm_matches_cpu_and_width_one() {
     // small fixture exercises the multi-parent kernel path.
     let gpu = WgpuSuccinctArchive::new(archive)
         .expect("resident wrap succeeds")
-        .with_min_confirm_batch(0);
+        .with_min_confirm_batch_uniform(0);
 
     let narrow = rows(&gpu, 1);
     assert_eq!(narrow, cpu_base, "GPU width-1 diverges from CPU");

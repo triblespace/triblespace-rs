@@ -119,7 +119,7 @@ fn fixture(entities: u32, attributes: u32, values: u32) -> Fixture {
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let gpu = WgpuSuccinctArchive::new(archive)
         .expect("resident wrap succeeds")
-        .with_min_confirm_batch(0);
+        .with_min_confirm_batch_uniform(0);
     Fixture {
         gpu,
         entities: entity_ids.iter().map(id_value).collect(),
@@ -536,7 +536,7 @@ fn mixed_parent_regions_fall_back_below_threshold() {
     assert!(routed_stats.gpu_confirms > 0, "{routed_stats:?}");
 
     fixture.gpu.reset_stats();
-    fixture.gpu.set_min_confirm_batch(usize::MAX);
+    fixture.gpu.set_min_confirm_batch_uniform(usize::MAX);
     let fallback = pinned_arms(&fixture, 256, pool, false);
     let fallback_stats = fixture.gpu.stats();
 
@@ -672,7 +672,7 @@ fn mixed_parent_crossover_sweep() {
         }
     }
     println!(
-        "\ncurrent DEFAULT_MIN_CONFIRM_BATCH = {}",
-        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH
+        "\ncurrent DEFAULT_MIN_CONFIRM_BATCH_RANGE = {}",
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE
     );
 }

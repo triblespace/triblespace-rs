@@ -1003,11 +1003,11 @@ pub fn f9_total(set: &TribleSet) -> usize {
 // ---------------------------------------------------------------------------
 // F10 — GPU confirm-batch threshold boundary.
 //
-// INTERROGATES: routing hysteresis around `DEFAULT_MIN_CONFIRM_BATCH`,
+// INTERROGATES: routing hysteresis around `DEFAULT_MIN_CONFIRM_BATCH_RANGE`,
 // and threshold rot.
 //
 // `triblespace-gpu` routes a confirm region to the device only when it
-// holds at least `DEFAULT_MIN_CONFIRM_BATCH` live candidates; smaller
+// holds at least `DEFAULT_MIN_CONFIRM_BATCH_RANGE` live candidates; smaller
 // regions run the canonical CPU probes. The threshold is a MEASURED
 // crossover (an M4 Max sweep recorded in its doc comment), which means
 // it is exactly the kind of constant that silently rots. This fixture
@@ -1036,7 +1036,7 @@ pub fn f9_total(set: &TribleSet) -> usize {
 /// F10: the routing threshold, read from the engine so this fixture
 /// cannot drift away from it.
 #[cfg(feature = "gpu")]
-pub const F10_THRESHOLD: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH;
+pub const F10_THRESHOLD: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE;
 
 /// F10: candidates just BELOW the routing threshold (CPU probes).
 #[cfg(feature = "gpu")]

@@ -136,7 +136,23 @@ pub type WgpuContext = GpuContext<WgpuRuntime>;
 /// 16384 (device time for a 262k-candidate 2-bound region: 13.4 ms → 7.3 ms),
 /// because the host no longer ranks a wavelet once per frontier row before
 /// it can dispatch.
-pub const DEFAULT_MIN_CONFIRM_BATCH: usize = 16384;
+pub const DEFAULT_MIN_CONFIRM_BATCH_RANGE: usize = 8192;
+
+/// Live candidates a **membership** confirm needs before the device beats
+/// the CPU.
+///
+/// The membership arm is one universe search and one boundary compare per
+/// candidate, with no wavelet rank at all — so the CPU path it replaces is
+/// far cheaper than the range arms', and the flat ~1.2-2.6 ms device round
+/// trip takes correspondingly longer to amortise. Measured: 0.72x at 16384
+/// (i.e. a 1.4x LOSS), crossing over only around 24k.
+///
+/// This is the constant that made the old single knob a compromise: 16384
+/// was chosen for the range arms' benefit and knowingly ran membership at a
+/// loss. Splitting the two removes an averaging error rather than adding a
+/// knob — the dispatch already classifies the region as
+/// [`ConfirmPlan::Membership`] or not, so no new information is needed.
+pub const DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP: usize = 24576;
 
 /// Observational dispatch counters for one [`WgpuSuccinctArchive`].
 ///
@@ -622,7 +638,8 @@ where
     v_bounds: DeviceU32Buffer<WgpuRuntime>,
     /// Resident Ring columns in canonical [`SuccinctRotation`] order.
     ring: [WgpuWaveletMatrix; SuccinctRotation::ALL.len()],
-    min_confirm_batch: usize,
+    min_confirm_batch_range: usize,
+    min_confirm_batch_membership: usize,
     stats: ConfirmStats,
 }
 
@@ -711,7 +728,8 @@ where
             a_bounds,
             v_bounds,
             ring,
-            min_confirm_batch: DEFAULT_MIN_CONFIRM_BATCH,
+            min_confirm_batch_range: DEFAULT_MIN_CONFIRM_BATCH_RANGE,
+            min_confirm_batch_membership: DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP,
             stats: ConfirmStats::default(),
         })
     }
@@ -720,22 +738,46 @@ where
     ///
     /// Zero forces every routed confirm through WGPU (parity testing);
     /// `usize::MAX` disables the device path without dropping residency.
-    pub fn with_min_confirm_batch(mut self, min_confirm_batch: usize) -> Self {
-        self.min_confirm_batch = min_confirm_batch;
+    /// Set both routing floors to the same value.
+    ///
+    /// The honest use for this is an ABLATION — forcing every region to the
+    /// device or none of it — not production tuning. Two curves want two
+    /// numbers; if you are reaching for this to pick a middle value, that is
+    /// the compromise this split exists to remove.
+    pub fn with_min_confirm_batch_uniform(mut self, n: usize) -> Self {
+        self.min_confirm_batch_range = n;
+        self.min_confirm_batch_membership = n;
         self
     }
 
-    /// Changes the minimum live-candidate region size dispatched to the device.
-    pub fn set_min_confirm_batch(&mut self, min_confirm_batch: usize) {
-        self.min_confirm_batch = min_confirm_batch;
+    /// Deliberately NOT one setter taking two `usize`s: adjacent positional
+    /// arguments of the same type are silently invertible, and inverting
+    /// these two swaps which cost curve gets which floor — a mistake that
+    /// changes routing without changing any result, so nothing would catch
+    /// it.
+    /// In-place twin of [`with_min_confirm_batch_uniform`](Self::with_min_confirm_batch_uniform);
+    /// same ablation-only caveat.
+    pub fn set_min_confirm_batch_uniform(&mut self, n: usize) {
+        self.min_confirm_batch_range = n;
+        self.min_confirm_batch_membership = n;
     }
 
-    /// Returns the minimum live-candidate region size dispatched to the device.
-    pub fn min_confirm_batch(&self) -> usize {
-        self.min_confirm_batch
+    pub fn set_min_confirm_batch_range(&mut self, n: usize) {
+        self.min_confirm_batch_range = n;
     }
 
-    /// Returns the canonical CPU archive wrapped by this adapter.
+    pub fn set_min_confirm_batch_membership(&mut self, n: usize) {
+        self.min_confirm_batch_membership = n;
+    }
+
+    pub fn min_confirm_batch_range(&self) -> usize {
+        self.min_confirm_batch_range
+    }
+
+    pub fn min_confirm_batch_membership(&self) -> usize {
+        self.min_confirm_batch_membership
+    }
+
     pub fn archive(&self) -> &SuccinctArchive<U> {
         &self.archive
     }
@@ -1147,11 +1189,11 @@ where
     /// rows the dispatch resolved.
     fn confirm_gpu(
         &self,
-        variable: VariableId,
+        plan: ConfirmPlan,
         frontier: &Frontier<'_>,
         cands: &mut Candidates<'_>,
     ) -> jerky::Result<usize> {
-        match self.plan(variable, &frontier.row(0)) {
+        match plan {
             ConfirmPlan::Membership { axis } => {
                 self.gpu.confirm_membership_gpu(axis, cands)?;
                 Ok(0)
@@ -1219,13 +1261,45 @@ where
         if frontier.is_empty() || cands.is_empty() {
             return;
         }
+        // Two cost curves, two floors. The membership arm replaces a far
+        // cheaper CPU path (one universe search and one boundary compare per
+        // candidate, no wavelet rank), so it needs a bigger batch to amortise
+        // the same flat device round trip: measured crossover ~24k against
+        // the range arms' ~6-8k. One averaged knob ran membership at 0.72x —
+        // a 1.4x loss — to buy the range arms their 2.02x.
+        //
+        // Ordered so the CPU path costs nothing new. A region below BOTH
+        // floors cannot route whichever shape it is, so it short-circuits
+        // without classifying; only a region that could route pays for
+        // `plan`, and that call is then handed to `confirm_gpu` so the
+        // dispatch reuses it rather than classifying a second time. This
+        // matters because most regions are small: hoisting `plan` above the
+        // early-out would charge every CPU-bound confirm for a decision it
+        // never uses, which is a cost belonging to the split rather than to
+        // the engine.
         let live = count_live(cands);
-        if live < self.gpu.min_confirm_batch {
+        if live < self
+            .gpu
+            .min_confirm_batch_range
+            .min(self.gpu.min_confirm_batch_membership)
+        {
             self.gpu.stats.record_cpu(cands.len());
             self.inner.confirm(variable, frontier, cands);
             return;
         }
-        match self.confirm_gpu(variable, frontier, cands) {
+        let plan = self.plan(variable, &frontier.row(0));
+        let floor = match plan {
+            ConfirmPlan::Membership { .. } => self.gpu.min_confirm_batch_membership,
+            ConfirmPlan::Base { .. } | ConfirmPlan::Restrict { .. } => {
+                self.gpu.min_confirm_batch_range
+            }
+        };
+        if live < floor {
+            self.gpu.stats.record_cpu(cands.len());
+            self.inner.confirm(variable, frontier, cands);
+            return;
+        }
+        match self.confirm_gpu(plan, frontier, cands) {
             Ok(parents) => self.gpu.stats.record_gpu(cands.len(), parents),
             Err(_) => {
                 // The helpers only write liveness after a complete verdict

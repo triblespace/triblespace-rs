@@ -10,7 +10,7 @@ mod cubecl_backend;
 #[cfg(feature = "wgpu")]
 pub use batch_confirm::{
     WgpuConfirmStats, WgpuContext, WgpuSuccinctArchive, WgpuSuccinctArchiveConstraint,
-    WgpuWaveletMatrix, DEFAULT_MIN_CONFIRM_BATCH,
+    WgpuWaveletMatrix, DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP, DEFAULT_MIN_CONFIRM_BATCH_RANGE,
 };
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 pub use cubecl_backend::CubeClWaveletFreeze;

@@ -87,6 +87,7 @@ struct Cfg {
     /// runs the same set twice (CPU and GPU).
     arch_iters: usize,
     arch_warmup: usize,
+
     verify: Option<std::path::PathBuf>,
 }
 
@@ -397,10 +398,6 @@ fn run_r2(
 // Archive query arm
 // ---------------------------------------------------------------------------
 
-/// Above this trible count the RAM archive build — and with it the
-/// archive query arm, which needs the same resident archive — is
-/// skipped (the portable_bench `--max-ram` default).
-const MAX_RAM: usize = 20_000_000;
 
 /// The per-query suffixes of the phase-1 confirm-region census.
 const ARCH_REGION_SUFFIXES: [&str; 6] = [
@@ -573,13 +570,14 @@ fn run_arch_queries(
                         let f = archq::frontier_summary();
                         println!(
                             "      frontier: widest {} | expansions {} | mean width {:.1} \
-                             | proposals {} | descents {} in-place / {} copied",
+                             | proposals {} | descents {} in-place / {} copied | groups/expansion {:.3}",
                             f.widest,
                             f.expansions,
                             f.mean_width(),
                             f.proposals,
                             f.inplace_descents,
-                            f.copied_descents
+                            f.copied_descents,
+                            if f.expansions>0 {f.variable_groups as f64 / f.expansions as f64} else {0.0}
                         );
                         for (suffix, value) in [
                             ("frontier_widest", f.widest),
@@ -587,6 +585,7 @@ fn run_arch_queries(
                             ("frontier_rows", f.rows),
                             ("frontier_inplace", f.inplace_descents),
                             ("frontier_copied", f.copied_descents),
+                            ("frontier_groups", f.variable_groups),
                         ] {
                             led.outcome(
                                 &format!("arch_regions/{}/{suffix}", q.name),
@@ -660,7 +659,7 @@ fn run_arch_queries(
                     "  {:<32} signal (1 span, {:.0} ms, min_confirm_batch {})",
                     "arch_gpu/attach/total",
                     attach_ns as f64 / 1e6,
-                    gpu.min_confirm_batch()
+                    format!("range {} / membership {}", gpu.min_confirm_batch_range(), gpu.min_confirm_batch_membership())
                 );
                 Some(gpu)
             }
@@ -821,6 +820,8 @@ fn run_sparqloscope_arm<B>(
     table: &[queries::Translated<B>],
     ds: &wd_schema::Dataset<B>,
     baseline: Option<&[Option<String>]>,
+    mut reset_backend: impl FnMut(&wd_schema::Dataset<B>),
+    mut emit_backend: impl FnMut(&mut ledger::ResultsLedger, &wd_schema::Dataset<B>, &str),
 ) -> (Vec<Option<String>>, usize, bool) {
     let mut answers: Vec<Option<String>> = Vec::with_capacity(table.len());
     let mut panicked = 0usize;
@@ -830,6 +831,12 @@ fn run_sparqloscope_arm<B>(
         let mut value: Option<String> = None;
         for k in 0..(cfg.arch_warmup + cfg.arch_iters) {
             let recording = k >= cfg.arch_warmup;
+            // Per-EXECUTION counters, reset OUTSIDE the timed call so the
+            // snapshot after the loop describes the LAST iteration without
+            // charging the reset to its span.
+            reset_backend(ds);
+            #[cfg(feature = "frontier")]
+            archq::reset_frontier_stats();
             m.iterate(recording, base, || {
                 let answer = (t.run)(ds);
                 let ident = answer_ident(&answer.value);
@@ -866,6 +873,32 @@ fn run_sparqloscope_arm<B>(
         // reader must be able to see that the arms agree on real
         // numbers rather than trust that they agreed on nothing.
         println!("      answer {}", value.as_deref().unwrap_or("<panicked>"));
+        // The engine's own view of how wide the frontier actually got on
+        // this query. Without it a "no difference" timing cannot be told
+        // apart from "this query never had a batch to widen".
+        #[cfg(feature = "frontier")]
+        {
+            let f = archq::frontier_summary();
+            for (suffix, value) in [
+                ("frontier_widest", f.widest),
+                ("frontier_expansions", f.expansions),
+                ("frontier_rows", f.rows),
+                ("frontier_proposals", f.proposals),
+                ("frontier_groups", f.variable_groups),
+            ] {
+                led.outcome(&format!("{group}/{}/{suffix}", t.name), "signal", Some(value));
+            }
+            println!(
+                "      frontier: widest {} | expansions {} | mean width {:.1} | proposals {} \
+                 | groups/expansion {:.4}",
+                f.widest,
+                f.expansions,
+                f.mean_width(),
+                f.proposals,
+                if f.expansions > 0 { f.variable_groups as f64 / f.expansions as f64 } else { 0.0 }
+            );
+        }
+        emit_backend(led, ds, t.name);
         answers.push(value);
     }
     (answers, panicked, cross_arm_failure)
@@ -899,11 +932,19 @@ fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) 
         return false;
     };
 
-    // The PATCH load is bounded by the same `--rung` the ladder arm
-    // uses, capped by MAX_RAM: a v2 dataset pile holds hundreds of
-    // millions of tribles, of which only a prefix fits in a resident
-    // TribleSet.
-    let budget = cfg.rung.min(MAX_RAM);
+    // The PATCH load is bounded by the same `--rung` the ladder arm uses,
+    // and by nothing else. A v2 dataset pile holds hundreds of millions of
+    // tribles; how many fit resident is a property of the machine the run
+    // is on, discovered by running out of memory, not decided in advance by
+    // a constant that makes big rungs quietly small.
+    // `--rung` is the ONLY bound on the load. There used to be a second,
+    // hidden one — `MAX_RAM = 20_000_000`, inherited from another tool's
+    // default — that silently clamped it, so every rung above 20M loaded
+    // identical data and a scale ladder measured one scale repeatedly. It
+    // was removed rather than made configurable: a cap you have to remember
+    // to raise is a rake, and this one lay in the grass through an entire
+    // day of measurements without anyone noticing the ladder was flat.
+    let budget = cfg.rung;
     let loaded = match fixtures::quiet_catch(|| {
         wd_schema::Dataset::load_pile_patch(path, budget)
     }) {
@@ -946,6 +987,8 @@ fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) 
         queries::TRANSLATED,
         ds,
         None,
+        |_| {},
+        |_, _, _| {},
     );
     println!(
         "  sparqloscope census              {} ran, {panicked} panicked ({engine_kind} engine / {fold_kind} fold / {periphery_kind} periphery) + {} rpq",
@@ -991,6 +1034,8 @@ fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) 
         queries::TRANSLATED_ARCHIVE,
         &arch_ds,
         Some(&patch_answers),
+        |_| {},
+        |_, _, _| {},
     );
     println!(
         "  sparqloscope_arch census         {} ran, {arch_panicked} panicked",
@@ -1048,7 +1093,7 @@ fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) 
                     "  {:<32} signal (1 span, {:.0} ms, min_confirm_batch {})",
                     "sparqloscope_gpu/attach/total",
                     attach_ns as f64 / 1e6,
-                    gpu.min_confirm_batch()
+                    format!("range {} / membership {}", gpu.min_confirm_batch_range(), gpu.min_confirm_batch_membership())
                 );
                 Some(gpu)
             }
@@ -1099,7 +1144,10 @@ fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) 
                 // much of the whole registry was batchable at all — the
                 // per-query resolution lives on the five-query
                 // `arch_gpu` arm above.
-                gpu_ds.facts.reset_stats();
+                // Per-QUERY routing: the whole point of the comparison is
+                // WHICH queries batch, so the arm total is accumulated from
+                // the per-query snapshots instead of read once at the end.
+                let mut totals = [0u64; 5];
                 let (_, gpu_panicked, gpu_cross_arm) = run_sparqloscope_arm(
                     led,
                     cfg,
@@ -1108,15 +1156,43 @@ fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) 
                     queries::TRANSLATED_WGPU,
                     &gpu_ds,
                     Some(&patch_answers),
+                    |ds| ds.facts.reset_stats(),
+                    |led, ds, name| {
+                        let s = ds.facts.stats();
+                        for (i, (suffix, value)) in [
+                            ("gpu_confirms", s.gpu_confirms),
+                            ("gpu_candidates", s.gpu_candidates),
+                            ("cpu_fallback_confirms", s.cpu_fallback_confirms),
+                            ("cpu_fallback_candidates", s.cpu_fallback_candidates),
+                            ("gpu_errors", s.gpu_errors),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            totals[i] += value;
+                            led.outcome(
+                                &format!("sparqloscope_gpu/{name}/routing/{suffix}"),
+                                "signal",
+                                Some(value),
+                            );
+                        }
+                        println!(
+                            "      routing: {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
+                            s.gpu_confirms,
+                            s.gpu_candidates,
+                            s.cpu_fallback_confirms,
+                            s.cpu_fallback_candidates,
+                            s.gpu_errors
+                        );
+                    },
                 );
                 cross_arm_failure |= gpu_cross_arm;
-                let s = gpu_ds.facts.stats();
                 for (suffix, value) in [
-                    ("gpu_confirms", s.gpu_confirms),
-                    ("gpu_candidates", s.gpu_candidates),
-                    ("cpu_fallback_confirms", s.cpu_fallback_confirms),
-                    ("cpu_fallback_candidates", s.cpu_fallback_candidates),
-                    ("gpu_errors", s.gpu_errors),
+                    ("gpu_confirms", totals[0]),
+                    ("gpu_candidates", totals[1]),
+                    ("cpu_fallback_confirms", totals[2]),
+                    ("cpu_fallback_candidates", totals[3]),
+                    ("gpu_errors", totals[4]),
                 ] {
                     led.outcome(
                         &format!("sparqloscope_gpu/routing/{suffix}"),
@@ -1130,11 +1206,7 @@ fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) 
                 );
                 println!(
                     "      routing (whole arm): {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
-                    s.gpu_confirms,
-                    s.gpu_candidates,
-                    s.cpu_fallback_confirms,
-                    s.cpu_fallback_candidates,
-                    s.gpu_errors
+                    totals[0], totals[1], totals[2], totals[3], totals[4]
                 );
             }
         }
@@ -1251,15 +1323,7 @@ fn main() {
     };
     let mut cross_arm_failure = false;
     if let Some(set) = &dataset {
-        if set.len() > MAX_RAM {
-            led.outcome("arch/build_ram/total", "skip:max-ram", None);
-            println!(
-                "  {:<32} SKIP ({} tribles > max-ram {MAX_RAM})",
-                "arch/build_ram/total",
-                set.len()
-            );
-            skip_arch_queries(&mut led, "skip:max-ram");
-        } else {
+        {
             let mut m = Measure::new("arch/build_ram/total");
             for i in 0..(cfg.build_warmup + cfg.build_iters) {
                 let recording = i >= cfg.build_warmup;

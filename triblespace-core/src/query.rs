@@ -642,6 +642,13 @@ impl BindingStore {
         }
     }
 
+    /// How far `variable`'s level cursor has run — the count of entries the
+    /// level has consumed or skipped. With `Level::proposed` this bounds the
+    /// candidates still pending without scanning the liveness words.
+    pub(crate) fn consumed(&self, variable: VariableId) -> usize {
+        self.levels[variable].pos
+    }
+
     /// Consumes up to `width` further live candidates from `variable`'s
     /// level and writes the child frontier's rows into `out`, recording
     /// each child row's parent row number in `parents_out`.
@@ -1523,6 +1530,48 @@ pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 /// shapes that actually occur, and they are exactly protected.
 pub const INITIAL_FRONTIER_WIDTH: usize = 1;
 
+/// Frontier state a query may hold, in bytes — the ceiling's *real*
+/// justification, and stating it in bytes is the point.
+///
+/// A ceiling exists because batching trades depth-first's `O(depth)` state
+/// for `O(width · variables · depth)`, and an uncapped fan-out level would
+/// materialise an unbounded frontier. That is a memory argument, so the
+/// constant should be a memory quantity.
+///
+/// [`DEFAULT_FRONTIER_WIDTH`] was not one. It was set equal to the GPU
+/// confirm crossover — the point at which a device round trip *stops
+/// losing* — which made one number serve three jobs: a range routing floor,
+/// a membership routing floor, and this. Those are now three constants.
+/// Measured on the 100-query registry, 144 of 300 spans sat exactly at the
+/// old ceiling, i.e. had more candidates and were capped by it.
+///
+/// Per row per depth: `slots * 4` for the index row (`Depth::block`, `u32`),
+/// `slots * 8` for the estimate row (`Depth::estimates`, `usize`), and `4`
+/// for `Depth::order`. Depth is bounded by the variable count, so the search
+/// costs `width * (12 * slots + 4) * (slots + 1)`.
+///
+/// The buffers grow on demand, so this is a cap and not a reservation: a
+/// query whose regions are small never allocates near it.
+pub const FRONTIER_MEMORY_BUDGET: usize = 16 << 30;
+
+/// The width ceiling a `slots`-variable query gets from
+/// [`FRONTIER_MEMORY_BUDGET`], by inverting the per-row cost above.
+///
+/// Never returns zero — a query must hold at least one row to make progress,
+/// and a budget too small for that is a misconfiguration, not a reason to
+/// hang.
+pub const fn frontier_width_for(slots: usize) -> usize {
+    if slots == 0 {
+        return 1;
+    }
+    let width = FRONTIER_MEMORY_BUDGET / ((12 * slots + 4) * (slots + 1));
+    if width == 0 {
+        1
+    } else {
+        width
+    }
+}
+
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
@@ -1825,7 +1874,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             influences,
             unbound: variables,
             slots,
-            width: DEFAULT_FRONTIER_WIDTH,
+            width: frontier_width_for(slots),
             stack: ArrayVec::new(),
             depths: vec![root],
             depth: 0,
