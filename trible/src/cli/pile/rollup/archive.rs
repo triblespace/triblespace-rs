@@ -25,8 +25,8 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::index_home::{
-    append_range, append_stored_range, store_artifact, strip_recipe_manifest, IndexHome, IndexKind,
-    Manifest, SuccinctRollup,
+    append_range, append_rollup_record, store_artifact, strip_recipe_manifest, IndexHome,
+    IndexKind, Manifest, SuccinctRollup,
 };
 use triblespace_core::repo::index_range::{convex_union, CommitRange, StoredCommitDag};
 use triblespace_core::repo::pile::Pile;
@@ -462,22 +462,44 @@ pub fn compact(
         let Some(mut head_set) = read_branch_meta(&mut pile, branch_id)? else {
             continue;
         };
-        // Replace rather than append: with the old ranges stripped the merged
-        // record lands alone, which is what a root IS. It sits at level 0
-        // because `append_stored_range` assigns levels by carry and there is
-        // nothing to carry against — so a compacted root and a one-shot build
-        // are indistinguishable by level, and neither the tier nor the count
-        // can tell you which happened.
-        let recipe = manifest.recipe();
-        strip_recipe_manifest(&mut head_set, recipe);
-        append_stored_range(&mut pile, &kind, merged_range, stored, &mut head_set)
-            .map_err(|e| anyhow!("append merged range: {e:?}"))?;
+        // ADD the root; do not replace what it rolls up. Stripping would
+        // destroy exactly the artifacts that make a historical query a
+        // selection instead of a chain replay — and it would force the
+        // union arm of any comparison into a second pile, where a difference
+        // could come from a second build rather than from the thing being
+        // measured.
+        //
+        // One level above the highest it consumes, so `Manifest::active`
+        // returns it alone and its children remain reachable beneath it.
+        let children: Vec<_> = active
+            .iter()
+            .map(|&i| manifest.ranges()[i].entity())
+            .collect();
+        let level = active
+            .iter()
+            .map(|&i| manifest.ranges()[i].level())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        append_rollup_record(
+            &mut pile,
+            &kind,
+            merged_range,
+            stored,
+            level,
+            &children,
+            &mut head_set,
+        )
+        .map_err(|e| anyhow!("append rollup record: {e:?}"))?;
         write_branch_meta(&mut pile, branch_id, head_set)?;
 
         println!(
-            "branch {label}: compacted {} active range(s) into 1 in {:.1}s",
+            "branch {label}: rolled {} active range(s) into 1 root at level {} in {:.1}s \
+             ({} record(s) retained beneath it)",
             active.len(),
-            started.elapsed().as_secs_f64()
+            level,
+            started.elapsed().as_secs_f64(),
+            manifest.ranges().len()
         );
     }
 

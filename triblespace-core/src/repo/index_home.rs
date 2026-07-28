@@ -960,6 +960,55 @@ fn make_entry<K: IndexKind>(
 /// exact convex union of its victim ranges against the commit DAG. Blob puts
 /// may leave unreachable CAS values on failure, but `head_set` is replaced
 /// only after the complete carry succeeds.
+/// Append one record that rolls up `children`, at `level`, without running
+/// the fanout carry.
+///
+/// This is a MAJOR COMPACTION: the operator's statement that no more small
+/// appends are coming, so the amortisation size-tiering exists to buy is no
+/// longer worth its read cost. `append_stored_range` cannot express it —
+/// that assigns levels by carry and would fold the new record into whatever
+/// happens to sit beside it.
+///
+/// The children are RETAINED, as everywhere else. A compaction adds a wider
+/// derivation; it does not destroy the narrower ones, so the pile afterwards
+/// answers both "read it as one archive" (the new record, which
+/// [`Manifest::active`] now returns alone) and "read it as its parts" (its
+/// children) — the same history, two covers, no second build that could
+/// differ for unrelated reasons.
+pub fn append_rollup_record<S: BlobStore, K: IndexKind>(
+    storage: &mut S,
+    kind: &K,
+    range: CommitRange,
+    artifacts: Vec<K::StoredArtifact>,
+    level: u64,
+    children: &[Id],
+    head_set: &mut TribleSet,
+) -> Result<(), IndexError> {
+    let reader = storage.reader().map_err(storage_error)?;
+    let mut manifest = Manifest::from_tribles(head_set, &reader, kind)?;
+    let retired: Vec<_> = manifest.subjects().collect();
+    let entity = RangeRecord::new(manifest.recipe, range.clone()).entity();
+    if manifest.ranges.iter().any(|entry| entry.entity() == entity) {
+        return Err(ManifestError::DuplicateRange { entity }.into());
+    }
+    let seq = manifest.reserve_seq()?;
+    manifest.ranges.push(make_entry(
+        kind,
+        manifest.recipe,
+        range,
+        level,
+        seq,
+        artifacts,
+        &[],
+        children,
+    )?);
+    manifest
+        .ranges
+        .sort_by_key(|entry| (entry.level, entry.seq));
+    replace_manifest_subjects(head_set, retired, &manifest);
+    Ok(())
+}
+
 pub fn append_stored_range<S: BlobStore, K: IndexKind>(
     storage: &mut S,
     kind: &K,
