@@ -30,6 +30,7 @@ use triblespace_core::repo::index_home::{
 };
 use triblespace_core::repo::index_range::{convex_union, StoredCommitDag};
 use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::CommitHandle;
 use triblespace_core::trible::TribleSet;
 
 use super::super::signing::load_signing_key;
@@ -107,6 +108,21 @@ fn write_branch_meta(pile: &mut Pile, branch_id: Id, set: TribleSet) -> Result<(
     }
 }
 
+/// Short form of a commit frontier: a range is bounded by ANTICHAINS, not by
+/// single commits, so the plural matters — `[]` is the empty frontier that
+/// starts a chain, and more than one entry means a genuine multi-parent
+/// boundary rather than a display quirk.
+fn frontier_hex(frontier: &[CommitHandle]) -> String {
+    if frontier.is_empty() {
+        return "[]".to_owned();
+    }
+    let parts: Vec<String> = frontier
+        .iter()
+        .map(|h| hex::encode(&h.raw[..4]))
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
 fn report(branch_id: Id, name: Option<&str>, manifest: &Manifest<SuccinctRollup>) {
     let ranges = manifest.ranges();
     match name {
@@ -119,11 +135,18 @@ fn report(branch_id: Id, name: Option<&str>, manifest: &Manifest<SuccinctRollup>
     let mut by_level: BTreeMap<u64, usize> = BTreeMap::new();
     for r in ranges {
         *by_level.entry(r.level()).or_default() += 1;
+        // The commit range is the whole point of a rollup record: it says
+        // WHICH HISTORY this artifact is a derivation of. Without it the
+        // listing shows that something is indexed but not what, and coverage
+        // — the question an operator actually has — is unanswerable.
+        let range = r.range();
         println!(
-            "    level {:<3} seq {:<6} artifacts {}",
+            "    level {:<3} seq {:<6} artifacts {}  commits {}..{}",
             r.level(),
             r.seq(),
-            r.artifacts().len()
+            r.artifacts().len(),
+            frontier_hex(range.start()),
+            frontier_hex(range.end()),
         );
     }
     println!("  tiers    {by_level:?}");
