@@ -480,6 +480,11 @@ pub struct BindingStore {
     /// results from expanding `frontiers[d]` by one variable, so
     /// backtracking to a shallower batch is a `pop`, not a rebuild.
     frontiers: Vec<Vec<u32>>,
+    /// Retired index matrices, kept for their capacity. A deep, narrow
+    /// search pushes and pops a batch at every level of every descent, so
+    /// without this the engine would allocate once per level per descent.
+    /// Cleared on retirement, so cloning the store does not copy them.
+    spare: Vec<Vec<u32>>,
     levels: [ProposalBuffer; 128],
 }
 
@@ -510,6 +515,7 @@ impl BindingStore {
             bound: VariableSet::new_empty(),
             stride,
             frontiers: vec![vec![0u32; stride]],
+            spare: Vec::new(),
             levels: std::array::from_fn(|_| ProposalBuffer::new()),
         }
     }
@@ -638,7 +644,8 @@ impl BindingStore {
         let stride = self.stride;
         let parent = self.frontiers.last().expect("non-empty frontier stack");
         let bounds = self.levels[variable].bounds();
-        let mut rows = Vec::with_capacity(entries.len() * stride);
+        let mut rows = self.spare.pop().unwrap_or_default();
+        rows.reserve(entries.len() * stride);
         for &entry in entries {
             // Segments are ascending and cover the buffer, so the segment
             // holding `entry` is the last one starting at or before it.
@@ -654,7 +661,10 @@ impl BindingStore {
     /// Drops the deepest batch, returning to its parent — the engine's
     /// backtracking step.
     fn pop_frontier(&mut self, variable: VariableId) {
-        self.frontiers.pop();
+        if let Some(mut retired) = self.frontiers.pop() {
+            retired.clear();
+            self.spare.push(retired);
+        }
         self.bound.unset(variable);
     }
 
@@ -1601,6 +1611,15 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     /// estimate from that bucket so the value keeps its usual meaning.
     fn batch_estimate(&self, variable: VariableId) -> usize {
         let frontier = self.bindings.frontier();
+        if frontier.len() == 1 {
+            // The overwhelmingly common case, and the one every level
+            // starts in: one row has nothing to summarise, so answer it
+            // exactly and skip the bucket table entirely.
+            return self
+                .constraint
+                .estimate(variable, &frontier.row(0))
+                .expect("unconstrained variable in query");
+        }
         // Bucket 0 is "estimate 0"; buckets are ilog2(e) + 1 thereafter, so
         // 65 buckets cover every usize.
         let mut counts = [0usize; 65];
