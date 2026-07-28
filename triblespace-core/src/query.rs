@@ -1653,6 +1653,7 @@ pub struct FrontierStats {
     rows: AtomicU64,
     variable_groups: AtomicU64,
     proposals: AtomicU64,
+    peak_region: AtomicU64,
     widest: AtomicU64,
     inplace_descents: AtomicU64,
     copied_descents: AtomicU64,
@@ -1667,6 +1668,22 @@ impl FrontierStats {
     /// Total parent rows expanded, summed over expansions.
     pub fn rows(&self) -> u64 {
         self.rows.load(Ordering::Relaxed)
+    }
+
+    /// Largest number of proposals a *single* level held at once.
+    ///
+    /// `refill` fills a level for the whole frontier in one call with no
+    /// budget, so this is `O(width x fan-out)` and nothing in the engine
+    /// caps it — the chunked proposing that used to bound it was removed
+    /// when `propose` began taking a frontier. Peak resident bytes for that
+    /// level are roughly this times the proposal entry size.
+    ///
+    /// Cumulative [`proposals`](Self::proposals) cannot answer this and
+    /// neither can [`widest`](Self::widest), which counts rows: a narrow
+    /// frontier over a huge fan-out is exactly the shape that is cheap by
+    /// both of those and expensive by this one.
+    pub fn peak_region(&self) -> u64 {
+        self.peak_region.load(Ordering::Relaxed)
     }
 
     /// Total preferred-variable groups, summed over expansions. Equal to
@@ -2001,6 +2018,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         self.stats
             .proposals
             .fetch_add(proposed as u64, Ordering::Relaxed);
+        // High-water mark of a single level's materialised proposals — the
+        // quantity `refill` leaves unbounded. `proposals` is cumulative and
+        // `widest` counts rows, so neither answers "how much did one level
+        // hold at once", which is the memory question.
+        self.stats
+            .peak_region
+            .fetch_max(proposed as u64, Ordering::Relaxed);
         self.mode = Search::NextChunk;
     }
 
