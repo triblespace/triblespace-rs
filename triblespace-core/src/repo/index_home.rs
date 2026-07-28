@@ -873,6 +873,7 @@ pub fn store_artifact<S: BlobStorePut, K: IndexKind>(
     kind.put(storage, artifact).map_err(IndexError::Artifact)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_entry<K: IndexKind>(
     kind: &K,
     recipe: Id,
@@ -880,6 +881,8 @@ fn make_entry<K: IndexKind>(
     level: u64,
     seq: u64,
     artifacts: Vec<K::StoredArtifact>,
+    covers: &[CommitHandle],
+    children: &[Id],
 ) -> Result<RangeEntry<K::StoredArtifact>, ManifestError> {
     let mut record = RangeRecord::new(recipe, range);
     let entity = record.entity();
@@ -887,6 +890,19 @@ fn make_entry<K: IndexKind>(
         seg_level: level,
         seg_seq: seq,
     };
+    // The hierarchy, as edges. A leaf names its commit; a carry names the
+    // records it merged. Together they let a cover be folded out of the
+    // manifest without walking the commit DAG.
+    for commit in covers {
+        *record.facts_mut() += entity! { ExclusiveId::force_ref(&entity) @
+            seg_covers: *commit,
+        };
+    }
+    for child in children {
+        *record.facts_mut() += entity! { ExclusiveId::force_ref(&entity) @
+            seg_child: *child,
+        };
+    }
     for artifact in &artifacts {
         let emitted = kind.emit(entity, artifact);
         if emitted.iter().any(|fact| {
@@ -941,15 +957,34 @@ pub fn append_stored_range<S: BlobStore, K: IndexKind>(
         }
         .into());
     }
-    let mut pending = (range, artifacts, 0u64);
+    // A leaf's covered commit is readable from its own range —
+    // `CommitRange::leaf` is `start == end == [commit]` — so recording the
+    // edge costs no DAG walk. A coarser incoming range is not a leaf and
+    // names no commits directly.
+    let leaf_commits: Vec<CommitHandle> = match (range.start(), range.end()) {
+        ([s], [e]) if s == e => vec![*s],
+        _ => Vec::new(),
+    };
+    let mut pending = (range, artifacts, 0u64, leaf_commits, Vec::<Id>::new());
 
     loop {
         let level = pending.2;
+        // Merged inputs are RETAINED now, so "how many records sit at this
+        // level" is no longer the carry condition — a record that has already
+        // been folded into a parent must not be folded again. Active means
+        // no record claims it as a child.
+        let claimed: HashSet<Id> = manifest
+            .ranges
+            .iter()
+            .flat_map(|entry| entry.child_records())
+            .collect();
         let resident_indices: Vec<_> = manifest
             .ranges
             .iter()
             .enumerate()
-            .filter_map(|(index, entry)| (entry.level == level).then_some(index))
+            .filter_map(|(index, entry)| {
+                (entry.level == level && !claimed.contains(&entry.entity())).then_some(index)
+            })
             .collect();
         if resident_indices.len() + 1 < FANOUT {
             let seq = manifest.reserve_seq()?;
@@ -960,6 +995,8 @@ pub fn append_stored_range<S: BlobStore, K: IndexKind>(
                 level,
                 seq,
                 pending.1,
+                &pending.3,
+                &pending.4,
             )?);
             manifest
                 .ranges
@@ -973,6 +1010,25 @@ pub fn append_stored_range<S: BlobStore, K: IndexKind>(
             victim_ranges.push(manifest.ranges[index].range().clone());
             victim_artifacts.extend(manifest.ranges[index].artifacts.iter().cloned());
         }
+        // The pending record must exist before it can be a child, so it is
+        // materialised at this level first and then folded with the others.
+        let pending_seq = manifest.reserve_seq()?;
+        let pending_entry = make_entry(
+            kind,
+            manifest.recipe,
+            pending.0.clone(),
+            level,
+            pending_seq,
+            pending.1.clone(),
+            &pending.3,
+            &pending.4,
+        )?;
+        let mut child_entities: Vec<Id> = resident_indices
+            .iter()
+            .map(|&index| manifest.ranges[index].entity())
+            .collect();
+        child_entities.push(pending_entry.entity());
+        manifest.ranges.push(pending_entry);
         victim_ranges.push(pending.0);
         victim_artifacts.extend(pending.1);
 
@@ -993,13 +1049,14 @@ pub fn append_stored_range<S: BlobStore, K: IndexKind>(
         for artifact in prepared {
             stored.push(store_artifact(storage, kind, artifact)?);
         }
-        for index in resident_indices.into_iter().rev() {
-            manifest.ranges.remove(index);
-        }
+        // NOT removed. The inputs stay queryable, which is what makes a
+        // historical cover a selection over existing artifacts instead of a
+        // replay of the commit chain. They are inert for future carries
+        // because they are now claimed as children.
         let next_level = level.checked_add(1).ok_or(ManifestError::InvalidLsmValue {
             entity: pending_entity,
         })?;
-        pending = (merged_range, stored, next_level);
+        pending = (merged_range, stored, next_level, Vec::new(), child_entities);
     }
 
     replace_manifest_subjects(head_set, retired, &manifest);
@@ -1745,37 +1802,26 @@ mod cover_tests {
         set
     }
 
-    /// Build a manifest whose records carry the hierarchy as EDGES: leaves
-    /// name their commits, rollups name their children.
+    /// Build a manifest whose records carry the hierarchy as EDGES, through
+    /// the same `make_entry` the carry uses — so the test cannot drift from
+    /// the construction it is testing.
     fn tree_manifest() -> (Manifest<SuccinctRollup>, Vec<Id>) {
         let kind = SuccinctRollup::new();
         let mut manifest = Manifest::new(&kind).expect("manifest");
         let recipe = manifest.recipe;
         let mut ids = Vec::new();
 
-        // Two leaves, one commit each.
         for n in 0..2u8 {
             let range = CommitRange::new(vec![commit(n)], vec![commit(n)]).expect("leaf");
-            let mut entry =
-                make_entry(&kind, recipe, range, 0, n as u64, Vec::new()).expect("entry");
-            let entity = entry.entity();
-            *entry.record.facts_mut() += entity! { ExclusiveId::force_ref(&entity) @
-                seg_covers: commit(n),
-            };
-            ids.push(entity);
+            let entry = make_entry(&kind, recipe, range, 0, n as u64, Vec::new(), &[commit(n)], &[])
+                .expect("entry");
+            ids.push(entry.entity());
             manifest.ranges.push(entry);
         }
 
-        // One rollup over both.
         let range = CommitRange::new(vec![commit(0)], vec![commit(1)]).expect("root");
-        let mut root = make_entry(&kind, recipe, range, 1, 2, Vec::new()).expect("entry");
-        let root_entity = root.entity();
-        for child in &ids {
-            *root.record.facts_mut() += entity! { ExclusiveId::force_ref(&root_entity) @
-                seg_child: *child,
-            };
-        }
-        ids.push(root_entity);
+        let root = make_entry(&kind, recipe, range, 1, 2, Vec::new(), &[], &ids).expect("entry");
+        ids.push(root.entity());
         manifest.ranges.push(root);
         (manifest, ids)
     }
