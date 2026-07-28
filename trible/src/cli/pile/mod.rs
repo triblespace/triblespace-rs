@@ -15,6 +15,7 @@ pub mod net;
 pub mod pin;
 mod reid;
 mod signing;
+pub mod rollup;
 mod squash;
 
 #[derive(Parser)]
@@ -94,6 +95,12 @@ pub enum PileCommand {
     Net {
         #[command(subcommand)]
         cmd: net::Command,
+    },
+    /// Inspect and maintain a branch's rollups — derived structures over
+    /// commit ranges, carried by a size-tiered LSM.
+    Rollup {
+        #[command(subcommand)]
+        command: rollup::RollupCommand,
     },
     /// Squash all branch histories into single commits in a new pile.
     ///
@@ -226,6 +233,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             Ok(())
         }
         PileCommand::Migrate { pile, cmd } => migrate::run(pile, cmd),
+        PileCommand::Rollup { command } => rollup::run(command),
         PileCommand::Squash {
             source,
             dest,
