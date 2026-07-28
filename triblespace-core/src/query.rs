@@ -2409,6 +2409,27 @@ mod parallel {
                             q.next_chunk();
                             continue;
                         }
+                        // A clone copies every depth's `group` cursor, so a
+                        // depth with groups still unexpanded would have them
+                        // expanded by BOTH halves — every row under them
+                        // emitted twice. Nothing in `split` prevents that;
+                        // it is currently unreachable only because a
+                        // split-time frontier is one row, and a one-row
+                        // frontier plans exactly one group.
+                        //
+                        // That is an accident of another part of the design,
+                        // not a property of this one, and the obvious next
+                        // step here — bisecting the frontier itself rather
+                        // than draining to one row first — removes it. Assert
+                        // it so that change fails loudly instead of silently
+                        // duplicating rows.
+                        debug_assert!(
+                            q.depths[..=q.depth]
+                                .iter()
+                                .all(|d| d.group >= d.groups.len()),
+                            "splitting a frontier with unexpanded groups \
+                             would duplicate every row beneath them"
+                        );
                         let right_level = q.bindings.bisect(top);
                         let mut right = q.clone();
                         right.bindings.install(top, right_level);
