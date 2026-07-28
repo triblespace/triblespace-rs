@@ -144,7 +144,17 @@ where
             }
             choice.push(best_child);
         }
-        debug_assert!(
+        // NOT a `debug_assert!`. The per-row tally above runs in every build
+        // — release included — so the only thing `debug_assert!` bought was
+        // discarding the conclusion we had already paid for. And the failure
+        // it guards is silent: a violating constraint does not crash, it
+        // returns a DIFFERENT BAG. Measured on the contract fixture, 18 rows
+        // at width 1 against 11 at width 4096, with nothing to indicate the
+        // seven that vanished. A wrong answer nobody can see is worse than a
+        // panic, so this one is paid for in release too. The `confirm`-side
+        // twin stays debug-only: its uniformity scan is work done ONLY for
+        // the check, which is a different trade.
+        assert!(
             relevant_rows.iter().all(|&n| n == 0 || n == rows),
             "Constraint::estimate returned Some for some rows of a frontier \
              and None for others on variable {variable}. Whether the answer \

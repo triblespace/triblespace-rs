@@ -121,8 +121,16 @@ fn width_one_is_unaffected_by_the_contract() {
 }
 
 /// Batched, the violation is caught rather than silently changing the bag.
+///
+/// Release included. This test used to fail under `--release`, because the
+/// guard was a `debug_assert!` and the violation is SILENT — the query
+/// returned 11 rows where width 1 returned 18, with nothing to say seven had
+/// gone. The `propose`-side guard is now a real assertion (its tally was
+/// already being computed in every build), so the contract is enforced in
+/// the builds that actually run.
 #[test]
 #[should_panic(expected = "must depend only on which variables are bound")]
 fn a_value_dependent_relevance_is_caught_when_batched() {
     let _ = rows(4096);
 }
+
