@@ -578,6 +578,30 @@ impl<K: IndexKind> Manifest<K> {
     /// `CommitRange` — and then a partial leaf is possible and is reported
     /// the same way. That is a property of a hand-built manifest, not of
     /// anything the repository produces.
+    /// The records nothing claims as a child.
+    ///
+    /// These are the roots of the rollup forest, and therefore the minimal
+    /// cover of everything indexed — no commit set and no DAG walk needed,
+    /// because "is anything above me" is exactly the question
+    /// [`seg_child`] answers.
+    ///
+    /// It is also the carry's own notion of an active record, so the set that
+    /// decides when a level is full is the same set a reader attaches. One
+    /// definition, two uses.
+    pub fn active(&self) -> Vec<usize> {
+        let claimed: HashSet<Id> = self
+            .ranges
+            .iter()
+            .flat_map(|entry| entry.child_records())
+            .collect();
+        self.ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !claimed.contains(&entry.entity()))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     pub fn cover(&self, wanted: &CommitSet) -> Result<Vec<usize>, CoverError> {
         // Leaves first: a record is a leaf when it names commits directly.
         let mut selected: HashSet<Id> = HashSet::new();
@@ -1287,9 +1311,18 @@ where
     }
 
     /// Parse and attach the current manifest without a source checkout.
+    /// Attach the current cover: every record nothing rolled up further.
+    ///
+    /// Not the whole manifest. Merged inputs are retained now, so a root and
+    /// its children both sit in the manifest and describe the same commits —
+    /// unioning all of them would read every trible from several artifacts.
+    /// `UnionConstraint` dedups, so that is merely wasteful rather than
+    /// wrong, but it is wasteful in proportion to the tree's depth and there
+    /// is no reason to pay it.
     pub fn attach_all(&mut self) -> Result<Vec<K::Segment>, IndexError> {
         let manifest = self.read_manifest()?;
-        self.attach_manifest(&manifest)
+        let active = manifest.active();
+        self.attach_selection(&manifest, &active)
     }
 }
 
@@ -1862,4 +1895,61 @@ mod cover_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod active_tests {
+    use super::*;
+
+    fn commit(n: u8) -> CommitHandle {
+        let mut raw = [0u8; 32];
+        raw[0] = n;
+        CommitHandle::new(raw)
+    }
+
+    /// With merged inputs retained, the manifest holds a root AND its
+    /// children. `active` must return the root alone — attaching all three
+    /// would read the same commits out of two tiers.
+    #[test]
+    fn active_is_the_roots_of_the_forest() {
+        let kind = SuccinctRollup::new();
+        let mut manifest = Manifest::new(&kind).expect("manifest");
+        let recipe = manifest.recipe;
+
+        let mut leaves = Vec::new();
+        for n in 0..2u8 {
+            let range = CommitRange::new(vec![commit(n)], vec![commit(n)]).expect("leaf");
+            let entry =
+                make_entry(&kind, recipe, range, 0, n as u64, Vec::new(), &[commit(n)], &[])
+                    .expect("entry");
+            leaves.push(entry.entity());
+            manifest.ranges.push(entry);
+        }
+        let range = CommitRange::new(vec![commit(0)], vec![commit(1)]).expect("root");
+        let root =
+            make_entry(&kind, recipe, range, 1, 2, Vec::new(), &[], &leaves).expect("entry");
+        let root_entity = root.entity();
+        manifest.ranges.push(root);
+
+        let active = manifest.active();
+        assert_eq!(active.len(), 1, "expected the root alone, got {active:?}");
+        assert_eq!(manifest.ranges()[active[0]].entity(), root_entity);
+    }
+
+    /// Leaves with nothing above them are all active — the pre-carry state,
+    /// and the case `attach_all` must still get right.
+    #[test]
+    fn unrolled_leaves_are_all_active() {
+        let kind = SuccinctRollup::new();
+        let mut manifest = Manifest::new(&kind).expect("manifest");
+        let recipe = manifest.recipe;
+        for n in 0..3u8 {
+            let range = CommitRange::new(vec![commit(n)], vec![commit(n)]).expect("leaf");
+            manifest.ranges.push(
+                make_entry(&kind, recipe, range, 0, n as u64, Vec::new(), &[commit(n)], &[])
+                    .expect("entry"),
+            );
+        }
+        assert_eq!(manifest.active().len(), 3);
+    }
 }
