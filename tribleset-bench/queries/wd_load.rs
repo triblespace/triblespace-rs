@@ -397,20 +397,20 @@ impl Dataset<UnionFacts> {
     /// `Arc<[SuccinctArchive<U>]>` (commit 6c346e04), so the leak is
     /// gone and the `Vec` moves straight in.
     ///
-    /// NOT WIRED INTO THE RUNNER, and the reason is a measurement, not
-    /// an opinion: this loader has no bound to give it. On
-    /// `dblp-574m-v2.pile` the branch head's annotation is ONE range
-    /// holding ONE shard of 561,475,905 rows — the whole dump — while
-    /// `load_pile_patch` at the documented `--rung` holds the first
-    /// commit's 4,064,802. Two arms over different graphs cannot be
-    /// row-compared, and the acceptance gate for this work is that the
-    /// backings agree row for row, so the archive arm is built from the
-    /// bounded PATCH set by [`to_archive`](Dataset::to_archive)
-    /// instead. Attaching costs ~19 s and is memory-cheap (mmap
-    /// zerocopy); it is running 100 translations over 561 M rows that
-    /// is out of reach, not the attach.
-    #[allow(dead_code)]
-    pub fn load_pile(path: &Path) -> Result<Self, String> {
+    /// # Choosing a cover
+    ///
+    /// With merged inputs retained, one pile holds every derivation of the
+    /// same history at several granularities, and `depth` says which to
+    /// read. `0` is [`Manifest::active`] — the coarsest cover, a single root
+    /// after a major compaction, i.e. the MONOLITHIC arm. Each further step
+    /// expands every record into its children, so `1` is what that root
+    /// rolled up (the UNION arm) and enough steps reach the leaves.
+    ///
+    /// Every depth answers over exactly the same commits. That is the point:
+    /// the arms of a monolithic-versus-tiered comparison become selections
+    /// over ONE artifact, so no difference between them can come from having
+    /// built two.
+    pub fn load_pile(path: &Path, depth: usize) -> Result<Self, String> {
         use subject::core::repo::index_home::{IndexHome, SuccinctRollup};
 
         let mut pile = Pile::open(path).map_err(|e| format!("open {}: {e:?}", path.display()))?;
@@ -418,7 +418,31 @@ impl Dataset<UnionFacts> {
         let ds = resolve_dataset(&mut pile, &reader)?;
         let segments = {
             let mut home = IndexHome::new(&mut pile, ds.data_branch, SuccinctRollup::new());
-            home.attach_all()
+            let manifest = home
+                .read_manifest()
+                .map_err(|e| format!("read manifest: {e:?}"))?;
+            let mut selection = manifest.active();
+            for _ in 0..depth {
+                let next = manifest.expand(&selection);
+                if next == selection {
+                    // Leaf granularity reached; a deeper request is a
+                    // no-op rather than an error, but say so — a reader
+                    // comparing "depth 3" against "depth 9" should know
+                    // they are the same cover.
+                    eprintln!(
+                        "note: rollup cover bottomed out at {} segment(s) before depth {depth}",
+                        selection.len()
+                    );
+                    break;
+                }
+                selection = next;
+            }
+            println!(
+                "rollup   : cover depth {depth} -> {} segment(s) of {} record(s)",
+                selection.len(),
+                manifest.ranges().len()
+            );
+            home.attach_selection(&manifest, &selection)
                 .map_err(|e| format!("attach index annotation: {e:?}"))?
         };
         let facts = UnionFacts::new(segments);

@@ -602,6 +602,47 @@ impl<K: IndexKind> Manifest<K> {
             .collect()
     }
 
+    /// Replace every record in `selection` by its children, leaving
+    /// childless records as they are.
+    ///
+    /// One step down the rollup forest, and the same commits either way — a
+    /// record and its children derive exactly the same history, which is why
+    /// they are alternative COVERS rather than different data. Applied to
+    /// [`active`](Self::active) it walks coarsest to finest:
+    /// the compacted root, then what it rolled up, then eventually the
+    /// leaves.
+    ///
+    /// This is what makes "monolithic versus tiered" a query-side choice
+    /// over one pile instead of two builds that could differ for reasons
+    /// unrelated to the question.
+    ///
+    /// Idempotent at the bottom: a selection of leaves expands to itself, so
+    /// iterating to a fixpoint terminates at leaf granularity.
+    pub fn expand(&self, selection: &[usize]) -> Vec<usize> {
+        let by_entity: HashMap<Id, usize> = self
+            .ranges
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.entity(), index))
+            .collect();
+        let mut out: Vec<usize> = Vec::new();
+        for &index in selection {
+            let children = self.ranges[index].child_records();
+            if children.is_empty() {
+                out.push(index);
+                continue;
+            }
+            for child in children {
+                if let Some(&child_index) = by_entity.get(&child) {
+                    out.push(child_index);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     pub fn cover(&self, wanted: &CommitSet) -> Result<Vec<usize>, CoverError> {
         // Leaves first: a record is a leaf when it names commits directly.
         let mut selected: HashSet<Id> = HashSet::new();
@@ -2000,5 +2041,61 @@ mod active_tests {
             );
         }
         assert_eq!(manifest.active().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::*;
+
+    fn commit(n: u8) -> CommitHandle {
+        let mut raw = [0u8; 32];
+        raw[0] = n;
+        CommitHandle::new(raw)
+    }
+
+    /// A root, its two children, and the leaves under them: `expand` walks
+    /// coarsest to finest and stops.
+    #[test]
+    fn expand_walks_down_and_is_idempotent_at_the_leaves() {
+        let kind = SuccinctRollup::new();
+        let mut manifest = Manifest::new(&kind).expect("manifest");
+        let recipe = manifest.recipe;
+
+        let mut leaves = Vec::new();
+        for n in 0..4u8 {
+            let range = CommitRange::new(vec![commit(n)], vec![commit(n)]).expect("leaf");
+            let entry =
+                make_entry(&kind, recipe, range, 0, n as u64, Vec::new(), &[commit(n)], &[])
+                    .expect("entry");
+            leaves.push(entry.entity());
+            manifest.ranges.push(entry);
+        }
+        let mid_a = CommitRange::new(vec![commit(0)], vec![commit(1)]).expect("mid");
+        let a = make_entry(&kind, recipe, mid_a, 1, 4, Vec::new(), &[], &leaves[..2])
+            .expect("entry");
+        let mid_b = CommitRange::new(vec![commit(2)], vec![commit(3)]).expect("mid");
+        let b = make_entry(&kind, recipe, mid_b, 1, 5, Vec::new(), &[], &leaves[2..])
+            .expect("entry");
+        let mids = vec![a.entity(), b.entity()];
+        manifest.ranges.push(a);
+        manifest.ranges.push(b);
+
+        let root_range = CommitRange::new(vec![commit(0)], vec![commit(3)]).expect("root");
+        let root = make_entry(&kind, recipe, root_range, 2, 6, Vec::new(), &[], &mids)
+            .expect("entry");
+        manifest.ranges.push(root);
+
+        let coarse = manifest.active();
+        assert_eq!(coarse.len(), 1, "the root is the only active record");
+
+        let middle = manifest.expand(&coarse);
+        assert_eq!(middle.len(), 2, "one step down is the two mid records");
+
+        let fine = manifest.expand(&middle);
+        assert_eq!(fine.len(), 4, "another step reaches the leaves");
+
+        // Bottom is a fixpoint, so iterating terminates.
+        assert_eq!(manifest.expand(&fine), fine);
     }
 }
