@@ -59,6 +59,23 @@ attributes! {
     "7188AAD5C5044798547E7F53FE1CA5D5" as pub seg_level: U256BE;
     /// Monotonic recipe-local sequence number of one logical range record.
     "DFE499897718CFB97497AA8504A5D48F" as pub seg_seq: U256BE;
+    /// A LEAF record's covered commit, one fact per commit. Minted with
+    /// `trible genid` on 2026-07-28.
+    ///
+    /// Leaves are the granularity of the index: a rollup can answer exactly
+    /// the spans its leaves tile, and a query cutting through the middle of a
+    /// leaf has to take the remainder from the commit chain.
+    "543637AB3AFE38A1095E66BF2198275B" as pub seg_covers: Handle<SimpleArchive>;
+    /// A ROLLUP record's child record, one fact per merged input. Minted with
+    /// `trible genid` on 2026-07-28.
+    ///
+    /// Makes the hierarchy STRUCTURAL. A cover is then a bottom-up fold —
+    /// take the leaves covering the wanted commits, then replace any node
+    /// whose children are all present with the node itself — which is linear
+    /// in the tree and exactly optimal, rather than a search whose optimality
+    /// depends on a laminarity nothing enforces. A non-laminar pool becomes
+    /// unrepresentable instead of undetected.
+    "A762AFE02BA1A4FBE3472C9431A239CD" as pub seg_child: GenId;
 }
 
 /// Number of logical range records that trigger one size-tiered carry.
@@ -246,6 +263,28 @@ impl<A> RangeEntry<A> {
     /// Recipe-local sequence number.
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Commits this record names directly — non-empty exactly for a LEAF.
+    pub fn covered_commits(&self) -> Vec<CommitHandle> {
+        let entity = self.record.entity();
+        find!(
+            (c: Inline<Handle<SimpleArchive>>),
+            pattern!(self.record.facts(), [{ ExclusiveId::force_ref(&entity) @ seg_covers: ?c }])
+        )
+        .map(|(c,)| c)
+        .collect()
+    }
+
+    /// Records merged into this one — non-empty exactly for a ROLLUP.
+    pub fn child_records(&self) -> Vec<Id> {
+        let entity = self.record.entity();
+        find!(
+            (c: Id),
+            pattern!(self.record.facts(), [{ ExclusiveId::force_ref(&entity) @ seg_child: ?c }])
+        )
+        .map(|(c,)| c)
+        .collect()
     }
 
     /// Typed physical artifacts carried by this logical record.
@@ -504,6 +543,92 @@ impl<K: IndexKind> Manifest<K> {
     /// Live logical records ordered by `(level, seq)`.
     pub fn ranges(&self) -> &[RangeEntry<K::StoredArtifact>] {
         &self.ranges
+    }
+
+    /// Cover a commit set by folding the rollup tree upward from its leaves.
+    ///
+    /// # Why this is not a search
+    ///
+    /// [`cover`](Self::cover) picks ranges greedily and is optimal only
+    /// because an LSM pool happens to be laminar — every carried record is
+    /// exactly the union of the records it replaced. Nothing enforces that,
+    /// and it pays a commit-DAG walk per range to discover membership it
+    /// could have been told.
+    ///
+    /// With the hierarchy recorded as edges — [`seg_covers`] from a leaf to
+    /// each commit, [`seg_child`] from a rollup to each merged input — the
+    /// same answer is a fold:
+    ///
+    /// 1. take the leaves whose commits are wanted,
+    /// 2. replace any node all of whose children are selected with that node,
+    /// 3. repeat until nothing changes.
+    ///
+    /// Linear in the tree, exactly minimal, and no DAG walk at all. A pool
+    /// that is not a hierarchy cannot be built this way rather than being
+    /// silently mis-covered.
+    ///
+    /// # Granularity is the leaf
+    ///
+    /// A leaf is the finest thing the index can answer. Asking for a commit
+    /// set that cuts through the middle of one returns
+    /// [`CoverError::Gap`] naming the shortfall — the honest answer is that
+    /// the rollups cover a prefix and the remainder must come from the commit
+    /// chain, and a hybrid caller wants to know exactly how much.
+    pub fn cover_by_fold(
+        &self,
+        wanted: &HashSet<CommitHandle>,
+    ) -> Result<Vec<usize>, CoverError<std::convert::Infallible>> {
+        // Leaves first: a record is a leaf when it names commits directly.
+        let mut selected: HashSet<Id> = HashSet::new();
+        let mut covered: HashSet<CommitHandle> = HashSet::new();
+        for entry in &self.ranges {
+            let commits = entry.covered_commits();
+            if commits.is_empty() {
+                continue;
+            }
+            // Whole leaves only. Half a leaf is not an artifact.
+            if commits.iter().all(|c| wanted.contains(c)) {
+                selected.insert(entry.entity());
+                covered.extend(commits);
+            }
+        }
+        if covered.len() != wanted.len() {
+            return Err(CoverError::Gap {
+                uncovered: wanted.len() - covered.len(),
+            });
+        }
+
+        // Fold upward to a fixpoint. A parent subsumes its children only when
+        // every child is selected, which is what keeps the cover exact.
+        loop {
+            let mut changed = false;
+            for entry in &self.ranges {
+                let children = entry.child_records();
+                if children.is_empty() || selected.contains(&entry.entity()) {
+                    continue;
+                }
+                if children.iter().all(|c| selected.contains(c)) {
+                    for child in &children {
+                        selected.remove(child);
+                    }
+                    selected.insert(entry.entity());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut chosen: Vec<usize> = self
+            .ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| selected.contains(&entry.entity()))
+            .map(|(index, _)| index)
+            .collect();
+        chosen.sort_unstable();
+        Ok(chosen)
     }
 
     /// Choose a minimal set of ranges that exactly covers `target`, without
@@ -1694,6 +1819,75 @@ mod cover_tests {
             dag.insert(commit(n), vec![commit(n - 1)]);
         }
         dag
+    }
+
+    /// Build a manifest whose records carry the hierarchy as EDGES: leaves
+    /// name their commits, rollups name their children.
+    fn tree_manifest() -> (Manifest<SuccinctRollup>, Vec<Id>) {
+        let kind = SuccinctRollup::new();
+        let mut manifest = Manifest::new(&kind).expect("manifest");
+        let recipe = manifest.recipe;
+        let mut ids = Vec::new();
+
+        // Two leaves, one commit each.
+        for n in 0..2u8 {
+            let range = CommitRange::new(vec![commit(n)], vec![commit(n)]).expect("leaf");
+            let mut entry =
+                make_entry(&kind, recipe, range, 0, n as u64, Vec::new()).expect("entry");
+            let entity = entry.entity();
+            *entry.record.facts_mut() += entity! { ExclusiveId::force_ref(&entity) @
+                seg_covers: commit(n),
+            };
+            ids.push(entity);
+            manifest.ranges.push(entry);
+        }
+
+        // One rollup over both.
+        let range = CommitRange::new(vec![commit(0)], vec![commit(1)]).expect("root");
+        let mut root = make_entry(&kind, recipe, range, 1, 2, Vec::new()).expect("entry");
+        let root_entity = root.entity();
+        for child in &ids {
+            *root.record.facts_mut() += entity! { ExclusiveId::force_ref(&root_entity) @
+                seg_child: *child,
+            };
+        }
+        ids.push(root_entity);
+        manifest.ranges.push(root);
+        (manifest, ids)
+    }
+
+    /// The fold does with edges what `cover` does with a search — and it
+    /// never touches the commit DAG.
+    #[test]
+    fn the_fold_collapses_a_full_subtree_to_its_root() {
+        let (manifest, ids) = tree_manifest();
+        let wanted: HashSet<CommitHandle> = [commit(0), commit(1)].into_iter().collect();
+        let chosen = manifest.cover_by_fold(&wanted).expect("cover");
+        assert_eq!(chosen.len(), 1, "expected the root alone, got {chosen:?}");
+        assert_eq!(manifest.ranges()[chosen[0]].entity(), ids[2]);
+    }
+
+    /// A partly-selected parent keeps its children: folding it in would cover
+    /// a commit nobody asked for.
+    #[test]
+    fn a_partial_subtree_keeps_its_leaves() {
+        let (manifest, ids) = tree_manifest();
+        let wanted: HashSet<CommitHandle> = [commit(0)].into_iter().collect();
+        let chosen = manifest.cover_by_fold(&wanted).expect("cover");
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(manifest.ranges()[chosen[0]].entity(), ids[0]);
+    }
+
+    /// Leaf granularity, stated honestly: a commit no leaf names is a gap,
+    /// and the caller is told how much has to come from the commit chain.
+    #[test]
+    fn a_commit_outside_every_leaf_is_a_gap() {
+        let (manifest, _) = tree_manifest();
+        let wanted: HashSet<CommitHandle> = [commit(0), commit(3)].into_iter().collect();
+        match manifest.cover_by_fold(&wanted) {
+            Err(CoverError::Gap { uncovered }) => assert_eq!(uncovered, 1),
+            other => panic!("expected a gap of 1, got {other:?}"),
+        }
     }
 
     fn manifest_with(ranges: Vec<(CommitRange, u64)>) -> Manifest<SuccinctRollup> {
