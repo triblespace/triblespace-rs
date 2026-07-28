@@ -36,7 +36,7 @@ use crate::query::{
     VariableId, VariableSet,
 };
 use crate::repo::index_range::{
-    convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
+    convex_union, is_ancestor, validate_exact_frontier_cover, CommitDag, RangeRecord, RangeRecordError,
     RangeValidationError, StoredCommitDag,
 };
 use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinStore};
@@ -186,6 +186,33 @@ pub trait IndexKind {
         segments: &[Self::Segment],
     ) -> Result<Vec<Self::PreparedArtifact>, ArtifactError>;
 }
+
+/// Why a cover could not be chosen.
+#[derive(Debug)]
+pub enum CoverError<E> {
+    /// The commit DAG could not be walked.
+    Range(RangeValidationError<E>),
+    /// No subset of the manifest's ranges covers the target exactly.
+    ///
+    /// Reported rather than approximated: a partial cover would answer a
+    /// query over less history than it was asked for, and be indistinguishable
+    /// from a correct answer over a smaller dataset.
+    Gap { uncovered: usize },
+}
+
+impl<E: fmt::Debug> fmt::Display for CoverError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CoverError::Range(e) => write!(f, "commit dag: {e:?}"),
+            CoverError::Gap { uncovered } => write!(
+                f,
+                "no exact cover: {uncovered} commit(s) are not covered by any range"
+            ),
+        }
+    }
+}
+
+impl<E: fmt::Debug> Error for CoverError<E> {}
 
 /// One logical LSM record and its zero-or-more physical artifacts.
 #[derive(Debug, Clone)]
@@ -477,6 +504,84 @@ impl<K: IndexKind> Manifest<K> {
     /// Live logical records ordered by `(level, seq)`.
     pub fn ranges(&self) -> &[RangeEntry<K::StoredArtifact>] {
         &self.ranges
+    }
+
+    /// Choose a minimal set of ranges that exactly covers `target`, without
+    /// overlap.
+    ///
+    /// # Why a cover, and not just "attach everything"
+    ///
+    /// [`attach_manifest`](IndexHome::attach_manifest) unions every artifact
+    /// it is given, which is only correct while the manifest's ranges form a
+    /// *partition*. They do today because a fanout carry DELETES the records
+    /// it merged — so the pool is disjoint by construction, and the union is
+    /// unambiguous.
+    ///
+    /// That disjointness is also what throws the time dimension away. The
+    /// merged inputs were valid derivations of their own sub-spans; deleting
+    /// them leaves only the current frontier indexed, so a query "as of an
+    /// earlier commit" has to be accumulated from the commit chain even
+    /// though an artifact covering exactly that prefix existed and was
+    /// discarded.
+    ///
+    /// Retaining them makes the ranges a *pool to choose from* rather than a
+    /// partition, and selection becomes mandatory: the root and its inputs
+    /// both cover the same commits, so unioning both would count every trible
+    /// twice. This is that selection. With it, "monolithic" and "tiered"
+    /// stop being different artifacts and become different covers of one —
+    /// the root alone, or its leaves — and a historical query is a cover of
+    /// an ancestor prefix rather than a replay.
+    ///
+    /// # Exactness
+    ///
+    /// Largest-first is optimal when the pool is hierarchical — which an LSM
+    /// guarantees, since every carried record is exactly the union of the
+    /// records it replaced. On an arbitrary pool it is the usual greedy
+    /// approximation. Either way it never returns an inexact answer: a range
+    /// is taken only if it lies wholly inside `target` and wholly outside
+    /// what is already chosen, and a target that cannot be covered exactly is
+    /// an error rather than a quiet under-read.
+    pub fn cover<D>(
+        &self,
+        dag: &mut D,
+        target: &CommitRange,
+    ) -> Result<Vec<usize>, CoverError<D::Error>>
+    where
+        D: CommitDag,
+    {
+        let want = target.members(dag).map_err(CoverError::Range)?;
+        let mut candidates: Vec<(usize, HashSet<CommitHandle>)> = Vec::new();
+        for (index, entry) in self.ranges.iter().enumerate() {
+            let members = entry.range().members(dag).map_err(CoverError::Range)?;
+            if !members.is_empty() && members.is_subset(&want) {
+                candidates.push((index, members));
+            }
+        }
+        candidates.sort_by_key(|(_, members)| std::cmp::Reverse(members.len()));
+
+        let mut remaining = want;
+        let mut chosen = Vec::new();
+        for (index, members) in &candidates {
+            if remaining.is_empty() {
+                break;
+            }
+            // Wholly outside what is already taken: every member still
+            // uncovered. A partial overlap is skipped rather than trimmed,
+            // because a range is an artifact and half of one is not.
+            if members.iter().all(|commit| remaining.contains(commit)) {
+                for commit in members {
+                    remaining.remove(commit);
+                }
+                chosen.push(*index);
+            }
+        }
+        if !remaining.is_empty() {
+            return Err(CoverError::Gap {
+                uncovered: remaining.len(),
+            });
+        }
+        chosen.sort_unstable();
+        Ok(chosen)
     }
 
     /// Replace only this recipe's optional source-head fact, retaining every
@@ -1017,6 +1122,46 @@ where
     }
 
     /// Attach every physical artifact in one already-read manifest snapshot.
+    /// Attach only the ranges at `selection`, as returned by
+    /// [`Manifest::cover`].
+    ///
+    /// This is the attach a pool of overlapping ranges requires: with merged
+    /// inputs retained, the root and its leaves both derive the same commits,
+    /// so unioning the whole manifest would count every trible twice. A
+    /// selection says which cover to read, and "monolithic" versus "tiered"
+    /// becomes a choice at query time rather than two artifacts.
+    pub fn attach_selection(
+        &mut self,
+        manifest: &Manifest<K>,
+        selection: &[usize],
+    ) -> Result<Vec<K::Segment>, IndexError> {
+        let reader = self.storage.reader().map_err(storage_error)?;
+        let mut segments = Vec::new();
+        for &index in selection {
+            let Some(range) = manifest.ranges.get(index) else {
+                return Err(ManifestError::InvalidLsmValue {
+                    entity: manifest.recipe,
+                }
+                .into());
+            };
+            for artifact in &range.artifacts {
+                segments.push(
+                    self.kind
+                        .attach(&reader, artifact)
+                        .map_err(IndexError::Artifact)?,
+                );
+            }
+        }
+        Ok(segments)
+    }
+
+    /// Attach every artifact in the manifest.
+    ///
+    /// Correct only while the manifest's ranges form a PARTITION — which
+    /// holds today because a fanout carry deletes the records it merged. Once
+    /// merged inputs are retained so that historical spans stay queryable,
+    /// this over-counts and [`attach_selection`](Self::attach_selection) with
+    /// a [`Manifest::cover`] is the right call.
     pub fn attach_manifest(
         &mut self,
         manifest: &Manifest<K>,
@@ -1520,3 +1665,95 @@ where
     }
 }
 
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+    use crate::inline::encodings::hash::Blake3;
+    use std::collections::HashMap;
+
+    fn commit(n: u8) -> CommitHandle {
+        let mut raw = [0u8; 32];
+        raw[0] = n;
+        CommitHandle::new(raw)
+    }
+
+    /// A linear chain `0 <- 1 <- 2 <- 3`.
+    fn chain() -> HashMap<CommitHandle, Vec<CommitHandle>> {
+        let mut dag = HashMap::new();
+        dag.insert(commit(0), vec![]);
+        for n in 1..4u8 {
+            dag.insert(commit(n), vec![commit(n - 1)]);
+        }
+        dag
+    }
+
+    fn manifest_with(ranges: Vec<(CommitRange, u64)>) -> Manifest<SuccinctRollup> {
+        let kind = SuccinctRollup::new();
+        let mut manifest = Manifest::new(&kind).expect("manifest");
+        let recipe = manifest.recipe;
+        for (seq, (range, level)) in ranges.into_iter().enumerate() {
+            manifest.ranges.push(
+                make_entry(&kind, recipe, range, level, seq as u64, Vec::new())
+                    .expect("entry"),
+            );
+        }
+        manifest
+    }
+
+    /// The case that cannot exist today and is the whole point of retaining
+    /// merged inputs: a root and its leaves in one manifest, covering the
+    /// same commits. Unioning both would count every trible twice; a cover
+    /// must pick one side.
+    #[test]
+    fn a_root_and_its_leaves_are_alternative_covers_not_a_union() {
+        let mut dag = chain();
+        let leaf_a = CommitRange::new(vec![commit(0)], vec![commit(1)]).expect("leaf a");
+        let leaf_b = CommitRange::new(vec![commit(2)], vec![commit(3)]).expect("leaf b");
+        let root = CommitRange::new(vec![commit(0)], vec![commit(3)]).expect("root");
+
+        let manifest = manifest_with(vec![
+            (leaf_a, 0),
+            (leaf_b, 0),
+            (root.clone(), 1),
+        ]);
+
+        // Largest-first: the root alone covers everything, so a minimal cover
+        // is one range, not three.
+        let chosen = manifest.cover(&mut dag, &root).expect("cover");
+        assert_eq!(chosen.len(), 1, "expected the root alone, got {chosen:?}");
+        assert_eq!(manifest.ranges()[chosen[0]].level(), 1);
+    }
+
+    /// A target that only the leaves can cover still resolves — the root is
+    /// too wide to fit inside it and must be rejected rather than trimmed.
+    #[test]
+    fn a_narrower_target_falls_back_to_the_leaves() {
+        let mut dag = chain();
+        let leaf_a = CommitRange::new(vec![commit(0)], vec![commit(1)]).expect("leaf a");
+        let leaf_b = CommitRange::new(vec![commit(2)], vec![commit(3)]).expect("leaf b");
+        let root = CommitRange::new(vec![commit(0)], vec![commit(3)]).expect("root");
+
+        let manifest = manifest_with(vec![(leaf_a.clone(), 0), (leaf_b, 0), (root, 1)]);
+
+        let chosen = manifest.cover(&mut dag, &leaf_a).expect("cover");
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(manifest.ranges()[chosen[0]].level(), 0);
+    }
+
+    /// A gap is an error, never a partial answer: under-covering would query
+    /// less history than asked for and be indistinguishable from a correct
+    /// answer over a smaller dataset.
+    #[test]
+    fn an_uncoverable_target_is_an_error() {
+        let mut dag = chain();
+        let leaf_a = CommitRange::new(vec![commit(0)], vec![commit(1)]).expect("leaf a");
+        let root = CommitRange::new(vec![commit(0)], vec![commit(3)]).expect("root");
+        let manifest = manifest_with(vec![(leaf_a, 0)]);
+
+        match manifest.cover(&mut dag, &root) {
+            Err(CoverError::Gap { uncovered }) => assert!(uncovered > 0),
+            other => panic!("expected a gap, got {other:?}"),
+        }
+    }
+}
