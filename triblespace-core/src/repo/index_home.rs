@@ -567,13 +567,20 @@ impl<K: IndexKind> Manifest<K> {
     /// that is not a hierarchy cannot be built this way rather than being
     /// silently mis-covered.
     ///
-    /// # Granularity is the leaf
+    /// # What a gap actually is
     ///
-    /// A leaf is the finest thing the index can answer. Asking for a commit
-    /// set that cuts through the middle of one returns
-    /// [`CoverError::Gap`] naming the shortfall — the honest answer is that
-    /// the rollups cover a prefix and the remainder must come from the commit
-    /// chain, and a hybrid caller wants to know exactly how much.
+    /// Under commit-as-leaf — which is what `Repository::register_index`
+    /// builds, one `CommitRange::leaf(commit)` per commit — a leaf names
+    /// exactly one commit, so a wanted set can never cut through one. Every
+    /// commit that has been rolled up is therefore exactly coverable, and the
+    /// only [`CoverError::Gap`] is a commit NO LEAF NAMES: one outside the
+    /// rolled-up frontier, whose rows must come from the commit chain. The
+    /// count says how much replay that is.
+    ///
+    /// The type permits coarser leaves — `append_range` takes any
+    /// `CommitRange` — and then a partial leaf is possible and is reported
+    /// the same way. That is a property of a hand-built manifest, not of
+    /// anything the repository produces.
     pub fn cover_by_fold(
         &self,
         wanted: &HashSet<CommitHandle>,
@@ -1878,10 +1885,12 @@ mod cover_tests {
         assert_eq!(manifest.ranges()[chosen[0]].entity(), ids[0]);
     }
 
-    /// Leaf granularity, stated honestly: a commit no leaf names is a gap,
-    /// and the caller is told how much has to come from the commit chain.
+    /// A commit outside the rolled-up frontier. NOT a partial leaf: with
+    /// commit-as-leaf a leaf is one commit, so a wanted set cannot cut
+    /// through one. The gap is un-indexed history, and the count is how much
+    /// has to come from the commit chain.
     #[test]
-    fn a_commit_outside_every_leaf_is_a_gap() {
+    fn a_commit_no_leaf_names_is_a_gap() {
         let (manifest, _) = tree_manifest();
         let wanted: HashSet<CommitHandle> = [commit(0), commit(3)].into_iter().collect();
         match manifest.cover_by_fold(&wanted) {
