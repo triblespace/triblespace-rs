@@ -46,15 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Experimental breaking intrinsic-entity epoch uses canonical full rows.**
-  Content-derived `entity!` records now canonicalize aligned
+- **Breaking: intrinsic entities use canonical full rows.**
+  Content-derived `entity!` records now canonicalize
   `NIL || attribute || value` rows, hash the complete contiguous row sequence,
-  fill the derived entity column in place, and retain the finished allocation
-  behind archive-backed PATCH leaves. This deliberately changes every derived
-  entity ID from the historical `attribute || value` stream; explicit entity
-  IDs are unchanged. The probe includes cross-revision construction and
-  fragment-aggregation benchmarks so the identity migration can be accepted
-  or rejected on compositional evidence rather than isolated throughput.
+  fill the derived entity column in place, and materialize ordinary shared
+  PATCH leaves from the finished rows. This deliberately changes every
+  derived entity ID from the historical `attribute || value` stream. Stored
+  intrinsic roots and artifacts derived from them must be regenerated or
+  migrated as one identity epoch; explicit entity IDs and facts built with
+  them are unchanged. Cross-revision benchmarks found unchanged 512×3 entity
+  aggregation, faster common small entities, and much faster duplicate-heavy
+  repeated fields.
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
   typed-Program engine is gone — `residual.rs`, the Program VM, query-time
   regular-path evaluation (`path!` and `RegularPathConstraint`), and the

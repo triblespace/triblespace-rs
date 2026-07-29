@@ -46,12 +46,12 @@ pub const V_END: usize = 63;
 /// Fundamentally a trible is always a collection of 64 bytes.
 pub type RawTrible = [u8; TRIBLE_LEN];
 
-/// One aligned scratch row used while deriving an intrinsic entity.
+/// One scratch row used while deriving an intrinsic entity.
 ///
 /// The row starts as `NIL || attribute || value`. After the complete row set
 /// has been canonicalized and hashed, the derived entity id is written into
-/// the leading 16 bytes in place. The 16-byte alignment lets the finished
-/// allocation serve directly as archive-backed PATCH leaf storage.
+/// the leading 16 bytes in place. Its exact 64-byte representation also lets
+/// the canonical row sequence be hashed as one contiguous byte slice.
 ///
 /// This is an implementation seam for the `entity!` macro rather than a
 /// general serialization format. Use [`Trible`] for ordinary fact
@@ -69,7 +69,7 @@ pub type RawTrible = [u8; TRIBLE_LEN];
     zerocopy::IntoBytes,
     zerocopy::Immutable,
 )]
-#[repr(C, align(16))]
+#[repr(transparent)]
 pub struct IntrinsicEntityRow {
     data: RawTrible,
 }
@@ -94,7 +94,6 @@ impl IntrinsicEntityRow {
 
 const _: () = {
     assert!(std::mem::size_of::<IntrinsicEntityRow>() == TRIBLE_LEN);
-    assert!(std::mem::align_of::<IntrinsicEntityRow>() == 16);
 };
 
 /// Fundamental 64-byte tuple of entity, attribute and value used throughout the

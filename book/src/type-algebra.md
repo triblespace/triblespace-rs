@@ -28,7 +28,7 @@ Semantically it is the meet (`∧`) of its constituent relations:
 Entity{A, B}  ≡  { A : ValueA } ∧ { B : ValueB }
 ```
 
-At runtime `entity!` expands to a small [`Fragment`](../src/trible/fragment.rs): a [`TribleSet`](../src/trible/tribleset.rs) containing those facts plus a set of exported entity ids. The procedural macro emits a fresh set, populates it with [`Trible::new`][Trible] calls, and returns the fragment by value. Use `+=` to merge fragments into a dataset (only the facts are unioned), and use `root()`/`exports()` when you want the produced entity id(s) back alongside the facts.
+At runtime `entity!` expands to a small [`Fragment`](../src/trible/fragment.rs): a [`TribleSet`](../src/trible/tribleset.rs) containing those facts plus a set of exported entity ids. With an explicit entity id, the procedural macro inserts the encoded facts directly. With intrinsic identity, it first builds canonical `NIL || attribute || value` rows, sorts and deduplicates them, hashes the complete row sequence, fills the derived id into each entity column, and then constructs the set. Use `+=` to merge fragments into a dataset (only the facts are unioned), and use `root()`/`exports()` when you want the produced entity id(s) back alongside the facts.
 At the type level it represents their conjunction.
 Records are therefore intersection types: every additional field refines the shape without invalidating existing data.
 

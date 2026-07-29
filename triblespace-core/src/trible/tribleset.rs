@@ -13,7 +13,6 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Blake3;
 use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
-use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
 use crate::patch::PATCH;
 use crate::query::Variable;
@@ -31,19 +30,15 @@ use std::iter::FromIterator;
 use std::iter::Map;
 use std::ops::Add;
 use std::ops::AddAssign;
-use std::ptr::NonNull;
-use std::sync::Arc;
 use zerocopy::IntoBytes;
-
-struct IntrinsicEntityRows(Vec<IntrinsicEntityRow>);
 
 /// Canonicalizes and stores the facts of one content-derived entity.
 ///
 /// Each input row has the shape `NIL || attribute || value`. Rows are sorted
 /// and deduplicated, then their complete contiguous 64-byte representations
 /// are hashed with BLAKE3. The final 16 digest bytes become the entity id and
-/// are written into every row in place. The same allocation then backs the
-/// resulting [`TribleSet`]'s PATCH leaves.
+/// are written into every row in place before ordinary shared PATCH leaves are
+/// constructed from the canonical rows.
 ///
 /// The leading NIL bytes deliberately participate in the hash. Consequently
 /// this identity scheme is not compatible with the historical `A || V`
@@ -62,29 +57,9 @@ pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleS
         row.fill_entity(id);
     }
 
-    if rows.is_empty() {
-        return (id, TribleSet::new());
-    }
-
-    // Keep the final canonical allocation stable before taking any pointers
-    // into it. The erased Arc is what PATCH Branch owners retain.
-    let rows = Arc::new(IntrinsicEntityRows(rows));
-    let owner: Arc<dyn ArchiveOwner> = rows.clone();
     let mut set = TribleSet::new();
-    let mut iter = rows.0.iter();
-
-    // An empty PATCH root has nowhere to retain an archive owner. Seed all six
-    // indexes with one shared heap Entry; the second row creates owner-bearing
-    // Branches, and every remaining row can stay in the archive allocation.
-    let first = iter.next().expect("the empty case returned above");
-    set.insert(Trible::as_transmute_raw_unchecked(first.raw()));
-
-    for row in iter {
-        // SAFETY: `row` points into the immutable allocation retained by
-        // `owner`. IntrinsicEntityRow is 16-byte aligned and 64 bytes wide, so
-        // every element satisfies ArchiveEntry's tagged-pointer alignment.
-        let entry = unsafe { ArchiveEntry::new(NonNull::from(row.raw()), &owner) };
-        set.insert_archive(&entry);
+    for row in &rows {
+        set.insert(Trible::as_transmute_raw_unchecked(row.raw()));
     }
 
     (id, set)
@@ -626,7 +601,6 @@ mod tests {
     #[test]
     fn intrinsic_entity_rows_are_canonical_hashed_and_indexed() {
         assert_eq!(std::mem::size_of::<IntrinsicEntityRow>(), TRIBLE_LEN);
-        assert_eq!(std::mem::align_of::<IntrinsicEntityRow>(), 16);
 
         let a = intrinsic_row([1; 16], [0x11; 32]);
         let b = intrinsic_row([2; 16], [0x22; 32]);
@@ -658,31 +632,25 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_archive_rows_survive_clone_and_different_owner_unions() {
+    fn intrinsic_rows_survive_clone_and_unions() {
         let rows_a = many_intrinsic_rows(1, 256);
         let rows_b = many_intrinsic_rows(2, 256);
         let (_, expected_a) = expected_intrinsic_entity(rows_a.clone());
         let (_, expected_b) = expected_intrinsic_entity(rows_b.clone());
         let expected: BTreeSet<_> = expected_a.union(&expected_b).copied().collect();
 
-        // Each builder's input allocation is moved in and its local owner Arc
-        // is gone before this union starts. Only the owners retained by PATCH
-        // Branches keep the archive rows alive here.
+        // Cloning and dropping the original must preserve every shared PATCH
+        // leaf before a differently rooted set is merged into the clone.
         let (_, first) = build_intrinsic_entity(rows_a);
         let surviving_clone = first.clone();
         drop(first);
         let (_, second) = build_intrinsic_entity(rows_b);
         let union = surviving_clone + second;
 
-        // Encourage any accidentally freed row allocation to be reused before
-        // every index dereferences its LocalLeaves.
-        let noise = vec![0xabu8; 256 * TRIBLE_LEN * 4];
-        std::hint::black_box(&noise);
         assert_all_indexes(&union, &expected);
 
-        // Independently built, byte-identical entities have distinct owner
-        // Arcs. Their overlapping LocalLeaves exercise PATCH's owner
-        // reconciliation while preserving exact set semantics.
+        // Independently built, byte-identical entities still preserve exact
+        // set semantics when all their leaves overlap.
         let same_rows = many_intrinsic_rows(3, 256);
         let (_, same_expected) = expected_intrinsic_entity(same_rows.clone());
         let (_, same_left) = build_intrinsic_entity(same_rows.clone());
