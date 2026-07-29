@@ -68,6 +68,8 @@ f256 = "0.7.0"
 blake3 = "1.5"
 
 [features]
+# Forward the core span instrumentation.
+trace = ["triblespace-core/trace"]
 default = ["triblespace-core/proptest", "wasm", "object-store", "parallel", "gpu"]
 proptest = ["triblespace-core/proptest"]
 object-store = ["triblespace-core/object-store"]

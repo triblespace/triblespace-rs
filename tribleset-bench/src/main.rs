@@ -60,6 +60,8 @@ use subject::core::prelude::TribleSet;
 
 mod archq;
 mod fixtures;
+#[cfg(feature = "trace")]
+mod spans;
 mod ledger;
 
 #[path = "../queries/wd_schema.rs"]
@@ -1324,6 +1326,18 @@ fn main() {
 
     let suite_start = Instant::now();
     let base = Instant::now();
+    // Installed before anything the engine does, so a span cannot be missed
+    // for having fired during setup — setup is exactly where the surprising
+    // costs turned out to live.
+    #[cfg(feature = "trace")]
+    let collector = {
+        use tracing_subscriber::prelude::*;
+        let collector = spans::Collector::new(base);
+        tracing_subscriber::registry()
+            .with(collector.clone())
+            .init();
+        collector
+    };
     let mut led = match ledger::ResultsLedger::open(results, &commit, label, &config) {
         Ok(l) => l,
         Err(e) => {
@@ -1686,6 +1700,15 @@ fn main() {
 
     // -- close -------------------------------------------------------------
     let end_ns = base.elapsed().as_nanos() as u64;
+    // Engine spans last, so they sit beside the harness measurements in one
+    // pile rather than a separate profile that has to be correlated by hand.
+    #[cfg(feature = "trace")]
+    {
+        let records = collector.drain();
+        let n = spans::flush(&mut led, records);
+        println!("trace    : {n} engine span(s) recorded");
+    }
+
     if let Err(e) = led.finish(end_ns) {
         eprintln!("cannot finish results session: {e:?}");
         std::process::exit(1);

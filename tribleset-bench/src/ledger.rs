@@ -193,17 +193,45 @@ impl ResultsLedger {
 
     /// Record one measured iteration as a telemetry span.
     pub fn span(&mut self, name: &str, begin_ns: u64, duration_ns: u64) {
+        self.span_in(name, "bench", begin_ns, duration_ns, None);
+    }
+
+    /// Record a span with an explicit category and parent.
+    ///
+    /// `parent` is the schema's nesting edge, declared since the beginning
+    /// and never written: every span was a flat "bench" measurement taken
+    /// from OUTSIDE the engine. Engine spans arrive nested — a `rollup.merge`
+    /// inside an append, a `blob.hash` inside an attach — and the tree is the
+    /// point. Without it a flame graph is a bar chart.
+    ///
+    /// Returns the span's entity so a caller can parent children to it.
+    pub fn span_in(
+        &mut self,
+        name: &str,
+        category: &str,
+        begin_ns: u64,
+        duration_ns: u64,
+        parent: Option<Id>,
+    ) -> Id {
         let span_owner = ufoid();
+        let id = *span_owner;
         let name_handle = self.ws.put(name.to_string());
-        self.pending += TribleSet::from(entity! { &span_owner @
+        let mut facts = TribleSet::from(entity! { &span_owner @
             metadata::tag: *KIND_SPAN,
             tele::session: self.session,
-            tele::category: "bench",
+            tele::category: category,
             tele::name: name_handle,
             tele::begin_ns: begin_ns,
             tele::end_ns: begin_ns + duration_ns,
             tele::duration_ns: duration_ns,
         });
+        if let Some(parent) = parent {
+            facts += TribleSet::from(entity! { &span_owner @
+                tele::parent: parent,
+            });
+        }
+        self.pending += facts;
+        id
     }
 
     /// Record a per-measure outcome entity.

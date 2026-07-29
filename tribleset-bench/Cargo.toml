@@ -5,6 +5,12 @@ edition = "2021"
 description = "Engine-version-agnostic benchmark suite for triblespace. The SUBJECT engine is a repointable dependency (any checkout, any era — no history grafting); results are written as canonical telemetry sessions/spans through the stable LEDGER dependency. The minted schema ids are the contract; GORBIE's telemetry-viewer renders the axis."
 
 [features]
+# Collect the engine's own spans into the results ledger.
+#
+# Turns on `subject/trace` as well: instrumentation that the harness can
+# enable without the engine emitting anything would silently produce an
+# empty profile, which reads as "nothing was slow".
+trace = ["dep:tracing", "dep:tracing-subscriber", "subject/trace"]
 # EMPTY BY DESIGN. Every capability feature below couples the suite to a
 # specific engine ERA; enabling one by default would break the crate's whole
 # purpose (benchmarking any rev). bench.sh probes the subject and enables
@@ -50,6 +56,8 @@ frontier-w1 = ["frontier"]
 gpu = ["subject/gpu"]
 
 [dependencies]
+tracing = { version = "0.1.44", optional = true }
+tracing-subscriber = { version = "0.3.22", optional = true }
 # The engine under test. `subjects/current` is a symlink managed by
 # bench.sh; the checked-in default target is `../..` — the enclosing
 # triblespace-rs repo, so a fresh clone builds the current checkout
