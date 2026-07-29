@@ -8,11 +8,39 @@
 //! measured iteration (warmups unmeasured), NO aggregation in the
 //! runner — raw observations only; statistics are the viewer's job.
 //!
+//! MODES. A measuring run is EITHER a query run or a construction run,
+//! never both, because a construction perturbs the machine state the
+//! timings beside it inherit — and by an amount that scales with the data,
+//! so it is not even a constant offset across a scale ladder.
+//! - default — times queries. `arch/build_ram/total` records
+//!   `skip:query-mode`.
+//! - `--bench-build` — times construction only (`ladder/checkout/total`
+//!   and `arch/build_ram/total`). Every query arm is represented by the
+//!   single `mode/query_arms` = `skip:build-mode` outcome; the session's
+//!   `config` records `mode: build` beside it.
+//! Run the same argv twice to get both halves.
+//!
+//! SOURCES. The archive/device arms take their rows from one of two
+//! places, recorded in the session config as `arch_source`:
+//! - `--rollup <pile>` — ATTACH a cover out of the pile's index
+//!   annotation (`attach`). Nothing is constructed and nothing is
+//!   resident, so the arms are bounded by the pile rather than by RAM.
+//!   This is the path an archive-versus-device comparison at dataset
+//!   scale wants.
+//! - `--data <pile>` — load a `TribleSet` and BUILD one archive over it
+//!   (`build`). The residency baseline: the `sparqloscope/…` arm is a
+//!   `TribleSet` arm and genuinely needs the rows in memory.
+//! A rollup run REPLACES the resident arms rather than joining them (it
+//! answers over the whole dataset, not a `--rung`-bounded prefix, so the
+//! two are not row-comparable), which is why `--data` goes unused when
+//! `--rollup` is given and the checkout records `skip:attached`.
+//!
 //! Groups:
 //! - `ladder/checkout/total` — `Workspace::checkout` of the first k
 //!   commits of the `--data` pile's branch at the `--rung` target.
+//!   BUILD mode only.
 //! - `arch/build_ram/total` — `SuccinctArchive<OrderedUniverse>` build
-//!   over the checked-out set.
+//!   over the checked-out set. BUILD mode only.
 //! - `arch_regions/<query>/{confirms,max,p95,median,ge_threshold,
 //!   live_total}` — the confirm-region census (see [`archq`]): the
 //!   distribution of LIVE candidate counts real queries hand the
@@ -20,10 +48,10 @@
 //!   routes on. Counting, never timing, so it reads the same on a
 //!   loaded machine as on a quiet one. `protocol-v2`-gated.
 //! - `arch/<query>/total` — the same queries timed against the CPU
-//!   archive; `arch_gpu/<query>/total` beside it against a
-//!   `WgpuSuccinctArchive` (gpu-gated), with
-//!   `arch_gpu/<query>/routing/*` recording how many confirms actually
-//!   reached the device. The two arms must return identical row
+//!   archive (attached cover or built archive, per `arch_source`);
+//!   `arch_gpu/<query>/total` beside it against the device (gpu-gated),
+//!   with `arch_gpu/<query>/routing/*` recording how many confirms
+//!   actually reached it. The two arms must return identical row
 //!   counts: a mismatch records `gate_fail:cross-arm …` AND exits
 //!   non-zero.
 //! - `harkonnen/F{1..5}/{ttfr,total}` — the R1 adversarial fixtures; F3
@@ -41,6 +69,14 @@
 //!   disagreement records `gate_fail:cross-arm …` AND exits non-zero.
 //!   A pile with no v2 manifest, or no `--data` at all, records SKIP
 //!   for every query (the census still lands in the pile).
+//! - `rollup_d<depth>/<query>/total` — the same registry against an
+//!   ATTACHED cover, with `rollup_d<depth>_gpu/<query>/total` beside it
+//!   on the device (gpu-gated) and `rollup_d<depth>_gpu/…/routing/*`
+//!   for its dispatch counters. The two ALTERNATE per query, so a run
+//!   that is stopped early still holds a complete comparison over the
+//!   queries it reached; the device answer is gated against the CPU
+//!   answer for the same query. Replaces the `sparqloscope*` arms — a
+//!   rollup run answers over the whole dataset, not a resident prefix.
 //!
 //! Panics in any measure are caught (`quiet_catch`) and recorded as
 //! `panic:<reason>` outcomes; the run continues.
@@ -71,7 +107,34 @@ mod wd_load;
 #[path = "../queries/sparqloscope.rs"]
 mod queries;
 
+/// What a run measures. The two are mutually exclusive BY CONSTRUCTION,
+/// which is the whole point: see [`Mode::Build`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    /// Time queries. Nothing large is constructed in this process — the
+    /// archive arms either attach a prebuilt cover (`--rollup`) or build
+    /// exactly the one archive they then query (`--data`).
+    Query,
+    /// Time CONSTRUCTION only (`--bench-build`): the ladder checkout and
+    /// `arch/build_ram/total`. Every query measure records
+    /// `skip:build-mode`.
+    ///
+    /// # Why this is a separate process and not a phase
+    ///
+    /// `arch/build_ram/total` builds a full `SuccinctArchive` over the
+    /// whole checked-out set and drops it — `build_warmup + build_iters`
+    /// times. Doing that in the process that then times queries leaves the
+    /// allocator, the page cache and the die's thermal state in a condition
+    /// the query timings then inherit, and the effect SCALES WITH THE DATA,
+    /// so it is not even a constant offset across a scale ladder. The
+    /// construction number is worth having; it is not worth having inside
+    /// the query window. Run the suite twice against the same rung: once
+    /// with `--bench-build`, once without.
+    Build,
+}
+
 struct Cfg {
+    mode: Mode,
     data: Option<std::path::PathBuf>,
     branch: Option<String>,
     rung: usize,
@@ -115,19 +178,41 @@ fn parse_size(s: &str) -> Option<usize> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tribleset-bench --results <pile> --label <engine label> \
-         [--data <pile> --branch <name> --rung <N>] \
-         [--iters N] [--warmup N] [--build-iters N] [--build-warmup N] \
-         [--arch-iters N] [--arch-warmup N]\n\
-         \x20      tribleset-bench --verify <pile>\n\
-         Sizes accept k/M/G suffixes. --data must be a clonefile copy \
-         (cp -c) of a dataset pile."
+        "usage:\n\
+         \x20 QUERY mode (default) — times queries, constructs nothing large:\n\
+         \x20   tribleset-bench --results <pile> --label <engine label>\n\
+         \x20     [--rollup <pile> [--rollup-depth N]]   attach a prebuilt cover (no residency)\n\
+         \x20     [--data <pile> [--branch <name>] [--rung N]]  load a resident set\n\
+         \x20     [--iters N] [--warmup N] [--arch-iters N] [--arch-warmup N]\n\
+         \x20 BUILD mode — times CONSTRUCTION only, never beside a query:\n\
+         \x20   tribleset-bench --bench-build --results <pile> --label <label> --data <pile>\n\
+         \x20     [--rung N] [--build-iters N] [--build-warmup N]\n\
+         \x20 READ-ONLY modes:\n\
+         \x20   tribleset-bench --report <pile> [--only <group>]\n\
+         \x20   tribleset-bench --verify <pile>\n\
+         \n\
+         The two measuring modes are separate PROCESSES on purpose: building a\n\
+         full archive perturbs the allocator, page cache and thermals that the\n\
+         query timings beside it would inherit, by an amount that scales with\n\
+         the data. Run the same argv twice, once with --bench-build.\n\
+         \n\
+         --rollup ATTACHES a cover out of a pile's index annotation, so the\n\
+         archive and device arms need no resident TribleSet and are not capped\n\
+         by RAM. --data loads tribles and is the residency baseline.\n\
+         Sizes accept k/M/G suffixes. --data must be a clonefile copy (cp -c)\n\
+         of a dataset pile."
     );
     std::process::exit(2);
 }
 
 fn parse_cfg() -> Cfg {
+    parse_args(&std::env::args().skip(1).collect::<Vec<_>>())
+}
+
+/// The hand-rolled parser, split from `std::env::args` so it is testable.
+fn parse_args(args: &[String]) -> Cfg {
     let mut cfg = Cfg {
+        mode: Mode::Query,
         data: None,
         branch: None,
         rung: 1_000_000,
@@ -145,7 +230,6 @@ fn parse_cfg() -> Cfg {
         report: None,
         report_only: None,
     };
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         usage();
     }
@@ -168,22 +252,24 @@ fn parse_cfg() -> Cfg {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--data" => cfg.data = Some(take(&args, &mut i).into()),
-            "--branch" => cfg.branch = Some(take(&args, &mut i).to_owned()),
-            "--rung" => cfg.rung = take_size(&args, &mut i),
-            "--rollup" => cfg.rollup = Some(take(&args, &mut i).into()),
-            "--rollup-depth" => cfg.rollup_depth = take_size(&args, &mut i),
-            "--results" => cfg.results = Some(take(&args, &mut i).into()),
-            "--label" => cfg.label = Some(take(&args, &mut i).to_owned()),
-            "--iters" => cfg.iters = take_size(&args, &mut i),
-            "--warmup" => cfg.warmup = take_size(&args, &mut i),
-            "--build-iters" => cfg.build_iters = take_size(&args, &mut i),
-            "--build-warmup" => cfg.build_warmup = take_size(&args, &mut i),
-            "--arch-iters" => cfg.arch_iters = take_size(&args, &mut i),
-            "--arch-warmup" => cfg.arch_warmup = take_size(&args, &mut i),
-            "--report" => cfg.report = Some(take(&args, &mut i).into()),
-            "--only" => cfg.report_only = Some(take(&args, &mut i).to_owned()),
-            "--verify" => cfg.verify = Some(take(&args, &mut i).into()),
+            "--bench-build" => cfg.mode = Mode::Build,
+            "--data" => cfg.data = Some(take(args, &mut i).into()),
+            "--branch" => cfg.branch = Some(take(args, &mut i).to_owned()),
+            "--rung" => cfg.rung = take_size(args, &mut i),
+            "--rollup" => cfg.rollup = Some(take(args, &mut i).into()),
+            "--rollup-depth" => cfg.rollup_depth = take_size(args, &mut i),
+            "--results" => cfg.results = Some(take(args, &mut i).into()),
+            "--label" => cfg.label = Some(take(args, &mut i).to_owned()),
+            "--iters" => cfg.iters = take_size(args, &mut i),
+            "--warmup" => cfg.warmup = take_size(args, &mut i),
+            "--build-iters" => cfg.build_iters = take_size(args, &mut i),
+            "--build-warmup" => cfg.build_warmup = take_size(args, &mut i),
+            "--arch-iters" => cfg.arch_iters = take_size(args, &mut i),
+            "--arch-warmup" => cfg.arch_warmup = take_size(args, &mut i),
+            "--report" => cfg.report = Some(take(args, &mut i).into()),
+            "--only" => cfg.report_only = Some(take(args, &mut i).to_owned()),
+            "--verify" => cfg.verify = Some(take(args, &mut i).into()),
+            "--help" | "-h" => usage(),
             other => {
                 eprintln!("unrecognized arg {other:?}");
                 usage();
@@ -192,6 +278,19 @@ fn parse_cfg() -> Cfg {
         i += 1;
     }
     cfg
+}
+
+impl Cfg {
+    /// Where the archive/device arms get their rows: an ATTACHED cover
+    /// (`--rollup`, no residency, nothing constructed) or a BUILT archive
+    /// over the resident `--data` set.
+    fn arch_source(&self) -> &'static str {
+        match (&self.rollup, &self.data) {
+            (Some(_), _) => "attach",
+            (None, Some(_)) => "build",
+            (None, None) => "none",
+        }
+    }
 }
 
 /// The subject's git rev (short=12), read at runtime from the checkout
@@ -440,6 +539,15 @@ const ARCH_ROUTING_SUFFIXES: [&str; 5] = [
     "gpu_errors",
 ];
 
+/// The one measure a BUILD-mode session records about the query arms.
+///
+/// Enumerating a `skip:build-mode` outcome for all ~250 query measures
+/// would restate, 250 times, what the session's `config` already says once
+/// (`mode: build`). The within-mode skips stay enumerated — "the gpu crate
+/// is absent" or "no dataset loaded" are facts about measures that COULD
+/// have run in this session. "A different process measures that" is not.
+const MODE_MARKER: &str = "mode/query_arms";
+
 /// Record `reason` against every measure the archive query arm would
 /// have produced. Keeps the census in the pile complete for runs that
 /// never reach the arm (no dataset, or a set too large to archive in
@@ -453,50 +561,36 @@ fn skip_arch_queries(led: &mut ledger::ResultsLedger, reason: &str) {
             led.outcome(&format!("arch_regions/{}/{suffix}", q.name), reason, None);
         }
         led.outcome(&format!("arch/{}/total", q.name), reason, None);
-        led.outcome(&format!("arch_gpu/{}/total", q.name), gpu_reason, None);
-        for suffix in ARCH_ROUTING_SUFFIXES {
-            led.outcome(
-                &format!("arch_gpu/{}/routing/{suffix}", q.name),
-                gpu_reason,
-                None,
-            );
-        }
     }
+    skip_arch_device(led, gpu_reason);
 }
 
-/// Run the archive query arm over `set`. Returns `true` when a
-/// cross-arm identity check FAILED — the caller turns that into a
-/// non-zero exit, because two backends that disagree make every
-/// timing next to them meaningless.
+/// Phases 1 and 2a of the archive query arm: the untimed confirm-region
+/// census and the timed CPU arm, over ONE backend.
 ///
-/// Three passes over ONE archive build:
-/// 1. the untimed confirm-region census ([`archq::CountingArchive`]),
-/// 2. the timed CPU arm (`arch/<query>/total`),
-/// 3. the timed device arm (`arch_gpu/<query>/total`) plus its routing
-///    counters, under the `gpu` capability.
-fn run_arch_queries(
+/// Generic over the backend, because the arm no longer cares where its rows
+/// came from:
+/// - `--rollup` hands it a `UnionArchive` ATTACHED from a pile's index
+///   annotation — mmapped segments, no resident `TribleSet`, nothing built,
+///   and therefore no ceiling from how much fits in RAM;
+/// - `--data` hands it a `SuccinctArchive` built once over the resident set,
+///   which is the residency baseline.
+///
+/// Returns each query's answer count (`None` where it panicked) so the
+/// device arm can be gated against it.
+fn run_arch_census_cpu<B>(
     led: &mut ledger::ResultsLedger,
     cfg: &Cfg,
     base: &Instant,
-    set: &TribleSet,
-) -> bool {
-    // Only the device arm can flip this; without the gpu capability
-    // there is no second arm to disagree with.
-    #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
-    let mut cross_arm_failure = false;
-    let built = Instant::now();
-    let archive = fixtures::build_archive(set);
-    println!(
-        "arch     : query arm over a {}-trible archive (built in {:.2}s), routing threshold {}",
-        set.len(),
-        built.elapsed().as_secs_f64(),
-        archq::CONFIRM_THRESHOLD
-    );
-
+    facts: B,
+) -> Vec<Option<usize>>
+where
+    B: subject::core::query::TriblePattern + Clone + Send + Sync,
+{
     // -- phase 1: the confirm-region census (counting, not timing) ------
     #[cfg(feature = "protocol-v2")]
-    let archive = {
-        let ds = archq::shell(archq::CountingArchive::new(archive));
+    {
+        let ds = archq::shell(archq::CountingArchive::new(facts.clone()));
         println!(
             "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}{:>10}",
             "regions/live-count", "confirms", "max", "p95", "median", ">=thresh", "width"
@@ -617,8 +711,7 @@ fn run_arch_queries(
                 }
             }
         }
-        ds.facts.into_archive()
-    };
+    }
     #[cfg(not(feature = "protocol-v2"))]
     {
         for q in archq::arch_queries::<TribleSet>() {
@@ -635,136 +728,251 @@ fn run_arch_queries(
 
     // -- phase 2a: the timed CPU arm ------------------------------------
     let mut cpu_counts: Vec<Option<usize>> = Vec::new();
-    let archive = {
-        let ds = archq::shell(archive);
-        for q in archq::arch_queries() {
-            let mut m = Measure::new(format!("arch/{}/total", q.name));
-            for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
-                let recording = i >= cfg.arch_warmup;
-                m.iterate(recording, base, || archq::answer_count(&(q.run)(&ds)));
-            }
-            cpu_counts.push(if m.panicked.is_some() { None } else { m.ident });
-            m.emit(led, true);
+    let ds = archq::shell(facts);
+    for q in archq::arch_queries() {
+        let mut m = Measure::new(format!("arch/{}/total", q.name));
+        for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
+            let recording = i >= cfg.arch_warmup;
+            m.iterate(recording, base, || archq::answer_count(&(q.run)(&ds)));
         }
-        ds.facts
-    };
+        cpu_counts.push(if m.panicked.is_some() { None } else { m.ident });
+        m.emit(led, true);
+    }
+    cpu_counts
+}
 
-    // -- phase 2b: the timed device arm ---------------------------------
-    #[cfg(not(feature = "gpu"))]
-    {
-        drop(archive);
-        for q in archq::arch_queries::<TribleSet>() {
-            led.outcome(&format!("arch_gpu/{}/total", q.name), "skip:gpu", None);
-            for suffix in ARCH_ROUTING_SUFFIXES {
-                led.outcome(
-                    &format!("arch_gpu/{}/routing/{suffix}", q.name),
-                    "skip:gpu",
-                    None,
+/// Phase 2b: the timed device arm (`arch_gpu/<query>/total`) plus its
+/// routing counters. Returns `true` when a cross-arm identity check
+/// FAILED — the caller turns that into a non-zero exit, because two
+/// backends that disagree make every timing next to them meaningless.
+///
+/// Generic over the device backend for the same reason phase 2a is generic
+/// over the CPU one: `--data` wraps one built archive, `--rollup` wraps an
+/// attached cover shard by shard (see [`archq::WgpuUnionArchive`]).
+#[cfg(feature = "gpu")]
+fn run_arch_device<G>(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    attach_begin: u64,
+    attach_ns: u64,
+    gpu: G,
+    cpu_counts: &[Option<usize>],
+) -> bool
+where
+    G: archq::DeviceFacts,
+{
+    let mut cross_arm_failure = false;
+    let (range_floor, membership_floor) = gpu.batch_floors();
+    led.span("arch_gpu/attach/total", attach_begin, attach_ns);
+    led.outcome("arch_gpu/attach/total", "signal", None);
+    println!(
+        "  {:<32} signal (1 span, {:.0} ms, {} shard(s), min_confirm_batch range {} / membership {})",
+        "arch_gpu/attach/total",
+        attach_ns as f64 / 1e6,
+        gpu.shard_count(),
+        range_floor,
+        membership_floor,
+    );
+    let ds = archq::shell(gpu);
+    for (q, cpu) in archq::arch_queries().into_iter().zip(cpu_counts.iter()) {
+        let mut m = Measure::new(format!("arch_gpu/{}/total", q.name));
+        for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
+            let recording = i >= cfg.arch_warmup;
+            m.iterate(recording, base, || {
+                // Per-EXECUTION routing counters: the snapshot below
+                // then describes the last iteration, directly
+                // comparable with the per-execution region census.
+                archq::DeviceFacts::reset_stats(&ds.facts);
+                archq::answer_count(&(q.run)(&ds))
+            });
+        }
+        if let (Some(expected), Some(got)) = (cpu, m.ident) {
+            if *expected != got {
+                cross_arm_failure = true;
+                eprintln!(
+                    "CROSS-ARM IDENTITY FAILURE: {} — cpu {expected} rows, gpu {got} rows",
+                    q.name
                 );
             }
-            println!("  {:<32} SKIP (gpu: no triblespace-gpu on the subject)", format!("arch_gpu/{}/total", q.name));
         }
+        if let Some(expected) = cpu {
+            m.cross_arm(*expected);
+        }
+        let s = archq::DeviceFacts::stats(&ds.facts);
+        for (suffix, value) in [
+            ("gpu_confirms", s.gpu_confirms),
+            ("gpu_candidates", s.gpu_candidates),
+            ("cpu_fallback_confirms", s.cpu_fallback_confirms),
+            ("cpu_fallback_candidates", s.cpu_fallback_candidates),
+            ("gpu_errors", s.gpu_errors),
+        ] {
+            led.outcome(
+                &format!("arch_gpu/{}/routing/{suffix}", q.name),
+                "signal",
+                Some(value),
+            );
+        }
+        m.emit(led, true);
+        println!(
+            "      routing: {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
+            s.gpu_confirms,
+            s.gpu_candidates,
+            s.cpu_fallback_confirms,
+            s.cpu_fallback_candidates,
+            s.gpu_errors
+        );
+    }
+    cross_arm_failure
+}
+
+/// Record `reason` against every measure the device arm would have
+/// produced, its attach included.
+fn skip_arch_device(led: &mut ledger::ResultsLedger, reason: &str) {
+    led.outcome("arch_gpu/attach/total", reason, None);
+    for q in archq::arch_queries::<TribleSet>() {
+        led.outcome(&format!("arch_gpu/{}/total", q.name), reason, None);
+        for suffix in ARCH_ROUTING_SUFFIXES {
+            led.outcome(
+                &format!("arch_gpu/{}/routing/{suffix}", q.name),
+                reason,
+                None,
+            );
+        }
+    }
+    println!("  {:<32} SKIP ({reason})", "arch_gpu/*");
+}
+
+/// The archive query arm over a BUILT archive (`--data`).
+///
+/// The archive is built ONCE, here, and immediately queried — it is the
+/// arm's subject, not a separate construction measurement. The
+/// throwaway build that used to run in this same process (a full
+/// `SuccinctArchive` over the whole set, `build_warmup + build_iters`
+/// times, dropped) now lives behind `--bench-build` in its own process;
+/// see [`Mode::Build`].
+///
+/// Needs the set RESIDENT, which is the ceiling this path cannot escape.
+/// Use `--rollup` to run the same arm against an attached cover instead.
+fn run_arch_queries_built(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    set: &TribleSet,
+) -> bool {
+    let built = Instant::now();
+    let archive = fixtures::build_archive(set);
+    println!(
+        "arch     : query arm over a {}-trible archive BUILT in {:.2}s, routing threshold {}",
+        set.len(),
+        built.elapsed().as_secs_f64(),
+        archq::CONFIRM_THRESHOLD
+    );
+    // Cloned, not rebuilt: a `SuccinctArchive` is a bundle of
+    // `anybytes::View`s over one shared buffer, so this is refcount
+    // traffic and no archive bytes are copied. That is what lets the CPU
+    // and device arms hold the same archive at once.
+    #[cfg(feature = "gpu")]
+    let for_device = archive.clone();
+    let cpu_counts = run_arch_census_cpu(led, cfg, base, archive);
+
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = cpu_counts;
+        skip_arch_device(led, "skip:gpu");
+        false
     }
     #[cfg(feature = "gpu")]
     {
         let attach_begin = base.elapsed().as_nanos() as u64;
         let attach = Instant::now();
-        let attached = fixtures::quiet_catch(|| subject::gpu::WgpuSuccinctArchive::new(archive));
+        let attached =
+            fixtures::quiet_catch(|| subject::gpu::WgpuSuccinctArchive::new(for_device));
         let attach_ns = attach.elapsed().as_nanos() as u64;
-        let gpu = match attached {
-            Ok(Ok(gpu)) => {
-                led.span("arch_gpu/attach/total", attach_begin, attach_ns);
-                led.outcome("arch_gpu/attach/total", "signal", None);
-                println!(
-                    "  {:<32} signal (1 span, {:.0} ms, min_confirm_batch {})",
-                    "arch_gpu/attach/total",
-                    attach_ns as f64 / 1e6,
-                    format!("range {} / membership {}", gpu.min_confirm_batch_range(), gpu.min_confirm_batch_membership())
-                );
-                Some(gpu)
-            }
+        match attached {
+            Ok(Ok(gpu)) => run_arch_device(
+                led,
+                cfg,
+                base,
+                attach_begin,
+                attach_ns,
+                gpu,
+                &cpu_counts,
+            ),
             Ok(Err(e)) => {
-                let reason = format!("gate_fail:attach {e:?}");
-                led.outcome("arch_gpu/attach/total", &reason, None);
-                println!("  {:<32} {reason}", "arch_gpu/attach/total");
-                None
+                skip_arch_device(led, &format!("gate_fail:attach {e:?}"));
+                false
             }
             Err(msg) => {
-                let reason = format!("panic:{msg}");
-                led.outcome("arch_gpu/attach/total", &reason, None);
-                println!("  {:<32} {reason}", "arch_gpu/attach/total");
-                None
-            }
-        };
-        match gpu {
-            None => {
-                for q in archq::arch_queries::<TribleSet>() {
-                    led.outcome(&format!("arch_gpu/{}/total", q.name), "skip:attach", None);
-                    for suffix in ARCH_ROUTING_SUFFIXES {
-                        led.outcome(
-                            &format!("arch_gpu/{}/routing/{suffix}", q.name),
-                            "skip:attach",
-                            None,
-                        );
-                    }
-                }
-            }
-            Some(gpu) => {
-                let ds = archq::shell(gpu);
-                for (q, cpu) in archq::arch_queries().into_iter().zip(cpu_counts.iter()) {
-                    let mut m = Measure::new(format!("arch_gpu/{}/total", q.name));
-                    for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
-                        let recording = i >= cfg.arch_warmup;
-                        m.iterate(recording, base, || {
-                            // Per-EXECUTION routing counters: the
-                            // snapshot below then describes the last
-                            // iteration, directly comparable with the
-                            // per-execution region census.
-                            ds.facts.reset_stats();
-                            archq::answer_count(&(q.run)(&ds))
-                        });
-                    }
-                    if let (Some(expected), Some(got)) = (cpu, m.ident) {
-                        if *expected != got {
-                            cross_arm_failure = true;
-                            eprintln!(
-                                "CROSS-ARM IDENTITY FAILURE: {} — cpu {expected} rows, gpu {got} rows",
-                                q.name
-                            );
-                        }
-                    }
-                    if let Some(expected) = cpu {
-                        m.cross_arm(*expected);
-                    }
-                    let s = ds.facts.stats();
-                    for (suffix, value) in [
-                        ("gpu_confirms", s.gpu_confirms),
-                        ("gpu_candidates", s.gpu_candidates),
-                        ("cpu_fallback_confirms", s.cpu_fallback_confirms),
-                        ("cpu_fallback_candidates", s.cpu_fallback_candidates),
-                        ("gpu_errors", s.gpu_errors),
-                    ] {
-                        led.outcome(
-                            &format!("arch_gpu/{}/routing/{suffix}", q.name),
-                            "signal",
-                            Some(value),
-                        );
-                    }
-                    m.emit(led, true);
-                    println!(
-                        "      routing: {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
-                        s.gpu_confirms,
-                        s.gpu_candidates,
-                        s.cpu_fallback_confirms,
-                        s.cpu_fallback_candidates,
-                        s.gpu_errors
-                    );
-                }
+                skip_arch_device(led, &format!("panic:{msg}"));
+                false
             }
         }
     }
+}
 
-    cross_arm_failure
+/// The archive query arm over an ATTACHED rollup cover (`--rollup`).
+///
+/// # Why this exists
+///
+/// The arm used to derive its archive from a loaded `TribleSet`, so the
+/// archive-versus-device comparison was capped by how much of a dataset fits
+/// resident even though an archive needs no residency at all. Here the rows
+/// come from the pile's index annotation: mmapped segments, attached, never
+/// constructed. The comparison is bounded by the pile, not by RAM.
+///
+/// Both arms read the SAME attached segments — the CPU union and the device
+/// union each clone the segment list in, which is refcount traffic over the
+/// pile mmap. No second attach, and no chance of the two arms disagreeing
+/// because they were given two artifacts.
+fn run_arch_queries_attached(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    cover: &wd_load::AttachedCover,
+) -> bool {
+    println!(
+        "arch     : query arm over an ATTACHED cover of {} segment(s), {} tribles, routing threshold {}",
+        cover.segments.len(),
+        cover.tribles,
+        archq::CONFIRM_THRESHOLD
+    );
+    let cpu_counts = run_arch_census_cpu(led, cfg, base, cover.union());
+
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = cpu_counts;
+        skip_arch_device(led, "skip:gpu");
+        false
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let attach_begin = base.elapsed().as_nanos() as u64;
+        let attach = Instant::now();
+        let attached = fixtures::quiet_catch(|| {
+            archq::WgpuUnionArchive::attach(&cover.segments)
+        });
+        let attach_ns = attach.elapsed().as_nanos() as u64;
+        match attached {
+            Ok(Ok(gpu)) => run_arch_device(
+                led,
+                cfg,
+                base,
+                attach_begin,
+                attach_ns,
+                gpu,
+                &cpu_counts,
+            ),
+            Ok(Err(e)) => {
+                skip_arch_device(led, &format!("gate_fail:attach {e}"));
+                false
+            }
+            Err(msg) => {
+                skip_arch_device(led, &format!("panic:{msg}"));
+                false
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -847,81 +1055,406 @@ fn run_sparqloscope_arm<B>(
     let mut panicked = 0usize;
     let mut cross_arm_failure = false;
     for (i, t) in table.iter().enumerate() {
-        let mut m = Measure::new(format!("{group}/{}/total", t.name));
-        let mut value: Option<String> = None;
-        for k in 0..(cfg.arch_warmup + cfg.arch_iters) {
-            let recording = k >= cfg.arch_warmup;
-            // Per-EXECUTION counters, reset OUTSIDE the timed call so the
-            // snapshot after the loop describes the LAST iteration without
-            // charging the reset to its span.
-            reset_backend(ds);
-            #[cfg(feature = "frontier")]
-            archq::reset_frontier_stats();
-            m.iterate(recording, base, || {
-                let answer = (t.run)(ds);
-                let ident = answer_ident(&answer.value);
-                value = Some(answer.value);
-                ident
-            });
-        }
-        if m.panicked.is_some() {
-            panicked += 1;
-            value = None;
-        }
-        // The backings must ANSWER identically or the timings beside
-        // each other mean nothing. Compared on the value itself rather
-        // than on `answer_ident`, so the failure line names the two
-        // results instead of two hashes.
-        if let Some(expected) = baseline.and_then(|b| b[i].as_deref()) {
-            if let Some(got) = value.as_deref() {
-                if expected != got {
-                    cross_arm_failure = true;
-                    eprintln!(
-                        "CROSS-ARM IDENTITY FAILURE: {} — TribleSet {expected}, {group} {got}",
-                        t.name
-                    );
-                    m.gate
-                        .get_or_insert(format!("cross-arm {got} vs {expected}"));
-                }
-            }
-        }
-        // `rows_meaningful: false` — the identity is the answer digest,
-        // not a cardinality, so it is not telemetry to report as rows.
-        m.emit(led, false);
-        // Print the answer beside every measure, on every arm. The
-        // cross-arm gate above is only as good as its inputs, and a
-        // reader must be able to see that the arms agree on real
-        // numbers rather than trust that they agreed on nothing.
-        println!("      answer {}", value.as_deref().unwrap_or("<panicked>"));
-        // The engine's own view of how wide the frontier actually got on
-        // this query. Without it a "no difference" timing cannot be told
-        // apart from "this query never had a batch to widen".
-        #[cfg(feature = "frontier")]
-        {
-            let f = archq::frontier_summary();
-            for (suffix, value) in [
-                ("frontier_widest", f.widest),
-                ("frontier_expansions", f.expansions),
-                ("frontier_rows", f.rows),
-                ("frontier_proposals", f.proposals),
-                ("frontier_groups", f.variable_groups),
-            ] {
-                led.outcome(&format!("{group}/{}/{suffix}", t.name), "signal", Some(value));
-            }
-            println!(
-                "      frontier: widest {} | expansions {} | mean width {:.1} | proposals {} \
-                 | groups/expansion {:.4}",
-                f.widest,
-                f.expansions,
-                f.mean_width(),
-                f.proposals,
-                if f.expansions > 0 { f.variable_groups as f64 / f.expansions as f64 } else { 0.0 }
-            );
-        }
-        emit_backend(led, ds, t.name);
-        answers.push(value);
+        let outcome = run_one_query(
+            led,
+            cfg,
+            base,
+            group,
+            t,
+            ds,
+            baseline.and_then(|b| b[i].as_deref()),
+            "TribleSet",
+            &mut reset_backend,
+            &mut emit_backend,
+        );
+        panicked += outcome.panicked as usize;
+        cross_arm_failure |= outcome.cross_arm_failure;
+        answers.push(outcome.value);
     }
     (answers, panicked, cross_arm_failure)
+}
+
+/// What [`run_one_query`] observed.
+struct QueryOutcome {
+    /// The answer VALUE, `None` where the query panicked.
+    value: Option<String>,
+    panicked: bool,
+    cross_arm_failure: bool,
+}
+
+/// One query against one backing: the timed iterations, the cross-arm
+/// identity check, the frontier snapshot, and the ledger writes.
+///
+/// Extracted from [`run_sparqloscope_arm`] so two backings can be driven
+/// ALTERNATELY over the same query rather than as two full censuses — see
+/// [`run_cover_registry_interleaved`], which is the reason this exists.
+/// `baseline_name` names the arm `baseline` came from, so a failure line
+/// says which two results disagreed rather than just that they did.
+#[allow(clippy::too_many_arguments)]
+fn run_one_query<B>(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    group: &str,
+    t: &queries::Translated<B>,
+    ds: &wd_schema::Dataset<B>,
+    baseline: Option<&str>,
+    baseline_name: &str,
+    reset_backend: &mut impl FnMut(&wd_schema::Dataset<B>),
+    emit_backend: &mut impl FnMut(&mut ledger::ResultsLedger, &wd_schema::Dataset<B>, &str),
+) -> QueryOutcome {
+    let mut cross_arm_failure = false;
+    let mut m = Measure::new(format!("{group}/{}/total", t.name));
+    let mut value: Option<String> = None;
+    for k in 0..(cfg.arch_warmup + cfg.arch_iters) {
+        let recording = k >= cfg.arch_warmup;
+        // Per-EXECUTION counters, reset OUTSIDE the timed call so the
+        // snapshot after the loop describes the LAST iteration without
+        // charging the reset to its span.
+        reset_backend(ds);
+        #[cfg(feature = "frontier")]
+        archq::reset_frontier_stats();
+        m.iterate(recording, base, || {
+            let answer = (t.run)(ds);
+            let ident = answer_ident(&answer.value);
+            value = Some(answer.value);
+            ident
+        });
+    }
+    let panicked = m.panicked.is_some();
+    if panicked {
+        value = None;
+    }
+    // The backings must ANSWER identically or the timings beside
+    // each other mean nothing. Compared on the value itself rather
+    // than on `answer_ident`, so the failure line names the two
+    // results instead of two hashes.
+    if let Some(expected) = baseline {
+        if let Some(got) = value.as_deref() {
+            if expected != got {
+                cross_arm_failure = true;
+                eprintln!(
+                    "CROSS-ARM IDENTITY FAILURE: {} — {baseline_name} {expected}, {group} {got}",
+                    t.name
+                );
+                m.gate
+                    .get_or_insert(format!("cross-arm {got} vs {expected}"));
+            }
+        }
+    }
+    // `rows_meaningful: false` — the identity is the answer digest,
+    // not a cardinality, so it is not telemetry to report as rows.
+    m.emit(led, false);
+    // Print the answer beside every measure, on every arm. The
+    // cross-arm gate above is only as good as its inputs, and a
+    // reader must be able to see that the arms agree on real
+    // numbers rather than trust that they agreed on nothing.
+    println!("      answer {}", value.as_deref().unwrap_or("<panicked>"));
+    // The engine's own view of how wide the frontier actually got on
+    // this query. Without it a "no difference" timing cannot be told
+    // apart from "this query never had a batch to widen".
+    #[cfg(feature = "frontier")]
+    {
+        let f = archq::frontier_summary();
+        for (suffix, value) in [
+            ("frontier_widest", f.widest),
+            ("frontier_expansions", f.expansions),
+            ("frontier_rows", f.rows),
+            ("frontier_proposals", f.proposals),
+            ("frontier_groups", f.variable_groups),
+        ] {
+            led.outcome(&format!("{group}/{}/{suffix}", t.name), "signal", Some(value));
+        }
+        println!(
+            "      frontier: widest {} | expansions {} | mean width {:.1} | proposals {} \
+             | groups/expansion {:.4}",
+            f.widest,
+            f.expansions,
+            f.mean_width(),
+            f.proposals,
+            if f.expansions > 0 { f.variable_groups as f64 / f.expansions as f64 } else { 0.0 }
+        );
+    }
+    emit_backend(led, ds, t.name);
+    QueryOutcome {
+        value,
+        panicked,
+        cross_arm_failure,
+    }
+}
+
+/// The registry against a ROLLUP COVER attached from a pile, on the CPU and
+/// (under the `gpu` capability) on the device, ALTERNATING per query.
+///
+/// No tribles are loaded into memory: the segments are mmapped, so the whole
+/// dataset is queryable regardless of how much of it would fit resident. The
+/// cover depth chooses the arm — 0 is a compacted root (monolithic), 1 is
+/// what that root rolled up (union) — and both read the same pile, so a
+/// difference between them cannot be an artifact of two builds.
+///
+/// # Why the arms alternate instead of running as two censuses
+///
+/// Sequential censuses make a truncated run useless: all 100 queries answer
+/// on the CPU cover, then all 100 on the device, so a run that stops early
+/// yields a complete CPU arm and NO device arm. At pile scale a single heavy
+/// join costs minutes and a full census costs hours, so truncation is the
+/// normal case — and the comparison is then not slow but ABSENT. Interleaved,
+/// whatever completed is a valid comparison over exactly that many queries.
+///
+/// The cost is cache interference: the arms alternate over the same data, so
+/// neither gets a warm cache to itself. That is a real effect, it applies
+/// EQUALLY to both arms, which is the property a ratio needs — and a slightly
+/// pessimistic ratio you can obtain beats an exact one you cannot. It does
+/// mean `rollup_d*` spans from a run WITH a device arm are not directly
+/// comparable with spans from a CPU-only run; the presence of the
+/// `rollup_d*_gpu` group in the results pile is what tells the two apart.
+///
+/// The device arm is gated against the CPU answer for the SAME query,
+/// computed moments earlier — the strongest form of the identity check the
+/// suite has, since neither arm can drift from a baseline taken over
+/// different rows.
+fn run_rollup_arm(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant, cover: &wd_load::AttachedCover) -> bool {
+    let group = format!("rollup_d{}", cfg.rollup_depth);
+    let gpu_group = format!("{group}_gpu");
+    let cpu_ds = cover.dataset(cover.union());
+
+    #[cfg(not(feature = "gpu"))]
+    {
+        for t in queries::TRANSLATED {
+            led.outcome(&format!("{gpu_group}/{}/total", t.name), "skip:gpu", None);
+            for suffix in ARCH_ROUTING_SUFFIXES {
+                led.outcome(
+                    &format!("{gpu_group}/{}/routing/{suffix}", t.name),
+                    "skip:gpu",
+                    None,
+                );
+            }
+        }
+        led.outcome(&format!("{gpu_group}/attach/total"), "skip:gpu", None);
+        println!("  {gpu_group:<32} SKIP (gpu: no triblespace-gpu on the subject)");
+        let (_, panicked, _) = run_sparqloscope_arm(
+            led,
+            cfg,
+            base,
+            &group,
+            queries::TRANSLATED_UNION,
+            &cpu_ds,
+            None,
+            |_| {},
+            |_, _, _| {},
+        );
+        println!(
+            "  {group} census              {} ran, {panicked} panicked",
+            queries::TRANSLATED_UNION.len() - panicked
+        );
+        panicked > 0
+    }
+    #[cfg(feature = "gpu")]
+    {
+        // Attach cost is a result, not overhead: it is what a query pays
+        // before reading anything, and the case for compacting is largely
+        // that it falls. Measured per shard-set, exactly like the built
+        // path's `arch_gpu/attach/total`.
+        let attach_begin = base.elapsed().as_nanos() as u64;
+        let attach = Instant::now();
+        let attached =
+            fixtures::quiet_catch(|| archq::WgpuUnionArchive::attach(&cover.segments));
+        let attach_ns = attach.elapsed().as_nanos() as u64;
+        let gpu = match attached {
+            Ok(Ok(gpu)) => {
+                led.span(&format!("{gpu_group}/attach/total"), attach_begin, attach_ns);
+                led.outcome(&format!("{gpu_group}/attach/total"), "signal", None);
+                let (range_floor, membership_floor) =
+                    archq::DeviceFacts::batch_floors(&gpu);
+                println!(
+                    "  {:<32} signal (1 span, {:.0} ms, {} shard(s), min_confirm_batch range {} / membership {})",
+                    format!("{gpu_group}/attach/total"),
+                    attach_ns as f64 / 1e6,
+                    cover.segments.len(),
+                    range_floor,
+                    membership_floor,
+                );
+                Some(gpu)
+            }
+            Ok(Err(e)) => {
+                let reason = format!("gate_fail:attach {e}");
+                led.outcome(&format!("{gpu_group}/attach/total"), &reason, None);
+                println!("  {:<32} {reason}", format!("{gpu_group}/attach/total"));
+                None
+            }
+            Err(msg) => {
+                let reason = format!("panic:{msg}");
+                led.outcome(&format!("{gpu_group}/attach/total"), &reason, None);
+                println!("  {:<32} {reason}", format!("{gpu_group}/attach/total"));
+                None
+            }
+        };
+        let Some(gpu) = gpu else {
+            for t in queries::TRANSLATED {
+                led.outcome(&format!("{gpu_group}/{}/total", t.name), "skip:attach", None);
+                for suffix in ARCH_ROUTING_SUFFIXES {
+                    led.outcome(
+                        &format!("{gpu_group}/{}/routing/{suffix}", t.name),
+                        "skip:attach",
+                        None,
+                    );
+                }
+            }
+            let (_, panicked, _) = run_sparqloscope_arm(
+                led,
+                cfg,
+                base,
+                &group,
+                queries::TRANSLATED_UNION,
+                &cpu_ds,
+                None,
+                |_| {},
+                |_, _, _| {},
+            );
+            println!(
+                "  {group} census              {} ran, {panicked} panicked",
+                queries::TRANSLATED_UNION.len() - panicked
+            );
+            return panicked > 0;
+        };
+        let gpu_ds = cover.dataset(gpu);
+        run_cover_registry_interleaved(led, cfg, base, &group, &gpu_group, &cpu_ds, &gpu_ds)
+    }
+}
+
+/// Record `reason` against every measure the rollup arms would have
+/// produced. Used when `--rollup` was asked for and the cover could not be
+/// attached: the registry census is the deliverable, so it lands in the
+/// pile either way, and it must say the ROLLUP arms did not run rather
+/// than borrow the `sparqloscope*` names of arms this run never had.
+fn skip_rollup(led: &mut ledger::ResultsLedger, depth: usize, reason: &str) {
+    let group = format!("rollup_d{depth}");
+    let gpu_group = format!("{group}_gpu");
+    let gpu_reason = if cfg!(feature = "gpu") { reason } else { "skip:gpu" };
+    led.outcome(&format!("{gpu_group}/attach/total"), gpu_reason, None);
+    for t in queries::TRANSLATED {
+        led.outcome(&format!("{group}/{}/total", t.name), reason, None);
+        led.outcome(&format!("{gpu_group}/{}/total", t.name), gpu_reason, None);
+        for suffix in ARCH_ROUTING_SUFFIXES {
+            led.outcome(
+                &format!("{gpu_group}/{}/routing/{suffix}", t.name),
+                gpu_reason,
+                None,
+            );
+        }
+    }
+    println!(
+        "  {group} census              {} {reason}",
+        queries::TRANSLATED.len()
+    );
+}
+
+/// Drive the CPU cover and the device cover ALTERNATELY, one query at a
+/// time. See [`run_rollup_arm`] for why.
+#[cfg(feature = "gpu")]
+fn run_cover_registry_interleaved(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    group: &str,
+    gpu_group: &str,
+    cpu_ds: &wd_schema::Dataset<wd_schema::UnionFacts>,
+    gpu_ds: &wd_schema::Dataset<wd_schema::WgpuUnionFacts>,
+) -> bool {
+    let mut cpu_panicked = 0usize;
+    let mut gpu_panicked = 0usize;
+    let mut failed = false;
+    let mut totals = [0u64; 5];
+    for (i, cpu_t) in queries::TRANSLATED_UNION.iter().enumerate() {
+        let gpu_t = &queries::TRANSLATED_WGPU_UNION[i];
+        let cpu = run_one_query(
+            led,
+            cfg,
+            base,
+            group,
+            cpu_t,
+            cpu_ds,
+            None,
+            "cover",
+            &mut |_: &wd_schema::Dataset<wd_schema::UnionFacts>| {},
+            &mut |_: &mut ledger::ResultsLedger,
+                  _: &wd_schema::Dataset<wd_schema::UnionFacts>,
+                  _: &str| {},
+        );
+        cpu_panicked += cpu.panicked as usize;
+        failed |= cpu.cross_arm_failure;
+        let gpu = run_one_query(
+            led,
+            cfg,
+            base,
+            gpu_group,
+            gpu_t,
+            gpu_ds,
+            cpu.value.as_deref(),
+            group,
+            &mut |ds: &wd_schema::Dataset<wd_schema::WgpuUnionFacts>| {
+                archq::DeviceFacts::reset_stats(&ds.facts);
+            },
+            &mut |led: &mut ledger::ResultsLedger,
+                  ds: &wd_schema::Dataset<wd_schema::WgpuUnionFacts>,
+                  name: &str| {
+                let s = archq::DeviceFacts::stats(&ds.facts);
+                for (j, (suffix, value)) in [
+                    ("gpu_confirms", s.gpu_confirms),
+                    ("gpu_candidates", s.gpu_candidates),
+                    ("cpu_fallback_confirms", s.cpu_fallback_confirms),
+                    ("cpu_fallback_candidates", s.cpu_fallback_candidates),
+                    ("gpu_errors", s.gpu_errors),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    totals[j] += value;
+                    led.outcome(
+                        &format!("{gpu_group}/{name}/routing/{suffix}"),
+                        "signal",
+                        Some(value),
+                    );
+                }
+                println!(
+                    "      routing: {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
+                    s.gpu_confirms,
+                    s.gpu_candidates,
+                    s.cpu_fallback_confirms,
+                    s.cpu_fallback_candidates,
+                    s.gpu_errors
+                );
+            },
+        );
+        gpu_panicked += gpu.panicked as usize;
+        failed |= gpu.cross_arm_failure;
+    }
+    for (suffix, value) in [
+        ("gpu_confirms", totals[0]),
+        ("gpu_candidates", totals[1]),
+        ("cpu_fallback_confirms", totals[2]),
+        ("cpu_fallback_candidates", totals[3]),
+        ("gpu_errors", totals[4]),
+    ] {
+        led.outcome(
+            &format!("{gpu_group}/routing/{suffix}"),
+            "signal",
+            Some(value),
+        );
+    }
+    println!(
+        "  {group} census              {} ran, {cpu_panicked} panicked",
+        queries::TRANSLATED_UNION.len() - cpu_panicked
+    );
+    println!(
+        "  {gpu_group} census          {} ran, {gpu_panicked} panicked",
+        queries::TRANSLATED_WGPU_UNION.len() - gpu_panicked
+    );
+    println!(
+        "      routing (whole arm): {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
+        totals[0], totals[1], totals[2], totals[3], totals[4]
+    );
+    failed || cpu_panicked > 0 || gpu_panicked > 0
 }
 
 /// Load the `--data` dataset pile and run the vendored registry against
@@ -938,60 +1471,6 @@ fn run_sparqloscope_arm<B>(
 /// Iteration counts come from `--arch-iters`/`--arch-warmup`, the same
 /// knobs the archive arm uses: one pass of a wide join over a real
 /// dataset costs orders of magnitude more than a synthetic fixture.
-/// The registry against a ROLLUP COVER attached from a pile.
-///
-/// No tribles are loaded into memory: the segments are mmapped, so the whole
-/// dataset is queryable regardless of how much of it would fit resident. The
-/// cover depth chooses the arm — 0 is a compacted root (monolithic), 1 is
-/// what that root rolled up (union) — and both read the same pile, so a
-/// difference between them cannot be an artifact of two builds.
-fn run_rollup_arm(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) -> bool {
-    let Some(path) = &cfg.rollup else {
-        return false;
-    };
-    let attach_started = Instant::now();
-    let ds = match fixtures::quiet_catch(|| {
-        wd_schema::Dataset::<wd_schema::UnionFacts>::load_pile(path, cfg.rollup_depth)
-    }) {
-        Ok(Ok(ds)) => ds,
-        Ok(Err(e)) => {
-            println!("  rollup: attach failed: {e}");
-            return true;
-        }
-        Err(msg) => {
-            println!("  rollup: attach panicked: {msg}");
-            return true;
-        }
-    };
-    // Attach cost is a result, not overhead: it is what a query pays before
-    // reading anything, and the case for compacting is largely that it falls.
-    let attach_ms = attach_started.elapsed().as_secs_f64() * 1e3;
-    println!(
-        "rollup   : attached depth {} in {attach_ms:.0} ms over {} tribles",
-        cfg.rollup_depth, ds.tribles
-    );
-    led.outcome(
-        &format!("rollup_d{}/attach/total", cfg.rollup_depth),
-        "signal",
-        Some(attach_ms as u64),
-    );
-
-    let group = format!("rollup_d{}", cfg.rollup_depth);
-    let (_, panicked, _) = run_sparqloscope_arm(
-        led,
-        cfg,
-        base,
-        &group,
-        queries::TRANSLATED_UNION,
-        &ds,
-        None,
-        |_| {},
-        |_, _, _| {},
-    );
-    println!("  {group} census              100 ran, {panicked} panicked");
-    panicked > 0
-}
-
 fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) -> bool {
     // The rpq translations are held out of the registry entirely, so
     // they skip regardless of whether a dataset loaded.
@@ -1313,14 +1792,32 @@ fn main() {
         usage();
     };
 
+    if cfg.mode == Mode::Build && cfg.data.is_none() {
+        eprintln!("--bench-build measures construction over a checked-out set; it needs --data");
+        usage();
+    }
+
     let commit = subject_commit();
     let config = format!(
-        "argv: {} | data: {} branch: {} rung: {} | iters: {} warmup: {} build_iters: {} build_warmup: {} arch_iters: {} arch_warmup: {} | load: {} | suite: tribleset-bench {}",
+        "mode: {} | arch_source: {} | argv: {} | data: {} rollup: {} depth: {} branch: {} rung: {} | iters: {} warmup: {} build_iters: {} build_warmup: {} arch_iters: {} arch_warmup: {} | load: {} | suite: tribleset-bench {}",
+        // The mode and the arch arm's SOURCE belong in the session's own
+        // provenance: a `arch/<query>/total` span taken over an attached
+        // cover and one taken over an archive built in this process are the
+        // same measure name over different substrates, and a reader
+        // comparing two sessions must be able to tell them apart without
+        // reverse-engineering the argv.
+        match cfg.mode { Mode::Query => "query", Mode::Build => "build" },
+        cfg.arch_source(),
         std::env::args().skip(1).collect::<Vec<_>>().join(" "),
         cfg.data
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "none".into()),
+        cfg.rollup
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "none".into()),
+        cfg.rollup_depth,
         cfg.branch.as_deref().unwrap_or("auto"),
         cfg.rung,
         cfg.iters,
@@ -1348,17 +1845,20 @@ fn main() {
     println!("session  : {:X}", led.session());
 
     // -- ladder + arch -----------------------------------------------------
-    let dataset = match &cfg.data {
-        None => {
-            println!("  {:<32} SKIP (no --data)", "ladder/checkout/total");
-            led.outcome("ladder/checkout/total", "skip:no-data", None);
-            led.outcome("ladder/checkout/digest", "skip:no-data", None);
-            println!("  {:<32} SKIP (no --data)", "arch/build_ram/total");
-            led.outcome("arch/build_ram/total", "skip:no-data", None);
-            skip_arch_queries(&mut led, "skip:no-data");
+    // The resident set is loaded only where it is actually needed: BUILD
+    // mode measures construction over it, and QUERY mode needs it for the
+    // sparqloscope `TribleSet` baseline. A `--rollup` query run never
+    // touches it — its archive arms attach.
+    let want_resident = cfg.mode == Mode::Build || cfg.rollup.is_none();
+    let dataset = match (&cfg.data, want_resident) {
+        (_, false) | (None, _) => {
+            let reason = if cfg.data.is_none() { "skip:no-data" } else { "skip:attached" };
+            println!("  {:<32} SKIP ({reason})", "ladder/checkout/total");
+            led.outcome("ladder/checkout/total", reason, None);
+            led.outcome("ladder/checkout/digest", reason, None);
             None
         }
-        Some(path) => {
+        (Some(path), true) => {
             match fixtures::quiet_catch(|| {
                 fixtures::pile_checkout(
                     path,
@@ -1403,22 +1903,115 @@ fn main() {
             }
         }
     };
-    let mut cross_arm_failure = false;
-    if let Some(set) = &dataset {
-        {
-            let mut m = Measure::new("arch/build_ram/total");
-            for i in 0..(cfg.build_warmup + cfg.build_iters) {
-                let recording = i >= cfg.build_warmup;
-                m.iterate(recording, &base, || {
-                    let arch = fixtures::build_archive(set);
-                    drop(arch);
-                    set.len()
-                });
+    // -- BUILD mode: construct, record, and stop ---------------------------
+    // This is the ONLY place a full archive is built repeatedly, and it is
+    // the only thing this process measures. Everything below is a query
+    // arm, and query arms do not run beside a construction — that is the
+    // whole point of the split (see `Mode::Build`).
+    if cfg.mode == Mode::Build {
+        match &dataset {
+            None => {
+                // `--data` is required in this mode, so reaching here means
+                // the checkout itself failed — and `ladder/checkout/total`
+                // one line above already carries the reason.
+                led.outcome("arch/build_ram/total", "skip:checkout", None);
+                println!("  {:<32} SKIP (no checked-out set)", "arch/build_ram/total");
             }
-            m.emit(&mut led, true);
-            cross_arm_failure = run_arch_queries(&mut led, &cfg, &base, set);
+            Some(set) => {
+                let mut m = Measure::new("arch/build_ram/total");
+                for i in 0..(cfg.build_warmup + cfg.build_iters) {
+                    let recording = i >= cfg.build_warmup;
+                    m.iterate(recording, &base, || {
+                        let arch = fixtures::build_archive(set);
+                        drop(arch);
+                        set.len()
+                    });
+                }
+                m.emit(&mut led, true);
+            }
         }
+        // One honest fact instead of ~250 enumerated skips: this session
+        // measured construction, so no query arm ran in it. The session's
+        // `config` carries `mode: build` beside it.
+        led.outcome(MODE_MARKER, "skip:build-mode", None);
+        println!("  {MODE_MARKER:<32} skip:build-mode (query arms do not run beside a build)");
+        let end_ns = base.elapsed().as_nanos() as u64;
+        if let Err(e) = led.finish(end_ns) {
+            eprintln!("cannot finish results session: {e:?}");
+            std::process::exit(1);
+        }
+        println!(
+            "done     : build suite ran {:.2}s, results in {}",
+            suite_start.elapsed().as_secs_f64(),
+            results.display()
+        );
+        return;
     }
+
+    // -- QUERY mode --------------------------------------------------------
+    // `arch/build_ram/total` is deliberately absent from this process: a
+    // full archive construction over the whole set, repeated and dropped,
+    // used to run immediately before the timings below and left the
+    // allocator, page cache and thermals it perturbed to them.
+    led.outcome("arch/build_ram/total", "skip:query-mode", None);
+    println!("  {:<32} SKIP (query mode — run --bench-build)", "arch/build_ram/total");
+
+    // The archive/device arms' rows: an ATTACHED cover where one is
+    // available (no residency, nothing constructed), else the resident set.
+    let cover = match &cfg.rollup {
+        None => None,
+        Some(path) => {
+            let attach_started = Instant::now();
+            match fixtures::quiet_catch(|| {
+                wd_load::AttachedCover::attach(path, cfg.rollup_depth)
+            }) {
+                Ok(Ok(cover)) => {
+                    // Attach cost is a result, not overhead: it is what a
+                    // query pays before reading anything, and the case for
+                    // compacting is largely that it falls.
+                    let attach_ms = attach_started.elapsed().as_secs_f64() * 1e3;
+                    println!(
+                        "rollup   : attached depth {} in {attach_ms:.0} ms over {} tribles",
+                        cfg.rollup_depth, cover.tribles
+                    );
+                    led.outcome(
+                        &format!("rollup_d{}/attach/total", cfg.rollup_depth),
+                        "signal",
+                        Some(attach_ms as u64),
+                    );
+                    Some(cover)
+                }
+                Ok(Err(e)) => {
+                    println!("  rollup: attach failed: {e}");
+                    led.outcome(
+                        &format!("rollup_d{}/attach/total", cfg.rollup_depth),
+                        "gate_fail:attach",
+                        None,
+                    );
+                    None
+                }
+                Err(msg) => {
+                    println!("  rollup: attach panicked: {msg}");
+                    led.outcome(
+                        &format!("rollup_d{}/attach/total", cfg.rollup_depth),
+                        &format!("panic:{msg}"),
+                        None,
+                    );
+                    None
+                }
+            }
+        }
+    };
+
+    let mut cross_arm_failure = match (&cover, &dataset) {
+        (Some(cover), _) => run_arch_queries_attached(&mut led, &cfg, &base, cover),
+        (None, Some(set)) => run_arch_queries_built(&mut led, &cfg, &base, set),
+        (None, None) => {
+            let reason = if cfg.rollup.is_some() { "skip:attach" } else { "skip:no-data" };
+            skip_arch_queries(&mut led, reason);
+            false
+        }
+    };
 
     // -- harkonnen ---------------------------------------------------------
     #[cfg(not(feature = "rpq"))]
@@ -1692,10 +2285,17 @@ fn main() {
     // the census itself is the deliverable and must land in the pile.
     // A rollup run answers over the whole dataset from mmapped segments, so
     // it replaces the resident arms rather than joining them.
-    if cfg.rollup.is_some() {
-        cross_arm_failure |= run_rollup_arm(&mut led, &cfg, &base);
-    } else {
-        cross_arm_failure |= run_sparqloscope(&mut led, &cfg, &base);
+    match &cover {
+        Some(cover) => cross_arm_failure |= run_rollup_arm(&mut led, &cfg, &base, cover),
+        None if cfg.rollup.is_some() => {
+            // `--rollup` was asked for and could not be attached; the
+            // resident arms are NOT a substitute (different rows), so the
+            // registry records the attach failure rather than quietly
+            // measuring something else.
+            skip_rollup(&mut led, cfg.rollup_depth, "skip:attach");
+            cross_arm_failure = true;
+        }
+        None => cross_arm_failure |= run_sparqloscope(&mut led, &cfg, &base),
     }
 
     // -- close -------------------------------------------------------------
@@ -1716,5 +2316,253 @@ fn main() {
     if cross_arm_failure {
         eprintln!("FAIL     : cross-arm identity failed (see gate_fail outcomes above)");
         std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// These check the two STRUCTURAL claims the arm split rests on, both of
+// which are otherwise only observable by running a benchmark for hours:
+//
+//   1. an archive query arm can serve a whole dataset from a pile-backed
+//      cover with NO resident `TribleSet` (`attached_cover_answers_without_residency`);
+//   2. one attached cover can back several arms at once, because cloning a
+//      `SuccinctArchive` aliases its buffer instead of copying it
+//      (`archive_clone_aliases_its_backing_bytes`) — which is what makes a
+//      CPU arm and a device arm over the same rows possible without
+//      attaching the pile twice.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Attributes for the throwaway pile the attach test builds. Ids minted
+    /// with `trible genid` on 2026-07-29 — never guessed, even for a test:
+    /// a colliding id would make the test pass for the wrong reason.
+    mod fixture {
+        use subject::core::prelude::attributes;
+        use subject::core::prelude::inlineencodings::{GenId, ShortString};
+
+        attributes! {
+            "9E33D7A5B4A0FF23F4E6D4A0FF41A5C6" as pub kind: ShortString;
+            "3B7D1CFE6F2C4A15A8E4D9B0C7126E5A" as pub peer: GenId;
+        }
+    }
+
+    fn parse(argv: &[&str]) -> Cfg {
+        parse_args(&argv.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn bench_build_selects_construction_mode() {
+        let cfg = parse(&["--bench-build", "--data", "/tmp/x.pile"]);
+        assert_eq!(cfg.mode, Mode::Build);
+        // Construction is measured over a resident set, so BUILD mode's
+        // source is always the built one.
+        assert_eq!(cfg.arch_source(), "build");
+    }
+
+    #[test]
+    fn query_is_the_default_mode() {
+        let cfg = parse(&["--results", "/tmp/r.pile", "--label", "x"]);
+        assert_eq!(cfg.mode, Mode::Query);
+        assert_eq!(cfg.arch_source(), "none");
+    }
+
+    #[test]
+    fn rollup_makes_the_arch_arm_attach() {
+        // Both given: the arm still ATTACHES — a rollup run replaces the
+        // resident arms rather than joining them, so `--data` goes unused.
+        let cfg = parse(&["--rollup", "/tmp/c.pile", "--data", "/tmp/d.pile"]);
+        assert_eq!(cfg.arch_source(), "attach");
+        assert_eq!(cfg.mode, Mode::Query);
+        let cfg = parse(&["--data", "/tmp/d.pile"]);
+        assert_eq!(cfg.arch_source(), "build");
+    }
+
+    /// Cloning a `SuccinctArchive` must ALIAS its bytes, not copy them.
+    ///
+    /// The whole "the arms cannot share one archive because
+    /// `WgpuSuccinctArchive::new` takes it by value" problem rests on the
+    /// assumption that a second handle on the same archive costs a second
+    /// archive. It does not: every payload in a `SuccinctArchive` is an
+    /// `anybytes::View` over one shared buffer, so a clone is a bounded
+    /// number of refcount bumps. This asserts the buffer identity directly
+    /// — same pointer, not merely equal contents — because that is the
+    /// property the CPU/device arm sharing depends on.
+    #[test]
+    fn archive_clone_aliases_its_backing_bytes() {
+        let mut set = TribleSet::new();
+        for i in 0..64u8 {
+            let e = subject::core::prelude::ufoid();
+            set += TribleSet::from(subject::core::macros::entity! { &e @
+                fixture::kind: "row",
+                fixture::peer: subject::core::id::Id::new([i.wrapping_add(1); 16])
+                    .expect("nonzero id"),
+            });
+        }
+        let archive = fixtures::build_archive(&set);
+        let twin = archive.clone();
+        assert_eq!(
+            archive.bytes.as_ptr(),
+            twin.bytes.as_ptr(),
+            "cloning a SuccinctArchive copied its buffer; the CPU and device \
+             arms can no longer share one attached cover"
+        );
+        assert_eq!(archive.bytes.len(), twin.bytes.len());
+    }
+
+    /// A rollup cover attached out of a pile answers the SAME rows as the
+    /// resident set it was derived from — with no `TribleSet` of the facts
+    /// alive while it does.
+    ///
+    /// This is the property the `--rollup` archive arm rests on and the one
+    /// the old `--data`-only arm could not have: the queried artifact is
+    /// read from the pile's index annotation, so nothing is built in the
+    /// measuring process and nothing has to fit in memory. Verified here on
+    /// a pile small enough to be a unit test rather than by running the
+    /// suite, which takes hours.
+    #[test]
+    fn attached_cover_answers_without_residency() {
+        use subject::core::blob::encodings::simplearchive::SimpleArchive;
+        use subject::core::inline::encodings::hash::Handle;
+        use subject::core::inline::Inline;
+        use subject::core::macros::{entity, pattern};
+        use subject::core::prelude::*;
+        use subject::core::repo::index_home::SuccinctRollup;
+        use subject::core::repo::pile::Pile;
+        use subject::core::repo::Repository;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tribleset-bench-attach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("cover.pile");
+
+        // -- write a v2-shaped dataset pile ------------------------------
+        // Same shape the real artifact has, because the point is to
+        // exercise the PRODUCTION attach path end to end: a named
+        // `manifest` branch whose single entity points at an anonymous data
+        // branch, and a succinct rollup annotation on that branch's head.
+        const ROWS: usize = 128;
+        let mut facts = TribleSet::new();
+        for i in 0..ROWS {
+            let e = ufoid();
+            facts += TribleSet::from(entity! { &e @
+                fixture::kind: if i % 2 == 0 { "even" } else { "odd" },
+            });
+        }
+        let expected_even = ROWS / 2;
+
+        {
+            // `Pile::open` attaches to an existing file; the file itself is
+            // the caller's to create (the results ledger does the same).
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&path)
+                .expect("create pile file");
+            let pile = Pile::open(&path).expect("open pile");
+            let mut repo = Repository::new(
+                pile,
+                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+                TribleSet::new(),
+            )
+            .expect("open repository");
+
+            let data_branch = repo.create_branch("data", None).expect("create data branch");
+            let data_id = *data_branch;
+            let manifest_branch = repo
+                .create_branch("manifest", None)
+                .expect("create manifest branch");
+            let manifest_id = *manifest_branch;
+
+            // The manifest lands BEFORE the index hook is registered, so
+            // the only rollup annotation in the pile is the data branch's —
+            // the one the attach path is supposed to read.
+            {
+                let mut ws = repo.pull(manifest_id).expect("pull manifest");
+                let side: Inline<Handle<SimpleArchive>> = ws.put(TribleSet::new());
+                let dataset_entity = ufoid();
+                let manifest_facts = TribleSet::from(entity! { &dataset_entity @
+                    wd_load::manifest::data_branch: data_id,
+                    wd_load::manifest::meta_set: side,
+                    wd_load::manifest::paths_set: side,
+                    wd_load::manifest::source_triples: ROWS as i64,
+                    wd_load::manifest::dataset_tribles: ROWS as i64,
+                });
+                ws.commit(manifest_facts, "manifest");
+                repo.push(&mut ws).expect("push manifest");
+            }
+
+            // The annotation the attach path reads is maintained by this
+            // hook, exactly as a real dataset pile's is.
+            repo.register_index(SuccinctRollup::new());
+            let mut ws = repo.pull(data_id).expect("pull data");
+            ws.commit(facts.clone(), "fixture");
+            repo.push(&mut ws).expect("push data");
+            repo.close().expect("close pile");
+        }
+
+        // -- attach the cover and query it -------------------------------
+        // `facts` is dropped FIRST: from here on nothing resident holds the
+        // rows, so an answer can only have come off the attached artifact.
+        let resident_even = find!(
+            (e: Id),
+            pattern!(&facts, [{ ?e @ fixture::kind: "even" }])
+        )
+        .count();
+        assert_eq!(resident_even, expected_even, "fixture built wrong");
+        drop(facts);
+
+        let cover = wd_load::AttachedCover::attach(&path, 0).expect("attach cover");
+        assert!(
+            !cover.segments.is_empty(),
+            "the push hook wrote no rollup record; there is nothing to attach"
+        );
+        assert_eq!(cover.tribles, ROWS as u64, "manifest row count");
+
+        // The CPU arm's backend, built exactly as `run_arch_queries_attached`
+        // builds it — and NOT from any `TribleSet` of the facts.
+        let union = cover.union();
+        assert_eq!(union.segment_count(), cover.segments.len());
+        let attached_even = find!(
+            (e: Id),
+            pattern!(&union, [{ ?e @ fixture::kind: "even" }])
+        )
+        .count();
+        assert_eq!(
+            attached_even, expected_even,
+            "the attached cover disagrees with the set it was derived from"
+        );
+
+        // A SECOND arm over the SAME cover — the move the CPU and device
+        // arms make, cloning the segment list rather than attaching twice.
+        // It must answer identically, which is the cross-arm property the
+        // suite gates on.
+        let twin = cover.union();
+        let twin_even = find!(
+            (e: Id),
+            pattern!(&twin, [{ ?e @ fixture::kind: "even" }])
+        )
+        .count();
+        assert_eq!(twin_even, attached_even, "two arms over one cover disagree");
+        // ...and the arms ALIAS the cover rather than each holding a copy:
+        // `union()` clones the segment list in, and a segment clone shares
+        // its buffer. This is what makes a second arm free.
+        assert_eq!(
+            cover.segments[0].bytes.as_ptr(),
+            cover.segments[0].clone().bytes.as_ptr(),
+            "cloning a cover segment copied its buffer; a second arm over \
+             the same cover would cost a second cover"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

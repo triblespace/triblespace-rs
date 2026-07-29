@@ -38,20 +38,21 @@ use std::collections::BTreeMap;
 #[cfg(feature = "protocol-v2")]
 use std::sync::Mutex;
 
-#[cfg(feature = "protocol-v2")]
-use subject::core::blob::encodings::succinctarchive::{
-    SuccinctArchive, SuccinctArchiveConstraint, Universe,
-};
 use subject::core::blob::MemoryBlobStore;
-#[cfg(feature = "protocol-v2")]
+// Needed by every hand-written `TriblePattern` here — the census wrapper
+// (`protocol-v2`) and the device union (`gpu`) — which are independently
+// gated, so the imports are gated on either.
+#[cfg(any(feature = "protocol-v2", feature = "gpu"))]
 use subject::core::inline::encodings::genid::GenId;
-#[cfg(feature = "protocol-v2")]
+#[cfg(any(feature = "protocol-v2", feature = "gpu"))]
 use subject::core::inline::InlineEncoding;
 use subject::core::prelude::BlobStore;
 use subject::core::prelude::TribleSet;
+#[cfg(any(feature = "protocol-v2", feature = "gpu"))]
+use subject::core::query::Term;
 #[cfg(feature = "protocol-v2")]
 use subject::core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, Term, VariableId, VariableSet,
+    Binding, Candidates, Constraint, ProposalBuffer, VariableId, VariableSet,
 };
 #[cfg(all(feature = "protocol-v2", not(feature = "frontier")))]
 use subject::core::query::ProposeCursor;
@@ -317,28 +318,33 @@ fn quantile(hist: &BTreeMap<u64, u64>, total: u64, q: f64) -> u64 {
     hist.keys().next_back().copied().unwrap_or(0)
 }
 
-/// A [`SuccinctArchive`] that histograms the size of every confirm
-/// region its constraints are handed.
+/// A pattern backend that histograms the size of every confirm region
+/// its constraints are handed.
 ///
 /// Deliberately shaped like `triblespace-gpu`'s `WgpuSuccinctArchive`:
-/// it owns the CPU archive, implements [`TriblePattern`] so `pattern!`
+/// it owns the backend, implements [`TriblePattern`] so `pattern!`
 /// reaches it unchanged, and its constraint forwards every protocol
-/// method to the canonical `SuccinctArchiveConstraint` verbatim. The
-/// ONLY addition is one histogram bump per `confirm`, recording
-/// `count_live` at entry — byte-for-byte the quantity the GPU wrapper
-/// compares against `min_confirm_batch`. Nothing about the plan
-/// changes: `estimate` is forwarded, so the planner sees the same
-/// numbers it would without the wrapper.
+/// method to the wrapped constraint verbatim. The ONLY addition is one
+/// histogram bump per `confirm`, recording `count_live` at entry —
+/// byte-for-byte the quantity the GPU wrapper compares against
+/// `min_confirm_batch`. Nothing about the plan changes: `estimate` is
+/// forwarded, so the planner sees the same numbers it would without the
+/// wrapper.
+///
+/// Generic over the wrapped backend rather than over a `SuccinctArchive`
+/// universe, so the census reads the same quantity whether the archive
+/// was BUILT from a resident set (`--data`) or ATTACHED from a pile as a
+/// rollup cover (`--rollup`, a `UnionArchive` of one or more segments).
+/// The two sources are the whole point of the arm's separation: an
+/// attached cover needs no residency, so the census is not capped by
+/// what fits in RAM.
 ///
 /// Requires the post-`Candidates` protocol (the `protocol-v2`
 /// capability), because a hand-written `Constraint` has to name
 /// `Candidates` in `confirm`.
 #[cfg(feature = "protocol-v2")]
-pub struct CountingArchive<U>
-where
-    U: Universe,
-{
-    archive: SuccinctArchive<U>,
+pub struct CountingArchive<B> {
+    inner: B,
     /// live-candidate count → number of confirms with that count.
     hist: Mutex<BTreeMap<u64, u64>>,
     /// DEPTH → the same histogram, restricted to confirms at that depth.
@@ -362,13 +368,10 @@ where
 }
 
 #[cfg(feature = "protocol-v2")]
-impl<U> CountingArchive<U>
-where
-    U: Universe,
-{
-    pub fn new(archive: SuccinctArchive<U>) -> Self {
+impl<B> CountingArchive<B> {
+    pub fn new(inner: B) -> Self {
         Self {
-            archive,
+            inner,
             hist: Mutex::new(BTreeMap::new()),
             depth_hist: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "frontier")]
@@ -414,12 +417,6 @@ where
             .take(k)
             .map(|(&value, &count)| (value, count))
             .collect()
-    }
-
-    /// Give the wrapped CPU archive back (the timed arms take it from
-    /// here — the census builds the archive exactly once).
-    pub fn into_archive(self) -> SuccinctArchive<U> {
-        self.archive
     }
 
     /// The per-depth census: for each depth, `(confirms, max, median,
@@ -489,14 +486,14 @@ where
 }
 
 #[cfg(feature = "protocol-v2")]
-impl<U> TriblePattern for CountingArchive<U>
+impl<B> TriblePattern for CountingArchive<B>
 where
-    U: Universe + Send + Sync,
+    B: TriblePattern + Send + Sync,
 {
     type PatternConstraint<'a>
-        = CountingConstraint<'a, U>
+        = CountingConstraint<'a, B>
     where
-        U: 'a;
+        B: 'a;
 
     fn pattern<'a, V: InlineEncoding>(
         &'a self,
@@ -505,27 +502,27 @@ where
         v: impl Into<Term<V>>,
     ) -> Self::PatternConstraint<'a> {
         CountingConstraint {
-            inner: SuccinctArchiveConstraint::new(e, a, v, &self.archive),
+            inner: self.inner.pattern(e, a, v),
             owner: self,
         }
     }
 }
 
-/// The canonical archive constraint with one histogram bump in
+/// The wrapped backend's own constraint with one histogram bump in
 /// `confirm`; see [`CountingArchive`].
 #[cfg(feature = "protocol-v2")]
-pub struct CountingConstraint<'a, U>
+pub struct CountingConstraint<'a, B>
 where
-    U: Universe,
+    B: TriblePattern + 'a,
 {
-    inner: SuccinctArchiveConstraint<'a, U>,
-    owner: &'a CountingArchive<U>,
+    inner: B::PatternConstraint<'a>,
+    owner: &'a CountingArchive<B>,
 }
 
 #[cfg(feature = "protocol-v2")]
-impl<'a, U> Constraint<'a> for CountingConstraint<'a, U>
+impl<'a, B> Constraint<'a> for CountingConstraint<'a, B>
 where
-    U: Universe,
+    B: TriblePattern + Send + Sync,
 {
     fn variables(&self) -> VariableSet {
         self.inner.variables()
@@ -603,5 +600,190 @@ where
 
     fn influence(&self, variable: VariableId) -> VariableSet {
         self.inner.influence(variable)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b — the device arm's backend
+// ---------------------------------------------------------------------------
+
+/// What the timed device arm needs of whatever it is running against.
+///
+/// The arm is identical for a single wrapped archive (`--data`, one built
+/// archive) and for a wrapped rollup COVER (`--rollup`, one
+/// `WgpuSuccinctArchive` per attached segment); only the construction
+/// differs. This trait is the seam, so `run_arch_device` is written once
+/// and both sources reach it.
+#[cfg(feature = "gpu")]
+pub trait DeviceFacts: TriblePattern {
+    /// Snapshot of the routing counters, summed over every shard.
+    fn stats(&self) -> subject::gpu::WgpuConfirmStats;
+    /// Zero the routing counters on every shard.
+    fn reset_stats(&self);
+    /// `(range, membership)` — the live-candidate floors above which a
+    /// confirm is dispatched to the device. Printed beside the attach so a
+    /// "no difference" timing can be read against the threshold it was
+    /// taken under.
+    fn batch_floors(&self) -> (usize, usize);
+    /// Physical shards behind this logical backend (1 for a built archive).
+    fn shard_count(&self) -> usize;
+}
+
+#[cfg(feature = "gpu")]
+impl<U> DeviceFacts for subject::gpu::WgpuSuccinctArchive<U>
+where
+    U: subject::core::blob::encodings::succinctarchive::Universe + Send + Sync,
+{
+    fn stats(&self) -> subject::gpu::WgpuConfirmStats {
+        subject::gpu::WgpuSuccinctArchive::stats(self)
+    }
+
+    fn reset_stats(&self) {
+        subject::gpu::WgpuSuccinctArchive::reset_stats(self)
+    }
+
+    fn batch_floors(&self) -> (usize, usize) {
+        (
+            self.min_confirm_batch_range(),
+            self.min_confirm_batch_membership(),
+        )
+    }
+
+    fn shard_count(&self) -> usize {
+        1
+    }
+}
+
+/// The device twin of `UnionArchive`: one `WgpuSuccinctArchive` per
+/// attached rollup segment, unioned back into one logical relation.
+///
+/// # Why this exists
+///
+/// `WgpuSuccinctArchive::new` wraps exactly ONE `SuccinctArchive`, and the
+/// engine's `UnionArchiveConstraint::new` is private and typed to
+/// `SuccinctArchiveConstraint`, so there was no way to put a rollup cover —
+/// which is a union of one *or more* segments — on the device. Without this
+/// the `--rollup` path had a CPU arm and no device arm, i.e. the one path
+/// that needs no residency was also the one path that could not answer the
+/// CPU-versus-GPU question.
+///
+/// It is a faithful analogue of the engine's own union, not a new join
+/// strategy: the shards' constraints carry the pattern's [`Term`]s natively,
+/// so every shard declares the same variable set and
+/// [`UnionConstraint`](subject::core::query::unionconstraint::UnionConstraint)
+/// — the very type `UnionArchiveConstraint` wraps — dedups across them.
+/// A monolithic cover is a union of one, so the monolithic and tiered arms
+/// differ only in how many shards were attached.
+///
+/// Lives in the bench crate rather than in `triblespace-gpu` deliberately:
+/// `subjects/current` is the ENGINE UNDER TEST, and a measurement harness
+/// must not modify its subject to make a measurement possible.
+#[cfg(feature = "gpu")]
+pub struct WgpuUnionArchive<U>
+where
+    U: subject::core::blob::encodings::succinctarchive::Universe,
+{
+    shards: Vec<subject::gpu::WgpuSuccinctArchive<U>>,
+}
+
+#[cfg(feature = "gpu")]
+impl<U> WgpuUnionArchive<U>
+where
+    U: subject::core::blob::encodings::succinctarchive::Universe + Clone + Send + Sync,
+{
+    /// Upload every segment of an attached cover to the device.
+    ///
+    /// Takes the segments by SHARED REFERENCE and clones each one in.
+    /// `SuccinctArchive` is a bundle of `anybytes::View`s over one shared
+    /// buffer, so the clone is a fixed number of refcount bumps and copies
+    /// no archive data — which is what lets the CPU arm and the device arm
+    /// hold the same cover at once instead of attaching the pile twice.
+    /// (The device-side residency the wrapper builds is a genuine copy; that
+    /// cost is what `*/attach/total` measures.)
+    pub fn attach(
+        segments: &[subject::core::blob::encodings::succinctarchive::SuccinctArchive<U>],
+    ) -> Result<Self, String> {
+        assert!(
+            !segments.is_empty(),
+            "a device union requires at least one attached segment"
+        );
+        let mut shards = Vec::with_capacity(segments.len());
+        for (i, segment) in segments.iter().enumerate() {
+            shards.push(
+                subject::gpu::WgpuSuccinctArchive::new(segment.clone())
+                    .map_err(|e| format!("segment {i}: {e:?}"))?,
+            );
+        }
+        Ok(Self { shards })
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl<U> DeviceFacts for WgpuUnionArchive<U>
+where
+    U: subject::core::blob::encodings::succinctarchive::Universe + Send + Sync,
+{
+    fn stats(&self) -> subject::gpu::WgpuConfirmStats {
+        let mut out = subject::gpu::WgpuConfirmStats::default();
+        for shard in &self.shards {
+            let s = shard.stats();
+            out.gpu_confirms += s.gpu_confirms;
+            out.gpu_candidates += s.gpu_candidates;
+            out.gpu_parents += s.gpu_parents;
+            out.cpu_fallback_confirms += s.cpu_fallback_confirms;
+            out.cpu_fallback_candidates += s.cpu_fallback_candidates;
+            out.gpu_errors += s.gpu_errors;
+        }
+        out
+    }
+
+    fn reset_stats(&self) {
+        for shard in &self.shards {
+            shard.reset_stats();
+        }
+    }
+
+    fn batch_floors(&self) -> (usize, usize) {
+        // Every shard is constructed with the engine's defaults, so the
+        // first one speaks for the cover; an empty cover cannot be built.
+        let shard = &self.shards[0];
+        (
+            shard.min_confirm_batch_range(),
+            shard.min_confirm_batch_membership(),
+        )
+    }
+
+    fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl<U> TriblePattern for WgpuUnionArchive<U>
+where
+    U: subject::core::blob::encodings::succinctarchive::Universe + Send + Sync,
+{
+    type PatternConstraint<'a>
+        = subject::core::query::unionconstraint::UnionConstraint<
+            subject::gpu::WgpuSuccinctArchiveConstraint<'a, U>,
+        >
+    where
+        U: 'a;
+
+    fn pattern<'a, V: InlineEncoding>(
+        &'a self,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
+    ) -> Self::PatternConstraint<'a> {
+        let e: Term<GenId> = e.into();
+        let a: Term<GenId> = a.into();
+        let v: Term<V> = v.into();
+        subject::core::query::unionconstraint::UnionConstraint::new(
+            self.shards
+                .iter()
+                .map(|shard| shard.pattern(e, a, v))
+                .collect(),
+        )
     }
 }

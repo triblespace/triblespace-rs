@@ -3204,6 +3204,15 @@ macro_rules! registry {
         pub static TRANSLATED_WGPU: &[Translated<crate::wd_schema::WgpuArchivedFacts>] = &[
             $( Translated { name: $name, kind: Kind::$kind, run: $f::<crate::wd_schema::WgpuArchivedFacts> } ),+
         ];
+        /// The same queries against a device-resident rollup COVER.
+        ///
+        /// The device sibling of [`TRANSLATED_UNION`], so the `--rollup`
+        /// path can answer the CPU-versus-GPU question the `--data` path
+        /// answers — at pile scale, without loading the dataset into RAM.
+        #[cfg(feature = "gpu")]
+        pub static TRANSLATED_WGPU_UNION: &[Translated<crate::wd_schema::WgpuUnionFacts>] = &[
+            $( Translated { name: $name, kind: Kind::$kind, run: $f::<crate::wd_schema::WgpuUnionFacts> } ),+
+        ];
     };
 }
 

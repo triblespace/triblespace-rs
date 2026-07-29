@@ -9,8 +9,8 @@
 //! the six-PATCH [`TribleSet`] out of a dataset pile's canonical
 //! per-commit `SimpleArchive` blobs, [`Dataset::to_archive`], which
 //! builds the succinct-archive view of that same set, and
-//! [`Dataset::<UnionFacts>::load_pile`], which serves queries from the
-//! data branch's index ANNOTATION instead.
+//! [`AttachedCover`], which serves queries from the data branch's index
+//! ANNOTATION instead — no residency, no construction.
 //!
 //! **Why a dataset pile needs this and not the ladder checkout.** The
 //! two pile layouts this suite sees are structurally different. A
@@ -87,10 +87,9 @@ pub mod manifest {
 pub struct PileDataset {
     pub data_branch: Id,
     pub meta: TribleSet,
-    /// The manifest's `path!` substrate. Read by
-    /// [`Dataset::<UnionFacts>::load_pile`]; the PATCH loader below
-    /// uses `facts.clone()` for `Dataset::paths`, exactly as upstream
-    /// does.
+    /// The manifest's `path!` substrate. Read by [`AttachedCover`]; the
+    /// PATCH loader below uses `facts.clone()` for `Dataset::paths`,
+    /// exactly as upstream does.
     pub paths: TribleSet,
     pub triples: usize,
     /// Manifest's recorded sum over index segments (within-segment
@@ -382,26 +381,50 @@ impl Dataset<TribleSet> {
     }
 }
 
-impl Dataset<UnionFacts> {
+/// One attached rollup COVER: the physical segments plus everything the
+/// [`Dataset`] shell needs around them.
+///
+/// # Why the segments are handed out rather than hidden in a `Dataset`
+///
+/// Attaching is where a query arm gets its data WITHOUT residency: the
+/// segments are `anybytes::View`s over the pile's mmap, so nothing is read
+/// until a query touches it and nothing is held that a `TribleSet` would
+/// have to hold. Several arms want that same cover at once — the CPU union,
+/// the confirm-region census, and the device union — and each takes it by
+/// value. Keeping the segment `Vec` visible lets every arm `clone()` what it
+/// needs (a `SuccinctArchive` clone is refcount bumps over shared views, not
+/// a data copy), so the pile is attached ONCE per run rather than once per
+/// arm.
+pub struct AttachedCover {
+    /// Physical shards of the selected cover, oldest tier first.
+    pub segments: Vec<ArchivedFacts>,
+    /// The manifest's `path!` substrate (small, and the only resident set).
+    pub paths: TribleSet,
+    pub reader: AnyBlobReader,
+    pub meta: TribleSet,
+    pub meta_reader: AnyBlobReader,
+    pub triples: usize,
+    pub tribles: u64,
+}
+
+impl AttachedCover {
     /// Attach a v2 dataset artifact: resolve the `manifest` branch's
-    /// dataset entity, attach the succinct index ANNOTATION carried by
-    /// the data branch's head (`repo::index_home` manifest — zerocopy
-    /// over the pile mmap), and serve queries from the union of its
-    /// segments. The canonical facts remain available as the commit
-    /// chain's `SimpleArchive` content blobs (see
+    /// dataset entity, attach the succinct index ANNOTATION carried by the
+    /// data branch's head (`repo::index_home` manifest — zerocopy over the
+    /// pile mmap), and hand back its segments. The canonical facts remain
+    /// available as the commit chain's `SimpleArchive` content blobs (see
     /// [`load_pile_patch`](Dataset::load_pile_patch)).
     ///
-    /// VENDOR NOTE (adaptation). Upstream leaks the attached segment
-    /// slice (`Box::leak`) because its `UnionArchive<'a, U>` borrows
-    /// them. At this engine rev `UnionArchive` owns an
-    /// `Arc<[SuccinctArchive<U>]>` (commit 6c346e04), so the leak is
-    /// gone and the `Vec` moves straight in.
+    /// VENDOR NOTE (adaptation). Upstream leaks the attached segment slice
+    /// (`Box::leak`) because its `UnionArchive<'a, U>` borrows them. At this
+    /// engine rev `UnionArchive` owns an `Arc<[SuccinctArchive<U>]>` (commit
+    /// 6c346e04), so the leak is gone and the `Vec` moves straight in.
     ///
     /// # Choosing a cover
     ///
     /// With merged inputs retained, one pile holds every derivation of the
     /// same history at several granularities, and `depth` says which to
-    /// read. `0` is [`Manifest::active`] — the coarsest cover, a single root
+    /// read. `0` is `Manifest::active` — the coarsest cover, a single root
     /// after a major compaction, i.e. the MONOLITHIC arm. Each further step
     /// expands every record into its children, so `1` is what that root
     /// rolled up (the UNION arm) and enough steps reach the leaves.
@@ -410,7 +433,7 @@ impl Dataset<UnionFacts> {
     /// the arms of a monolithic-versus-tiered comparison become selections
     /// over ONE artifact, so no difference between them can come from having
     /// built two.
-    pub fn load_pile(path: &Path, depth: usize) -> Result<Self, String> {
+    pub fn attach(path: &Path, depth: usize) -> Result<Self, String> {
         use subject::core::repo::index_home::{IndexHome, SuccinctRollup};
 
         let mut pile = Pile::open(path).map_err(|e| format!("open {}: {e:?}", path.display()))?;
@@ -445,10 +468,9 @@ impl Dataset<UnionFacts> {
             home.attach_selection(&manifest, &selection)
                 .map_err(|e| format!("attach index annotation: {e:?}"))?
         };
-        let facts = UnionFacts::new(segments);
         pile.close().map_err(|e| format!("close pile: {e:?}"))?;
-        Ok(Dataset {
-            facts,
+        Ok(Self {
+            segments,
             paths: ds.paths,
             reader: AnyBlobReader::Pile(reader.clone()),
             meta: ds.meta,
@@ -456,6 +478,30 @@ impl Dataset<UnionFacts> {
             triples: ds.triples,
             tribles: ds.tribles,
         })
+    }
+
+    /// Wrap any backend built over this cover in the [`Dataset`] shell the
+    /// vendored translations take. Every arm gets the SAME `paths`, blobs
+    /// and meta, so a cross-arm answer difference can only come from the
+    /// backend.
+    pub fn dataset<B>(&self, facts: B) -> Dataset<B> {
+        Dataset {
+            facts,
+            paths: self.paths.clone(),
+            reader: self.reader.clone(),
+            meta: self.meta.clone(),
+            meta_reader: self.meta_reader.clone(),
+            triples: self.triples,
+            tribles: self.tribles,
+        }
+    }
+
+    /// The CPU arm's backend: the union over every attached shard.
+    ///
+    /// Cloning the segments in is refcount traffic over the pile mmap, so
+    /// this can be called once per arm without a second attach.
+    pub fn union(&self) -> UnionFacts {
+        UnionFacts::new(self.segments.clone())
     }
 }
 

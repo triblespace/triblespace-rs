@@ -40,10 +40,9 @@ use subject::core::trible::TribleSet;
 pub type ArchivedFacts = SuccinctArchive<OrderedUniverse>;
 
 /// The union-of-index-segments backend
-/// [`Dataset::<UnionFacts>::load_pile`](crate::wd_load) serves queries
-/// from: a data branch's index annotation may cover the commit chain
-/// with several LSM shards, and the union constraint dedups across
-/// them.
+/// [`AttachedCover`](crate::wd_load::AttachedCover) serves queries from:
+/// a data branch's index annotation may cover the commit chain with
+/// several LSM shards, and the union constraint dedups across them.
 ///
 /// VENDOR NOTE: upstream spells this
 /// `UnionArchive<'static, OrderedUniverse>` over a leaked segment
@@ -65,6 +64,15 @@ pub type UnionFacts = subject::core::repo::index_home::UnionArchive<OrderedUnive
 /// which is also how `run_arch_queries` already drives the device.
 #[cfg(feature = "gpu")]
 pub type WgpuArchivedFacts = subject::gpu::WgpuSuccinctArchive<OrderedUniverse>;
+
+/// The device twin of [`UnionFacts`]: one device-resident archive per
+/// attached rollup segment, unioned back into one relation.
+///
+/// NOT vendored — see [`crate::archq::WgpuUnionArchive`] for why the suite
+/// carries its own. Named beside the other backings because it is one: the
+/// registry is monomorphized over it exactly as it is over the other four.
+#[cfg(feature = "gpu")]
+pub type WgpuUnionFacts = crate::archq::WgpuUnionArchive<OrderedUniverse>;
 
 /// Blob reader over either backing store the harness supports: the
 /// importer's in-memory store (a fresh `.nt` import) or a pile's mmap
