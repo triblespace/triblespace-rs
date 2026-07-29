@@ -962,8 +962,14 @@ fn run_rollup_arm(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) ->
     // Attach cost is a result, not overhead: it is what a query pays before
     // reading anything, and the case for compacting is largely that it falls.
     let attach_ms = attach_started.elapsed().as_secs_f64() * 1e3;
+    // `ds.tribles` is the DATASET entity's count from manifest metadata — the
+    // whole dump — not what this cover attached. Reporting it beside "attached
+    // depth N" reads as the size of what was just opened, and on a rollup
+    // built from a PREFIX of the chain it is wrong by the ratio of the
+    // prefix: a 16-commit rollup of 65M rows announced 561M. Say which
+    // number this is.
     println!(
-        "rollup   : attached depth {} in {attach_ms:.0} ms over {} tribles",
+        "rollup   : attached depth {} in {attach_ms:.0} ms (dataset manifest declares {} tribles)",
         cfg.rollup_depth, ds.tribles
     );
     led.outcome(
