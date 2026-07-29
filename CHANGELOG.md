@@ -53,6 +53,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cost: an `entity!{}` describing four attributes measured ~5.4 µs
   against ~0.8 µs before, since a description is several times larger
   than the small entity it describes.
+- **Breaking: the N-Triples importer describes its own attributes.**
+  `NtImport` no longer returns a `meta` fragment the caller has to
+  remember to fold in. The attribute vocabulary — `metadata::iri` +
+  `metadata::value_encoding` per distinct `(predicate IRI, value
+  schema)` pair, plus the IRI-string blobs — now lands directly in the
+  metafacts and metablobs of `import.facts`, so a plain
+  `ws.commit(import.facts, …)` records what its attribute ids mean.
+  Since the importer mints those ids from IRIs, nothing else could have
+  described them; making it the caller's job to route the description
+  was the same opt-out shape as the removed `commit_metadata`, one layer
+  up.
+
+  The URI↔id map — an `rdf_uri` annotation per distinct entity IRI —
+  remains a separate fragment, renamed `NtImport::uri_map`, because that
+  one *is* a real choice: it is queryable content, so `facts +=
+  uri_map` (join against it), `facts.describe_with(uri_map)` (persist
+  without exposing it to content queries), and dropping it are all
+  defensible. `uri_map` also carries the `rdf_uri` description now, so
+  either of the first two options yields described content.
+
+  Two silent losses fell out of the same audit and are fixed: the
+  reified `"text"@lang` entities put `rdf_lang` / `rdf_text` facts into
+  the graph while their descriptions were dropped, and a predicate whose
+  first occurrence had a blank-node subject was described into a
+  throwaway scratch fragment — and never again, because resolution
+  memoises per (schema, IRI). Both now reach the fragment the facts land
+  in. `tests/ntriples_commit_describes.rs` pins the invariant with the
+  same predicate `trible pile diagnose describes` reports.
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm

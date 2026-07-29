@@ -125,10 +125,10 @@ kinds. You typically merge it once alongside your lossless archive.
 ## Importing N-Triples (RDF)
 
 The `import::ntriples` module reads the [N-Triples](https://www.w3.org/TR/n-triples/)
-serialization of an RDF graph and emits one trible per statement. The
-importer runs directly against a `Workspace<Blobs: BlobStore<Blake3>>` so
-literal blobs land in the workspace's local store alongside the emitted
-facts:
+serialization of an RDF graph and emits one trible per statement. It is a
+pure function of the input bytes: the returned `Fragment`s carry the blobs
+their facts reference, so no workspace is touched until you decide where
+the result should live.
 
 ```rust,ignore
 use std::io::Cursor;
@@ -138,20 +138,37 @@ let data = br#"
 <http://example.org/frank> <http://example.org/firstname> "Frank" .
 <http://example.org/frank> <http://example.org/birthyear> "1920"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
-let (facts, count) = ingest_ntriples(&mut workspace, Cursor::new(&data[..]));
-assert_eq!(count, 2);
-workspace.commit(facts, "import example");
+let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean n-triples");
+assert_eq!(import.triples, 2);
+workspace.commit(import.facts, "import example");
 ```
+
+That commit is complete, not a shortcut. The importer mints an attribute
+per `(predicate IRI, value schema)` pair, so nothing outside the import
+could describe those ids; `import.facts` therefore carries the
+`metadata::iri` + `metadata::value_encoding` record for each of them in
+its **metafacts** (and the IRI strings in its metablobs), and `commit`
+persists that as the commit's metadata. There is no separate description
+to fold in — the vocabulary of the data you are storing was never a
+reasonable thing to drop, so it is not offered as an option.
 
 **URI → entity id.** Every subject and URI-valued object gets a stable
 triblespace `Id` derived from its URI via the `import::rdf_uri` attribute:
-the URI is stored as a `LongString` blob, wrapped in an `entity!` fragment
+the URI is stored as a `UTF8String` blob, wrapped in an `entity!` fragment
 exporting a single `rdf_uri` edge, and the fragment's content-derived root
 id becomes the entity id. The same URI always produces the same id across
 processes, so repeated imports over the same data reach the same
-TribleSet — even across machines. The `rdf_uri` edge itself is also
-emitted, so `pattern!([{ ?e @ rdf_uri: ?uri }])` recovers the original
-URI for any imported entity.
+TribleSet — even across machines.
+
+The `rdf_uri` edges themselves come back separately, in `import.uri_map`,
+because whether the URI↔id map belongs in your graph is a real choice:
+`import.facts += import.uri_map` makes it queryable content, so
+`pattern!([{ ?e @ rdf_uri: ?uri }])` recovers the original URI of any
+imported entity; `import.facts.describe_with(import.uri_map)` keeps it out
+of content queries but still persists it as commit metadata; and dropping
+it costs only the ability to recover URIs. Deriving an id without an
+import in hand is `uri_to_id_pure(uri)`, which routes through the same
+derivation and stores nothing.
 
 **Predicate → attribute id.** Predicate URIs become attribute ids through
 the entity-core derivation rooted at `metadata::iri` —

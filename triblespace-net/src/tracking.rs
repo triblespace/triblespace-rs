@@ -427,6 +427,7 @@ mod tests {
     use triblespace_core::blob::Blob;
     use triblespace_core::id::genid;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::trible::Fragment;
 
     fn test_repo() -> Repository<MemoryRepo> {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -566,7 +567,7 @@ mod tests {
         let commit_meta: TribleSet = TribleSet::new();
         let commit_blob: Blob<SimpleArchive> = commit_meta.to_blob();
         let commit_handle = store.put::<SimpleArchive, _>(commit_blob.clone()).unwrap();
-        let remote_meta = branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob), None);
+        let remote_meta = branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob));
         let remote_meta_handle = store.put::<SimpleArchive, _>(remote_meta).unwrap();
 
         let publisher = [0u8; 32];
@@ -641,8 +642,7 @@ mod tests {
             let remote_branch_id = genid();
             let commit_blob: Blob<SimpleArchive> = TribleSet::new().to_blob();
             let _commit_handle = store.put::<SimpleArchive, _>(commit_blob.clone()).unwrap();
-            let remote_meta =
-                branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob), None);
+            let remote_meta = branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob));
             let remote_meta_handle = store.put::<SimpleArchive, _>(remote_meta).unwrap();
             (*remote_branch_id, remote_meta_handle.raw)
         };
