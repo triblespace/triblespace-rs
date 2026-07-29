@@ -164,6 +164,8 @@ struct Cfg {
     verify: Option<std::path::PathBuf>,
     report: Option<std::path::PathBuf>,
     report_only: Option<String>,
+    /// Measure anyway on a contended machine. See [`contention_gate`].
+    allow_contention: bool,
 }
 
 fn parse_size(s: &str) -> Option<usize> {
@@ -195,6 +197,11 @@ fn usage() -> ! {
          full archive perturbs the allocator, page cache and thermals that the\n\
          query timings beside it would inherit, by an amount that scales with\n\
          the data. Run the same argv twice, once with --bench-build.\n\
+         \n\
+         Both measuring modes REFUSE to run when the 1-minute load average\n\
+         exceeds half the cores: durations taken there record the machine's\n\
+         queue depth rather than the engine, and nothing downstream can tell\n\
+         them apart. --allow-contention measures anyway.\n\
          \n\
          --rollup ATTACHES a cover out of a pile's index annotation, so the\n\
          archive and device arms need no resident TribleSet and are not capped\n\
@@ -229,6 +236,7 @@ fn parse_args(args: &[String]) -> Cfg {
         verify: None,
         report: None,
         report_only: None,
+        allow_contention: false,
     };
     if args.is_empty() {
         usage();
@@ -253,6 +261,7 @@ fn parse_args(args: &[String]) -> Cfg {
     while i < args.len() {
         match args[i].as_str() {
             "--bench-build" => cfg.mode = Mode::Build,
+            "--allow-contention" => cfg.allow_contention = true,
             "--data" => cfg.data = Some(take(args, &mut i).into()),
             "--branch" => cfg.branch = Some(take(args, &mut i).to_owned()),
             "--rung" => cfg.rung = take_size(args, &mut i),
@@ -321,11 +330,93 @@ fn subject_commit() -> String {
 /// run, not in whatever prose later quotes the numbers. Read from
 /// `/proc/loadavg` (Linux) or `sysctl -n vm.loadavg` (macOS/BSD);
 /// unavailable is recorded as unknown rather than guessed.
+/// The 1-minute load average and the parallelism it is relative to, as
+/// numbers rather than a display string — the contention gate has to
+/// compare, not just print. `None` when the platform does not tell us,
+/// which the gate treats as "cannot verify" rather than "quiet".
+fn load_1min_and_cpus() -> Option<(f64, usize)> {
+    let cpus = std::thread::available_parallelism().ok()?.get();
+    let first = load_averages()?
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()?;
+    Some((first, cpus))
+}
+
+/// Refuse to take timings on a machine that is not mostly ours.
+///
+/// # Why this is a hard refusal and not a warning
+///
+/// This suite exists to produce numbers someone will later quote. A run
+/// under heavy contention does not produce *noisy* numbers, it produces
+/// numbers that measure the machine's queue depth instead of the engine —
+/// and nothing downstream can tell the difference, because a duration
+/// carries no evidence of what else was running. A warning printed at
+/// start scrolls away and the pile keeps the timings either way.
+///
+/// The threshold is half the cores: generous enough that ordinary
+/// background activity passes, decisive against the case that motivated
+/// it — a 16-core machine at load 41, where the runner was getting 49% of
+/// ONE core while another agent compiled. Those query timings were
+/// unusable and would have been indistinguishable from a real regression.
+///
+/// `--allow-contention` overrides, because a deliberately-contended
+/// measurement is a legitimate experiment; it just must be chosen.
+fn contention_gate(allow: bool) -> Result<(), String> {
+    let Some((load1, cpus)) = load_1min_and_cpus() else {
+        eprintln!("warning: cannot read load average — contention unverified");
+        return Ok(());
+    };
+    contention_verdict(load1, cpus, allow)
+}
+
+/// The decision, separated from reading the machine.
+///
+/// # Why this split exists
+///
+/// Verifying that the gate FIRES (not merely that some duplicated copy of
+/// the arithmetic is right) originally meant saturating the machine with
+/// busy loops. That worked — and drove a 16-core shared box to load 140 for
+/// several minutes while another agent was running tests, which is precisely
+/// the harm the gate exists to prevent. A guard whose own test needs the bad
+/// condition it guards against is mis-factored.
+///
+/// So the rule is a pure function of `(load1, cpus, allow)` and is tested
+/// directly at the values that matter. Only the two lines that read
+/// `sysctl` remain untested by construction, and `load_1min_and_cpus` is
+/// separately pinned against the display string the ledger records.
+fn contention_verdict(load1: f64, cpus: usize, allow: bool) -> Result<(), String> {
+    let ceiling = cpus as f64 / 2.0;
+    if load1 <= ceiling {
+        return Ok(());
+    }
+    if allow {
+        eprintln!(
+            "warning: 1-min load {load1:.2} exceeds {ceiling:.1} ({cpus} cpus) — \
+             timings measure contention as much as the engine (--allow-contention)"
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to measure: 1-min load {load1:.2} exceeds {ceiling:.1} on {cpus} cpus.\n\
+         Durations taken here record the machine's queue depth, not the engine, and\n\
+         nothing downstream can tell the two apart. Wait for the machine to quiet\n\
+         (`uptime`), or pass --allow-contention to measure deliberately."
+    ))
+}
+
 fn load_average() -> String {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "?".to_owned());
-    let averages = std::fs::read_to_string("/proc/loadavg")
+    let averages = load_averages().unwrap_or_else(|| "unknown".to_owned());
+    format!("{averages} over {cpus} cpus")
+}
+
+/// The raw "1min 5min 15min" triple, or `None` if the platform withholds it.
+fn load_averages() -> Option<String> {
+    std::fs::read_to_string("/proc/loadavg")
         .ok()
         .and_then(|text| {
             let fields: Vec<String> = text
@@ -350,8 +441,6 @@ fn load_average() -> String {
                 .collect();
             (fields.len() >= 3).then(|| fields[..3].join(" "))
         })
-        .unwrap_or_else(|| "unknown".to_owned());
-    format!("{averages} over {cpus} cpus")
 }
 
 /// One measure being sampled across iterations: raw spans plus the
@@ -1833,6 +1922,14 @@ fn main() {
     println!("subject  : {commit} ({label})");
     println!("config   : {config}");
 
+    // After the config line (so the load is on the record either way) and
+    // before anything is timed. Exits non-zero so a driver script running
+    // `set -e` stops rather than continuing to the next phase.
+    if let Err(msg) = contention_gate(cfg.allow_contention) {
+        eprintln!("{msg}");
+        std::process::exit(3);
+    }
+
     let suite_start = Instant::now();
     let base = Instant::now();
     let mut led = match ledger::ResultsLedger::open(results, &commit, label, &config) {
@@ -2352,6 +2449,70 @@ mod tests {
 
     fn parse(argv: &[&str]) -> Cfg {
         parse_args(&argv.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+    }
+
+    /// The gate must be decisive on the case that motivated it and quiet on
+    /// an ordinary machine — a threshold that fires at idle would just get
+    /// `--allow-contention` pasted into every invocation, which is the same
+    /// as not having a gate.
+    ///
+    /// Calls [`contention_verdict`] directly. An earlier version of this test
+    /// re-implemented the comparison, which meant it could pass while the
+    /// real rule was wrong; and the version before that generated actual load
+    /// to prove the gate fires, which saturated a shared machine for minutes.
+    #[test]
+    fn contention_gate_refuses_a_saturated_machine_and_passes_a_quiet_one() {
+        // The motivating incident: 16 cores at 1-min load 41, where the
+        // runner was getting 49% of ONE core.
+        let refused = contention_verdict(41.0, 16, false).expect_err("must refuse");
+        assert!(refused.contains("refusing to measure"), "got {refused}");
+        assert!(refused.contains("41.00"), "the message must quote the load: {refused}");
+        assert!(refused.contains("8.0"), "and the ceiling it exceeded: {refused}");
+        assert!(
+            refused.contains("--allow-contention"),
+            "and how to override: {refused}"
+        );
+
+        // The override is a choice, not a warning to be ignored.
+        assert!(contention_verdict(41.0, 16, true).is_ok(), "override must pass");
+
+        // Ordinary background activity must pass, or the gate is useless.
+        assert!(contention_verdict(1.5, 16, false).is_ok(), "idle must pass");
+        assert!(contention_verdict(8.0, 16, false).is_ok(), "at the ceiling passes");
+        assert!(
+            contention_verdict(8.01, 16, false).is_err(),
+            "just over the ceiling refuses"
+        );
+
+        // The ceiling is relative to the machine, not a constant.
+        assert!(contention_verdict(5.0, 4, false).is_err(), "4 cpus: 5.0 > 2.0");
+        assert!(contention_verdict(5.0, 64, false).is_ok(), "64 cpus: 5.0 <= 32.0");
+    }
+
+    /// The numeric reader must agree with the display string the ledger
+    /// records, or the gate and the provenance line describe different
+    /// machines.
+    #[test]
+    fn numeric_load_agrees_with_the_recorded_display_string() {
+        let display = load_average();
+        match load_1min_and_cpus() {
+            Some((load1, cpus)) => {
+                assert!(
+                    display.contains(&format!("over {cpus} cpus")),
+                    "cpu count disagrees: {display} vs {cpus}"
+                );
+                let first = display.split_whitespace().next().unwrap();
+                let parsed: f64 = first.parse().expect("display starts with the 1-min average");
+                assert!(
+                    (parsed - load1).abs() < f64::EPSILON,
+                    "1-min average disagrees: {parsed} vs {load1}"
+                );
+            }
+            None => assert!(
+                display.starts_with("unknown"),
+                "if the numeric reader cannot read load, the display must say unknown, got {display}"
+            ),
+        }
     }
 
     #[test]
