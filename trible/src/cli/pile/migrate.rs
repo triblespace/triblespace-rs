@@ -74,6 +74,10 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
         let reader = pile.reader().context("pile reader")?;
 
         let mut missing_name = 0usize;
+        // Branches the migration CANNOT fix, tracked separately from the ones
+        // it can so the report never implies a repair it will not perform.
+        let mut indeterminate_name = 0usize;
+        let mut unreadable_meta = 0usize;
         let mut duplicate_names: HashMap<String, usize> = HashMap::new();
 
         for bid in pile.pins().context("list branches")? {
@@ -85,17 +89,31 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
             let meta: TribleSet =
                 match reader.get::<TribleSet, blobencodings::SimpleArchive>(meta_handle) {
                     Ok(meta) => meta,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // Previously `continue` — silently dropping the branch
+                        // from the audit, so a pile with unreadable branch
+                        // metadata reported "ok". An audit that cannot read a
+                        // branch must say so, not omit it.
+                        unreadable_meta += 1;
+                        continue;
+                    }
                 };
 
             if !has_unique_name(&meta) {
-                // Count only if the legacy name exists and is unambiguous; otherwise
-                // we don't know how to migrate it.
+                // The legacy name is what the migration reads, so a branch is
+                // only *migratable* when it has one.
                 if legacy_branch_name(&meta)
                     .context("read legacy branch name")?
                     .is_some()
                 {
                     missing_name += 1;
+                } else {
+                    // No unique modern name AND no legacy name to migrate
+                    // from: either the metadata carries two names or it
+                    // carries none. The old code counted this nowhere and
+                    // printed nothing, so the branches most in need of repair
+                    // were the ones the report stayed silent about.
+                    indeterminate_name += 1;
                 }
             }
 
@@ -108,13 +126,37 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
 
         println!("Known migrations:");
         if missing_name == 0 {
-            println!("- branch-metadata-name: ok");
+            // "ok" is reserved for a pile with nothing wrong. With
+            // indeterminate or unreadable branches present the migration has
+            // nothing to DO, which is not the same claim.
+            if indeterminate_name == 0 && unreadable_meta == 0 {
+                println!("- branch-metadata-name: ok");
+            } else {
+                println!("- branch-metadata-name: nothing to migrate");
+            }
         } else {
             println!("- branch-metadata-name: needed ({missing_name} branch(es))");
         }
         if duplicates > 0 {
             println!(
                 "  note: {duplicates} duplicate branch name(s) detected (run migration to auto-rename)"
+            );
+        }
+        // Reported separately from `missing_name` because these are NOT
+        // fixed by running the migration — they need `pile reid` or metadata
+        // repair. Folding them into the migratable count would promise a
+        // repair that does not happen.
+        if indeterminate_name > 0 {
+            println!(
+                "  warning: {indeterminate_name} branch(es) have no determinable name \
+                 (no unique metadata::name and no legacy name); the migration cannot \
+                 fix these"
+            );
+        }
+        if unreadable_meta > 0 {
+            println!(
+                "  warning: {unreadable_meta} branch(es) have unreadable metadata and \
+                 were not audited"
             );
         }
         Ok(())
