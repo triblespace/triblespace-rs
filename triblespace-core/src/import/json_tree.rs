@@ -168,7 +168,16 @@ where
         if bytes.peek_token().is_some() {
             return Err(JsonImportError::Syntax("trailing tokens".into()));
         }
-        Ok(Fragment::rooted(root, data))
+        let mut fragment = Fragment::rooted(root, data);
+        // The node kinds are minted here, not declared by an
+        // `attributes!{}` block, so nothing can describe them on the
+        // importer's behalf. Carrying the schema in the returned
+        // fragment's metafacts means a caller who just persists what
+        // `import_str` handed them has persisted a decodable pile —
+        // rather than having to know to call `metadata()` as a separate
+        // step, which is exactly the discipline this replaces.
+        fragment.describe_with(build_json_tree_metadata());
+        Ok(fragment)
     }
 
     /// Returns schema metadata for the lossless JSON tree format.

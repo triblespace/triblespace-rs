@@ -61,6 +61,7 @@ use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 use triblespace_net::reconcile::Reconciler;
 use triblespace_net::tracking;
+use triblespace_core::trible::Fragment;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -252,13 +253,13 @@ fn run_a(dir: &Path) {
     pile.flush().expect("flush pile a");
 
     let (peer, my_addr) = bring_up(&ka, pile, team_root, self_cap_a, Vec::new());
-    let mut repo = Repository::new(peer, ka.clone(), TribleSet::new()).expect("repo a");
+    let mut repo = Repository::new(peer, ka.clone());
 
     // The eager fact: one commit on "main".
     let branch_id = repo.ensure_branch("main", None).ok().expect("branch");
     let a_head = {
         let mut ws = repo.pull(branch_id).expect("pull");
-        ws.commit(TribleSet::new(), "two-pile sync demo: fact from A");
+        ws.commit(Fragment::empty(), "two-pile sync demo: fact from A");
         repo.push(&mut ws).ok().expect("push");
         let ws = repo.pull(branch_id).expect("pull");
         ws.head().expect("branch has head").raw
@@ -379,7 +380,7 @@ fn run_b(dir: &Path) {
     pile.flush().expect("flush pile b");
 
     let (peer, my_addr) = bring_up(&kb, pile, team_root, self_cap_b, vec![a_addr]);
-    let mut repo = Repository::new(peer, kb.clone(), TribleSet::new()).expect("repo b");
+    let mut repo = Repository::new(peer, kb.clone());
     println!("B: node {}", hex::encode(my_addr.id.as_bytes()));
 
     // ── Stage 1: eager gossip convergence ────────────────────────────

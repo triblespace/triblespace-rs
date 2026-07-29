@@ -4,6 +4,7 @@ use triblespace::core::repo::commit;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
+use triblespace::core::trible::Fragment;
 
 #[test]
 fn branch_from_and_pull_with_key() {
@@ -13,12 +14,12 @@ fn branch_from_and_pull_with_key() {
     let commit_set = commit::commit_metadata(&key, [], None, None, None);
     let initial = store.put(commit_set).unwrap();
 
-    let mut repo = Repository::new(store, key.clone(), TribleSet::new()).unwrap();
+    let mut repo = Repository::new(store, key.clone());
     let branch_id = repo
         .create_branch("feature", Some(initial))
         .expect("branch from");
     let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(TribleSet::new(), "work");
+    ws.commit(Fragment::empty(), "work");
     repo.push(&mut ws).expect("push");
 
     // pull using a different key should succeed

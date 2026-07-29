@@ -21,8 +21,7 @@ fn main() {
     let mut pile = Pile::open(&path).expect("open pile");
     pile.refresh().expect("load pile");
 
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .expect("create repo");
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
 
     // 1) Register the index kind ONCE. From here on every push maintains
     //    the index incrementally from its own commit delta: the on-commit
@@ -36,7 +35,7 @@ fn main() {
     // 2) Commit normally; no explicit index calls anywhere.
     for name in ["Ada", "Grace", "Barbara"] {
         let mut ws = repo.pull(*branch_id).expect("pull");
-        let delta: TribleSet = entity! { &ufoid() @ literature::firstname: name }.into();
+        let delta = entity! { &ufoid() @ literature::firstname: name };
         ws.commit(delta, "add person");
         repo.push(&mut ws).expect("push");
     }

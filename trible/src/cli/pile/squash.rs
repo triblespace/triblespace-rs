@@ -36,8 +36,7 @@ pub fn run(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("branch iter: {e:?}"))?;
 
-    let mut src_repo = Repository::new(src_pile, key.clone(), TribleSet::new())
-        .map_err(|e| anyhow!("source repo: {e:?}"))?;
+    let mut src_repo = Repository::new(src_pile, key.clone());
 
     // Create source reader (self-contained via Arc<Mmap> clone).
     let src_reader = src_repo

@@ -102,7 +102,7 @@ before sharing work or starting another task.
 
 
 ```rust,ignore
-let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())?;
+let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
 let branch_id = repo.create_branch("main", None).expect("create branch");
 
 let mut ws = repo.pull(*branch_id).expect("pull branch");

@@ -55,6 +55,7 @@ use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 use triblespace_net::reconcile::Reconciler;
 use triblespace_net::tracking;
+use triblespace_core::trible::Fragment;
 
 fn key(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
@@ -205,8 +206,8 @@ async fn two_nodes(
     let a_id: EndpointAddr = peer_a.id().into();
     let peer_b = bring_up(network, kb, pile_b, team_root, self_cap_b, vec![a_id]).await;
 
-    let repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
-    let repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+    let repo_a = Repository::new(peer_a, ka.clone());
+    let repo_b = Repository::new(peer_b, kb.clone());
     TwoNodes {
         repo_a,
         repo_b,
@@ -225,7 +226,7 @@ async fn commit_on_a_and_converge(
     let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
     {
         let mut ws = repo_a.pull(branch_id).expect("pull");
-        ws.commit(TribleSet::new(), msg);
+        ws.commit(Fragment::empty(), msg);
         repo_a.push(&mut ws).ok().expect("push");
     }
     // A's head COMMIT handle — content-addressed, so seeing it on B is

@@ -171,6 +171,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- this block deliberately when release notes are cut.                  -->
 <!-- ------------------------------------------------------------------ -->
 
+- **Breaking: data now describes itself, and commits record that
+  description automatically.** `Fragment` gains a `metafacts: TribleSet`
+  (plus a `metablobs` store backing its handles), and `entity!{}` fills
+  it with the description — rust identifier, declaring module, doc
+  comment, and the value encoding — of every attribute it actually
+  asserts. `Workspace::commit` writes those metafacts as the commit's
+  metadata. Recording what a pile's attributes mean is therefore a
+  property of writing to it rather than a step producers have to
+  remember, which is what minting stable ids was for in the first place.
+
+  The repo-wide metadata slot that used to serve this purpose is
+  removed: `Repository::new` loses its `commit_metadata` parameter (and
+  is now infallible), the `Repository::commit_metadata` /
+  `Workspace::metadata` accessors are gone, and `commit_with_metadata` /
+  `commit_with_metadata_handle` are deleted with no shims. It was
+  opt-in, and opt-in in practice meant an empty set: piles that nothing
+  but the original source could decode.
+
+  The accumulator type was a second, invisible opt-out: `let mut change
+  = TribleSet::new(); change += entity!{…}; ws.commit(change, …)`
+  compiled and silently threw the descriptions away. So
+  `impl From<TribleSet> for Fragment` is removed and
+  `Workspace::commit` takes a `Fragment` rather than
+  `impl Into<Fragment>` — the shape now fails to compile. Committing
+  undescribed content is still possible via the explicit
+  `Fragment::undescribed(set)`, whose name states the consequence at
+  the call site: the resulting commit references no metadata blob at
+  all, so a reader can see the tribles but cannot learn what the
+  attribute ids mean. `impl From<Fragment> for TribleSet` is kept —
+  asking for the facts and getting the facts confuses nobody.
+
+  Metafacts are kept strictly out of `facts`: content queries never see
+  schema records, entity ids (derived from the facts alone) are
+  unchanged, and content committed as `undescribed` honestly
+  records no description rather than an empty one. They merge as a set
+  through `+=` and spread composition, so repeated descriptions
+  collapse, and the metadata archive is content-addressed — 100 commits
+  over two attribute shapes converge on two metadata blobs.
+  `Fragment::into_parts` now yields all five channels, and
+  `describe_with` merges another fragment in as description for
+  importers that mint attributes at runtime. Note the construction
+  cost: an `entity!{}` describing four attributes measured ~5.4 µs
+  against ~0.8 µs before, since a description is several times larger
+  than the small entity it describes.
+- **Breaking: the N-Triples importer describes its own attributes.**
+  `NtImport` no longer returns a `meta` fragment the caller has to
+  remember to fold in. The attribute vocabulary — `metadata::iri` +
+  `metadata::value_encoding` per distinct `(predicate IRI, value
+  schema)` pair, plus the IRI-string blobs — now lands directly in the
+  metafacts and metablobs of `import.facts`, so a plain
+  `ws.commit(import.facts, …)` records what its attribute ids mean.
+  Since the importer mints those ids from IRIs, nothing else could have
+  described them; making it the caller's job to route the description
+  was the same opt-out shape as the removed `commit_metadata`, one layer
+  up.
+
+  The URI↔id map — an `rdf_uri` annotation per distinct entity IRI —
+  remains a separate fragment, renamed `NtImport::uri_map`, because that
+  one *is* a real choice: it is queryable content, so `facts +=
+  uri_map` (join against it), `facts.describe_with(uri_map)` (persist
+  without exposing it to content queries), and dropping it are all
+  defensible. `uri_map` also carries the `rdf_uri` description now, so
+  either of the first two options yields described content.
+
+  Two silent losses fell out of the same audit and are fixed: the
+  reified `"text"@lang` entities put `rdf_lang` / `rdf_text` facts into
+  the graph while their descriptions were dropped, and a predicate whose
+  first occurrence had a blank-node subject was described into a
+  throwaway scratch fragment — and never again, because resolution
+  memoises per (schema, IRI). Both now reach the fragment the facts land
+  in. `tests/ntriples_commit_describes.rs` pins the invariant with the
+  same predicate `trible pile diagnose describes` reports.
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm

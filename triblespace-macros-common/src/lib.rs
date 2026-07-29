@@ -20,6 +20,7 @@ mod find;
 mod value_formatter;
 
 pub use attributes::attributes_impl;
+
 pub use find::find_impl;
 pub use value_formatter::value_formatter_impl;
 
@@ -497,14 +498,55 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
     Ok(output)
 }
 
+/// Expands an `entity!{}` invocation.
+///
+/// The produced fragment carries the descriptions of every attribute
+/// it expanded in its `metafacts` — see [`entity_impl_with`].
 pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<TokenStream2> {
+    entity_impl_with(input, base_path, true)
+}
+
+/// Like [`entity_impl`] but suppresses metafact emission.
+///
+/// Used by `attributes!{}` for the expansions that *build* attribute
+/// descriptions: those must not ask the attributes they use for their
+/// descriptions, or the bootstrap (`metadata::name` is declared with
+/// `metadata::name`) would not terminate.
+pub fn entity_impl_no_meta(
+    input: TokenStream2,
+    base_path: &TokenStream2,
+) -> syn::Result<TokenStream2> {
+    entity_impl_with(input, base_path, false)
+}
+
+/// Expands an `entity!{}` invocation, optionally emitting metafacts.
+///
+/// With `emit_meta`, each expanded attribute contributes its
+/// description (`Attribute::meta`) to the resulting fragment's
+/// metafacts and any bytes that description references to its blob
+/// store. That is what makes data self-describing by construction: the
+/// producer writes `entity!{ social::name: "Alice" }` and the fragment
+/// already knows what `social::name` means.
+///
+/// Metafacts never touch `set` (the content facts), so entity ids —
+/// which derive from the attribute/value pairs only — are unchanged.
+pub fn entity_impl_with(
+    input: TokenStream2,
+    base_path: &TokenStream2,
+    emit_meta: bool,
+) -> syn::Result<TokenStream2> {
     let wrapped = quote! { { #input } };
 
     let Entity { id, attributes } = syn::parse2(wrapped)?;
 
     let set_init = quote! {
         let mut set = #base_path::trible::TribleSet::new();
+        #[allow(unused_mut)]
+        let mut __meta: #base_path::trible::TribleSet = #base_path::trible::TribleSet::new();
         let mut __blobs: #base_path::blob::MemoryBlobStore =
+            #base_path::blob::MemoryBlobStore::new();
+        #[allow(unused_mut)]
+        let mut __metablobs: #base_path::blob::MemoryBlobStore =
             #base_path::blob::MemoryBlobStore::new();
     };
     let attr_count = attributes.len();
@@ -559,6 +601,45 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         let extra_ident = format_ident!("__extra{}", i, span = Span::mixed_site());
 
         attr_eval_tokens.extend(quote! { let #af_ident = &#field_expr; });
+
+        // Fold this attribute's description into the fragment's
+        // metafacts. Both channels of the description travel: its facts
+        // are the schema records themselves, its metafacts anything the
+        // description was in turn described by, and its blobs the bytes
+        // those records reference by handle (rust identifier, module
+        // path, doc comment).
+        //
+        // Emitted only where the attribute actually contributes a
+        // fact, so metafacts stay a *cover* of the attributes present
+        // in the data: an `attr?:` that resolved to `None` and an
+        // `attr*:` that spread nothing describe nothing, and the
+        // fragment is bit-identical to one that never mentioned the
+        // attribute at all.
+        let meta_tokens = if emit_meta {
+            quote! {
+                {
+                    let __attr_meta = #af_ident.meta();
+                    // Set union rather than per-trible inserts: PATCH's
+                    // union moves the root outright when the target is
+                    // still empty, which makes the first attribute of an
+                    // entity essentially free. Inserting trible by
+                    // trible measured ~10x slower in that case.
+                    __meta.union(__attr_meta.facts().clone());
+                    if !__attr_meta.metafacts().is_empty() {
+                        __meta.union(__attr_meta.metafacts().clone());
+                    }
+                    if !__attr_meta.blobs().is_empty() {
+                        __metablobs.union(__attr_meta.blobs().clone());
+                    }
+                    if !__attr_meta.metablobs().is_empty() {
+                        __metablobs.union(__attr_meta.metablobs().clone());
+                    }
+                }
+            }
+        } else {
+            TokenStream2::new()
+        };
+
         match mode {
             AttributeMode::Required => {
                 attr_eval_tokens.extend(quote! {
@@ -567,6 +648,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                     if let Some(__b) = __maybe_blob {
                         __blobs.insert(__b);
                     }
+                    #meta_tokens
                 });
             }
             AttributeMode::Optional => {
@@ -582,6 +664,9 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                             __val
                         })
                     };
+                    if #val_ident.is_some() {
+                        #meta_tokens
+                    }
                 });
             }
             AttributeMode::Repeated => {
@@ -601,6 +686,9 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                             .collect::<::std::vec::Vec<_>>();
                         (__vals, __spread_facts)
                     };
+                    if !#val_ident.is_empty() {
+                        #meta_tokens
+                    }
                 });
             }
         }
@@ -651,10 +739,12 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                     for __v in #val_ident.iter() {
                         set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
                     }
-                    let (__extra_facts, __extra_blobs) =
-                        #extra_ident.into_facts_and_blobs();
+                    let (_, __extra_facts, __extra_metafacts, __extra_blobs, __extra_metablobs) =
+                        #extra_ident.into_parts();
                     set += __extra_facts;
+                    __meta.union(__extra_metafacts);
                     __blobs.union(__extra_blobs);
+                    __metablobs.union(__extra_metablobs);
                 });
             }
         }
@@ -737,7 +827,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             #attr_eval_tokens
             #id_init
             #insert_tokens
-            #base_path::trible::Fragment::rooted_with_blobs(id_ref.id, set, __blobs)
+            #base_path::trible::Fragment::rooted_from_parts(id_ref.id, set, __meta, __blobs, __metablobs)
         }
     };
 

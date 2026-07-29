@@ -118,14 +118,14 @@ fn diverged_peers(n: usize) -> Vec<Peer> {
             let sk = SigningKey::from_bytes(&[seed; 32]);
             let pubkey = sk.verifying_key().to_bytes();
             let mut repo =
-                Repository::new(MemoryRepo::default(), sk, TribleSet::new()).expect("repo");
+                Repository::new(MemoryRepo::default(), sk);
             let id = repo.ensure_branch(BRANCH, None).unwrap();
             let mut ws = repo.pull(id).unwrap();
             // A distinct, non-empty payload per peer so the merged
             // *content* (the union of tribles) is observable and the
             // commits genuinely diverge.
             let e = Id::new([0x20 + i as u8; 16]).unwrap();
-            let payload: TribleSet = entity! {
+            let payload = entity! {
                 ExclusiveId::force_ref(&e) @
                 triblespace_core::metadata::tag: Id::new([0x30 + i as u8; 16]).unwrap(),
             }
@@ -356,7 +356,7 @@ fn commit_more(peer: &mut Peer, tag: u8) {
     let mut vb = [0u8; 16];
     vb[0] = 0x70;
     vb[1] = tag;
-    let payload: TribleSet = entity! {
+    let payload = entity! {
         ExclusiveId::force_ref(&e) @
         triblespace_core::metadata::tag: Id::new(vb).unwrap(),
     }

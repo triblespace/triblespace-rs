@@ -31,11 +31,12 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, Repository};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::tracking::{MergeOutcome, ensure_tracking_pin, merge_tracking_into_local};
+use triblespace_core::trible::Fragment;
 
 fn new_repo(seed: u8) -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
     let store = MemoryRepo::default();
-    Repository::new(store, signing_key, TribleSet::new()).expect("repo")
+    Repository::new(store, signing_key)
 }
 
 /// Copy every blob from `src`'s store into `dst`'s store. Content-addressed,
@@ -115,13 +116,13 @@ fn sequential_sync_converges_under_divergent_commits() {
     {
         let id = a.ensure_branch("main", None).unwrap();
         let mut ws = a.pull(id).unwrap();
-        ws.commit(TribleSet::new(), "A's commit");
+        ws.commit(Fragment::empty(), "A's commit");
         a.push(&mut ws).unwrap();
     }
     {
         let id = b.ensure_branch("main", None).unwrap();
         let mut ws = b.pull(id).unwrap();
-        ws.commit(TribleSet::new(), "B's commit");
+        ws.commit(Fragment::empty(), "B's commit");
         b.push(&mut ws).unwrap();
     }
 
@@ -188,13 +189,13 @@ fn parallel_merges_produce_identical_commits() {
     {
         let id = a.ensure_branch("main", None).unwrap();
         let mut ws = a.pull(id).unwrap();
-        ws.commit(TribleSet::new(), "A's commit");
+        ws.commit(Fragment::empty(), "A's commit");
         a.push(&mut ws).unwrap();
     }
     {
         let id = b.ensure_branch("main", None).unwrap();
         let mut ws = b.pull(id).unwrap();
-        ws.commit(TribleSet::new(), "B's commit");
+        ws.commit(Fragment::empty(), "B's commit");
         b.push(&mut ws).unwrap();
     }
 
@@ -243,7 +244,7 @@ fn single_round_converges_when_only_one_side_advanced() {
     {
         let id = a.ensure_branch("main", None).unwrap();
         let mut ws = a.pull(id).unwrap();
-        ws.commit(TribleSet::new(), "A's only commit");
+        ws.commit(Fragment::empty(), "A's only commit");
         a.push(&mut ws).unwrap();
     }
 

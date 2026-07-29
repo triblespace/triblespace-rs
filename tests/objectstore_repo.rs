@@ -8,13 +8,14 @@ use triblespace::core::repo::Repository;
 use triblespace::core::repo::{self};
 use triblespace::prelude::*;
 use url::Url;
+use triblespace::core::trible::Fragment;
 
 #[test]
 fn objectstore_branch_creates_branch() {
     let url = Url::parse("memory:///repo").unwrap();
     let storage = Blocking::new(ObjectStoreRemote::with_url(&url).unwrap()).unwrap();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
 
     repo.pull(*branch_id).expect("pull");
@@ -25,11 +26,11 @@ fn objectstore_workspace_commit_updates_head() {
     let url = Url::parse("memory:///repo2").unwrap();
     let storage = Blocking::new(ObjectStoreRemote::with_url(&url).unwrap()).unwrap();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
-    ws.commit(TribleSet::new(), "change");
+    ws.commit(Fragment::empty(), "change");
 
     repo.push(&mut ws).expect("push");
 }
@@ -42,12 +43,12 @@ fn objectstore_branch_from_and_pull_with_key() {
     let commit_set = repo::commit::commit_metadata(&key, [], None, None, None);
     let initial = store.put(commit_set).unwrap();
 
-    let mut repo = Repository::new(store, key.clone(), TribleSet::new()).unwrap();
+    let mut repo = Repository::new(store, key.clone());
     let branch_id = repo
         .create_branch("feature", Some(initial))
         .expect("branch from");
     let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(TribleSet::new(), "work");
+    ws.commit(Fragment::empty(), "work");
     repo.push(&mut ws).expect("push");
 
     let other_key = SigningKey::generate(&mut OsRng);
@@ -60,13 +61,13 @@ fn objectstore_push_and_merge_conflict_resolution() {
     let url = Url::parse("memory:///repo4").unwrap();
     let storage = Blocking::new(ObjectStoreRemote::with_url(&url).unwrap()).unwrap();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws1 = repo.pull(*branch_id).expect("pull");
     let mut ws2 = repo.pull(*branch_id).expect("pull");
 
-    ws1.commit(TribleSet::new(), "first");
-    ws2.commit(TribleSet::new(), "second");
+    ws1.commit(Fragment::empty(), "first");
+    ws2.commit(Fragment::empty(), "second");
 
     repo.push(&mut ws1).expect("push");
 

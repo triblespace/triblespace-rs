@@ -41,11 +41,11 @@ impl Spread for Fragment {
     type Item = Id;
     type Iter = std::iter::Map<PATCHIntoOrderedIterator<16, IdentitySchema, ()>, fn(RawId) -> Id>;
     fn spread(self) -> (Self::Iter, Fragment) {
-        let (exports, facts, blobs) = self.into_parts();
-        // Wrap the remaining facts + blobs as an extras fragment with
-        // no exports — the exports are consumed lazily as the spread
-        // values via the mapping iterator below.
-        let extras = Fragment::from_facts_and_blobs(facts, blobs);
+        let (exports, facts, metafacts, blobs, metablobs) = self.into_parts();
+        // Wrap everything but the exports as an extras fragment — the
+        // exports are consumed lazily as the spread values via the
+        // mapping iterator below.
+        let extras = Fragment::from_parts(facts, metafacts, blobs, metablobs);
         let iter = exports.into_iter_ordered().map(raw_to_id as fn(_) -> _);
         (iter, extras)
     }

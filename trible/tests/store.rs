@@ -4,7 +4,6 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
-use triblespace_core::trible::TribleSet;
 
 fn random_signing_key() -> SigningKey {
     let mut seed = [0u8; 32];
@@ -197,7 +196,7 @@ fn branch_push_pull_transfers_branch() {
 
     let branch_id = {
         let pile: Pile = Pile::open(&local).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
 
         let branch_id = repo.create_branch("main", None).unwrap();
         repo.close().unwrap();

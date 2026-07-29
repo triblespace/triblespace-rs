@@ -17,6 +17,7 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
+use triblespace::core::trible::Fragment;
 
 const ENV_TELEMETRY_PILE: &str = "TELEMETRY_PILE";
 const ENV_PILE: &str = "PILE";
@@ -347,20 +348,24 @@ impl Telemetry {
         }
 
         let signing_key = SigningKey::generate(&mut OsRng);
-        let metadata_fragment = schema::build_telemetry_metadata();
-        let metadata_set: TribleSet = metadata_fragment.into();
-        let mut repo = Repository::new(pile, signing_key, metadata_set).ok()?;
+        let mut repo = Repository::new(pile, signing_key);
 
         // Commit session start entity.
         let mut ws = repo.pull(branch_id).ok()?;
         let session_entity = ExclusiveId::force_ref(&session_id);
-        let mut init = TribleSet::new();
+        let mut init = Fragment::empty();
         init += entity! { session_entity @
             metadata::tag: schema::kind_session,
             schema::category: "session",
             schema::name: ws.put(session_name.to_string()),
             schema::begin_ns: 0u64,
         };
+        // `entity!{}` describes the attributes it used on its own; the
+        // protocol entity and the `kind_*` tags are minted here rather
+        // than declared, so they have to be described by hand. Folding
+        // them into the fragment's metafacts puts them in this commit's
+        // metadata without them ever reaching a content query.
+        init.describe_with(schema::build_telemetry_metadata());
         ws.commit(init, "telemetry session");
         if repo.push(&mut ws).is_err() {
             let _ = repo.close();
@@ -423,7 +428,7 @@ impl Drop for Telemetry {
                 let end_ns = self.inner.now_ns();
                 if let Ok(mut ws) = repo.pull(self.inner.branch_id) {
                     let session_entity = ExclusiveId::force_ref(&self.inner.session);
-                    let mut end = TribleSet::new();
+                    let mut end = Fragment::empty();
                     end += entity! { session_entity @
                         schema::end_ns: end_ns,
                         schema::duration_ns: end_ns,
@@ -458,7 +463,7 @@ fn span_begin(
     source: Option<String>,
 ) {
     let span_entity = ExclusiveId::force_ref(&span_id);
-    let mut tribles = TribleSet::new();
+    let mut tribles = Fragment::empty();
     tribles += entity! { span_entity @
         metadata::tag: schema::kind_span,
         schema::session: session,
@@ -477,7 +482,7 @@ fn span_begin(
 
 fn span_end(ws: &mut Workspace<Pile>, span_id: Id, at_ns: u64, duration_ns: u64) {
     let span_entity = ExclusiveId::force_ref(&span_id);
-    let mut tribles = TribleSet::new();
+    let mut tribles = Fragment::empty();
     tribles += entity! { span_entity @
         schema::end_ns: at_ns,
         schema::duration_ns: duration_ns,

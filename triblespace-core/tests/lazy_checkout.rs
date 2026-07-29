@@ -31,18 +31,18 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
 
     // ── Source repo: one branch, one commit ──────────────────────────
     let mut repo_a =
-        Repository::new(MemoryRepo::default(), key.clone(), TribleSet::new()).expect("source repo");
+        Repository::new(MemoryRepo::default(), key.clone());
     let branch_id = *repo_a.create_branch("main", None).expect("create branch");
     let mut ws = repo_a.pull(branch_id).expect("pull");
 
     let e = triblespace_core::id::rngid();
-    let data: TribleSet = entity! { &e @ test_ns::label: "payload" }.into();
+    let data = entity! { &e @ test_ns::label: "payload" };
     ws.commit(data.clone(), "the payload commit");
     repo_a.push(&mut ws).expect("push");
 
     // The commit's content blob — the one we withhold from the replica.
     let content_blob: Blob<triblespace_core::blob::encodings::simplearchive::SimpleArchive> =
-        data.to_blob();
+        data.facts().clone().to_blob();
     let content_handle = content_blob.get_handle();
 
     // ── Replica: everything EXCEPT the content blob ──────────────────
@@ -69,7 +69,7 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
 
     // ── Lazy checkout over the wrapped replica ─────────────────────
     let lazy = Lazy::new(replica);
-    let mut repo_b = Repository::new(lazy, key, TribleSet::new()).expect("replica repo");
+    let mut repo_b = Repository::new(lazy, key);
     let mut ws_b = repo_b
         .pull(branch_id)
         .expect("pull succeeds — branch meta + commit present");

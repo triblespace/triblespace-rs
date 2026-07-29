@@ -41,6 +41,7 @@ use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 use triblespace_net::tracking;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
+use triblespace_core::trible::Fragment;
 
 thread_local! {
     /// Diagnostic blob-dump directory for nondeterminism diffing.
@@ -217,14 +218,14 @@ async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunRep
         sender_b,
         receiver_b,
     );
-    let mut repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+    let mut repo_b = Repository::new(peer_b, kb.clone());
 
     // ── A commits a fact on "main" ───────────────────────────────────
-    let mut repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+    let mut repo_a = Repository::new(peer_a, ka.clone());
     let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
     {
         let mut ws = repo_a.pull(branch_id).expect("pull");
-        ws.commit(TribleSet::new(), "first fact from A");
+        ws.commit(Fragment::empty(), "first fact from A");
         repo_a.push(&mut ws).ok().expect("push");
     }
     // A's head COMMIT handle — content-addressed, so comparing it on
@@ -447,7 +448,7 @@ fn partition_blocks_then_heal_converges() {
             receiver_a,
         );
         let mut repo_a =
-            Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+            Repository::new(peer_a, ka.clone());
 
         let harness_b = net.join(pk(&kb), true);
         let (sender_b, receiver_b, wiring_b) =
@@ -462,7 +463,7 @@ fn partition_blocks_then_heal_converges() {
             receiver_b,
         );
         let mut repo_b =
-            Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+            Repository::new(peer_b, kb.clone());
 
         // Partition BEFORE A commits: the gossip frame for the new
         // head never reaches B.
@@ -471,7 +472,7 @@ fn partition_blocks_then_heal_converges() {
         let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
         {
             let mut ws = repo_a.pull(branch_id).expect("pull");
-            ws.commit(TribleSet::new(), "committed during partition");
+            ws.commit(Fragment::empty(), "committed during partition");
             repo_a.push(&mut ws).ok().expect("push");
         }
         let a_head = {
@@ -630,7 +631,7 @@ fn fetch_failure_recovers_despite_gossip_dedupe() {
             sender_a,
             receiver_a,
         );
-        let mut repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+        let mut repo_a = Repository::new(peer_a, ka.clone());
 
         let harness_b = net.join(pk(&kb), true);
         let (sender_b, receiver_b, wiring_b) =
@@ -644,13 +645,13 @@ fn fetch_failure_recovers_despite_gossip_dedupe() {
             sender_b,
             receiver_b,
         );
-        let mut repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+        let mut repo_b = Repository::new(peer_b, kb.clone());
 
         // A commits while the link is still up...
         let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
         {
             let mut ws = repo_a.pull(branch_id).expect("pull");
-            ws.commit(TribleSet::new(), "the only commit");
+            ws.commit(Fragment::empty(), "the only commit");
             repo_a.push(&mut ws).ok().expect("push");
         }
         let a_head = {
@@ -781,7 +782,7 @@ fn stalled_dial_does_not_wedge_the_pool() {
             sender_a,
             receiver_a,
         );
-        let mut repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+        let mut repo_a = Repository::new(peer_a, ka.clone());
 
         let harness_b = net.join(pk(&kb), true);
         let (sender_b, receiver_b, wiring_b) =
@@ -795,7 +796,7 @@ fn stalled_dial_does_not_wedge_the_pool() {
             sender_b,
             receiver_b,
         );
-        let mut repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+        let mut repo_b = Repository::new(peer_b, kb.clone());
 
         // Dials toward A stall BEFORE A commits: B hears the gossip
         // but every fetch attempt parks in connection setup until
@@ -805,7 +806,7 @@ fn stalled_dial_does_not_wedge_the_pool() {
         let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
         {
             let mut ws = repo_a.pull(branch_id).expect("pull");
-            ws.commit(TribleSet::new(), "committed behind a stalled dial");
+            ws.commit(Fragment::empty(), "committed behind a stalled dial");
             repo_a.push(&mut ws).ok().expect("push");
         }
         let a_head = {

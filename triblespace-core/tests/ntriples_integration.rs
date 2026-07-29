@@ -15,6 +15,7 @@ use triblespace_core::id::Id;
 use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id_pure, IngestError};
 use triblespace_core::import::rdf_uri;
 use triblespace_core::inline::{Inline, TryToInline};
+use triblespace_core::exists;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::inlineencodings::{self, Handle};
@@ -27,7 +28,27 @@ use triblespace_core::trible::TribleSet;
 fn new_repo() -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[0x11; 32]);
     let store = MemoryRepo::default();
-    Repository::new(store, signing_key, TribleSet::new()).expect("fresh repo")
+    Repository::new(store, signing_key)
+}
+
+/// The attributes `facts` uses that `meta` does not give a value
+/// encoding for — the predicate `commit_describes_content.rs` audits and
+/// the `trible pile diagnose describes` invariant reports. Kept in sync
+/// by being the same three lines; integration test crates cannot share
+/// helpers.
+fn undescribed_attributes(facts: &TribleSet, meta: &TribleSet) -> Vec<Id> {
+    let used: std::collections::HashSet<Id> = facts.iter().map(|trible| *trible.a()).collect();
+    used.into_iter()
+        .filter(|attr| {
+            let attr = *attr;
+            find!(
+                (schema: Id),
+                pattern!(meta, [{ attr @ metadata::value_encoding: ?schema }])
+            )
+            .next()
+            .is_none()
+        })
+        .collect()
 }
 
 const NT_SAMPLE: &[u8] = br#"
@@ -45,7 +66,7 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
     assert_eq!(import.triples, 4, "four non-empty triples in the sample");
-    let facts = import.facts.into_facts();
+    let facts = import.facts.facts().clone();
 
     // `facts` is the faithful graph — no rdf_uri annotations mixed in.
     let uri_in_facts = find!(
@@ -55,15 +76,15 @@ fn ingests_facts_and_roundtrips_via_query() {
     .count();
     assert_eq!(uri_in_facts, 0, "rdf_uri annotations stay out of facts");
 
-    // The URI↔id inverse mapping rides in `meta` instead: the two
+    // The URI↔id inverse mapping rides in `uri_map` instead: the two
     // distinct subject URIs (frank, dune) each appear, and the
     // URI-valued object (dune) is also tagged.
-    let uri_in_meta = find!(
+    let uri_in_map = find!(
         (entity: Id, uri: Inline<Handle<UTF8String>>),
-        pattern!(import.meta.facts(), [{ ?entity @ rdf_uri: ?uri }])
+        pattern!(import.uri_map.facts(), [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
-    assert!(uri_in_meta >= 2, "at least frank and dune carry rdf_uri");
+    assert!(uri_in_map >= 2, "at least frank and dune carry rdf_uri");
 
     // The integer literal lands as I256BE under an IRI-rooted attribute.
     let birthyear = Attribute::<inlineencodings::I256BE>::from(entity! {
@@ -103,9 +124,29 @@ fn ingests_facts_and_roundtrips_via_query() {
     .count();
     assert_eq!(link_count, 1, "one wrote edge");
 
-    // Actually commit, to prove the facts are a valid commit payload.
-    ws.commit(facts, "ntriples import");
+    // Actually commit, to prove the facts are a valid commit payload —
+    // and that the plain call is the complete one. The importer mints
+    // its attributes from IRIs, so nothing outside the import can
+    // describe them; the descriptions therefore ride in the content
+    // fragment's own metafacts, and `commit` persists them. No fold
+    // here, deliberately: the invariant below is what a caller gets
+    // without knowing anything about metafacts.
+    ws.commit(import.facts, "ntriples import");
     repo.push(&mut ws).expect("push succeeds");
+
+    let head = ws.head().expect("head after commit");
+    let committed = ws.checkout(head).expect("checkout the commit");
+    let meta = ws.checkout_metadata(head).expect("checkout its metadata");
+    assert_eq!(
+        committed, facts,
+        "the commit holds the imported graph and nothing else"
+    );
+    let missing = undescribed_attributes(&committed, &meta);
+    assert!(
+        missing.is_empty(),
+        "commit uses {} attribute(s) its metadata does not describe: {missing:?}",
+        missing.len()
+    );
 }
 
 #[test]
@@ -643,13 +684,14 @@ fn w3c_negative_bad_esc_invalid_escape() {
 }
 
 #[test]
-fn predicate_uris_recoverable_from_meta() {
-    // The import's meta fragment is a full self-description: besides
-    // the rdf_uri annotations for entity URIs, it carries one
-    // describing entity per (predicate IRI, value schema) pair, plus
-    // the IRI-string blobs those facts reference. Round-trip: derive
-    // the attribute id the standard way, look up its IRI handle in
-    // meta, resolve the bytes from meta's embedded blob store.
+fn predicate_uris_recoverable_from_metafacts() {
+    // The imported graph describes its own vocabulary: one describing
+    // entity per (predicate IRI, value schema) pair in the fragment's
+    // metafacts, with the IRI-string blobs in its metablobs. Round-trip:
+    // derive the attribute id the standard way, look up its IRI handle
+    // in the metafacts, resolve the bytes from the metablobs — all from
+    // the one fragment `import.facts`, which is also the one thing a
+    // caller has to commit.
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
 
     let firstname_attr = Attribute::<Handle<UTF8String>>::from(entity! {
@@ -660,18 +702,38 @@ fn predicate_uris_recoverable_from_meta() {
 
     let (h,) = find!(
         (h: Inline<Handle<UTF8String>>),
-        pattern!(import.meta.facts(), [{ attr_entity @ metadata::iri: ?h }])
+        pattern!(import.facts.metafacts(), [{ attr_entity @ metadata::iri: ?h }])
     )
     .next()
-    .expect("describing entity for the firstname attribute in meta");
+    .expect("describing entity for the firstname attribute in the metafacts");
 
-    let mut blobs = import.meta.blobs().clone();
+    let mut blobs = import.facts.metablobs().clone();
     let uri: View<str> = blobs
         .reader()
-        .expect("meta blob reader")
+        .expect("metablob reader")
         .get(h)
-        .expect("IRI blob resolvable from meta's embedded store");
+        .expect("IRI blob resolvable from the fragment's own metablobs");
     assert_eq!(uri.as_ref(), "http://example.org/firstname");
+
+    // Content and description stay in separate channels: the IRI record
+    // is not among the facts a query over the graph would see, and its
+    // bytes are not in the content blob store either.
+    assert!(
+        !exists!(pattern!(
+            import.facts.facts(),
+            [{ attr_entity @ metadata::iri: h }]
+        )),
+        "the describing entity must not appear in the imported graph"
+    );
+    let mut content_blobs = import.facts.blobs().clone();
+    assert!(
+        content_blobs
+            .reader()
+            .expect("content blob reader")
+            .get::<View<str>, _>(h)
+            .is_err(),
+        "IRI bytes belong to the metablobs, not the content blob store"
+    );
 }
 
 #[test]
