@@ -885,33 +885,55 @@ fn run_arch_gpu_interleaved(
     led: &mut ledger::ResultsLedger,
     cfg: &Cfg,
     base: &Instant,
-    arch_ds: &wd_schema::Dataset<wd_schema::ArchivedFacts>,
-    gpu_ds: &wd_schema::Dataset<wd_schema::WgpuArchivedFacts>,
+    gpu: &'static wd_schema::WgpuArchivedFacts,
+    template: &wd_schema::Dataset<wd_schema::WgpuArchivedFacts>,
     baseline: Option<&[Option<String>]>,
 ) -> (usize, usize, bool) {
+    // Both arms borrow from the SAME wrapper: the host through `archive()`,
+    // the device through the wrapper itself. One archive, two views, no
+    // copy — which matters at the scale that needs interleaving, where a
+    // clone would be a second 561M-row archive.
+    let arch_ds = wd_schema::Dataset {
+        facts: gpu.archive(),
+        paths: template.paths.clone(),
+        reader: template.reader.clone(),
+        meta: template.meta.clone(),
+        meta_reader: template.meta_reader.clone(),
+        triples: template.triples,
+        tribles: template.tribles,
+    };
+    let gpu_ds = wd_schema::Dataset {
+        facts: gpu,
+        paths: template.paths.clone(),
+        reader: template.reader.clone(),
+        meta: template.meta.clone(),
+        meta_reader: template.meta_reader.clone(),
+        triples: template.triples,
+        tribles: template.tribles,
+    };
     let mut arch_panicked = 0usize;
     let mut gpu_panicked = 0usize;
     let mut failed = false;
-    let arch_table = queries::TRANSLATED_ARCHIVE;
-    let gpu_table = queries::TRANSLATED_WGPU;
-    for i in 0..arch_table.len() {
+    for i in 0..queries::TRANSLATED_ARCHIVE_REF.len() {
         let want = baseline.and_then(|b| b[i].as_deref());
         let (_, p, f) = run_one_query(
-            led, cfg, base, "sparqloscope_arch", &arch_table[i], arch_ds, want,
-            &mut |_: &wd_schema::Dataset<wd_schema::ArchivedFacts>| {},
+            led, cfg, base, "sparqloscope_arch",
+            &queries::TRANSLATED_ARCHIVE_REF[i], &arch_ds, want,
+            &mut |_: &wd_schema::Dataset<&'static wd_schema::ArchivedFacts>| {},
             &mut |_: &mut ledger::ResultsLedger,
-                  _: &wd_schema::Dataset<wd_schema::ArchivedFacts>,
+                  _: &wd_schema::Dataset<&'static wd_schema::ArchivedFacts>,
                   _: &str| {},
         );
         arch_panicked += p as usize;
         failed |= f;
         let (_, p, f) = run_one_query(
-            led, cfg, base, "sparqloscope_gpu", &gpu_table[i], gpu_ds, want,
-            &mut |ds: &wd_schema::Dataset<wd_schema::WgpuArchivedFacts>| {
+            led, cfg, base, "sparqloscope_gpu",
+            &queries::TRANSLATED_WGPU_REF[i], &gpu_ds, want,
+            &mut |ds: &wd_schema::Dataset<&'static wd_schema::WgpuArchivedFacts>| {
                 ds.facts.reset_stats();
             },
             &mut |_: &mut ledger::ResultsLedger,
-                  _: &wd_schema::Dataset<wd_schema::WgpuArchivedFacts>,
+                  _: &wd_schema::Dataset<&'static wd_schema::WgpuArchivedFacts>,
                   _: &str| {},
         );
         gpu_panicked += p as usize;

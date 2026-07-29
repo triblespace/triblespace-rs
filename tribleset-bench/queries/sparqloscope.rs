@@ -3190,6 +3190,17 @@ macro_rules! registry {
         pub static TRANSLATED_ARCHIVE: &[Translated<ArchivedFacts>] = &[
             $( Translated { name: $name, kind: Kind::$kind, run: $f::<ArchivedFacts> } ),+
         ];
+        /// The same queries against a BORROWED archive.
+        ///
+        /// Exists so the host arm can run off the archive the device wrapper
+        /// owns. `WgpuSuccinctArchive::new` takes the archive by value and
+        /// lends it back through `archive()`, so without a borrowed backend
+        /// the two views cannot coexist — and the benchmark has to run two
+        /// full censuses instead of alternating, which makes a truncated
+        /// full-scale run yield one arm rather than a comparison.
+        pub static TRANSLATED_ARCHIVE_REF: &[Translated<&'static ArchivedFacts>] = &[
+            $( Translated { name: $name, kind: Kind::$kind, run: $f::<&'static ArchivedFacts> } ),+
+        ];
         /// The same queries against a UNION of rollup segments.
         ///
         /// Both arms of a monolithic-versus-tiered comparison run through
@@ -3198,6 +3209,16 @@ macro_rules! registry {
         /// queries it.
         pub static TRANSLATED_UNION: &[Translated<crate::wd_schema::UnionFacts>] = &[
             $( Translated { name: $name, kind: Kind::$kind, run: $f::<crate::wd_schema::UnionFacts> } ),+
+        ];
+        /// The same queries against a BORROWED device wrapper.
+        ///
+        /// The interleaved driver leaks the wrapper so BOTH arms can borrow
+        /// from it — the host from `archive()`, the device from the wrapper
+        /// itself — which is the only way two views of one archive coexist
+        /// when the wrapper owns it.
+        #[cfg(feature = "gpu")]
+        pub static TRANSLATED_WGPU_REF: &[Translated<&'static crate::wd_schema::WgpuArchivedFacts>] = &[
+            $( Translated { name: $name, kind: Kind::$kind, run: $f::<&'static crate::wd_schema::WgpuArchivedFacts> } ),+
         ];
         /// The same queries against the device-wrapped archive.
         #[cfg(feature = "gpu")]
