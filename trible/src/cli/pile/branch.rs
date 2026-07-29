@@ -266,9 +266,7 @@ pub fn run(cmd: Command) -> Result<()> {
                         if let Some(mh) = meta_handle {
                             if reader.metadata(mh)?.is_some() {
                                 if let Ok(meta_set) = reader.get::<TribleSet, _>(mh) {
-                                    if let Ok(Some(n)) = load_branch_name(&reader, &meta_set) {
-                                        name = n;
-                                    }
+                                    name = load_branch_name(&reader, &meta_set).tag();
                                     if let Some(h) = extract_repo_head(&meta_set) {
                                         head_str = format!("blake3:{}", hex::encode(h.raw));
                                     }
@@ -437,8 +435,17 @@ pub fn run(cmd: Command) -> Result<()> {
                                     head_val = Some(h);
                                 }
                             }
-                            let name_val = load_branch_name(&reader, &meta)?;
-                            (name_val, head_val, None)
+                            // An indeterminate name is reported as a note
+                            // rather than dropped: `Unnamed` is legitimate
+                            // and stays quiet, but ambiguous or unreadable
+                            // metadata is a finding this listing exists to
+                            // surface.
+                            let resolved = load_branch_name(&reader, &meta);
+                            let note = match &resolved {
+                                BranchName::Named(_) | BranchName::Unnamed => None,
+                                other => Some(other.reason()),
+                            };
+                            (resolved.named().map(str::to_string), head_val, note)
                         }
                         Err(e) => (None, None, Some(format!("decode failed: {e:?}"))),
                     }
@@ -591,7 +598,7 @@ pub fn run(cmd: Command) -> Result<()> {
                         meta_state = if present { "present" } else { "missing" };
                         if present {
                             if let Ok(meta_set) = reader.get::<TribleSet, _>(mh) {
-                                name = load_branch_name(&reader, &meta_set).ok().flatten();
+                                name = Some(load_branch_name(&reader, &meta_set).tag());
                                 if let Some(h) = extract_repo_head(&meta_set) {
                                     head_str = format!("blake3:{}", hex::encode(h.raw));
                                     head_state = if reader.metadata(h)?.is_some() {
@@ -1019,6 +1026,12 @@ pub fn run(cmd: Command) -> Result<()> {
                         Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>,
                     > = BTreeMap::new();
 
+                    // Branches whose name could not be established. They are
+                    // NOT given a synthetic group key: consolidate merges
+                    // branches that provably share a name, and must never
+                    // merge branches that merely share a failure.
+                    let mut ungroupable: Vec<(Id, String)> = Vec::new();
+
                     for (bid, state) in &states {
                         let meta_handle = match state.kind {
                             RecordKind::Set => state.meta,
@@ -1026,42 +1039,38 @@ pub fn run(cmd: Command) -> Result<()> {
                         };
 
                         let Some(mh) = meta_handle else {
-                            groups
-                                .entry("<unnamed>".to_string())
-                                .or_default()
-                                .push((*bid, None));
+                            ungroupable.push((*bid, "no metadata handle on record".to_string()));
                             continue;
                         };
 
                         if reader.metadata(mh)?.is_none() {
-                            eprintln!("warning: metadata blob missing for branch {bid:X}");
-                            groups
-                                .entry("<unnamed>".to_string())
-                                .or_default()
-                                .push((*bid, None));
+                            ungroupable.push((*bid, "metadata blob missing".to_string()));
                             continue;
                         }
 
                         let meta_set = match reader.get::<TribleSet, SimpleArchive>(mh) {
                             Ok(ms) => ms,
-                            Err(_) => {
-                                eprintln!("warning: failed to read metadata for branch {bid:X}");
-                                groups
-                                    .entry("<unnamed>".to_string())
-                                    .or_default()
-                                    .push((*bid, None));
+                            Err(err) => {
+                                ungroupable
+                                    .push((*bid, format!("metadata unreadable: {err:?}")));
                                 continue;
                             }
                         };
 
-                        let name = load_branch_name(&reader, &meta_set)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| "<unnamed>".to_string());
+                        let resolved = load_branch_name(&reader, &meta_set);
+                        let Some(name) = resolved.named() else {
+                            ungroupable.push((*bid, resolved.reason()));
+                            continue;
+                        };
 
                         let head = extract_repo_head(&meta_set);
-                        groups.entry(name).or_default().push((*bid, head));
+                        groups
+                            .entry(name.to_string())
+                            .or_default()
+                            .push((*bid, head));
                     }
+
+                    report_ungroupable(&ungroupable);
 
                     // --- Phase 3: Subsumption + merge per name group ---
                     let statuses: HashMap<Id, &str> = states
@@ -1124,40 +1133,41 @@ pub fn run(cmd: Command) -> Result<()> {
 
                     println!("found {} active branch(es)", branch_ids.len());
 
+                    let mut ungroupable: Vec<(Id, String)> = Vec::new();
+
                     for bid in &branch_ids {
                         let Some(mh) = repo.storage_mut().head(*bid)? else {
                             continue;
                         };
 
                         if reader.metadata(mh)?.is_none() {
-                            eprintln!("warning: metadata blob missing for branch {bid:X}");
-                            groups
-                                .entry("<unnamed>".to_string())
-                                .or_default()
-                                .push((*bid, None));
+                            ungroupable.push((*bid, "metadata blob missing".to_string()));
                             continue;
                         }
 
                         let meta_set = match reader.get::<TribleSet, SimpleArchive>(mh) {
                             Ok(ms) => ms,
-                            Err(_) => {
-                                eprintln!("warning: failed to read metadata for branch {bid:X}");
-                                groups
-                                    .entry("<unnamed>".to_string())
-                                    .or_default()
-                                    .push((*bid, None));
+                            Err(err) => {
+                                ungroupable
+                                    .push((*bid, format!("metadata unreadable: {err:?}")));
                                 continue;
                             }
                         };
 
-                        let name = load_branch_name(&reader, &meta_set)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| "<unnamed>".to_string());
+                        let resolved = load_branch_name(&reader, &meta_set);
+                        let Some(name) = resolved.named() else {
+                            ungroupable.push((*bid, resolved.reason()));
+                            continue;
+                        };
 
                         let head = extract_repo_head(&meta_set);
-                        groups.entry(name).or_default().push((*bid, head));
+                        groups
+                            .entry(name.to_string())
+                            .or_default()
+                            .push((*bid, head));
                     }
+
+                    report_ungroupable(&ungroupable);
 
                     let statuses: HashMap<Id, &str> =
                         branch_ids.iter().map(|bid| (*bid, "active")).collect();
@@ -2247,26 +2257,125 @@ fn is_ancestor_of(
     Ok(false)
 }
 
-fn load_branch_name(reader: &impl BlobStoreGet, meta: &TribleSet) -> Result<Option<String>> {
-    let name_attr = triblespace_core::metadata::name.id();
-    let mut handle_opt: Option<BranchNameHandle> = None;
-    for t in meta.iter() {
-        if t.a() == &name_attr {
-            let h: BranchNameHandle = *t.v();
-            if handle_opt.replace(h).is_some() {
-                return Ok(None);
-            }
+/// What a branch's name resolution actually established.
+///
+/// # Why this is not `Option<String>`
+///
+/// There are four distinguishable outcomes and `Result<Option<String>>` had
+/// room for two, so `Ok(None)` meant BOTH "this branch has no name" (a
+/// legitimate state) and "this branch's metadata carries two names" (the
+/// metadata is malformed). Callers then wrote
+/// `.ok().flatten().unwrap_or_else(|| "<unnamed>".to_string())`, folding the
+/// blob read error in as a third — and used the resulting fabricated string
+/// as a **group key for `consolidate`**. Six distinct conditions (no metadata
+/// handle, metadata blob missing, metadata unreadable, name absent, name
+/// ambiguous, name blob unreadable) all became the single key `"<unnamed>"`,
+/// which `consolidate_groups` then merged into ONE branch. Unrelated
+/// lineages whose only shared property was a *failure* were welded together,
+/// silently for the last three.
+///
+/// A name is a merge key, so "I could not determine it" must not be
+/// expressible as one. Only [`BranchName::Named`] can be grouped; every other
+/// variant carries the reason and is reported, never merged.
+#[derive(Debug, Clone)]
+enum BranchName {
+    /// Exactly one `metadata::name`, and its blob resolved.
+    Named(String),
+    /// No `metadata::name` trible at all. Legitimate — anonymous pins exist.
+    Unnamed,
+    /// More than one `metadata::name`. The metadata is malformed; picking
+    /// either name would invent a fact.
+    Ambiguous { count: usize },
+    /// Exactly one name trible, but its blob could not be read (missing,
+    /// corrupt, or GC'd). The branch HAS a name; this pile cannot see it.
+    Unreadable(String),
+}
+
+impl BranchName {
+    /// The name, if one was actually established. `None` for every
+    /// indeterminate variant — deliberately no fallback string.
+    fn named(&self) -> Option<&str> {
+        match self {
+            BranchName::Named(n) => Some(n),
+            _ => None,
         }
     }
 
+    /// Column-width-friendly rendering for listing tables. Indeterminate
+    /// variants render as an angle-bracketed tag rather than blanking to
+    /// `-`, so a damaged branch is visibly damaged in `pile branch list`
+    /// instead of looking merely anonymous.
+    fn tag(&self) -> String {
+        match self {
+            BranchName::Named(n) => n.clone(),
+            BranchName::Unnamed => "-".to_string(),
+            BranchName::Ambiguous { count } => format!("<ambiguous:{count}>"),
+            BranchName::Unreadable(_) => "<name-unreadable>".to_string(),
+        }
+    }
+
+    /// Operator-facing reason a branch could not be grouped.
+    fn reason(&self) -> String {
+        match self {
+            BranchName::Named(n) => format!("named {n:?}"),
+            BranchName::Unnamed => "no metadata::name trible".to_string(),
+            BranchName::Ambiguous { count } => {
+                format!("{count} metadata::name tribles — metadata is malformed")
+            }
+            BranchName::Unreadable(err) => format!("name blob unreadable: {err}"),
+        }
+    }
+}
+
+/// Report branches consolidation is leaving alone, and why.
+///
+/// Printed rather than silently skipped: these are exactly the branches the
+/// old code merged into a fabricated `"<unnamed>"` lineage, so an operator
+/// who relied on that behaviour needs to see that they still exist and still
+/// need attention (`pile reid`, or repairing the metadata).
+fn report_ungroupable(ungroupable: &[(Id, String)]) {
+    if ungroupable.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: {} branch(es) have no determinable name and were NOT consolidated:",
+        ungroupable.len()
+    );
+    for (bid, reason) in ungroupable {
+        eprintln!("  {bid:X}  {reason}");
+    }
+    eprintln!(
+        "  (a name is a merge key; branches sharing only a failure are not the same branch)"
+    );
+}
+
+/// Resolve a branch's name from its metadata, distinguishing every outcome.
+///
+/// Infallible by signature: an unreadable name blob is a *classification*,
+/// not an error to be swallowed by a caller's `.ok()`.
+fn load_branch_name(reader: &impl BlobStoreGet, meta: &TribleSet) -> BranchName {
+    let name_attr = triblespace_core::metadata::name.id();
+    let mut handle_opt: Option<BranchNameHandle> = None;
+    let mut count = 0usize;
+    for t in meta.iter() {
+        if t.a() == &name_attr {
+            count += 1;
+            handle_opt = Some(*t.v());
+        }
+    }
+
+    if count > 1 {
+        return BranchName::Ambiguous { count };
+    }
+
     let Some(handle) = handle_opt else {
-        return Ok(None);
+        return BranchName::Unnamed;
     };
 
-    let view: View<str> = reader
-        .get(handle)
-        .map_err(|err| anyhow::anyhow!("read branch name blob: {err:?}"))?;
-    Ok(Some(view.as_ref().to_string()))
+    match reader.get::<View<str>, _>(handle) {
+        Ok(view) => BranchName::Named(view.as_ref().to_string()),
+        Err(err) => BranchName::Unreadable(format!("{err:?}")),
+    }
 }
 
 #[cfg(test)]
@@ -2274,6 +2383,92 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// The regression this file exists to prevent.
+    ///
+    /// `consolidate --by-name` groups branches by name and merges each group
+    /// into one branch. Name resolution used to return `Result<Option<String>>`
+    /// and callers wrote `.ok().flatten().unwrap_or_else(|| "<unnamed>")`,
+    /// which mapped THREE different conditions — no name, two names, name
+    /// blob unreadable — onto one string that was then used as the merge key.
+    /// Branches sharing only a failure got welded into a single lineage.
+    ///
+    /// So the property under test is not "names parse" but: **every
+    /// indeterminate outcome is distinguishable, and none of them yields a
+    /// groupable name.**
+    #[test]
+    fn indeterminate_branch_names_are_distinguishable_and_never_groupable() {
+        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::trible::Trible;
+
+        let name_attr = triblespace_core::metadata::name.id();
+        let e = triblespace_core::id::fucid();
+
+        let mut store = MemoryBlobStore::new();
+        let h_a: BranchNameHandle = store
+            .put::<LongString, _>("main".to_owned().to_blob())
+            .expect("put a");
+        let h_b: BranchNameHandle = store
+            .put::<LongString, _>("other".to_owned().to_blob())
+            .expect("put b");
+        // A handle whose blob is deliberately NOT in the store, standing in
+        // for a name blob that was GC'd or lost to truncation.
+        let h_missing: BranchNameHandle =
+            IntoBlob::<LongString>::to_blob("vanished".to_owned()).get_handle();
+        let reader = store.reader().expect("reader");
+
+        // Exactly one name, resolvable.
+        let mut named = TribleSet::new();
+        named.insert(&Trible::new(&e, &name_attr, &h_a));
+        let r = load_branch_name(&reader, &named);
+        assert_eq!(r.named(), Some("main"), "one resolvable name must resolve");
+
+        // No name trible at all — legitimate, and NOT groupable.
+        let r = load_branch_name(&reader, &TribleSet::new());
+        assert!(matches!(r, BranchName::Unnamed));
+        assert_eq!(r.named(), None, "an unnamed branch must not be groupable");
+
+        // Two names — malformed metadata. Must not silently pick one.
+        let mut ambiguous = TribleSet::new();
+        ambiguous.insert(&Trible::new(&e, &name_attr, &h_a));
+        ambiguous.insert(&Trible::new(&e, &name_attr, &h_b));
+        let r = load_branch_name(&reader, &ambiguous);
+        assert!(
+            matches!(r, BranchName::Ambiguous { count: 2 }),
+            "two name tribles must classify as Ambiguous, got {r:?}"
+        );
+        assert_eq!(
+            r.named(),
+            None,
+            "an ambiguous branch must not be groupable — this is the merge \
+             key that welded unrelated lineages together"
+        );
+
+        // One name, blob unreadable. The branch HAS a name; we cannot see it.
+        let mut unreadable = TribleSet::new();
+        unreadable.insert(&Trible::new(&e, &name_attr, &h_missing));
+        let r = load_branch_name(&reader, &unreadable);
+        assert!(
+            matches!(r, BranchName::Unreadable(_)),
+            "a missing name blob must classify as Unreadable, got {r:?}"
+        );
+        assert_eq!(r.named(), None, "an unreadable name must not be groupable");
+
+        // And the three indeterminate outcomes must be mutually
+        // distinguishable — collapsing any two of them is what caused the
+        // bug, so equal renderings would let it come back.
+        let tags = [
+            load_branch_name(&reader, &TribleSet::new()).tag(),
+            load_branch_name(&reader, &ambiguous).tag(),
+            load_branch_name(&reader, &unreadable).tag(),
+        ];
+        let unique: std::collections::HashSet<&String> = tags.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "indeterminate outcomes must render distinguishably, got {tags:?}"
+        );
+    }
 
     #[test]
     fn parse_signing_key_hex_and_file() {
