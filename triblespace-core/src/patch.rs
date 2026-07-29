@@ -543,42 +543,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
-    /// Constructs a `LocalLeaf` Head pointing directly at a `[u8; KEY_LEN]`
-    /// trible inside an archive's mmap'd buffer. The pointer's address must
-    /// be 16-byte aligned (so the low 4 bits are free for the `HeadTag`);
-    /// for `SimpleArchive` buffers this holds whenever the base allocation
-    /// is 16-byte aligned and tribles are 64 bytes wide (every offset is a
-    /// multiple of 16).
-    ///
-    /// # Safety
-    /// - `trible_ptr` must remain valid for at least as long as this Head
-    ///   exists, which is the caller's responsibility to arrange — typically
-    ///   by holding an `Arc<dyn ArchiveOwner>` in the nearest ancestor
-    ///   `Branch`'s `owner` slot.
-    /// - The pointer must be 16-byte aligned; this is debug-asserted.
-    pub(crate) unsafe fn new_local_leaf(key: u8, trible_ptr: NonNull<[u8; KEY_LEN]>) -> Self {
-        unsafe {
-            let tptr = std::ptr::NonNull::new_unchecked((trible_ptr.as_ptr() as *mut u8).map_addr(
-                |addr| {
-                    debug_assert_eq!(
-                        addr as u64 & Self::TAG_MASK,
-                        0,
-                        "LocalLeaf trible pointer must be 16-byte aligned"
-                    );
-                    ((addr as u64 & Self::BODY_MASK)
-                        | ((key as u64) << 56)
-                        | (HeadTag::LocalLeaf as u64)) as usize
-                },
-            ));
-            Self {
-                tptr,
-                key_ordering: PhantomData,
-                key_segments: PhantomData,
-                value: PhantomData,
-            }
-        }
-    }
-
     #[inline]
     pub(crate) fn tag(&self) -> HeadTag {
         HeadTag::from_raw((self.tptr.as_ptr() as u64 & Self::TAG_MASK) as u8)
@@ -861,6 +825,43 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 // machinery requires the value type to be zero-sized so reification
 // (constructing a heap Leaf with `()` as the value) is well-defined.
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
+    /// Constructs a `LocalLeaf` Head pointing directly at a `[u8; KEY_LEN]`
+    /// trible inside an archive's mmap'd buffer. Restricting construction to
+    /// `V = ()` makes the value-type invariant available to generic readers
+    /// and union code that encounter the `LocalLeaf` tag.
+    ///
+    /// The pointer's address must be 16-byte aligned (so the low 4 bits are
+    /// free for the `HeadTag`); for `SimpleArchive` buffers this holds whenever
+    /// the base allocation is 16-byte aligned and tribles are 64 bytes wide.
+    ///
+    /// # Safety
+    /// - `trible_ptr` must remain valid for at least as long as this Head
+    ///   exists, which the caller normally arranges by retaining an
+    ///   `Arc<dyn ArchiveOwner>` in the nearest ancestor `Branch`.
+    /// - The pointer must be 16-byte aligned; this is debug-asserted.
+    pub(crate) unsafe fn new_local_leaf(key: u8, trible_ptr: NonNull<[u8; KEY_LEN]>) -> Self {
+        unsafe {
+            let tptr = std::ptr::NonNull::new_unchecked((trible_ptr.as_ptr() as *mut u8).map_addr(
+                |addr| {
+                    debug_assert_eq!(
+                        addr as u64 & Self::TAG_MASK,
+                        0,
+                        "LocalLeaf trible pointer must be 16-byte aligned"
+                    );
+                    ((addr as u64 & Self::BODY_MASK)
+                        | ((key as u64) << 56)
+                        | (HeadTag::LocalLeaf as u64)) as usize
+                },
+            ));
+            Self {
+                tptr,
+                key_ordering: PhantomData,
+                key_segments: PhantomData,
+                value: PhantomData,
+            }
+        }
+    }
+
     /// Inserts a new leaf into a PATCH while keeping owner-aware
     /// invariants intact. `this` is guaranteed by the call protocol
     /// to be a heap `Leaf` or a `Branch` — never a `LocalLeaf`,
@@ -989,6 +990,128 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
 // union, intersect, query operations, etc.) which don't care about V
 // shape and so remain in the V-generic impl block.
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
+    /// Reify a LocalLeaf encountered by the generic union machinery.
+    ///
+    /// LocalLeaf construction is only exposed on `PATCH<_, _, ()>`, so seeing
+    /// that tag proves that `V` is `()`. Keeping this helper in the generic
+    /// implementation lets the ordinary union path reconcile archive owners
+    /// without imposing a `V: Default` bound on every PATCH union.
+    fn reify_local_leaf_for_union(head: Self) -> Self {
+        match head.body_ref() {
+            BodyRef::Leaf(_) | BodyRef::Branch(_) => head,
+            BodyRef::LocalLeaf(bytes) => {
+                assert_eq!(
+                    std::mem::size_of::<V>(),
+                    0,
+                    "LocalLeaf is only valid for zero-sized PATCH values",
+                );
+                assert_eq!(
+                    std::mem::size_of::<Leaf<KEY_LEN, V>>(),
+                    std::mem::size_of::<Leaf<KEY_LEN, ()>>(),
+                    "LocalLeaf reification requires the unit-value Leaf layout",
+                );
+                assert_eq!(
+                    std::mem::align_of::<Leaf<KEY_LEN, V>>(),
+                    std::mem::align_of::<Leaf<KEY_LEN, ()>>(),
+                    "LocalLeaf reification requires the unit-value Leaf alignment",
+                );
+
+                let key_byte = head.key();
+                let key_copy = *bytes;
+                drop(head);
+
+                // SAFETY: LocalLeaf construction is defined only on
+                // `Head<_, _, ()>`, and cloning preserves the existing Head
+                // type. Therefore observing this tag proves `V = ()`. The
+                // layout assertions catch accidental erosion of that internal
+                // invariant near this cast.
+                let unit_leaf = unsafe { Leaf::<KEY_LEN, ()>::new(&key_copy, ()) };
+                let leaf = unit_leaf.cast::<Leaf<KEY_LEN, V>>();
+                Head::new(key_byte, leaf)
+            }
+        }
+    }
+
+    /// Union two children that have been detached from their parent Branches.
+    ///
+    /// A LocalLeaf does not carry its own Arc: `this_owner` / `other_owner`
+    /// name the parent Branch owners that keep its bytes alive. When a
+    /// divergence creates a new Branch, that owner must move with the local
+    /// child. Conflicting local owners are resolved by reifying the right-hand
+    /// leaf, matching archive insertion's existing policy.
+    fn union_detached_children(
+        mut this: Self,
+        this_owner: Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        mut other: Self,
+        mut other_owner: Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        at_depth: usize,
+    ) -> Self {
+        let this_is_local = this.tag() == HeadTag::LocalLeaf;
+        let mut other_is_local = other.tag() == HeadTag::LocalLeaf;
+
+        debug_assert_eq!(
+            this_is_local,
+            this_owner.is_some(),
+            "a detached LocalLeaf must carry its parent Branch owner",
+        );
+        debug_assert_eq!(
+            other_is_local,
+            other_owner.is_some(),
+            "a detached LocalLeaf must carry its parent Branch owner",
+        );
+
+        if this.hash() == other.hash() {
+            return this;
+        }
+
+        if this_is_local && other_is_local {
+            let same_owner = std::sync::Arc::ptr_eq(
+                this_owner
+                    .as_ref()
+                    .expect("LocalLeaf must have a parent owner"),
+                other_owner
+                    .as_ref()
+                    .expect("LocalLeaf must have a parent owner"),
+            );
+            if !same_owner {
+                other = Self::reify_local_leaf_for_union(other);
+                other_owner = None;
+                other_is_local = false;
+            }
+        }
+
+        if let Some((depth, this_byte_key, other_byte_key)) =
+            this.first_divergence(&other, at_depth)
+        {
+            let old_key = this.key();
+            let owner = if this_is_local {
+                this_owner
+            } else if other_is_local {
+                other_owner
+            } else {
+                None
+            };
+            let new_body = Branch::new_with_owner(
+                depth,
+                this.with_key(this_byte_key),
+                other.with_key(other_byte_key),
+                owner,
+            );
+            return Head::new(old_key, new_body);
+        }
+
+        // The only no-divergence LocalLeaf shape left is leaf-vs-Branch.
+        // Reify that single leaf before handing control back to the generic
+        // recursive union. Branch children retain their own direct owners.
+        if this_is_local {
+            this = Self::reify_local_leaf_for_union(this);
+        }
+        if other_is_local {
+            other = Self::reify_local_leaf_for_union(other);
+        }
+        Self::union(this, other, at_depth)
+    }
+
     pub(crate) fn replace_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Self {
         if let Some((depth, this_byte_key, leaf_byte_key)) =
             this.first_divergence(&leaf, start_depth)
@@ -1045,10 +1168,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let other_depth = other.end_depth();
         if this_depth < other_depth {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+            let branch_owner = ed.owner.clone();
             let inserted = other.with_start(ed.end_depth as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
+                Some(old) => {
+                    let old_owner = if old.tag() == HeadTag::LocalLeaf {
+                        branch_owner.clone()
+                    } else {
+                        None
+                    };
+                    Some(Head::union_detached_children(
+                        old, old_owner, inserted, None, this_depth,
+                    ))
+                }
                 None => Some(inserted),
             });
             drop(ed);
@@ -1059,10 +1192,24 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let this_head = this;
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
+            let branch_owner = ed.owner.clone();
             let inserted = this_head.with_start(ed.end_depth as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, other_depth)),
+                Some(old) => {
+                    let old_owner = if old.tag() == HeadTag::LocalLeaf {
+                        branch_owner.clone()
+                    } else {
+                        None
+                    };
+                    Some(Head::union_detached_children(
+                        old,
+                        old_owner,
+                        inserted,
+                        None,
+                        other_depth,
+                    ))
+                }
                 None => Some(inserted),
             });
             drop(ed);
@@ -1070,7 +1217,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
 
         // Equal depth, hashes differ → walk `other`'s children,
-        // resolving collisions via recursive `Head::union` and the
+        // resolving collisions with their direct-owner context and
         // `modify_child`'s per-call accounting.
         //
         // Union is commutative; mutating either side in place is
@@ -1086,16 +1233,52 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
         };
+        let other_owner = other_branch_ref.owner.clone();
         let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+
+        if ed.owner.is_none() {
+            ed.owner = other_owner.clone();
+        }
+        let target_owner = ed.owner.clone();
+
         for other_child in other_branch_ref
             .child_table
             .iter_mut()
             .filter_map(Option::take)
         {
-            let inserted = other_child.with_start(ed.end_depth as usize);
+            let mut inserted = other_child.with_start(ed.end_depth as usize);
+            let inserted_owner = if inserted.tag() == HeadTag::LocalLeaf {
+                let source_owner = other_owner
+                    .as_ref()
+                    .expect("a direct LocalLeaf must have a Branch owner");
+                let target_matches = target_owner
+                    .as_ref()
+                    .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, source_owner));
+                if target_matches {
+                    target_owner.clone()
+                } else {
+                    inserted = Self::reify_local_leaf_for_union(inserted);
+                    None
+                }
+            } else {
+                None
+            };
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
+                Some(old) => {
+                    let old_owner = if old.tag() == HeadTag::LocalLeaf {
+                        target_owner.clone()
+                    } else {
+                        None
+                    };
+                    Some(Head::union_detached_children(
+                        old,
+                        old_owner,
+                        inserted,
+                        inserted_owner,
+                        this_depth,
+                    ))
+                }
                 None => Some(inserted),
             });
         }
@@ -1156,6 +1339,25 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let other_depth = other.end_depth();
         if this_depth != other_depth {
             // Asymmetric — no fan-out opportunity, serial path wins.
+            return Self::union(this, other, at_depth);
+        }
+
+        // A Branch owner protects its direct LocalLeaf children. The parallel
+        // scatter path deliberately erases parent context while resolving
+        // child pairs, so branches that actually contain direct LocalLeaves
+        // must use the owner-aware serial path. An owner retained above only
+        // self-contained owned descendants is harmless; those descendants
+        // make the same decision recursively if their pairs collide.
+        let has_direct_archive_leaf = matches!(
+            (this.body_ref(), other.body_ref()),
+            (BodyRef::Branch(a), BodyRef::Branch(b))
+                if a.child_table
+                    .iter()
+                    .chain(b.child_table.iter())
+                    .filter_map(Option::as_ref)
+                    .any(|child| child.tag() == HeadTag::LocalLeaf)
+        );
+        if has_direct_archive_leaf {
             return Self::union(this, other, at_depth);
         }
 
@@ -1666,11 +1868,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 // ingestion path (step 3), which constrains the PATCH to
                 // `V = ()`. The `Option<&V>` here therefore points at a
                 // zero-sized value; a static `()` provides the address.
-                // For non-`()` V this branch is unreachable today, and
-                // construction will refuse such PATCHes once step 3 lands.
-                // The type-system invariant will eventually be enforced
-                // via a `LocalLeafSupported: V` trait constraint at
-                // `Head::new_local_leaf` callers.
+                // For non-`()` V this branch is unreachable because
+                // `Head::new_local_leaf` is defined only for `V = ()`.
                 static UNIT: () = ();
                 let unit_ref: &V = unsafe {
                     debug_assert_eq!(std::mem::size_of::<V>(), 0, "LocalLeaf requires V = ()");
@@ -2002,12 +2201,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Clone for Head<KEY_LEN, O, 
         unsafe {
             match self.body() {
                 BodyPtr::Leaf(leaf) => Self::new(self.key(), Leaf::rc_inc(leaf)),
-                BodyPtr::LocalLeaf(ptr) => {
+                BodyPtr::LocalLeaf(_) => {
                     // LocalLeaf has no refcount — its lifetime is managed by
                     // the nearest ancestor Branch's `owner`. Cloning the Head
                     // just copies the tagged pointer; both Heads will read
                     // the same archive bytes.
-                    Self::new_local_leaf(self.key(), ptr)
+                    Self {
+                        tptr: self.tptr,
+                        key_ordering: PhantomData,
+                        key_segments: PhantomData,
+                        value: PhantomData,
+                    }
                 }
                 BodyPtr::Branch(branch) => Self::new(self.key(), Branch::rc_inc(branch)),
             }
@@ -3013,12 +3217,94 @@ impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::encodings::simplearchive::SimpleArchive;
+    use crate::blob::{Blob, TryFromBlob};
+    use crate::inline::Encodes;
+    use crate::trible::{Trible, TribleSet};
     use itertools::Itertools;
     use proptest::prelude::*;
     use std::collections::HashSet;
     use std::convert::TryInto;
     use std::iter::FromIterator;
     use std::mem;
+
+    fn unowned_direct_local_leaves<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>(
+        head: &Head<KEY_LEN, O, V>,
+    ) -> usize {
+        if matches!(head.tag(), HeadTag::Leaf | HeadTag::LocalLeaf) {
+            return 0;
+        }
+        let BodyRef::Branch(branch) = head.body_ref() else {
+            unreachable!();
+        };
+        let direct = if branch.owner.is_none() {
+            branch
+                .child_table
+                .iter()
+                .filter_map(Option::as_ref)
+                .filter(|child| child.tag() == HeadTag::LocalLeaf)
+                .count()
+        } else {
+            0
+        };
+        direct
+            + branch
+                .child_table
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(unowned_direct_local_leaves)
+                .sum::<usize>()
+    }
+
+    fn patch_unowned_direct_local_leaves<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>(
+        patch: &PATCH<KEY_LEN, O, V>,
+    ) -> usize {
+        patch
+            .root
+            .as_ref()
+            .map(unowned_direct_local_leaves)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn union_reconciles_independent_archive_owners() {
+        fn decoded_archive(owner: u8) -> TribleSet {
+            let mut source = TribleSet::new();
+            for attribute in [1u8, 2] {
+                let mut data = [0u8; 64];
+                data[0] = 1;
+                data[15] = owner;
+                data[16] = attribute;
+                data[32] = 1;
+                data[47] = owner;
+                data[63] = attribute;
+                source.insert(&Trible::force_raw(data).unwrap());
+            }
+            let blob: Blob<SimpleArchive> = SimpleArchive::encode(&source);
+            drop(source);
+            TribleSet::try_from_blob(blob).unwrap()
+        }
+
+        // Two entries are enough for each decoder to retain its own archive
+        // allocation behind LocalLeaves. Keeping the attribute bytes equal
+        // makes AEV/AVE union below the attribute prefix, where detached
+        // children need their parent Branch's owner context.
+        let left = decoded_archive(1);
+        let right = decoded_archive(2);
+        assert!(left.aev.node_stats().3 > 0);
+        assert!(right.aev.node_stats().3 > 0);
+
+        let unioned = left + right;
+        assert_eq!(unioned.len(), 4);
+        assert_eq!(unioned.eav.iter_ordered().count(), 4);
+
+        assert_eq!(patch_unowned_direct_local_leaves(&unioned.eav), 0);
+        assert_eq!(patch_unowned_direct_local_leaves(&unioned.eva), 0);
+        assert_eq!(patch_unowned_direct_local_leaves(&unioned.aev), 0);
+        assert_eq!(patch_unowned_direct_local_leaves(&unioned.ave), 0);
+        assert_eq!(patch_unowned_direct_local_leaves(&unioned.vea), 0);
+        assert_eq!(patch_unowned_direct_local_leaves(&unioned.vae), 0);
+    }
 
     #[test]
     fn head_tag() {

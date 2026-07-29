@@ -440,6 +440,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PATCH union preserves independently owned archive leaves.** Serial branch
+  merges now carry each detached `LocalLeaf`'s parent owner into divergence
+  branches, adopt matching source owners, and reify only the incoming leaf
+  when two direct-owner domains conflict. Branches with direct archive leaves
+  avoid the context-free parallel scatter path, preventing dangling archive
+  pointers and the resulting stale aggregate hashes.
+
 - **Typed `UnionArchive` proposals no longer re-scan every attached shard for
   every emitted value.** Bounded shard paging and dense complete drains share
   the same already-located Succinct Ring walk. Sparse continuations keep their

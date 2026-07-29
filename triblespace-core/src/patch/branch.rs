@@ -667,6 +667,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let mut match_found = false;
 
         for child in self.child_table.iter().flatten() {
+            debug_assert!(
+                child.tag() != HeadTag::LocalLeaf || self.owner.is_some(),
+                "a Branch with a direct LocalLeaf child must retain its archive owner",
+            );
             agg_leaf_count = agg_leaf_count.saturating_add(child.count());
             agg_segment_count = agg_segment_count.saturating_add(child.count_segment(end_depth));
             agg_hash ^= child.hash();

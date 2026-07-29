@@ -53,9 +53,9 @@ static A: CountingAllocator = CountingAllocator;
 /// the `union` work in the wee hours of 2026-06-03.
 /// Regression: union two archive-backed TribleSets with overlapping
 /// keys *from different archive Arcs*. The merge path drives both
-/// the parallel `par_union` (above the 4096 threshold) and the
-/// serial fallback, and exercises every LocalLeaf-vs-LocalLeaf
-/// collision in the trie. The sources are dropped before any
+/// the six-index `TribleSet` fan-out and PATCH's owner-aware merge,
+/// exercising every LocalLeaf-vs-LocalLeaf collision in the trie. The
+/// sources are dropped before any
 /// reads so the result must keep all LocalLeaves' backing bytes
 /// alive transitively via the surviving Branches' owner Arcs.
 #[test]
@@ -64,8 +64,8 @@ fn union_two_overlapping_archives() {
     // process-global counting allocator and would race on its state
     // if run in parallel.
     let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
-    // Big enough to engage the parallel par_union path on each
-    // index (threshold is 4096 leaves).
+    // Big enough to engage TribleSet's six-index fan-out and many nested
+    // owner-reconciliation paths.
     const N: usize = 8_192;
 
     // Build two archive-backed TribleSets whose keys overlap heavily.
