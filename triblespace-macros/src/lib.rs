@@ -407,8 +407,9 @@ pub fn pattern_changes(input: TokenStream) -> TokenStream {
 /// `entity! { [id_expr] @ attr: value, attr?: option, attr*: repeated }`
 ///
 /// If the id is omitted, the macro derives a deterministic entity id from the
-/// attribute/value pairs. `attr?:` inserts a fact only when the option is
-/// `Some`, and `attr*:` spreads repeated values into multiple facts.
+/// canonical `NIL || attribute || value` fact rows. `attr?:` inserts a fact
+/// only when the option is `Some`, and `attr*:` spreads repeated values into
+/// multiple facts.
 ///
 /// ```rust,ignore
 /// let alice = fucid();

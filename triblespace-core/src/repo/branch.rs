@@ -43,7 +43,7 @@ fn now_updated_at() -> Inline<NsTAIInterval> {
 /// authenticity.
 ///
 /// The metadata entity id is derived intrinsically from the
-/// `(attribute, value)` pairs via `entity!`'s content-hash form — no
+/// canonical fact rows via `entity!`'s content-hash form — no
 /// open-coded derivation. Because every publish stamps a fresh
 /// `metadata::updated_at`, each publish produces a distinct entity id
 /// and a distinct metadata blob hash (which is what lets receivers order

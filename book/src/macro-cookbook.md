@@ -69,7 +69,12 @@ assert_eq!(facts.len(), 1);
 ```
 
 If you omit the entity id, `entity!` derives one deterministically from the
-attribute/value pairs.
+facts. It encodes each fact as a 64-byte `NIL || attribute || value` row,
+sorts and deduplicates the rows, hashes their complete contiguous byte
+sequence with BLAKE3, and uses the final 16 digest bytes as the entity id.
+It then fills that id into every row before constructing the `TribleSet`.
+Field order and duplicate repeated values therefore do not affect identity;
+an absent optional field contributes no row.
 
 ```rust
 # use triblespace::prelude::*;

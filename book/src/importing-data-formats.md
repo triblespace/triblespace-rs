@@ -52,8 +52,9 @@ fresh run (drop the per-field attribute caches and multi-value tracking).
 Attributes are derived through the entity-core mechanism —
 `Attribute::<S>::from(entity!{ metadata::name: <field handle>,
 metadata::value_encoding: <S as MetaDescribe>::id() })` — which hashes the
-sorted+deduped `(attr, value)` pairs to produce a stable attribute id from
-the JSON field name and its fixed `InlineEncoding`. The importer caches the
+sorted and deduplicated canonical `NIL || attribute || value` rows to produce
+a stable attribute id from the JSON field name and its fixed `InlineEncoding`.
+The importer caches the
 resulting `Attribute<S>` per field so the hash only has to be computed once
 per run. Arrays are treated as multi-valued fields: every item is
 encoded and stored under the same attribute identifier, producing one trible per
