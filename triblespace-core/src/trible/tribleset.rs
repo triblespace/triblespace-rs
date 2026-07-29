@@ -601,6 +601,7 @@ mod tests {
     #[test]
     fn intrinsic_entity_rows_are_canonical_hashed_and_indexed() {
         assert_eq!(std::mem::size_of::<IntrinsicEntityRow>(), TRIBLE_LEN);
+        assert_eq!(std::mem::align_of::<IntrinsicEntityRow>(), ID_LEN);
 
         let a = intrinsic_row([1; 16], [0x11; 32]);
         let b = intrinsic_row([2; 16], [0x22; 32]);

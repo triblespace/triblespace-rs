@@ -47,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking: intrinsic entities use canonical full rows.**
-  Content-derived `entity!` records now canonicalize
+  Content-derived `entity!` records now canonicalize 16-byte-aligned
   `NIL || attribute || value` rows, hash the complete contiguous row sequence,
   fill the derived entity column in place, and materialize ordinary shared
   PATCH leaves from the finished rows. This deliberately changes every
