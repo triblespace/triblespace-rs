@@ -1296,6 +1296,21 @@ where
 
         let mut matches = Vec::new();
 
+        // One reader for the whole scan. This used to be constructed inside
+        // the loop, costing a `refresh()` and a blobs-PATCH clone per branch
+        // to produce N equivalent readers.
+        let reader = self.storage.reader().map_err(LookupError::StorageReader)?;
+
+        // The name we are looking for hashes to exactly one handle, and
+        // handle equality IS content equality — so compare handles rather
+        // than fetching each branch's name blob and comparing strings. That
+        // removes the second blob read per branch: the scan is now one
+        // metadata read each, not a metadata read plus a name read.
+        //
+        // Exact by construction, with no length ceiling anywhere, which is
+        // why this needs no on-disk name field to be fast.
+        let target: Inline<Handle<LongString>> = name.to_owned().to_blob().get_handle();
+
         for branch_id in branch_ids {
             let Some(meta_handle) = self
                 .storage
@@ -1305,9 +1320,11 @@ where
                 continue;
             };
 
-            let reader = self.storage.reader().map_err(LookupError::StorageReader)?;
             let meta_set: TribleSet = reader.get(meta_handle).map_err(LookupError::StorageGet)?;
 
+            // `exactly_one` skips a branch carrying two `metadata::name`
+            // tribles: its name is not determinable, and guessing one would
+            // let an ambiguous branch answer to a name it may not have.
             let Ok((name_handle,)) = find!(
                 (n: Inline<Handle<LongString>>),
                 pattern!(&meta_set, [{ crate::metadata::name: ?n }])
@@ -1316,11 +1333,7 @@ where
                 continue;
             };
 
-            let Ok(branch_name): Result<anybytes::View<str>, _> = reader.get(name_handle) else {
-                continue;
-            };
-
-            if branch_name.as_ref() == name {
+            if name_handle == target {
                 matches.push(branch_id);
             }
         }
