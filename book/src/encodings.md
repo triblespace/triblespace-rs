@@ -136,7 +136,7 @@ let encoding_id = ShortString::id(); // derived via describe(&mut scratch).root(
 
 The crate also ships with these blob encodings:
 
-- `LongString` for arbitrarily long UTF‑8 strings.
+- `UTF8String` for arbitrarily long UTF‑8 strings.
 - `RawBytes` for opaque file-backed byte payloads.
 - `SimpleArchive` which stores a raw sequence of tribles.
 - `SuccinctArchiveBlob` which stores the [`SuccinctArchive` index
@@ -152,18 +152,18 @@ The crate also ships with these blob encodings:
 
 ```rust
 use triblespace::core::metadata::MetaDescribe;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob};
 
-let b: Blob<LongString> = "example".to_blob();
-let encoding_id = LongString::id(); // derived via describe(&mut scratch).root()
+let b: Blob<UTF8String> = "example".to_blob();
+let encoding_id = UTF8String::id(); // derived via describe(&mut scratch).root()
 ```
 
 Both value and blob encodings can emit optional discovery metadata. Calling
 `MetaDescribe::describe` returns a rooted `Fragment` (exporting the encoding id)
 whose facts tag the encoding entity with `metadata::KIND_INLINE_ENCODING` or
 `metadata::KIND_BLOB_ENCODING` and may attach a `metadata::name` and
-`metadata::description` (LongString handles). Persist the description blobs
+`metadata::description` (UTF8String handles). Persist the description blobs
 alongside the metadata tribles if you want the text to remain readable.
 
 ## Choosing the right encoding
@@ -187,7 +187,7 @@ What are you storing?
 │  ├─ Fits in 32 bytes (≤32 UTF-8 bytes)?
 │  │  └─ ShortString
 │  └─ Longer text?
-│     └─ Handle<LongString>  (blob)
+│     └─ Handle<UTF8String>  (blob)
 │
 ├─ A number?
 │  ├─ Integer
@@ -220,7 +220,7 @@ What are you storing?
 **Rules of thumb:**
 - If two values should be joinable (appear in the same query variable), they must
   share an encoding. Choose the most specific encoding that covers both uses.
-- Prefer `ShortString` over `LongString` when the text fits — inline values avoid
+- Prefer `ShortString` over `UTF8String` when the text fits — inline values avoid
   a blob lookup.
 - Use `GenId` for relationships between entities. Never store entity references as
   strings.

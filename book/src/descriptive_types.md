@@ -61,14 +61,14 @@ descriptive pattern.
 
 The Workspace is the primary object for interacting with a repository. It
 lets you open a branch, commit, push, checkout history, and — importantly —
-read blob handles (LongString) cheaply.
+read blob handles (UTF8String) cheaply.
 
 Pattern: open a workspace for the configured branch, checkout the HEAD
 ancestors to produce a TribleSet content snapshot for efficient read-only
 pattern matching, and use the same Workspace to lazily read blobs when you
 need them.
 
-This avoids duplicating memory and allows cheap zero-copy access to LongString
+This avoids duplicating memory and allows cheap zero-copy access to UTF8String
 blobs.
 
 #### Manager-owned repository and workspace DI
@@ -226,15 +226,15 @@ blessed schema. Resist the temptation to evolve it into a "real" model type —
 extend the `find!` pattern first and only mirror those changes here when an
 external interface forces your hand.
 
-### 4. Read LongString as &str (zero-copy)
+### 4. Read UTF8String as &str (zero-copy)
 
 Blob encoding types in tribles are intentionally zerocopy. Prefer the
 typed View API which returns a borrowed &str without copying when possible.
 
 ```rust,ignore
 let view = ws
-    .get::<View<str>, LongString>(handle)
-    .map_err(|e| ...)?; // `handle` is a Inline<Handle<LongString>>
+    .get::<View<str>, UTF8String>(handle)
+    .map_err(|e| ...)?; // `handle` is a Inline<Handle<UTF8String>>
 let s: &str = view.as_ref(); // zero-copy view tied to the workspace lifetime
 // If you need an owned String: let owned = view.to_string();
 ```
@@ -252,7 +252,7 @@ from storage (potentially a remote) in the first place.
 
 When persisting graphs that contain many repeated or immutable pieces
 (e.g. steps in a plan), prefer structural sharing:
-- Store canonical step entities (LongString blobs for their text).
+- Store canonical step entities (UTF8String blobs for their text).
 - Create a lightweight "link" entity per plan that references the step ids
   and metadata like order and status.
 
@@ -322,7 +322,7 @@ repo.push(&mut ws)?;
 - find!: the macro you use to discover entities matching a pattern (a
   descriptive type declaration).
 - entity!: construct an ad-hoc entity fragment (facts + exported id). Merge it into a TribleSet via `+=` or call `.into_facts()` when you explicitly need a plain TribleSet (dropping exports).
-- LongString: zero-copy blob encoding for potentially-large text.
+- UTF8String: zero-copy blob encoding for potentially-large text.
 
 ## Closing notes
 
@@ -357,7 +357,7 @@ When reviewing code that touches tribles, look for these items:
 
 - Does the code use find! to select only the fields it needs, rather than
   unfolding the entire graph?
-- Are blob reads kept lazy (only read LongString when necessary)?
+- Are blob reads kept lazy (only read UTF8String when necessary)?
 - Are push flows using the push/merge retry loop to avoid losing concurrent
   updates?
 - Is the code avoiding holding the repo's Mutex across awaits and long

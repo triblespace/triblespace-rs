@@ -2,7 +2,7 @@
 
 ## Built-in blob encodings
 
-- `LongString` — UTF-8 text stored as a blob.
+- `UTF8String` — UTF-8 text stored as a blob.
 - `RawBytes` — opaque file-backed byte payloads.
 - `SimpleArchive` — archived `TribleSet` blobs.
 - `SuccinctArchiveBlob` — compressed succinct archive index blobs.

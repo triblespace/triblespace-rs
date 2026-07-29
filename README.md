@@ -41,7 +41,7 @@ use triblespace::prelude::*;
 
 mod literature {
     use triblespace::prelude::*;
-    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::inlineencodings::{GenId, Handle, R256, ShortString};
 
     attributes! {
@@ -51,7 +51,7 @@ mod literature {
         "A74AA63539354CDA47F387A4C3A8D54C" as pub title: ShortString;
 
         /// A quote from a work.
-        "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<LongString>;
+        "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<UTF8String>;
 
         /// The author of a work.
         "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
@@ -66,7 +66,7 @@ mod literature {
         "FCCE870BECA333D059D5CD68C43B98F0" as pub page_count: R256;
 
         /// A throwaway prototype field; omit the id to derive it from the name and encoding.
-        pub prototype_note: Handle<LongString>;
+        pub prototype_note: Handle<UTF8String>;
     }
 }
 

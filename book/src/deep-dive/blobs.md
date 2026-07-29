@@ -42,7 +42,7 @@ use triblespace::prelude::*;
 use triblespace::examples::literature;
 use triblespace::repo;
 use inlineencodings::{Handle, Blake3};
-use blobencodings::{SimpleArchive, LongString};
+use blobencodings::{SimpleArchive, UTF8String};
 use rand::rngs::OsRng;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 
@@ -50,7 +50,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey};
 let mut memory_store: MemoryBlobStore = MemoryBlobStore::new();
 
 let book_author_id = fucid();
-let quote_a: Inline<Handle<LongString>> = memory_store
+let quote_a: Inline<Handle<UTF8String>> = memory_store
     .put("Deep in the human unconscious is a pervasive need for a logical universe that makes sense. But the real universe is always one step beyond logic.")
     .unwrap();
 let quote_b = memory_store
