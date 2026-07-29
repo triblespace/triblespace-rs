@@ -36,6 +36,7 @@ use fake::faker::lorem::en::Words;
 use fake::faker::name::raw::*;
 use fake::locales::*;
 use fake::Fake;
+use triblespace::core::trible::Fragment;
 
 type UNIVERSE = CachedUniverse<1_048_576, 1_048_576, CompressedUniverse>;
 
@@ -957,15 +958,14 @@ fn checkout_benchmark(c: &mut Criterion) {
     for &n_commits in &[10usize, 100, 1000] {
         let entities_per_commit = 100;
         let storage = MemoryRepo::default();
-        let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())
-            .expect("repo");
+        let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("bench", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull");
 
         let mut total_tribles: u64 = 0;
         for _ in 0..n_commits {
             let owner = IdOwner::new();
-            let mut commit_data = TribleSet::new();
+            let mut commit_data = Fragment::empty();
             for _ in 0..entities_per_commit {
                 let author = owner.defer_insert(fucid());
                 let book = owner.defer_insert(fucid());

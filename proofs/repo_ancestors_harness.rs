@@ -45,7 +45,7 @@ fn ancestors_respects_bounded_commit_dags() {
         return;
     }
 
-    let mut repo = Repository::new(storage, signing_key, TribleSet::new()).unwrap();
+    let mut repo = Repository::new(storage, signing_key);
     let branch_id = repo
         .create_branch("kani", commit_handles.last().copied())
         .expect("branch creation")

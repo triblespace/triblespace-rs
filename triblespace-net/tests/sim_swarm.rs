@@ -44,6 +44,7 @@ use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 use triblespace_net::tracking;
 use triblespace_net::transport::sim::{SimConfig, SimNet};
+use triblespace_core::trible::Fragment;
 
 fn vclock() -> Arc<VirtualClock> {
     static CLOCK: OnceLock<Arc<VirtualClock>> = OnceLock::new();
@@ -180,7 +181,7 @@ async fn world_body(vc: Arc<VirtualClock>, seed: u64, n_nodes: usize, n_ops: usi
             sender,
             receiver,
         );
-        let repo = Repository::new(peer, k.clone(), TribleSet::new()).expect("repo");
+        let repo = Repository::new(peer, k.clone());
         nodes.push(Node {
             id,
             repo,
@@ -272,7 +273,7 @@ async fn world_body(vc: Arc<VirtualClock>, seed: u64, n_nodes: usize, n_ops: usi
                 if let Ok(Some(branch_id)) = nd.repo.lookup_branch("main") {
                     if let Ok(mut ws) = nd.repo.pull(branch_id) {
                         let label = format!("commit {} from node {}", nd.commits_made, node);
-                        ws.commit(TribleSet::new(), &label);
+                        ws.commit(Fragment::empty(), &label);
                         if nd.repo.push(&mut ws).is_ok() {
                             nd.commits_made += 1;
                         }

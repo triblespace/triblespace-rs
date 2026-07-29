@@ -118,13 +118,13 @@ mod readme_example {
     fn readme_example() -> Result<(), Box<dyn std::error::Error>> {
         let storage = MemoryRepo::default();
         let mut repo =
-            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+            Repository::new(storage, SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("main", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
         let herbert = ufoid();
         let dune = ufoid();
-        let mut library = TribleSet::new();
+        let mut library = triblespace::core::trible::Fragment::empty();
 
         library += entity! { &herbert @
             literature::firstname: "Frank",

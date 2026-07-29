@@ -264,7 +264,7 @@ mod tests {
     ) -> (TribleSet, Vec<Inline<Handle<UTF8String>>>) {
         std::fs::File::create(path).unwrap();
         let pile: Pile = Pile::open(path).unwrap();
-        let mut repo_h = Repository::new(pile, test_key(), TribleSet::new()).unwrap();
+        let mut repo_h = Repository::new(pile, test_key());
         let branch_id = repo_h.create_branch(branch_name, None).unwrap();
         let mut ws = repo_h.pull(*branch_id).unwrap();
 
@@ -293,7 +293,7 @@ mod tests {
             }
             assert_eq!(set.len() as usize, tribles_per);
             expected += set.clone();
-            ws.commit(set, &format!("ingest step {ci}"));
+            ws.commit(Fragment::undescribed(set), &format!("ingest step {ci}"));
         }
 
         repo_h.push(&mut ws).unwrap();
@@ -344,7 +344,7 @@ mod tests {
         // Checkout equality (test-only materialization): dest content ==
         // source content, exactly, under the same branch id.
         let dst_pile: Pile = Pile::open(&dst).unwrap();
-        let mut dst_repo = Repository::new(dst_pile, test_key(), TribleSet::new()).unwrap();
+        let mut dst_repo = Repository::new(dst_pile, test_key());
         let mut dst_ws = dst_repo.pull(summary.branch_id).unwrap();
         let dst_facts = dst_ws.checkout(..).unwrap().into_facts();
         assert_eq!(dst_facts, expected);
@@ -378,7 +378,7 @@ mod tests {
 
         std::fs::File::create(&src).unwrap();
         let pile: Pile = Pile::open(&src).unwrap();
-        let mut repo_h = Repository::new(pile, test_key(), TribleSet::new()).unwrap();
+        let mut repo_h = Repository::new(pile, test_key());
         repo_h.create_branch("bare", None).unwrap();
         repo_h.close().unwrap();
 

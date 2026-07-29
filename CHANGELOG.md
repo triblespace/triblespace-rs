@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: data now describes itself, and commits record that
+  description automatically.** `Fragment` gains a `metafacts: TribleSet`
+  (plus a `metablobs` store backing its handles), and `entity!{}` fills
+  it with the description — rust identifier, declaring module, doc
+  comment, and the value encoding — of every attribute it actually
+  asserts. `Workspace::commit` writes those metafacts as the commit's
+  metadata. Recording what a pile's attributes mean is therefore a
+  property of writing to it rather than a step producers have to
+  remember, which is what minting stable ids was for in the first place.
+
+  The repo-wide metadata slot that used to serve this purpose is
+  removed: `Repository::new` loses its `commit_metadata` parameter (and
+  is now infallible), the `Repository::commit_metadata` /
+  `Workspace::metadata` accessors are gone, and `commit_with_metadata` /
+  `commit_with_metadata_handle` are deleted with no shims. It was
+  opt-in, and opt-in in practice meant an empty set: piles that nothing
+  but the original source could decode.
+
+  The accumulator type was a second, invisible opt-out: `let mut change
+  = TribleSet::new(); change += entity!{…}; ws.commit(change, …)`
+  compiled and silently threw the descriptions away. So
+  `impl From<TribleSet> for Fragment` is removed and
+  `Workspace::commit` takes a `Fragment` rather than
+  `impl Into<Fragment>` — the shape now fails to compile. Committing
+  undescribed content is still possible via the explicit
+  `Fragment::undescribed(set)`, whose name states the consequence at
+  the call site: the resulting commit references no metadata blob at
+  all, so a reader can see the tribles but cannot learn what the
+  attribute ids mean. `impl From<Fragment> for TribleSet` is kept —
+  asking for the facts and getting the facts confuses nobody.
+
+  Metafacts are kept strictly out of `facts`: content queries never see
+  schema records, entity ids (derived from the facts alone) are
+  unchanged, and content committed as `undescribed` honestly
+  records no description rather than an empty one. They merge as a set
+  through `+=` and spread composition, so repeated descriptions
+  collapse, and the metadata archive is content-addressed — 100 commits
+  over two attribute shapes converge on two metadata blobs.
+  `Fragment::into_parts` now yields all five channels, and
+  `describe_with` merges another fragment in as description for
+  importers that mint attributes at runtime. Note the construction
+  cost: an `entity!{}` describing four attributes measured ~5.4 µs
+  against ~0.8 µs before, since a description is several times larger
+  than the small entity it describes.
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm

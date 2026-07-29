@@ -4,6 +4,7 @@ use rand::rngs::OsRng;
 use triblespace::core::examples::literature;
 use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
+use triblespace::core::trible::Fragment;
 
 fn main() {
     let tmp = tempfile::tempdir().expect("tmp dir");
@@ -17,13 +18,12 @@ fn main() {
     pile.refresh().expect("load pile");
 
     // Create a repository from the pile and initialize the main branch
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .expect("create repo");
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws1 = repo.pull(*branch_id).expect("pull");
 
     // First workspace adds Alice and pushes
-    let mut change = TribleSet::new();
+    let mut change = Fragment::empty();
     change += entity! { &ufoid() @ literature::firstname: "Alice" };
 
     ws1.commit(change, "add alice");
@@ -32,7 +32,7 @@ fn main() {
 
     // Second workspace adds Bob and attempts to push, merging on conflict
     let mut ws2 = repo.pull(*branch_id).expect("pull");
-    let mut change = TribleSet::new();
+    let mut change = Fragment::empty();
     change += entity! { &ufoid() @ literature::firstname: "Bob" };
     ws2.commit(change, "add bob");
 

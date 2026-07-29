@@ -12,6 +12,7 @@ use triblespace_core::metadata;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
+use triblespace_core::trible::Fragment;
 
 fn random_signing_key() -> SigningKey {
     let mut seed = [0u8; 32];
@@ -33,14 +34,14 @@ fn consolidate_merges_branch_heads() {
     let mut branch_ids: Vec<String> = Vec::new();
     {
         let pile: Pile = Pile::open(&pile_path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
 
         for i in 0..3 {
             let branch_id = repo.create_branch("mem", None).expect("create branch");
             branch_ids.push(format!("{:X}", *branch_id));
             let mut ws = repo.pull(*branch_id).expect("pull");
             let e = ufoid();
-            let mut content = TribleSet::new();
+            let mut content = Fragment::empty();
             let label = ws.put::<blobencodings::UTF8String, _>(format!("branch-{i}"));
             content += entity! { &e @ metadata::name: label };
             ws.commit(content, &format!("commit-{i}"));
@@ -178,14 +179,14 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
     let alpha_a_id: String;
     {
         let pile: Pile = Pile::open(&pile_path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
 
         // Branch A: "alpha", commit, push, tombstone.
         let bid_a = repo.create_branch("alpha", None).expect("create alpha-A");
         alpha_a_id = format!("{:X}", *bid_a);
         let mut ws = repo.pull(*bid_a).expect("pull alpha-A");
         let e = ufoid();
-        let mut content = TribleSet::new();
+        let mut content = Fragment::empty();
         let label = ws.put::<blobencodings::UTF8String, _>("alpha-A-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "alpha-A commit");
@@ -209,7 +210,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let bid_b = repo.create_branch("alpha", None).expect("create alpha-B");
         let mut ws = repo.pull(*bid_b).expect("pull alpha-B");
         let e = ufoid();
-        let mut content = TribleSet::new();
+        let mut content = Fragment::empty();
         let label = ws.put::<blobencodings::UTF8String, _>("alpha-B-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "alpha-B commit");
@@ -226,7 +227,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let bid_c = repo.create_branch("beta", None).expect("create beta");
         let mut ws = repo.pull(*bid_c).expect("pull beta");
         let e = ufoid();
-        let mut content = TribleSet::new();
+        let mut content = Fragment::empty();
         let label = ws.put::<blobencodings::UTF8String, _>("beta-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "beta commit");
@@ -417,13 +418,13 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
     let descendant_head: String;
     {
         let pile: Pile = Pile::open(&pile_path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
 
         // Branch A: "gamma", commit C1.
         let bid_a = repo.create_branch("gamma", None).expect("create gamma-A");
         let mut ws_a = repo.pull(*bid_a).expect("pull gamma-A");
         let e = ufoid();
-        let mut content = TribleSet::new();
+        let mut content = Fragment::empty();
         let label = ws_a.put::<blobencodings::UTF8String, _>("gamma-A".to_string());
         content += entity! { &e @ metadata::name: label };
         ws_a.commit(content, "gamma-A commit");
@@ -443,7 +444,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         // Merge branch A's head into B so C1 becomes an ancestor of C2.
         ws_b.merge_commit(head_a).expect("merge C1 into B");
         let e2 = ufoid();
-        let mut content2 = TribleSet::new();
+        let mut content2 = Fragment::empty();
         let label2 = ws_b.put::<blobencodings::UTF8String, _>("gamma-B".to_string());
         content2 += entity! { &e2 @ metadata::name: label2 };
         ws_b.commit(content2, "gamma-B commit");
@@ -561,7 +562,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
     let mut delta_heads: Vec<String> = Vec::new();
     {
         let pile: Pile = Pile::open(&pile_path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
 
         for i in 0..2 {
             let bid = repo
@@ -569,7 +570,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
                 .expect("create delta branch");
             let mut ws = repo.pull(*bid).expect("pull");
             let e = ufoid();
-            let mut content = TribleSet::new();
+            let mut content = Fragment::empty();
             let label = ws.put::<blobencodings::UTF8String, _>(format!("delta-{i}"));
             content += entity! { &e @ metadata::name: label };
             ws.commit(content, &format!("delta-{i}"));
@@ -587,7 +588,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
         let bid = repo.create_branch("epsilon", None).expect("create epsilon");
         let mut ws = repo.pull(*bid).expect("pull");
         let e = ufoid();
-        let mut content = TribleSet::new();
+        let mut content = Fragment::empty();
         let label = ws.put::<blobencodings::UTF8String, _>("epsilon-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "epsilon");

@@ -5,6 +5,7 @@ use rand::rngs::OsRng;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
+use triblespace::core::trible::Fragment;
 
 pub mod literature {
     use triblespace::prelude::*;
@@ -21,14 +22,14 @@ fn main() {
     // ANCHOR: pattern_changes_example
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("branch");
 
     // ── commit initial data ──────────────────────────────────────────
     let herbert = ufoid();
     let dune = ufoid();
     let mut ws = repo.pull(*branch_id).expect("pull");
-    let mut initial = TribleSet::new();
+    let mut initial = Fragment::empty();
     initial +=
         entity! { &herbert @ literature::firstname: "Frank", literature::lastname: "Herbert" };
     initial += entity! { &dune @ literature::title: "Dune", literature::author: &herbert };

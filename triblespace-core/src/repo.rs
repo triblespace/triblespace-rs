@@ -31,7 +31,7 @@
 //! use triblespace::repo::{memoryrepo::MemoryRepo, Repository};
 //!
 //! let storage = MemoryRepo::default();
-//! let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+//! let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
 //! let branch_id = repo.create_branch("main", None).expect("create branch");
 //! let mut ws = repo.pull(*branch_id).expect("pull branch");
 //!
@@ -1002,7 +1002,6 @@ pub struct HookError {
 pub struct Repository<Storage: BlobStore + PinStore> {
     storage: Storage,
     signing_key: SigningKey,
-    commit_metadata: MetadataHandle,
     /// On-commit hooks (see [`CommitHook`]); empty by default, in which
     /// case pushes take the plain path with zero added work.
     hooks: Vec<CommitHook<Storage>>,
@@ -1051,44 +1050,21 @@ impl<Storage> Repository<Storage>
 where
     Storage: BlobStore + PinStore,
 {
-    /// Creates a new repository with the given storage, signing key, and
-    /// repo-wide commit metadata.
+    /// Creates a new repository with the given storage and signing key.
     ///
-    /// `commit_metadata` accepts anything convertible into a [`Fragment`] —
-    /// either a raw [`TribleSet`] (auto-promoted with empty blob store via
-    /// `impl From<TribleSet> for Fragment`), or a Fragment built up via
-    /// `entity!{}` / `attributes!::describe()` that carries auxiliary blobs
-    /// (e.g. `Handle<UTF8String>` doc strings). The Fragment's blobs are
-    /// absorbed into storage so handles referenced by the metadata facts
-    /// stay resolvable for any downstream reader that pulls a commit and
-    /// calls [`Workspace::checkout_metadata`].
-    ///
-    /// The resulting metadata blob is referenced from every commit produced
-    /// by workspaces of this repository.
-    pub fn new<F: Into<crate::trible::Fragment>>(
-        mut storage: Storage,
-        signing_key: SigningKey,
-        commit_metadata: F,
-    ) -> Result<Self, <Storage as BlobStorePut>::PutError> {
-        let (facts, mut blobs) = commit_metadata.into().into_facts_and_blobs();
-        // Persist any blobs the Fragment carried — typically `Handle<UTF8String>`
-        // doc strings or other handle-referenced payloads. They're stored as
-        // `UnknownBlob` (raw bytes) because the storage layer is encoding-agnostic;
-        // readers recover the schema via the handle's declared encoding.
-        let reader = blobs
-            .reader()
-            .expect("MemoryBlobStore::reader is infallible");
-        for (_handle, blob) in reader {
-            storage.put::<UnknownBlob, _>(blob)?;
-        }
-        let commit_metadata = storage.put(facts)?;
-        Ok(Self {
+    /// A repository carries no metadata of its own. Each commit's
+    /// metadata is the [`metafacts`](crate::trible::Fragment::metafacts)
+    /// of the content committed — see [`Workspace::commit`]. The
+    /// repo-wide metadata slot this constructor used to take was
+    /// opt-in, and opt-in meant nearly every producer passed an empty
+    /// set and shipped piles nothing could decode.
+    pub fn new(storage: Storage, signing_key: SigningKey) -> Self {
+        Self {
             storage,
             signing_key,
-            commit_metadata,
             hooks: Vec::new(),
             hook_errors: Vec::new(),
-        })
+        }
     }
 
     /// Register an on-commit hook (see [`CommitHook`] for the contract:
@@ -1211,11 +1187,6 @@ where
     /// Replace the repository signing key.
     pub fn set_signing_key(&mut self, signing_key: SigningKey) {
         self.signing_key = signing_key;
-    }
-
-    /// Returns the repository commit metadata handle.
-    pub fn commit_metadata(&self) -> MetadataHandle {
-        self.commit_metadata
     }
 
     /// Initializes a new branch in the repository.
@@ -1420,7 +1391,6 @@ where
             base_branch_id: branch_id,
             base_branch_meta: base_branch_meta_handle,
             signing_key,
-            commit_metadata: self.commit_metadata,
         })
     }
 
@@ -1614,7 +1584,6 @@ where
                     base_branch_id: workspace.base_branch_id,
                     base_branch_meta: conflicting_meta,
                     signing_key: workspace.signing_key.clone(),
-                    commit_metadata: workspace.commit_metadata,
                 };
 
                 Ok(Some(conflict_ws))
@@ -1625,7 +1594,6 @@ where
 
 /// A handle to a commit blob in the repository.
 pub type CommitHandle = Inline<Handle<SimpleArchive>>;
-type MetadataHandle = Inline<Handle<SimpleArchive>>;
 /// A set of commit handles, used by [`CommitSelector`] and [`Checkout`].
 pub type CommitSet = PATCH<INLINE_LEN, IdentitySchema, ()>;
 type BranchMetaHandle = Inline<Handle<SimpleArchive>>;
@@ -1748,8 +1716,6 @@ pub struct Workspace<Blobs: BlobStore> {
     base_head: Option<CommitHandle>,
     /// Signing key used for commit/branch signing.
     signing_key: SigningKey,
-    /// Metadata handle for commits created in this workspace.
-    commit_metadata: MetadataHandle,
 }
 
 impl<Blobs> fmt::Debug for Workspace<Blobs>
@@ -1765,7 +1731,6 @@ where
             .field("base_branch_meta", &self.base_branch_meta)
             .field("base_head", &self.base_head)
             .field("head", &self.head)
-            .field("commit_metadata", &self.commit_metadata)
             .finish()
     }
 }
@@ -2454,11 +2419,6 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         self.head
     }
 
-    /// Returns the workspace metadata handle.
-    pub fn metadata(&self) -> MetadataHandle {
-        self.commit_metadata
-    }
-
     /// Adds a blob to the workspace's local blob store.
     /// Mirrors [`BlobStorePut::put`](crate::repo::BlobStorePut) for ease of use.
     pub fn put<S, T>(&mut self, item: T) -> Inline<Handle<S>>
@@ -2492,68 +2452,50 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
 
     /// Performs a commit in the workspace.
     ///
-    /// Accepts anything that converts into a [`Fragment`] — either a
-    /// raw [`TribleSet`] (auto-promoted to a Fragment with empty blob
-    /// store), or a Fragment built up via `entity!{}` /
-    /// `MetaDescribe::describe()` whose embedded blobs get absorbed
-    /// into `self.staged` alongside the commit-content blob.
-    /// This method creates a new commit blob (stored in the local
-    /// blobset) and updates the current commit handle.
-    pub fn commit(&mut self, content_: impl Into<Fragment>, message_: &str) {
-        self.commit_internal(content_.into(), Some(self.commit_metadata), Some(message_));
-    }
-
-    /// Like [`commit`](Self::commit) but attaches one-off metadata
-    /// instead of the repository default.
+    /// Takes a [`Fragment`]: its blobs get absorbed into `self.staged`
+    /// alongside the commit-content blob, and its facts become the
+    /// commit content. This method creates a new commit blob (stored in
+    /// the local blobset) and updates the current commit handle.
     ///
-    /// Accepts anything that converts into a [`Fragment`]: the
-    /// fragment's embedded blobs are absorbed into the staged blob
-    /// store and its facts are archived as a `SimpleArchive` blob
-    /// whose handle lands in the commit's metadata slot. Archiving is
-    /// content-addressed, so committing the same metadata fragment
-    /// repeatedly converges on one blob — no caller-side caching
-    /// needed for correctness or storage. When the metadata is
-    /// already archived (e.g. shared across many commits and you hold
-    /// its handle), use
-    /// [`commit_with_metadata_handle`](Self::commit_with_metadata_handle)
-    /// to skip re-serialization.
-    pub fn commit_with_metadata(
-        &mut self,
-        content_: impl Into<Fragment>,
-        metadata_: impl Into<Fragment>,
-        message_: &str,
-    ) {
-        let (meta_facts, meta_blobs) = metadata_.into().into_facts_and_blobs();
-        self.staged.union(meta_blobs);
-        let metadata_handle = self.put(meta_facts);
-        self.commit_internal(content_.into(), Some(metadata_handle), Some(message_));
+    /// **The commit's metadata is the fragment's own
+    /// [`metafacts`](Fragment::metafacts)** — the descriptions
+    /// `entity!{}` already collected for every attribute the content
+    /// asserts. Recording what a pile means is therefore not a step a
+    /// producer can forget: describing and committing are the same act.
+    ///
+    /// The parameter is a `Fragment` rather than `impl Into<Fragment>`
+    /// on purpose. Accumulating into a `TribleSet` and letting it
+    /// convert on the way in silently threw the descriptions away —
+    /// a second, invisible opt-out next to the one this design
+    /// removed. Committing undescribed content is still possible, but
+    /// you have to say [`Fragment::undescribed`] and mean it.
+    ///
+    /// The metadata archive is content-addressed, so the thousands of
+    /// commits a tool makes over the same handful of attributes
+    /// converge on a handful of distinct metadata blobs.
+    pub fn commit(&mut self, content_: Fragment, message_: &str) {
+        self.commit_internal(content_, Some(message_));
     }
 
-    /// Like [`commit`](Self::commit) but attaches an already-archived
-    /// metadata handle instead of the repository default. The handle
-    /// variant of [`commit_with_metadata`](Self::commit_with_metadata):
-    /// no serialization happens, so this is the right form when the
-    /// same metadata archive is shared across many commits.
-    pub fn commit_with_metadata_handle(
-        &mut self,
-        content_: impl Into<Fragment>,
-        metadata_: MetadataHandle,
-        message_: &str,
-    ) {
-        self.commit_internal(content_.into(), Some(metadata_), Some(message_));
-    }
-
-    fn commit_internal(
-        &mut self,
-        content_: Fragment,
-        metadata_handle: Option<MetadataHandle>,
-        message_: Option<&str>,
-    ) {
-        let (content_facts, content_blobs) = content_.into_facts_and_blobs();
+    fn commit_internal(&mut self, content_: Fragment, message_: Option<&str>) {
+        let (exports, content_facts, metafacts, content_blobs, metablobs) = content_.into_parts();
+        let _ = exports;
         // 0. Absorb any blobs the Fragment carried with it into the
         //    staging area before producing the commit blob, so handles
         //    inside `content_facts` resolve against `self.staged`.
         self.staged.union(content_blobs);
+        // 0b. The content's descriptions become this commit's metadata.
+        //     Their handle-referenced bytes (identifiers, module paths,
+        //     doc comments) have to land in the store too, or the
+        //     metadata archive would point at bytes nobody kept.
+        //     Content that describes nothing gets no metadata blob
+        //     rather than an empty one.
+        let metadata_handle = if metafacts.is_empty() {
+            None
+        } else {
+            self.staged.union(metablobs);
+            Some(self.put(metafacts))
+        };
         // 1. Create a commit blob from the current head, content, metadata and the commit message.
         let content_blob: Blob<SimpleArchive> = content_facts.to_blob();
         // If a message is provided, store it as a UTF8String blob and pass the handle.

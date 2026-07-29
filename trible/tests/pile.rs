@@ -24,7 +24,7 @@ fn list_branches_outputs_branch_id() {
 
     {
         let pile: Pile = Pile::open(&path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
         repo.create_branch("main", None).expect("create branch");
         repo.into_storage().close().unwrap();
     }
@@ -45,7 +45,7 @@ fn delete_branch_removes_branch_id_from_list() {
 
     let branch_id = {
         let pile: Pile = Pile::open(&path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
         let branch_id = repo.create_branch("main", None).expect("create branch");
         let pile = repo.into_storage();
         pile.close().unwrap();
@@ -88,12 +88,12 @@ fn branch_stats_reports_fast_and_full_counts() {
 
     let branch_id = {
         let pile: Pile = Pile::open(&path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
         let branch_id = repo.create_branch("main", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull");
 
         let entity_id = ufoid();
-        let mut content = TribleSet::new();
+        let mut content = Fragment::empty();
         let label = ws.put::<UTF8String, _>("stats-test".to_string());
         content += entity! { &entity_id @ triblespace_core::metadata::name: label };
         ws.commit(content, "seed");
@@ -618,7 +618,7 @@ fn corrupt_source_fails_loud_without_truncation() {
     // Seed a valid pile with one branch.
     {
         let pile: Pile = Pile::open(&src_path).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key());
         repo.create_branch("main", None).expect("create branch");
         repo.into_storage().close().unwrap();
     }

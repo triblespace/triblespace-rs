@@ -10,17 +10,19 @@ use triblespace::core::repo::parents;
 use triblespace::core::repo::symmetric_diff;
 use triblespace::core::repo::union;
 use triblespace::core::repo::Repository;
+use triblespace::prelude::inlineencodings::ShortString;
 use triblespace::prelude::*;
+use triblespace::core::trible::Fragment;
 
 #[test]
 fn workspace_commit_updates_head() {
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
-    ws.commit(TribleSet::new(), "change");
+    ws.commit(Fragment::empty(), "change");
 
     repo.push(&mut ws).expect("push");
 }
@@ -29,7 +31,7 @@ fn workspace_commit_updates_head() {
 fn workspace_checkout_empty_branch_returns_empty_set() {
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -44,7 +46,7 @@ fn workspace_checkout_unions_commits() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -55,7 +57,7 @@ fn workspace_checkout_unions_commits() {
     let mut s1 = TribleSet::new();
     s1.insert(&t1);
 
-    ws.commit(s1.clone(), "commit");
+    ws.commit(Fragment::undescribed(s1.clone()), "commit");
     let c1 = ws.head().unwrap();
 
     let e2 = ufoid();
@@ -65,7 +67,7 @@ fn workspace_checkout_unions_commits() {
     let mut s2 = TribleSet::new();
     s2.insert(&t2);
 
-    ws.commit(s2.clone(), "commit");
+    ws.commit(Fragment::undescribed(s2.clone()), "commit");
     let c2 = ws.head().unwrap();
 
     let result = ws.checkout(&[c1, c2][..]).expect("checkout");
@@ -82,7 +84,7 @@ fn workspace_checkout_single_commit() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -93,7 +95,7 @@ fn workspace_checkout_single_commit() {
     let mut s = TribleSet::new();
     s.insert(&t);
 
-    ws.commit(s.clone(), "commit");
+    ws.commit(Fragment::undescribed(s.clone()), "commit");
     let c = ws.head().unwrap();
 
     let result = ws.checkout(c).expect("checkout single");
@@ -107,7 +109,7 @@ fn workspace_checkout_vec_commits() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -120,7 +122,7 @@ fn workspace_checkout_vec_commits() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(Fragment::undescribed(s.clone()), "commit");
         sets.push(s);
         commits.push(ws.head().unwrap());
     }
@@ -135,95 +137,103 @@ fn workspace_checkout_vec_commits() {
     assert_eq!(result, expected);
 }
 
+attributes! {
+    /// A person's display name, for the metadata round-trip tests.
+    "2A0C4A2C1E3B4D5F6A7B8C9D0E1F2A3B" as pub ws_name: ShortString;
+    /// A person's city.
+    "3B1D5B3D2F4C5E6A7B8C9D0E1F2A3B4C" as pub ws_city: ShortString;
+}
+
+/// A commit's metadata is the metafacts of the content committed —
+/// there is no repo-wide slot to forget to fill any more, so a commit
+/// describes the attributes it used by virtue of having been made.
 #[test]
-fn workspace_checkout_metadata_returns_repo_metadata() {
-    use triblespace::core::inline::encodings::r256::R256;
-
-    let meta_e = ufoid();
-    let meta_a = ufoid();
-    let meta_v: Inline<R256> = 1i128.to_inline();
-    let meta_t = Trible::new(&meta_e, &meta_a, &meta_v);
-    let mut meta = TribleSet::new();
-    meta.insert(&meta_t);
-
+fn workspace_commit_records_content_metafacts_as_metadata() {
     let storage = MemoryRepo::default();
-    let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
-    ws.commit(TribleSet::new(), "first");
+    let alice = ufoid();
+    let content = entity! { &alice @ ws_name: "Alice" };
+    let expected_meta = content.metafacts().clone();
+    assert!(!expected_meta.is_empty());
+
+    ws.commit(content, "first");
     let c1 = ws.head().unwrap();
-    ws.commit(TribleSet::new(), "second");
+
+    let result = ws.checkout_metadata(c1).expect("checkout metadata");
+    assert_eq!(result, expected_meta);
+}
+
+/// Metadata unions across the selected commits, so a range covering
+/// commits that used different attributes describes all of them.
+#[test]
+fn workspace_checkout_metadata_unions_across_commits() {
+    let storage = MemoryRepo::default();
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let branch_id = repo.create_branch("main", None).expect("create branch");
+    let mut ws = repo.pull(*branch_id).expect("pull");
+
+    let alice = ufoid();
+    let named = entity! { &alice @ ws_name: "Alice" };
+    let located = entity! { &alice @ ws_city: "Bremen" };
+    let mut expected = named.metafacts().clone();
+    expected += located.metafacts().clone();
+
+    ws.commit(named, "first");
+    let c1 = ws.head().unwrap();
+    ws.commit(located, "second");
     let c2 = ws.head().unwrap();
 
     let result = ws
         .checkout_metadata(&[c1, c2][..])
         .expect("checkout metadata");
 
-    assert_eq!(result, meta);
+    assert_eq!(result, expected);
 }
 
+/// Content and metadata come back separately: the schema records never
+/// leak into the content a query runs over.
 #[test]
 fn workspace_checkout_with_metadata_returns_both() {
-    use triblespace::core::inline::encodings::r256::R256;
-
-    let meta_e = ufoid();
-    let meta_a = ufoid();
-    let meta_v: Inline<R256> = 7i128.to_inline();
-    let meta_t = Trible::new(&meta_e, &meta_a, &meta_v);
-    let mut meta = TribleSet::new();
-    meta.insert(&meta_t);
-
     let storage = MemoryRepo::default();
-    let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
-    let data_e = ufoid();
-    let data_a = ufoid();
-    let data_v: Inline<R256> = 42i128.to_inline();
-    let data_t = Trible::new(&data_e, &data_a, &data_v);
-    let mut data = TribleSet::new();
-    data.insert(&data_t);
+    let alice = ufoid();
+    let content = entity! { &alice @ ws_name: "Alice" };
+    let expected_data = content.facts().clone();
+    let expected_meta = content.metafacts().clone();
 
-    ws.commit(data.clone(), "commit");
+    ws.commit(content, "commit");
     let c = ws.head().unwrap();
 
     let (data_out, meta_out) = ws
         .checkout_with_metadata(c)
         .expect("checkout with metadata");
 
-    assert_eq!(data_out, data);
-    assert_eq!(meta_out, meta);
+    assert_eq!(data_out, expected_data);
+    assert_eq!(meta_out, expected_meta);
 }
 
+/// A bare `TribleSet` carries no descriptions, so its commit honestly
+/// records none rather than an empty metadata archive.
 #[test]
-fn workspace_commit_uses_repo_metadata() {
-    use triblespace::core::inline::encodings::r256::R256;
-
-    let meta_e = ufoid();
-    let meta_a = ufoid();
-    let meta_v: Inline<R256> = 99i128.to_inline();
-    let meta_t = Trible::new(&meta_e, &meta_a, &meta_v);
-    let mut meta = TribleSet::new();
-    meta.insert(&meta_t);
-
+fn workspace_commit_of_undescribed_content_has_no_metadata() {
     let storage = MemoryRepo::default();
-    let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
-    let data_e = ufoid();
-    let data_a = ufoid();
-    let data_v: Inline<R256> = 1i128.to_inline();
-    let data_t = Trible::new(&data_e, &data_a, &data_v);
     let mut data = TribleSet::new();
-    data.insert(&data_t);
+    let e = ufoid();
+    let a = ufoid();
+    let v: Inline<ShortString> = "x".to_inline();
+    data.insert(&Trible::new(&e, &a, &v));
 
-    ws.commit(data.clone(), "commit");
+    ws.commit(Fragment::undescribed(data.clone()), "commit");
     let c = ws.head().unwrap();
 
     let (data_out, meta_out) = ws
@@ -231,7 +241,7 @@ fn workspace_commit_uses_repo_metadata() {
         .expect("checkout with metadata");
 
     assert_eq!(data_out, data);
-    assert_eq!(meta_out, meta);
+    assert!(meta_out.is_empty());
 }
 
 #[test]
@@ -240,7 +250,7 @@ fn workspace_checkout_range_variants() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -253,7 +263,7 @@ fn workspace_checkout_range_variants() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(Fragment::undescribed(s.clone()), "commit");
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -288,7 +298,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -355,7 +365,7 @@ fn workspace_checkout_symmetric_diff() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -368,7 +378,7 @@ fn workspace_checkout_symmetric_diff() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(Fragment::undescribed(s.clone()), "commit");
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -386,7 +396,7 @@ fn workspace_checkout_set_operation_selectors() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -399,7 +409,7 @@ fn workspace_checkout_set_operation_selectors() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(Fragment::undescribed(s.clone()), "commit");
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -432,7 +442,7 @@ fn workspace_get_local_and_base() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -444,7 +454,7 @@ fn workspace_get_local_and_base() {
     set.insert(&t);
 
     let handle = ws.put(set.clone());
-    ws.commit(set.clone(), "commit");
+    ws.commit(Fragment::undescribed(set.clone()), "commit");
 
     let local: TribleSet = ws.get(handle).expect("get local");
     assert_eq!(local, set);
@@ -463,7 +473,7 @@ fn workspace_checkout_head_collects_history() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -475,7 +485,7 @@ fn workspace_checkout_head_collects_history() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(Fragment::undescribed(s.clone()), "commit");
         sets.push(s);
     }
 
@@ -495,7 +505,7 @@ fn workspace_nth_ancestor_selector() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -507,7 +517,7 @@ fn workspace_nth_ancestor_selector() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(Fragment::undescribed(s.clone()), "commit");
         sets.push(s);
     }
 
@@ -530,7 +540,7 @@ fn workspace_parents_selector() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
 
     // Base commit so both workspaces share a common ancestor.
     let main_branch_id = repo.create_branch("main", None).expect("create branch");
@@ -541,7 +551,7 @@ fn workspace_parents_selector() {
     let t0 = Trible::new(&e0, &a0, &v0);
     let mut s0 = TribleSet::new();
     s0.insert(&t0);
-    ws_main.commit(s0, "commit");
+    ws_main.commit(Fragment::undescribed(s0), "commit");
     repo.push(&mut ws_main).expect("push base");
 
     // Fork a second workspace from the same base commit.
@@ -554,7 +564,7 @@ fn workspace_parents_selector() {
     let t1 = Trible::new(&e1, &a1, &v1);
     let mut s1 = TribleSet::new();
     s1.insert(&t1);
-    ws_main.commit(s1.clone(), "commit");
+    ws_main.commit(Fragment::undescribed(s1.clone()), "commit");
 
     let e2 = ufoid();
     let a2 = ufoid();
@@ -562,7 +572,7 @@ fn workspace_parents_selector() {
     let t2 = Trible::new(&e2, &a2, &v2);
     let mut s2 = TribleSet::new();
     s2.insert(&t2);
-    ws_feature.commit(s2.clone(), "commit");
+    ws_feature.commit(Fragment::undescribed(s2.clone()), "commit");
 
     // Merge the feature workspace into main to create a commit with two parents.
     ws_main.merge(&mut ws_feature).expect("merge workspaces");
@@ -584,7 +594,7 @@ fn workspace_history_of_entity() {
 
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -596,15 +606,15 @@ fn workspace_history_of_entity() {
 
     let mut s1 = TribleSet::new();
     s1.insert(&Trible::new(&entity, &a1, &v1));
-    ws.commit(s1.clone(), "commit");
+    ws.commit(Fragment::undescribed(s1.clone()), "commit");
 
     let mut s2 = TribleSet::new();
     s2.insert(&Trible::new(&ufoid(), &a1, &v1));
-    ws.commit(s2.clone(), "commit");
+    ws.commit(Fragment::undescribed(s2.clone()), "commit");
 
     let mut s3 = TribleSet::new();
     s3.insert(&Trible::new(&entity, &a2, &v2));
-    ws.commit(s3.clone(), "commit");
+    ws.commit(Fragment::undescribed(s3.clone()), "commit");
 
     let result = ws.checkout(history_of(*entity)).expect("history_of");
 

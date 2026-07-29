@@ -80,20 +80,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory
     // for quick experiments. Swap in a `Pile` when you need durable storage.
     //
-    // The third argument is a repo-wide metadata `Fragment` attached to
-    // *every* commit this repo's workspaces produce — `ws.checkout_metadata(..)`
-    // retrieves it later. `attributes! { … }` synthesises a `describe()`
-    // function that returns a Fragment describing the schema (attribute
-    // ids, names, doc strings, encodings); passing it directly means the
-    // schema's facts *and* its handle-referenced doc-string blobs both
-    // travel with every commit, so downstream readers can pull the
-    // schema along with the data.
+    // A repository carries no schema of its own, and you never hand it
+    // one. Each commit's metadata is the *metafacts* of the content you
+    // commit: `entity!{}` already collected the description of every
+    // attribute it asserted — id, name, doc string, value encoding, plus
+    // the blobs those descriptions reference — so `ws.checkout_metadata(..)`
+    // hands a downstream reader the schema for exactly the data they
+    // pulled. Describing the pile is not a step you can forget, because
+    // it is the same step as writing to it.
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(
-        storage,
-        SigningKey::generate(&mut OsRng),
-        literature::describe(),
-    )?;
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo
         .create_branch("main", None)
         .expect("create branch");

@@ -1,12 +1,15 @@
-//! `Workspace::commit` accepts `impl Into<Fragment>` so a Fragment
-//! built via `entity!{}` (which may carry blobs from its `*:`
-//! spreads or its own `Fragment::put` calls) commits *with* those
-//! blobs absorbed into `Workspace::staged`. The blob bytes round-trip
-//! through `staged.reader()`.
+//! `Workspace::commit` takes a `Fragment`, so a fragment built via
+//! `entity!{}` (which may carry blobs from its `*:` spreads or its own
+//! `Fragment::put` calls) commits *with* those blobs absorbed into
+//! `Workspace::staged`. The blob bytes round-trip through
+//! `staged.reader()`.
 //!
-//! Counter-test: passing a raw `TribleSet` works too (auto-promotes
-//! to a Fragment with empty blob store), with no behaviour change vs.
-//! the pre-Into-flip API.
+//! Counter-test: `Fragment::undescribed` is the way to commit a bare
+//! `TribleSet`, and it is honest about the consequence — such a commit
+//! carries no metadata at all. There is no `From<TribleSet>` to do
+//! this silently, which is the point: dropping the descriptions is a
+//! decision, not a side effect of the accumulator type you happened to
+//! reach for.
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -29,7 +32,7 @@ mod ns {
 fn commit_fragment_absorbs_blobs() {
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).expect("repo");
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -67,24 +70,47 @@ fn commit_fragment_absorbs_blobs() {
 }
 
 #[test]
-fn commit_tribleset_auto_promotes() {
-    // The existing TribleSet-callers continue to work via the new
-    // `impl From<TribleSet> for Fragment` (lossless promotion: no
-    // exports, empty blob store).
+fn undescribed_commit_records_no_metadata() {
     let storage = MemoryRepo::default();
-    let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).expect("repo");
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
+    // A bare TribleSet, deliberately promoted without descriptions.
     let mut data = TribleSet::new();
     let e = rngid();
-    // Put the blob via the workspace's staged store the old way,
-    // pass a bare TribleSet to commit.
     let h: triblespace_core::inline::Inline<Handle<UTF8String>> = ws.put("tribleset-side bytes");
     data += entity! { &e @ ns::note: h };
-    ws.commit(data, "tribleset commit");
+    let expected = data.clone();
 
+    ws.commit(Fragment::undescribed(data), "undescribed commit");
+    let commit = ws.head().expect("head");
+
+    // The content is intact...
+    let checkout = ws.checkout(commit).expect("checkout");
+    assert_eq!(*checkout, expected);
+
+    // ...and the commit carries no metadata handle at all. Not an empty
+    // archive — no handle. `undescribed` means undescribed, and the
+    // pile records that honestly instead of implying a description that
+    // was never supplied.
+    let commit_facts: TribleSet = ws.get(commit).expect("commit blob");
+    let metadata_handles = find!(
+        (h: Inline<_>),
+        pattern!(&commit_facts, [{ triblespace_core::repo::metadata: ?h }])
+    )
+    .count();
+    assert_eq!(
+        metadata_handles, 0,
+        "an undescribed commit must not reference a metadata blob",
+    );
+    assert!(ws
+        .checkout_metadata(commit)
+        .expect("checkout metadata")
+        .is_empty());
+
+    // Blobs the content references still land in staging, exactly as
+    // for a described commit — only the description is absent.
     let mut staged = ws.staged.clone();
     let reader = staged.reader().expect("reader");
     let resolved: anybytes::View<str> = reader

@@ -2,19 +2,19 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::Repository;
-use triblespace::prelude::*;
+use triblespace::core::trible::Fragment;
 
 #[test]
 fn push_and_merge_conflict_resolution() {
     let storage = MemoryRepo::default();
     let mut repo =
-        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        Repository::new(storage, SigningKey::generate(&mut OsRng));
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws1 = repo.pull(*branch_id).expect("pull");
     let mut ws2 = repo.pull(*branch_id).expect("pull");
 
-    ws1.commit(TribleSet::new(), "first");
-    ws2.commit(TribleSet::new(), "second");
+    ws1.commit(Fragment::empty(), "first");
+    ws2.commit(Fragment::empty(), "second");
 
     repo.push(&mut ws1).expect("push");
 

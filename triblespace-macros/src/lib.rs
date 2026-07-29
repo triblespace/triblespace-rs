@@ -14,7 +14,7 @@ use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::repo::Workspace;
-use triblespace_core::trible::TribleSet;
+use triblespace_core::trible::Fragment;
 
 use syn::parse::Parse;
 use syn::parse::ParseStream;
@@ -138,10 +138,7 @@ where
             return;
         }
     };
-    let mut repo = match Repository::new(pile, signing_key, TribleSet::new()) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
+    let mut repo = Repository::new(pile, signing_key);
 
     let mut workspace = match repo.pull(branch_id) {
         Ok(ws) => ws,
@@ -152,7 +149,7 @@ where
     };
 
     let span = invocation_span(input);
-    let mut set = TribleSet::new();
+    let mut set = Fragment::empty();
     let entity = fucid();
     let invocation_id = entity.id;
 

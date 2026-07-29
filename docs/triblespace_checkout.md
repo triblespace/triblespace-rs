@@ -6,16 +6,18 @@ pointing to a SimpleArchive TribleSet. `Workspace::checkout` unions the
 unions the referenced metadata TribleSets. `Workspace::checkout_with_metadata`
 returns both in one pass as `(content, metadata)`.
 
-Commits without a metadata handle contribute an empty metadata TribleSet. To
-attach metadata at write time, pass `Some(metadata)` to `Workspace::commit`
-(or use the lower-level `repo::commit::commit_metadata` helper). You can also
-configure a workspace default metadata TribleSet with
-`Workspace::set_default_metadata`, which `Workspace::commit` will attach
-whenever `metadata` is `None`. Supplying metadata does not change the default.
-`Repository::set_default_metadata` seeds new workspaces created via `pull` with
-a default metadata handle. Use `Repository::pull_with_metadata` to override
-the workspace default for a specific pull. Defaults are runtime configuration
-and are not stored in branch metadata.
-If you need to seed metadata blobs directly in the repository, borrow the
-underlying blob store via `Repository::storage_mut` before calling
-`set_default_metadata`.
+Metadata is not something you attach at write time. A commit's metadata is the
+*metafacts* of the content committed: `entity!{}` collects the description of
+every attribute it asserts — rust identifier, declaring module, doc comment,
+and the encoding its values are in — into the fragment's `metafacts`, and
+`Workspace::commit` archives those as that commit's metadata. Describing a
+pile and writing to it are therefore the same act, with no separate step left
+to skip.
+
+Content committed as a bare `TribleSet` carries no descriptions, so its commit
+gets no metadata handle and contributes an empty metadata TribleSet on
+checkout. Merge commits carry neither content nor metadata.
+
+Metadata archives are content-addressed, so the many commits a tool makes over
+the same handful of attributes converge on a handful of distinct metadata
+blobs rather than one per commit.

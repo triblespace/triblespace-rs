@@ -263,12 +263,7 @@ fn run_sync(
             direction,
         },
     );
-    let mut repo = Repository::new(
-        peer,
-        key.clone(),
-        triblespace_core::trible::TribleSet::new(),
-    )
-    .map_err(|e| anyhow!("repo: {e:?}"))?;
+    let mut repo = Repository::new(peer, key.clone());
 
     eprintln!("node: {}", repo.storage().id());
     eprintln!(

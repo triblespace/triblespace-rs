@@ -2121,9 +2121,16 @@ mod tests {
         Inline::new([byte; 32])
     }
 
+    /// Raw tribles, for the helpers that build archives directly.
     fn source(name: &str) -> TribleSet {
+        described_source(name).into_facts()
+    }
+
+    /// The same content as a fragment that still knows what
+    /// `literature::firstname` means — what a commit should be handed.
+    fn described_source(name: &str) -> Fragment {
         let person = fucid();
-        entity! { &person @ literature::firstname: name }.into_facts()
+        entity! { &person @ literature::firstname: name }
     }
 
     fn raw_value(tag: u8) -> RawInline {
@@ -3905,14 +3912,14 @@ mod tests {
 
         let storage = MemoryRepo::default();
         let mut repo =
-            Repository::new(storage, SigningKey::from_bytes(&[17; 32]), TribleSet::new()).unwrap();
+            Repository::new(storage, SigningKey::from_bytes(&[17; 32]));
         repo.register_index(SuccinctRollup);
         let branch = repo.create_branch("main", None).unwrap();
 
         let count = 2 * FANOUT - 1;
         for index in 0..count {
             let mut workspace = repo.pull(*branch).unwrap();
-            workspace.commit(source(&format!("p{index}")), "commit");
+            workspace.commit(described_source(&format!("p{index}")), "commit");
             repo.push(&mut workspace).unwrap();
         }
         assert!(repo.take_hook_errors().is_empty());
@@ -3946,24 +3953,24 @@ mod tests {
 
         let key = SigningKey::from_bytes(&[19; 32]);
         let mut indexed =
-            Repository::new(MemoryRepo::default(), key.clone(), TribleSet::new()).unwrap();
+            Repository::new(MemoryRepo::default(), key.clone());
         indexed.register_index(SuccinctRollup);
         let branch = indexed.create_branch("main", None).unwrap();
         let mut first = indexed.pull(*branch).unwrap();
-        first.commit(source("indexed"), "indexed");
+        first.commit(described_source("indexed"), "indexed");
         indexed.push(&mut first).unwrap();
         let indexed_head = first.head();
 
         let mut unhooked =
-            Repository::new(indexed.into_storage(), key.clone(), TribleSet::new()).unwrap();
+            Repository::new(indexed.into_storage(), key.clone());
         let mut missed = unhooked.pull(*branch).unwrap();
-        missed.commit(source("missed"), "missed");
+        missed.commit(described_source("missed"), "missed");
         unhooked.push(&mut missed).unwrap();
 
-        let mut resumed = Repository::new(unhooked.into_storage(), key, TribleSet::new()).unwrap();
+        let mut resumed = Repository::new(unhooked.into_storage(), key);
         resumed.register_index(SuccinctRollup);
         let mut later = resumed.pull(*branch).unwrap();
-        later.commit(source("later"), "later");
+        later.commit(described_source("later"), "later");
         let later_head = later.head();
         resumed.push(&mut later).unwrap();
 
@@ -3983,16 +3990,13 @@ mod tests {
 
         let mut repo = Repository::new(
             MemoryRepo::default(),
-            SigningKey::from_bytes(&[23; 32]),
-            TribleSet::new(),
-        )
-        .unwrap();
+            SigningKey::from_bytes(&[23; 32]));
         repo.register_index(SuccinctRollup);
         let branch = repo.create_branch("main", None).unwrap();
         let mut left = repo.pull(*branch).unwrap();
         let mut right = repo.pull(*branch).unwrap();
-        left.commit(source("left"), "left");
-        right.commit(source("right"), "right");
+        left.commit(described_source("left"), "left");
+        right.commit(described_source("right"), "right");
         repo.push(&mut left).unwrap();
         repo.push(&mut right).unwrap();
         assert!(repo.take_hook_errors().is_empty());

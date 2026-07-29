@@ -8,6 +8,7 @@ use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
+use triblespace_core::trible::Fragment;
 
 mod test_ns {
     use triblespace_core::prelude::*;
@@ -26,14 +27,12 @@ proptest! {
         let storage = MemoryRepo::default();
         let mut repo = Repository::new(
             storage,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        ).unwrap();
+            SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("test", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull");
 
         // Commit data
-        let mut data = TribleSet::new();
+        let mut data = Fragment::empty();
         for label in &labels {
             let e = rngid();
             data += entity! { &e @ test_ns::label: label.as_str() };
@@ -65,14 +64,12 @@ proptest! {
         let storage = MemoryRepo::default();
         let mut repo = Repository::new(
             storage,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        ).unwrap();
+            SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("test", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull");
 
         // First commit
-        let mut data1 = TribleSet::new();
+        let mut data1 = Fragment::empty();
         for label in &batch1 {
             let e = rngid();
             data1 += entity! { &e @ test_ns::label: label.as_str() };
@@ -80,7 +77,7 @@ proptest! {
         ws.commit(data1.clone(), "batch 1");
 
         // Second commit
-        let mut data2 = TribleSet::new();
+        let mut data2 = Fragment::empty();
         for label in &batch2 {
             let e = rngid();
             data2 += entity! { &e @ test_ns::label: label.as_str() };
@@ -110,13 +107,11 @@ proptest! {
         let storage = MemoryRepo::default();
         let mut repo = Repository::new(
             storage,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        ).unwrap();
+            SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("test", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull");
 
-        let mut data = TribleSet::new();
+        let mut data = Fragment::empty();
         for label in &labels {
             let e = rngid();
             data += entity! { &e @ test_ns::label: label.as_str() };
@@ -150,14 +145,12 @@ proptest! {
         let storage = MemoryRepo::default();
         let mut repo = Repository::new(
             storage,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        ).unwrap();
+            SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("test", None).expect("branch");
 
         // First commit + push
         let mut ws = repo.pull(*branch_id).expect("pull");
-        let mut data1 = TribleSet::new();
+        let mut data1 = Fragment::empty();
         for label in &batch1 {
             let e = rngid();
             data1 += entity! { &e @ test_ns::label: label.as_str() };
@@ -170,7 +163,7 @@ proptest! {
 
         // Second commit + push
         let mut ws = repo.pull(*branch_id).expect("pull");
-        let mut data2 = TribleSet::new();
+        let mut data2 = Fragment::empty();
         for label in &batch2 {
             let e = rngid();
             data2 += entity! { &e @ test_ns::label: label.as_str() };
@@ -217,14 +210,12 @@ proptest! {
         let storage = MemoryRepo::default();
         let mut repo = Repository::new(
             storage,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        ).unwrap();
+            SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("test", None).expect("branch");
 
         // Workspace A commits
         let mut ws_a = repo.pull(*branch_id).expect("pull");
-        let mut data_a = TribleSet::new();
+        let mut data_a = Fragment::empty();
         for label in &labels_a {
             let e = rngid();
             data_a += entity! { &e @ test_ns::label: label.as_str() };
@@ -234,7 +225,7 @@ proptest! {
 
         // Workspace B commits (on top of A)
         let mut ws_b = repo.pull(*branch_id).expect("pull");
-        let mut data_b = TribleSet::new();
+        let mut data_b = Fragment::empty();
         for label in &labels_b {
             let e = rngid();
             data_b += entity! { &e @ test_ns::label: label.as_str() };
@@ -267,14 +258,12 @@ proptest! {
         let storage = MemoryRepo::default();
         let mut repo = Repository::new(
             storage,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        ).unwrap();
+            SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("test", None).expect("branch");
 
         // Commit batch1
         let mut ws = repo.pull(*branch_id).expect("pull");
-        let mut data1 = TribleSet::new();
+        let mut data1 = Fragment::empty();
         for label in &batch1 {
             let e = rngid();
             data1 += entity! { &e @ test_ns::label: label.as_str() };
@@ -288,7 +277,7 @@ proptest! {
 
         // Commit batch2
         let mut ws = repo.pull(*branch_id).expect("pull");
-        let mut data2 = TribleSet::new();
+        let mut data2 = Fragment::empty();
         for label in &batch2 {
             let e = rngid();
             data2 += entity! { &e @ test_ns::label: label.as_str() };
@@ -351,13 +340,11 @@ proptest! {
         let storage = MemoryRepo::default();
         let mut repo = Repository::new(
             storage,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        ).unwrap();
+            SigningKey::generate(&mut OsRng));
         let branch_id = repo.create_branch("test", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull");
 
-        let mut data = TribleSet::new();
+        let mut data = Fragment::empty();
         for label in &labels {
             let e = rngid();
             data += entity! { &e @ test_ns::label: label.as_str() };
@@ -401,12 +388,12 @@ mod branch_head_carry {
     fn an_unknown_fact_on_a_branch_head_survives_a_push() {
         let storage = MemoryRepo::default();
         let mut repo =
-            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+            Repository::new(storage, SigningKey::generate(&mut OsRng));
         let branch_id = *repo.create_branch("annotated", None).expect("create branch");
 
         // Attach an annotation core knows nothing about, beside the head.
         let marker = rngid();
-        let annotation: TribleSet = entity! { &marker @ ann::note: "kilroy" }.into();
+        let annotation = entity! { &marker @ ann::note: "kilroy" };
         let base = repo
             .storage_mut()
             .head(branch_id)
@@ -430,7 +417,7 @@ mod branch_head_carry {
         // An ordinary commit — nothing to do with the annotation.
         let mut ws = repo.pull(branch_id).expect("pull");
         let e = rngid();
-        let work: TribleSet = entity! { &e @ test_ns::label: "work" }.into();
+        let work = entity! { &e @ test_ns::label: "work" };
         ws.commit(work, "a commit");
         repo.push(&mut ws).expect("push");
 

@@ -431,7 +431,7 @@ mod tests {
     fn test_repo() -> Repository<MemoryRepo> {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let store = MemoryRepo::default();
-        Repository::new(store, signing_key, TribleSet::new()).unwrap()
+        Repository::new(store, signing_key)
     }
 
     #[test]
@@ -442,7 +442,7 @@ mod tests {
 
         let source_id = repo.ensure_branch("source", None).unwrap();
         let mut src_ws = repo.pull(source_id).unwrap();
-        src_ws.commit(TribleSet::new(), "remote commit");
+        src_ws.commit(Fragment::empty(), "remote commit");
         let source_head = src_ws.head().unwrap();
         repo.push(&mut src_ws).unwrap();
 
@@ -467,7 +467,7 @@ mod tests {
 
         let source_id = repo.ensure_branch("source", None).unwrap();
         let mut src_ws = repo.pull(source_id).unwrap();
-        src_ws.commit(TribleSet::new(), "shared commit");
+        src_ws.commit(Fragment::empty(), "shared commit");
         let shared_head = src_ws.head().unwrap();
         repo.push(&mut src_ws).unwrap();
 
@@ -491,13 +491,13 @@ mod tests {
 
         let main_id = repo.ensure_branch("main", None).unwrap();
         let mut main_ws = repo.pull(main_id).unwrap();
-        main_ws.commit(TribleSet::new(), "local commit");
+        main_ws.commit(Fragment::empty(), "local commit");
         let commit_a = main_ws.head().unwrap();
         repo.push(&mut main_ws).unwrap();
 
         let source_id = repo.ensure_branch("source", None).unwrap();
         let mut src_ws = repo.pull(source_id).unwrap();
-        src_ws.commit(TribleSet::new(), "remote commit");
+        src_ws.commit(Fragment::empty(), "remote commit");
         let commit_b = src_ws.head().unwrap();
         repo.push(&mut src_ws).unwrap();
 

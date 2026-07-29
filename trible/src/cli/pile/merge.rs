@@ -101,7 +101,7 @@ pub fn run(
 ) -> Result<()> {
     let key = load_signing_key(&signing_key)?;
     let pile: Pile = Pile::open(&pile_path)?;
-    let mut repo = Repository::new(pile, key, TribleSet::new())?;
+    let mut repo = Repository::new(pile, key);
 
     let res = (|| -> Result<(), anyhow::Error> {
         repo.storage_mut()

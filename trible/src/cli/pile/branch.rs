@@ -384,7 +384,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
             let pile: Pile = Pile::open(&pile)?;
             let key = load_signing_key(&signing_key)?;
-            let mut repo = Repository::new(pile, key, TribleSet::new())?;
+            let mut repo = Repository::new(pile, key);
 
             let res = (|| -> Result<(), anyhow::Error> {
                 let branch_id = repo
@@ -891,7 +891,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 }
             };
 
-            let mut repo = Repository::new(dst_pile, key, TribleSet::new())?;
+            let mut repo = Repository::new(dst_pile, key);
             let result = (|| -> Result<CopyStats, anyhow::Error> {
                 let src_head: Inline<Handle<SimpleArchive>> = src
                     .head(src_bid)?
@@ -985,7 +985,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
                 let pile_path = pile;
                 let pile_store: Pile = Pile::open(&pile_path)?;
-                let mut repo = Repository::new(pile_store, key.clone(), TribleSet::new())?;
+                let mut repo = Repository::new(pile_store, key.clone());
 
                 let res = (|| -> Result<(), anyhow::Error> {
                     repo.storage_mut().refresh()?;
@@ -1104,7 +1104,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 }
 
                 let pile_store: Pile = Pile::open(&pile)?;
-                let mut repo = Repository::new(pile_store, key.clone(), TribleSet::new())?;
+                let mut repo = Repository::new(pile_store, key.clone());
 
                 let res = (|| -> Result<(), anyhow::Error> {
                     repo.storage_mut().refresh()?;
@@ -1198,7 +1198,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 }
 
                 let pile: Pile = Pile::open(&pile)?;
-                let mut repo = Repository::new(pile, key.clone(), TribleSet::new())?;
+                let mut repo = Repository::new(pile, key.clone());
 
                 let res = (|| -> Result<(), anyhow::Error> {
                     // Ensure in-memory indices are populated.

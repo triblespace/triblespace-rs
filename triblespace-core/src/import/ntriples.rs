@@ -949,10 +949,11 @@ fn record_uri(meta: &mut Fragment, uri: impl IntoBlob<UTF8String>) -> Id {
 ///   predicate URIs and schemas.
 ///
 /// It is import *metadata*, not part of the imported graph: when
-/// persisting an import, store it in the commit's metadata slot
-/// (`ws.commit_with_metadata(import.facts, import.meta, msg)`), or
-/// union it into `facts` (`import.facts + import.meta`) if the
-/// merged view is genuinely wanted.
+/// persisting an import, fold it into the content fragment's
+/// metafacts (`import.facts.describe_with(import.meta)`), which puts
+/// it in the commit's metadata slot without ever letting it reach a
+/// content query. Union it into `facts` (`import.facts +
+/// import.meta`) only if the merged view is genuinely wanted.
 #[derive(Debug)]
 pub struct NtImport {
     /// The imported graph — one trible per source triple, with the

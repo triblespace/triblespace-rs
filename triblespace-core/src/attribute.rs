@@ -36,7 +36,100 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::inline::InlineEncoding;
 use crate::trible::Fragment;
+use core::cell::Cell;
 use core::marker::PhantomData;
+use std::sync::OnceLock;
+
+std::thread_local! {
+    /// Re-entrancy depth for [`AttributeMeta`] construction.
+    ///
+    /// Building an attribute's description is not a leaf operation: it
+    /// asks the value type for `<S as MetaDescribe>::id()`, and those
+    /// `describe()` bodies are themselves written with `entity!{}` over
+    /// `metadata::*` attributes — whose own descriptions are what we're
+    /// in the middle of building. The dependency graph genuinely has
+    /// cycles (`metadata::name` → `Handle<UTF8String>` →
+    /// `metadata::name`), so the only question is where to cut them.
+    ///
+    /// We cut at the outermost build: while a description is under
+    /// construction, nested `entity!{}` expansions contribute no
+    /// metafacts of their own. Those nested fragments are schema
+    /// descriptions to begin with, so their metafacts would be
+    /// redundant. Ids are unaffected — entity ids derive from facts
+    /// only — so this changes nothing observable about identity.
+    static META_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct DepthGuard;
+
+impl DepthGuard {
+    /// Enters the "building a description" region, or returns `None`
+    /// if we are already inside one on this thread.
+    fn enter() -> Option<Self> {
+        META_DEPTH.with(|d| {
+            if d.get() > 0 {
+                None
+            } else {
+                d.set(1);
+                Some(DepthGuard)
+            }
+        })
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        META_DEPTH.with(|d| d.set(0));
+    }
+}
+
+/// A lazily built, process-wide cached description of one attribute.
+///
+/// The [`attributes!`](crate::macros::attributes) macro emits one of
+/// these per declared attribute and hands `entity!{}` a reference to
+/// it, so every entity built from that attribute can fold the
+/// attribute's description into its
+/// [`metafacts`](Fragment::metafacts) without the caller doing
+/// anything.
+///
+/// Construction is deferred (not done in the `Attribute`'s own
+/// initializer) because it needs the value type's schema id, which is
+/// itself described in terms of attributes. See [`META_DEPTH`] for how
+/// the resulting cycles are cut.
+pub struct AttributeMeta {
+    cell: OnceLock<Fragment>,
+    build: fn() -> Fragment,
+}
+
+impl AttributeMeta {
+    /// Wraps a description builder. `const` so the macro can put the
+    /// result in a `static`.
+    pub const fn new(build: fn() -> Fragment) -> Self {
+        Self {
+            cell: OnceLock::new(),
+            build,
+        }
+    }
+
+    /// Returns the built description, or `None` when we are already
+    /// building a description on this thread (see [`META_DEPTH`]).
+    pub fn get(&self) -> Option<&Fragment> {
+        if let Some(fragment) = self.cell.get() {
+            return Some(fragment);
+        }
+        let _guard = DepthGuard::enter()?;
+        let fragment = (self.build)();
+        Some(self.cell.get_or_init(|| fragment))
+    }
+}
+
+impl core::fmt::Debug for AttributeMeta {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AttributeMeta")
+            .field("built", &self.cell.get().is_some())
+            .finish()
+    }
+}
 
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
 /// the identity-determining facts, tagged with a phantom value-schema
@@ -46,12 +139,35 @@ use core::marker::PhantomData;
 /// read — `entity!{}` codegen calls it once per attribute per fact,
 /// and walking the fragment's exports PATCH each time dominated the
 /// pre-0.40 entities/union benches.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// An attribute declared through [`attributes!`](crate::macros::attributes)
+/// additionally carries a pointer to its [`AttributeMeta`], the
+/// description `entity!{}` folds into every fragment built from it.
 pub struct Attribute<S: InlineEncoding> {
     id: Id,
     fragment: Fragment,
+    meta: Option<&'static AttributeMeta>,
     _schema: PhantomData<S>,
 }
+
+impl<S: InlineEncoding> core::fmt::Debug for Attribute<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Attribute")
+            .field("id", &self.id)
+            .field("fragment", &self.fragment)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: InlineEncoding> PartialEq for Attribute<S> {
+    /// Identity + carried facts. The description slot is derived data
+    /// (and interior-mutable), so it does not participate.
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.fragment == other.fragment
+    }
+}
+
+impl<S: InlineEncoding> Eq for Attribute<S> {}
 
 impl<S: InlineEncoding> Clone for Attribute<S> {
     // Manual impl: `PhantomData<S>` doesn't require `S: Clone`, but
@@ -62,6 +178,7 @@ impl<S: InlineEncoding> Clone for Attribute<S> {
         Self {
             id: self.id,
             fragment: self.fragment.clone(),
+            meta: self.meta,
             _schema: PhantomData,
         }
     }
@@ -81,6 +198,33 @@ impl<S: InlineEncoding> Attribute<S> {
     /// The identity-determining fragment.
     pub fn fragment(&self) -> &Fragment {
         &self.fragment
+    }
+
+    /// Attaches a lazily built description to this attribute.
+    ///
+    /// Called by the [`attributes!`](crate::macros::attributes)
+    /// expansion; attributes minted at runtime (importers deriving one
+    /// per JSON field or RDF predicate) leave the slot empty and fall
+    /// back to their identity fragment.
+    pub fn with_meta(mut self, meta: &'static AttributeMeta) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+
+    /// The description `entity!{}` folds into the metafacts of every
+    /// fragment built from this attribute.
+    ///
+    /// For a declared attribute this is the full record — rust
+    /// identifier, value encoding, declaring module, doc comment, and
+    /// the usage entity tying them together. For a runtime-minted
+    /// attribute it is the identity fragment the caller constructed
+    /// (typically `metadata::iri` / `metadata::name` plus
+    /// `metadata::value_encoding`), which is exactly the information an
+    /// importer has to hand.
+    pub fn meta(&self) -> &Fragment {
+        self.meta
+            .and_then(AttributeMeta::get)
+            .unwrap_or(&self.fragment)
     }
 
     /// Convert a host value into a typed `Inline<S>` using the Field's schema.
@@ -146,6 +290,7 @@ impl<S: InlineEncoding> From<Fragment> for Attribute<S> {
         Self {
             id,
             fragment,
+            meta: None,
             _schema: PhantomData,
         }
     }

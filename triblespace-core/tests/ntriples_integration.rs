@@ -22,12 +22,11 @@ use triblespace_core::prelude::BlobStore as _;
 use triblespace_core::prelude::BlobStoreGet as _;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
-use triblespace_core::trible::TribleSet;
 
 fn new_repo() -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[0x11; 32]);
     let store = MemoryRepo::default();
-    Repository::new(store, signing_key, TribleSet::new()).expect("fresh repo")
+    Repository::new(store, signing_key)
 }
 
 const NT_SAMPLE: &[u8] = br#"
@@ -45,7 +44,7 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
     assert_eq!(import.triples, 4, "four non-empty triples in the sample");
-    let facts = import.facts.into_facts();
+    let facts = import.facts.facts().clone();
 
     // `facts` is the faithful graph — no rdf_uri annotations mixed in.
     let uri_in_facts = find!(
@@ -104,7 +103,13 @@ fn ingests_facts_and_roundtrips_via_query() {
     assert_eq!(link_count, 1, "one wrote edge");
 
     // Actually commit, to prove the facts are a valid commit payload.
-    ws.commit(facts, "ntriples import");
+    // The importer mints its attributes from IRIs, so nothing can
+    // describe them on its behalf — fold the import's own
+    // self-description into the content's metafacts and the commit
+    // records it.
+    let mut content = import.facts;
+    content.describe_with(import.meta);
+    ws.commit(content, "ntriples import");
     repo.push(&mut ws).expect("push succeeds");
 }
 
