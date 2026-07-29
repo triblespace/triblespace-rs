@@ -98,13 +98,29 @@ pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummar
                 Ok(m) => m,
                 Err(_) => continue, // unreadable pin metadata — not a usable branch
             };
-            let name = meta.iter().find(|t| t.a() == &name_attr).and_then(|t| {
-                let h = *t.v::<Handle<LongString>>();
-                src_reader
+            // Collect ALL name tribles rather than the first: metadata
+            // carrying two names is malformed, and picking either would
+            // invent the fact that this branch is called that. An
+            // indeterminate name leaves the branch addressable only by its
+            // hex id, which is never ambiguous.
+            let mut name_handles = meta
+                .iter()
+                .filter(|t| t.a() == &name_attr)
+                .map(|t| *t.v::<Handle<LongString>>());
+            let name = match (name_handles.next(), name_handles.next()) {
+                (Some(h), None) => src_reader
                     .get::<View<str>, LongString>(h)
                     .ok()
-                    .map(|v| v.to_string())
-            });
+                    .map(|v| v.to_string()),
+                (Some(_), Some(_)) => {
+                    eprintln!(
+                        "warning: branch {bid:X} carries multiple metadata::name tribles; \
+                         addressable by hex id only"
+                    );
+                    None
+                }
+                _ => None,
+            };
             branches.push(BranchInfo {
                 id: bid,
                 name,
@@ -113,9 +129,42 @@ pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummar
         }
 
         // Resolve --branch by name or hex id (case-insensitive hex).
-        let info = match branches.iter().find(|b| {
-            b.name.as_deref() == Some(branch) || branch.eq_ignore_ascii_case(&format!("{:x}", b.id))
-        }) {
+        //
+        // ALL matches are collected, not the first. Branch names are not
+        // unique and are not enforced to be: `consolidate --by-name` repairs
+        // a collision by minting a fresh id under the same name while the old
+        // members are still live, and `reid` + `cat` exists precisely so two
+        // piles that each have a "main" can be merged. So a name matching
+        // several branches is a normal, representable state — and silently
+        // extracting whichever one iteration order reached first turns that
+        // state into a wrong answer with no indication.
+        //
+        // A hex id is unique by construction (it keys the pin table), so the
+        // error names it as the way out.
+        let matches: Vec<&BranchInfo> = branches
+            .iter()
+            .filter(|b| {
+                b.name.as_deref() == Some(branch)
+                    || branch.eq_ignore_ascii_case(&format!("{:x}", b.id))
+            })
+            .collect();
+        if matches.len() > 1 {
+            let mut listing = String::new();
+            for b in &matches {
+                listing.push_str(&format!(
+                    "  {:X}  {}\n",
+                    b.id,
+                    b.name.as_deref().unwrap_or("(unnamed)")
+                ));
+            }
+            return Err(anyhow!(
+                "branch '{branch}' is ambiguous in {}: {} branches match\n{listing}\
+                 re-run with one of the hex ids above (ids are unique; names are not)",
+                source.display(),
+                matches.len()
+            ));
+        }
+        let info = match matches.into_iter().next() {
             Some(i) => i,
             None => {
                 let mut listing = String::new();
