@@ -24,12 +24,36 @@ pub enum Command {
         /// Handle to locate (e.g. "blake3:HEX..." or bare 64 hex)
         handle: String,
     },
+    /// Report commits whose content uses attributes their metadata never describes.
+    ///
+    /// Attribute ids are minted and stable precisely so that DATA OUTLIVES
+    /// CODE. That only holds if a commit records what its attributes mean:
+    /// `attributes!` generates a usage entity carrying `metadata::attribute`
+    /// (plus `source_module`, and a `KIND_ATTRIBUTE_USAGE` annotation with
+    /// name and description when a doc comment exists), and `Repository::new`
+    /// takes that as commit metadata.
+    ///
+    /// Supplying it is opt-in, and the common helper passes an EMPTY set — so
+    /// a pile can accumulate years of facts that nothing but the original
+    /// source can interpret. This reports where that has happened, per branch
+    /// and per commit, so it can be fixed rather than discovered later.
+    Describes {
+        /// Path to the pile file to inspect
+        pile: PathBuf,
+        /// Restrict to one branch id (hex). Default: every branch.
+        #[arg(long)]
+        branch: Option<String>,
+        /// List every undescribed attribute id, not just the counts.
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Check { pile, fail_fast } => check(&pile, fail_fast),
         Command::LocateHash { pile, handle } => locate_hash_in_pile(&pile, &handle),
+        Command::Describes { pile, branch, verbose } => describes(&pile, branch, verbose),
     }
 }
 
@@ -369,5 +393,148 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
         println!("  parse stopped:  {err}");
         anyhow::bail!("pile contains an unreadable record: {err}");
     }
+    Ok(())
+}
+
+/// Report commits whose content uses attributes their metadata never describes.
+///
+/// The check is a set difference per commit: the attributes appearing in the
+/// A-position of the content's tribles, minus the attributes named by
+/// `metadata::attribute` in the commit's own metadata.
+///
+/// Repo-structural attributes (`head`/`parent`/`content`) are excluded — they
+/// are the commit envelope itself, not payload schema, and describing them in
+/// every commit would be noise that hides the real gaps.
+fn describes(pile_path: &Path, branch_filter: Option<String>, verbose: bool) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use triblespace::prelude::blobencodings::SimpleArchive;
+    use triblespace::prelude::{BlobStore, BlobStoreGet, PinStore};
+    use triblespace_core::id::{id_hex, Id};
+    use triblespace_core::id::RawId;
+    use triblespace_core::inline::encodings::genid::GenId;
+    use triblespace_core::inline::TryFromInline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::Inline;
+    use triblespace_core::trible::TribleSet;
+
+    let mut pile = triblespace::core::repo::pile::Pile::open(pile_path)
+        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", pile_path.display()))?;
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("load pile: {e:?}"))?;
+    let reader = pile
+        .reader()
+        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
+
+    let head_attr: Id = id_hex!("272FBC56108F336C4D2E17289468C35F");
+    let parent_attr: Id = id_hex!("317044B612C690000D798CA660ECFD2A");
+    let content_attr: Id = id_hex!("4DD4DDD05CC31734B03ABB4E43188B1F");
+    // `metadata::attribute` — what a describe() record names.
+    let describes_attr: Id = id_hex!("F10DE6D8E60E0E86013F1B867173A85C");
+
+    let branches: Vec<Id> = pile
+        .pins()
+        .map_err(|e| anyhow::anyhow!("list pins: {e:?}"))?
+        .filter_map(|p| p.ok())
+        .filter(|b| match &branch_filter {
+            Some(want) => format!("{b:X}").eq_ignore_ascii_case(want),
+            None => true,
+        })
+        .collect();
+
+    let mut total_commits = 0usize;
+    let mut total_undescribed_commits = 0usize;
+    let mut all_missing: BTreeMap<String, usize> = BTreeMap::new();
+
+    for branch_id in branches {
+        let Ok(Some(meta_handle)) = pile.head(branch_id) else {
+            continue;
+        };
+        let Ok(branch_meta) = reader.get::<TribleSet, SimpleArchive>(meta_handle) else {
+            continue;
+        };
+        let mut cursor: Option<Inline<Handle<SimpleArchive>>> = branch_meta
+            .iter()
+            .find(|t| t.a() == &head_attr)
+            .map(|t| *t.v::<Handle<SimpleArchive>>());
+
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let (mut commits, mut bad) = (0usize, 0usize);
+        let mut branch_missing: BTreeSet<String> = BTreeSet::new();
+
+        while let Some(h) = cursor {
+            let key = format!("{:?}", h);
+            if !seen.insert(key) {
+                break;
+            }
+            let Ok(commit_meta) = reader.get::<TribleSet, SimpleArchive>(h) else {
+                break;
+            };
+            commits += 1;
+
+            // What this commit says it describes.
+            let described: BTreeSet<Id> = commit_meta
+                .iter()
+                .filter(|t| t.a() == &describes_attr)
+                .filter_map(|t| {
+                    // A GenId value carries the 16-byte id in its low half;
+                    // TryFromInline enforces the high half is zero, so a
+                    // malformed value is skipped rather than misread.
+                    let raw: Result<RawId, _> = t.v::<GenId>().try_from_inline();
+                    raw.ok().and_then(Id::new)
+                })
+                .collect();
+
+            // What its content actually uses.
+            let mut used: BTreeSet<Id> = BTreeSet::new();
+            if let Some(c) = commit_meta
+                .iter()
+                .find(|t| t.a() == &content_attr)
+                .map(|t| *t.v::<Handle<SimpleArchive>>())
+            {
+                if let Ok(content) = reader.get::<TribleSet, SimpleArchive>(c) {
+                    for t in content.iter() {
+                        used.insert(*t.a());
+                    }
+                }
+            }
+
+            let missing: Vec<Id> = used.difference(&described).copied().collect();
+            if !missing.is_empty() {
+                bad += 1;
+                for m in &missing {
+                    branch_missing.insert(format!("{m:X}"));
+                    *all_missing.entry(format!("{m:X}")).or_default() += 1;
+                }
+            }
+
+            cursor = commit_meta
+                .iter()
+                .find(|t| t.a() == &parent_attr)
+                .map(|t| *t.v::<Handle<SimpleArchive>>());
+        }
+
+        total_commits += commits;
+        total_undescribed_commits += bad;
+        if commits > 0 {
+            println!(
+                "branch {branch_id:X}: {commits} commits, {bad} with undescribed attributes ({} distinct)",
+                branch_missing.len()
+            );
+            if verbose {
+                for m in &branch_missing {
+                    println!("    {m}");
+                }
+            }
+        }
+    }
+
+    println!(
+        "\n{total_undescribed_commits} of {total_commits} commits use attributes their metadata does not describe"
+    );
+    println!("{} distinct undescribed attribute ids", all_missing.len());
+    if !verbose && !all_missing.is_empty() {
+        println!("(pass --verbose to list them)");
+    }
+    pile.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;
     Ok(())
 }
