@@ -269,6 +269,28 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         owner: Option<Arc<dyn ArchiveOwner>>,
         rchild_hash: u128,
     ) -> NonNull<Self> {
+        let lchild_hash = lchild.hash();
+        Self::new_with_owner_and_child_hashes(
+            end_depth,
+            lchild,
+            rchild,
+            owner,
+            lchild_hash,
+            rchild_hash,
+        )
+    }
+
+    /// Variant used when a known archive batch bootstraps a Branch directly
+    /// from two LocalLeaves. Both hashes come from the two ArchiveEntries, so
+    /// the six TribleSet indexes do not each hash the same bytes again.
+    pub(super) fn new_with_owner_and_child_hashes(
+        end_depth: usize,
+        lchild: Head<KEY_LEN, O, V>,
+        rchild: Head<KEY_LEN, O, V>,
+        owner: Option<Arc<dyn ArchiveOwner>>,
+        lchild_hash: u128,
+        rchild_hash: u128,
+    ) -> NonNull<Self> {
         unsafe {
             let size = 2;
             // SAFETY: `BRANCH_ALIGN` is a power of two and `size` is small enough
@@ -289,7 +311,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
-            addr_of_mut!((*ptr.as_ptr()).hash).write(lchild.hash() ^ rchild_hash);
+            addr_of_mut!((*ptr.as_ptr()).hash).write(lchild_hash ^ rchild_hash);
             addr_of_mut!((*ptr.as_ptr()).owner).write(owner);
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);

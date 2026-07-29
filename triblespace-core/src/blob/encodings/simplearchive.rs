@@ -158,6 +158,8 @@ fn serial_unarchive(
     owner: Option<&Arc<dyn ArchiveOwner>>,
 ) -> Result<TribleSet, UnarchiveError> {
     let mut tribles = TribleSet::new();
+    let mut first_archive_entry = None;
+    let mut archive_batch_started = false;
     let mut prev_trible: Option<&[u8; 64]> = None;
     for t in slice.iter() {
         let Some(trible) = Trible::as_transmute_force_raw(t) else {
@@ -179,10 +181,25 @@ fn serial_unarchive(
                 // guarantees this element is 16-byte aligned.
                 let ptr = NonNull::from(t);
                 let entry = unsafe { ArchiveEntry::new(ptr, owner_arc) };
-                tribles.insert_archive(&entry);
+                if archive_batch_started {
+                    tribles.insert_archive(&entry);
+                } else if let Some(first) = first_archive_entry.take() {
+                    // The first two validated rows are a same-owner, distinct
+                    // stack batch. They directly bootstrap each PATCH index
+                    // as an owner-bearing Branch over two LocalLeaves.
+                    tribles.insert_archive_batch(&[first, entry]);
+                    archive_batch_started = true;
+                } else {
+                    first_archive_entry = Some(entry);
+                }
             }
             None => tribles.insert(trible),
         }
+    }
+    if let Some(first) = first_archive_entry {
+        // A singleton has no Branch in which to retain the archive owner, so
+        // the batch path creates one shared heap Leaf for all six indexes.
+        tribles.insert_archive_batch(&[first]);
     }
     Ok(tribles)
 }

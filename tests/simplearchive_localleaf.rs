@@ -11,6 +11,7 @@
 //! not trible count).
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::time::Instant;
@@ -120,6 +121,113 @@ fn make_trible(i: u64) -> Trible {
     Trible::force_raw(data).expect("non-nil entity/attribute")
 }
 
+#[test]
+fn simplearchive_batch_layout_and_all_index_parity() {
+    let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
+
+    for n in 0usize..=3 {
+        let mut source = TribleSet::new();
+        for i in 0..n as u64 {
+            source.insert(&make_trible(i));
+        }
+        let expected: BTreeSet<[u8; 64]> = source.eav.iter_ordered().copied().collect();
+        let archive: Blob<SimpleArchive> = SimpleArchive::encode(&source);
+        drop(source);
+
+        let decoded: TribleSet = archive.try_from_blob().unwrap();
+        assert_eq!(decoded.len(), n);
+        let stats = [
+            decoded.eav.node_stats(),
+            decoded.eva.node_stats(),
+            decoded.aev.node_stats(),
+            decoded.ave.node_stats(),
+            decoded.vea.node_stats(),
+            decoded.vae.node_stats(),
+        ];
+        match n {
+            0 => assert!(stats.iter().all(|stat| *stat == (0, 0, 0, 0))),
+            1 => assert!(stats.iter().all(|stat| *stat == (0, 0, 1, 0))),
+            2 => assert!(stats.iter().all(|stat| *stat == (1, 2, 0, 2))),
+            _ => assert!(stats.iter().all(|stat| stat.2 == 0 && stat.3 == n as u64)),
+        }
+
+        macro_rules! assert_index {
+            ($index:expr) => {{
+                let actual: BTreeSet<[u8; 64]> = $index.iter_ordered().copied().collect();
+                assert_eq!(actual, expected);
+            }};
+        }
+        assert_index!(decoded.eav);
+        assert_index!(decoded.eva);
+        assert_index!(decoded.aev);
+        assert_index!(decoded.ave);
+        assert_index!(decoded.vea);
+        assert_index!(decoded.vae);
+
+        if n == 1 {
+            let pointers = [
+                decoded.eav.iter().next().unwrap().as_ptr(),
+                decoded.eva.iter().next().unwrap().as_ptr(),
+                decoded.aev.iter().next().unwrap().as_ptr(),
+                decoded.ave.iter().next().unwrap().as_ptr(),
+                decoded.vea.iter().next().unwrap().as_ptr(),
+                decoded.vae.iter().next().unwrap().as_ptr(),
+            ];
+            assert!(pointers.iter().all(|pointer| *pointer == pointers[0]));
+        }
+
+        if n == 3 {
+            let surviving_clone = decoded.clone();
+            drop(decoded);
+            let noise = vec![0x5au8; 3 * 64 * 32];
+            std::hint::black_box(&noise);
+            assert_eq!(surviving_clone.eav.iter_ordered().count(), 3);
+            assert_eq!(surviving_clone.eva.iter_ordered().count(), 3);
+            assert_eq!(surviving_clone.aev.iter_ordered().count(), 3);
+            assert_eq!(surviving_clone.ave.iter_ordered().count(), 3);
+            assert_eq!(surviving_clone.vea.iter_ordered().count(), 3);
+            assert_eq!(surviving_clone.vae.iter_ordered().count(), 3);
+        }
+    }
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn simplearchive_parallel_chunks_remain_all_local() {
+    let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
+    const N: usize = 4_096;
+
+    let mut source = TribleSet::new();
+    for i in 0..N as u64 {
+        source.insert(&make_trible(i));
+    }
+    let archive: Blob<SimpleArchive> = SimpleArchive::encode(&source);
+    drop(source);
+
+    // Force four non-singleton chunks, each of which must bootstrap directly
+    // from its first pair before the same-owner parallel reduction.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let decoded: TribleSet = pool.install(|| archive.try_from_blob().unwrap());
+    let stats = [
+        decoded.eav.node_stats(),
+        decoded.eva.node_stats(),
+        decoded.aev.node_stats(),
+        decoded.ave.node_stats(),
+        decoded.vea.node_stats(),
+        decoded.vae.node_stats(),
+    ];
+    assert!(stats.iter().all(|stat| stat.2 == 0 && stat.3 == N as u64));
+    assert_eq!(decoded.eav.iter_ordered().count(), N);
+    assert_eq!(decoded.eva.iter_ordered().count(), N);
+    assert_eq!(decoded.aev.iter_ordered().count(), N);
+    assert_eq!(decoded.ave.iter_ordered().count(), N);
+    assert_eq!(decoded.vea.iter_ordered().count(), N);
+    assert_eq!(decoded.vae.iter_ordered().count(), N);
+}
+
 fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
     ALLOCS.store(0, Ordering::Relaxed);
     ALLOC_BYTES.store(0, Ordering::Relaxed);
@@ -136,12 +244,10 @@ fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
 #[test]
 fn simplearchive_decode_uses_archive_owner() {
     let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
-    // Both paths share the same parallel-reduce gate, so at small N
-    // they're naturally serial. At large N the heap path goes parallel
-    // via rayon while the archive path stays serial (LocalLeaf-aware
-    // `union` not yet implemented). To keep the *per-trible* signal
-    // comparable across scales, set `RAYON_NUM_THREADS=1` when running
-    // this test:
+    // Both paths share the same parallel-reduce gate, so at small N they're
+    // naturally serial and at large N both build chunks via rayon. To keep
+    // the *per-trible* signal comparable across scales, set
+    // `RAYON_NUM_THREADS=1` when running this test:
     //
     //     RAYON_NUM_THREADS=1 cargo test --release --test simplearchive_localleaf
     //
@@ -180,6 +286,17 @@ fn measure_at(n: usize) {
     let (archive_set, archive_allocs, archive_bytes) =
         measure(|| -> TribleSet { archive.clone().try_from_blob().unwrap() });
     assert_eq!(archive_set.len(), N);
+    if N >= 2 {
+        let stats = [
+            archive_set.eav.node_stats(),
+            archive_set.eva.node_stats(),
+            archive_set.aev.node_stats(),
+            archive_set.ave.node_stats(),
+            archive_set.vea.node_stats(),
+            archive_set.vae.node_stats(),
+        ];
+        assert!(stats.iter().all(|stat| stat.2 == 0 && stat.3 == N as u64));
+    }
 
     // Wall-clock timing: warm up once, then take a min-of-3 to filter
     // GC/allocator noise. Min beats mean for tight ingest loops where

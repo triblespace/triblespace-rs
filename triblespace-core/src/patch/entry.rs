@@ -101,6 +101,10 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     ///   the low 4 bits). Any `[u8; 64]` at an offset that's a
     ///   multiple of 16 from a 16-byte aligned base satisfies this.
     pub unsafe fn new(ptr: NonNull<[u8; KEY_LEN]>, owner: &'a Arc<dyn ArchiveOwner>) -> Self {
+        // The cached hash must use the same process-local key as PATCH Leaves
+        // even when callers construct ArchiveEntries before their first
+        // PATCH. A completed Once makes subsequent calls a single fast check.
+        crate::patch::init_sip_key();
         debug_assert_eq!(
             ptr.as_ptr() as usize & 0x0f,
             0,
@@ -115,6 +119,13 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
                 .into()
         };
         Self { ptr, owner, hash }
+    }
+
+    /// Returns the archive-resident key bytes borrowed for this entry's
+    /// lifetime. Used by the singleton batch path to create one shared heap
+    /// Entry when no Branch exists to retain the archive owner.
+    pub(crate) fn key(&self) -> &[u8; KEY_LEN] {
+        unsafe { self.ptr.as_ref() }
     }
 
     /// Returns a `LocalLeaf` head for this entry, the borrowed owner

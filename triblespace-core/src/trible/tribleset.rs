@@ -66,25 +66,37 @@ pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleS
         return (id, TribleSet::new());
     }
 
+    let mut set = TribleSet::new();
+    if rows.len() == 1 {
+        // A root LocalLeaf would have nowhere to retain its archive owner.
+        // Keep the singleton as one shared heap Leaf across all six indexes
+        // and avoid creating an otherwise unnecessary owner allocation.
+        set.insert(Trible::as_transmute_raw_unchecked(rows[0].raw()));
+        return (id, set);
+    }
+
     // Keep the final canonical allocation stable before taking any pointers
     // into it. The erased Arc is what PATCH Branch owners retain.
     let rows = Arc::new(IntrinsicEntityRows(rows));
     let owner: Arc<dyn ArchiveOwner> = rows.clone();
-    let mut set = TribleSet::new();
     let mut iter = rows.0.iter();
 
-    // An empty PATCH root has nowhere to retain an archive owner. Seed all six
-    // indexes with one shared heap Entry; the second row creates owner-bearing
-    // Branches, and every remaining row can stay in the archive allocation.
-    let first = iter.next().expect("the empty case returned above");
-    set.insert(Trible::as_transmute_raw_unchecked(first.raw()));
-
-    for row in iter {
+    let entry = |row: &IntrinsicEntityRow| {
         // SAFETY: `row` points into the immutable allocation retained by
         // `owner`. IntrinsicEntityRow is 16-byte aligned and 64 bytes wide, so
         // every element satisfies ArchiveEntry's tagged-pointer alignment.
-        let entry = unsafe { ArchiveEntry::new(NonNull::from(row.raw()), &owner) };
-        set.insert_archive(&entry);
+        unsafe { ArchiveEntry::new(NonNull::from(row.raw()), &owner) }
+    };
+
+    // The known pair can directly form an ordinary owner-bearing Branch in
+    // every index. This is the minimum non-empty archive-backed trie and needs
+    // no heap seed.
+    let first = entry(iter.next().expect("at least two rows remain"));
+    let second = entry(iter.next().expect("at least two rows remain"));
+    set.insert_archive_batch(&[first, second]);
+
+    for row in iter {
+        set.insert_archive(&entry(row));
     }
 
     (id, set)
@@ -357,12 +369,66 @@ impl TribleSet {
     /// Inserts a trible into all six covering indexes.
     pub fn insert(&mut self, trible: &Trible) {
         let key = Entry::new(&trible.data);
-        self.eav.insert(&key);
-        self.eva.insert(&key);
-        self.aev.insert(&key);
-        self.ave.insert(&key);
-        self.vea.insert(&key);
-        self.vae.insert(&key);
+        self.insert_entry(&key);
+    }
+
+    /// Fans one shared heap Entry into all six covering indexes.
+    fn insert_entry(&mut self, entry: &Entry<TRIBLE_LEN>) {
+        self.eav.insert(entry);
+        self.eva.insert(entry);
+        self.aev.insert(entry);
+        self.ave.insert(entry);
+        self.vea.insert(entry);
+        self.vae.insert(entry);
+    }
+
+    /// Inserts a known archive batch without forcing its first row through
+    /// the online empty-root path.
+    ///
+    /// An empty receiving set handles the three irreducible cardinalities
+    /// directly: zero stays empty; one row is copied into one shared heap
+    /// Entry because a standalone LocalLeaf cannot retain an owner; two or
+    /// more distinct rows from the same owner bootstrap each index as one
+    /// owner-bearing Branch over two LocalLeaves. Remaining rows use ordinary
+    /// archive insertion. Duplicate or cross-owner leading pairs safely fall
+    /// back to the online path.
+    pub(crate) fn insert_archive_batch(&mut self, entries: &[ArchiveEntry<'_, TRIBLE_LEN>]) {
+        if entries.is_empty() {
+            return;
+        }
+        if !self.is_empty() {
+            for entry in entries {
+                self.insert_archive(entry);
+            }
+            return;
+        }
+
+        let first = &entries[0];
+        let Some(second) = entries.get(1) else {
+            let shared = Entry::new(first.key());
+            self.insert_entry(&shared);
+            return;
+        };
+
+        if first.key() == second.key() || !Arc::ptr_eq(first.owner(), second.owner()) {
+            let shared = Entry::new(first.key());
+            self.insert_entry(&shared);
+            for entry in &entries[1..] {
+                self.insert_archive(entry);
+            }
+            return;
+        }
+
+        self.eav = PATCH::from_archive_pair(first, second);
+        self.eva = PATCH::from_archive_pair(first, second);
+        self.aev = PATCH::from_archive_pair(first, second);
+        self.ave = PATCH::from_archive_pair(first, second);
+        self.vea = PATCH::from_archive_pair(first, second);
+        self.vae = PATCH::from_archive_pair(first, second);
+
+        for entry in &entries[2..] {
+            self.insert_archive(entry);
+        }
     }
 
     /// Inserts an archive-backed trible into all six covering indexes
@@ -638,6 +704,18 @@ mod tests {
         assert_eq!(id, expected_id);
         assert_eq!(set.len(), 2);
         assert_all_indexes(&set, &expected);
+        let stats = [
+            set.eav.node_stats(),
+            set.eva.node_stats(),
+            set.aev.node_stats(),
+            set.ave.node_stats(),
+            set.vea.node_stats(),
+            set.vae.node_stats(),
+        ];
+        assert!(stats.iter().all(|stat| *stat == (1, 2, 0, 2)));
+        assert_eq!(stats.iter().map(|stat| stat.0).sum::<u64>(), 6);
+        assert_eq!(stats.iter().map(|stat| stat.2).sum::<u64>(), 0);
+        assert_eq!(stats.iter().map(|stat| stat.3).sum::<u64>(), 12);
         for raw in &expected {
             assert_eq!(&raw[E_START..=E_END], &id[..]);
             assert!(Trible::force_raw(*raw).is_some());
@@ -655,6 +733,31 @@ mod tests {
 
         assert_eq!(id, expected_id);
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn intrinsic_singleton_shares_one_heap_leaf_across_indexes() {
+        let (_, set) = build_intrinsic_entity(vec![intrinsic_row([1; 16], [0x11; 32])]);
+
+        let stats = [
+            set.eav.node_stats(),
+            set.eva.node_stats(),
+            set.aev.node_stats(),
+            set.ave.node_stats(),
+            set.vea.node_stats(),
+            set.vae.node_stats(),
+        ];
+        assert!(stats.iter().all(|stat| *stat == (0, 0, 1, 0)));
+
+        let pointers = [
+            set.eav.iter().next().unwrap().as_ptr(),
+            set.eva.iter().next().unwrap().as_ptr(),
+            set.aev.iter().next().unwrap().as_ptr(),
+            set.ave.iter().next().unwrap().as_ptr(),
+            set.vea.iter().next().unwrap().as_ptr(),
+            set.vae.iter().next().unwrap().as_ptr(),
+        ];
+        assert!(pointers.iter().all(|pointer| *pointer == pointers[0]));
     }
 
     #[test]
