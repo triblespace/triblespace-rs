@@ -370,3 +370,91 @@ proptest! {
             "checkout should track the commit");
     }
 }
+
+// ── Branch-head annotations survive a rebuild ─────────────────────────
+//
+// Pushing a commit REBUILDS the branch-head metadata: `branch_metadata`
+// mints a fresh, content-derived branch entity, so anything else stored
+// beside it is dropped unless deliberately carried forward.
+//
+// That carry used to name exactly one kind (`index_home::manifest_tribles`),
+// which made head metadata durable only for annotations core knew about by
+// name — a closed-world assumption in a store built on open extension. The
+// loss was invisible: an annotation could be written, read back, and then
+// vanish at the next unrelated push, with no error at the write and no trace
+// afterwards.
+//
+// This asserts the property that makes head metadata usable by anything
+// outside core — a migration record, a downstream faculty's annotation.
+mod branch_head_carry {
+    use super::*;
+    use triblespace_core::repo::branch;
+
+    mod ann {
+        use triblespace_core::prelude::*;
+        attributes! {
+            "DD00000000000000DD00000000000002" as pub note: inlineencodings::ShortString;
+        }
+    }
+
+    #[test]
+    fn an_unknown_fact_on_a_branch_head_survives_a_push() {
+        let storage = MemoryRepo::default();
+        let mut repo =
+            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        let branch_id = *repo.create_branch("annotated", None).expect("create branch");
+
+        // Attach an annotation core knows nothing about, beside the head.
+        let marker = rngid();
+        let annotation: TribleSet = entity! { &marker @ ann::note: "kilroy" }.into();
+        let base = repo
+            .storage_mut()
+            .head(branch_id)
+            .expect("head")
+            .expect("branch exists");
+        let mut head_set: TribleSet = repo
+            .storage_mut()
+            .reader()
+            .expect("reader")
+            .get(base)
+            .expect("read head meta");
+        head_set += annotation;
+        let handle = repo
+            .storage_mut()
+            .put(head_set.to_blob())
+            .expect("store annotated head");
+        repo.storage_mut()
+            .update(branch_id, Some(base), Some(handle))
+            .expect("update head");
+
+        // An ordinary commit — nothing to do with the annotation.
+        let mut ws = repo.pull(branch_id).expect("pull");
+        let e = rngid();
+        let work: TribleSet = entity! { &e @ test_ns::label: "work" }.into();
+        ws.commit(work, "a commit");
+        repo.push(&mut ws).expect("push");
+
+        // The annotation must still be there.
+        let after_handle = repo
+            .storage_mut()
+            .head(branch_id)
+            .expect("head")
+            .expect("branch exists");
+        let after: TribleSet = repo
+            .storage_mut()
+            .reader()
+            .expect("reader")
+            .get(after_handle)
+            .expect("read head meta");
+        let notes: Vec<Inline<triblespace_core::inline::encodings::shortstring::ShortString>> =
+            find!(n: Inline<ShortString>, pattern!(&after, [{ marker @ ann::note: ?n }])).collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "an annotation beside the branch head must survive a push that rebuilds it"
+        );
+
+        // And the head genuinely advanced — otherwise this proves nothing.
+        assert_ne!(after_handle, base, "the push must have rebuilt the head");
+    }
+}
