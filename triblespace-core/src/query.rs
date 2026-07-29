@@ -101,6 +101,34 @@ pub trait TriblePattern {
     ) -> Self::PatternConstraint<'a>;
 }
 
+/// Query a backend through a shared reference.
+///
+/// Exists so a caller that does not OWN its backend can still query it. The
+/// motivating case: `WgpuSuccinctArchive::new` takes a `SuccinctArchive` by
+/// value and lends it back through
+/// [`archive`](crate::repo::index_home::SuccinctRollup), so the host and
+/// device views of the same data cannot both be owners. Without this impl a
+/// benchmark cannot alternate between them, which forces two full censuses
+/// and makes a truncated run yield one arm instead of a comparison.
+///
+/// Pure forwarding — the constraint and its lifetime are the referent's, so
+/// borrowing costs nothing and changes no semantics.
+impl<T: TriblePattern> TriblePattern for &T {
+    type PatternConstraint<'a>
+        = T::PatternConstraint<'a>
+    where
+        Self: 'a;
+
+    fn pattern<'a, V: InlineEncoding>(
+        &'a self,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
+    ) -> Self::PatternConstraint<'a> {
+        (**self).pattern(e, a, v)
+    }
+}
+
 /// Low-level identifier for a variable in a query.
 pub type VariableId = usize;
 
@@ -2916,4 +2944,34 @@ mod tests {
     }
 
 
+}
+
+#[cfg(test)]
+mod reference_pattern_tests {
+    use super::*;
+    use crate::trible::TribleSet;
+
+    /// A borrowed backend produces the same constraint as the owned one.
+    ///
+    /// The point is not that forwarding works — it is that a caller which
+    /// only holds a REFERENCE can query at all. `WgpuSuccinctArchive` owns
+    /// the archive it wraps and lends it back; without this impl a host-side
+    /// view of the same bytes is unobtainable, and two arms over one dataset
+    /// must be two full censuses — which is what makes a truncated run yield
+    /// one arm instead of a comparison.
+    #[test]
+    fn a_reference_is_a_pattern_backend() {
+        let set = TribleSet::new();
+        let borrowed: &TribleSet = &set;
+        let mut ctx = VariableContext::new();
+        let e = ctx.next_variable::<crate::inline::encodings::genid::GenId>();
+        let a = ctx.next_variable::<crate::inline::encodings::genid::GenId>();
+        let v = ctx.next_variable::<crate::inline::encodings::genid::GenId>();
+        // Both call sites type-check and yield a constraint over the same
+        // variables; an empty set makes the assertion about the SHAPE, which
+        // is what the impl is for.
+        let owned = set.pattern(e, a, v);
+        let by_ref = borrowed.pattern(e, a, v);
+        assert_eq!(owned.variables(), by_ref.variables());
+    }
 }
