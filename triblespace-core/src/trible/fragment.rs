@@ -21,7 +21,7 @@ use super::TribleSet;
 /// caller as the fragment's interface.
 ///
 /// The embedded blob store is what makes a Fragment *self-contained*:
-/// handles in the facts (e.g. `metadata::name: <Inline<Handle</// LongString>>>`) reference bytes that the fragment carries with
+/// handles in the facts (e.g. `metadata::name: <Inline<Handle</// UTF8String>>>`) reference bytes that the fragment carries with
 /// itself. An empty `MemoryBlobStore` is structurally a single
 /// PATCH-root pointer — fragments without blobs pay essentially
 /// zero overhead.

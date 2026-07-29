@@ -19,7 +19,7 @@
 //! # Where the text lives
 //!
 //! The source view passed to [`IndexKind::build`] carries
-//! `message -> Handle<LongString>` content tribles under a caller-named
+//! `message -> Handle<UTF8String>` content tribles under a caller-named
 //! attribute; the message *text* is a separate content-addressed blob
 //! in the pile. So — like [`HnswRollup`] and its embedding handles —
 //! `Bm25Rollup` holds a blob reader to resolve those handles into the
@@ -54,7 +54,7 @@ use std::collections::HashMap;
 
 use anybytes::View;
 
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -77,7 +77,7 @@ use crate::tokens::WordHash;
 type Seg = SuccinctBM25Index<GenId, WordHash>;
 
 /// An [`IndexKind`] whose segments are [`SuccinctBM25Index`]es over the
-/// `Handle<LongString>` content a branch's entities point at, keyed by
+/// `Handle<UTF8String>` content a branch's entities point at, keyed by
 /// entity id.
 ///
 /// Parameterised by the blob reader `R` used to resolve those content
@@ -92,7 +92,7 @@ pub struct Bm25Rollup<R> {
 }
 
 impl<R> Bm25Rollup<R> {
-    /// A rollup that indexes the text behind the `Handle<LongString>`
+    /// A rollup that indexes the text behind the `Handle<UTF8String>`
     /// values stored under `content_attr`, resolving them through
     /// `reader`.
     pub fn new(reader: R, content_attr: Id) -> Self {
@@ -116,10 +116,10 @@ where
     /// Resolve one content handle into its text. A range is a completion
     /// certificate, so an unreadable source handle fails the build instead of
     /// silently publishing an incomplete projection.
-    fn text_of(&self, h: Inline<Handle<LongString>>) -> Result<String, ArtifactError> {
+    fn text_of(&self, h: Inline<Handle<UTF8String>>) -> Result<String, ArtifactError> {
         let view: View<str> = self
             .reader
-            .get::<View<str>, LongString>(h)
+            .get::<View<str>, UTF8String>(h)
             .map_err(|error| Box::new(error) as ArtifactError)?;
         Ok(view.as_ref().to_owned())
     }
@@ -157,7 +157,7 @@ where
     }
 
     fn build(&self, source: &TribleSet) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
-        // Extract `entity -> Handle<LongString>` tribles under our
+        // Extract `entity -> Handle<UTF8String>` tribles under our
         // content attribute and tokenise each resolved string. An entity can
         // carry several content values in one commit. Treat those values as a
         // monotone union: for each term keep the largest frequency seen in
@@ -167,7 +167,7 @@ where
         let mut docs: HashMap<RawInline, HashMap<RawInline, u32>> = HashMap::new();
         for t in source.iter().filter(|t| t.a() == &self.content_attr) {
             let key: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(t.e());
-            let handle: Inline<Handle<LongString>> = *t.v::<Handle<LongString>>();
+            let handle: Inline<Handle<UTF8String>> = *t.v::<Handle<UTF8String>>();
             let text = self.text_of(handle)?;
 
             let mut value_tfs: HashMap<RawInline, u32> = HashMap::new();
@@ -297,7 +297,7 @@ mod tests {
     use std::collections::HashSet;
 
     use anybytes::Bytes;
-    use triblespace_core::blob::encodings::longstring::LongString;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::blob::Blob;
     use triblespace_core::id::{fucid, Id};
     use triblespace_core::inline::encodings::hash::Handle;
@@ -314,8 +314,8 @@ mod tests {
     use crate::tokens::hash_tokens;
 
     attributes! {
-        "155F694D45E9135AEBBE3FDAE750A69F" as content: Handle<LongString>;
-        "882E48C941C34CA9B27E708A808AEE1C" as alternate_content: Handle<LongString>;
+        "155F694D45E9135AEBBE3FDAE750A69F" as content: Handle<UTF8String>;
+        "882E48C941C34CA9B27E708A808AEE1C" as alternate_content: Handle<UTF8String>;
     }
 
     fn commit(byte: u8) -> triblespace_core::repo::CommitHandle {
@@ -323,7 +323,7 @@ mod tests {
     }
 
     fn stage(storage: &mut MemoryRepo, attribute: Id, document: Id, text: &str) -> TribleSet {
-        let handle: Inline<Handle<LongString>> = storage.put(text.to_owned()).unwrap();
+        let handle: Inline<Handle<UTF8String>> = storage.put(text.to_owned()).unwrap();
         let mut source = TribleSet::new();
         source.insert(&triblespace_core::trible::Trible::new(
             triblespace_core::id::ExclusiveId::force_ref(&document),
@@ -665,7 +665,7 @@ mod tests {
         assert!(kind.build(&TribleSet::new()).unwrap().is_empty());
         assert!(kind.merge(&[]).unwrap().is_empty());
 
-        let unrelated = entity! { _ @ alternate_content: storage.put::<LongString, _>("x".to_owned()).unwrap() }
+        let unrelated = entity! { _ @ alternate_content: storage.put::<UTF8String, _>("x".to_owned()).unwrap() }
             .into_facts();
         assert!(kind.build(&unrelated).unwrap().is_empty());
     }
@@ -674,7 +674,7 @@ mod tests {
     fn unreadable_source_content_fails_the_range_build() {
         let mut storage = MemoryRepo::default();
         let document = *fucid();
-        let missing = Inline::<Handle<LongString>>::new([0xA5; 32]);
+        let missing = Inline::<Handle<UTF8String>>::new([0xA5; 32]);
         let mut source = TribleSet::new();
         source.insert(&triblespace_core::trible::Trible::new(
             triblespace_core::id::ExclusiveId::force_ref(&document),

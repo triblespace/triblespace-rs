@@ -10,7 +10,7 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::id::rngid;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::*;
@@ -21,7 +21,7 @@ use triblespace_core::trible::Fragment;
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000010" as pub note: inlineencodings::Handle<blobencodings::LongString>;
+        "DD00000000000000DD00000000000010" as pub note: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -38,7 +38,7 @@ fn commit_fragment_absorbs_blobs() {
     // staging area yet.
     let e = rngid();
     let mut frag = Fragment::empty();
-    let note_handle = frag.put::<LongString, _>("hello from a fragment");
+    let note_handle = frag.put::<UTF8String, _>("hello from a fragment");
     frag += entity! { &e @ ns::note: note_handle };
 
     // Pre-condition: the fresh workspace's staged store does NOT
@@ -48,7 +48,7 @@ fn commit_fragment_absorbs_blobs() {
         let reader = staged.reader().expect("reader");
         assert!(
             reader
-                .get::<anybytes::View<str>, LongString>(note_handle)
+                .get::<anybytes::View<str>, UTF8String>(note_handle)
                 .is_err(),
             "note bytes shouldn't be in staged before commit"
         );
@@ -61,7 +61,7 @@ fn commit_fragment_absorbs_blobs() {
     let mut staged = ws.staged.clone();
     let reader = staged.reader().expect("reader");
     let resolved: anybytes::View<str> = reader
-        .get::<anybytes::View<str>, LongString>(note_handle)
+        .get::<anybytes::View<str>, UTF8String>(note_handle)
         .expect("note bytes must round-trip through commit absorption");
     assert_eq!(&*resolved, "hello from a fragment");
 }
@@ -81,14 +81,14 @@ fn commit_tribleset_auto_promotes() {
     let e = rngid();
     // Put the blob via the workspace's staged store the old way,
     // pass a bare TribleSet to commit.
-    let h: triblespace_core::inline::Inline<Handle<LongString>> = ws.put("tribleset-side bytes");
+    let h: triblespace_core::inline::Inline<Handle<UTF8String>> = ws.put("tribleset-side bytes");
     data += entity! { &e @ ns::note: h };
     ws.commit(data, "tribleset commit");
 
     let mut staged = ws.staged.clone();
     let reader = staged.reader().expect("reader");
     let resolved: anybytes::View<str> = reader
-        .get::<anybytes::View<str>, LongString>(h)
+        .get::<anybytes::View<str>, UTF8String>(h)
         .expect("note bytes were already in staged");
     assert_eq!(&*resolved, "tribleset-side bytes");
 }

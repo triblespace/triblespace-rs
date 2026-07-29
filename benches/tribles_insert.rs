@@ -53,7 +53,7 @@ fn bench_inserts(c: &mut Criterion) {
                 let mut store = MemoryBlobStore::new();
                 for (trible, text) in data.tribles.iter().zip(&data.blobs) {
                     let handle: Inline<_> = store
-                        .put::<triblespace::prelude::blobencodings::LongString, _>(text.clone())
+                        .put::<triblespace::prelude::blobencodings::UTF8String, _>(text.clone())
                         .expect("blob store insert");
                     // The sampled trible supplies the raw entity and attribute IDs.
                     let blob_trible = Trible::force(trible.e(), trible.a(), &handle);

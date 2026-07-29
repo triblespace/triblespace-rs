@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::export::json::export_to_json;
@@ -58,7 +58,7 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
             let (merged, root, data_tribles) = {
                 let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
                 let fragment = importer
-                    .import_blob(Blob::<LongString>::new(Bytes::from(
+                    .import_blob(Blob::<UTF8String>::new(Bytes::from(
                         fixture.payload.clone().into_bytes(),
                     )))
                     .expect("import JSON");
@@ -234,7 +234,7 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                     let (merged, root) = {
                         let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
                         let fragment = importer
-                            .import_blob(Blob::<LongString>::new(Bytes::from(
+                            .import_blob(Blob::<UTF8String>::new(Bytes::from(
                                 prepared.payload.clone().into_bytes(),
                             )))
                             .expect("import JSON");
@@ -272,7 +272,7 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                     let (merged, root) = {
                         let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
                         let fragment = importer
-                            .import_blob(Blob::<LongString>::new(Bytes::from(payload.clone())))
+                            .import_blob(Blob::<UTF8String>::new(Bytes::from(payload.clone())))
                             .expect("import JSON");
                         let root = fragment
                             .root()

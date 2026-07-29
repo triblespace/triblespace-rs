@@ -15,7 +15,7 @@ use anybytes::{Bytes, View};
 use winnow::stream::Stream;
 
 use crate::attribute::Attribute;
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
@@ -141,7 +141,7 @@ where
     store: &'a mut Store,
     bool_attrs: HashMap<View<str>, Attribute<Boolean>>,
     num_attrs: HashMap<View<str>, Attribute<F64>>,
-    str_attrs: HashMap<View<str>, Attribute<Handle<LongString>>>,
+    str_attrs: HashMap<View<str>, Attribute<Handle<UTF8String>>>,
     genid_attrs: HashMap<View<str>, Attribute<GenId>>,
     id_salt: Option<[u8; 32]>,
     array_fields: HashSet<View<str>>,
@@ -191,12 +191,12 @@ where
     fn str_attr(
         &mut self,
         field: &ParsedString,
-    ) -> Result<Attribute<Handle<LongString>>, JsonImportError> {
+    ) -> Result<Attribute<Handle<UTF8String>>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.str_attrs.get(&key) {
             return Ok(attr.clone());
         }
-        let attr = self.attr_from_field::<Handle<LongString>>(field)?;
+        let attr = self.attr_from_field::<Handle<UTF8String>>(field)?;
         self.str_attrs.insert(key, attr.clone());
         Ok(attr)
     }
@@ -230,9 +230,9 @@ where
         self.import_blob(input.to_owned().to_blob())
     }
 
-    /// Imports a JSON document from a [`LongString`] blob, returning a
+    /// Imports a JSON document from a [`UTF8String`] blob, returning a
     /// [`Fragment`] with the root entity ids as exports.
-    pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Fragment, JsonImportError> {
+    pub fn import_blob(&mut self, blob: Blob<UTF8String>) -> Result<Fragment, JsonImportError> {
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);
 
@@ -384,7 +384,7 @@ where
                 let text = self.parse_string(bytes)?;
                 let field_name = field.as_ref().to_owned();
                 let attr = self.str_attr(field)?;
-                let handle: Inline<Handle<LongString>> =
+                let handle: Inline<Handle<UTF8String>> =
                     self.store
                         .put(text)
                         .map_err(|err| JsonImportError::EncodeString {
@@ -485,7 +485,7 @@ where
         meta += <Boolean as MetaDescribe>::describe();
         meta += <F64 as MetaDescribe>::describe();
         meta += <GenId as MetaDescribe>::describe();
-        meta += <Handle<LongString> as MetaDescribe>::describe();
+        meta += <Handle<UTF8String> as MetaDescribe>::describe();
         for (key, attr) in self.bool_attrs.iter() {
             meta += attr.describe();
             if self.array_fields.contains(key) {
@@ -676,17 +676,17 @@ mod tests {
     fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawInline {
         use crate::blob::IntoBlob;
         use crate::metadata::MetaDescribe;
-        let h: Inline<Handle<LongString>> = String::from(expected_attr).to_blob().get_handle();
-        let attr = Attribute::<Handle<LongString>>::from(crate::macros::entity! {
+        let h: Inline<Handle<UTF8String>> = String::from(expected_attr).to_blob().get_handle();
+        let attr = Attribute::<Handle<UTF8String>>::from(crate::macros::entity! {
             metadata::name:         h,
-            metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+            metadata::value_encoding: <Handle<UTF8String> as MetaDescribe>::id(),
         })
         .id();
         let trible = facts
             .iter()
             .find(|t| *t.a() == attr)
             .expect("missing string trible");
-        trible.v::<Handle<LongString>>().raw
+        trible.v::<Handle<UTF8String>>().raw
     }
 
     fn read_text(blobs: &mut MemoryBlobStore, handle_raw: RawInline) -> String {
@@ -694,14 +694,14 @@ mod tests {
         let (_, blob) = entries
             .iter()
             .find(|(h, _)| {
-                let h: Inline<Handle<LongString>> = (*h).transmute();
+                let h: Inline<Handle<UTF8String>> = (*h).transmute();
                 h.raw == handle_raw
             })
             .expect("handle not found in blob store");
 
         let text: View<str> = blob
             .clone()
-            .transmute::<LongString>()
+            .transmute::<UTF8String>()
             .try_from_blob()
             .expect("blob should decode as string");
         text.as_ref().to_owned()

@@ -3,7 +3,7 @@ use std::fmt;
 use std::fmt::Write as FmtWrite;
 
 use crate::and;
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::id::Id;
 use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::f64::F64;
@@ -64,7 +64,7 @@ pub fn export_to_json(
 ) -> Result<(), ExportError> {
     let mut multi_flags = HashSet::new();
     find!(
-        (name_handle: Inline<Handle<LongString>>),
+        (name_handle: Inline<Handle<UTF8String>>),
         temp!((field), pattern!(merged, [
             { ?field @ metadata::name: ?name_handle },
             { ?field @ metadata::tag: metadata::KIND_MULTI }
@@ -103,12 +103,12 @@ fn write_entity(
 
     let mut field_values: Vec<(
         RawInline,
-        Inline<Handle<LongString>>,
+        Inline<Handle<UTF8String>>,
         Id,
         Inline<UnknownInline>,
     )> = Vec::new();
     find!(
-        (name_handle: Inline<Handle<LongString>>, schema_value: Inline<GenId>, value: Inline<UnknownInline>),
+        (name_handle: Inline<Handle<UTF8String>>, schema_value: Inline<GenId>, value: Inline<UnknownInline>),
         temp!((e, attr), and!(
             e.is(entity.to_inline()),
             merged.pattern(e, attr, value),
@@ -181,7 +181,7 @@ fn render_schema_value(
     static BOOLEAN_ID: LazyLock<Id> = LazyLock::new(Boolean::id);
     static F64_ID: LazyLock<Id> = LazyLock::new(F64::id);
     static GENID_ID: LazyLock<Id> = LazyLock::new(GenId::id);
-    static HANDLE_BLAKE3_LONGSTRING_ID: LazyLock<Id> = LazyLock::new(Handle::<LongString>::id);
+    static HANDLE_BLAKE3_LONGSTRING_ID: LazyLock<Id> = LazyLock::new(Handle::<UTF8String>::id);
 
     if schema == *BOOLEAN_ID {
         let value = value.transmute::<Boolean>();
@@ -215,7 +215,7 @@ fn render_schema_value(
         return Ok(());
     }
     if schema == *HANDLE_BLAKE3_LONGSTRING_ID {
-        let handle = value.transmute::<Handle<LongString>>();
+        let handle = value.transmute::<Handle<UTF8String>>();
         let text = resolve_string(ctx, handle)?;
         write_escaped_str(text.as_ref(), out);
         return Ok(());
@@ -287,7 +287,7 @@ struct ExportCtx<'a, Store: BlobStoreGet> {
 
 fn resolve_name(
     ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
-    handle: Inline<Handle<LongString>>,
+    handle: Inline<Handle<UTF8String>>,
 ) -> Result<String, ExportError> {
     if let Some(cached) = ctx.name_cache.get(&handle.raw) {
         return Ok(cached.clone());
@@ -296,7 +296,7 @@ fn resolve_name(
     let hash: Inline<Hash<Blake3>> = Handle::to_hash(handle);
     let text = ctx
         .store
-        .get::<View<str>, LongString>(handle)
+        .get::<View<str>, UTF8String>(handle)
         .map_err(|err| ExportError::BlobStore {
             hash: hex::encode(hash.raw),
             source: err.to_string(),
@@ -308,7 +308,7 @@ fn resolve_name(
 
 fn resolve_string(
     ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
-    handle: Inline<Handle<LongString>>,
+    handle: Inline<Handle<UTF8String>>,
 ) -> Result<View<str>, ExportError> {
     if let Some(cached) = ctx.string_cache.get(&handle.raw) {
         return Ok(cached.clone());
@@ -317,7 +317,7 @@ fn resolve_string(
     let hash: Inline<Hash<Blake3>> = Handle::to_hash(handle);
     let text: View<str> = ctx
         .store
-        .get::<View<str>, LongString>(handle)
+        .get::<View<str>, UTF8String>(handle)
         .map_err(|err| ExportError::BlobStore {
             hash: hex::encode(hash.raw),
             source: err.to_string(),

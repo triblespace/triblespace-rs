@@ -10,7 +10,7 @@ use itertools::Itertools;
 
 use ed25519::signature::Signer;
 
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::inline::Inline;
@@ -39,7 +39,7 @@ impl From<SignatureError> for ValidationError {
 ///
 /// The resulting [`TribleSet`] is signed using `signing_key` when content is
 /// present, so that its authenticity can later be verified. If `msg` is
-/// provided it is stored as a long commit message via a LongString blob
+/// provided it is stored as a long commit message via a UTF8String blob
 /// handle. If `metadata` is provided it is stored as a SimpleArchive handle.
 ///
 /// The commit's entity id is derived intrinsically from the
@@ -53,7 +53,7 @@ impl From<SignatureError> for ValidationError {
 pub fn commit_metadata(
     signing_key: &SigningKey,
     parents: impl IntoIterator<Item = Inline<Handle<SimpleArchive>>>,
-    msg: Option<Inline<Handle<LongString>>>,
+    msg: Option<Inline<Handle<UTF8String>>>,
     content: Option<Blob<SimpleArchive>>,
     metadata: Option<Inline<Handle<SimpleArchive>>>,
 ) -> TribleSet {

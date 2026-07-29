@@ -1,6 +1,6 @@
 use anybytes::Bytes;
 use serde_json::json;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::export::json::export_to_json;
@@ -22,7 +22,7 @@ fn exports_json_with_cardinality_hints() {
     let mut blobs = MemoryBlobStore::new();
     let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
-    let blob: Blob<LongString> = Blob::new(Bytes::from(json.into_bytes()));
+    let blob: Blob<UTF8String> = Blob::new(Bytes::from(json.into_bytes()));
     let fragment = importer.import_blob(blob).expect("import payload");
     let root = fragment
         .root()
@@ -80,7 +80,7 @@ fn exports_openai_like_conversation() {
     let mut blobs = MemoryBlobStore::new();
     let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
-    let blob: Blob<LongString> = Blob::new(Bytes::from(json.into_bytes()));
+    let blob: Blob<UTF8String> = Blob::new(Bytes::from(json.into_bytes()));
     let fragment = importer.import_blob(blob).expect("import payload");
     let root = fragment
         .root()

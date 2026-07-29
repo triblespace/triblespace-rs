@@ -331,13 +331,13 @@ proptest! {
         content in vec(any::<u8>(), 0..200),
     ) {
         use triblespace_core::blob::MemoryBlobStore;
-        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
         use triblespace_core::repo::{BlobStorePut, BlobStore, BlobStoreGet};
         use anybytes::View;
 
         let text = String::from_utf8_lossy(&content).to_string();
         let mut store: MemoryBlobStore = MemoryBlobStore::default();
-        let handle = store.put::<LongString, _>(text.clone()).expect("put");
+        let handle = store.put::<UTF8String, _>(text.clone()).expect("put");
 
         let reader = store.reader().expect("reader");
         let retrieved: View<str> = reader.get(handle).expect("get");

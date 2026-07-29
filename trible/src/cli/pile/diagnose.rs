@@ -34,7 +34,7 @@ pub fn run(cmd: Command) -> Result<()> {
 }
 
 fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
-    use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
+    use triblespace::prelude::blobencodings::{UTF8String, SimpleArchive};
     use triblespace::prelude::{BlobStore, BlobStoreGet, PinStore};
 
     use triblespace_core::id::id_hex;
@@ -190,7 +190,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                     Ok(meta) => {
                                         for t in meta.iter() {
                                             if t.a() == &name_attr {
-                                                let h: Inline<Handle<LongString>> = *t.v();
+                                                let h: Inline<Handle<UTF8String>> = *t.v();
                                                 if let Ok(view) = reader
                                                     .get::<triblespace::prelude::View<str>, _>(h)
                                                 {

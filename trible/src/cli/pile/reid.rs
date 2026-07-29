@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
 use triblespace::prelude::*;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
@@ -81,11 +81,11 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
             }
         };
 
-        let mut name_handle: Option<Inline<Handle<LongString>>> = None;
+        let mut name_handle: Option<Inline<Handle<UTF8String>>> = None;
         let mut head_handle: Option<Inline<Handle<SimpleArchive>>> = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                name_handle = Some(*t.v::<Handle<LongString>>());
+                name_handle = Some(*t.v::<Handle<UTF8String>>());
             } else if t.a() == &head_attr {
                 head_handle = Some(*t.v::<Handle<SimpleArchive>>());
             }
@@ -101,7 +101,7 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
 
         // Resolve human-readable name for logging.
         let name: String = src_reader
-            .get::<View<str>, LongString>(name_handle)
+            .get::<View<str>, UTF8String>(name_handle)
             .map(|v| v.to_string())
             .unwrap_or_else(|_| format!("{bid:x}"));
 

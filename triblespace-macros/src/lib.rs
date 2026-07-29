@@ -35,7 +35,7 @@ mod instrumentation_attributes {
     /// Reuses `metadata::name`, `metadata::attribute`, and `metadata::tag` for
     /// fields that match their runtime `describe()` counterparts.
     pub(crate) mod attribute {
-        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
         use triblespace_core::prelude::inlineencodings::{Handle, ShortString};
         use triblespace_core_macros::attributes;
 
@@ -43,20 +43,20 @@ mod instrumentation_attributes {
             // Instrumentation-specific: link back to the macro invocation entity.
             "19D4972B2DF977FA64541FC967C4B133" as invocation: ShortString;
             // Instrumentation-specific: the Rust type tokens for this attribute's inline encoding.
-            "D97A427FF782B0BF08B55AC84877B486" as attribute_type: Handle<LongString>;
+            "D97A427FF782B0BF08B55AC84877B486" as attribute_type: Handle<UTF8String>;
         }
     }
 
     pub(crate) mod invocation {
-        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
         use triblespace_core::prelude::inlineencodings::{Handle, LineLocation, ShortString};
         use triblespace_core_macros::attributes;
 
         attributes! {
             "1CED5213A71C9DD60AD9B3698E5548F4" as macro_kind: ShortString;
-            "E413CB09A4352D7B46B65FC635C18CCC" as manifest_dir: Handle<LongString>;
+            "E413CB09A4352D7B46B65FC635C18CCC" as manifest_dir: Handle<UTF8String>;
             "8ED33DA54C226ADEA0FFF7863563DF5F" as source_range: LineLocation;
-            "B981AEA9437561F8DB96E7EECBB94BFD" as source_tokens: Handle<LongString>;
+            "B981AEA9437561F8DB96E7EECBB94BFD" as source_tokens: Handle<UTF8String>;
             "92EF719DA3DD2405E89B953837E076A5" as crate_name: ShortString;
         }
     }

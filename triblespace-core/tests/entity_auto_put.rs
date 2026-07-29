@@ -9,7 +9,7 @@
 //! then self-contained — every handle in its facts resolves against
 //! its own blob store.
 
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
 use triblespace_core::id::rngid;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -19,28 +19,28 @@ use triblespace_core::repo::{BlobStore, BlobStoreGet};
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000020" as pub note: inlineencodings::Handle<blobencodings::LongString>;
+        "DD00000000000000DD00000000000020" as pub note: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
 #[test]
 fn entity_auto_puts_blob_handle_fields() {
     let e = rngid();
-    // Build a Blob (typed as LongString) without ever touching a blob
+    // Build a Blob (typed as UTF8String) without ever touching a blob
     // store. Pass it directly into `entity!{}` as the value for a
-    // Handle<LongString>-typed field. The macro must:
+    // Handle<UTF8String>-typed field. The macro must:
     //   1. Run IntoEncoded → get back (handle, Some(bytes)).
     //   2. Insert the bytes into the fragment's local blob store.
     //   3. Use the handle as the field value.
-    let blob: Blob<LongString> = "hi from a Blob<LongString>".to_blob();
+    let blob: Blob<UTF8String> = "hi from a Blob<UTF8String>".to_blob();
     let expected_handle = blob.clone().get_handle();
 
     let frag = entity! { &e @ ns::note: blob };
 
     // The handle in the facts must match what the macro computed.
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::inline::Inline<Handle<LongString>> = find!(
-        (h: triblespace_core::inline::Inline<Handle<LongString>>),
+    let resolved: triblespace_core::inline::Inline<Handle<UTF8String>> = find!(
+        (h: triblespace_core::inline::Inline<Handle<UTF8String>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)
@@ -52,14 +52,14 @@ fn entity_auto_puts_blob_handle_fields() {
     let mut blobs = frag.blobs().clone();
     let reader = blobs.reader().expect("blob reader");
     let bytes: anybytes::View<str> = reader
-        .get::<anybytes::View<str>, LongString>(resolved)
+        .get::<anybytes::View<str>, UTF8String>(resolved)
         .expect("note bytes were absorbed by the macro");
-    assert_eq!(&*bytes, "hi from a Blob<LongString>");
+    assert_eq!(&*bytes, "hi from a Blob<UTF8String>");
 }
 
 #[test]
 fn entity_still_accepts_precomputed_value() {
-    // Passing a precomputed `Inline<Handle<LongString>>` still
+    // Passing a precomputed `Inline<Handle<UTF8String>>` still
     // works via the blanket IntoInline→IntoEncoded impl. No bytes
     // get absorbed (since the caller didn't hand us any), which is
     // the right behaviour — the caller is responsible for making
@@ -70,8 +70,8 @@ fn entity_still_accepts_precomputed_value() {
 
     // Handle is in the facts.
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::inline::Inline<Handle<LongString>> = find!(
-        (h: triblespace_core::inline::Inline<Handle<LongString>>),
+    let resolved: triblespace_core::inline::Inline<Handle<UTF8String>> = find!(
+        (h: triblespace_core::inline::Inline<Handle<UTF8String>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)
@@ -94,9 +94,9 @@ fn entity_still_accepts_precomputed_value() {
 #[test]
 fn entity_pipeline_does_not_rehash() {
     let e = rngid();
-    let bogus_handle: triblespace_core::inline::Inline<Handle<LongString>> =
+    let bogus_handle: triblespace_core::inline::Inline<Handle<UTF8String>> =
         triblespace_core::inline::Inline::new([0xAA; 32]);
-    let blob: Blob<LongString> = Blob::with_handle(
+    let blob: Blob<UTF8String> = Blob::with_handle(
         anybytes::Bytes::from(b"contents whose true hash we'll never see".to_vec()),
         bogus_handle,
     );
@@ -104,8 +104,8 @@ fn entity_pipeline_does_not_rehash() {
     let frag = entity! { &e @ ns::note: blob };
 
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::inline::Inline<Handle<LongString>> = find!(
-        (h: triblespace_core::inline::Inline<Handle<LongString>>),
+    let resolved: triblespace_core::inline::Inline<Handle<UTF8String>> = find!(
+        (h: triblespace_core::inline::Inline<Handle<UTF8String>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)

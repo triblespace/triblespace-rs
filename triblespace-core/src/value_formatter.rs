@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn builtins_emit_and_run() {
-        use crate::blob::encodings::longstring::LongString;
+        use crate::blob::encodings::utf8string::UTF8String;
         use crate::inline::encodings::boolean::Boolean;
         use crate::inline::encodings::ed25519::ED25519PublicKey;
         use crate::inline::encodings::ed25519::ED25519RComponent;
@@ -372,7 +372,7 @@ mod tests {
         bundle += ED25519PublicKey::describe();
         bundle += UnknownInline::describe();
         bundle += <Hash<Blake3> as MetaDescribe>::describe();
-        bundle += <Handle<LongString> as MetaDescribe>::describe();
+        bundle += <Handle<UTF8String> as MetaDescribe>::describe();
 
         let (space, mut store) = bundle.into_facts_and_blobs();
         let reader = store.reader().expect("blob reader");
@@ -561,8 +561,8 @@ mod tests {
             format!("hash:{}", "AB".repeat(32))
         );
 
-        let handle_formatter = formatter_for(Handle::<LongString>::id());
-        let raw = Inline::<Handle<LongString>>::new([0xEF; 32]).raw;
+        let handle_formatter = formatter_for(Handle::<UTF8String>::id());
+        let raw = Inline::<Handle<UTF8String>>::new([0xEF; 32]).raw;
         assert_eq!(
             handle_formatter
                 .format_value_with_limits(&raw, limits)

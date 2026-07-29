@@ -8,7 +8,7 @@
 use anybytes::{Bytes, View};
 use winnow::stream::Stream;
 
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
@@ -33,16 +33,16 @@ type ParsedString = View<str>;
 attributes! {
     /// Node kind tag (one of the `kind_*` constants).
     "D78B9D5A96029FDBBB327E377418AF51" as pub kind: GenId;
-    /// String content stored as a LongString blob.
-    "40BC51924FD5D2058A48D1FA6073F871" as pub string: Handle<LongString>;
+    /// String content stored as a UTF8String blob.
+    "40BC51924FD5D2058A48D1FA6073F871" as pub string: Handle<UTF8String>;
     /// Raw decimal number string (preserves precision).
-    "428E02672FFD0D010D95AE641ADE1730" as pub number_raw: Handle<LongString>;
+    "428E02672FFD0D010D95AE641ADE1730" as pub number_raw: Handle<UTF8String>;
     /// Boolean value.
     "6F43FC771207574BF4CC58D3080C313C" as pub boolean: Boolean;
     /// Parent entity of an object field entry.
     "97A4ACD83EC9EA29EE7E487BB058C437" as pub field_parent: GenId;
-    /// Field name stored as a LongString blob.
-    "2B9FCF2A60C9B05FADDA9F022762B822" as pub field_name: Handle<LongString>;
+    /// Field name stored as a UTF8String blob.
+    "2B9FCF2A60C9B05FADDA9F022762B822" as pub field_name: Handle<UTF8String>;
     /// Ordinal position of a field within its parent object.
     "38C7B1CDEA580DE70A520B2C8CBC4F14" as pub field_index: U256BE;
     /// Inline entity referenced by an object field entry.
@@ -119,7 +119,7 @@ fn describe_kind(kind_id: Id, name: &str, description: &str) -> Fragment {
 #[derive(Clone)]
 struct FieldEntry {
     name: View<str>,
-    name_handle: Inline<Handle<LongString>>,
+    name_handle: Inline<Handle<UTF8String>>,
     index: u64,
     value: Id,
 }
@@ -157,9 +157,9 @@ where
         self.import_blob(input.to_owned().to_blob())
     }
 
-    /// Imports a JSON document from a [`LongString`] blob, returning a
+    /// Imports a JSON document from a [`UTF8String`] blob, returning a
     /// [`Fragment`] rooted at the document's top-level node.
-    pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Fragment, JsonImportError> {
+    pub fn import_blob(&mut self, blob: Blob<UTF8String>) -> Result<Fragment, JsonImportError> {
         let mut data = TribleSet::new();
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);

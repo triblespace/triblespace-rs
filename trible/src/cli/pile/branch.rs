@@ -12,7 +12,7 @@ use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStorePut;
 use triblespace::prelude::PinStore;
 use triblespace::prelude::View;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -24,7 +24,7 @@ use triblespace_core::trible::TribleSet;
 use super::signing::load_signing_key;
 use triblespace_core::repo::BlobStoreMeta;
 
-type BranchNameHandle = Inline<Handle<LongString>>;
+type BranchNameHandle = Inline<Handle<UTF8String>>;
 
 #[derive(Parser)]
 pub enum Command {
@@ -1658,7 +1658,7 @@ pub fn run(cmd: Command) -> Result<()> {
                                         // Now find the name for this entity.
                                         for t2 in meta_set.iter() {
                                             if t2.e() == t.e() && t2.a() == &name_attr {
-                                                let nh: Inline<Handle<LongString>> = *t2.v();
+                                                let nh: Inline<Handle<UTF8String>> = *t2.v();
                                                 if let Ok(view) = reader.get::<View<str>, _>(nh) {
                                                     attr_names.entry(described_id).or_insert_with(
                                                         || view.as_ref().to_string(),
@@ -1751,7 +1751,7 @@ pub fn run(cmd: Command) -> Result<()> {
                         None
                     };
 
-                    // Store the new name as a LongString blob.
+                    // Store the new name as a UTF8String blob.
                     let name_handle: BranchNameHandle = pile
                         .put(new_name.clone().to_blob())
                         .map_err(|e| anyhow::anyhow!("put name blob: {e:?}"))?;
@@ -1890,7 +1890,7 @@ struct CommitInfo {
     parents: Vec<Inline<Handle<SimpleArchive>>>,
     content: Option<Inline<Handle<SimpleArchive>>>,
     metadata: Option<Inline<Handle<SimpleArchive>>>,
-    message: Option<Inline<Handle<LongString>>>,
+    message: Option<Inline<Handle<UTF8String>>>,
     short_message: Option<String>,
     timestamp: Option<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>>,
     signed_by: Option<[u8; 32]>,
@@ -1930,7 +1930,7 @@ fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
         } else if a == metadata_attr {
             info.metadata = Some(*t.v::<Handle<SimpleArchive>>());
         } else if a == message_attr {
-            info.message = Some(*t.v::<Handle<LongString>>());
+            info.message = Some(*t.v::<Handle<UTF8String>>());
         } else if a == short_message_attr {
             let v: Inline<ShortString> = *t.v();
             info.short_message = v.try_from_inline().ok();

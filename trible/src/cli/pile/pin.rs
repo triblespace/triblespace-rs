@@ -105,11 +105,11 @@ impl Role {
 fn classify(meta: &TribleSet) -> Role {
     // Branch: has metadata::name.
     let mut name_iter = find!(
-        h: Inline<Handle<triblespace_core::blob::encodings::longstring::LongString>>,
+        h: Inline<Handle<triblespace_core::blob::encodings::utf8string::UTF8String>>,
         pattern!(meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
     );
     if name_iter.next().is_some() {
-        // We don't dereference the LongString here (would require an
+        // We don't dereference the UTF8String here (would require an
         // extra blob fetch); the branch row shows the *id* with a
         // hint that it's named — `pile branch list` is the place to
         // get the resolved name.

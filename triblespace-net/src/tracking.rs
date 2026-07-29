@@ -15,7 +15,7 @@
 //! The tracking pin has its own local pin id. Repository can pull/merge
 //! it like any other commit-history pin (a Branch).
 
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
 use triblespace_core::inline::Inline;
@@ -34,7 +34,7 @@ use crate::protocol::RawHash;
 
 // Minted attribute IDs for tracking pins.
 attributes! {
-    "FD45B98C108B3F9F2D18C0B5373BC9FB" as pub remote_name: Handle<LongString>;
+    "FD45B98C108B3F9F2D18C0B5373BC9FB" as pub remote_name: Handle<UTF8String>;
     "ACEBAE99F0B5B1E12DAE3FDC1E2BC575" as pub tracking_remote_pin: GenId;
     "C52A223988BB237B0859319661DA23F5" as pub tracking_peer: ED25519PublicKey;
     // Presence marks a *weak* (lazy/evictable) tracking pin: its history
@@ -144,7 +144,7 @@ where
         };
 
         let Some(name_handle) = find!(
-            h: Inline<Handle<LongString>>,
+            h: Inline<Handle<UTF8String>>,
             pattern!(&meta, [{ _?e @ remote_name: ?h }])
         )
         .next() else {
@@ -245,8 +245,8 @@ where
     let tracking_id: Id = *genid();
 
     let name_string = remote_name_str.to_string();
-    let name_handle: Inline<Handle<LongString>> =
-        store.put::<LongString, String>(name_string).ok()?;
+    let name_handle: Inline<Handle<UTF8String>> =
+        store.put::<UTF8String, String>(name_string).ok()?;
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
 
@@ -298,8 +298,8 @@ where
     let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash)?;
 
     let name_string = remote_name_str.to_string();
-    let name_handle: Inline<Handle<LongString>> =
-        store.put::<LongString, String>(name_string).ok()?;
+    let name_handle: Inline<Handle<UTF8String>> =
+        store.put::<UTF8String, String>(name_string).ok()?;
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
 
@@ -557,10 +557,10 @@ mod tests {
         // Build a fake remote branch metadata blob first so we have something
         // to point to. Use branch_unsigned to avoid signing-key plumbing.
         use triblespace_core::blob::IntoBlob;
-        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
         use triblespace_core::repo::branch::branch_unsigned;
         let name_blob = "remote-branch".to_string().to_blob();
-        let name_handle: Inline<Handle<LongString>> = store.put(name_blob).unwrap();
+        let name_handle: Inline<Handle<UTF8String>> = store.put(name_blob).unwrap();
         let remote_branch_id = genid();
         // Create a dummy commit blob and set it as the remote head.
         let commit_meta: TribleSet = TribleSet::new();
@@ -636,7 +636,7 @@ mod tests {
         // Build a remote branch metadata blob to point a tracking pin at.
         // Returns (remote_branch_id, remote_meta_hash).
         let mut make_remote = |label: &str| -> (Id, RawHash) {
-            let name_handle: Inline<Handle<LongString>> =
+            let name_handle: Inline<Handle<UTF8String>> =
                 store.put(label.to_string().to_blob()).unwrap();
             let remote_branch_id = genid();
             let commit_blob: Blob<SimpleArchive> = TribleSet::new().to_blob();

@@ -56,7 +56,7 @@ mod wiki {
         "F27792C7AF218F1BAE047650DF560B95"
             as pub title: inlineencodings::ShortString;
         "512F2ABC687A4E42916C19E6A552B285"
-            as pub body: inlineencodings::Handle<blobencodings::LongString>;
+            as pub body: inlineencodings::Handle<blobencodings::UTF8String>;
         // `index` rotated 2026-05-05 alongside the
         // `SuccinctBM25Blob` schema id rotation
         // (`5A1EF3FFD638B15E3EBEAA1E92660441` →
@@ -118,7 +118,7 @@ fn seed(pile: &mut Pile) -> Result<TribleSet, Box<dyn Error>> {
 
     let mut kb = TribleSet::new();
     for (id, title, body) in &docs {
-        let body_handle = pile.put::<blobencodings::LongString, _>(body.to_string())?;
+        let body_handle = pile.put::<blobencodings::UTF8String, _>(body.to_string())?;
         kb += entity! { ExclusiveId::force_ref(id) @
             wiki::title: *title,
             wiki::body: body_handle,
@@ -134,8 +134,8 @@ fn refresh(
     pile: &mut Pile,
     kb: &mut TribleSet,
 ) -> Result<Inline<Handle<SuccinctBM25Blob>>, Box<dyn Error>> {
-    let body_handles: Vec<(Id, Inline<Handle<blobencodings::LongString>>)> = find!(
-        (id: Id, body: Inline<Handle<blobencodings::LongString>>),
+    let body_handles: Vec<(Id, Inline<Handle<blobencodings::UTF8String>>)> = find!(
+        (id: Id, body: Inline<Handle<blobencodings::UTF8String>>),
         pattern!(&*kb, [{ ?id @ wiki::body: ?body }])
     )
     .collect();
@@ -143,7 +143,7 @@ fn refresh(
     let reader = pile.reader()?;
     let mut builder: BM25Builder = BM25Builder::new();
     for (id, handle) in &body_handles {
-        let body: View<str> = reader.get::<View<str>, blobencodings::LongString>(*handle)?;
+        let body: View<str> = reader.get::<View<str>, blobencodings::UTF8String>(*handle)?;
         builder.insert(*id, hash_tokens(body.as_ref()));
     }
     let idx: SuccinctBM25Index = builder.build();
@@ -212,7 +212,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut kb = seed(&mut pile)?;
     let n_seeded = find!(
-        (id: Id, h: Inline<Handle<blobencodings::LongString>>),
+        (id: Id, h: Inline<Handle<blobencodings::UTF8String>>),
         pattern!(&kb, [{ ?id @ wiki::body: ?h }])
     )
     .count();

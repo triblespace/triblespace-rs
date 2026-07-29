@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::path::PathBuf;
 
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::PinStore;
@@ -72,7 +72,7 @@ fn read_branch_info(pile: &mut Pile, branch_id: Id) -> Result<BranchInfo> {
             if name.is_some() {
                 bail!("branch {branch_id:X} has multiple name values");
             }
-            let handle: Inline<Handle<LongString>> = *t.v();
+            let handle: Inline<Handle<UTF8String>> = *t.v();
             let view: View<str> = reader
                 .get(handle)
                 .map_err(|e| anyhow::anyhow!("branch name blob: {e:?}"))?;

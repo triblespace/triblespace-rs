@@ -392,9 +392,9 @@ pub trait TryToInline<S: InlineEncoding> {
 /// trait parameter.
 ///
 /// ```ignore
-/// impl Encodes<&str> for LongString {
-///     type Output = Blob<LongString>;
-///     fn encode(s: &str) -> Blob<LongString> { Blob::new(s.into()) }
+/// impl Encodes<&str> for UTF8String {
+///     type Output = Blob<UTF8String>;
+///     fn encode(s: &str) -> Blob<UTF8String> { Blob::new(s.into()) }
 /// }
 /// ```
 ///

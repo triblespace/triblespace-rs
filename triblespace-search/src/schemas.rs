@@ -13,8 +13,8 @@
 //! live next to their index types.
 //!
 //! The built-in tokenizers in [`crate::tokens`] return
-//! `Inline<Handle<LongString>>` — the hash bytes are
-//! valid LongString-blob handles by construction, so there's
+//! `Inline<Handle<UTF8String>>` — the hash bytes are
+//! valid UTF8String-blob handles by construction, so there's
 //! no need for a bespoke "token hash" encoding.
 
 use std::convert::Infallible;
