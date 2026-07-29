@@ -555,10 +555,18 @@ mod tests {
         .unwrap()
     }
 
-    fn edge_facts(source_byte: u8, target_byte: u8) -> TribleSet {
+    /// The edge as a fragment that still knows what `metadata::tag` means —
+    /// what a commit should be handed, so it records its own vocabulary.
+    fn described_edge(source_byte: u8, target_byte: u8) -> Fragment {
         let source = Id::new([source_byte; 16]).unwrap();
         let target = Id::new([target_byte; 16]).unwrap();
-        entity! { ExclusiveId::force_ref(&source) @ metadata::tag: target }.into_facts()
+        entity! { ExclusiveId::force_ref(&source) @ metadata::tag: target }
+    }
+
+    /// Raw tribles, for the helpers that build archives directly and have no
+    /// commit to describe.
+    fn edge_facts(source_byte: u8, target_byte: u8) -> TribleSet {
+        described_edge(source_byte, target_byte).into_facts()
     }
 
     fn store_commit(
@@ -869,19 +877,14 @@ mod tests {
     #[test]
     fn repository_hook_publishes_exact_paths_and_contentless_coverage() {
         let rollup = PathRollup::new(plus_label(metadata::tag.id().into()));
-        let mut repo = Repository::new(
-            MemoryRepo::default(),
-            SigningKey::from_bytes(&[7; 32]),
-            TribleSet::new(),
-        )
-        .unwrap();
+        let mut repo = Repository::new(MemoryRepo::default(), SigningKey::from_bytes(&[7; 32]));
         repo.register_index(rollup.clone());
         let branch_id = *repo.create_branch("paths", None).unwrap();
 
         let mut left = repo.pull(branch_id).unwrap();
         let mut right = repo.pull(branch_id).unwrap();
-        left.commit(edge_facts(1, 2), "left edge");
-        right.commit(edge_facts(2, 3), "right edge");
+        left.commit(described_edge(1, 2), "left edge");
+        right.commit(described_edge(2, 3), "right edge");
         repo.push(&mut left).unwrap();
 
         // The stale right push exercises Repository's conflict merge/retry.

@@ -2,7 +2,7 @@
 
 `Fragment` gives us an ergonomic, unified abstraction for "a slice of graph plus
 exported entrypoints". The missing piece is: how do we move/persist a fragment
-*together with* any blobs it references (attachments, LongStrings, archives,
+*together with* any blobs it references (attachments, UTF8Strings, archives,
 etc.)?
 
 The naive answer is "make a type that contains `Fragment` + blob bytes", but
@@ -39,7 +39,7 @@ In practice, a **commit handle** is already an excellent bundle root:
   - the content blob (`SimpleArchive`), and optionally metadata and message
     blobs.
 - The content blob references:
-  - any additional blobs via typed handle values (e.g. `LongString`, `RawBytes`,
+  - any additional blobs via typed handle values (e.g. `UTF8String`, `RawBytes`,
     `WasmCode`, ...).
 
 So "exporting a graph" becomes:

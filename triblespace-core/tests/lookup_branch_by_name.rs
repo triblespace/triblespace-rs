@@ -11,7 +11,7 @@
 //! refuses to guess which one you meant.
 //!
 //! These tests also pin the equivalence that lets the scan skip a blob read
-//! per branch: a branch's name is stored as a content-addressed `LongString`
+//! per branch: a branch's name is stored as a content-addressed `UTF8String`
 //! blob and the metadata holds only its handle, so hashing the *sought* name
 //! and comparing handles is equivalent to fetching each name and comparing
 //! strings — handle equality IS content equality. The equivalence holds
@@ -27,12 +27,7 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{LookupError, Repository};
 
 fn repo() -> Repository<MemoryRepo> {
-    Repository::new(
-        MemoryRepo::default(),
-        SigningKey::generate(&mut OsRng),
-        TribleSet::new(),
-    )
-    .expect("repo")
+    Repository::new(MemoryRepo::default(), SigningKey::generate(&mut OsRng))
 }
 
 #[test]

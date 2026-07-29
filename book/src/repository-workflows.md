@@ -215,7 +215,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::examples::{self, literature};
 use triblespace::prelude::*;
 use triblespace::core::repo::{self, memoryrepo::MemoryRepo, Repository};
-use blobencodings::{LongString, SimpleArchive};
+use blobencodings::{UTF8String, SimpleArchive};
 
 let storage = MemoryRepo::default();
 let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
@@ -228,7 +228,7 @@ let mut ws = repo.pull(*branch_id).expect("pull branch");
 //
 // When you also need the handle in hand (to read back, log, share,
 // or reuse across multiple entities), call `ws.put` explicitly.
-let quote_handle: Inline<Handle<LongString>> =
+let quote_handle: Inline<Handle<UTF8String>> =
     ws.put("Fear is the mind-killer".to_owned());
 let archive_handle: Inline<Handle<SimpleArchive>> =
     ws.put(&examples::dataset());

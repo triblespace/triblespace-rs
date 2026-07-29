@@ -48,7 +48,7 @@ use triblespace_search::tokens::hash_tokens;
 
 // Assume a `wiki` namespace is already in the pile, providing:
 //   wiki::title:   ShortString                   (fragment title)
-//   wiki::body:    Handle<LongString>    (typst body)
+//   wiki::body:    Handle<UTF8String>    (typst body)
 //   wiki::index:   Handle<SuccinctBM25Blob>  (current-index handle)
 mod wiki { /* ... */ }
 
@@ -330,7 +330,7 @@ Migration recipe:
    sweeps the orphaned blobs at the next consolidation.
 
 Attributes whose value type is a plain `ShortString`,
-`LongString`, `GenId`, etc. (anything not parameterized on a
+`UTF8String`, `GenId`, etc. (anything not parameterized on a
 crate-owned `BlobEncoding`) are unaffected by our schema
 rotations — only handles to *our* blob types transitively
 depend on our IDs.

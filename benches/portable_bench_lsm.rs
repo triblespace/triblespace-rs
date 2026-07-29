@@ -60,7 +60,7 @@
 
 use std::time::Instant;
 
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::inline::encodings::hash::Handle;
@@ -460,8 +460,8 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     for id in branch_ids {
         let Ok(Some(meta_handle)) = pile.head(id) else { continue };
         let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue };
-        let handles: Vec<Inline<Handle<LongString>>> = find!(
-            (n: Inline<Handle<LongString>>),
+        let handles: Vec<Inline<Handle<UTF8String>>> = find!(
+            (n: Inline<Handle<UTF8String>>),
             pattern!(&meta, [{ metadata::name: ?n }])
         )
         .map(|(n,)| n)

@@ -2406,15 +2406,15 @@ mod tests {
 
         let mut store = MemoryBlobStore::new();
         let h_a: BranchNameHandle = store
-            .put::<LongString, _>("main".to_owned().to_blob())
+            .put::<UTF8String, _>("main".to_owned().to_blob())
             .expect("put a");
         let h_b: BranchNameHandle = store
-            .put::<LongString, _>("other".to_owned().to_blob())
+            .put::<UTF8String, _>("other".to_owned().to_blob())
             .expect("put b");
         // A handle whose blob is deliberately NOT in the store, standing in
         // for a name blob that was GC'd or lost to truncation.
         let h_missing: BranchNameHandle =
-            IntoBlob::<LongString>::to_blob("vanished".to_owned()).get_handle();
+            IntoBlob::<UTF8String>::to_blob("vanished".to_owned()).get_handle();
         let reader = store.reader().expect("reader");
 
         // Exactly one name, resolvable.

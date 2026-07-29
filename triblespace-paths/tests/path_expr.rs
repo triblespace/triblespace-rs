@@ -6,6 +6,7 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::macros::entity;
 use triblespace_core::metadata;
+use triblespace_core::trible::Fragment;
 use triblespace_core::query::{Binding, Query, Variable};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
@@ -32,10 +33,10 @@ fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
 }
 
-fn tagged_edge(source: u8, target: u8) -> TribleSet {
+fn tagged_edge(source: u8, target: u8) -> Fragment {
     let source = id(source);
     let target = id(target);
-    entity! { ExclusiveId::force_ref(&source) @ metadata::tag: target }.into_facts()
+    entity! { ExclusiveId::force_ref(&source) @ metadata::tag: target }
 }
 
 #[test]
@@ -82,12 +83,7 @@ fn canonical_expression_construction_stabilizes_automaton_fingerprints() {
 fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
     let expression = PathExpr::from(Step::Forward(metadata::tag.id().into())).plus();
     let rollup = PathRollup::new(expression.compile());
-    let mut repo = Repository::new(
-        MemoryRepo::default(),
-        SigningKey::from_bytes(&[17; 32]),
-        TribleSet::new(),
-    )
-    .unwrap();
+    let mut repo = Repository::new(MemoryRepo::default(), SigningKey::from_bytes(&[17; 32]));
     repo.register_index(rollup.clone());
     let branch_id = *repo.create_branch("path-expr", None).unwrap();
 

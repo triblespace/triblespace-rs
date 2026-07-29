@@ -214,7 +214,7 @@ prioritized for efficient zero-copy access.
   cardinality explicit or make resolution deterministic and test it.
 - Make `IndexKind::build` fallible (or split out a fallible resolver-backed
   build surface). BM25/HNSW kinds cannot currently report an unreadable source
-  handle through the trait; archive indexing prevalidates LongString content,
+  handle through the trait; archive indexing prevalidates UTF8String content,
   but generic callers can otherwise build a segment that silently omits it.
 - Extend commit-native index-home testing with an interrupted bootstrap over a
   true merge DAG (multi-tip frontier plus CAS conflict), an actual commit above
