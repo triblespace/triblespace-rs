@@ -99,6 +99,8 @@ struct Cfg {
     /// difference between them can come from having built two artifacts.
     rollup_depth: usize,
     verify: Option<std::path::PathBuf>,
+    report: Option<std::path::PathBuf>,
+    report_only: Option<String>,
 }
 
 fn parse_size(s: &str) -> Option<usize> {
@@ -140,6 +142,8 @@ fn parse_cfg() -> Cfg {
         rollup: None,
         rollup_depth: 0,
         verify: None,
+        report: None,
+        report_only: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -177,6 +181,8 @@ fn parse_cfg() -> Cfg {
             "--build-warmup" => cfg.build_warmup = take_size(&args, &mut i),
             "--arch-iters" => cfg.arch_iters = take_size(&args, &mut i),
             "--arch-warmup" => cfg.arch_warmup = take_size(&args, &mut i),
+            "--report" => cfg.report = Some(take(&args, &mut i).into()),
+            "--only" => cfg.report_only = Some(take(&args, &mut i).to_owned()),
             "--verify" => cfg.verify = Some(take(&args, &mut i).into()),
             other => {
                 eprintln!("unrecognized arg {other:?}");
@@ -1285,6 +1291,14 @@ fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) 
 
 fn main() {
     let cfg = parse_cfg();
+
+    if let Some(path) = &cfg.report {
+        if let Err(e) = ledger::report(path, cfg.report_only.as_deref()) {
+            eprintln!("report failed: {e:?}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Some(path) = &cfg.verify {
         if let Err(e) = ledger::verify(path) {

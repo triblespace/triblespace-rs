@@ -26,7 +26,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{self, branch, PushResult, Workspace};
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Handle, ShortString};
+use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
 use triblespace::prelude::*;
 
 /// Canonical telemetry attributes — byte-for-byte the ids of
@@ -237,6 +237,175 @@ impl ResultsLedger {
             .map_err(|e| anyhow!("close results pile: {e:?}"))?;
         Ok(())
     }
+}
+
+/// Per-measure durations, the quantity every results table is made of.
+///
+/// # Why this exists
+///
+/// [`verify`] proves a results pile is well-formed; it counts spans but
+/// never projects [`tele::duration_ns`], so the timings were readable only
+/// by the process that wrote them. On 2026-07-29 an audit of two published
+/// benchmark tables found their figures appeared in no file on disk: one
+/// was rescued because the run log happens to print a suite total, the
+/// other could not be re-derived at all and had to be marked unconfirmed.
+/// The data was in the pile the whole time.
+///
+/// A benchmark that records provenance-grade telemetry and then cannot read
+/// it back is not a ledger — it is a write-only log with extra steps. This
+/// makes every published number one command from re-derivation.
+///
+/// Groups are the first path segment of a measure key
+/// (`sparqloscope_gpu/join-2-small-large/total` → `sparqloscope_gpu`), which
+/// is exactly the backing/arm axis the comparison tables are built on, so
+/// the group totals printed here ARE the table rows.
+pub fn report(path: &Path, only: Option<&str>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow!("open results pile {}: {e:?}", path.display()))?;
+    pile.refresh().map_err(|e| anyhow!("load results pile: {e:?}"))?;
+    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+    let Some(meta_handle) = pile
+        .head(*RESULTS_BRANCH)
+        .map_err(|e| anyhow!("read results branch head: {e:?}"))?
+    else {
+        bail!("no results branch {:X} in {}", &*RESULTS_BRANCH, path.display());
+    };
+    let branch_meta: TribleSet = reader
+        .get(meta_handle)
+        .map_err(|e| anyhow!("read branch metadata: {e:?}"))?;
+
+    // Same linear walk as `verify`. Deliberately duplicated rather than
+    // extracted: `reader` borrows `pile`, so a shared helper returning both
+    // is self-referential, and the alternatives (generic over the blob
+    // store, or a closure) are refactors of the ONLY working reader of
+    // these piles. Extract once both have a compiler behind them.
+    let heads: Vec<Inline<Handle<SimpleArchive>>> = find!(
+        (c: Inline<Handle<SimpleArchive>>),
+        pattern!(&branch_meta, [{ repo::head: ?c }])
+    )
+    .map(|(c,)| c)
+    .collect();
+    let [head] = heads[..] else { bail!("results branch has no unique head commit") };
+    let mut facts = TribleSet::new();
+    let mut cursor = Some(head);
+    while let Some(handle) = cursor {
+        let meta: TribleSet = reader
+            .get(handle)
+            .map_err(|e| anyhow!("read commit metadata: {e:?}"))?;
+        for (content,) in find!(
+            (c: Inline<Handle<SimpleArchive>>),
+            pattern!(&meta, [{ repo::content: ?c }])
+        ) {
+            let set: TribleSet = reader
+                .get(content)
+                .map_err(|e| anyhow!("read commit content: {e:?}"))?;
+            facts += set;
+        }
+        let parents: Vec<Inline<Handle<SimpleArchive>>> = find!(
+            (p: Inline<Handle<SimpleArchive>>),
+            pattern!(&meta, [{ repo::parent: ?p }])
+        )
+        .map(|(p,)| p)
+        .collect();
+        cursor = match parents[..] {
+            [] => None,
+            [p] => Some(p),
+            _ => bail!("merge commit on the results branch (expected a linear chain)"),
+        };
+    }
+
+    // Keyed by the INLINE form, not by `Id`. `?s` here is an entity
+    // position so it projects as `Id`, but `tele::session` below is a
+    // GenId-valued attribute, whose idiomatic projection is
+    // `Inline<GenId>` (see triblespace-core/tests/or_pattern.rs). Rather
+    // than convert inline→Id — a direction with no example in the tests —
+    // convert the session Id the confirmed way, `Id::to_inline()`, and
+    // compare in the inline domain. A linear scan is right: a results pile
+    // holds one session per run, and every pile checked held exactly one.
+    let mut engines: Vec<(Inline<GenId>, String)> = Vec::new();
+    for (s, eng) in find!(
+        (s: Id, eng: Inline<ShortString>),
+        pattern!(&facts, [{ ?s @ bench::engine: ?eng }])
+    ) {
+        engines.push((
+            s.to_inline(),
+            eng.try_from_inline()
+                .map_err(|e| anyhow!("engine decode: {e:?}"))?,
+        ));
+    }
+
+    // The span entity is projected so `find!`'s SET semantics cannot
+    // collapse repeated iterations of one measure into a single row — the
+    // same trap `verify` documents.
+    let kind_span: Id = *KIND_SPAN;
+    let mut rows: Vec<(String, String, u64)> = Vec::new();
+    for (_span, sess, n, d) in find!(
+        (span: Id, sess: Inline<GenId>, n: Inline<Handle<LongString>>, d: u64),
+        pattern!(&facts, [{ ?span @ metadata::tag: kind_span, tele::session: ?sess,
+                            tele::name: ?n, tele::duration_ns: ?d }])
+    ) {
+        let name: anybytes::View<str> =
+            reader.get(n).map_err(|e| anyhow!("span name blob: {e:?}"))?;
+        let name = name.as_ref().to_owned();
+        if let Some(pat) = only {
+            if !name.contains(pat) {
+                continue;
+            }
+        }
+        let engine = engines
+            .iter()
+            .find(|(id, _)| *id == sess)
+            .map(|(_, e)| e.clone())
+            .unwrap_or_else(|| "<unlabelled session>".to_owned());
+        rows.push((engine, name, d));
+    }
+
+    if rows.is_empty() {
+        bail!(
+            "no spans with durations in {}{}",
+            path.display(),
+            only.map(|p| format!(" matching {p:?}")).unwrap_or_default()
+        );
+    }
+
+    rows.sort();
+    let mut by_group: BTreeMap<(String, String), (u64, usize)> = BTreeMap::new();
+    let mut by_engine: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+    println!("report   : {} — {} measured span(s)", path.display(), rows.len());
+    let mut current = String::new();
+    for (engine, name, ns) in &rows {
+        if *engine != current {
+            println!("\n=== {engine} ===");
+            current = engine.clone();
+        }
+        println!("  {:<52} {:>12.3} ms", name, *ns as f64 / 1e6);
+        let group = name.split('/').next().unwrap_or(name).to_owned();
+        let g = by_group.entry((engine.clone(), group)).or_insert((0, 0));
+        g.0 += ns;
+        g.1 += 1;
+        let e = by_engine.entry(engine.clone()).or_insert((0, 0));
+        e.0 += ns;
+        e.1 += 1;
+    }
+
+    println!("\n=== totals by group ===");
+    for ((engine, group), (ns, n)) in &by_group {
+        println!(
+            "  {:<28} {:<22} {:>14.3} ms  ({n} spans)",
+            engine,
+            group,
+            *ns as f64 / 1e6
+        );
+    }
+    println!("\n=== totals by engine ===");
+    for (engine, (ns, n)) in &by_engine {
+        println!("  {:<28} {:>14.3} ms  ({n} spans)", engine, *ns as f64 / 1e6);
+    }
+
+    pile.close().map_err(|e| anyhow!("close results pile: {e:?}"))?;
+    Ok(())
 }
 
 /// The acceptance instrument: reopen a results pile READ-ONLY (no
