@@ -100,6 +100,13 @@ struct Cfg {
     /// Both arms answer over the SAME commits out of the SAME pile, so no
     /// difference between them can come from having built two artifacts.
     rollup_depth: usize,
+    /// Alternate the archive and device arms per query instead of running
+    /// two full censuses.
+    ///
+    /// Sequential censuses make a truncated run useless: it yields a
+    /// complete CPU arm and no device arm. At full scale a census takes
+    /// hours, so truncation is the normal case rather than the exception.
+    interleave: bool,
     verify: Option<std::path::PathBuf>,
 }
 
@@ -141,6 +148,7 @@ fn parse_cfg() -> Cfg {
         arch_warmup: 1,
         rollup: None,
         rollup_depth: 0,
+        interleave: false,
         verify: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -171,6 +179,7 @@ fn parse_cfg() -> Cfg {
             "--rung" => cfg.rung = take_size(&args, &mut i),
             "--rollup" => cfg.rollup = Some(take(&args, &mut i).into()),
             "--rollup-depth" => cfg.rollup_depth = take_size(&args, &mut i),
+            "--interleave" => cfg.interleave = true,
             "--results" => cfg.results = Some(take(&args, &mut i).into()),
             "--label" => cfg.label = Some(take(&args, &mut i).to_owned()),
             "--iters" => cfg.iters = take_size(&args, &mut i),
@@ -843,6 +852,97 @@ fn run_sparqloscope_arm<B>(
     let mut panicked = 0usize;
     let mut cross_arm_failure = false;
     for (i, t) in table.iter().enumerate() {
+        let (value, did_panic, failed) = run_one_query(
+            led, cfg, base, group, t, ds, baseline.and_then(|b| b[i].as_deref()),
+            &mut reset_backend, &mut emit_backend,
+        );
+        panicked += did_panic as usize;
+        cross_arm_failure |= failed;
+        answers.push(value);
+    }
+    (answers, panicked, cross_arm_failure)
+}
+
+/// Run the archive and device arms ALTERNATELY, one query at a time.
+///
+/// The censuses used to run in full, one after the other: all 100 queries on
+/// the CPU archive, then all 100 on the device. That is fine when a run
+/// finishes and useless when it does not — and at 561M rows a single heavy
+/// join costs minutes, so "does not finish" is the normal case. A truncated
+/// sequential run yields a complete CPU arm and NO device arm, which is not
+/// a slow comparison but an absent one.
+///
+/// Interleaved, whatever completes is a valid comparison over exactly that
+/// many queries, and the run can be stopped at any point without losing the
+/// question it was asked.
+///
+/// The cost is cache interference: the two arms alternate over the same
+/// data, so neither gets a warm cache to itself. That is a real effect and
+/// it applies EQUALLY to both, which is the property a ratio needs — and a
+/// slightly pessimistic ratio you can obtain beats an exact one you cannot.
+#[allow(clippy::too_many_arguments)]
+fn run_arch_gpu_interleaved(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    arch_ds: &wd_schema::Dataset<wd_schema::ArchivedFacts>,
+    gpu_ds: &wd_schema::Dataset<wd_schema::WgpuArchivedFacts>,
+    baseline: Option<&[Option<String>]>,
+) -> (usize, usize, bool) {
+    let mut arch_panicked = 0usize;
+    let mut gpu_panicked = 0usize;
+    let mut failed = false;
+    let arch_table = queries::TRANSLATED_ARCHIVE;
+    let gpu_table = queries::TRANSLATED_WGPU;
+    for i in 0..arch_table.len() {
+        let want = baseline.and_then(|b| b[i].as_deref());
+        let (_, p, f) = run_one_query(
+            led, cfg, base, "sparqloscope_arch", &arch_table[i], arch_ds, want,
+            &mut |_: &wd_schema::Dataset<wd_schema::ArchivedFacts>| {},
+            &mut |_: &mut ledger::ResultsLedger,
+                  _: &wd_schema::Dataset<wd_schema::ArchivedFacts>,
+                  _: &str| {},
+        );
+        arch_panicked += p as usize;
+        failed |= f;
+        let (_, p, f) = run_one_query(
+            led, cfg, base, "sparqloscope_gpu", &gpu_table[i], gpu_ds, want,
+            &mut |ds: &wd_schema::Dataset<wd_schema::WgpuArchivedFacts>| {
+                ds.facts.reset_stats();
+            },
+            &mut |_: &mut ledger::ResultsLedger,
+                  _: &wd_schema::Dataset<wd_schema::WgpuArchivedFacts>,
+                  _: &str| {},
+        );
+        gpu_panicked += p as usize;
+        failed |= f;
+    }
+    (arch_panicked, gpu_panicked, failed)
+}
+
+/// One query against one backing: the timed iterations, the cross-arm
+/// identity check, the frontier snapshot, and the ledger writes.
+///
+/// Extracted so two backings can be driven ALTERNATELY over the same query
+/// rather than as two full censuses. Sequential censuses mean a run that
+/// does not finish yields a complete CPU arm and NO GPU arm — and at 561M
+/// rows a full census takes hours, so "does not finish" is the normal case.
+/// Interleaved, whatever completes is a valid comparison over that many
+/// queries.
+#[allow(clippy::too_many_arguments)]
+fn run_one_query<B>(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    group: &str,
+    t: &queries::Translated<B>,
+    ds: &wd_schema::Dataset<B>,
+    baseline: Option<&str>,
+    reset_backend: &mut impl FnMut(&wd_schema::Dataset<B>),
+    emit_backend: &mut impl FnMut(&mut ledger::ResultsLedger, &wd_schema::Dataset<B>, &str),
+) -> (Option<String>, bool, bool) {
+    let mut cross_arm_failure = false;
+    {
         let mut m = Measure::new(format!("{group}/{}/total", t.name));
         let mut value: Option<String> = None;
         for k in 0..(cfg.arch_warmup + cfg.arch_iters) {
@@ -861,14 +961,13 @@ fn run_sparqloscope_arm<B>(
             });
         }
         if m.panicked.is_some() {
-            panicked += 1;
             value = None;
         }
         // The backings must ANSWER identically or the timings beside
         // each other mean nothing. Compared on the value itself rather
         // than on `answer_ident`, so the failure line names the two
         // results instead of two hashes.
-        if let Some(expected) = baseline.and_then(|b| b[i].as_deref()) {
+        if let Some(expected) = baseline {
             if let Some(got) = value.as_deref() {
                 if expected != got {
                     cross_arm_failure = true;
@@ -881,6 +980,8 @@ fn run_sparqloscope_arm<B>(
                 }
             }
         }
+        // Captured before `emit` consumes the measure.
+        let did_panic = m.panicked.is_some();
         // `rows_meaningful: false` — the identity is the answer digest,
         // not a cardinality, so it is not telemetry to report as rows.
         m.emit(led, false);
@@ -915,9 +1016,8 @@ fn run_sparqloscope_arm<B>(
             );
         }
         emit_backend(led, ds, t.name);
-        answers.push(value);
+        return (value, did_panic, cross_arm_failure);
     }
-    (answers, panicked, cross_arm_failure)
 }
 
 /// Load the `--data` dataset pile and run the vendored registry against
