@@ -46,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Experimental breaking intrinsic-entity epoch uses canonical full rows.**
+  Content-derived `entity!` records now canonicalize aligned
+  `NIL || attribute || value` rows, hash the complete contiguous row sequence,
+  fill the derived entity column in place, and retain the finished allocation
+  behind archive-backed PATCH leaves. This deliberately changes every derived
+  entity ID from the historical `attribute || value` stream; explicit entity
+  IDs are unchanged. The probe includes cross-revision construction and
+  fragment-aggregation benchmarks so the identity migration can be accepted
+  or rejected on compositional evidence rather than isolated throughput.
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
   typed-Program engine is gone — `residual.rs`, the Program VM, query-time
   regular-path evaluation (`path!` and `RegularPathConstraint`), and the

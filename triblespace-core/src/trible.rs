@@ -12,11 +12,14 @@ use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
 
 /// Re-export of [`Fragment`](fragment::Fragment).
 pub use fragment::Fragment;
 /// Re-export of [`Spread`](spread::Spread).
 pub use spread::Spread;
+#[doc(hidden)]
+pub use tribleset::build_intrinsic_entity;
 /// Re-export of [`TribleSet`](tribleset::TribleSet).
 pub use tribleset::TribleSet;
 /// Re-export of [`TribleSetFingerprint`](tribleset::TribleSetFingerprint).
@@ -42,6 +45,57 @@ pub const V_END: usize = 63;
 
 /// Fundamentally a trible is always a collection of 64 bytes.
 pub type RawTrible = [u8; TRIBLE_LEN];
+
+/// One aligned scratch row used while deriving an intrinsic entity.
+///
+/// The row starts as `NIL || attribute || value`. After the complete row set
+/// has been canonicalized and hashed, the derived entity id is written into
+/// the leading 16 bytes in place. The 16-byte alignment lets the finished
+/// allocation serve directly as archive-backed PATCH leaf storage.
+///
+/// This is an implementation seam for the `entity!` macro rather than a
+/// general serialization format. Use [`Trible`] for ordinary fact
+/// construction.
+#[doc(hidden)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+)]
+#[repr(C, align(16))]
+pub struct IntrinsicEntityRow {
+    data: RawTrible,
+}
+
+impl IntrinsicEntityRow {
+    /// Creates a `NIL || attribute || value` scratch row.
+    pub fn new(attribute: Id, value: RawInline) -> Self {
+        let mut data = [0; TRIBLE_LEN];
+        data[A_START..=A_END].copy_from_slice(&attribute[..]);
+        data[V_START..=V_END].copy_from_slice(&value);
+        Self { data }
+    }
+
+    fn fill_entity(&mut self, entity: Id) {
+        self.data[E_START..=E_END].copy_from_slice(&entity[..]);
+    }
+
+    fn raw(&self) -> &RawTrible {
+        &self.data
+    }
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<IntrinsicEntityRow>() == TRIBLE_LEN);
+    assert!(std::mem::align_of::<IntrinsicEntityRow>() == 16);
+};
 
 /// Fundamental 64-byte tuple of entity, attribute and value used throughout the
 /// knowledge graph.

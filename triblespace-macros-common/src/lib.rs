@@ -1,7 +1,5 @@
-use proc_macro2::Delimiter;
 use proc_macro2::Span;
 use proc_macro2::TokenStream as TokenStream2;
-use proc_macro2::TokenTree;
 use quote::format_ident;
 use quote::quote;
 use quote::ToTokens;
@@ -12,7 +10,6 @@ use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
 use syn::Expr;
 use syn::Ident;
-use syn::Path;
 use syn::Token;
 
 mod attributes;
@@ -22,7 +19,6 @@ mod value_formatter;
 pub use attributes::attributes_impl;
 pub use find::find_impl;
 pub use value_formatter::value_formatter_impl;
-
 
 struct PatternInput {
     set: Expr,
@@ -502,20 +498,16 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
 
     let Entity { id, attributes } = syn::parse2(wrapped)?;
 
-    let set_init = quote! {
-        let mut set = #base_path::trible::TribleSet::new();
+    let state_init = quote! {
         let mut __blobs: #base_path::blob::MemoryBlobStore =
             #base_path::blob::MemoryBlobStore::new();
     };
     let attr_count = attributes.len();
-    let has_dynamic_pairs = attributes
-        .iter()
-        .any(|attr| attr.mode != AttributeMode::Required);
 
     let mut attr_eval_tokens = TokenStream2::new();
-    let mut insert_tokens = TokenStream2::new();
-    let mut pair_entries = TokenStream2::new();
-    let mut pair_push_tokens = TokenStream2::new();
+    let mut explicit_insert_tokens = TokenStream2::new();
+    let mut intrinsic_row_tokens = TokenStream2::new();
+    let mut extra_merge_tokens = TokenStream2::new();
 
     for (i, attr) in attributes.into_iter().enumerate() {
         let mode = attr.mode;
@@ -606,51 +598,48 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         }
         attr_eval_tokens.extend(quote! { let #aid_ident = #af_ident.id(); });
 
-        if has_dynamic_pairs {
-            match mode {
-                AttributeMode::Required => {
-                    pair_push_tokens.extend(quote! {
-                        __pairs.push((#aid_ident, #val_ident.raw));
-                    });
-                }
-                AttributeMode::Optional => {
-                    pair_push_tokens.extend(quote! {
-                        if let Some(ref __v) = #val_ident {
-                            __pairs.push((#aid_ident, __v.raw));
-                        }
-                    });
-                }
-                AttributeMode::Repeated => {
-                    pair_push_tokens.extend(quote! {
-                        for __v in #val_ident.iter() {
-                            __pairs.push((#aid_ident, __v.raw));
-                        }
-                    });
-                }
-            }
-        } else {
-            // Used for deterministic id derivation when no explicit id is provided.
-            pair_entries.extend(quote! { (#aid_ident, #val_ident.raw), });
-        }
-
         match mode {
             AttributeMode::Required => {
-                insert_tokens.extend(quote! {
+                intrinsic_row_tokens.extend(quote! {
+                    __rows.push(#base_path::trible::IntrinsicEntityRow::new(
+                        #aid_ident,
+                        #val_ident.raw,
+                    ));
+                });
+                explicit_insert_tokens.extend(quote! {
                     set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, &#val_ident));
                 });
             }
             AttributeMode::Optional => {
-                insert_tokens.extend(quote! {
+                intrinsic_row_tokens.extend(quote! {
+                    if let Some(ref __v) = #val_ident {
+                        __rows.push(#base_path::trible::IntrinsicEntityRow::new(
+                            #aid_ident,
+                            __v.raw,
+                        ));
+                    }
+                });
+                explicit_insert_tokens.extend(quote! {
                     if let Some(ref __v) = #val_ident {
                         set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
                     }
                 });
             }
             AttributeMode::Repeated => {
-                insert_tokens.extend(quote! {
+                intrinsic_row_tokens.extend(quote! {
+                    for __v in #val_ident.iter() {
+                        __rows.push(#base_path::trible::IntrinsicEntityRow::new(
+                            #aid_ident,
+                            __v.raw,
+                        ));
+                    }
+                });
+                explicit_insert_tokens.extend(quote! {
                     for __v in #val_ident.iter() {
                         set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
                     }
+                });
+                extra_merge_tokens.extend(quote! {
                     let (__extra_facts, __extra_blobs) =
                         #extra_ident.into_facts_and_blobs();
                     set += __extra_facts;
@@ -660,11 +649,14 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         }
     }
 
-    let id_init: TokenStream2 = if let Some(val) = id {
+    let entity_init: TokenStream2 = if let Some(val) = id {
         match val {
             Inline::Expr(expr) => quote! {
                 let id_tmp = #expr;
                 let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
+                let root_id = id_ref.id;
+                let mut set = #base_path::trible::TribleSet::new();
+                #explicit_insert_tokens
             },
             Inline::Var(ident) => {
                 return Err(syn::Error::new_spanned(
@@ -679,65 +671,22 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                 ));
             }
         }
-    } else if has_dynamic_pairs {
-        quote! {
-            let mut __pairs: ::std::vec::Vec<(#base_path::id::Id, #base_path::inline::RawInline)> =
-                ::std::vec::Vec::with_capacity(#attr_count);
-            #pair_push_tokens
-            __pairs.sort_unstable();
-
-            let mut __hasher = #base_path::inline::encodings::hash::Blake3::new();
-            let mut __last: Option<(#base_path::id::Id, #base_path::inline::RawInline)> = None;
-            for (__a, __v) in __pairs.iter() {
-                if let Some((__la, __lv)) = __last {
-                    if *__a == __la && *__v == __lv {
-                        continue;
-                    }
-                }
-                __hasher.update(&__a[..]);
-                __hasher.update(&__v[..]);
-                __last = Some((*__a, *__v));
-            }
-            let __digest_bytes = __hasher.finalize();
-            let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
-            __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
-            let __id = #base_path::id::Id::new(__raw).unwrap();
-            let id_tmp: #base_path::id::ExclusiveId = #base_path::id::ExclusiveId::force(__id);
-            let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
-        }
     } else {
         quote! {
-            let mut __pairs: [(#base_path::id::Id, #base_path::inline::RawInline); #attr_count] = [#pair_entries];
-            __pairs.sort_unstable();
-
-            let mut __hasher = #base_path::inline::encodings::hash::Blake3::new();
-            let mut __last: Option<(#base_path::id::Id, #base_path::inline::RawInline)> = None;
-            for (__a, __v) in __pairs.iter() {
-                if let Some((__la, __lv)) = __last {
-                    if *__a == __la && *__v == __lv {
-                        continue;
-                    }
-                }
-                __hasher.update(&__a[..]);
-                __hasher.update(&__v[..]);
-                __last = Some((*__a, *__v));
-            }
-            let __digest_bytes = __hasher.finalize();
-            let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
-            __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
-            let __id = #base_path::id::Id::new(__raw).unwrap();
-            let id_tmp: #base_path::id::ExclusiveId = #base_path::id::ExclusiveId::force(__id);
-            let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
+            let mut __rows: ::std::vec::Vec<#base_path::trible::IntrinsicEntityRow> =
+                ::std::vec::Vec::with_capacity(#attr_count);
+            #intrinsic_row_tokens
+            let (root_id, mut set) = #base_path::trible::build_intrinsic_entity(__rows);
         }
     };
 
     let output = quote! {
         {
-            #set_init
+            #state_init
             #attr_eval_tokens
-            #id_init
-            #insert_tokens
-            #base_path::trible::Fragment::rooted_with_blobs(id_ref.id, set, __blobs)
+            #entity_init
+            #extra_merge_tokens
+            #base_path::trible::Fragment::rooted_with_blobs(root_id, set, __blobs)
         }
     };
 
