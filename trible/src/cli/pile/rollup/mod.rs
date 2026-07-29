@@ -65,6 +65,15 @@ pub enum KindCommand {
         branch: Option<String>,
         #[arg(long)]
         signing_key: Option<PathBuf>,
+        /// Stop after this many commits.
+        ///
+        /// A rollup over a prefix of the chain is a smaller dataset with the
+        /// SAME tier structure, which is what a union-versus-monolithic
+        /// comparison actually varies. Being able to ask the question at a
+        /// scale that finishes is worth more than asking it at full scale
+        /// and getting one arm.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Collapse every tier into a single root range.
     ///
@@ -117,7 +126,8 @@ pub fn run(cmd: RollupCommand) -> Result<()> {
                 pile,
                 branch,
                 signing_key,
-            } => archive::build(pile, branch, signing_key),
+                limit,
+            } => archive::build(pile, branch, signing_key, limit),
             KindCommand::Compact {
                 pile,
                 branch,

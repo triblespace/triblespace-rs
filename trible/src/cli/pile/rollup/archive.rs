@@ -353,6 +353,7 @@ pub fn build(
     pile_path: PathBuf,
     branch: Option<String>,
     signing_key: Option<PathBuf>,
+    limit: Option<usize>,
 ) -> Result<()> {
     let _key = load_signing_key(&signing_key)?;
     let selected = mutating_branches(branch.as_deref())?;
@@ -365,7 +366,10 @@ pub fn build(
             Some(n) => format!("{n:?} ({branch_id:X})"),
             None => format!("{branch_id:X}"),
         };
-        let chain = chain_oldest_first(&mut pile, branch_id)?;
+        let mut chain = chain_oldest_first(&mut pile, branch_id)?;
+        if let Some(n) = limit {
+            chain.truncate(n);
+        }
         if chain.is_empty() {
             println!("branch {label}: no commits, nothing to roll up");
             continue;
