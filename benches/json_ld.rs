@@ -5,7 +5,7 @@ use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{fs, hint};
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
@@ -52,7 +52,7 @@ fn normalize_for_import(payload: &str) -> String {
 fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     let import_payload = normalize_for_import(payload);
     let bytes = import_payload.len() as u64;
-    let import_blob: Blob<LongString> = Blob::new(Bytes::from(import_payload.clone().into_bytes()));
+    let import_blob: Blob<UTF8String> = Blob::new(Bytes::from(import_payload.clone().into_bytes()));
     let mut group = c.benchmark_group("json_ld");
     group.throughput(Throughput::Bytes(bytes));
 

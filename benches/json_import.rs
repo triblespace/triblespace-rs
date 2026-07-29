@@ -3,7 +3,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::PathBuf;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::import::json::JsonObjectImporter;
@@ -44,7 +44,7 @@ fn json_import_benchmark(c: &mut Criterion) {
         let file = File::open(&fixture.path).expect("open fixture");
         let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
         let bytes = Bytes::from_source(mmap);
-        let blob: Blob<LongString> = Blob::new(bytes);
+        let blob: Blob<UTF8String> = Blob::new(bytes);
 
         group.throughput(Throughput::Bytes(fixture.size));
         group.bench_with_input(

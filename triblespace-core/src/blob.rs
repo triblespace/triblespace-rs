@@ -404,8 +404,8 @@ mod tests {
         let h_before: Inline<Handle<UnknownBlob>> = b.get_handle();
         // Schema cast — handle bytes stay identical, only the phantom
         // changes.
-        let b2: Blob<crate::blob::encodings::longstring::LongString> =
-            b.transmute::<crate::blob::encodings::longstring::LongString>();
+        let b2: Blob<crate::blob::encodings::utf8string::UTF8String> =
+            b.transmute::<crate::blob::encodings::utf8string::UTF8String>();
         let h_after = b2.get_handle();
         assert_eq!(h_before.raw, h_after.raw);
     }

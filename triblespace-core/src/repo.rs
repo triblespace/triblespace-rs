@@ -214,7 +214,7 @@ use crate::repo::branch::branch_metadata;
 use crate::trible::TribleSet;
 use ed25519_dalek::SigningKey;
 
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::inline::encodings::ed25519 as ed;
 use crate::inline::encodings::shortstring::ShortString;
@@ -228,7 +228,7 @@ attributes! {
     /// A commit that this commit is based on.
     "317044B612C690000D798CA660ECFD2A" as pub parent: Handle<SimpleArchive>;
     /// A (potentially long) message describing the commit.
-    "B59D147839100B6ED4B165DF76EDF3BB" as pub message: Handle<LongString>;
+    "B59D147839100B6ED4B165DF76EDF3BB" as pub message: Handle<UTF8String>;
     /// A short message describing the commit.
     "12290C0BE0E9207E324F24DDE0D89300" as pub short_message: ShortString;
     /// The hash of the first commit in the commit chain of the branch.
@@ -267,7 +267,7 @@ attributes! {
 fn rebuild_branch_meta(
     signing_key: &SigningKey,
     branch_id: Id,
-    name: Inline<Handle<LongString>>,
+    name: Inline<Handle<UTF8String>>,
     commit_head: Option<Blob<SimpleArchive>>,
     base_meta: &TribleSet,
 ) -> TribleSet {
@@ -1058,7 +1058,7 @@ where
     /// either a raw [`TribleSet`] (auto-promoted with empty blob store via
     /// `impl From<TribleSet> for Fragment`), or a Fragment built up via
     /// `entity!{}` / `attributes!::describe()` that carries auxiliary blobs
-    /// (e.g. `Handle<LongString>` doc strings). The Fragment's blobs are
+    /// (e.g. `Handle<UTF8String>` doc strings). The Fragment's blobs are
     /// absorbed into storage so handles referenced by the metadata facts
     /// stay resolvable for any downstream reader that pulls a commit and
     /// calls [`Workspace::checkout_metadata`].
@@ -1071,7 +1071,7 @@ where
         commit_metadata: F,
     ) -> Result<Self, <Storage as BlobStorePut>::PutError> {
         let (facts, mut blobs) = commit_metadata.into().into_facts_and_blobs();
-        // Persist any blobs the Fragment carried — typically `Handle<LongString>`
+        // Persist any blobs the Fragment carried — typically `Handle<UTF8String>`
         // doc strings or other handle-referenced payloads. They're stored as
         // `UnknownBlob` (raw bytes) because the storage layer is encoding-agnostic;
         // readers recover the schema via the handle's declared encoding.
@@ -1247,10 +1247,10 @@ where
         signing_key: SigningKey,
     ) -> Result<ExclusiveId, BranchError<Storage>> {
         let branch_id = genid();
-        let name_blob: Blob<LongString> = branch_name.to_owned().to_blob();
+        let name_blob: Blob<UTF8String> = branch_name.to_owned().to_blob();
         let name_handle = name_blob.get_handle();
         self.storage
-            .put::<LongString, _>(name_blob)
+            .put::<UTF8String, _>(name_blob)
             .map_err(|e| BranchError::StoragePut(e))?;
 
         let branch_set = if let Some(commit) = commit {
@@ -1309,7 +1309,7 @@ where
             let meta_set: TribleSet = reader.get(meta_handle).map_err(LookupError::StorageGet)?;
 
             let Ok((name_handle,)) = find!(
-                (n: Inline<Handle<LongString>>),
+                (n: Inline<Handle<UTF8String>>),
                 pattern!(&meta_set, [{ crate::metadata::name: ?n }])
             )
             .exactly_one() else {
@@ -1481,7 +1481,7 @@ where
             .map_err(PushError::StorageGet)?;
 
         let Ok((branch_name,)) = find!(
-            (name: Inline<Handle<LongString>>),
+            (name: Inline<Handle<UTF8String>>),
             pattern!(&base_branch_meta, [{ crate::metadata::name: ?name }])
         )
         .exactly_one() else {
@@ -2556,7 +2556,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         self.staged.union(content_blobs);
         // 1. Create a commit blob from the current head, content, metadata and the commit message.
         let content_blob: Blob<SimpleArchive> = content_facts.to_blob();
-        // If a message is provided, store it as a LongString blob and pass the handle.
+        // If a message is provided, store it as a UTF8String blob and pass the handle.
         let message_handle = message_.map(|m| self.put(m.to_string()));
         let parents = self.head.iter().copied();
 

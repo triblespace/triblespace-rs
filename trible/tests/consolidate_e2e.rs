@@ -41,7 +41,7 @@ fn consolidate_merges_branch_heads() {
             let mut ws = repo.pull(*branch_id).expect("pull");
             let e = ufoid();
             let mut content = TribleSet::new();
-            let label = ws.put::<blobencodings::LongString, _>(format!("branch-{i}"));
+            let label = ws.put::<blobencodings::UTF8String, _>(format!("branch-{i}"));
             content += entity! { &e @ metadata::name: label };
             ws.commit(content, &format!("commit-{i}"));
 
@@ -186,7 +186,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut ws = repo.pull(*bid_a).expect("pull alpha-A");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<blobencodings::LongString, _>("alpha-A-data".to_string());
+        let label = ws.put::<blobencodings::UTF8String, _>("alpha-A-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "alpha-A commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
@@ -210,7 +210,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut ws = repo.pull(*bid_b).expect("pull alpha-B");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<blobencodings::LongString, _>("alpha-B-data".to_string());
+        let label = ws.put::<blobencodings::UTF8String, _>("alpha-B-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "alpha-B commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
@@ -227,7 +227,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut ws = repo.pull(*bid_c).expect("pull beta");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<blobencodings::LongString, _>("beta-data".to_string());
+        let label = ws.put::<blobencodings::UTF8String, _>("beta-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "beta commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
@@ -316,7 +316,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut branch_name = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Inline<Handle<blobencodings::LongString>> = *t.v();
+                let h: Inline<Handle<blobencodings::UTF8String>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     branch_name = Some(view.as_ref().to_string());
                 }
@@ -424,7 +424,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         let mut ws_a = repo.pull(*bid_a).expect("pull gamma-A");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws_a.put::<blobencodings::LongString, _>("gamma-A".to_string());
+        let label = ws_a.put::<blobencodings::UTF8String, _>("gamma-A".to_string());
         content += entity! { &e @ metadata::name: label };
         ws_a.commit(content, "gamma-A commit");
         assert!(repo.try_push(&mut ws_a).expect("push").is_none());
@@ -444,7 +444,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         ws_b.merge_commit(head_a).expect("merge C1 into B");
         let e2 = ufoid();
         let mut content2 = TribleSet::new();
-        let label2 = ws_b.put::<blobencodings::LongString, _>("gamma-B".to_string());
+        let label2 = ws_b.put::<blobencodings::UTF8String, _>("gamma-B".to_string());
         content2 += entity! { &e2 @ metadata::name: label2 };
         ws_b.commit(content2, "gamma-B commit");
         assert!(repo.try_push(&mut ws_b).expect("push").is_none());
@@ -514,7 +514,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         let mut head_handle = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Inline<Handle<blobencodings::LongString>> = *t.v();
+                let h: Inline<Handle<blobencodings::UTF8String>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     if view.as_ref() == "gamma" {
                         is_gamma = true;
@@ -570,7 +570,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
             let mut ws = repo.pull(*bid).expect("pull");
             let e = ufoid();
             let mut content = TribleSet::new();
-            let label = ws.put::<blobencodings::LongString, _>(format!("delta-{i}"));
+            let label = ws.put::<blobencodings::UTF8String, _>(format!("delta-{i}"));
             content += entity! { &e @ metadata::name: label };
             ws.commit(content, &format!("delta-{i}"));
             assert!(repo.try_push(&mut ws).expect("push").is_none());
@@ -588,7 +588,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
         let mut ws = repo.pull(*bid).expect("pull");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<blobencodings::LongString, _>("epsilon-data".to_string());
+        let label = ws.put::<blobencodings::UTF8String, _>("epsilon-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "epsilon");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
@@ -649,7 +649,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
         let mut head_handle = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Inline<Handle<blobencodings::LongString>> = *t.v();
+                let h: Inline<Handle<blobencodings::UTF8String>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     if view.as_ref() == "delta" {
                         is_delta = true;

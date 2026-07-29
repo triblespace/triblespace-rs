@@ -13,22 +13,22 @@
 //! 2. The id is robust to annotation churn — adding name/description/tag
 //!    facts under the core's root does not change the root.
 //! 3. Different generic instantiations have distinct ids
-//!    (`Array<F32>` ≠ `Array<U8>`, `Handle<LongString>` ≠
+//!    (`Array<F32>` ≠ `Array<U8>`, `Handle<UTF8String>` ≠
 //!    `Handle<RawBytes>`).
 
 use triblespace_core::blob::encodings::array::{
     elements::{F32, U8},
     Array,
 };
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::rawbytes::RawBytes;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle};
 use triblespace_core::metadata::MetaDescribe;
 
 #[test]
 fn handle_id_is_deterministic() {
-    let a = Handle::<LongString>::id();
-    let b = Handle::<LongString>::id();
+    let a = Handle::<UTF8String>::id();
+    let b = Handle::<UTF8String>::id();
     assert_eq!(a, b);
 }
 
@@ -42,7 +42,7 @@ fn array_id_is_deterministic() {
 #[test]
 fn handle_id_distinguishes_blob_schema() {
     // Same hash, different element schemas → different ids.
-    let lstr = Handle::<LongString>::id();
+    let lstr = Handle::<UTF8String>::id();
     let raw = Handle::<RawBytes>::id();
     assert_ne!(lstr, raw);
 }
@@ -64,9 +64,9 @@ fn array_id_distinguishes_element_schema() {
 /// None, fragment.root().unwrap() → panic, or root would differ).
 #[test]
 fn handle_describe_root_matches_id() {
-    let frag = <Handle<LongString> as MetaDescribe>::describe();
+    let frag = <Handle<UTF8String> as MetaDescribe>::describe();
     let from_describe = frag.root().expect("rooted fragment");
-    let from_id = Handle::<LongString>::id();
+    let from_id = Handle::<UTF8String>::id();
     assert_eq!(from_describe, from_id);
 }
 
@@ -148,10 +148,10 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
 
-    let frag = <Handle<LongString> as MetaDescribe>::describe();
+    let frag = <Handle<UTF8String> as MetaDescribe>::describe();
 
-    let handle_id = Handle::<LongString>::id();
-    let blob_schema_id = LongString::id();
+    let handle_id = Handle::<UTF8String>::id();
+    let blob_schema_id = UTF8String::id();
     let hash_schema_id = Blake3::id();
 
     // The handle's id is linked to both sub-schemas via
@@ -183,7 +183,7 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     assert_eq!(
         blob_names.len(),
         1,
-        "LongString's name annotation reaches the registry"
+        "UTF8String's name annotation reaches the registry"
     );
 
     let hash_names: Vec<Inline<Handle<_>>> = find!(
@@ -234,8 +234,8 @@ fn entity_spread_propagates_blobs() {
     let frag = <Array<F32> as MetaDescribe>::describe();
 
     let f32_id = F32::id();
-    let f32_name_handle: Inline<Handle<LongString>> = find!(
-        (n: Inline<Handle<LongString>>),
+    let f32_name_handle: Inline<Handle<UTF8String>> = find!(
+        (n: Inline<Handle<UTF8String>>),
         pattern!(&frag, [{ f32_id @ metadata::name: ?n }])
     )
     .map(|(n,)| n)
@@ -248,7 +248,7 @@ fn entity_spread_propagates_blobs() {
     let mut blobs = frag.blobs().clone();
     let reader = blobs.reader().expect("blob reader");
     let bytes: anybytes::View<str> = reader
-        .get::<anybytes::View<str>, LongString>(f32_name_handle)
+        .get::<anybytes::View<str>, UTF8String>(f32_name_handle)
         .expect("F32 name blob is present in the fragment's blob store");
     assert_eq!(&*bytes, "F32");
 

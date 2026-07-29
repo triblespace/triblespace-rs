@@ -19,7 +19,7 @@
 //! - `xsd:decimal` → `R256BE` (exact rational)
 //! - `xsd:float` / `xsd:double` → `F64`
 //! - `xsd:boolean` → `Boolean`
-//! - `xsd:string`, untyped → `Handle<LongString>`
+//! - `xsd:string`, untyped → `Handle<UTF8String>`
 //! - URI objects (and `xsd:anyURI` literals) → `GenId`
 //! - `xsd:dateTime` → `NsTAIInterval` as `[t, t]` (degenerate instant)
 //! - `xsd:date` → `NsTAIInterval` (whole day, inclusive bounds)
@@ -50,7 +50,7 @@
 //! [`import_bytes`] is the core entry point — it parses a `Bytes`
 //! buffer (e.g. a memory-mapped file, an over-the-wire payload, or a
 //! `String::into_bytes`'d test fixture) without copying string slices.
-//! [`import_blob`] is a convenience over `Blob<LongString>`, mirroring
+//! [`import_blob`] is a convenience over `Blob<UTF8String>`, mirroring
 //! [`crate::import::json::JsonObjectImporter::import_blob`].
 //! [`ingest_ntriples`] adapts a `BufRead` by slurping it into a
 //! `Bytes`. [`ingest_ntriples_file`] opens a path and forwards.
@@ -80,7 +80,7 @@ use winnow::stream::Stream;
 use winnow::token::{take, take_while};
 use winnow::Parser;
 
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::rawbytes::RawBytes;
 use crate::blob::{Blob, IntoBlob};
 use crate::id::{ExclusiveId, Id, ID_LEN};
@@ -903,7 +903,7 @@ fn parse_xsd_duration(s: &str) -> Option<i128> {
 /// machines, and repeated imports — so callers can derive ids for
 /// query constants that match what [`import_bytes`] inserts.
 pub fn uri_to_id_pure(uri: &str) -> Id {
-    let handle: Inline<Handle<LongString>> = uri.to_owned().to_blob().get_handle();
+    let handle: Inline<Handle<UTF8String>> = uri.to_owned().to_blob().get_handle();
     let fragment = entity! { crate::import::rdf_uri: handle };
     fragment.root().expect("intrinsic URI entity")
 }
@@ -914,8 +914,8 @@ pub fn uri_to_id_pure(uri: &str) -> Id {
 /// annotation entity, and the id; idempotent under content
 /// addressing, so repeated mentions of the same URI cost a hash and
 /// two no-op inserts.
-fn record_uri(meta: &mut Fragment, uri: impl IntoBlob<LongString>) -> Id {
-    let handle: Inline<Handle<LongString>> = meta.put(uri);
+fn record_uri(meta: &mut Fragment, uri: impl IntoBlob<UTF8String>) -> Id {
+    let handle: Inline<Handle<UTF8String>> = meta.put(uri);
     let annotation = entity! { crate::import::rdf_uri: handle };
     let id = annotation.root().expect("intrinsic URI entity");
     *meta += annotation.into_facts();
@@ -1010,9 +1010,9 @@ pub fn import_bytes(mut bytes: Bytes) -> Result<NtImport, IngestError> {
     })
 }
 
-/// Convenience wrapper around [`import_bytes`] for a `Blob<LongString>`
+/// Convenience wrapper around [`import_bytes`] for a `Blob<UTF8String>`
 /// — the on-disk / on-wire representation N-Triples shows up as.
-pub fn import_blob(blob: Blob<LongString>) -> Result<NtImport, IngestError> {
+pub fn import_blob(blob: Blob<UTF8String>) -> Result<NtImport, IngestError> {
     import_bytes(blob.bytes)
 }
 
@@ -1046,7 +1046,7 @@ pub fn ingest_ntriples(mut reader: impl BufRead) -> Result<NtImport, IngestError
 #[derive(Default)]
 struct NTriplesAttrCache {
     genid: HashMap<String, Id>,
-    longstring: HashMap<String, Id>,
+    utf8string: HashMap<String, Id>,
     rawbytes: HashMap<String, Id>,
     i256be: HashMap<String, Id>,
     u256be: HashMap<String, Id>,
@@ -1069,7 +1069,7 @@ impl NTriplesAttrCache {
         if let Some(id) = map.get(iri) {
             return *id;
         }
-        let h: Inline<Handle<LongString>> = meta.put(String::from(iri));
+        let h: Inline<Handle<UTF8String>> = meta.put(String::from(iri));
         let describe = entity! {
             crate::metadata::iri:            h,
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
@@ -1084,8 +1084,8 @@ impl NTriplesAttrCache {
     fn genid(&mut self, meta: &mut Fragment, iri: &str) -> Id {
         Self::resolve::<inlineencodings::GenId>(&mut self.genid, meta, iri)
     }
-    fn longstring(&mut self, meta: &mut Fragment, iri: &str) -> Id {
-        Self::resolve::<Handle<LongString>>(&mut self.longstring, meta, iri)
+    fn utf8string(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<Handle<UTF8String>>(&mut self.utf8string, meta, iri)
     }
     fn rawbytes(&mut self, meta: &mut Fragment, iri: &str) -> Id {
         Self::resolve::<Handle<RawBytes>>(&mut self.rawbytes, meta, iri)
@@ -1306,8 +1306,8 @@ fn build_resolved_outgoing(
 ) -> Option<OutgoingFact> {
     match suffix {
         LiteralSuffix::None => {
-            let attr_id = attr_cache.longstring(meta, predicate);
-            let handle: Inline<Handle<LongString>> = facts.put(text);
+            let attr_id = attr_cache.utf8string(meta, predicate);
+            let handle: Inline<Handle<UTF8String>> = facts.put(text);
             Some(OutgoingFact::Resolved {
                 attr_id,
                 value_raw: handle.raw,
@@ -1353,7 +1353,7 @@ fn build_resolved_outgoing(
             else {
                 return None;
             };
-            let text_handle: Inline<Handle<LongString>> = facts.put(text);
+            let text_handle: Inline<Handle<UTF8String>> = facts.put(text);
             let label_fragment = entity! {
                 crate::import::rdf_lang: lang_value,
                 crate::import::rdf_text: text_handle,
@@ -1395,8 +1395,8 @@ fn emit_text_literal(
     text: View<str>,
     attr_cache: &mut NTriplesAttrCache,
 ) {
-    let attr_id = attr_cache.longstring(meta, predicate);
-    let handle: Inline<Handle<LongString>> = facts.put(text);
+    let attr_id = attr_cache.utf8string(meta, predicate);
+    let handle: Inline<Handle<UTF8String>> = facts.put(text);
     facts.facts_mut().insert(&Trible::new(e, &attr_id, &handle));
 }
 
@@ -1555,7 +1555,7 @@ fn emit_lang_literal(
     let Ok(lang_value): Result<Inline<ShortString>, _> = lang.try_to_inline() else {
         return; // tag too long; BCP-47 caps subtags at 8 chars
     };
-    let text_handle: Inline<Handle<LongString>> = facts.put(text);
+    let text_handle: Inline<Handle<UTF8String>> = facts.put(text);
     let label_fragment = entity! {
         crate::import::rdf_lang: lang_value,
         crate::import::rdf_text: text_handle,

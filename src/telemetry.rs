@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::core::metadata;
 use crate::core::repo::pile::Pile;
 use crate::core::repo::{Repository, Workspace};
-use crate::prelude::blobencodings::LongString;
+use crate::prelude::blobencodings::UTF8String;
 use crate::prelude::inlineencodings::{Blake3, GenId, Handle, ShortString, U256BE};
 use crate::prelude::*;
 use ed25519_dalek::SigningKey;
@@ -29,12 +29,12 @@ pub mod schema {
     attributes! {
         "3E062AA7E3554C8F2DB94883CE639BFE" as pub session: GenId;
         "146E5AA2F7CB3D8B654BC7742A13CAB3" as pub parent: GenId;
-        "CCB0147D20C4C6FCAC0E3D87FAFF71D1" as pub name: Handle<LongString>;
+        "CCB0147D20C4C6FCAC0E3D87FAFF71D1" as pub name: Handle<UTF8String>;
         "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" as pub category: ShortString;
         "E11A84A30CC112650DC860B66B8BD8A9" as pub begin_ns: U256BE;
         "2786FA563372FB6EF469EC7710719A49" as pub end_ns: U256BE;
         "7593602383D0B0D21BBE382A67E5BD9F" as pub duration_ns: U256BE;
-        "7E96DD9A0B5002796B645ED25F5E99AC" as pub source: Handle<LongString>;
+        "7E96DD9A0B5002796B645ED25F5E99AC" as pub source: Handle<UTF8String>;
     }
 
     #[allow(non_upper_case_globals)]

@@ -1149,7 +1149,7 @@ where
 /// first (normal branches) and falls back to `remote_name` (tracking
 /// branches mirrored from a remote peer).
 fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<String> {
-    use triblespace_core::blob::encodings::longstring::LongString;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::repo::BlobStoreGet;
 
@@ -1157,14 +1157,14 @@ fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<
     let meta_handle = Inline::<Handle<SimpleArchive>>::new(*head_hash);
     let meta: triblespace_core::trible::TribleSet = reader.get(meta_handle).ok()?;
 
-    let name_handle: Inline<Handle<LongString>> = find!(
-        h: Inline<Handle<LongString>>,
+    let name_handle: Inline<Handle<UTF8String>> = find!(
+        h: Inline<Handle<UTF8String>>,
         pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
     )
     .next()
     .or_else(|| {
         find!(
-            h: Inline<Handle<LongString>>,
+            h: Inline<Handle<UTF8String>>,
             pattern!(&meta, [{ _?e @ crate::tracking::remote_name: ?h }])
         )
         .next()

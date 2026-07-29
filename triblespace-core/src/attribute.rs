@@ -174,7 +174,7 @@ pub use crate::id::RawId as RawIdAlias;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::encodings::longstring::LongString;
+    use crate::blob::encodings::utf8string::UTF8String;
     use crate::blob::IntoBlob;
     use crate::id::Id;
     use crate::inline::encodings::hash::Handle;
@@ -223,9 +223,9 @@ mod tests {
             metadata::name:         h,
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
-        let handle = Attribute::<Handle<LongString>>::from(entity! {
+        let handle = Attribute::<Handle<UTF8String>>::from(entity! {
             metadata::name:         h,
-            metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+            metadata::value_encoding: <Handle<UTF8String> as MetaDescribe>::id(),
         });
 
         assert_ne!(short.raw(), handle.raw());
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn describe_preserves_identity_iri() {
         let iri = "http://example.org/foo".to_string();
-        let iri_handle: Inline<Handle<LongString>> = iri.to_blob().get_handle();
+        let iri_handle: Inline<Handle<UTF8String>> = iri.to_blob().get_handle();
         let attr = Attribute::<ShortString>::from(entity! {
             metadata::iri:          iri_handle,
             metadata::value_encoding: <ShortString as crate::metadata::MetaDescribe>::id(),

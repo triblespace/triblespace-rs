@@ -8,7 +8,7 @@ use ed25519_dalek::Verifier;
 use ed25519_dalek::VerifyingKey;
 use itertools::Itertools;
 
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::Blob;
 use crate::find;
 use crate::id::Id;
@@ -51,7 +51,7 @@ fn now_updated_at() -> Inline<NsTAIInterval> {
 pub fn branch_metadata(
     signing_key: &SigningKey,
     branch_id: Id,
-    name: Inline<Handle<LongString>>,
+    name: Inline<Handle<UTF8String>>,
     commit_head: Option<Blob<SimpleArchive>>,
 ) -> TribleSet {
     let (head_handle, signed_by, signature) = match commit_head.as_ref() {
@@ -82,7 +82,7 @@ pub fn branch_metadata(
 /// therefore be created without access to a private key.
 pub fn branch_unsigned(
     branch_id: Id,
-    name: Inline<Handle<LongString>>,
+    name: Inline<Handle<UTF8String>>,
     commit_head: Option<Blob<SimpleArchive>>,
 ) -> TribleSet {
     let head_handle = commit_head.as_ref().map(|blob| blob.get_handle());

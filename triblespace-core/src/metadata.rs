@@ -3,7 +3,7 @@
 //! This namespace is used to bootstrap the meaning of other namespaces.
 //! It defines meta attributes that are used to describe other attributes.
 
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::wasmcode::WasmCode;
 use crate::id::Id;
 use crate::id_hex;
@@ -93,12 +93,12 @@ pub const KIND_PROTOCOL: Id = id_hex!("A04AD649FA28DC5904385532E9C8EF74");
 pub const KIND_TAG: Id = id_hex!("452584B4C1CAE0B77F44408E6F194A31");
 
 attributes! {
-    /// Optional long-form description stored as a LongString handle.
+    /// Optional long-form description stored as a UTF8String handle.
     ///
     /// This attribute is general-purpose: it can describe any entity. Schema
     /// metadata uses it for documenting value/blob encodings, but it is equally
     /// valid for domain entities.
-    "AE94660A55D2EE3C428D2BB299E02EC3" as description: inlineencodings::Handle<LongString>;
+    "AE94660A55D2EE3C428D2BB299E02EC3" as description: inlineencodings::Handle<UTF8String>;
     /// Links an attribute or handle to its inline encoding identifier.
     "213F89E3F49628A105B3830BD3A6612C" as value_encoding: inlineencodings::GenId;
     /// Links a handle to its blob encoding identifier.
@@ -114,7 +114,7 @@ attributes! {
     /// The value is a `Handle<WasmCode>` that points to a sandboxed
     /// formatter module (see `triblespace_core::value_formatter`).
     "1A3D520FEDA9E1A4051EBE96E43ABAC7" as value_formatter: inlineencodings::Handle<WasmCode>;
-    /// Long-form display name stored as a LongString handle.
+    /// Long-form display name stored as a UTF8String handle.
     ///
     /// Names are *display*-oriented and contextual: multiple usages of the
     /// same attribute may carry different names depending on the codebase
@@ -127,7 +127,7 @@ attributes! {
     /// [`iri`](`self::iri`) instead. The id-derivation paths for dynamic
     /// attributes hash from those identity-determining attributes, not
     /// from `name`.
-    "7FB28C0B48E1924687857310EE230414" as name: inlineencodings::Handle<LongString>;
+    "7FB28C0B48E1924687857310EE230414" as name: inlineencodings::Handle<UTF8String>;
     /// Internationalized Resource Identifier (IRI) for this entity.
     ///
     /// The canonical identity-determining string for RDF predicate URIs and
@@ -137,19 +137,19 @@ attributes! {
     /// entity-intrinsic-id derivation differs in the attr_id, even when the
     /// raw value bytes are identical.
     ///
-    /// The value is stored as a `Handle<LongString>` — IRI-ness is a
+    /// The value is stored as a `Handle<UTF8String>` — IRI-ness is a
     /// semantic property of *this attribute*, not a structural property of
     /// the bytes. Callers that need IRI-shape validation can apply
     /// it at the application boundary; the storage layer doesn't enforce
     /// it, so mistyped or placeholder IRIs ingest without rejection and
     /// queries can unify across "any string this entity has."
-    "325F05DB88184B4540AAEEFAE1E9667F" as iri: inlineencodings::Handle<LongString>;
+    "325F05DB88184B4540AAEEFAE1E9667F" as iri: inlineencodings::Handle<UTF8String>;
     /// Link a usage annotation entity to the attribute it describes.
     "F10DE6D8E60E0E86013F1B867173A85C" as attribute: inlineencodings::GenId;
     /// Optional provenance string for a usage annotation.
-    "A56350FD00EC220B4567FE15A5CD68B8" as source: inlineencodings::Handle<LongString>;
+    "A56350FD00EC220B4567FE15A5CD68B8" as source: inlineencodings::Handle<UTF8String>;
     /// Optional module path for the usage annotation (from `module_path!()`).
-    "BCB94C7439215641A3E9760CE3F4F432" as source_module: inlineencodings::Handle<LongString>;
+    "BCB94C7439215641A3E9760CE3F4F432" as source_module: inlineencodings::Handle<UTF8String>;
     /// Preferred JSON representation (e.g. string, number, bool, object, ref, blob).
     /// Preferred JSON representation hint (e.g. `"string"`, `"number"`, `"bool"`, `"object"`).
     "A7AFC8C0FAD017CE7EC19587AF682CFF" as json_kind: inlineencodings::ShortString;

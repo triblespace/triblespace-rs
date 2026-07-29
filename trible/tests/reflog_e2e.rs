@@ -21,14 +21,14 @@ fn reflog_lists_branch_updates_and_tombstones() {
 
         let mut a = TribleSet::new();
         let a_name = pile
-            .put::<blobencodings::LongString, _>("a".to_string())
+            .put::<blobencodings::UTF8String, _>("a".to_string())
             .unwrap();
         a += entity! { &ufoid() @ triblespace_core::metadata::name: a_name };
         let h1 = pile.put::<SimpleArchive, _>(a).unwrap();
 
         let mut b = TribleSet::new();
         let b_name = pile
-            .put::<blobencodings::LongString, _>("b".to_string())
+            .put::<blobencodings::UTF8String, _>("b".to_string())
             .unwrap();
         b += entity! { &ufoid() @ triblespace_core::metadata::name: b_name };
         let h2 = pile.put::<SimpleArchive, _>(b).unwrap();

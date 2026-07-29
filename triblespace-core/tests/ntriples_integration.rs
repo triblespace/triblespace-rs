@@ -9,7 +9,7 @@ use anybytes::View;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::attribute::Attribute;
-use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
 use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id_pure, IngestError};
@@ -49,7 +49,7 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     // `facts` is the faithful graph — no rdf_uri annotations mixed in.
     let uri_in_facts = find!(
-        (entity: Id, uri: Inline<Handle<LongString>>),
+        (entity: Id, uri: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
@@ -59,7 +59,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     // distinct subject URIs (frank, dune) each appear, and the
     // URI-valued object (dune) is also tagged.
     let uri_in_meta = find!(
-        (entity: Id, uri: Inline<Handle<LongString>>),
+        (entity: Id, uri: Inline<Handle<UTF8String>>),
         pattern!(import.meta.facts(), [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
@@ -78,14 +78,14 @@ fn ingests_facts_and_roundtrips_via_query() {
     .expect("birthyear triple");
     assert_eq!(year, 1920);
 
-    // The string literal lands as Handle<LongString>; we don't pull the blob
+    // The string literal lands as Handle<UTF8String>; we don't pull the blob
     // (the test would need a reader), we just verify the trible exists.
-    let firstname_attr = Attribute::<Handle<LongString>>::from(entity! {
+    let firstname_attr = Attribute::<Handle<UTF8String>>::from(entity! {
         metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+        metadata::value_encoding: <Handle<UTF8String> as MetaDescribe>::id(),
     });
     let firstname_count = find!(
-        (h: Inline<Handle<LongString>>),
+        (h: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ _?e @ firstname_attr: ?h }])
     )
     .count();
@@ -122,9 +122,9 @@ fn uri_to_id_is_deterministic_across_workspaces() {
         .facts
         .into_facts();
 
-    let frank_attr = Attribute::<Handle<LongString>>::from(entity! {
+    let frank_attr = Attribute::<Handle<UTF8String>>::from(entity! {
         metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+        metadata::value_encoding: <Handle<UTF8String> as MetaDescribe>::id(),
     });
     let (frank_a,) = find!(
         (e: Id),
@@ -374,7 +374,7 @@ fn lang_tagged_literals_reify_into_entities() {
 
     // The label entity also carries an `rdf_text` handle.
     let text_count = find!(
-        (e: Id, h: Inline<Handle<LongString>>),
+        (e: Id, h: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ ?e @ rdf_text: ?h }])
     )
     .count();
@@ -435,9 +435,9 @@ _:b1 <http://ex/q> "x" .
         metadata::iri:          "http://ex/p".to_blob().get_handle(),
         metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
     });
-    let q = Attribute::<Handle<LongString>>::from(entity! {
+    let q = Attribute::<Handle<UTF8String>>::from(entity! {
         metadata::iri:          "http://ex/q".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+        metadata::value_encoding: <Handle<UTF8String> as MetaDescribe>::id(),
     });
 
     let (target,) = find!(
@@ -449,7 +449,7 @@ _:b1 <http://ex/q> "x" .
 
     // The same id appears as the subject of the bnode's outgoing fact.
     let outgoing_count = find!(
-        (h: Inline<Handle<LongString>>),
+        (h: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ target @ q: ?h }])
     )
     .count();
@@ -652,14 +652,14 @@ fn predicate_uris_recoverable_from_meta() {
     // meta, resolve the bytes from meta's embedded blob store.
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
 
-    let firstname_attr = Attribute::<Handle<LongString>>::from(entity! {
+    let firstname_attr = Attribute::<Handle<UTF8String>>::from(entity! {
         metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+        metadata::value_encoding: <Handle<UTF8String> as MetaDescribe>::id(),
     });
     let attr_entity = firstname_attr.id();
 
     let (h,) = find!(
-        (h: Inline<Handle<LongString>>),
+        (h: Inline<Handle<UTF8String>>),
         pattern!(import.meta.facts(), [{ attr_entity @ metadata::iri: ?h }])
     )
     .next()

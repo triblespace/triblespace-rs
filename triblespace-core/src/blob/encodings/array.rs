@@ -3,7 +3,7 @@
 //! `Array<T>` is a structural blob encoding: it says "this blob is a flat array
 //! of T values in native byte order." The semantics (weight tensor, audio
 //! samples, embeddings) come from the TribleSpace attributes that reference
-//! the blob, not the schema itself — same as `LongString` being structural
+//! the blob, not the schema itself — same as `UTF8String` being structural
 //! rather than semantic.
 
 use core::marker::PhantomData;

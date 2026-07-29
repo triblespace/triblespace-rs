@@ -33,7 +33,7 @@ impl MetaDescribe for ED25519RComponent {
         let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "ed25519:r",
-                metadata::description: "Ed25519 signature R component stored as a 32-byte field. This is one half of the standard 64-byte Ed25519 signature.\n\nUse when you store signatures as structured values or need to index the components separately. Pair with the S component to reconstruct or verify the full signature.\n\nIf you prefer storing the signature as a single binary blob, use a blob encoding (for example LongString with base64 or a custom blob encoding).",
+                metadata::description: "Ed25519 signature R component stored as a 32-byte field. This is one half of the standard 64-byte Ed25519 signature.\n\nUse when you store signatures as structured values or need to index the components separately. Pair with the S component to reconstruct or verify the full signature.\n\nIf you prefer storing the signature as a single binary blob, use a blob encoding (for example UTF8String with base64 or a custom blob encoding).",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
