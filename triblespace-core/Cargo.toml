@@ -39,6 +39,7 @@ bytes = "1.6.0"
 serde_json = "1.0"
 bytemuck = { version = "1.15.0", features = ["extern_crate_alloc"]}
 proptest = { version = "1.6.0", optional = true }
+tracing = { version = "0.1.44", optional = true }
 hifitime = "4.1.2"
 f256 = "0.7.0"
 jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "8a066da4a70eb1188f5c6dca70c009e07aa6d048" }
@@ -79,6 +80,15 @@ kani = []
 deterministic = []
 wasm = ["dep:wasmi"]
 parallel = ["dep:rayon", "blake3/rayon"]
+# Emit `tracing` spans from the hot paths — blob validation, rollup attach
+# and merge, device routing.
+#
+# Off by default and zero-cost when off: every span sits behind a macro that
+# compiles to nothing without this feature, so an uninstrumented build is
+# byte-identical to today's. A benchmark measuring the engine must be able
+# to measure it WITHOUT the instrument in the way, and a profiler you cannot
+# switch off is one nobody trusts a timing from.
+trace = ["dep:tracing"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }

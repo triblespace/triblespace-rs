@@ -1158,7 +1158,14 @@ pub fn append_stored_range<S: BlobStore, K: IndexKind>(
                     .map_err(IndexError::Artifact)?,
             );
         }
-        let prepared = kind.merge(&segments).map_err(IndexError::Merge)?;
+        // A carry, which is where the tier curve lives: 45 s at level 1,
+        // 240 s at level 2, 1300 s at level 3. That curve was readable only
+        // because the carry happens inside a timed append — an accident of
+        // where the measurement sat. This makes it structural.
+        let prepared = {
+            crate::scope!("rollup.merge", level = level, segments = segments.len());
+            kind.merge(&segments).map_err(IndexError::Merge)?
+        };
         let mut stored = Vec::with_capacity(prepared.len());
         for artifact in prepared {
             stored.push(store_artifact(storage, kind, artifact)?);
@@ -1563,6 +1570,10 @@ impl IndexKind for SuccinctRollup {
         reader: &R,
         artifact: &Self::StoredArtifact,
     ) -> Result<Self::Segment, ArtifactError> {
+        // Nests over `blob.hash`: the difference between this span and the
+        // hashes inside it is what attaching actually costs once verification
+        // is paid for — the question the tier curve could not answer.
+        crate::scope!("rollup.attach");
         let raw: Blob<SuccinctArchiveBlob> = reader
             .get(artifact.raw)
             .map_err(|error| Box::new(error) as ArtifactError)?;

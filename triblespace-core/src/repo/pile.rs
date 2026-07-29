@@ -206,7 +206,16 @@ impl ValidationCache {
             return cached;
         }
 
-        let computed = compute_validation_state(bytes, expected, strategy);
+        // Only a MISS is spanned. A validated blob is free on every
+        // subsequent read, so emitting a span for the cache hit would report
+        // work that did not happen and bury the real cost in a crowd of
+        // near-zero entries. A span here means Blake3 actually ran, and its
+        // duration is that hash over `bytes` — which is what an "attach"
+        // mostly is.
+        let computed = {
+            crate::scope!("blob.hash", bytes = bytes.len());
+            compute_validation_state(bytes, expected, strategy)
+        };
         *self
             .states
             .lock()

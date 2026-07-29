@@ -1278,6 +1278,12 @@ where
         // never uses, which is a cost belonging to the split rather than to
         // the engine.
         let live = count_live(cands);
+        // Per-call, not per-arm. The registry reports "97.46% of candidate
+        // entries went to the device" as one number for a whole census,
+        // which cannot say whether that is every call at 97% or a handful of
+        // enormous ones carrying the average. `live` and the floor that
+        // gated it make the distribution recoverable.
+        triblespace_core::scope!("confirm.route", live = live);
         if live < self
             .gpu
             .min_confirm_batch_range

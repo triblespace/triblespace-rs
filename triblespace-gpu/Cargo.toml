@@ -16,6 +16,9 @@ no-default-features = true
 features = ["wgpu", "cuda"]
 
 [features]
+# Forwards to the core `trace` feature; the routing decision is a core
+# span consumer, not a second instrumentation stack.
+trace = ["triblespace-core/trace"]
 default = ["wgpu"]
 wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky", "dep:itertools"]
 cuda = ["dep:cubecl", "cubecl/cuda"]

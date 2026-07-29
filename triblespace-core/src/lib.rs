@@ -34,6 +34,7 @@ pub mod query;
 /// Repository layer: blob stores, branch stores, commits, and workspaces.
 pub mod repo;
 /// Trible representation, sets, fragments, and spread helpers.
+pub mod trace;
 pub mod trible;
 
 #[cfg(feature = "wasm")]
