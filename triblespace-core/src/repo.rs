@@ -243,12 +243,27 @@ attributes! {
     "1ACE03BF70242B289FDF00E4327C3BC6" as pub signature_s: ed::ED25519SComponent;
 }
 
-/// Rebuild branch-head metadata against a new commit head while carrying the
-/// range-native index manifests forward from `base_meta`.
+/// Rebuild branch-head metadata against a new commit head, carrying every
+/// other fact on the head forward from `base_meta`.
 ///
-/// [`branch_metadata`] builds a fresh head that omits the manifest, so a
-/// rebuild would otherwise wipe soft derived state. Unknown recipe-owned
-/// facts are copied losslessly alongside known typed manifests.
+/// [`branch_metadata`] mints a fresh branch-head entity — it is
+/// content-derived, so a new head or timestamp yields a new id — and a naive
+/// rebuild would therefore drop everything else stored beside it.
+///
+/// # Why the carry is total
+///
+/// This used to preserve exactly one thing: `index_home::manifest_tribles`.
+/// That made branch-head metadata durable only for the annotation kinds core
+/// knows by name — a closed-world assumption inside a store built on open
+/// extension. Anything else attached to a head (a migration record, a
+/// downstream faculty's annotation) survived until the next push and then
+/// vanished, with no error and no trace, because the loss happens in the
+/// rebuild rather than at the write.
+///
+/// So the rule is inverted: everything is carried EXCEPT the branch-head
+/// entities being replaced. Those are identified by carrying the `branch`
+/// attribute, which is exactly what `branch_metadata` mints and therefore
+/// exactly what this rebuild supersedes.
 fn rebuild_branch_meta(
     signing_key: &SigningKey,
     branch_id: Id,
@@ -257,8 +272,26 @@ fn rebuild_branch_meta(
     base_meta: &TribleSet,
 ) -> TribleSet {
     let mut meta = branch_metadata(signing_key, branch_id, name, commit_head);
-    meta += index_home::manifest_tribles(base_meta);
+    meta += carried_head_facts(base_meta);
     meta
+}
+
+/// Every fact on a branch head except the branch-head entities themselves.
+///
+/// The complement of [`index_home::manifest_tribles`]: rather than naming
+/// the kinds worth keeping, this names the one kind being replaced and keeps
+/// the rest.
+fn carried_head_facts(base_meta: &TribleSet) -> TribleSet {
+    let replaced: std::collections::HashSet<Id> = find!(
+        e: Id,
+        pattern!(base_meta, [{ ?e @ branch: _?b }])
+    )
+    .collect();
+    let mut out = TribleSet::new();
+    for fact in base_meta.iter().filter(|fact| !replaced.contains(fact.e())) {
+        out.insert(fact);
+    }
+    out
 }
 
 /// The `ListBlobs` trait is used to list all blobs in a repository.
