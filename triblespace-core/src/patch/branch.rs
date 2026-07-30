@@ -67,6 +67,37 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
+    /// Union one incoming child whose hash is already known. The closure only
+    /// runs for an occupied slot and receives exact receipts for both sides.
+    pub(super) fn union_child_hashed<F>(
+        &mut self,
+        incoming: HashedHead<KEY_LEN, O, V>,
+        f: F,
+    ) where
+        F: FnOnce(
+            HashedHead<KEY_LEN, O, V>,
+            HashedHead<KEY_LEN, O, V>,
+        ) -> HashedHead<KEY_LEN, O, V>,
+    {
+        Branch::union_child_hashed(&mut self.branch_nn, incoming, f);
+    }
+
+    /// Drain a complete source Branch into this Branch while using its known
+    /// aggregate hash for every non-colliding child. Only true slot collisions
+    /// need to recover the two child hashes.
+    pub(super) fn union_branch_hashed<F>(
+        &mut self,
+        source: &mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>,
+        f: F,
+    ) where
+        F: FnMut(
+            HashedHead<KEY_LEN, O, V>,
+            HashedHead<KEY_LEN, O, V>,
+        ) -> HashedHead<KEY_LEN, O, V>,
+    {
+        Branch::union_branch_hashed(&mut self.branch_nn, source, f);
+    }
+
     /// Like [`modify_child`] but uses the supplied `inserted_hash`
     /// for the empty-slot insertion case instead of calling
     /// `inserted.hash()`. Lets archive ingest avoid recomputing
@@ -483,6 +514,154 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 }
             }
             // Debug invariant check (no-op in release builds).
+            #[cfg(debug_assertions)]
+            branch_nn.as_ref().debug_check_invariants();
+        }
+    }
+
+    /// Receipt-preserving union of one child into an ordinary Branch.
+    pub(super) fn union_child_hashed<F>(
+        branch_nn: &mut NonNull<Self>,
+        incoming: HashedHead<KEY_LEN, O, V>,
+        f: F,
+    ) where
+        F: FnOnce(
+            HashedHead<KEY_LEN, O, V>,
+            HashedHead<KEY_LEN, O, V>,
+        ) -> HashedHead<KEY_LEN, O, V>,
+    {
+        unsafe {
+            let branch = branch_nn.as_ptr();
+            let end_depth = (*branch).end_depth as usize;
+            let key = incoming.head.key();
+
+            if let Some(slot) = (*branch).child_table.table_get_slot(key) {
+                let child = slot.take().unwrap();
+                let old_child_segment_count = child.count_segment(end_depth);
+                let old_child_leaf_count = child.count();
+                let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
+                #[cfg(all(test, not(debug_assertions)))]
+                if child.tag() == HeadTag::LocalLeaf {
+                    record_existing_local_collision();
+                }
+                let existing = HashedHead::from_head(child);
+                let old_child_hash = existing.hash;
+                let replacement = f(existing, incoming);
+
+                (*branch).hash = ((*branch).hash ^ old_child_hash) ^ replacement.hash;
+                (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
+                    + replacement.head.count_segment(end_depth);
+                (*branch).leaf_count = ((*branch).leaf_count - old_child_leaf_count)
+                    + replacement.head.count();
+                if replaced_childleaf {
+                    (*branch).childleaf = replacement.head.childleaf_ptr();
+                }
+                if slot.replace(replacement.head.with_key(key)).is_some() {
+                    unreachable!();
+                }
+            } else {
+                let HashedHead {
+                    head: mut inserted,
+                    hash,
+                } = incoming;
+                (*branch).leaf_count += inserted.count();
+                (*branch).segment_count += inserted.count_segment(end_depth);
+                (*branch).hash ^= hash;
+
+                let mut branch_ptr = branch_nn.as_ptr();
+                while let Some(displaced) = (*branch_ptr).child_table.table_insert(inserted) {
+                    inserted = displaced;
+                    Self::grow(branch_nn);
+                    branch_ptr = branch_nn.as_ptr();
+                }
+            }
+
+            #[cfg(debug_assertions)]
+            branch_nn.as_ref().debug_check_invariants();
+        }
+    }
+
+    /// Bulk receipt-preserving Branch union.
+    ///
+    /// If `D` and `S` are the destination and source aggregate hashes, start
+    /// from `D xor S`. For a colliding child pair `(a, b)` whose union has hash
+    /// `u`, xor the correction `a xor b xor u`. Non-colliding source children
+    /// therefore move without recovering their individual LocalLeaf hashes.
+    pub(super) fn union_branch_hashed<F>(
+        branch_nn: &mut NonNull<Self>,
+        source: &mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>,
+        mut f: F,
+    ) where
+        F: FnMut(
+            HashedHead<KEY_LEN, O, V>,
+            HashedHead<KEY_LEN, O, V>,
+        ) -> HashedHead<KEY_LEN, O, V>,
+    {
+        unsafe {
+            let end_depth = branch_nn.as_ref().end_depth as usize;
+            debug_assert_eq!(source.end_depth as usize, end_depth);
+            let source_hash = source.hash;
+            let mut correction = 0u128;
+
+            for source_child in source.child_table.iter_mut().filter_map(Option::take) {
+                let incoming = source_child.with_start(end_depth);
+                let key = incoming.key();
+                let branch = branch_nn.as_ptr();
+
+                if let Some(slot) = (*branch).child_table.table_get_slot(key) {
+                    let child = slot.take().unwrap();
+                    let old_child_segment_count = child.count_segment(end_depth);
+                    let old_child_leaf_count = child.count();
+                    let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
+                    #[cfg(all(test, not(debug_assertions)))]
+                    {
+                        if child.tag() == HeadTag::LocalLeaf {
+                            record_existing_local_collision();
+                        }
+                        if incoming.tag() == HeadTag::LocalLeaf {
+                            record_bulk_incoming_local_collision();
+                        }
+                    }
+
+                    let existing = HashedHead::from_head(child);
+                    let incoming = HashedHead::from_head(incoming);
+                    let old_hash = existing.hash;
+                    let incoming_hash = incoming.hash;
+                    let replacement = f(existing, incoming);
+                    correction ^= old_hash ^ incoming_hash ^ replacement.hash;
+
+                    (*branch).segment_count =
+                        ((*branch).segment_count - old_child_segment_count)
+                            + replacement.head.count_segment(end_depth);
+                    (*branch).leaf_count = ((*branch).leaf_count - old_child_leaf_count)
+                        + replacement.head.count();
+                    if replaced_childleaf {
+                        (*branch).childleaf = replacement.head.childleaf_ptr();
+                    }
+                    if slot.replace(replacement.head.with_key(key)).is_some() {
+                        unreachable!();
+                    }
+                } else {
+                    #[cfg(all(test, not(debug_assertions)))]
+                    if incoming.tag() == HeadTag::LocalLeaf {
+                        record_bulk_local_passthrough();
+                    }
+                    (*branch).leaf_count += incoming.count();
+                    (*branch).segment_count += incoming.count_segment(end_depth);
+
+                    let mut inserted = incoming;
+                    let mut branch_ptr = branch_nn.as_ptr();
+                    while let Some(displaced) = (*branch_ptr).child_table.table_insert(inserted) {
+                        inserted = displaced;
+                        Self::grow(branch_nn);
+                        branch_ptr = branch_nn.as_ptr();
+                    }
+                }
+            }
+
+            let branch = branch_nn.as_ptr();
+            (*branch).hash ^= source_hash ^ correction;
+
             #[cfg(debug_assertions)]
             branch_nn.as_ref().debug_check_invariants();
         }

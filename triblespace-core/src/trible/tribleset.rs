@@ -767,6 +767,105 @@ mod tests {
         set
     }
 
+    #[cfg(not(debug_assertions))]
+    mod aggregate_receipt_512x3_attr {
+        use crate::prelude::inlineencodings::ShortString;
+        use crate::prelude::*;
+
+        attributes! {
+            pub field_01: ShortString;
+            pub field_02: ShortString;
+            pub field_03: ShortString;
+        }
+    }
+
+    /// Exact source-only receipt for the aggregate-hash union experiment.
+    /// Run alone because the release-test counters are process-global:
+    ///
+    /// `cargo test --release -p triblespace-core --lib aggregate_hash_union_512x3_probe -- --ignored --nocapture --test-threads=1`
+    #[cfg(not(debug_assertions))]
+    #[test]
+    #[ignore = "explicit release-mode aggregate hash union diagnostic"]
+    fn aggregate_hash_union_512x3_probe() {
+        let _ = aggregate_receipt_512x3_attr::field_01.id();
+        let _ = aggregate_receipt_512x3_attr::field_02.id();
+        let _ = aggregate_receipt_512x3_attr::field_03.id();
+        let inputs: Vec<[String; 3]> = (0..512)
+            .map(|entity| {
+                [
+                    format!("a{entity:06}"),
+                    format!("b{entity:06}"),
+                    format!("c{entity:06}"),
+                ]
+            })
+            .collect();
+        let entities: Vec<_> = inputs
+            .iter()
+            .map(|values| {
+                entity! {
+                    aggregate_receipt_512x3_attr::field_01: values[0].as_str(),
+                    aggregate_receipt_512x3_attr::field_02: values[1].as_str(),
+                    aggregate_receipt_512x3_attr::field_03: values[2].as_str(),
+                }
+            })
+            .map(crate::trible::Fragment::into_facts)
+            .collect();
+        let expected: BTreeSet<[u8; TRIBLE_LEN]> = entities
+            .iter()
+            .flat_map(|entity| entity.iter().map(|trible| trible.data))
+            .collect();
+        assert_eq!(expected.len(), 512 * 3);
+
+        crate::patch::reset_root_hash_receipt_probe();
+        let mut aggregate = TribleSet::new();
+        for entity in entities {
+            aggregate += entity;
+        }
+        let (
+            local_leaf_hashes,
+            local_passthroughs,
+            incoming_local_collisions,
+            existing_local_collisions,
+        ) = crate::patch::root_hash_receipt_probe_snapshot();
+        let expected_hash = expected.iter().fold(0u128, |hash, key| {
+            let entry = Entry::new(key);
+            let mut singleton = PATCH::<TRIBLE_LEN, EAVOrder, ()>::new();
+            singleton.insert(&entry);
+            hash ^ singleton.root_hash().expect("singleton has a root hash")
+        });
+
+        assert_eq!(aggregate.len(), 512 * 3);
+        assert_all_indexes(&aggregate, &expected);
+        for root_hash in [
+            aggregate.eav.root_hash(),
+            aggregate.eva.root_hash(),
+            aggregate.aev.root_hash(),
+            aggregate.ave.root_hash(),
+            aggregate.vea.root_hash(),
+            aggregate.vae.root_hash(),
+        ] {
+            assert_eq!(root_hash, Some(expected_hash));
+        }
+        // Every incoming LocalLeaf collides at the current structural Branch
+        // slot even though the full keys are distinct. The bulk aggregate law
+        // therefore cannot split the source hash into the child receipts that
+        // `union_hashed` currently requires: it reproduces the stack-receipt
+        // result instead of the initially predicted 1,935-hash result.
+        assert_eq!(local_passthroughs, 0);
+        assert_eq!(incoming_local_collisions, 6_132);
+        assert_eq!(existing_local_collisions, 936);
+        assert_eq!(local_passthroughs + incoming_local_collisions, 6_132);
+        assert_eq!(
+            local_leaf_hashes,
+            incoming_local_collisions + existing_local_collisions,
+        );
+        assert_eq!(local_leaf_hashes, 7_068);
+        assert_eq!(std::mem::size_of::<TribleSet>(), 96);
+        eprintln!(
+            "aggregate_hash_union entities=512 rows_per_entity=3 baseline_local_leaf_hashes=8004 stack_receipt_local_leaf_hashes=7068 local_leaf_hashes={local_leaf_hashes} local_passthroughs={local_passthroughs} incoming_local_collisions={incoming_local_collisions} existing_local_collisions={existing_local_collisions}",
+        );
+    }
+
     fn assert_shared_owner_guard(set: &TribleSet) {
         let guards = [
             set.eav.owner_guard(),

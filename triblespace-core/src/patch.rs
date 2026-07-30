@@ -349,12 +349,89 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
+// Release-test-only accounting for the root-hash receipt experiment. These
+// counters do not exist in production library builds.
+#[cfg(all(test, not(debug_assertions)))]
+static LOCAL_LEAF_HASHES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static BULK_LOCAL_PASSTHROUGHS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static BULK_INCOMING_LOCAL_COLLISIONS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static EXISTING_LOCAL_COLLISIONS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(test, not(debug_assertions)))]
+fn record_local_leaf_hash() {
+    LOCAL_LEAF_HASHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+fn record_bulk_local_passthrough() {
+    BULK_LOCAL_PASSTHROUGHS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+fn record_bulk_incoming_local_collision() {
+    BULK_INCOMING_LOCAL_COLLISIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+fn record_existing_local_collision() {
+    EXISTING_LOCAL_COLLISIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) fn reset_root_hash_receipt_probe() {
+    LOCAL_LEAF_HASHES.store(0, core::sync::atomic::Ordering::Relaxed);
+    BULK_LOCAL_PASSTHROUGHS.store(0, core::sync::atomic::Ordering::Relaxed);
+    BULK_INCOMING_LOCAL_COLLISIONS.store(0, core::sync::atomic::Ordering::Relaxed);
+    EXISTING_LOCAL_COLLISIONS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) fn root_hash_receipt_probe_snapshot() -> (u64, u64, u64, u64) {
+    (
+        LOCAL_LEAF_HASHES.load(core::sync::atomic::Ordering::Relaxed),
+        BULK_LOCAL_PASSTHROUGHS.load(core::sync::atomic::Ordering::Relaxed),
+        BULK_INCOMING_LOCAL_COLLISIONS.load(core::sync::atomic::Ordering::Relaxed),
+        EXISTING_LOCAL_COLLISIONS.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
 /// branch arm. Below this, the per-key `modify_child` loop wins
 /// because asymmetric merges only touch a handful of slots.
 #[cfg(feature = "parallel")]
 const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
+
+// A thread-local test receipt distinguishes a genuine union spawn from merely
+// compiling the parallel implementation. The top-level scope claims its first
+// overlapping child on the calling test thread, so concurrent tests cannot
+// create a false positive here.
+#[cfg(all(test, feature = "parallel"))]
+std::thread_local! {
+    static PARALLEL_UNION_SPAWNS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "parallel"))]
+fn reset_parallel_union_spawn_probe() {
+    PARALLEL_UNION_SPAWNS.with(|spawns| spawns.set(0));
+}
+
+#[cfg(all(test, feature = "parallel"))]
+fn record_parallel_union_spawn() {
+    PARALLEL_UNION_SPAWNS.with(|spawns| spawns.set(spawns.get() + 1));
+}
+
+#[cfg(all(test, feature = "parallel"))]
+fn parallel_union_spawn_probe() -> usize {
+    PARALLEL_UNION_SPAWNS.with(core::cell::Cell::get)
+}
 
 /// Parallel-aware PATCH union, with a shared work-stealing budget
 /// carried across the entire recursive descent.
@@ -818,6 +895,40 @@ pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     value: PhantomData<V>,
 }
 
+/// Ephemeral ownership of a PATCH head together with its exact semantic XOR
+/// hash. A receipt is stack-only: persistent Heads and Branches keep their
+/// existing layouts, while a root or detached child can carry a hash already
+/// established by its enclosing PATCH or Branch.
+struct HashedHead<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+    head: Head<KEY_LEN, O, V>,
+    hash: u128,
+}
+
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> HashedHead<KEY_LEN, O, V> {
+    #[inline]
+    fn from_head(head: Head<KEY_LEN, O, V>) -> Self {
+        let hash = head.hash();
+        Self { head, hash }
+    }
+
+    #[inline]
+    fn with_hash(head: Head<KEY_LEN, O, V>, hash: u128) -> Self {
+        Self { head, hash }
+    }
+
+    #[inline]
+    fn with_key(mut self, key: u8) -> Self {
+        self.head = self.head.with_key(key);
+        self
+    }
+
+    #[inline]
+    fn with_start(mut self, depth: usize) -> Self {
+        self.head = self.head.with_start(depth);
+        self
+    }
+}
+
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Send for Head<KEY_LEN, O, V> {}
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Sync for Head<KEY_LEN, O, V> {}
 
@@ -962,6 +1073,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::LocalLeaf(bytes) => {
                 use siphasher::sip128::SipHasher24;
                 use std::ptr::addr_of;
+                #[cfg(all(test, not(debug_assertions)))]
+                record_local_leaf_hash();
                 // SAFETY: SIP_KEY is initialized at startup; we only read it.
                 let key = unsafe { *addr_of!(SIP_KEY) };
                 SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
@@ -1242,17 +1355,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         this
     }
 
-    /// Sequential PATCH-trie union. Always serial; the parallel
-    /// dispatch lives in [`Self::par_union`] which calls back into
-    /// `union` once budget is exhausted.
-    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
+    /// Canonical serial PATCH union. Root and detached-subtree hashes become
+    /// stack receipts; equal-depth Branch merges consume the source aggregate
+    /// without hashing right-only LocalLeaf children individually.
+    pub(crate) fn union(this: Self, other: Self, at_depth: usize) -> Self {
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
 
         // Singleton equality is exact byte equality. Decide it before asking
-        // for a fingerprint: LocalLeaf intentionally has no cached hash, and
-        // distinct singleton children need those hashes only once when their
-        // first Branch is formed.
+        // for a root receipt so duplicate root LocalLeaves remain hash-free.
         if this_depth == KEY_LEN && other_depth == KEY_LEN {
             if let Some((depth, this_byte_key, other_byte_key)) =
                 this.first_divergence(&other, at_depth)
@@ -1268,54 +1379,92 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return this;
         }
 
+        Self::union_hashed(
+            HashedHead::from_head(this),
+            HashedHead::from_head(other),
+            at_depth,
+        )
+        .head
+    }
+
+    fn union_hashed(
+        mut this: HashedHead<KEY_LEN, O, V>,
+        mut other: HashedHead<KEY_LEN, O, V>,
+        at_depth: usize,
+    ) -> HashedHead<KEY_LEN, O, V> {
+        let this_depth = this.head.end_depth();
+        let other_depth = other.head.end_depth();
+
+        if this_depth == KEY_LEN && other_depth == KEY_LEN {
+            if let Some((depth, this_byte_key, other_byte_key)) =
+                this.head.first_divergence(&other.head, at_depth)
+            {
+                let old_key = this.head.key();
+                let this_hash = this.hash;
+                let other_hash = other.hash;
+                let hash = this_hash ^ other_hash;
+                let new_body = Branch::new_with_child_hashes(
+                    depth,
+                    this.with_key(this_byte_key).head,
+                    other.with_key(other_byte_key).head,
+                    this_hash,
+                    other_hash,
+                );
+                return HashedHead::with_hash(Head::new(old_key, new_body), hash);
+            }
+            return this;
+        }
+
         // Equal sets necessarily have equal cardinality. This cheap exact
-        // discriminator avoids computing LocalLeaf fingerprints in the much
-        // more common unequal-size case.
-        if this.count() == other.count() && this.hash() == other.hash() {
+        // discriminator now compares the receipts directly.
+        if this.head.count() == other.head.count() && this.hash == other.hash {
             return this;
         }
 
         if let Some((depth, this_byte_key, other_byte_key)) =
-            this.first_divergence(&other, at_depth)
+            this.head.first_divergence(&other.head, at_depth)
         {
-            let old_key = this.key();
-            let new_body = Branch::new(
+            let old_key = this.head.key();
+            let this_hash = this.hash;
+            let other_hash = other.hash;
+            let hash = this_hash ^ other_hash;
+            let new_body = Branch::new_with_child_hashes(
                 depth,
-                this.with_key(this_byte_key),
-                other.with_key(other_byte_key),
+                this.with_key(this_byte_key).head,
+                other.with_key(other_byte_key).head,
+                this_hash,
+                other_hash,
             );
-
-            return Head::new(old_key, new_body);
+            return HashedHead::with_hash(Head::new(old_key, new_body), hash);
         }
 
         if this_depth < other_depth {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+            let mut head = this.head;
+            let mut ed = crate::patch::branch::BranchMut::from_head(&mut head);
             let inserted = other.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
-                None => Some(inserted),
+            ed.union_child_hashed(inserted, |existing, incoming| {
+                Head::union_hashed(existing, incoming, this_depth)
             });
             drop(ed);
-            return this;
+            return HashedHead::from_head(head);
         }
 
         if other_depth < this_depth {
-            let old_key = this.key();
-            let this_head = this;
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
-            let inserted = this_head.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, other_depth)),
-                None => Some(inserted),
+            let old_key = this.head.key();
+            let mut head = other.head;
+            let mut ed = crate::patch::branch::BranchMut::from_head(&mut head);
+            let inserted = this.with_start(ed.end_depth as usize);
+            ed.union_child_hashed(inserted, |existing, incoming| {
+                Head::union_hashed(existing, incoming, other_depth)
             });
             drop(ed);
-            return other.with_key(old_key);
+            return HashedHead::from_head(head.with_key(old_key));
         }
 
-        // Equal depth, hashes differ → walk `other`'s children and resolve
-        // collisions with `modify_child`'s per-call accounting.
+        // Equal depth, hashes differ: drain one complete Branch under its one
+        // aggregate receipt. The target Branch accounts right-only children
+        // with that aggregate and asks for individual receipts only where the
+        // two child tables actually collide.
         //
         // Union is commutative; mutating either side in place is
         // semantically equivalent. Swap when `other`'s child_table
@@ -1324,28 +1473,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // insert. Branch tags encode `log2(child_table_size)`, so
         // the 2× ratio reduces to `other_tag > this_tag` (no body
         // deref needed; the tag bits live in the head's pointer).
-        if other.tag() > this.tag() {
+        if other.head.tag() > this.head.tag() {
             std::mem::swap(&mut this, &mut other);
         }
-        let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
+        let BodyMut::Branch(other_branch_ref) = other.head.body_mut() else {
             unreachable!();
         };
-        let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
-
-        for other_child in other_branch_ref
-            .child_table
-            .iter_mut()
-            .filter_map(Option::take)
-        {
-            let inserted = other_child.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
-                None => Some(inserted),
-            });
-        }
+        let mut ed = crate::patch::branch::BranchMut::from_head(&mut this.head);
+        ed.union_branch_hashed(other_branch_ref, |existing, incoming| {
+            Head::union_hashed(existing, incoming, this_depth)
+        });
         drop(ed);
-        this
+        HashedHead::from_head(this.head)
     }
 
     /// Parallel-aware top-level union entry. Allocates a fresh
@@ -1488,6 +1627,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     let t = this_arr[i].take().expect("both ⇒ this");
                     let o = other_arr[i].take().expect("both ⇒ other");
                     if ctx.try_claim() {
+                        #[cfg(test)]
+                        record_parallel_union_spawn();
                         s.spawn(move |_| {
                             let head = Self::par_union_with_ctx(t, o, this_depth, ctx);
                             // SAFETY: each task has a distinct
@@ -4116,6 +4257,56 @@ mod tests {
         tree.insert(&entry);
     }
 
+    /// Guards the capability boundary separately from the receipt algebra.
+    /// The two fixtures straddle the source-leaf threshold exactly; only the
+    /// 4096-row union may claim Rayon work.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_union_dispatch_respects_leaf_threshold() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("test Rayon pool should build");
+
+        for (side, should_spawn) in [
+            (PARALLEL_PATCH_UNION_THRESHOLD as u64 - 1, false),
+            (PARALLEL_PATCH_UNION_THRESHOLD as u64, true),
+        ] {
+            let overlap = side / 2;
+            let mut left = PATCH::<8, IdentitySchema, ()>::new();
+            for value in 0..side {
+                left.insert(&Entry::new(&value.to_be_bytes()));
+            }
+
+            let mut right = PATCH::<8, IdentitySchema, ()>::new();
+            for value in overlap..overlap + side {
+                right.insert(&Entry::new(&value.to_be_bytes()));
+            }
+
+            let mut expected = PATCH::<8, IdentitySchema, ()>::new();
+            for value in 0..overlap + side {
+                expected.insert(&Entry::new(&value.to_be_bytes()));
+            }
+
+            let spawns = pool.install(|| {
+                // Arm and read the thread-local receipt inside the same pool
+                // worker that executes the top-level scope body. Spawned child
+                // work may migrate, but the claim itself is recorded before
+                // `scope.spawn` on this worker.
+                reset_parallel_union_spawn_probe();
+                left.union(right);
+                parallel_union_spawn_probe()
+            });
+
+            assert_eq!(spawns > 0, should_spawn, "side={side}");
+            assert_eq!(left.root_hash(), expected.root_hash());
+            assert_eq!(
+                left.iter().copied().collect::<HashSet<_>>(),
+                expected.iter().copied().collect::<HashSet<_>>(),
+            );
+        }
+    }
+
     #[test]
     fn ordered_infix_bounds_include_all_zero_and_all_ff() {
         let mut tree = PATCH::<4, IdentitySchema, ()>::new();
@@ -4363,8 +4554,13 @@ mod tests {
 
     #[test]
     fn patch_root_owner_guard_is_one_thin_arc() {
+        type Receipt = HashedHead<64, IdentitySchema, ()>;
+
         assert_eq!(mem::size_of::<Option<Arc<OwnerCover>>>(), 8);
+        // The persistent layout is unchanged: before = 16, after = 16.
         assert_eq!(mem::size_of::<PATCH<64, IdentitySchema, ()>>(), 16);
+        assert_eq!(mem::size_of::<Head<64, IdentitySchema, ()>>(), 8);
+        assert_eq!(mem::size_of::<Receipt>(), 32);
     }
 
     /// Checks what happens if we join two PATCHes that
