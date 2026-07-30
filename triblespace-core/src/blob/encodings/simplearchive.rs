@@ -234,6 +234,30 @@ pub(crate) fn try_from_blob_serial_for_test(
     serial_unarchive(slice, owner.as_ref())
 }
 
+#[cfg(test)]
+fn validate_and_hash_archive_slice_for_test(
+    slice: &[[u8; 64]],
+) -> Result<Vec<u128>, UnarchiveError> {
+    let mut hashes = Vec::with_capacity(slice.len());
+    let mut previous: Option<&[u8; 64]> = None;
+    for row in slice {
+        if Trible::as_transmute_force_raw(row).is_none() {
+            return Err(UnarchiveError::BadTrible);
+        }
+        if let Some(previous) = previous {
+            if previous == row {
+                return Err(UnarchiveError::BadCanonicalizationRedundancy);
+            }
+            if previous > row {
+                return Err(UnarchiveError::BadCanonicalizationOrdering);
+            }
+        }
+        previous = Some(row);
+        hashes.push(hash_key(&row[..]));
+    }
+    Ok(hashes)
+}
+
 /// Validates one canonical EAV archive, hashes each row exactly once, and then
 /// constructs all six PATCH indexes through the test-only in-place MSD radix
 /// builder.
@@ -254,23 +278,7 @@ pub(crate) fn try_from_blob_bottom_up_for_test(
     let owner: Arc<dyn ArchiveOwner> = Arc::new(blob.bytes.clone());
 
     let validation_start = std::time::Instant::now();
-    let mut hashes = Vec::with_capacity(slice.len());
-    let mut prev_trible: Option<&[u8; 64]> = None;
-    for row in slice {
-        if Trible::as_transmute_force_raw(row).is_none() {
-            return Err(UnarchiveError::BadTrible);
-        }
-        if let Some(previous) = prev_trible {
-            if previous == row {
-                return Err(UnarchiveError::BadCanonicalizationRedundancy);
-            }
-            if previous > row {
-                return Err(UnarchiveError::BadCanonicalizationOrdering);
-            }
-        }
-        prev_trible = Some(row);
-        hashes.push(hash_key(&row[..]));
-    }
+    let hashes = validate_and_hash_archive_slice_for_test(slice)?;
     let validation_and_hash = validation_start.elapsed();
     let row_hashes = hashes.len();
     let hash_bytes = hashes.capacity() * std::mem::size_of::<u128>();
@@ -289,6 +297,65 @@ pub(crate) fn try_from_blob_bottom_up_for_test(
         hash_bytes,
         permutation_bytes,
     })
+}
+
+/// Production-shaped bottom-up probe: retain the existing parallel unarchive
+/// topology (one contiguous EAV chunk per worker followed by disjoint set
+/// reduction), but replace each chunk's online insertion loop with the fused
+/// all-six partition builder. Across all live chunks the explicit hash and
+/// permutation storage remains 20 bytes per archive row.
+#[cfg(all(test, feature = "parallel"))]
+fn try_from_blob_chunked_bottom_up_for_test(
+    blob: Blob<SimpleArchive>,
+) -> Result<TribleSet, UnarchiveError> {
+    use rayon::prelude::*;
+
+    let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
+        return Err(UnarchiveError::BadArchive);
+    };
+    let slice: &[[u8; 64]] = &packed_tribles;
+    let owner: Option<Arc<dyn ArchiveOwner>> = ((slice.as_ptr() as usize) & 0x0f == 0)
+        .then(|| Arc::new(blob.bytes.clone()) as Arc<dyn ArchiveOwner>);
+
+    if slice.len() < PARALLEL_UNARCHIVE_THRESHOLD {
+        return serial_unarchive(slice, owner.as_ref());
+    }
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk_size = slice.len().div_ceil(n_threads).max(1);
+    let Some(owner) = owner else {
+        return parallel_unarchive(slice, None);
+    };
+    if u32::try_from(chunk_size).is_err() {
+        return parallel_unarchive(slice, Some(owner));
+    }
+    let chunks: Vec<&[[u8; 64]]> = slice.chunks(chunk_size).collect();
+
+    for pair in chunks.windows(2) {
+        let left = pair[0].last().expect("non-empty chunk");
+        let right = pair[1].first().expect("non-empty chunk");
+        if left == right {
+            return Err(UnarchiveError::BadCanonicalizationRedundancy);
+        }
+        if left > right {
+            return Err(UnarchiveError::BadCanonicalizationOrdering);
+        }
+    }
+
+    let chunk_sets: Result<Vec<TribleSet>, UnarchiveError> = chunks
+        .par_iter()
+        .map(|chunk| {
+            let hashes = validate_and_hash_archive_slice_for_test(chunk)?;
+            let (set, _) = unsafe {
+                TribleSet::from_archive_partition_for_test(chunk, &hashes, &owner)
+            };
+            Ok(set)
+        })
+        .collect();
+
+    Ok(chunk_sets?
+        .into_par_iter()
+        .reduce(TribleSet::new, |left, right| left + right))
 }
 
 /// Parallel unarchive: chunk the blob, validate internal ordering
@@ -467,6 +534,89 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn chunked_bottom_up_archive_matches_public_parallel_path() {
+        for len in [4_095usize, 4_096, 8_192] {
+            let blob = fixture_blob(len);
+            let baseline = TribleSet::try_from_blob(blob.clone()).unwrap();
+            let candidate = try_from_blob_chunked_bottom_up_for_test(blob.clone()).unwrap();
+            assert_all_six_parity(&candidate, &baseline, len);
+
+            let survivor = candidate.clone();
+            drop(candidate);
+            drop(baseline);
+            drop(blob);
+            black_box(vec![0x5au8; len.saturating_mul(64).min(1 << 20)]);
+            assert_eq!(survivor.eav.iter_ordered().count(), len);
+            assert_eq!(survivor.eva.iter_ordered().count(), len);
+            assert_eq!(survivor.aev.iter_ordered().count(), len);
+            assert_eq!(survivor.ave.iter_ordered().count(), len);
+            assert_eq!(survivor.vea.iter_ordered().count(), len);
+            assert_eq!(survivor.vae.iter_ordered().count(), len);
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn chunked_bottom_up_archive_preserves_public_errors() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                fn assert_error_parity(rows: Vec<[u8; 64]>, expected: UnarchiveError) {
+                    let blob = blob_from_rows(rows);
+                    assert_eq!(
+                        TribleSet::try_from_blob(blob.clone())
+                            .expect_err("public decoder must reject invalid input"),
+                        expected,
+                    );
+                    assert_eq!(
+                        try_from_blob_chunked_bottom_up_for_test(blob)
+                            .expect_err("chunked bottom-up decoder must reject invalid input"),
+                        expected,
+                    );
+                }
+
+                let len = PARALLEL_UNARCHIVE_THRESHOLD;
+                let chunk_size = len.div_ceil(rayon::current_num_threads());
+
+                let mut duplicate = (0..len).map(fixture_row).collect::<Vec<_>>();
+                duplicate[chunk_size] = duplicate[chunk_size - 1];
+                assert_error_parity(
+                    duplicate,
+                    UnarchiveError::BadCanonicalizationRedundancy,
+                );
+
+                let mut descending = (0..len).map(fixture_row).collect::<Vec<_>>();
+                descending.swap(chunk_size - 1, chunk_size);
+                assert_error_parity(descending, UnarchiveError::BadCanonicalizationOrdering);
+
+                let invalid = (0..len)
+                    .map(|index| {
+                        let mut row = [0u8; 64];
+                        row[31] = 1;
+                        row[56..64].copy_from_slice(&((index + 1) as u64).to_be_bytes());
+                        row
+                    })
+                    .collect();
+                assert_error_parity(invalid, UnarchiveError::BadTrible);
+
+                let malformed = Blob::new(Bytes::from(vec![0u8; 63]));
+                assert_eq!(
+                    TribleSet::try_from_blob(malformed.clone())
+                        .expect_err("public decoder must reject malformed bytes"),
+                    UnarchiveError::BadArchive,
+                );
+                assert_eq!(
+                    try_from_blob_chunked_bottom_up_for_test(malformed)
+                        .expect_err("chunked bottom-up decoder must reject malformed bytes"),
+                    UnarchiveError::BadArchive,
+                );
+            });
+    }
+
     /// End-to-end serial production vs fused all-six MSD construction timing.
     /// Run with:
     ///
@@ -541,6 +691,70 @@ mod tests {
                 build.as_secs_f64() * 1e3,
                 hash_bytes + permutation_bytes,
                 (hash_bytes + permutation_bytes) as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
+
+    /// Actual public parallel chunk+online+union path versus the same chunk
+    /// DAG with the sparse bottom-up builder inside every worker.
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[ignore = "manual 100k/1m production-shaped construction benchmark"]
+    fn chunked_bottom_up_archive_timing() {
+        fn median(samples: &mut [Duration]) -> Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        for (len, rounds) in [(100_000usize, 6usize), (1_000_000, 4)] {
+            let blob = fixture_blob(len);
+            let baseline_oracle = TribleSet::try_from_blob(blob.clone()).unwrap();
+            let candidate_oracle =
+                try_from_blob_chunked_bottom_up_for_test(blob.clone()).unwrap();
+            assert_all_six_parity(&candidate_oracle, &baseline_oracle, len);
+            drop(candidate_oracle);
+            drop(baseline_oracle);
+
+            let mut baseline_samples = Vec::with_capacity(rounds);
+            let mut candidate_samples = Vec::with_capacity(rounds);
+            for round in 0..rounds {
+                let baseline = || {
+                    let start = Instant::now();
+                    let set = TribleSet::try_from_blob(black_box(blob.clone())).unwrap();
+                    let elapsed = start.elapsed();
+                    black_box(set.len());
+                    drop(set);
+                    elapsed
+                };
+                let candidate = || {
+                    let start = Instant::now();
+                    let set = try_from_blob_chunked_bottom_up_for_test(black_box(blob.clone()))
+                        .unwrap();
+                    let elapsed = start.elapsed();
+                    black_box(set.len());
+                    drop(set);
+                    elapsed
+                };
+                let (baseline_elapsed, candidate_elapsed) = if round % 2 == 0 {
+                    (baseline(), candidate())
+                } else {
+                    let candidate_elapsed = candidate();
+                    (baseline(), candidate_elapsed)
+                };
+                baseline_samples.push(baseline_elapsed);
+                candidate_samples.push(candidate_elapsed);
+            }
+
+            let baseline = median(&mut baseline_samples);
+            let candidate = median(&mut candidate_samples);
+            let transient_bytes = len * (std::mem::size_of::<u128>() + std::mem::size_of::<u32>());
+            println!(
+                "chunked_bottom_up_archive len={len} threads={} baseline_ms={:.3} candidate_ms={:.3} speedup={:.3}x transient_bytes={transient_bytes} transient_mib={:.3}",
+                rayon::current_num_threads(),
+                baseline.as_secs_f64() * 1e3,
+                candidate.as_secs_f64() * 1e3,
+                baseline.as_secs_f64() / candidate.as_secs_f64(),
+                transient_bytes as f64 / (1024.0 * 1024.0),
             );
         }
     }
