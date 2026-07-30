@@ -1104,6 +1104,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Publish an independently proven exact hash without traversing this
+    /// subtree. Branches memoize the proof for every shared snapshot; heap
+    /// leaves already carry the same value. A LocalLeaf has nowhere to retain
+    /// it, so singleton archive roots remain demand-hashed.
+    #[inline]
+    fn publish_known_hash(&self, hash: u128) {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => debug_assert_eq!(leaf.hash, hash),
+            BodyRef::LocalLeaf(_) => {}
+            BodyRef::Branch(branch) => branch.publish_cached_hash(hash),
+        }
+    }
+
     pub(crate) fn hash(&self) -> u128 {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => leaf.hash,
@@ -2714,6 +2727,35 @@ where
         }
     }
 
+    /// Apply the exact set-hash delta for an operation whose only possible
+    /// key-set change is inserting `inserted_hash` once. Descendant caches do
+    /// not participate in this proof: equal cardinality means a duplicate,
+    /// while growth by one means XORing in the new key.
+    #[inline]
+    fn publish_insert_one_delta(
+        &self,
+        old_count: u64,
+        old_hash: Option<u128>,
+        inserted_hash: u128,
+    ) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        let delta = root.count().checked_sub(old_count);
+        debug_assert!(
+            matches!(delta, Some(0 | 1)),
+            "one-key insertion must change cardinality by zero or one",
+        );
+        let derived = match delta {
+            Some(0) => old_hash,
+            Some(1) => old_hash.map(|hash| hash ^ inserted_hash),
+            _ => None,
+        };
+        if let Some(hash) = derived {
+            root.publish_known_hash(hash);
+        }
+    }
+
     /// Inserts a shared key into the PATCH.
     ///
     /// Takes an [Entry] object that can be created from a key,
@@ -2721,25 +2763,39 @@ where
     ///
     /// If the key is already present, this is a no-op.
     pub fn insert(&mut self, entry: &Entry<KEY_LEN, V>) {
+        let old_count = self.len();
+        let old_hash = self.root.as_ref().and_then(Head::known_hash);
+        let leaf = entry.leaf();
+        let inserted_hash = leaf
+            .known_hash()
+            .expect("a heap Entry must carry a resident key hash");
         if self.root.is_some() {
             let this = self.root.take().expect("root should not be empty");
-            let new_head = Head::insert_leaf(this, entry.leaf(), 0);
+            let new_head = Head::insert_leaf(this, leaf, 0);
             self.root.replace(new_head);
         } else {
-            self.root.replace(entry.leaf());
+            self.root.replace(leaf);
         }
+        self.publish_insert_one_delta(old_count, old_hash, inserted_hash);
         self.debug_check_owner_invariant();
     }
 
     /// Inserts a key into the PATCH, replacing the value if it already exists.
     pub fn replace(&mut self, entry: &Entry<KEY_LEN, V>) {
+        let old_count = self.len();
+        let old_hash = self.root.as_ref().and_then(Head::known_hash);
+        let leaf = entry.leaf();
+        let inserted_hash = leaf
+            .known_hash()
+            .expect("a heap Entry must carry a resident key hash");
         if self.root.is_some() {
             let this = self.root.take().expect("root should not be empty");
-            let new_head = Head::replace_leaf(this, entry.leaf(), 0);
+            let new_head = Head::replace_leaf(this, leaf, 0);
             self.root.replace(new_head);
         } else {
-            self.root.replace(entry.leaf());
+            self.root.replace(leaf);
         }
+        self.publish_insert_one_delta(old_count, old_hash, inserted_hash);
         self.debug_check_owner_invariant();
     }
 
@@ -3199,6 +3255,16 @@ where
         }
         if let Some(other_root) = other.root.take() {
             if self.root.is_some() {
+                // Union's result contains both operands. If its cardinality
+                // equals either operand's, the finite key sets are identical,
+                // so that operand's resident hash is an exact result hash.
+                // Capture this boundary evidence before consuming the roots;
+                // the structural merge itself remains fully hash-lazy.
+                let this_count = self.len();
+                let this_hash = self.root.as_ref().and_then(Head::known_hash);
+                let other_count = other_root.count();
+                let other_hash = other_root.known_hash();
+
                 // Extend the installed lifetime guard before Head::union can
                 // detach or move either side's LocalLeaves. Owner-cover carry
                 // is monotone and transactional, so a caught allocation panic
@@ -3211,6 +3277,18 @@ where
                 let merged = Head::par_union(this, other_root, 0);
                 #[cfg(not(feature = "parallel"))]
                 let merged = Head::union(this, other_root, 0);
+                let merged_count = merged.count();
+                let donated_hash = (merged_count == this_count)
+                    .then_some(this_hash)
+                    .flatten()
+                    .or_else(|| {
+                        (merged_count == other_count)
+                            .then_some(other_hash)
+                            .flatten()
+                    });
+                if let Some(hash) = donated_hash {
+                    merged.publish_known_hash(hash);
+                }
                 self.root.replace(merged);
             } else {
                 self.root.replace(other_root);
@@ -3382,6 +3460,8 @@ where
     /// Inserts an archive-backed key and retains its allocation in the PATCH's
     /// persistent root owner cover.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, KEY_LEN>) {
+        let old_count = self.len();
+        let old_hash = self.root.as_ref().and_then(Head::known_hash);
         let (leaf_head, leaf_owner, leaf_hash) = entry.leaf::<O>();
         OwnerCover::retain(&mut self.owners, leaf_owner);
         if let Some(this) = self.root.take() {
@@ -3390,6 +3470,7 @@ where
         } else {
             self.root.replace(leaf_head);
         }
+        self.publish_insert_one_delta(old_count, old_hash, leaf_hash);
         self.debug_check_owner_invariant();
     }
 }
@@ -4234,7 +4315,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_insert_propagates_a_dirty_child_through_a_clean_ancestor() {
+    fn ordinary_insert_updates_a_clean_ancestor_over_a_dirty_child() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
         let mut b = a;
@@ -4302,17 +4383,101 @@ mod tests {
             0,
             "ordinary mutation must not recursively hash a dirty old child",
         );
+        let expected = heap_hash_oracle(&patch);
         assert_eq!(
             branch_cached_hash(&patch),
-            0,
-            "unknown replacement accounting must dirty the clean ancestor",
+            expected,
+            "the known one-key delta must update the clean ancestor exactly",
         );
-        deep_hash_audit(&patch);
-
-        let expected = heap_hash_oracle(&patch);
-        let before = local_leaf_hash_calls();
         assert_eq!(patch.root_hash(), Some(expected));
-        assert_eq!(local_leaf_hash_calls() - before, 4);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
+    fn archive_insert_updates_a_resident_ancestor_over_a_dirty_collision() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut inserted = a;
+        inserted[1] = 1;
+
+        let storage = Arc::new([
+            AlignedArchiveKey(a),
+            AlignedArchiveKey(b),
+            AlignedArchiveKey(inserted),
+        ]);
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let entries: [ArchiveEntry<'_, KEY_LEN>; 3] = std::array::from_fn(|i| unsafe {
+            ArchiveEntry::new(NonNull::from(&storage[i].0), &owner)
+        });
+        let mut patch: PATCH<KEY_LEN> = PATCH::from_archive_pair(&entries[0], &entries[1]);
+        let before = branch_cached_hash(&patch);
+        let expected = before ^ entries[2].hash;
+
+        reset_local_leaf_hash_calls();
+        patch.insert_archive(&entries[2]);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&patch), expected);
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // The first-byte collision creates a dirty child, but the public
+        // insertion boundary still knows the exact whole-set delta.
+        let BodyRef::Branch(root) = patch.root.as_ref().unwrap().body_ref() else {
+            panic!("three-key fixture must have a Branch root");
+        };
+        let collided = root
+            .child_table
+            .table_get(a[0])
+            .expect("the collided first-byte child must remain present");
+        let BodyRef::Branch(collided) = collided.body_ref() else {
+            panic!("the first-byte collision must create a nested Branch");
+        };
+        assert_eq!(collided.cached_hash(), None);
+
+        // Grow only one clone through the same dirty child, then independently
+        // reinsert a duplicate. Both one-key outcomes are exact without
+        // teaching Branch mutation about insertion semantics.
+        let snapshot = patch.clone();
+        let mut novel = inserted;
+        novel[1] = 2;
+        let novel_storage = Arc::new(AlignedArchiveKey(novel));
+        let novel_owner: Arc<dyn ArchiveOwner> = novel_storage.clone();
+        let novel_entry =
+            unsafe { ArchiveEntry::new(NonNull::from(&novel_storage.0), &novel_owner) };
+        let grown_expected = expected ^ novel_entry.hash;
+        reset_local_leaf_hash_calls();
+        patch.insert_archive(&novel_entry);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&snapshot), expected);
+        assert_eq!(snapshot.root_hash(), Some(expected));
+        assert_eq!(branch_cached_hash(&patch), grown_expected);
+        assert_eq!(patch.root_hash(), Some(grown_expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        let duplicate_storage = Arc::new(AlignedArchiveKey(inserted));
+        let duplicate_owner: Arc<dyn ArchiveOwner> = duplicate_storage.clone();
+        let duplicate =
+            unsafe { ArchiveEntry::new(NonNull::from(&duplicate_storage.0), &duplicate_owner) };
+        patch.insert_archive(&duplicate);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&patch), grown_expected);
+        assert_eq!(patch.root_hash(), Some(grown_expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(patch.len(), 4);
+        assert_eq!(
+            snapshot.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, inserted])
+        );
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, inserted, novel])
+        );
+        deep_hash_audit(&snapshot);
+        deep_hash_audit(&patch);
     }
 
     #[test]
@@ -4418,6 +4583,46 @@ mod tests {
         let expected = heap_hash_oracle(&left);
         assert_eq!(left.root_hash(), Some(expected));
         assert_eq!(local_leaf_hash_calls(), 1);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn union_boundary_donates_an_exact_root_over_dirty_children() {
+        let mut key = [0u8; 16];
+        key[0] = 0;
+        key[1] = 0;
+
+        let mut target = owned_archive_dirty_parent(0, 2, 0, 2);
+        let expected = branch_cached_hash(&target);
+        assert_ne!(expected, 0);
+        assert!(direct_dirty_branch_children(&target) > 0);
+        let snapshot = target.clone();
+
+        reset_local_leaf_hash_calls();
+        target.union(owned_archive_single(key));
+        assert_eq!(target.len(), 4);
+        assert_eq!(branch_cached_hash(&target), expected);
+        assert_eq!(target.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(snapshot.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // The proof is symmetric in the operands: when the resident superset
+        // is consumed on the right, its hash can still be donated to the
+        // result after the structural union chooses or mutates either root.
+        let superset = owned_archive_dirty_parent(0, 2, 0, 2);
+        let superset_hash = branch_cached_hash(&superset);
+        let mut subset = owned_archive_single(key);
+        reset_local_leaf_hash_calls();
+        subset.union(superset);
+        assert_eq!(subset.len(), 4);
+        assert_eq!(branch_cached_hash(&subset), superset_hash);
+        assert_eq!(subset.root_hash(), Some(superset_hash));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        deep_hash_audit(&snapshot);
+        deep_hash_audit(&target);
+        deep_hash_audit(&subset);
     }
 
     #[test]
