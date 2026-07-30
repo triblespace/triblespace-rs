@@ -182,16 +182,13 @@ impl TribleSet {
             && self.eav.shares_owner_guard(&self.vae)
     }
 
-    /// The zero-work archive-insert shortcut: one shared cover whose latest
-    /// leaf is the incoming allocation.
-    ///
-    /// Older owners may already occur in the conservative forest. We do not
-    /// search for them; appending one again preserves constant-time adoption.
+    /// The zero-work archive-insert shortcut: one shared exact owner set whose
+    /// latest allocation is the incoming owner.
     fn shared_owner_guard_latest_is(&self, owner: &Arc<dyn ArchiveOwner>) -> bool {
         self.owner_guards_are_shared() && self.eav.owner_guard_latest_is(owner)
     }
 
-    /// Join the conservative owner receipts of all six public indexes.
+    /// Join the exact owner receipts of all six public indexes.
     ///
     /// Public PATCH fields may have evolved independently, so no single index
     /// is authoritative for aggregate lifetime ownership.
@@ -213,7 +210,7 @@ impl TribleSet {
     fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
         // SAFETY: every caller constructs `guard` by joining the receipts of
         // all six indexes in `self` before optionally retaining more owners.
-        // It is therefore a conservative superset of every replaced cover.
+        // It is therefore a superset of every replaced owner set.
         unsafe {
             self.eav.set_owner_guard(guard);
             self.eva.set_owner_guard(guard);
@@ -505,8 +502,8 @@ impl TribleSet {
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, TRIBLE_LEN>) {
         if !self.shared_owner_guard_latest_is(entry.owner()) {
             // Either public indexes diverged or this allocation is not the
-            // latest cover leaf. Repair the complete conservative cover before
-            // installing any LocalLeaf. Each PATCH retain below then sees the
+            // latest owner. Repair the complete exact set before installing
+            // any LocalLeaf. Each PATCH retain below then sees the
             // shared+latest identity and becomes a no-op.
             let mut owners = self.combined_owner_guard();
             owners.retain_archive_owner(entry.owner());
@@ -1046,8 +1043,8 @@ mod tests {
             assert!(!after_a.ptr_eq(&after_b));
             assert!(!set.shared_owner_guard_latest_is(entry_a.owner()));
 
-            // A is already retained deeper in the cover. The forest does not
-            // search for it: appending A conservatively makes it latest again.
+            // A is already retained in the exact set. Re-adopting it changes
+            // only the latest-owner discriminator, not set membership.
             set.insert_archive(&entry_a);
             assert!(set.shared_owner_guard_latest_is(entry_a.owner()));
             assert!(!after_b.ptr_eq(&set.eav.owner_guard()));
