@@ -4083,6 +4083,37 @@ mod tests {
     }
 
     #[test]
+    fn same_key_replace_preserves_exact_ancestor_over_dirty_child() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+        let mut d = c;
+        d[1] = 1;
+
+        let mut patch = owned_archive_pair([a, c]);
+        patch.union(owned_archive_pair([b, d]));
+        let cached_hash = branch_cached_hash(&patch);
+        assert_ne!(cached_hash, 0);
+
+        // The matching LocalLeaf lives below a dirty Branch. Replacing its
+        // provenance changes the returned Head but has an exact zero key-set
+        // delta, which must propagate to the resident outer ancestor.
+        reset_local_leaf_hash_calls();
+        patch.replace(&Entry::new(&a));
+        assert_eq!(branch_cached_hash(&patch), cached_hash);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(patch.node_stats(), (3, 6, 1, 3));
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c, d]),
+        );
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
     fn lazy_union_keeps_disjoint_local_leaves_unhashed_across_dirty_children() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
@@ -4236,6 +4267,46 @@ mod tests {
         assert_eq!(branch_cached_hash(&patch), expected);
         assert_eq!(patch.root_hash(), Some(expected));
         assert_eq!(local_leaf_hash_calls(), before);
+    }
+
+    #[test]
+    fn archive_insert_carries_known_delta_through_a_dirty_child() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+        let mut d = c;
+        d[1] = 1;
+        let mut inserted = a;
+        inserted[1] = 2;
+
+        let mut patch = owned_archive_pair([a, c]);
+        patch.union(owned_archive_pair([b, d]));
+        let before_insert = branch_cached_hash(&patch);
+        assert_ne!(before_insert, 0);
+
+        let storage = Arc::new(AlignedArchiveKey(inserted));
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let entry = unsafe { ArchiveEntry::new(NonNull::from(&storage.0), &owner) };
+
+        reset_local_leaf_hash_calls();
+        patch.insert_archive(&entry);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_ne!(branch_cached_hash(&patch), 0);
+        assert_ne!(branch_cached_hash(&patch), before_insert);
+        assert_eq!(patch.node_stats(), (3, 8, 0, 5));
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c, d, inserted]),
+        );
+
+        let expected = heap_hash_oracle(&patch);
+        assert_eq!(branch_cached_hash(&patch), expected);
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&patch);
     }
 
     #[test]

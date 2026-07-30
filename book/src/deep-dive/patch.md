@@ -111,12 +111,24 @@ demand. A nonzero cached parent may cover dirty children when its exact receipt
 was derived algebraically, so cache knowledge is not required to be
 downward-closed.
 
-A child mutation keeps an exact parent only when the parent, old contribution,
-and replacement contribution are already known (or insertion supplies an exact
-hash hint). Otherwise the parent becomes dirty. Structural mutation never
-calls `child.hash()` merely to maintain a cache. Reading a resident root hash is
-O(1); reading a dirty root folds the subtree in O(n) and does not memoize through
-a shared reference.
+A child mutation returns its structural result together with an exact
+fingerprint delta when the operation knows one:
+
+```
+delta = H(keys before) xor H(keys after)
+H(parent after) = H(parent before) xor delta
+```
+
+Thus a resident parent can remain exact across a duplicate insertion, failed
+removal, value-only replacement, or known-key insertion/removal even when the
+changed child itself is dirty. `delta == 0` describes equal key fingerprints,
+not structural identity or value provenance; the returned child must still be
+installed. When the operation cannot supply a delta, the child editor falls
+back to already-resident old and replacement receipts. If neither source is
+available, the parent becomes dirty. Structural mutation never calls
+`child.hash()` merely to maintain a cache. Reading a resident root hash is O(1);
+reading a dirty root folds the subtree in O(n) and does not memoize through a
+shared reference.
 
 Union repairs more receipts without hashing disjoint LocalLeaves. For
 
