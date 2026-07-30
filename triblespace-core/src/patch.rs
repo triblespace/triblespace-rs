@@ -1325,8 +1325,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if end_depth != KEY_LEN {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
+            let inserted_hash = inserted
+                .known_hash()
+                .expect("insert_leaf requires a heap Leaf with a resident hash");
             let key = inserted.key();
-            ed.modify_child_monotonic(key, |opt| match opt {
+            ed.modify_child_insert_one(key, inserted_hash, |opt| match opt {
                 Some(old) => Some(Head::insert_leaf(old, inserted, end_depth)),
                 None => Some(inserted),
             });
@@ -1404,7 +1407,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child_monotonic_with_inserted_hint(key, leaf_hash, |opt| match opt {
+            ed.modify_child_insert_one(key, leaf_hash, |opt| match opt {
                 None => Some(inserted),
                 Some(old) => Some(Head::insert_archive_leaf(
                     old, inserted, leaf_hash, end_depth,
@@ -4259,7 +4262,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_insert_propagates_a_dirty_child_through_a_clean_ancestor() {
+    fn ordinary_insert_updates_a_clean_ancestor_over_a_dirty_child() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
         let mut b = a;
@@ -4327,17 +4330,110 @@ mod tests {
             0,
             "ordinary mutation must not recursively hash a dirty old child",
         );
+        let expected = heap_hash_oracle(&patch);
         assert_eq!(
             branch_cached_hash(&patch),
-            0,
-            "unknown replacement accounting must dirty the clean ancestor",
+            expected,
+            "the known one-key delta must update the clean ancestor exactly",
+        );
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(patch.len(), 5);
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c, d, inserted])
         );
         deep_hash_audit(&patch);
+    }
 
-        let expected = heap_hash_oracle(&patch);
-        let before = local_leaf_hash_calls();
+    #[test]
+    fn archive_insert_updates_a_resident_ancestor_over_a_dirty_collision() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut inserted = a;
+        inserted[1] = 1;
+
+        let storage = Arc::new([
+            AlignedArchiveKey(a),
+            AlignedArchiveKey(b),
+            AlignedArchiveKey(inserted),
+        ]);
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let entries: [ArchiveEntry<'_, KEY_LEN>; 3] = std::array::from_fn(|i| unsafe {
+            ArchiveEntry::new(NonNull::from(&storage[i].0), &owner)
+        });
+        let mut patch: PATCH<KEY_LEN> =
+            PATCH::from_archive_pair(&entries[0], &entries[1]);
+        let before = branch_cached_hash(&patch);
+        let expected = before ^ entries[2].hash;
+
+        reset_local_leaf_hash_calls();
+        patch.insert_archive(&entries[2]);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&patch), expected);
         assert_eq!(patch.root_hash(), Some(expected));
-        assert_eq!(local_leaf_hash_calls() - before, 4);
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // The first-byte collision creates a dirty child: its old LocalLeaf
+        // contribution was not resident. The root nevertheless remains exact
+        // because insertion changed that child's cardinality by exactly one.
+        let BodyRef::Branch(root) = patch.root.as_ref().unwrap().body_ref() else {
+            panic!("three-key fixture must have a Branch root");
+        };
+        let collided = root
+            .child_table
+            .table_get(a[0])
+            .expect("the collided first-byte child must remain present");
+        let BodyRef::Branch(collided) = collided.body_ref() else {
+            panic!("the first-byte collision must create a nested Branch");
+        };
+        assert_eq!(collided.cached_hash(), None);
+
+        // Clone the exact ancestor over that dirty child, then grow only one
+        // lineage through the same collision. This forces COW at both Branch
+        // levels; the algebraic delta belongs only to the changed snapshot.
+        let snapshot = patch.clone();
+        let mut novel = inserted;
+        novel[1] = 2;
+        let novel_storage = Arc::new(AlignedArchiveKey(novel));
+        let novel_owner: Arc<dyn ArchiveOwner> = novel_storage.clone();
+        let novel_entry =
+            unsafe { ArchiveEntry::new(NonNull::from(&novel_storage.0), &novel_owner) };
+        let grown_expected = expected ^ novel_entry.hash;
+        reset_local_leaf_hash_calls();
+        patch.insert_archive(&novel_entry);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&snapshot), expected);
+        assert_eq!(snapshot.root_hash(), Some(expected));
+        assert_eq!(branch_cached_hash(&patch), grown_expected);
+        assert_eq!(patch.root_hash(), Some(grown_expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // A duplicate from an independent allocation takes the zero-delta
+        // branch of the same contract and must retain the resident ancestor.
+        let duplicate_storage = Arc::new(AlignedArchiveKey(inserted));
+        let duplicate_owner: Arc<dyn ArchiveOwner> = duplicate_storage.clone();
+        let duplicate =
+            unsafe { ArchiveEntry::new(NonNull::from(&duplicate_storage.0), &duplicate_owner) };
+        patch.insert_archive(&duplicate);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&patch), grown_expected);
+        assert_eq!(patch.root_hash(), Some(grown_expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(patch.len(), 4);
+        assert_eq!(
+            snapshot.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, inserted])
+        );
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, inserted, novel])
+        );
+        deep_hash_audit(&snapshot);
+        deep_hash_audit(&patch);
     }
 
     #[test]
