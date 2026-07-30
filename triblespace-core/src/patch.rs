@@ -1347,6 +1347,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     /// - `trible_ptr` must remain valid for at least as long as this Head
     ///   exists, which the caller arranges by retaining its owner in the
     ///   enclosing PATCH's root owner cover.
+    /// - The pointed-to bytes must remain fully initialized and immutable for
+    ///   that lifetime. LocalLeaf routing and fingerprints read them through
+    ///   shared references.
     /// - The pointer must be 16-byte aligned; this is debug-asserted.
     unsafe fn new_local_leaf(key: u8, trible_ptr: NonNull<[u8; KEY_LEN]>) -> Self {
         unsafe {

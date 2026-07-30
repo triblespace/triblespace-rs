@@ -9,8 +9,10 @@ ideas:
    like an immutable value with copy-on-write updates.
 2. **Adaptive width.** Every node is conceptually 256-ary, yet the physical
    footprint scales with the number of occupied children.
-3. **Hash maintenance.** Each subtree carries a 128-bit fingerprint that allows
-   set operations to skip identical branches early.
+3. **Hash receipts.** Subtrees can carry an exact 128-bit fingerprint that lets
+   set operations skip identical branches early. Unknown receipts stay
+   conservative instead of forcing archive-backed leaves to be hashed during
+   every structural update.
 
 Together these properties let PATCH evaluate unions, intersections, and
 differences quickly while staying cache friendly and safe to clone.
@@ -36,6 +38,22 @@ is too small we allocate a larger table with the same layout, migrate the
 children, and update the owning pointer in place. Because every branch uses the
 same structure we avoid the tag soup and pointer chasing that ARTs rely on while
 still adapting to sparse and dense fan-out.
+
+## Archive-backed leaves
+
+An ordinary `Leaf` owns its key and value. A `LocalLeaf` instead points directly
+at immutable, aligned key bytes in an archive. The enclosing PATCH retains an
+exact persistent set of archive owners at its root; every LocalLeaf reachable
+from that root is covered by an owner, and retaining extra owners is harmless.
+This keeps archive lifetime independent of trie shape, so copy-on-write,
+resizing, and set operations can move Heads without reifying their bytes into
+heap leaves.
+
+The owner set is a Patricia trie keyed by allocation address. Its shape is
+canonical for an address set, its height is bounded by the machine word width,
+and unchanged paths remain shared across PATCH snapshots. A PATCH drops its
+root before its owner set, ensuring no archive pointer can outlive the guard
+that makes it readable.
 
 ## Resizing strategy
 
@@ -77,16 +95,51 @@ path-compressed header only materialises a table when needed, while the largest
 table reaches full occupancy without growing past 256 entries. These predictable fill
 factors keep memory usage steady without ART’s specialised node types.
 
-## Hash maintenance
+## Hash receipts
 
-Every leaf stores a SipHash-2-4 fingerprint of its key, and each branch XORs
-its children’s 128-bit hashes together. On insert or delete the previous hash
-contribution is XORed out and the new value XORed in, so updates run in constant
-time. Set operations such as `difference` compare these fingerprints first:
-matching hashes short-circuit because the subtrees are assumed identical, while
-differing hashes force a walk to compute the result. SipHash collisions are
-astronomically unlikely for these 128-bit values, so the shortcut is safe in
-practice.
+Heap leaves store a SipHash-2-4 fingerprint of their key. Archive-backed
+LocalLeaves deliberately do not: their canonical representation is just the
+archive bytes. A branch's receipt obeys the one-way invariant
+
+```
+branch.hash == 0  OR  branch.hash == XOR(hash(key) for key below branch)
+```
+
+Zero is conservative cache bottom. It may also be the genuine XOR of a
+nonempty subtree; that rare case is simply treated as unknown and recomputed on
+demand. A nonzero cached parent may cover dirty children when its exact receipt
+was derived algebraically, so cache knowledge is not required to be
+downward-closed.
+
+A child mutation keeps an exact parent only when the parent, old contribution,
+and replacement contribution are already known (or insertion supplies an exact
+hash hint). Otherwise the parent becomes dirty. Structural mutation never
+calls `child.hash()` merely to maintain a cache. Reading a resident root hash is
+O(1); reading a dirty root folds the subtree in O(n) and does not memoize through
+a shared reference.
+
+Union repairs more receipts without hashing disjoint LocalLeaves. For
+
+```
+H(S) = XOR(hash(key) for key in S),
+```
+
+the recursive union also returns the intersection receipt and applies
+
+```
+H(A union B) = H(A) xor H(B) xor H(A intersection B).
+```
+
+Disjoint byte partitions contribute zero; equal singleton keys contribute one
+leaf hash; child intersections combine by XOR. When both input roots are
+resident, this is enough to make the result root resident even if newly formed
+internal branches remain dirty.
+
+Set operations such as `difference` use whole-subtree equality shortcuts only
+when both candidate receipts are resident. Dirty trees descend structurally
+instead of forcing hashes merely to ask whether they match. SipHash collisions
+remain the same probabilistic equality assumption as before and are
+astronomically unlikely for these 128-bit values.
 
 Consumers can reorder or segment keys through the [`KeySchema`](../../src/patch.rs)
 and [`KeySegmentation`](../../src/patch.rs) traits. Prefix queries reuse the
