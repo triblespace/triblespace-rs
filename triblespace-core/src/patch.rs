@@ -82,25 +82,51 @@ impl ArchiveOwners {
         })
     }
 
+    /// Insert one owner into an already-private outer receipt.
+    ///
+    /// `im::HashMap::insert` reports whether it replaced an existing value,
+    /// so this performs one HAMT traversal instead of a `contains_key` probe
+    /// followed by an insertion. Replacing an existing value is harmless:
+    /// while its Arc is stored, an equal data address can only name the same
+    /// live allocation.
+    #[inline]
+    fn insert(&mut self, address: usize, owner: &Arc<dyn ArchiveOwner>) -> bool {
+        self.by_address.insert(address, owner.clone()).is_none()
+    }
+
     fn retain(current: &mut Option<Arc<Self>>, owner: &Arc<dyn ArchiveOwner>) {
         let address = Self::address(owner);
-        let Some(existing) = current.as_ref() else {
+        let Some(existing) = current.as_mut() else {
             *current = Some(Self::singleton(owner));
             return;
         };
-        if existing.representative_address == address || existing.by_address.contains_key(&address)
-        {
+        if existing.representative_address == address {
             return;
         }
-        // Build the new persistent snapshot while the old guard remains
-        // installed, then publish it in one assignment. Same-owner ingestion
-        // returns above without allocation or Arc traffic.
-        let mut by_address = existing.by_address.clone();
-        by_address.insert(address, owner.clone());
-        *current = Some(Arc::new(Self {
-            representative_address: address,
-            by_address,
-        }));
+
+        // A unique receipt can discover the no-op from `insert`'s return
+        // value without a redundant lookup or a new outer Arc. This path has
+        // no user-defined panic points: the key is `usize`, values clone as
+        // `Arc`, and ordinary allocation failure aborts rather than unwinds.
+        if let Some(existing) = Arc::get_mut(existing) {
+            if existing.insert(address, owner) {
+                existing.representative_address = address;
+            }
+            return;
+        }
+
+        // Preserve receipt identity for a shared no-op. If this owner is new,
+        // `make_mut` snapshots the shared receipt before mutation. If
+        // snapshotting fails, `current` still holds the old cover; once it
+        // succeeds, the snapshot already covers every installed LocalLeaf
+        // before the new owner is inserted.
+        if existing.by_address.contains_key(&address) {
+            return;
+        }
+        let existing = Arc::make_mut(existing);
+        if existing.insert(address, owner) {
+            existing.representative_address = address;
+        }
     }
 
     fn union(left: Option<Arc<Self>>, right: Option<Arc<Self>>) -> Option<Arc<Self>> {
@@ -119,27 +145,40 @@ impl ArchiveOwners {
             return Some(left);
         }
 
-        let (large, small) = if left.by_address.len() >= right.by_address.len() {
+        let (mut large, small) = if left.by_address.len() >= right.by_address.len() {
             (left, right)
         } else {
             (right, left)
         };
-        let mut by_address = large.by_address.clone();
-        let mut changed = false;
-        for (address, owner) in small.by_address.iter() {
-            if !by_address.contains_key(address) {
-                by_address.insert(*address, owner.clone());
-                changed = true;
+
+        if let Some(target) = Arc::get_mut(&mut large) {
+            // The outer receipt is private, so keep its Arc identity and let
+            // the persistent map copy only internally shared HAMT paths as
+            // needed.
+            for (&address, owner) in small.by_address.iter() {
+                target.insert(address, owner);
             }
+            return Some(large);
         }
-        if changed {
-            Some(Arc::new(Self {
-                representative_address: large.representative_address,
-                by_address,
-            }))
-        } else {
-            Some(large)
+
+        // Do not clone a shared outer receipt for a subset union. Once the
+        // first missing owner is found, the union necessarily changes and the
+        // remaining entries can use single-traversal insertion.
+        let mut entries = small.by_address.iter();
+        while let Some((&address, owner)) = entries.next() {
+            if large.by_address.contains_key(&address) {
+                continue;
+            }
+
+            let target = Arc::make_mut(&mut large);
+            let inserted = target.insert(address, owner);
+            debug_assert!(inserted);
+            for (&address, owner) in entries {
+                target.insert(address, owner);
+            }
+            return Some(large);
         }
+        Some(large)
     }
 }
 
@@ -3333,6 +3372,62 @@ mod tests {
             emptied.owners.is_none(),
             "an empty PATCH must release its owners"
         );
+    }
+
+    #[test]
+    fn archive_owner_retention_mutates_unique_receipts_and_snapshots_shared_ones() {
+        let first: Arc<dyn ArchiveOwner> = Arc::new(1u8);
+        let second: Arc<dyn ArchiveOwner> = Arc::new(2u8);
+        let third: Arc<dyn ArchiveOwner> = Arc::new(3u8);
+
+        let mut current = None;
+        ArchiveOwners::retain(&mut current, &first);
+        let unique_address = Arc::as_ptr(current.as_ref().unwrap());
+        ArchiveOwners::retain(&mut current, &second);
+        assert_eq!(Arc::as_ptr(current.as_ref().unwrap()), unique_address);
+        assert_eq!(current.as_ref().unwrap().by_address.len(), 2);
+
+        let snapshot = current.clone();
+        ArchiveOwners::retain(&mut current, &third);
+        assert!(!Arc::ptr_eq(
+            current.as_ref().unwrap(),
+            snapshot.as_ref().unwrap(),
+        ));
+        assert_eq!(current.as_ref().unwrap().by_address.len(), 3);
+        assert_eq!(snapshot.as_ref().unwrap().by_address.len(), 2);
+
+        // Retaining an older owner is a shared no-op and keeps receipt
+        // identity, even though it is not the representative hot-path owner.
+        let before = current.clone();
+        ArchiveOwners::retain(&mut current, &second);
+        assert!(Arc::ptr_eq(
+            current.as_ref().unwrap(),
+            before.as_ref().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn archive_owner_union_reuses_unique_and_shared_superset_receipts() {
+        let first: Arc<dyn ArchiveOwner> = Arc::new(1u8);
+        let second: Arc<dyn ArchiveOwner> = Arc::new(2u8);
+        let third: Arc<dyn ArchiveOwner> = Arc::new(3u8);
+
+        let mut large = None;
+        ArchiveOwners::retain(&mut large, &first);
+        ArchiveOwners::retain(&mut large, &second);
+        let unique_address = Arc::as_ptr(large.as_ref().unwrap());
+        let joined = ArchiveOwners::union(large, Some(ArchiveOwners::singleton(&third))).unwrap();
+        assert_eq!(Arc::as_ptr(&joined), unique_address);
+        assert_eq!(joined.by_address.len(), 3);
+
+        let shared_superset = joined.clone();
+        let unchanged = ArchiveOwners::union(
+            Some(joined),
+            Some(ArchiveOwners::singleton(&first)),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&unchanged, &shared_superset));
+        assert_eq!(unchanged.by_address.len(), 3);
     }
 
     #[test]
