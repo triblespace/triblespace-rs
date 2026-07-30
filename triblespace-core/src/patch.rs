@@ -489,10 +489,14 @@ pub(crate) enum BodyRef<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     Branch(&'a Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>),
 }
 
-/// Mutable borrow view of a Head body.
+/// Mutation-capable borrow view of a Head body.
 /// Returned by `body_mut()` and tied to the lifetime of the `&mut Head`.
+///
+/// Branches are copy-on-write and therefore unique before this view exposes
+/// them mutably. Heap leaves, like archive-local leaves, may still be shared
+/// by another PATCH snapshot, so both leaf variants are exposed read-only.
 pub(crate) enum BodyMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
-    Leaf(&'a mut Leaf<KEY_LEN, V>),
+    Leaf(&'a Leaf<KEY_LEN, V>),
     /// `LocalLeaf` is read-only by construction (it points into immutable
     /// archive bytes), so the mutable view yields a shared reference.
     /// Callers attempting to mutate a `LocalLeaf` must first reify it
@@ -647,7 +651,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(crate) fn body_mut(&mut self) -> BodyMut<'_, KEY_LEN, O, V> {
         unsafe {
             match self.body() {
-                BodyPtr::Leaf(mut leaf) => BodyMut::Leaf(leaf.as_mut()),
+                BodyPtr::Leaf(leaf) => BodyMut::Leaf(leaf.as_ref()),
                 BodyPtr::LocalLeaf(ptr) => BodyMut::LocalLeaf(ptr.as_ref()),
                 BodyPtr::Branch(mut branch) => {
                     // Ensure ownership: try copy-on-write and update local pointer if needed.
@@ -3066,6 +3070,26 @@ mod tests {
         let entry = Entry::new(&[0; KEY_SIZE]);
         tree.insert(&entry);
         let _clone = tree.clone();
+    }
+
+    #[test]
+    fn consuming_shared_leaf_does_not_mutably_alias_value() {
+        const KEY_SIZE: usize = 4;
+        let key = [1u8; KEY_SIZE];
+        let mut retained = PATCH::<KEY_SIZE, IdentitySchema, String>::new();
+        let entry = Entry::with_value(&key, String::from("still borrowed"));
+        retained.insert(&entry);
+        drop(entry);
+
+        let unordered = retained.clone();
+        let value = retained.get(&key).expect("inserted value");
+        assert_eq!(unordered.into_iter().collect::<Vec<_>>(), vec![key]);
+        assert_eq!(value, "still borrowed");
+
+        let ordered = retained.clone();
+        let value = retained.get(&key).expect("inserted value");
+        assert_eq!(ordered.into_iter_ordered().collect::<Vec<_>>(), vec![key]);
+        assert_eq!(value, "still borrowed");
     }
 
     #[test]
