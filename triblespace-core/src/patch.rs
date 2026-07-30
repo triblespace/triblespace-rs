@@ -4557,7 +4557,7 @@ mod tests {
             }
             assert_eq!(
                 patch.root_hash(),
-                hashes.iter().copied().fold(0, |acc, hash| acc ^ hash),
+                Some(hashes.iter().copied().fold(0, |acc, hash| acc ^ hash)),
             );
             assert_eq!(patch.branch_fanout_histogram()[fanout], 1);
             assert_eq!(stats.branches, 1);
