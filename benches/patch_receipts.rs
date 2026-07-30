@@ -564,6 +564,26 @@ fn bench_union(c: &mut Criterion) {
                 );
             });
         }
+        group.throughput(Throughput::Elements(
+            8 * (case.left.len() + case.right.len()),
+        ));
+        group.bench_function(BenchmarkId::new(case.name, "union_repeat8"), |b| {
+            b.iter_batched(
+                || {
+                    (
+                        case.left.clone(),
+                        (0..8).map(|_| case.right.clone()).collect::<Vec<_>>(),
+                    )
+                },
+                |(mut left, rights)| {
+                    for right in rights {
+                        left.union(black_box(right));
+                    }
+                    black_box(left)
+                },
+                BatchSize::LargeInput,
+            );
+        });
     }
     group.finish();
 }
@@ -902,9 +922,9 @@ fn bench_tribleset_union(c: &mut Criterion) {
     let cases = tribleset_union_cases();
     let mut group = c.benchmark_group("patch_receipts/tribleset_union");
     group.sample_size(20);
-    group.throughput(Throughput::Elements(8_192));
 
     for case in &cases {
+        group.throughput(Throughput::Elements(8_192));
         for (workload, equality_repeats) in
             [("union_only", 0), ("union_eq1", 1), ("union_eq8", 8)]
         {
@@ -924,6 +944,24 @@ fn bench_tribleset_union(c: &mut Criterion) {
                 );
             });
         }
+        group.throughput(Throughput::Elements(8 * 8_192));
+        group.bench_function(BenchmarkId::new(case.name, "union_repeat8"), |b| {
+            b.iter_batched(
+                || {
+                    (
+                        case.left.clone(),
+                        (0..8).map(|_| case.right.clone()).collect::<Vec<_>>(),
+                    )
+                },
+                |(mut left, rights)| {
+                    for right in rights {
+                        left.union(black_box(right));
+                    }
+                    black_box(left)
+                },
+                BatchSize::LargeInput,
+            );
+        });
     }
     group.finish();
 }
