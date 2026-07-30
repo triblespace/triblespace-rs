@@ -921,8 +921,22 @@ pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     value: PhantomData<V>,
 }
 
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Send for Head<KEY_LEN, O, V> {}
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Sync for Head<KEY_LEN, O, V> {}
+// SAFETY: a Head owns a persistent, atomically reference-counted node. Cloned
+// Heads may expose the same Leaf<V> on different threads, and the final owner
+// may drop V on either thread, so both auto traits require V: Send + Sync.
+// O and O::Segmentation are ignored deliberately: they are type-level schemas
+// used only through associated constants and functions; no value or reference
+// of either type is stored in, or accessed through, a Head.
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync> Send
+    for Head<KEY_LEN, O, V>
+{
+}
+
+// SAFETY: the same shared-leaf and type-level-schema argument above applies.
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync> Sync
+    for Head<KEY_LEN, O, V>
+{
+}
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // Tagged pointer layout (64-bit only):
@@ -2453,6 +2467,30 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
 /// compared to other adaptive trie implementations, like ARTs or Judy Arrays
 ///
 /// The PATCH allows for cheap copy-on-write operations, with `clone` being O(1).
+/// Its persistent snapshots can share leaves, so a PATCH is `Send + Sync` only
+/// when its associated value is also both `Send` and `Sync`.
+///
+/// A value that is neither thread-safe cannot make a PATCH thread-safe:
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+/// use triblespace_core::patch::{IdentitySchema, PATCH};
+///
+/// fn assert_send_sync<T: Send + Sync>() {}
+/// assert_send_sync::<PATCH<1, IdentitySchema, Rc<()>>>();
+/// ```
+///
+/// `Cell<u64>` is `Send` but not `Sync`. Rejecting this case is important:
+/// moving one PATCH snapshot can leave another snapshot reading the same leaf
+/// on its original thread.
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+/// use triblespace_core::patch::{IdentitySchema, PATCH};
+///
+/// fn assert_send<T: Send>() {}
+/// assert_send::<PATCH<1, IdentitySchema, Cell<u64>>>();
+/// ```
 #[derive(Debug)]
 pub struct PATCH<const KEY_LEN: usize, O = IdentitySchema, V = ()>
 where

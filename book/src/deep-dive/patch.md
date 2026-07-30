@@ -107,10 +107,11 @@ Structural operations preserve that invariant as follows:
 
 The cover is a lifetime receipt rather than a reachability index. Operations
 may conservatively retain an owner whose leaves disappeared from the result;
-that provenance can remain until the `PATCH` becomes empty, at which point the
-cover is cleared. A `TribleSet` shares one such cover across all six PATCH
-indexes, joining any divergent covers once at aggregate set-operation
-boundaries.
+direct clearing and removal paths that empty a `PATCH` clear that provenance.
+Aggregate reconciliation may nevertheless install or retain a conservative
+cover on an already-empty `PATCH`, so emptiness alone does not promise immediate
+release. A `TribleSet` shares one such cover across all six PATCH indexes,
+joining any divergent covers once at aggregate set-operation boundaries.
 
 ## Hash maintenance
 

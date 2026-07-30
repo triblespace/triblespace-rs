@@ -469,6 +469,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PATCH thread-safety now follows its associated values.** Persistent PATCH
+  snapshots may share a leaf across threads, so both `Send` and `Sync` now
+  require `V: Send + Sync`; compile-time coverage includes the important
+  `Cell<u64>` case where `Send` alone is insufficient. Type-only key schemas
+  remain independent of these bounds.
+
 - **Safe PATCH entries cannot observe an uninitialized or racing hash key.**
   The internal leaf key and independent public-fingerprint key now live in one
   immutable `OnceLock` bundle. Heap entries, archive entries, bulk hashing,
