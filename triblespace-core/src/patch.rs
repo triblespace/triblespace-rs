@@ -988,10 +988,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// probabilistic fingerprint.
     #[inline]
     fn same_body(&self, other: &Self) -> bool {
+        self.body_identity() == other.body_identity()
+    }
+
+    /// Exact persistent-body identity, excluding the contextual routing byte.
+    /// Both Heads compared by [`Self::same_body`] remain live for the duration
+    /// of that comparison. This is not a general mutation token: a uniquely
+    /// owned Branch can change its key set without changing address.
+    #[inline]
+    fn body_identity(&self) -> u64 {
         let body_and_tag = Self::BODY_MASK | Self::TAG_MASK;
-        let this_body = self.tptr.as_ptr() as u64 & body_and_tag;
-        let other_body = other.tptr.as_ptr() as u64 & body_and_tag;
-        this_body == other_body
+        self.tptr.as_ptr() as u64 & body_and_tag
     }
 
     #[inline]
@@ -1319,7 +1326,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
+            ed.modify_child_monotonic(key, |opt| match opt {
                 Some(old) => Some(Head::insert_leaf(old, inserted, end_depth)),
                 None => Some(inserted),
             });
@@ -1397,7 +1404,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child_with_inserted_hint(key, leaf_hash, |opt| match opt {
+            ed.modify_child_monotonic_with_inserted_hint(key, leaf_hash, |opt| match opt {
                 None => Some(inserted),
                 Some(old) => Some(Head::insert_archive_leaf(
                     old, inserted, leaf_hash, end_depth,
@@ -1509,7 +1516,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = other.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
+            ed.modify_child_monotonic(key, |opt| match opt {
                 Some(old) => Some(Head::union(old, inserted, this_depth)),
                 None => Some(inserted),
             });
@@ -1523,7 +1530,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
             let inserted = this_head.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
+            ed.modify_child_monotonic(key, |opt| match opt {
                 Some(old) => Some(Head::union(old, inserted, other_depth)),
                 None => Some(inserted),
             });
@@ -1559,7 +1566,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         {
             let inserted = other_child.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
+            ed.modify_child_monotonic(key, |opt| match opt {
                 Some(old) => Some(Head::union(old, inserted, this_depth)),
                 None => Some(inserted),
             });
@@ -1611,8 +1618,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Self::union(this, other, at_depth);
         }
 
-        let this_hash = this.known_hash();
-        let other_hash = other.known_hash();
+        let mut this_hash = this.known_hash();
+        let mut other_hash = other.known_hash();
         if this.count() == other.count() {
             if let (Some(left), Some(right)) = (this_hash, other_hash) {
                 if left == right {
@@ -1650,6 +1657,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // head pointer, no body deref / CoW risk.
         if other.tag() > this.tag() {
             std::mem::swap(&mut this, &mut other);
+            std::mem::swap(&mut this_hash, &mut other_hash);
         }
 
         // Threshold check via `body_ref` (no CoW); fall back to
@@ -1663,9 +1671,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Self::union(this, other, at_depth);
         }
 
+        let this_leaf_count = this.count();
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
         };
+        let other_leaf_count = other_branch_ref.leaf_count;
 
         {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
@@ -1698,14 +1708,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     }
                 }
             }
-            let known_hash = if both == crate::patch::bytetable::ByteSet::new_empty() {
-                match (this_hash, other_hash) {
-                    (Some(left), Some(right)) => Some(left ^ right),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let disjoint = both == crate::patch::bytetable::ByteSet::new_empty();
 
             // Reuse `this_arr` as the resolved-head target. A both-side slot is
             // taken before dispatch, so each task writes into a distinct empty
@@ -1756,13 +1759,35 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // semantics.
 
             debug_assert!(other_arr.iter().all(Option::is_none));
+            let mut result_leaf_count = 0u64;
             for slot in &mut this_arr {
                 if let Some(head) = slot.take() {
+                    result_leaf_count += head.count();
                     ed.install_child_growing(head);
                 }
             }
 
+            debug_assert!(result_leaf_count >= this_leaf_count);
+            debug_assert!(result_leaf_count >= other_leaf_count);
+            let same_as_this = result_leaf_count == this_leaf_count;
+            let same_as_other = result_leaf_count == other_leaf_count;
+            let known_hash = match (same_as_this, same_as_other) {
+                // Union is monotone. Equal cardinality proves the result is
+                // exactly that operand's original key set under PATCH's
+                // existing fingerprint-collision assumption, including when
+                // a colliding Branch mutated in place. If both counts match,
+                // either resident operand can supply the identical hash.
+                (true, true) => this_hash.or(other_hash),
+                (true, false) => this_hash,
+                (false, true) => other_hash,
+                (false, false) if disjoint => match (this_hash, other_hash) {
+                    (Some(left), Some(right)) => Some(left ^ right),
+                    _ => None,
+                },
+                (false, false) => None,
+            };
             ed.finish_bulk_aggregates(known_hash);
+            debug_assert_eq!(ed.leaf_count, result_leaf_count);
             drop(ed);
             return this;
         }
@@ -4494,6 +4519,59 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
+    fn parallel_strict_subset_union_donates_source_hash_without_swap() {
+        // Both roots have the same 128-way fan-out/capacity, so the exact
+        // 8,192-row source remains `other`. The dirty physical target is a
+        // strict 4,096-row subset and must grow to the source's cardinality.
+        let mut left = owned_archive_dirty_parent(0, 128, 0, 32);
+        demote_root_hash(&mut left);
+        let right = owned_archive_dirty_parent(0, 128, 0, 64);
+        let expected_hash = right.root_hash().expect("right root must be exact");
+        assert_eq!(left.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(right.len(), 2 * left.len());
+        assert_eq!(
+            left.root.as_ref().unwrap().tag(),
+            right.root.as_ref().unwrap().tag()
+        );
+        assert_eq!(branch_cached_hash(&left), 0);
+        assert_eq!(branch_cached_hash(&right), expected_hash);
+
+        reset_local_leaf_hash_calls();
+        left.union(right);
+
+        assert_eq!(left.len(), 2 * PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(branch_cached_hash(&left), expected_hash);
+        assert_eq!(left.root_hash(), Some(expected_hash));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&left);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_capacity_swap_keeps_hash_with_exact_target() {
+        // The exact 8,192-row source has 128-way root fan-out while the dirty
+        // 4,096-row target has 64-way fan-out. The parallel merge therefore
+        // swaps the physical operands (and their hashes) before scattering;
+        // the now-target superset must retain its resident fingerprint.
+        let mut dirty_left = owned_archive_dirty_parent(0, 64, 0, 64);
+        demote_root_hash(&mut dirty_left);
+        let exact_right = owned_archive_dirty_parent(0, 128, 0, 64);
+        let expected_hash = exact_right.root_hash().expect("right root must be exact");
+        assert!(exact_right.root.as_ref().unwrap().tag() > dirty_left.root.as_ref().unwrap().tag());
+        assert_eq!(dirty_left.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(exact_right.len(), 2 * dirty_left.len());
+
+        reset_local_leaf_hash_calls();
+        dirty_left.union(exact_right);
+        assert_eq!(dirty_left.len(), 2 * PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(branch_cached_hash(&dirty_left), expected_hash);
+        assert_eq!(dirty_left.root_hash(), Some(expected_hash));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&dirty_left);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
     fn parallel_union_defers_overlapping_hash_work_until_requested() {
         // The two 4,096-row inputs share exactly variant 31: one leaf in each
         // of 128 root buckets. Their direct child hashes are deliberately
@@ -4591,6 +4669,120 @@ mod tests {
         assert_eq!(local.len(), 1);
         assert_eq!(local_leaf_hash_calls(), 0);
         assert_eq!(local.root.as_ref().unwrap().tag(), HeadTag::LocalLeaf);
+    }
+
+    #[test]
+    fn monotone_duplicate_union_preserves_a_resident_parent() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+
+        let mut left = owned_archive_pair([a, b]);
+        let original = left.clone();
+        let BodyRef::Branch(root) = left.root.as_ref().unwrap().body_ref() else {
+            panic!("pair fixture must have a Branch root");
+        };
+        let resident = root.cached_hash().expect("archive pair must be resident");
+
+        // Removing `a` from a shared snapshot collapses it to the very same
+        // archive-resident `b` body that occurs below `left`.
+        let mut same_owner_duplicate = left.clone();
+        same_owner_duplicate.remove(&a);
+        assert_eq!(
+            same_owner_duplicate.root.as_ref().unwrap().tag(),
+            HeadTag::LocalLeaf
+        );
+
+        reset_local_leaf_hash_calls();
+        left.union(same_owner_duplicate);
+        assert_eq!(left.len(), 2);
+        assert_eq!(branch_cached_hash(&left), resident);
+        assert_eq!(branch_cached_hash(&original), resident);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(left.root_hash(), Some(resident));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // Monotonicity plus equal cardinality is enough even when the duplicate
+        // comes from another archive allocation.
+        let independent_duplicate = owned_archive_single(b);
+        left.union(independent_duplicate);
+        assert_eq!(branch_cached_hash(&left), resident);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(left.root_hash(), Some(resident));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&left);
+        deep_hash_audit(&original);
+    }
+
+    #[test]
+    fn monotone_subset_union_preserves_resident_ancestors() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+
+        let mut left = owned_archive_pair([a, b]);
+        left.union(owned_archive_single(c));
+        let resident = left.root_hash().expect("left must have an exact root");
+
+        // Rebuild the two-key subset through a real removal and reinsertion so
+        // its Branch is dirty rather than hash-equal-shortcutting at entry.
+        let mut subset = owned_archive_pair([a, b]);
+        subset.remove(&a);
+        subset.union(owned_archive_single(a));
+        assert_eq!(subset.len(), 2);
+        assert_eq!(branch_cached_hash(&subset), 0);
+
+        reset_local_leaf_hash_calls();
+        left.union(subset);
+        assert_eq!(left.len(), 3);
+        assert_eq!(branch_cached_hash(&left), resident);
+        assert_eq!(left.root_hash(), Some(resident));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(
+            left.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c])
+        );
+        deep_hash_audit(&left);
+    }
+
+    #[test]
+    fn real_local_leaf_change_still_dirties_a_resident_parent() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[1] = 2;
+
+        let mut patch = owned_archive_pair([a, b]);
+        let BodyRef::Branch(root) = patch.root.as_ref().unwrap().body_ref() else {
+            panic!("pair fixture must have a Branch root");
+        };
+        let resident = root.cached_hash().expect("archive pair must be resident");
+
+        reset_local_leaf_hash_calls();
+        patch.union(owned_archive_single(b));
+        let BodyRef::Branch(root) = patch.root.as_ref().unwrap().body_ref() else {
+            panic!("duplicate union must retain the Branch root");
+        };
+        assert_eq!(root.cached_hash(), Some(resident));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        patch.union(owned_archive_single(c));
+        let BodyRef::Branch(root) = patch.root.as_ref().unwrap().body_ref() else {
+            panic!("changed union must retain a Branch root");
+        };
+        assert_eq!(root.cached_hash(), None);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c])
+        );
+        deep_hash_audit(&patch);
     }
 
     #[test]

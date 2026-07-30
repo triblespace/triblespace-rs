@@ -18,6 +18,12 @@ const TABLE_ENTRY_SIZE: usize = 8;
 const HASH_KNOWN: u32 = 1 << 31;
 const RC_MASK: u32 = HASH_KNOWN - 1;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ChildEditSemantics {
+    Arbitrary,
+    MonotoneSetGrowth,
+}
+
 #[inline]
 pub(crate) fn dst_len<T>(ptr: *const [T]) -> usize {
     let ptr: *const [()] = ptr as _;
@@ -69,20 +75,41 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
-    /// Like [`modify_child`] but treats the supplied `inserted_hash` as a known
-    /// contribution for the empty-slot insertion case. This lets archive
-    /// ingest maintain a clean parent around a LocalLeaf without recomputing
-    /// siphash24 once per index — the caller already has it from
-    /// `ArchiveEntry::hash`.
-    ///
-    /// The hint MUST equal the hash of whatever `f(None)` returns.
-    /// When the slot is non-empty, both old and replacement contributions must
-    /// already be cached or the parent becomes dirty.
-    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: u128, f: F)
+    /// Modify a child with an operation whose result key set is guaranteed to
+    /// contain the input key set. Equal pre/post leaf counts then prove an
+    /// exact semantic no-op, so a resident parent hash can be retained without
+    /// consulting either child hash. `union` and insertion satisfy this
+    /// contract; replacement, removal, and difference do not.
+    pub fn modify_child_monotonic<F>(&mut self, key: u8, f: F)
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
-        Branch::modify_child_with_inserted_hint(&mut self.branch_nn, key, inserted_hash, f);
+        Branch::modify_child_monotonic(&mut self.branch_nn, key, f);
+    }
+
+    /// Like [`Self::modify_child_monotonic`] but treats the supplied
+    /// `inserted_hash` as a known contribution for an empty-slot insertion.
+    /// This lets archive ingest maintain a clean parent around a LocalLeaf
+    /// without recomputing siphash24 once per index—the caller already has it
+    /// from `ArchiveEntry::hash`.
+    ///
+    /// The hint MUST equal the hash of whatever `f(None)` returns.
+    /// An occupied equal-count edit retains the parent by the monotonicity
+    /// proof; a growing replacement uses resident child hashes when available.
+    pub fn modify_child_monotonic_with_inserted_hint<F>(
+        &mut self,
+        key: u8,
+        inserted_hash: u128,
+        f: F,
+    ) where
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    {
+        Branch::modify_child_monotonic_with_inserted_hint(
+            &mut self.branch_nn,
+            key,
+            inserted_hash,
+            f,
+        );
     }
 
     /// Insert `head` into the child table, growing the allocation if cuckoo
@@ -528,7 +555,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
-        Self::modify_child_impl(branch_nn, key, None, f);
+        Self::modify_child_impl(branch_nn, key, None, ChildEditSemantics::Arbitrary, f);
+    }
+
+    pub(super) fn modify_child_monotonic<F>(branch_nn: &mut NonNull<Self>, key: u8, f: F)
+    where
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    {
+        Self::modify_child_impl(
+            branch_nn,
+            key,
+            None,
+            ChildEditSemantics::MonotoneSetGrowth,
+            f,
+        );
     }
 
     /// Shared child mutation machinery. `empty_slot_hash_hint` is consulted
@@ -540,6 +580,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         branch_nn: &mut NonNull<Self>,
         key: u8,
         empty_slot_hash_hint: Option<u128>,
+        edit_semantics: ChildEditSemantics,
         f: F,
     ) where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
@@ -563,15 +604,30 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
                 if let Some(new_child) = f(Some(child)) {
                     // Replace existing child
-                    let new_child_hash = new_child.known_hash();
-                    let hash = match (cached_parent_hash, old_child_hash, new_child_hash) {
-                        (Some(parent), Some(old), Some(new)) => Some(parent ^ old ^ new),
-                        _ => None,
+                    let new_child_leaf_count = new_child.count();
+                    debug_assert!(
+                        edit_semantics != ChildEditSemantics::MonotoneSetGrowth
+                            || new_child_leaf_count >= old_child_leaf_count,
+                        "a monotone child edit cannot remove keys"
+                    );
+                    let same_contribution = edit_semantics == ChildEditSemantics::MonotoneSetGrowth
+                        && new_child_leaf_count == old_child_leaf_count;
+                    let hash = if same_contribution {
+                        // Monotonicity plus unchanged cardinality proves the
+                        // exact same key set. This remains valid when a Branch
+                        // mutated in place and when a LocalLeaf has no hash.
+                        cached_parent_hash
+                    } else {
+                        let new_child_hash = new_child.known_hash();
+                        match (cached_parent_hash, old_child_hash, new_child_hash) {
+                            (Some(parent), Some(old), Some(new)) => Some(parent ^ old ^ new),
+                            _ => None,
+                        }
                     };
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
-                        ((*branch).leaf_count - old_child_leaf_count) + new_child.count();
+                        ((*branch).leaf_count - old_child_leaf_count) + new_child_leaf_count;
 
                     if replaced_childleaf {
                         (*branch).childleaf = new_child.childleaf_ptr();
@@ -582,6 +638,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     }
                     (&mut *branch).replace_cached_hash(hash);
                 } else {
+                    debug_assert_eq!(edit_semantics, ChildEditSemantics::Arbitrary);
                     // Remove existing child
                     let hash = match (cached_parent_hash, old_child_hash) {
                         (Some(parent), Some(old)) => Some(parent ^ old),
@@ -628,11 +685,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
-    /// Variant of [`Self::modify_child`] that takes a precomputed
+    /// Variant of [`Self::modify_child_monotonic`] that takes a precomputed
     /// `inserted_hash` as a known empty-slot contribution. The hint MUST equal
-    /// the hash of whatever `f(None)` returns. A non-empty replacement keeps
-    /// the parent clean only when both child hashes are already cached.
-    pub(super) fn modify_child_with_inserted_hint<F>(
+    /// the hash of whatever `f(None)` returns.
+    pub(super) fn modify_child_monotonic_with_inserted_hint<F>(
         branch_nn: &mut NonNull<Self>,
         key: u8,
         inserted_hash: u128,
@@ -640,7 +696,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     ) where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
-        Self::modify_child_impl(branch_nn, key, Some(inserted_hash), f);
+        Self::modify_child_impl(
+            branch_nn,
+            key,
+            Some(inserted_hash),
+            ChildEditSemantics::MonotoneSetGrowth,
+            f,
+        );
     }
 
     // Note: upsert_child removed in favor of explicit insert_child / update_child
