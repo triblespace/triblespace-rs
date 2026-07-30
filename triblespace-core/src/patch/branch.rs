@@ -15,6 +15,8 @@ use std::ptr::addr_of_mut;
 const BRANCH_ALIGN: usize = 16;
 const BRANCH_BASE_SIZE: usize = 48;
 const TABLE_ENTRY_SIZE: usize = 8;
+const HASH_KNOWN: u32 = 1 << 31;
+const RC_MASK: u32 = HASH_KNOWN - 1;
 
 #[inline]
 pub(crate) fn dst_len<T>(ptr: *const [T]) -> usize {
@@ -109,8 +111,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     /// rebuilt in one table scan. The hash is different: asking every child
     /// for it would cross dirty archive-backed subtrees and defeat lazy hash
     /// maintenance. `known_hash` can install an independently derived exact
-    /// aggregate; `None` (and exact zero) installs the conservative zero
-    /// sentinel.
+    /// aggregate, including zero; `None` marks the cache unknown.
     #[cfg(feature = "parallel")]
     pub fn finish_bulk_aggregates(&mut self, known_hash: Option<u128>) {
         unsafe {
@@ -162,7 +163,11 @@ pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Si
     pub childleaf: *const [u8; KEY_LEN],
     pub leaf_count: u64,
     pub segment_count: u64,
-    pub hash: u128,
+    /// The exact subtree fingerprint, split into atomic words so an immutable
+    /// reader can memoize a dirty Branch without COW. `HASH_KNOWN` in `rc`
+    /// publishes both words and distinguishes exact zero from unknown.
+    hash_lo: atomic::AtomicU64,
+    hash_hi: atomic::AtomicU64,
     pub child_table: Table,
 }
 
@@ -175,18 +180,47 @@ impl<
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Branch")
-            .field("rc", &self.rc)
+            .field("rc", &(self.rc.load(Relaxed) & RC_MASK))
             .field("end_depth", &self.end_depth)
             .field("childleaf", &self.childleaf)
             .field("leaf_count", &self.leaf_count)
             .field("segment_count", &self.segment_count)
-            .field("hash", &self.hash)
+            .field("hash", &self.cached_hash())
             .field("child_table", &&self.child_table)
             .finish()
     }
 }
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_LEN, O, Table, V> {
+    /// Return the resident exact fingerprint without traversing children.
+    ///
+    /// The known flag is published with `Release` after both words and loaded
+    /// with `Acquire` before them. Multiple immutable readers may race to
+    /// install the same semantic value; atomic word stores make that benign.
+    #[inline]
+    pub(crate) fn cached_hash(&self) -> Option<u128> {
+        if self.rc.load(Acquire) & HASH_KNOWN == 0 {
+            return None;
+        }
+        let lo = self.hash_lo.load(Relaxed) as u128;
+        let hi = self.hash_hi.load(Relaxed) as u128;
+        Some(lo | (hi << 64))
+    }
+
+    /// Publish an exact fingerprint, or mark the cache unknown. Structural
+    /// callers may clear the state only while uniquely borrowing the Branch;
+    /// immutable hash consumers may concurrently publish identical values.
+    #[inline]
+    pub(crate) fn store_cached_hash(&self, hash: Option<u128>) {
+        if let Some(hash) = hash {
+            self.hash_lo.store(hash as u64, Relaxed);
+            self.hash_hi.store((hash >> 64) as u64, Relaxed);
+            self.rc.fetch_or(HASH_KNOWN, Release);
+        } else {
+            self.rc.fetch_and(RC_MASK, Release);
+        }
+    }
+
     /// Returns the key bytes of the representative child leaf. The
     /// pointer is set to a heap `Leaf`'s `key` field (offset 0) or to
     /// a `LocalLeaf`'s archive-resident bytes; both yield the same
@@ -275,9 +309,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     }
 
     /// Construct a branch whose aggregate is cached only when both child
-    /// hashes are already known. Zero is a conservative uncached sentinel;
-    /// an exact semantic zero is intentionally represented by the same value
-    /// and will simply be recomputed by [`Head::hash`].
+    /// hashes are already known. The publication bit distinguishes exact zero
+    /// from an unknown aggregate without enlarging the Branch.
     pub(super) fn new_with_optional_child_hashes(
         end_depth: usize,
         lchild: Head<KEY_LEN, O, V>,
@@ -299,17 +332,22 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             else {
                 handle_alloc_error(layout);
             };
-            addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
+            let hash = match (lchild_hash, rchild_hash) {
+                (Some(left), Some(right)) => Some(left ^ right),
+                _ => None,
+            };
+            let state = 1 | hash.is_some().then_some(HASH_KNOWN).unwrap_or(0);
+            addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(state));
             addr_of_mut!((*ptr.as_ptr()).end_depth).write(end_depth as u32);
             addr_of_mut!((*ptr.as_ptr()).childleaf).write(lchild.childleaf_ptr());
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
-            let hash = match (lchild_hash, rchild_hash) {
-                (Some(left), Some(right)) => left ^ right,
-                _ => 0,
-            };
-            addr_of_mut!((*ptr.as_ptr()).hash).write(hash);
+            let hash = hash.unwrap_or(0);
+            addr_of_mut!((*ptr.as_ptr()).hash_lo)
+                .write(atomic::AtomicU64::new(hash as u64));
+            addr_of_mut!((*ptr.as_ptr()).hash_hi)
+                .write(atomic::AtomicU64::new((hash >> 64) as u64));
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);
 
@@ -322,7 +360,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             let branch = branch.as_ptr();
             let mut current = (*branch).rc.load(Relaxed);
             loop {
-                if current == u32::MAX {
+                if current & RC_MASK == RC_MASK {
                     panic!("max refcount exceeded");
                 }
                 match (*branch)
@@ -339,7 +377,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     pub(super) unsafe fn rc_dec(branch: NonNull<Self>) {
         unsafe {
             let branch = branch.as_ptr();
-            if (*branch).rc.fetch_sub(1, Release) != 1 {
+            if (*branch).rc.fetch_sub(1, Release) & RC_MASK != 1 {
                 return;
             }
             (*branch).rc.load(Acquire);
@@ -366,10 +404,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     pub(super) unsafe fn rc_cow(branch_nn: &mut NonNull<Self>) -> Option<()> {
         unsafe {
             let branch = branch_nn.as_ptr();
-            if (*branch).rc.load(Acquire) == 1 {
+            if (*branch).rc.load(Acquire) & RC_MASK == 1 {
                 None
             } else {
                 let size = dst_len(addr_of!((*branch).child_table));
+                let cached_hash = (*branch).cached_hash();
                 // SAFETY: `size` preserves alignment requirements and the size
                 // calculation cannot overflow for the allowed range.
                 let layout = Layout::from_size_align_unchecked(
@@ -380,12 +419,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     NonNull::new(std::ptr::slice_from_raw_parts(alloc_zeroed(layout), size)
                         as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
                 {
-                    addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
+                    let state = 1 | cached_hash.is_some().then_some(HASH_KNOWN).unwrap_or(0);
+                    addr_of_mut!((*ptr.as_ptr()).rc)
+                        .write(atomic::AtomicU32::new(state));
                     addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
                     addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
                     addr_of_mut!((*ptr.as_ptr()).leaf_count).write((*branch).leaf_count);
                     addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
-                    addr_of_mut!((*ptr.as_ptr()).hash).write((*branch).hash);
+                    let hash = cached_hash.unwrap_or(0);
+                    addr_of_mut!((*ptr.as_ptr()).hash_lo)
+                        .write(atomic::AtomicU64::new(hash as u64));
+                    addr_of_mut!((*ptr.as_ptr()).hash_hi)
+                        .write(atomic::AtomicU64::new((hash >> 64) as u64));
                     (*ptr.as_ptr())
                         .child_table
                         .clone_from_slice(&(*branch).child_table);
@@ -409,6 +454,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             let branch = branch_nn.as_ptr();
             let old_size = dst_len(addr_of!((*branch).child_table));
             let new_size = old_size * 2;
+            let cached_hash = (*branch).cached_hash();
             assert!(new_size <= 256);
 
             // SAFETY: `new_size` is bounded and alignment is constant, so the
@@ -423,12 +469,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             )
                 as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
             {
-                addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
+                let state = 1 | cached_hash.is_some().then_some(HASH_KNOWN).unwrap_or(0);
+                addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(state));
                 addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
                 addr_of_mut!((*ptr.as_ptr()).leaf_count).write((*branch).leaf_count);
                 addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
                 addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
-                addr_of_mut!((*ptr.as_ptr()).hash).write((*branch).hash);
+                let hash = cached_hash.unwrap_or(0);
+                addr_of_mut!((*ptr.as_ptr()).hash_lo)
+                    .write(atomic::AtomicU64::new(hash as u64));
+                addr_of_mut!((*ptr.as_ptr()).hash_hi)
+                    .write(atomic::AtomicU64::new((hash >> 64) as u64));
                 // Note that the child_table is already zeroed by the allocator and therefore None initialized.
 
                 (*branch)
@@ -480,11 +531,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
-            // A zero aggregate is deliberately ambiguous: it may be a dirty
-            // cache or a legitimate semantic zero. Incremental maintenance is
-            // valid only when the parent and every replaced contribution are
-            // already known; otherwise dirtiness propagates upward.
-            let cached_parent_hash = ((*branch).hash != 0).then_some((*branch).hash);
+            // Incremental maintenance is valid only when the parent and every
+            // replaced contribution are already known; otherwise dirtiness
+            // propagates upward.
+            let cached_parent_hash = (*branch).cached_hash();
 
             // If a slot exists, operate on the existing child in-place.
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
@@ -498,10 +548,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 if let Some(new_child) = f(Some(child)) {
                     // Replace existing child
                     let new_child_hash = new_child.known_hash();
-                    (*branch).hash = match (cached_parent_hash, old_child_hash, new_child_hash) {
-                        (Some(parent), Some(old), Some(new)) => parent ^ old ^ new,
-                        _ => 0,
+                    let hash = match (cached_parent_hash, old_child_hash, new_child_hash) {
+                        (Some(parent), Some(old), Some(new)) => Some(parent ^ old ^ new),
+                        _ => None,
                     };
+                    (*branch).store_cached_hash(hash);
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
@@ -516,10 +567,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     }
                 } else {
                     // Remove existing child
-                    (*branch).hash = match (cached_parent_hash, old_child_hash) {
-                        (Some(parent), Some(old)) => parent ^ old,
-                        _ => 0,
+                    let hash = match (cached_parent_hash, old_child_hash) {
+                        (Some(parent), Some(old)) => Some(parent ^ old),
+                        _ => None,
                     };
+                    (*branch).store_cached_hash(hash);
                     (*branch).segment_count -= old_child_segment_count;
                     (*branch).leaf_count -= old_child_leaf_count;
 
@@ -539,10 +591,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     (*branch).segment_count += inserted.count_segment(end_depth);
                     let inserted_hash =
                         empty_slot_hash_hint.or_else(|| inserted.known_hash());
-                    (*branch).hash = match (cached_parent_hash, inserted_hash) {
-                        (Some(parent), Some(inserted)) => parent ^ inserted,
-                        _ => 0,
+                    let hash = match (cached_parent_hash, inserted_hash) {
+                        (Some(parent), Some(inserted)) => Some(parent ^ inserted),
+                        _ => None,
                     };
+                    (*branch).store_cached_hash(hash);
 
                     // Cuckoo insert loop, growing the table when necessary.
                     let mut branch_ptr = branch_nn.as_ptr();
@@ -625,7 +678,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         (*branch).leaf_count = agg_leaf_count;
         (*branch).segment_count = agg_segment_count;
-        (*branch).hash = agg_hash;
+        (*branch).store_cached_hash(Some(agg_hash));
         if !first_childleaf.is_null() {
             (*branch).childleaf = first_childleaf;
         }
@@ -637,9 +690,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// Rebuild non-hash aggregates after a bulk rewrite and optionally install
     /// an independently-derived hash without traversing a child for it.
     ///
-    /// `known_hash` is exact when present. Zero remains the shared encoding
-    /// for both an exact-zero XOR and an unknown cache, so either case is
-    /// conservatively verified on demand by [`Head::hash`].
+    /// `known_hash` is exact when present, including exact zero.
     #[cfg(feature = "parallel")]
     pub(crate) unsafe fn finish_bulk_aggregates(
         branch_nn: &mut NonNull<Self>,
@@ -661,7 +712,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         (*branch).leaf_count = agg_leaf_count;
         (*branch).segment_count = agg_segment_count;
-        (*branch).hash = known_hash.unwrap_or(0);
+        (*branch).store_cached_hash(known_hash);
         if !first_childleaf.is_null() {
             (*branch).childleaf = first_childleaf;
         }
@@ -690,7 +741,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let mut agg_segment_count: u64 = 0;
         let mut agg_hash: u128 = 0;
         let mut match_found = false;
-        let has_cached_hash = self.hash != 0;
+        let cached_hash = self.cached_hash();
+        let has_cached_hash = cached_hash.is_some();
         let mut all_child_hashes_known = true;
 
         for child in self.child_table.iter().flatten() {
@@ -716,14 +768,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             agg_segment_count, self.segment_count,
             "branch.segment_count mismatch"
         );
-        // Zero is the conservative uncached sentinel. It is also a valid
-        // semantic XOR, so zero branches are always verified on demand by
-        // `Head::hash` rather than distinguished with extra state. A nonzero
-        // parent may legally cover dirty descendants after algebraic repair;
-        // keep this local audit resident-only and leave that case to the
-        // explicit deep boundary oracle.
-        if has_cached_hash && all_child_hashes_known {
-            debug_assert_eq!(agg_hash, self.hash, "branch.hash mismatch");
+        // A parent may legally carry an exact cache over dirty descendants
+        // after algebraic repair; keep this local audit resident-only and
+        // leave that case to the explicit deep boundary oracle.
+        if let (Some(cached_hash), true) = (cached_hash, all_child_hashes_known) {
+            debug_assert_eq!(agg_hash, cached_hash, "branch.hash mismatch");
         }
 
         // If there are any leaves aggregated in this branch then the

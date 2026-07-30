@@ -1085,14 +1085,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 
     /// Return a hash already resident in this node without traversing it.
-    /// LocalLeaves have no hash field, and a zero Branch hash is the
-    /// conservative uncached sentinel.
+    /// LocalLeaves have no hash field; Branches carry an explicit publication
+    /// bit, so exact zero remains distinguishable from an unknown cache.
     #[inline]
     fn known_hash(&self) -> Option<u128> {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => Some(leaf.hash),
             BodyRef::LocalLeaf(_) => None,
-            BodyRef::Branch(branch) => (branch.hash != 0).then_some(branch.hash),
+            BodyRef::Branch(branch) => branch.cached_hash(),
         }
     }
 
@@ -1109,15 +1109,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
             }
             BodyRef::Branch(branch) => {
-                if branch.hash != 0 {
-                    branch.hash
-                } else {
-                    branch
-                        .child_table
-                        .iter()
-                        .flatten()
-                        .fold(0, |hash, child| hash ^ child.hash())
+                if let Some(hash) = branch.cached_hash() {
+                    return hash;
                 }
+                let hash = branch
+                    .child_table
+                    .iter()
+                    .flatten()
+                    .fold(0, |hash, child| hash ^ child.hash());
+                branch.store_cached_hash(Some(hash));
+                hash
             }
         }
     }
@@ -1151,8 +1152,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     .flatten()
                     .fold(0, |hash, child| hash ^ child.debug_semantic_hash());
                 debug_assert!(
-                    branch.hash == 0 || branch.hash == semantic,
-                    "nonzero Branch hash disagrees with leaf-derived semantics",
+                    branch.cached_hash().map_or(true, |hash| hash == semantic),
+                    "resident Branch hash disagrees with leaf-derived semantics",
                 );
                 semantic
             }
@@ -2797,7 +2798,7 @@ where
     }
 
     /// Expensive debug oracle: derive the root hash from leaf bytes while
-    /// recursively checking every nonzero Branch cache. Kept explicit rather
+    /// recursively checking every resident Branch cache. Kept explicit rather
     /// than attached to each mutation so ordinary debug insertion does not
     /// become quadratic in the number of leaves.
     #[cfg(debug_assertions)]
@@ -3840,7 +3841,7 @@ mod tests {
             .iter()
             .flatten()
             .filter(|child| {
-                matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0)
+                matches!(child.body_ref(), BodyRef::Branch(branch) if branch.cached_hash().is_none())
             })
             .count()
     }
@@ -3890,18 +3891,19 @@ mod tests {
         let BodyRef::Branch(branch) = root.body_ref() else {
             panic!("expected a Branch root");
         };
-        branch.hash
+        branch.cached_hash().unwrap_or(0)
     }
 
-    #[cfg(feature = "parallel")]
-    fn demote_root_hash(patch: &mut PATCH<16>) {
+    fn demote_root_hash<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(
+        patch: &mut PATCH<KEY_LEN, O>,
+    ) {
         let Some(root) = patch.root.as_mut() else {
             panic!("expected a non-empty PATCH");
         };
         let BodyMut::Branch(branch) = root.body_mut() else {
             panic!("expected a Branch root");
         };
-        branch.hash = 0;
+        branch.store_cached_hash(None);
     }
 
     fn deep_hash_audit<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(patch: &PATCH<KEY_LEN, O>) {
@@ -3909,6 +3911,71 @@ mod tests {
         patch.debug_check_deep_hash_invariant();
         #[cfg(not(debug_assertions))]
         let _ = patch;
+    }
+
+    #[test]
+    fn branch_cache_distinguishes_exact_zero_from_unknown() {
+        let mut patch = PATCH::<2>::new();
+        patch.insert(&Entry::new(&[0, 0]));
+        patch.insert(&Entry::new(&[1, 0]));
+        let BodyRef::Branch(branch) = patch.root.as_ref().unwrap().body_ref() else {
+            panic!("fixture root must be a Branch");
+        };
+        let original = branch.cached_hash();
+        assert!(original.is_some());
+
+        branch.store_cached_hash(None);
+        assert_eq!(branch.cached_hash(), None);
+        branch.store_cached_hash(Some(0));
+        assert_eq!(branch.cached_hash(), Some(0));
+
+        branch.store_cached_hash(original);
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
+    fn first_fingerprint_consumer_memoizes_for_shared_snapshots() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut patch = owned_archive_single(a);
+        patch.union(owned_archive_single(b));
+        let snapshot = patch.clone();
+        assert_eq!(branch_cached_hash(&patch), 0);
+        assert_eq!(branch_cached_hash(&snapshot), 0);
+
+        let expected = heap_hash_oracle(&patch);
+        reset_local_leaf_hash_calls();
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 2);
+        assert_eq!(branch_cached_hash(&snapshot), expected);
+        assert_eq!(snapshot.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 2);
+        deep_hash_audit(&patch);
+        deep_hash_audit(&snapshot);
+    }
+
+    #[test]
+    fn concurrent_first_consumers_publish_one_exact_value() {
+        const KEY_LEN: usize = 8;
+        let mut patch = owned_archive_single([0u8; KEY_LEN]);
+        for byte in 1..32 {
+            let mut key = [0u8; KEY_LEN];
+            key[0] = byte;
+            patch.union(owned_archive_single(key));
+        }
+        assert_eq!(branch_cached_hash(&patch), 0);
+        let expected = heap_hash_oracle(&patch);
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| assert_eq!(patch.root_hash(), Some(expected)));
+            }
+        });
+
+        assert_eq!(branch_cached_hash(&patch), expected);
+        deep_hash_audit(&patch);
     }
 
     #[test]
@@ -3953,14 +4020,14 @@ mod tests {
         let before = local_leaf_hash_calls();
         assert_eq!(left.root_hash(), Some(expected));
         assert_eq!(local_leaf_hash_calls() - before, 5);
-        assert_eq!(branch_cached_hash(&left), 0);
+        assert_eq!(branch_cached_hash(&left), expected);
 
-        // Zero remains an uncached sentinel even after verification. A
-        // legitimate semantic zero follows the same conservative rule.
+        // The first real consumer memoizes the exact aggregate through the
+        // shared Branch. Repeated consumers are constant-time.
         let before = local_leaf_hash_calls();
         assert_eq!(left.root_hash(), Some(expected));
-        assert_eq!(local_leaf_hash_calls() - before, 5);
-        assert_eq!(branch_cached_hash(&left), 0);
+        assert_eq!(local_leaf_hash_calls() - before, 0);
+        assert_eq!(branch_cached_hash(&left), expected);
     }
 
     #[test]
@@ -4025,7 +4092,7 @@ mod tests {
                 .iter()
                 .flatten()
                 .filter(
-                    |child| matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0),
+                    |child| matches!(child.body_ref(), BodyRef::Branch(branch) if branch.cached_hash().is_none()),
                 )
                 .count(),
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 0,
@@ -4041,7 +4108,7 @@ mod tests {
         let BodyMut::Branch(root) = patch.root.as_mut().unwrap().body_mut() else {
             panic!("fixture root must be a Branch");
         };
-        root.hash = exact_root_hash;
+        root.store_cached_hash(Some(exact_root_hash));
 
         // An unrelated known heap child can extend the exact parent without
         // consulting either dirty sibling. The ordinary local debug audit must
@@ -4210,6 +4277,9 @@ mod tests {
         let expected = heap_hash_oracle(&left);
         assert_eq!(left.root_hash(), Some(expected));
         assert_eq!(local_leaf_hash_calls(), 3);
+        assert_eq!(branch_cached_hash(&left), expected);
+        assert_eq!(left.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 3);
     }
 
     #[cfg(feature = "parallel")]
@@ -4230,7 +4300,6 @@ mod tests {
         assert_eq!(direct_dirty_branch_children(&right), 128);
 
         let expected_hash = left.root_hash().unwrap() ^ right.root_hash().unwrap();
-        assert_ne!(expected_hash, 0, "zero is the conservative cache sentinel");
         reset_local_leaf_hash_calls();
         left.union(right);
 
@@ -4276,6 +4345,9 @@ mod tests {
         let serial_oracle = heap_hash_oracle(&serial_scatter);
         assert_eq!(serial_scatter.root_hash(), Some(serial_oracle));
         assert_eq!(local_leaf_hash_calls(), 8_064);
+        assert_eq!(branch_cached_hash(&serial_scatter), serial_oracle);
+        assert_eq!(serial_scatter.root_hash(), Some(serial_oracle));
+        assert_eq!(local_leaf_hash_calls(), 8_064);
 
         // The ordinary context spends its budget on rayon tasks. It has no
         // scalar fingerprint sidecar; validate its structure independently.
@@ -4286,6 +4358,7 @@ mod tests {
         assert_eq!(branch_cached_hash(&parallel), 0);
         let parallel_oracle = heap_hash_oracle(&parallel);
         assert_eq!(parallel.root_hash(), Some(parallel_oracle));
+        assert_eq!(branch_cached_hash(&parallel), parallel_oracle);
         deep_hash_audit(&parallel);
     }
 
@@ -4318,6 +4391,7 @@ mod tests {
         let expected = heap_hash_oracle(&union);
         assert_eq!(union.root_hash(), Some(expected));
         assert_eq!(local_leaf_hash_calls(), 8_064);
+        assert_eq!(branch_cached_hash(&union), expected);
 
         // Exercise the ordinary spawned-task path as well. Its worker-local
         // census is intentionally not asserted; structure plus the immediate
@@ -4328,6 +4402,7 @@ mod tests {
         assert_eq!(branch_cached_hash(&spawned_left), 0);
         let spawned_expected = heap_hash_oracle(&spawned_left);
         assert_eq!(spawned_left.root_hash(), Some(spawned_expected));
+        assert_eq!(branch_cached_hash(&spawned_left), spawned_expected);
         deep_hash_audit(&spawned_left);
     }
 
@@ -4382,6 +4457,9 @@ mod tests {
             3,
             "the first fingerprint consumer hashes the three result leaves once",
         );
+        assert_eq!(branch_cached_hash(&left), expected);
+        assert_eq!(left.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 3);
     }
 
     fn owner_cover_in_order(owners: &[Arc<dyn ArchiveOwner>], order: &[usize]) -> Arc<OwnerCover> {
@@ -4699,7 +4777,7 @@ mod tests {
         let before = local_leaf_hash_calls();
         assert_eq!(left.root_hash(), Some(expected));
         assert_eq!(local_leaf_hash_calls() - before, 2);
-        assert_eq!(branch_cached_hash(&left), 0);
+        assert_eq!(branch_cached_hash(&left), expected);
     }
 
     #[test]
@@ -4744,9 +4822,10 @@ mod tests {
         drop(left_storage);
         drop(right_storage);
 
-        // Exercise the PATCH-level diamond, not just OwnerCover directly:
-        // every Head merge walks two dirty Branches while the independently
-        // materialized exact receipts repeatedly join in opposite directions.
+        // Exercise the PATCH-level diamond, not just OwnerCover directly.
+        // Each fingerprint consumer memoizes the Branch; clear that cache
+        // after checking it so every iteration still stresses the structural
+        // dirty-Branch path and opposite owner joins.
         for _ in 0..256 {
             let mut next_first = first.clone();
             let mut next_second = second.clone();
@@ -4766,10 +4845,12 @@ mod tests {
                 assert_eq!(stats.branches, 1);
                 assert_eq!(stats.max_depth, 1);
                 assert_eq!(Arc::as_ptr(&cover.root) as usize, owner_root);
-                assert_eq!(branch_cached_hash(patch), 0);
                 deep_hash_audit(patch);
                 assert_eq!(patch.root_hash(), Some(expected));
+                assert_eq!(branch_cached_hash(patch), expected);
             }
+            demote_root_hash(&mut first);
+            demote_root_hash(&mut second);
         }
     }
 
