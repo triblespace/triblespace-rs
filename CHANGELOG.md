@@ -50,8 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aggregate is treated as a conservative uncached sentinel, serial union
   propagates exact intersection-hash receipts, and cached input aggregates
   repair the result algebraically. Disjoint archive-backed aggregation can
-  therefore move LocalLeaves without hashing them, while on-demand root hashes
-  and deep debug audits retain the same key-set semantics.
+  therefore move LocalLeaves without hashing them. The large parallel scatter
+  carries the same receipts in a scalar sidecar and rebuilds only structural
+  aggregates, rather than recursively hashing dirty children during bulk
+  finalization. On-demand root hashes and deep debug audits retain the same
+  key-set semantics.
 
 - **Known archive batches now start at their irreducible PATCH shape.** Empty
   batches stay empty, singleton tribles remain root LocalLeaves, and batches of

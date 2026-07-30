@@ -486,11 +486,12 @@ const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
 ///      drain "both" pairs, for each: claim 1 unit from the
 ///      shared budget — if successful, spawn the child union as
 ///      a `rayon::scope` task; if budget is exhausted, run the
-///      child serially via `Head::union`.
+///      child serially via `Head::union_with_overlap`.
 ///   2. Install phase (purely serial): scatter-collected resolved
 ///      heads + single-side pass-throughs land in the parent
-///      branch, then `recompute_aggregates` rebuilds the
-///      hash/leaf_count/segment_count/childleaf in one pass.
+///      branch. Structural aggregates are rebuilt in one pass while
+///      the hash is installed from the two input roots and the XOR of
+///      exact per-child overlap receipts.
 ///
 /// The budget is a single shared atomic — `num_threads²` total
 /// spawns across the entire descent, after which everything is
@@ -542,12 +543,11 @@ mod parallel_union {
         }
     }
 
-    /// Raw-pointer wrapper for the scatter-write target. Each
-    /// spawned task writes to `resolved[k]` for its specific key
-    /// byte `k`; keys are pairwise distinct by construction (each
-    /// "both" bit in the partition uniquely identifies a slot), so
-    /// the writes are non-aliasing despite sharing a `*mut` across
-    /// threads.
+    /// Raw-pointer wrapper for a scatter-write target. Each spawned task
+    /// writes to slot `k` for its specific key byte; keys are pairwise
+    /// distinct by construction (each "both" bit in the partition uniquely
+    /// identifies a slot), so the writes are non-aliasing despite sharing a
+    /// `*mut` across threads.
     ///
     /// `write_at` exists as an inherent method (rather than callers
     /// reading the `*mut` field directly) so that move closures
@@ -1648,27 +1648,21 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         V: Send + Sync,
     {
         let ctx = parallel_union::ParUnionCtx::new();
-        Self::par_union_with_ctx(this, other, at_depth, &ctx)
+        Self::par_union_with_ctx(this, other, at_depth, &ctx).head
     }
 
-    /// Recursive parallel-aware union: at the equal-depth-branch
-    /// arm, drains the "both" pairs and, for each pair, either
-    /// claims a budget unit and spawns a parallel task or falls
-    /// back to serial `Self::union`. All other arms (hash-equal,
-    /// divergence, asymmetric depth) delegate to `Self::union` —
-    /// they don't generate fan-out work for the budget to spend.
-    ///
-    /// Prototype scope: the large scatter path still finishes with eager
-    /// `recompute_aggregates`, which recursively materializes any dirty child
-    /// hashes. Lazy overlap receipts currently optimize only serial union (and
-    /// the small parallel-dispatch fallback that delegates to it).
+    /// Recursive parallel-aware union. Every arm returns the same exact
+    /// intersection-hash receipt as serial [`Self::union_with_overlap`]. The
+    /// large equal-depth arm scatters child pairs, resolves them in parallel,
+    /// and XOR-reduces their receipts; no child is traversed merely to rebuild
+    /// the result hash.
     #[cfg(feature = "parallel")]
-    pub(crate) fn par_union_with_ctx(
+    fn par_union_with_ctx(
         mut this: Self,
         mut other: Self,
         at_depth: usize,
         ctx: &parallel_union::ParUnionCtx,
-    ) -> Self
+    ) -> UnionResult<KEY_LEN, O, V>
     where
         O: Send + Sync,
         V: Send + Sync,
@@ -1679,15 +1673,21 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // Singleton pairs have no fan-out work for rayon and the serial rule
         // decides them exactly without a fingerprint.
         if this_depth == KEY_LEN && other_depth == KEY_LEN {
-            return Self::union(this, other, at_depth);
+            return Self::union_with_overlap(this, other, at_depth);
         }
 
+        // Capture the logical input receipts before the capacity-driven swap
+        // below. The union formula is symmetric, but tying these names to the
+        // original inputs keeps the proof boundary explicit.
         let this_hash = this.known_hash();
         let other_hash = other.known_hash();
         if this.count() == other.count() {
             if let (Some(left), Some(right)) = (this_hash, other_hash) {
                 if left == right {
-                    return this;
+                    return UnionResult {
+                        head: this,
+                        overlap: UnionOverlap { hash: left },
+                    };
                 }
             }
         }
@@ -1703,12 +1703,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 this_hash,
                 other_hash,
             );
-            return Head::new(old_key, new_body);
+            return UnionResult {
+                head: Head::new(old_key, new_body),
+                overlap: UnionOverlap::EMPTY,
+            };
         }
 
         if this_depth != other_depth {
             // Asymmetric — no fan-out opportunity, serial path wins.
-            return Self::union(this, other, at_depth);
+            return Self::union_with_overlap(this, other, at_depth);
         }
 
         // Equal depth, hashes differ → branch merge. Swap when
@@ -1731,7 +1734,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => unreachable!(),
         };
         if small {
-            return Self::union(this, other, at_depth);
+            return Self::union_with_overlap(this, other, at_depth);
         }
 
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
@@ -1768,19 +1771,21 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             }
 
             let mut both = this_present.intersect(&other_present);
-            let mut only = this_present.symmetric_difference(&other_present);
 
-            // Pre-allocated scatter-write target. Each spawned task
-            // writes to `resolved[k]` for its specific key byte —
-            // disjoint by construction. The raw pointer wrapper
-            // (`ScatterPtr`) makes the cross-thread sharing explicit.
-            let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-            let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
+            // Reuse `this_arr` as the resolved-head target. A both-side slot is
+            // taken before dispatch, so each task writes into a distinct empty
+            // slot; if a task panics, rayon joins the remaining work and normal
+            // array drops reclaim every result that was already written. Keep
+            // the tiny scalar receipts in a separate sidecar so the head array
+            // remains compact.
+            let this_arr_ptr = parallel_union::ScatterPtr(this_arr.as_mut_ptr());
+            let mut overlap_receipts = [0u128; 256];
+            let overlap_ptr = parallel_union::ScatterPtr(overlap_receipts.as_mut_ptr());
 
             rayon::scope(|s| {
                 // Drain `both` pairs serially in the parent; per
                 // pair, either claim a spawn unit and dispatch as a
-                // task, or run serially via `Head::union` here on
+                // task, or run serially via `union_with_overlap` here on
                 // the parent thread. The atomic budget is shared
                 // with all nested `par_union_with_ctx` calls.
                 while let Some(k) = both.drain_next_ascending() {
@@ -1789,51 +1794,50 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     let o = other_arr[i].take().expect("both ⇒ other");
                     if ctx.try_claim() {
                         s.spawn(move |_| {
-                            let head = Self::par_union_with_ctx(t, o, this_depth, ctx);
+                            let result = Self::par_union_with_ctx(t, o, this_depth, ctx);
                             // SAFETY: each task has a distinct
-                            // key `k`, so the writes to
-                            // `resolved[i]` are non-aliasing.
+                            // key `k`, so both writes at `i` are
+                            // non-aliasing with every other task.
                             unsafe {
-                                resolved_ptr.write_at(i, Some(head));
+                                this_arr_ptr.write_at(i, Some(result.head));
+                                overlap_ptr.write_at(i, result.overlap.hash);
                             }
                         });
                     } else {
                         // Budget exhausted — fall back to fully
-                        // serial union on this pair, then scatter
-                        // the result. SAFETY: same disjointness
+                        // serial union on this pair, then scatter its
+                        // result and receipt. SAFETY: same disjointness
                         // invariant; the parent thread races only
                         // with tasks targeting distinct keys.
-                        let head = Self::union(t, o, this_depth);
+                        let result = Self::union_with_overlap(t, o, this_depth);
                         unsafe {
-                            resolved_ptr.write_at(i, Some(head));
+                            this_arr_ptr.write_at(i, Some(result.head));
+                            overlap_ptr.write_at(i, result.overlap.hash);
                         }
                     }
                 }
             });
             // After scope: all spawned tasks have completed; the
-            // scatter writes to `resolved` are all sequenced-before
-            // here by rayon's join semantics.
+            // scatter writes are all sequenced-before here by rayon's join
+            // semantics.
 
-            for slot in resolved.iter_mut() {
+            for slot in this_arr.iter_mut().chain(other_arr.iter_mut()) {
                 if let Some(head) = slot.take() {
                     ed.install_child_growing(head);
                 }
             }
-            while let Some(k) = only.drain_next_ascending() {
-                let i = k as usize;
-                let head = this_arr[i]
-                    .take()
-                    .or_else(|| other_arr[i].take())
-                    .expect("only ⇒ exactly one side");
-                ed.install_child_growing(head);
-            }
 
-            // Deliberately eager in this prototype. This preserves the
-            // existing parallel implementation while leaving a clear later
-            // seam for per-task overlap receipts and algebraic aggregation.
-            ed.recompute_aggregates();
+            let overlap = UnionOverlap {
+                hash: overlap_receipts.into_iter().fold(0, |hash, child| hash ^ child),
+            };
+            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
+            ed.finish_union_aggregates(known_hash);
+            drop(ed);
+            return UnionResult {
+                head: this,
+                overlap,
+            };
         }
-        this
     }
 
     /// Parallel-aware top-level intersect entry. Allocates a fresh
@@ -3851,6 +3855,100 @@ mod tests {
         patch
     }
 
+    /// Build one exact archive-backed row per selected first-byte bucket.
+    /// Balanced unions of these variants create a resident root whose direct
+    /// children deliberately remain dirty: the root knows the input hashes
+    /// and disjoint overlap, while each LocalLeaf collision does not.
+    #[cfg(feature = "parallel")]
+    fn owned_archive_variant(
+        bucket_start: usize,
+        bucket_count: usize,
+        variant: usize,
+    ) -> PATCH<16> {
+        assert!(bucket_start + bucket_count <= 256);
+        assert!(variant < 256);
+        let storage = Arc::new(
+            (bucket_start..bucket_start + bucket_count)
+                .map(|bucket| {
+                    let mut key = [0u8; 16];
+                    key[0] = bucket as u8;
+                    key[1] = variant as u8;
+                    AlignedArchiveKey(key)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let mut patch = PATCH::new();
+        for key in storage.iter() {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
+            patch.insert_archive(&entry);
+        }
+        drop(owner);
+        drop(storage);
+        patch
+    }
+
+    #[cfg(feature = "parallel")]
+    fn owned_archive_dirty_parent(
+        bucket_start: usize,
+        bucket_count: usize,
+        variant_start: usize,
+        variant_count: usize,
+    ) -> PATCH<16> {
+        assert!(variant_count.is_power_of_two());
+        let mut groups: Vec<_> = (variant_start..variant_start + variant_count)
+            .map(|variant| owned_archive_variant(bucket_start, bucket_count, variant))
+            .collect();
+
+        while groups.len() > 1 {
+            let mut next = Vec::with_capacity((groups.len() + 1) / 2);
+            let mut iter = groups.into_iter();
+            while let Some(mut left) = iter.next() {
+                if let Some(right) = iter.next() {
+                    left.union(right);
+                }
+                next.push(left);
+            }
+            groups = next;
+        }
+
+        groups.pop().expect("at least one archive variant")
+    }
+
+    #[cfg(feature = "parallel")]
+    fn direct_dirty_branch_children(patch: &PATCH<16>) -> usize {
+        let BodyRef::Branch(root) = patch.root.as_ref().expect("non-empty PATCH").body_ref() else {
+            panic!("fixture root must be a Branch");
+        };
+        root.child_table
+            .iter()
+            .flatten()
+            .filter(|child| {
+                matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0)
+            })
+            .count()
+    }
+
+    /// Drive the large scatter path while keeping child resolution on this
+    /// test thread. This makes the thread-local LocalLeaf hash census exact
+    /// without changing production instrumentation or introducing a global
+    /// counter that would race unrelated tests.
+    #[cfg(feature = "parallel")]
+    fn union_with_exhausted_parallel_budget(
+        mut left: PATCH<16>,
+        mut right: PATCH<16>,
+    ) -> PATCH<16> {
+        OwnerCover::merge_into(&mut left.owners, &right.owners);
+        let this = left.root.take().expect("left root");
+        let other = right.root.take().expect("right root");
+        let ctx = parallel_union::ParUnionCtx {
+            budget: AtomicUsize::new(0),
+        };
+        left.root = Some(Head::par_union_with_ctx(this, other, 0, &ctx).head);
+        left.debug_check_owner_invariant();
+        left
+    }
+
     fn test_archive_owner(byte: u8) -> Arc<dyn ArchiveOwner> {
         Arc::new([byte])
     }
@@ -4138,6 +4236,83 @@ mod tests {
             TestHead::known_union_hash(None, Some(0x55), UnionOverlap::EMPTY),
             None,
         );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_union_threshold_preserves_dirty_descendants_without_hashing() {
+        // Each input has exactly 4,096 rows: the inclusive threshold boundary.
+        // Its root hash is resident, but every direct child is a dirty Branch
+        // over 32 archive-backed leaves. The two first-byte ranges are
+        // disjoint, so the exact overlap receipt is zero.
+        let mut left = owned_archive_dirty_parent(0, 128, 0, 32);
+        let right = owned_archive_dirty_parent(128, 128, 0, 32);
+        assert_eq!(left.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(right.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(direct_dirty_branch_children(&left), 128);
+        assert_eq!(direct_dirty_branch_children(&right), 128);
+
+        let expected_hash = left.root_hash().unwrap() ^ right.root_hash().unwrap();
+        assert_ne!(expected_hash, 0, "zero is the conservative cache sentinel");
+        reset_local_leaf_hash_calls();
+        left.union(right);
+
+        assert_eq!(left.len(), 8_192);
+        assert_eq!(direct_dirty_branch_children(&left), 256);
+        assert_eq!(branch_cached_hash(&left), expected_hash);
+        assert_eq!(
+            local_leaf_hash_calls(),
+            0,
+            "the parallel bulk finalizer must not hash disjoint dirty children",
+        );
+
+        // Immediate verification consumes the installed root receipt rather
+        // than descending into all 8,192 LocalLeaves.
+        let before = local_leaf_hash_calls();
+        assert_eq!(left.root_hash(), Some(expected_hash));
+        assert_eq!(local_leaf_hash_calls(), before);
+        deep_hash_audit(&left);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_union_hash_work_tracks_overlap_and_spawned_receipts_are_exact() {
+        // The two 4,096-row inputs share exactly variant 31: one leaf in each
+        // of 128 root buckets. Their direct child hashes are deliberately
+        // dirty, so structural descent must identify those 128 equal keys.
+        let left = owned_archive_dirty_parent(0, 128, 0, 32);
+        let right = owned_archive_dirty_parent(0, 128, 31, 32);
+        assert_eq!(direct_dirty_branch_children(&left), 128);
+        assert_eq!(direct_dirty_branch_children(&right), 128);
+
+        // Exhausting the spawn budget keeps the overlap hashes on this thread,
+        // making the thread-local census exact: one hash per duplicate and no
+        // hash for the other 7,936 input rows.
+        reset_local_leaf_hash_calls();
+        let serial_scatter =
+            union_with_exhausted_parallel_budget(left.clone(), right.clone());
+        assert_eq!(serial_scatter.len(), 8_064);
+        assert_eq!(local_leaf_hash_calls(), 128);
+        let before_verify = local_leaf_hash_calls();
+        let serial_oracle = heap_hash_oracle(&serial_scatter);
+        assert_eq!(branch_cached_hash(&serial_scatter), serial_oracle);
+        assert_eq!(serial_scatter.root_hash(), Some(serial_oracle));
+        assert_eq!(local_leaf_hash_calls(), before_verify);
+
+        // The ordinary context spends its budget on rayon tasks. Their scalar
+        // receipts use a distinct sidecar from the resolved Heads; compare the
+        // installed cache with an independent heap-backed oracle to cover the
+        // cross-thread scatter writes.
+        let mut parallel = left;
+        reset_local_leaf_hash_calls();
+        parallel.union(right);
+        assert_eq!(parallel.len(), 8_064);
+        let before_verify = local_leaf_hash_calls();
+        let parallel_oracle = heap_hash_oracle(&parallel);
+        assert_eq!(branch_cached_hash(&parallel), parallel_oracle);
+        assert_eq!(parallel.root_hash(), Some(parallel_oracle));
+        assert_eq!(local_leaf_hash_calls(), before_verify);
+        deep_hash_audit(&parallel);
     }
 
     #[test]

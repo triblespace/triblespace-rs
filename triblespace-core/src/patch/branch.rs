@@ -102,6 +102,21 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
             Branch::recompute_aggregates(&mut self.branch_nn);
         }
     }
+
+    /// Finish a bulk union rewrite from its algebraic root-hash receipt.
+    ///
+    /// Counts and the representative child pointer are structural and can be
+    /// rebuilt in one table scan. The hash is different: asking every child
+    /// for it would cross dirty archive-backed subtrees and defeat lazy hash
+    /// maintenance. `known_hash` is therefore the union-wide receipt derived
+    /// from the two input roots and their exact overlap; `None` (and exact
+    /// zero) installs the conservative zero sentinel.
+    #[cfg(feature = "parallel")]
+    pub fn finish_union_aggregates(&mut self, known_hash: Option<u128>) {
+        unsafe {
+            Branch::finish_union_aggregates(&mut self.branch_nn, known_hash);
+        }
+    }
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Deref for BranchMut<'a, KEY_LEN, O, V> {
@@ -611,6 +626,42 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         (*branch).leaf_count = agg_leaf_count;
         (*branch).segment_count = agg_segment_count;
         (*branch).hash = agg_hash;
+        if !first_childleaf.is_null() {
+            (*branch).childleaf = first_childleaf;
+        }
+
+        #[cfg(debug_assertions)]
+        branch_nn.as_ref().debug_check_invariants();
+    }
+
+    /// Rebuild the non-hash aggregates after a bulk union rewrite and install
+    /// the union-wide hash receipt without traversing a child for its hash.
+    ///
+    /// `known_hash` is exact when present. Zero remains the shared encoding
+    /// for both an exact-zero XOR and an unknown cache, so either case is
+    /// conservatively verified on demand by [`Head::hash`].
+    #[cfg(feature = "parallel")]
+    pub(crate) unsafe fn finish_union_aggregates(
+        branch_nn: &mut NonNull<Self>,
+        known_hash: Option<u128>,
+    ) {
+        let branch = branch_nn.as_ptr();
+        let end_depth = (*branch).end_depth as usize;
+        let mut agg_leaf_count: u64 = 0;
+        let mut agg_segment_count: u64 = 0;
+        let mut first_childleaf: *const [u8; KEY_LEN] = std::ptr::null();
+
+        for child in (*branch).child_table.iter().flatten() {
+            agg_leaf_count += child.count();
+            agg_segment_count += child.count_segment(end_depth);
+            if first_childleaf.is_null() {
+                first_childleaf = child.childleaf_ptr();
+            }
+        }
+
+        (*branch).leaf_count = agg_leaf_count;
+        (*branch).segment_count = agg_segment_count;
+        (*branch).hash = known_hash.unwrap_or(0);
         if !first_childleaf.is_null() {
             (*branch).childleaf = first_childleaf;
         }
