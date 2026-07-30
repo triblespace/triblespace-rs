@@ -1246,7 +1246,32 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
     pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
-        if this.hash() == other.hash() {
+        let this_depth = this.end_depth();
+        let other_depth = other.end_depth();
+
+        // Singleton equality is exact byte equality. Decide it before asking
+        // for a fingerprint: LocalLeaf intentionally has no cached hash, and
+        // distinct singleton children need those hashes only once when their
+        // first Branch is formed.
+        if this_depth == KEY_LEN && other_depth == KEY_LEN {
+            if let Some((depth, this_byte_key, other_byte_key)) =
+                this.first_divergence(&other, at_depth)
+            {
+                let old_key = this.key();
+                let new_body = Branch::new(
+                    depth,
+                    this.with_key(this_byte_key),
+                    other.with_key(other_byte_key),
+                );
+                return Head::new(old_key, new_body);
+            }
+            return this;
+        }
+
+        // Equal sets necessarily have equal cardinality. This cheap exact
+        // discriminator avoids computing LocalLeaf fingerprints in the much
+        // more common unequal-size case.
+        if this.count() == other.count() && this.hash() == other.hash() {
             return this;
         }
 
@@ -1263,8 +1288,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Head::new(old_key, new_body);
         }
 
-        let this_depth = this.end_depth();
-        let other_depth = other.end_depth();
         if this_depth < other_depth {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = other.with_start(ed.end_depth as usize);
@@ -1358,7 +1381,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        if this.hash() == other.hash() {
+        let this_depth = this.end_depth();
+        let other_depth = other.end_depth();
+
+        // Singleton pairs have no fan-out work for rayon and the serial rule
+        // decides them exactly without a fingerprint.
+        if this_depth == KEY_LEN && other_depth == KEY_LEN {
+            return Self::union(this, other, at_depth);
+        }
+
+        if this.count() == other.count() && this.hash() == other.hash() {
             return this;
         }
 
@@ -1374,8 +1406,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Head::new(old_key, new_body);
         }
 
-        let this_depth = this.end_depth();
-        let other_depth = other.end_depth();
         if this_depth != other_depth {
             // Asymmetric — no fan-out opportunity, serial path wins.
             return Self::union(this, other, at_depth);
