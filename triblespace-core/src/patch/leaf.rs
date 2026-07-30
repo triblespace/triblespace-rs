@@ -32,14 +32,27 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
         // the shared process-local key at the hash-construction boundary so a
         // later PATCH never observes a stale zero-key leaf hash.
         init_sip_key();
+        let hash = unsafe {
+            SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
+                .hash(&key[..])
+                .into()
+        };
+        unsafe { Self::new_with_hash(key, value, hash) }
+    }
+
+    /// Allocates a leaf whose PATCH-compatible key hash is already known.
+    ///
+    /// This is the reification seam for archive-backed `LocalLeaf`s: a set
+    /// operation may already have hashed the archive bytes for equality and
+    /// aggregate maintenance, so materializing those same bytes must not hash
+    /// them again. The caller is responsible for supplying the SipHash-2-4
+    /// value for `key` under PATCH's process-local key.
+    pub(super) unsafe fn new_with_hash(key: &[u8; KEY_LEN], value: V, hash: u128) -> NonNull<Self> {
         unsafe {
             let layout = Layout::new::<Self>();
             let Some(ptr) = NonNull::new(alloc(layout) as *mut Self) else {
                 handle_alloc_error(layout);
             };
-            let hash = SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
-                .hash(&key[..])
-                .into();
 
             ptr.write(Self {
                 key: *key,

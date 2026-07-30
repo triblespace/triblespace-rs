@@ -43,6 +43,25 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
+#[cfg(all(test, not(debug_assertions)))]
+std::thread_local! {
+    /// Test-only accounting for the uncached LocalLeaf hash boundary. A
+    /// thread-local counter keeps independently scheduled tests from
+    /// perturbing one another; archive-aware union falls back to its serial
+    /// path on the calling thread before touching direct LocalLeaves.
+    static LOCAL_LEAF_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+fn reset_local_leaf_hash_calls() {
+    LOCAL_LEAF_HASH_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+fn local_leaf_hash_calls() -> usize {
+    LOCAL_LEAF_HASH_CALLS.with(std::cell::Cell::get)
+}
+
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
 /// branch arm. Below this, the per-key `modify_child` loop wins
@@ -514,6 +533,48 @@ pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     value: PhantomData<V>,
 }
 
+/// A transient PATCH head paired with its already-computed subtree hash.
+///
+/// `LocalLeaf` deliberately has no persistent hash field. Set operations carry
+/// this small receipt while a child is detached so branch accounting, equality
+/// checks, owner-safe reification, recursion, and replacement construction can
+/// all reuse one SipHash computation. It never escapes the mutation call and
+/// does not change the persistent node layout.
+pub(crate) struct HashedHead<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+    pub(crate) head: Head<KEY_LEN, O, V>,
+    pub(crate) hash: u128,
+}
+
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> HashedHead<KEY_LEN, O, V> {
+    #[inline]
+    fn new(head: Head<KEY_LEN, O, V>) -> Self {
+        let hash = head.hash();
+        Self { head, hash }
+    }
+
+    /// Pair a head with a hash already established by its caller.
+    ///
+    /// The hash is trusted for the same reason Branch's existing
+    /// `*_with_*_hash` constructors trust their arguments: all call sites are
+    /// internal and preserve the receipt alongside the exact head it hashes.
+    #[inline]
+    fn with_hash(head: Head<KEY_LEN, O, V>, hash: u128) -> Self {
+        Self { head, hash }
+    }
+
+    #[inline]
+    fn with_key(mut self, key: u8) -> Self {
+        self.head = self.head.with_key(key);
+        self
+    }
+
+    #[inline]
+    fn with_start(mut self, new_start_depth: usize) -> Self {
+        self.head = self.head.with_start(new_start_depth);
+        self
+    }
+}
+
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Send for Head<KEY_LEN, O, V> {}
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Sync for Head<KEY_LEN, O, V> {}
 
@@ -656,6 +717,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => leaf.hash,
             BodyRef::LocalLeaf(bytes) => {
+                #[cfg(all(test, not(debug_assertions)))]
+                LOCAL_LEAF_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
                 use siphasher::sip128::SipHasher24;
                 use std::ptr::addr_of;
                 // SAFETY: SIP_KEY is initialized at startup; we only read it.
@@ -924,7 +987,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             match (ed.owner.as_ref(), leaf_owner) {
                 (None, Some(lo)) => ed.owner = Some(lo.clone()),
                 (Some(bo), Some(lo)) if !std::sync::Arc::ptr_eq(bo, lo) => {
-                    leaf = Self::reify_local_leaf_unit(leaf);
+                    leaf = Self::reify_local_leaf_unit_with_hash(leaf, leaf_hash);
                     leaf_owner = None;
                 }
                 _ => {}
@@ -939,68 +1002,70 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             let branch_owner_ptr: *const Option<
                 std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>,
             > = &ed.owner;
-            let inserted = leaf.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child_with_inserted_hint(key, leaf_hash, |opt| match opt {
+            let inserted = HashedHead::with_hash(leaf.with_start(ed.end_depth as usize), leaf_hash);
+            let key = inserted.head.key();
+            ed.modify_child_hashed(key, |opt| match opt {
                 None => Some(inserted),
-                Some(old) if old.tag() == HeadTag::LocalLeaf => {
+                Some(old) if old.head.tag() == HeadTag::LocalLeaf => {
                     // Direct-child LocalLeaf: its owner is THIS
                     // Branch's owner. Build the divergence sub-Branch
                     // inline and stop the recursion. `tag()` is a
                     // pointer-bits check (no deref) — cheaper than
                     // `body_ref()` for the common non-LocalLeaf case.
                     let Some((depth, old_byte_key, leaf_byte_key)) =
-                        old.first_divergence(&inserted, end_depth)
+                        old.head.first_divergence(&inserted.head, end_depth)
                     else {
                         // Exact duplicate. Keep the archive-resident leaf and
                         // discard the incoming head without a membership
                         // preflight or another tree traversal.
                         return Some(old);
                     };
-                    let old_top_key = old.key();
+                    let old_top_key = old.head.key();
+                    let old_hash = old.hash;
+                    let inserted_hash = inserted.hash;
+                    let combined_hash = old_hash ^ inserted_hash;
                     let sub_owner = unsafe { (*branch_owner_ptr).clone() };
-                    let new_body = crate::patch::branch::Branch::new_with_owner_and_rchild_hash(
+                    let new_body = crate::patch::branch::Branch::new_with_owner_and_child_hashes(
                         depth,
-                        old.with_key(old_byte_key),
-                        inserted.with_key(leaf_byte_key),
+                        old.with_key(old_byte_key).head,
+                        inserted.with_key(leaf_byte_key).head,
                         sub_owner,
-                        leaf_hash,
+                        old_hash,
+                        inserted_hash,
                     );
-                    Some(Head::new(old_top_key, new_body))
+                    Some(HashedHead::with_hash(
+                        Head::new(old_top_key, new_body),
+                        combined_hash,
+                    ))
                 }
                 Some(old) => {
                     // `old` is a heap Leaf or a Branch — recurse with
                     // the protocol-conforming shape, threading the
                     // precomputed leaf hash through.
-                    Some(Head::insert_leaf_with_owner(
-                        old, inserted, leaf_owner, leaf_hash, end_depth,
-                    ))
+                    let head = Head::insert_leaf_with_owner(
+                        old.head,
+                        inserted.head,
+                        leaf_owner,
+                        leaf_hash,
+                        end_depth,
+                    );
+                    Some(HashedHead::new(head))
                 }
             });
         }
         this
     }
 
-    /// Reifies a LocalLeaf head into a heap `Leaf<KEY_LEN, ()>` head.
-    /// Leaf and Branch heads pass through unchanged. Specialized to
-    /// V = () so no `V: Default` bound leaks into generic call sites.
-    fn reify_local_leaf_unit(head: Self) -> Self {
-        match head.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::Branch(_) => head,
-            BodyRef::LocalLeaf(bytes) => {
-                let key_byte = head.key();
-                let key_copy = *bytes;
-                drop(head);
-                let new_leaf = unsafe { Leaf::<KEY_LEN, ()>::new(&key_copy, ()) };
-                Head::new(key_byte, new_leaf)
-            }
-        }
+    /// Reifies a LocalLeaf head with a hash already cached by its
+    /// `ArchiveEntry`. Leaf and Branch heads pass through unchanged.
+    fn reify_local_leaf_unit_with_hash(head: Self, hash: u128) -> Self {
+        Self::reify_local_leaf_hashed(HashedHead::with_hash(head, hash)).head
     }
 
     /// Public re-export for the root-reification path used by
     /// `PATCH::insert_archive` when the PATCH is empty.
-    pub(crate) fn reify_local_leaf_unit_for_root(head: Self) -> Self {
-        Self::reify_local_leaf_unit(head)
+    pub(crate) fn reify_local_leaf_unit_for_root(head: Self, hash: u128) -> Self {
+        Self::reify_local_leaf_unit_with_hash(head, hash)
     }
 }
 
@@ -1016,39 +1081,53 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// implementation lets the ordinary union path reconcile archive owners
     /// without imposing a `V: Default` bound on every PATCH union.
     fn reify_local_leaf(head: Self) -> Self {
-        match head.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::Branch(_) => head,
-            BodyRef::LocalLeaf(bytes) => {
-                assert_eq!(
-                    std::mem::size_of::<V>(),
-                    0,
-                    "LocalLeaf is only valid for zero-sized PATCH values",
-                );
-                assert_eq!(
-                    std::mem::size_of::<Leaf<KEY_LEN, V>>(),
-                    std::mem::size_of::<Leaf<KEY_LEN, ()>>(),
-                    "LocalLeaf reification requires the unit-value Leaf layout",
-                );
-                assert_eq!(
-                    std::mem::align_of::<Leaf<KEY_LEN, V>>(),
-                    std::mem::align_of::<Leaf<KEY_LEN, ()>>(),
-                    "LocalLeaf reification requires the unit-value Leaf alignment",
-                );
-
-                let key_byte = head.key();
-                let key_copy = *bytes;
-                drop(head);
-
-                // SAFETY: LocalLeaf construction is defined only on
-                // `Head<_, _, ()>`, and cloning preserves the existing Head
-                // type. Therefore observing this tag proves `V = ()`. The
-                // layout assertions catch accidental erosion of that internal
-                // invariant near this cast.
-                let unit_leaf = unsafe { Leaf::<KEY_LEN, ()>::new(&key_copy, ()) };
-                let leaf = unit_leaf.cast::<Leaf<KEY_LEN, V>>();
-                Head::new(key_byte, leaf)
-            }
+        if head.tag() != HeadTag::LocalLeaf {
+            return head;
         }
+        Self::reify_local_leaf_hashed(HashedHead::new(head)).head
+    }
+
+    /// Materialize a detached LocalLeaf while preserving the hash receipt that
+    /// caused the operation to inspect it. Heap Leaves and Branches pass
+    /// through with their cached hash unchanged.
+    fn reify_local_leaf_hashed(hashed: HashedHead<KEY_LEN, O, V>) -> HashedHead<KEY_LEN, O, V> {
+        if hashed.head.tag() != HeadTag::LocalLeaf {
+            return hashed;
+        }
+
+        assert_eq!(
+            std::mem::size_of::<V>(),
+            0,
+            "LocalLeaf is only valid for zero-sized PATCH values",
+        );
+        assert_eq!(
+            std::mem::size_of::<Leaf<KEY_LEN, V>>(),
+            std::mem::size_of::<Leaf<KEY_LEN, ()>>(),
+            "LocalLeaf reification requires the unit-value Leaf layout",
+        );
+        assert_eq!(
+            std::mem::align_of::<Leaf<KEY_LEN, V>>(),
+            std::mem::align_of::<Leaf<KEY_LEN, ()>>(),
+            "LocalLeaf reification requires the unit-value Leaf alignment",
+        );
+
+        let HashedHead { head, hash } = hashed;
+        let key_byte = head.key();
+        let BodyRef::LocalLeaf(bytes) = head.body_ref() else {
+            unreachable!();
+        };
+        let key_copy = *bytes;
+        drop(head);
+
+        // SAFETY: LocalLeaf construction is defined only on
+        // `Head<_, _, ()>`, and cloning preserves the existing Head type.
+        // Therefore observing this tag proves `V = ()`. The layout assertions
+        // catch accidental erosion of that internal invariant near this cast.
+        // `hash` was computed from these exact immutable bytes before their
+        // parent owner could be dropped.
+        let unit_leaf = unsafe { Leaf::<KEY_LEN, ()>::new_with_hash(&key_copy, (), hash) };
+        let leaf = unit_leaf.cast::<Leaf<KEY_LEN, V>>();
+        HashedHead::with_hash(Head::new(key_byte, leaf), hash)
     }
 
     /// Clone a self-contained Branch or heap Leaf cheaply, but materialize a
@@ -1065,14 +1144,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// child. Conflicting local owners are resolved by reifying the right-hand
     /// leaf, matching archive insertion's existing policy.
     fn union_detached_children(
-        mut this: Self,
+        mut this: HashedHead<KEY_LEN, O, V>,
         this_owner: Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
-        mut other: Self,
+        mut other: HashedHead<KEY_LEN, O, V>,
         mut other_owner: Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
         at_depth: usize,
-    ) -> Self {
-        let this_is_local = this.tag() == HeadTag::LocalLeaf;
-        let mut other_is_local = other.tag() == HeadTag::LocalLeaf;
+    ) -> HashedHead<KEY_LEN, O, V> {
+        let this_is_local = this.head.tag() == HeadTag::LocalLeaf;
+        let mut other_is_local = other.head.tag() == HeadTag::LocalLeaf;
 
         debug_assert_eq!(
             this_is_local,
@@ -1085,7 +1164,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             "a detached LocalLeaf must carry its parent Branch owner",
         );
 
-        if this.hash() == other.hash() {
+        if this.hash == other.hash {
             return this;
         }
 
@@ -1099,16 +1178,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     .expect("LocalLeaf must have a parent owner"),
             );
             if !same_owner {
-                other = Self::reify_local_leaf(other);
+                other = Self::reify_local_leaf_hashed(other);
                 other_owner = None;
                 other_is_local = false;
             }
         }
 
         if let Some((depth, this_byte_key, other_byte_key)) =
-            this.first_divergence(&other, at_depth)
+            this.head.first_divergence(&other.head, at_depth)
         {
-            let old_key = this.key();
+            let old_key = this.head.key();
+            let this_hash = this.hash;
+            let other_hash = other.hash;
             let owner = if this_is_local {
                 this_owner
             } else if other_is_local {
@@ -1116,25 +1197,27 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             } else {
                 None
             };
-            let new_body = Branch::new_with_owner(
+            let new_body = Branch::new_with_owner_and_child_hashes(
                 depth,
-                this.with_key(this_byte_key),
-                other.with_key(other_byte_key),
+                this.with_key(this_byte_key).head,
+                other.with_key(other_byte_key).head,
                 owner,
+                this_hash,
+                other_hash,
             );
-            return Head::new(old_key, new_body);
+            return HashedHead::with_hash(Head::new(old_key, new_body), this_hash ^ other_hash);
         }
 
         // The only no-divergence LocalLeaf shape left is leaf-vs-Branch.
         // Reify that single leaf before handing control back to the generic
         // recursive union. Branch children retain their own direct owners.
         if this_is_local {
-            this = Self::reify_local_leaf(this);
+            this = Self::reify_local_leaf_hashed(this);
         }
         if other_is_local {
-            other = Self::reify_local_leaf(other);
+            other = Self::reify_local_leaf_hashed(other);
         }
-        Self::union(this, other, at_depth)
+        Self::union_hashed(this, other, at_depth)
     }
 
     pub(crate) fn replace_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Self {
@@ -1175,34 +1258,51 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// Sequential PATCH-trie union. Always serial; the parallel
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
-    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
-        if this.hash() == other.hash() {
+    pub(crate) fn union(this: Self, other: Self, at_depth: usize) -> Self {
+        Self::union_hashed(HashedHead::new(this), HashedHead::new(other), at_depth).head
+    }
+
+    /// Recursive union carrying each input's established hash. Heap Leaves and
+    /// Branches simply expose their persistent cache; LocalLeaves pay SipHash
+    /// once when first wrapped and retain that receipt through the operation.
+    fn union_hashed(
+        mut this: HashedHead<KEY_LEN, O, V>,
+        mut other: HashedHead<KEY_LEN, O, V>,
+        at_depth: usize,
+    ) -> HashedHead<KEY_LEN, O, V> {
+        if this.hash == other.hash {
             return this;
         }
 
         if let Some((depth, this_byte_key, other_byte_key)) =
-            this.first_divergence(&other, at_depth)
+            this.head.first_divergence(&other.head, at_depth)
         {
-            let old_key = this.key();
-            let new_body = Branch::new(
+            let old_key = this.head.key();
+            let this_hash = this.hash;
+            let other_hash = other.hash;
+            let new_body = Branch::new_with_owner_and_child_hashes(
                 depth,
-                this.with_key(this_byte_key),
-                other.with_key(other_byte_key),
+                this.with_key(this_byte_key).head,
+                other.with_key(other_byte_key).head,
+                None,
+                this_hash,
+                other_hash,
             );
 
-            return Head::new(old_key, new_body);
+            return HashedHead::with_hash(Head::new(old_key, new_body), this_hash ^ other_hash);
         }
 
-        let this_depth = this.end_depth();
-        let other_depth = other.end_depth();
+        let this_depth = this.head.end_depth();
+        let other_depth = other.head.end_depth();
         if this_depth < other_depth {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+            let mut this_head = this.head;
+            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this_head);
             let branch_owner = ed.owner.clone();
             let inserted = other.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
+            let key = inserted.head.key();
+            ed.modify_child_hashed(key, |opt| match opt {
                 Some(old) => {
-                    let old_owner = if old.tag() == HeadTag::LocalLeaf {
+                    let old_owner = if old.head.tag() == HeadTag::LocalLeaf {
                         branch_owner.clone()
                     } else {
                         None
@@ -1214,19 +1314,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 None => Some(inserted),
             });
             drop(ed);
-            return this;
+            return HashedHead::new(this_head);
         }
 
         if other_depth < this_depth {
-            let old_key = this.key();
-            let this_head = this;
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
+            let old_key = this.head.key();
+            let mut other_head = other.head;
+            let mut ed = crate::patch::branch::BranchMut::from_head(&mut other_head);
             let branch_owner = ed.owner.clone();
-            let inserted = this_head.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
+            let inserted = this.with_start(ed.end_depth as usize);
+            let key = inserted.head.key();
+            ed.modify_child_hashed(key, |opt| match opt {
                 Some(old) => {
-                    let old_owner = if old.tag() == HeadTag::LocalLeaf {
+                    let old_owner = if old.head.tag() == HeadTag::LocalLeaf {
                         branch_owner.clone()
                     } else {
                         None
@@ -1242,7 +1342,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 None => Some(inserted),
             });
             drop(ed);
-            return other.with_key(old_key);
+            return HashedHead::new(other_head.with_key(old_key));
         }
 
         // Equal depth, hashes differ → walk `other`'s children,
@@ -1256,14 +1356,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // insert. Branch tags encode `log2(child_table_size)`, so
         // the 2× ratio reduces to `other_tag > this_tag` (no body
         // deref needed; the tag bits live in the head's pointer).
-        if other.tag() > this.tag() {
+        if other.head.tag() > this.head.tag() {
             std::mem::swap(&mut this, &mut other);
         }
-        let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
+        let BodyMut::Branch(other_branch_ref) = other.head.body_mut() else {
             unreachable!();
         };
         let other_owner = other_branch_ref.owner.clone();
-        let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+        let mut ed = crate::patch::branch::BranchMut::from_head(&mut this.head);
 
         if ed.owner.is_none() {
             ed.owner = other_owner.clone();
@@ -1275,8 +1375,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             .iter_mut()
             .filter_map(Option::take)
         {
-            let mut inserted = other_child.with_start(ed.end_depth as usize);
-            let inserted_owner = if inserted.tag() == HeadTag::LocalLeaf {
+            let mut inserted = HashedHead::new(other_child).with_start(ed.end_depth as usize);
+            let inserted_owner = if inserted.head.tag() == HeadTag::LocalLeaf {
                 let source_owner = other_owner
                     .as_ref()
                     .expect("a direct LocalLeaf must have a Branch owner");
@@ -1286,16 +1386,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 if target_matches {
                     target_owner.clone()
                 } else {
-                    inserted = Self::reify_local_leaf(inserted);
+                    inserted = Self::reify_local_leaf_hashed(inserted);
                     None
                 }
             } else {
                 None
             };
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
+            let key = inserted.head.key();
+            ed.modify_child_hashed(key, |opt| match opt {
                 Some(old) => {
-                    let old_owner = if old.tag() == HeadTag::LocalLeaf {
+                    let old_owner = if old.head.tag() == HeadTag::LocalLeaf {
                         target_owner.clone()
                     } else {
                         None
@@ -1312,7 +1412,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             });
         }
         drop(ed);
-        this
+        HashedHead::new(this.head)
     }
 
     /// Parallel-aware top-level union entry. Allocates a fresh
@@ -2935,7 +3035,7 @@ where
             // into a heap Leaf. The next insertion creates a Branch
             // which can adopt the owner cleanly.
             self.root
-                .replace(Head::reify_local_leaf_unit_for_root(leaf_head));
+                .replace(Head::reify_local_leaf_unit_for_root(leaf_head, leaf_hash));
         }
     }
 }
@@ -3375,6 +3475,101 @@ mod tests {
         drop(owner);
         drop(storage);
         patch
+    }
+
+    fn heap_patch<const KEY_LEN: usize>(keys: &[[u8; KEY_LEN]]) -> PATCH<KEY_LEN, IdentitySchema> {
+        let mut patch = PATCH::new();
+        for key in keys {
+            patch.insert(&Entry::new(key));
+        }
+        patch
+    }
+
+    #[test]
+    fn known_hash_union_receipt_size_is_explicit() {
+        type Receipt = HashedHead<8, IdentitySchema, ()>;
+
+        assert_eq!(mem::size_of::<Head<8, IdentitySchema, ()>>(), 8);
+        assert_eq!(mem::align_of::<Receipt>(), 16);
+        assert_eq!(mem::size_of::<Receipt>(), 32);
+    }
+
+    #[test]
+    fn known_hash_union_same_owner_local_leaves_hash_each_encounter_once() {
+        const KEY_SIZE: usize = 8;
+        let a = [0u8; KEY_SIZE];
+        let mut b = [0u8; KEY_SIZE];
+        b[0] = 1;
+        let mut c = [0u8; KEY_SIZE];
+        c[0] = 2;
+
+        // Both input Branches retain the same archive allocation. During the
+        // merge, the source `a` and `c` leaves are extracted once and the
+        // colliding target `a` is extracted once. The untouched target `b`
+        // never needs a hash.
+        let (mut left, right) = {
+            let storage = std::sync::Arc::new([
+                AlignedArchiveKey(a),
+                AlignedArchiveKey(b),
+                AlignedArchiveKey(c),
+            ]);
+            let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+            let entries: [ArchiveEntry<'_, KEY_SIZE>; 3] = std::array::from_fn(|i| unsafe {
+                ArchiveEntry::new(NonNull::from(&storage[i].0), &owner)
+            });
+            (
+                PATCH::<KEY_SIZE, IdentitySchema>::from_archive_pair(&entries[0], &entries[1]),
+                PATCH::<KEY_SIZE, IdentitySchema>::from_archive_pair(&entries[0], &entries[2]),
+            )
+        };
+        let expected = heap_patch(&[a, b, c]);
+
+        #[cfg(not(debug_assertions))]
+        reset_local_leaf_hash_calls();
+        left.union(right);
+
+        #[cfg(not(debug_assertions))]
+        assert_eq!(local_leaf_hash_calls(), 3);
+        assert_eq!(left.root_hash(), expected.root_hash());
+        assert_eq!(
+            left.iter_ordered().copied().collect_vec(),
+            expected.iter_ordered().copied().collect_vec(),
+        );
+        assert_eq!(patch_unowned_direct_local_leaves(&left), 0);
+    }
+
+    #[test]
+    fn known_hash_union_reification_reuses_the_detached_local_leaf_hash() {
+        const KEY_SIZE: usize = 8;
+        let a = [0u8; KEY_SIZE];
+        let mut b = [0u8; KEY_SIZE];
+        b[1] = 1;
+        let mut c = [0u8; KEY_SIZE];
+        c[1] = 2;
+        let mut d = [0u8; KEY_SIZE];
+        d[0] = 1;
+
+        // The depth-0 left Branch contributes direct LocalLeaf `a` to the
+        // depth-1 right Branch. That leaf is hashed as it is detached, then
+        // reified because its owning parent is being left behind. Allocation,
+        // recursive union, and aggregate maintenance must all reuse the same
+        // receipt instead of hashing `a` again.
+        let mut left = owned_archive_pair([a, d]);
+        let right = owned_archive_pair([b, c]);
+        let expected = heap_patch(&[a, b, c, d]);
+
+        #[cfg(not(debug_assertions))]
+        reset_local_leaf_hash_calls();
+        left.union(right);
+
+        #[cfg(not(debug_assertions))]
+        assert_eq!(local_leaf_hash_calls(), 1);
+        assert_eq!(left.root_hash(), expected.root_hash());
+        assert_eq!(
+            left.iter_ordered().copied().collect_vec(),
+            expected.iter_ordered().copied().collect_vec(),
+        );
+        assert_eq!(patch_unowned_direct_local_leaves(&left), 0);
     }
 
     #[test]

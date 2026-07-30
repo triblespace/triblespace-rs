@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Archive-backed PATCH union carries transient hash receipts.** Direct
+  `LocalLeaf` children now pay SipHash at most once when union encounters
+  them; child extraction, owner-safe reification, recursive union, Branch
+  construction, and aggregate replacement reuse that result without adding a
+  persistent hash field to archive leaves. Root archive insertion likewise
+  materializes its heap Leaf from the `ArchiveEntry` hash it already owns.
 - **Known archive batches now start at their irreducible PATCH shape.** Empty
   batches stay empty, singleton tribles use one shared heap Leaf across all six
   indexes, and batches of two or more same-owner rows directly create ordinary

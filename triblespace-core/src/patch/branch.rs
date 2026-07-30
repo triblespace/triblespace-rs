@@ -80,21 +80,18 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
-    /// Like [`modify_child`] but uses the supplied `inserted_hash`
-    /// for the empty-slot insertion case instead of calling
-    /// `inserted.hash()`. Lets archive ingest avoid recomputing
-    /// the LocalLeaf siphash24 once per index — the caller already
-    /// has it from `ArchiveEntry::hash`.
+    /// Like [`modify_child`] but carries each detached or replacement child's
+    /// already-computed hash through the closure.
     ///
-    /// The hint MUST equal the hash of whatever `f(None)` returns.
-    /// When the slot is non-empty and `f(Some(_))` runs, the result
-    /// is hashed normally (recursion result, hash already cached on
-    /// the Branch).
-    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: u128, f: F)
+    /// This is the archive-aware set-operation seam. A `LocalLeaf` has no
+    /// persistent cache, so extracting it computes SipHash once and the
+    /// returned [`HashedHead`] reuses that receipt for equality, reification,
+    /// recursive union, and branch aggregate maintenance.
+    pub fn modify_child_hashed<F>(&mut self, key: u8, f: F)
     where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+        F: FnOnce(Option<HashedHead<KEY_LEN, O, V>>) -> Option<HashedHead<KEY_LEN, O, V>>,
     {
-        Branch::modify_child_with_inserted_hint(&mut self.branch_nn, key, inserted_hash, f);
+        Branch::modify_child_hashed(&mut self.branch_nn, key, f);
     }
 
     /// Insert `head` into the child table, growing the allocation if cuckoo
@@ -533,47 +530,38 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
-    /// Variant of [`Self::modify_child`] that takes a precomputed
-    /// `inserted_hash` and uses it for the empty-slot insertion path
-    /// instead of calling `inserted.hash()`. The hint MUST equal the
-    /// hash of whatever `f(None)` returns. The non-empty path uses
-    /// `new_child.hash()` as normal (the recursive result is a Branch
-    /// whose hash is already cached, so the call is O(1)).
-    pub(super) fn modify_child_with_inserted_hint<F>(
-        branch_nn: &mut NonNull<Self>,
-        key: u8,
-        inserted_hash: u128,
-        f: F,
-    ) where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    /// Variant of [`Self::modify_child`] whose closure receives and returns a
+    /// head together with its known hash. This avoids hashing a detached
+    /// `LocalLeaf` once for the old aggregate and then again in the operation
+    /// that decides its replacement.
+    pub(super) fn modify_child_hashed<F>(branch_nn: &mut NonNull<Self>, key: u8, f: F)
+    where
+        F: FnOnce(Option<HashedHead<KEY_LEN, O, V>>) -> Option<HashedHead<KEY_LEN, O, V>>,
     {
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
 
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
-                let child = slot.take().unwrap();
-                let old_child_hash = child.hash();
-                let old_child_segment_count = child.count_segment(end_depth);
-                let old_child_leaf_count = child.count();
+                let child = HashedHead::new(slot.take().unwrap());
+                let old_child_hash = child.hash;
+                let old_child_segment_count = child.head.count_segment(end_depth);
+                let old_child_leaf_count = child.head.count();
 
-                let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
+                let replaced_childleaf = child.head.childleaf_ptr() == (*branch).childleaf;
 
                 if let Some(new_child) = f(Some(child)) {
-                    // Recursion result — its hash is cached on the
-                    // returned Head (Branch.hash field), so calling
-                    // .hash() is cheap.
-                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
+                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash;
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
-                        + new_child.count_segment(end_depth);
+                        + new_child.head.count_segment(end_depth);
                     (*branch).leaf_count =
-                        ((*branch).leaf_count - old_child_leaf_count) + new_child.count();
+                        ((*branch).leaf_count - old_child_leaf_count) + new_child.head.count();
 
                     if replaced_childleaf {
-                        (*branch).childleaf = new_child.childleaf_ptr();
+                        (*branch).childleaf = new_child.head.childleaf_ptr();
                     }
 
-                    if slot.replace(new_child.with_key(key)).is_some() {
+                    if slot.replace(new_child.head.with_key(key)).is_some() {
                         unreachable!();
                     }
                 } else {
@@ -588,13 +576,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     }
                 }
             } else {
-                if let Some(mut inserted) = f(None) {
-                    // Use the caller-supplied hint instead of
-                    // recomputing siphash24 over the LocalLeaf bytes.
-                    (*branch).leaf_count += inserted.count();
-                    (*branch).segment_count += inserted.count_segment(end_depth);
-                    (*branch).hash ^= inserted_hash;
+                if let Some(inserted) = f(None) {
+                    (*branch).leaf_count += inserted.head.count();
+                    (*branch).segment_count += inserted.head.count_segment(end_depth);
+                    (*branch).hash ^= inserted.hash;
 
+                    let mut inserted = inserted.head;
                     let mut branch_ptr = branch_nn.as_ptr();
                     while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
                     {
