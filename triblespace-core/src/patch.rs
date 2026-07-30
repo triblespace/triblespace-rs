@@ -397,14 +397,9 @@ impl OwnerNode {
 
     fn same_shape(&self, other: &Self) -> bool {
         match (self, other) {
-            (
-                Self::Owner {
-                    address: left, ..
-                },
-                Self::Owner {
-                    address: right, ..
-                },
-            ) => left == right,
+            (Self::Owner { address: left, .. }, Self::Owner { address: right, .. }) => {
+                left == right
+            }
             (
                 Self::Branch {
                     mask: left_mask,
@@ -1843,7 +1838,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             }
 
             let overlap = UnionOverlap {
-                hash: overlap_receipts.into_iter().fold(0, |hash, child| hash ^ child),
+                hash: overlap_receipts
+                    .into_iter()
+                    .fold(0, |hash, child| hash ^ child),
             };
             let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
             ed.finish_union_aggregates(known_hash);
@@ -3941,9 +3938,7 @@ mod tests {
         root.child_table
             .iter()
             .flatten()
-            .filter(|child| {
-                matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0)
-            })
+            .filter(|child| matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0))
             .count()
     }
 
@@ -4311,8 +4306,7 @@ mod tests {
         // making the thread-local census exact: one hash per duplicate and no
         // hash for the other 7,936 input rows.
         reset_local_leaf_hash_calls();
-        let serial_scatter =
-            union_with_exhausted_parallel_budget(left.clone(), right.clone());
+        let serial_scatter = union_with_exhausted_parallel_budget(left.clone(), right.clone());
         assert_eq!(serial_scatter.len(), 8_064);
         assert_eq!(local_leaf_hash_calls(), 128);
         let before_verify = local_leaf_hash_calls();
@@ -4473,10 +4467,7 @@ mod tests {
         assert!(first.root.same_shape(&second.root));
         assert!(first.root.same_shape(&third.root));
         for owner in &owners {
-            assert!(OwnerNode::contains(
-                &first.root,
-                OwnerCover::address(owner)
-            ));
+            assert!(OwnerNode::contains(&first.root, OwnerCover::address(owner)));
         }
         let unrelated = test_archive_owner(255);
         assert!(!OwnerNode::contains(
@@ -4720,12 +4711,10 @@ mod tests {
         let left_owner: Arc<dyn ArchiveOwner> = left_storage.clone();
         let right_owner: Arc<dyn ArchiveOwner> = right_storage.clone();
         let (mut first, mut second) = {
-            let left_entry = unsafe {
-                ArchiveEntry::new(NonNull::from(&left_storage.0), &left_owner)
-            };
-            let right_entry = unsafe {
-                ArchiveEntry::new(NonNull::from(&right_storage.0), &right_owner)
-            };
+            let left_entry =
+                unsafe { ArchiveEntry::new(NonNull::from(&left_storage.0), &left_owner) };
+            let right_entry =
+                unsafe { ArchiveEntry::new(NonNull::from(&right_storage.0), &right_owner) };
 
             let mut first = PATCH::<KEY_LEN, IdentitySchema>::new();
             first.insert_archive(&left_entry);
@@ -4761,10 +4750,7 @@ mod tests {
             first = next_first;
             second = next_second;
 
-            for (patch, owner_root) in [
-                (&first, first_owner_root),
-                (&second, second_owner_root),
-            ] {
+            for (patch, owner_root) in [(&first, first_owner_root), (&second, second_owner_root)] {
                 let cover = patch.owners.as_ref().expect("dirty Head lost its owners");
                 let stats = cover.stats();
                 assert_eq!(cover.owner_count(), 2);
