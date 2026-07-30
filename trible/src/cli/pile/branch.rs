@@ -971,15 +971,18 @@ pub fn run(cmd: Command) -> Result<()> {
                 let mut repo = Repository::new(pile_store, key.clone(), TribleSet::new())?;
 
                 let res = (|| -> Result<(), anyhow::Error> {
+                    // --- Phase 1: Raw pile scan ---
+                    let records = scan_pile_records(&pile_path)?;
+                    let states = collapse_branch_states(&records);
+
+                    // Open the blob reader after fixing the raw pin-state
+                    // snapshot so every metadata handle in `states` is from
+                    // the reader's generation or an earlier one.
                     repo.storage_mut().refresh()?;
                     let reader = repo
                         .storage_mut()
                         .reader()
                         .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
-
-                    // --- Phase 1: Raw pile scan ---
-                    let records = scan_pile_records(&pile_path)?;
-                    let states = collapse_branch_states(&records);
 
                     let n_active = states
                         .values()
@@ -997,10 +1000,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     );
 
                     // --- Phase 2: Name resolution & grouping ---
-                    let mut groups: BTreeMap<
-                        String,
-                        Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>,
-                    > = BTreeMap::new();
+                    let mut groups: BTreeMap<String, Vec<ConsolidateMember>> = BTreeMap::new();
 
                     // Branches whose name could not be established. They are
                     // NOT given a synthetic group key: consolidate merges
@@ -1009,9 +1009,9 @@ pub fn run(cmd: Command) -> Result<()> {
                     let mut ungroupable: Vec<(Id, String)> = Vec::new();
 
                     for (bid, state) in &states {
-                        let meta_handle = match state.kind {
-                            RecordKind::Set => state.meta,
-                            RecordKind::Tombstone => state.last_set,
+                        let (meta_handle, delete_expected) = match state.kind {
+                            RecordKind::Set => (state.meta, state.meta),
+                            RecordKind::Tombstone => (state.last_set, None),
                         };
 
                         let Some(mh) = meta_handle else {
@@ -1049,7 +1049,11 @@ pub fn run(cmd: Command) -> Result<()> {
                         groups
                             .entry(name.to_string())
                             .or_default()
-                            .push((*bid, head));
+                            .push(ConsolidateMember {
+                                id: *bid,
+                                delete_expected,
+                                commit_head: head,
+                            });
                     }
 
                     report_ungroupable(&ungroupable);
@@ -1098,67 +1102,78 @@ pub fn run(cmd: Command) -> Result<()> {
                 let mut repo = Repository::new(pile_store, key.clone(), TribleSet::new())?;
 
                 let res = (|| -> Result<(), anyhow::Error> {
-                    repo.storage_mut().refresh()?;
+                    // Snapshot ids and metadata handles together before
+                    // opening the reader. Refreshing individual heads after
+                    // this point could mix generations under concurrent
+                    // writers and produce handles the reader cannot see.
+                    let pin_snapshot = repo.storage_mut().pin_snapshot()?;
                     let reader = repo
                         .storage_mut()
                         .reader()
                         .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
 
                     // Iterate active branches, resolve names, group.
-                    let mut groups: std::collections::BTreeMap<
-                        String,
-                        Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>,
-                    > = std::collections::BTreeMap::new();
+                    let mut groups: std::collections::BTreeMap<String, Vec<ConsolidateMember>> =
+                        std::collections::BTreeMap::new();
 
-                    let branch_ids: Vec<Id> =
-                        repo.storage_mut().pins()?.collect::<Result<Vec<_>, _>>()?;
-
-                    println!("found {} active branch(es)", branch_ids.len());
+                    println!("found {} active branch(es)", pin_snapshot.len());
 
                     let mut ungroupable: Vec<(Id, String)> = Vec::new();
 
-                    for bid in &branch_ids {
-                        let Some(mh) = repo.storage_mut().head(*bid)? else {
-                            continue;
-                        };
+                    for raw_bid in &pin_snapshot {
+                        let bid = Id::new(*raw_bid).expect("pin snapshot contains nil id");
+                        let mh = *pin_snapshot
+                            .get(raw_bid)
+                            .expect("pin snapshot key has no value");
 
                         if reader.metadata(mh)?.is_none() {
-                            ungroupable.push((*bid, "metadata blob missing".to_string()));
+                            ungroupable.push((bid, "metadata blob missing".to_string()));
                             continue;
                         }
 
                         let meta_set = match reader.get::<TribleSet, SimpleArchive>(mh) {
                             Ok(ms) => ms,
                             Err(err) => {
-                                ungroupable.push((*bid, format!("metadata unreadable: {err:?}")));
+                                ungroupable.push((bid, format!("metadata unreadable: {err:?}")));
                                 continue;
                             }
                         };
 
-                        let resolved = load_branch_name(&reader, &meta_set, *bid);
+                        let resolved = load_branch_name(&reader, &meta_set, bid);
                         let Some(name) = resolved.named() else {
-                            ungroupable.push((*bid, resolved.reason()));
+                            ungroupable.push((bid, resolved.reason()));
                             continue;
                         };
 
-                        let head = match extract_repo_head(&meta_set, *bid) {
+                        let head = match extract_repo_head(&meta_set, bid) {
                             BranchHead::Head(head) => Some(head),
                             BranchHead::Headless => None,
                             BranchHead::Malformed => {
-                                ungroupable.push((*bid, "branch head metadata malformed".into()));
+                                ungroupable.push((bid, "branch head metadata malformed".into()));
                                 continue;
                             }
                         };
                         groups
                             .entry(name.to_string())
                             .or_default()
-                            .push((*bid, head));
+                            .push(ConsolidateMember {
+                                id: bid,
+                                delete_expected: Some(mh),
+                                commit_head: head,
+                            });
                     }
 
                     report_ungroupable(&ungroupable);
 
-                    let statuses: HashMap<Id, &str> =
-                        branch_ids.iter().map(|bid| (*bid, "active")).collect();
+                    let statuses: HashMap<Id, &str> = (&pin_snapshot)
+                        .into_iter()
+                        .map(|raw_bid| {
+                            (
+                                Id::new(*raw_bid).expect("pin snapshot contains nil id"),
+                                "active",
+                            )
+                        })
+                        .collect();
                     let created_count = consolidate_groups(
                         &groups,
                         &statuses,
@@ -1199,22 +1214,30 @@ pub fn run(cmd: Command) -> Result<()> {
                 let mut repo = Repository::new(pile, key.clone(), TribleSet::new())?;
 
                 let res = (|| -> Result<(), anyhow::Error> {
-                    // Ensure in-memory indices are populated.
-                    repo.storage_mut().refresh()?;
+                    // Fix the requested ids and metadata handles as one pin
+                    // snapshot before opening the blob reader. The reader can
+                    // then see every analyzed handle, and those exact handles
+                    // also become the delete CAS expectations below.
+                    let pin_snapshot = repo.storage_mut().pin_snapshot()?;
+                    let branch_metadata: Vec<_> = branch_ids
+                        .into_iter()
+                        .map(|bid| {
+                            let raw_bid: [u8; 16] = bid.into();
+                            let meta_handle = pin_snapshot
+                                .get(&raw_bid)
+                                .copied()
+                                .ok_or_else(|| anyhow::anyhow!("branch not found: {bid:X}"))?;
+                            Ok((bid, meta_handle))
+                        })
+                        .collect::<Result<_, anyhow::Error>>()?;
                     let reader = repo
                         .storage_mut()
                         .reader()
                         .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
 
-                    // Collect all branch ids and their current heads.
-                    let mut candidates: Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)> =
-                        Vec::new();
-                    for bid in branch_ids {
-                        let meta_handle = repo
-                            .storage_mut()
-                            .head(bid)?
-                            .ok_or_else(|| anyhow::anyhow!("branch not found: {bid:X}"))?;
-
+                    // Decode the branch metadata from the fixed snapshot.
+                    let mut candidates: Vec<ConsolidateMember> = Vec::new();
+                    for (bid, meta_handle) in branch_metadata {
                         let mut head_state = BranchHead::Malformed;
                         if reader.metadata(meta_handle)?.is_some() {
                             if let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(meta_handle) {
@@ -1230,14 +1253,18 @@ pub fn run(cmd: Command) -> Result<()> {
                             }
                         };
 
-                        candidates.push((bid, head_val));
+                        candidates.push(ConsolidateMember {
+                            id: bid,
+                            delete_expected: Some(meta_handle),
+                            commit_head: head_val,
+                        });
                     }
 
                     println!("found {} branch(es)", candidates.len());
-                    for (bid, head) in &candidates {
-                        let id_hex = format!("{bid:X}");
-                        if let Some(h) = head {
-                            let hh: Inline<Hash<Blake3>> = Handle::to_hash(*h);
+                    for candidate in &candidates {
+                        let id_hex = format!("{:X}", candidate.id);
+                        if let Some(h) = candidate.commit_head {
+                            let hh: Inline<Hash<Blake3>> = Handle::to_hash(h);
                             let hex: String = hh.from_inline();
                             println!("- {id_hex} -> commit {hex}");
                         } else {
@@ -1257,7 +1284,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
                     // Collect parent commit handles (skip branches without a head).
                     let parents: Vec<Inline<Handle<SimpleArchive>>> =
-                        candidates.iter().filter_map(|(_, h)| *h).collect();
+                        candidates.iter().filter_map(|c| c.commit_head).collect();
                     if parents.is_empty() {
                         anyhow::bail!("no branch heads available to attach");
                     }
@@ -1286,15 +1313,22 @@ pub fn run(cmd: Command) -> Result<()> {
                     println!("created consolidated branch '{out}' with id {new_id:X}");
 
                     if delete_sources {
-                        for (bid, _) in &candidates {
-                            if let Some(old) = repo.storage_mut().head(*bid)? {
-                                match repo.storage_mut().update(*bid, Some(old), None)? {
-                                    triblespace_core::repo::PushResult::Success() => {
-                                        println!("deleted source branch {bid:X}");
-                                    }
-                                    triblespace_core::repo::PushResult::Conflict(_) => {
-                                        eprintln!("warning: branch {bid:X} advanced concurrently; skipping delete");
-                                    }
+                        for candidate in &candidates {
+                            let Some(expected) = candidate.delete_expected else {
+                                continue;
+                            };
+                            match repo
+                                .storage_mut()
+                                .update(candidate.id, Some(expected), None)?
+                            {
+                                triblespace_core::repo::PushResult::Success() => {
+                                    println!("deleted source branch {:X}", candidate.id);
+                                }
+                                triblespace_core::repo::PushResult::Conflict(_) => {
+                                    eprintln!(
+                                            "warning: branch {:X} advanced concurrently; skipping delete",
+                                            candidate.id
+                                        );
                                 }
                             }
                         }
@@ -1958,6 +1992,16 @@ enum BranchHead {
     Malformed,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ConsolidateMember {
+    id: Id,
+    /// The pin metadata handle observed during consolidation analysis.
+    /// `None` denotes a historical tombstoned member, which must never be
+    /// resurrected or counted as a source deletion.
+    delete_expected: Option<Inline<Handle<SimpleArchive>>>,
+    commit_head: Option<Inline<Handle<SimpleArchive>>>,
+}
+
 fn extract_repo_head(meta: &TribleSet, branch_id: Id) -> BranchHead {
     use triblespace::prelude::blobencodings::SimpleArchive;
     use triblespace::prelude::inlineencodings::Handle;
@@ -2024,7 +2068,7 @@ fn parse_blake3_handle_opt(s: &str) -> Result<Option<Inline<Handle<SimpleArchive
 ///
 /// `statuses` maps branch IDs to display labels (e.g. "active"/"deleted").
 fn consolidate_groups(
-    groups: &std::collections::BTreeMap<String, Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>>,
+    groups: &std::collections::BTreeMap<String, Vec<ConsolidateMember>>,
     statuses: &HashMap<Id, &str>,
     reader: &triblespace_core::repo::pile::PileReader,
     repo: &mut Repository<Pile>,
@@ -2038,8 +2082,10 @@ fn consolidate_groups(
     let mut created_count: usize = 0;
 
     for (name, members) in groups {
-        let heads: Vec<Inline<Handle<SimpleArchive>>> =
-            members.iter().filter_map(|(_, h)| *h).collect();
+        let heads: Vec<Inline<Handle<SimpleArchive>>> = members
+            .iter()
+            .filter_map(|member| member.commit_head)
+            .collect();
 
         if heads.is_empty() {
             if !dry_run && delete_sources {
@@ -2066,14 +2112,14 @@ fn consolidate_groups(
             members.len(),
             heads.len()
         );
-        for (bid, head) in members {
-            let status = statuses.get(bid).copied().unwrap_or("?");
-            if let Some(h) = head {
-                let hh: Inline<Hash<Blake3>> = Handle::to_hash(*h);
+        for member in members {
+            let status = statuses.get(&member.id).copied().unwrap_or("?");
+            if let Some(h) = member.commit_head {
+                let hh: Inline<Hash<Blake3>> = Handle::to_hash(h);
                 let hex: String = hh.from_inline();
-                println!("  - {bid:X} [{status}] head={}", &hex[..23]);
+                println!("  - {:X} [{status}] head={}", member.id, &hex[..23]);
             } else {
-                println!("  - {bid:X} [{status}] <no head>");
+                println!("  - {:X} [{status}] <no head>", member.id);
             }
         }
 
@@ -2131,9 +2177,9 @@ fn consolidate_groups(
         // Check if a single active branch already has the right head — skip if so.
         if non_subsumed.len() == 1 {
             let dominated_head = non_subsumed[0];
-            let already_active = members.iter().any(|(bid, head)| {
-                head.as_ref() == Some(&dominated_head)
-                    && statuses.get(bid).copied() == Some("active")
+            let already_active = members.iter().any(|member| {
+                member.commit_head.as_ref() == Some(&dominated_head)
+                    && statuses.get(&member.id).copied() == Some("active")
             });
             if already_active {
                 if dry_run {
@@ -2143,11 +2189,11 @@ fn consolidate_groups(
                 } else if delete_sources {
                     let keeper = members
                         .iter()
-                        .find(|(bid, head)| {
-                            head.as_ref() == Some(&dominated_head)
-                                && statuses.get(bid).copied() == Some("active")
+                        .find(|member| {
+                            member.commit_head.as_ref() == Some(&dominated_head)
+                                && statuses.get(&member.id).copied() == Some("active")
                         })
-                        .map(|(b, _)| *b);
+                        .map(|member| member.id);
                     let cleaned = tombstone_branches(repo, members, keeper)?;
                     if cleaned > 0 {
                         println!(
@@ -2206,21 +2252,28 @@ fn consolidate_groups(
 /// Tombstone all branches in `members` except `keeper`. Returns the number tombstoned.
 fn tombstone_branches(
     repo: &mut Repository<Pile>,
-    members: &[(Id, Option<Inline<Handle<SimpleArchive>>>)],
+    members: &[ConsolidateMember],
     keeper: Option<Id>,
 ) -> Result<usize> {
     let mut count = 0;
-    for (bid, _) in members {
-        if Some(*bid) == keeper {
+    for member in members {
+        if Some(member.id) == keeper {
             continue;
         }
-        let old = repo.storage_mut().head(*bid)?;
-        match repo.storage_mut().update(*bid, old, None)? {
+        let Some(expected) = member.delete_expected else {
+            // Historical tombstoned members participate in ancestry
+            // analysis but are not live sources to delete.
+            continue;
+        };
+        match repo.storage_mut().update(member.id, Some(expected), None)? {
             triblespace_core::repo::PushResult::Success() => {
                 count += 1;
             }
             triblespace_core::repo::PushResult::Conflict(_) => {
-                eprintln!("  warning: branch {bid:X} advanced concurrently; skipping delete");
+                eprintln!(
+                    "  warning: branch {:X} advanced concurrently; skipping delete",
+                    member.id
+                );
             }
         }
     }
@@ -2666,6 +2719,49 @@ mod tests {
             "malformed source pin must not be tombstoned or rewritten"
         );
         check.close().unwrap();
+    }
+
+    #[test]
+    fn consolidate_delete_sources_preserves_a_branch_that_advanced_after_analysis() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("concurrent-advance.pile");
+        std::fs::File::create(&path).expect("create pile");
+
+        let pile = Pile::open(&path).expect("open pile");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        let mut repo = Repository::new(pile, key, TribleSet::new()).expect("repo");
+        let branch_id = *repo.create_branch("main", None).expect("branch");
+        let analyzed_meta = repo.storage_mut().head(branch_id).unwrap().unwrap();
+
+        // Model a writer advancing the source after consolidation captured
+        // its candidate metadata but before --delete-sources runs.
+        let advanced_meta: Inline<Handle<SimpleArchive>> = repo
+            .storage_mut()
+            .put(TribleSet::new().to_blob())
+            .expect("put advanced metadata");
+        assert!(matches!(
+            repo.storage_mut()
+                .update(branch_id, Some(analyzed_meta), Some(advanced_meta)),
+            Ok(triblespace_core::repo::PushResult::Success())
+        ));
+
+        let members = [ConsolidateMember {
+            id: branch_id,
+            delete_expected: Some(analyzed_meta),
+            commit_head: None,
+        }];
+        assert_eq!(
+            tombstone_branches(&mut repo, &members, None).expect("delete attempt"),
+            0,
+            "the stale analyzed metadata handle must lose the delete CAS"
+        );
+        assert_eq!(
+            repo.storage_mut().head(branch_id).unwrap(),
+            Some(advanced_meta),
+            "a concurrently advanced source must remain live"
+        );
+
+        repo.into_storage().close().unwrap();
     }
 
     /// The regression this file exists to prevent.
