@@ -94,7 +94,12 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     /// trible's bytes eagerly so the 6 covering indexes can share it.
     ///
     /// # Safety
-    /// - `ptr` must remain valid for as long as `owner` is held.
+    /// - `ptr` must designate a fully initialized `[u8; KEY_LEN]` and remain
+    ///   valid for as long as any clone of `owner` retained by a PATCH exists.
+    /// - The pointed-to bytes must not be mutated during that retained-owner
+    ///   lifetime, including through concurrent aliases or interior
+    ///   mutability. PATCH caches their hash and uses them as immutable trie
+    ///   routing keys; changing them would invalidate both properties.
     /// - `ptr` must be 16-byte aligned (so `Head::new_local_leaf`'s
     ///   tagged-pointer encoding has room for the `LocalLeaf` tag in
     ///   the low 4 bits). Any `[u8; 64]` at an offset that's a
