@@ -152,13 +152,14 @@ depth-first traversal from thrashing through unrelated values.
 
 ## Implementation notes
 
-- The search state is one `Binding` plus a stack of per-level candidate
-  buffers. Backtracking unsets a variable and pops; because constraints are
-  stateless, nothing has to be notified or unwound.
-- A level can be enumerated in geometrically growing chunks (64 candidates,
-  then four times as many each refill) so time-to-first-result at a wide level
-  is bounded by the first chunk rather than by the level's cardinality, while
-  total enumeration work stays within a constant factor of proposing eagerly.
+- The search state is a stack of row frontiers over reusable per-variable
+  candidate buffers. Retiring a frontier unsets its variable and pops; because
+  constraints are stateless, nothing has to be notified or unwound.
+- Constraints propose a complete candidate region for each parent batch; they
+  do not implement cursors or seek. The engine resumably consumes its own
+  buffer into child frontiers whose width ramps through 1, 8, 64, 512, … up to
+  the query ceiling. This protects the first result from batching overhead
+  while still presenting accelerators with wide regions deeper in the search.
 - Highly skewed data still behaves predictably: even if one attribute dominates
   the dataset, the other constraints continue to bound the search space tightly
   and prevent runaway exploration. This is the payoff of re-estimating per

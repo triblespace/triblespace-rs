@@ -133,4 +133,3 @@ fn width_one_is_unaffected_by_the_contract() {
 fn a_value_dependent_relevance_is_caught_when_batched() {
     let _ = rows(4096);
 }
-

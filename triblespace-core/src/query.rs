@@ -1476,7 +1476,9 @@ impl Default for LevelValues {
 /// at a wide root.
 ///
 /// It is a *ceiling*, not the first batch: a level's first chunk is
-/// [`INITIAL_FRONTIER_WIDTH`] and every chunk after it is this wide.
+/// [`INITIAL_FRONTIER_WIDTH`], then chunk width grows by
+/// [`FRONTIER_RAMP_BASE`] until it reaches this ceiling. A conservative tail
+/// merge may consume the remainder early, but never exceeds the ceiling.
 ///
 /// The cost is frontier memory: one index row plus one estimate row per
 /// live row per depth, i.e. `O(width · variables · depth)` — the price of
@@ -1488,8 +1490,8 @@ impl Default for LevelValues {
 /// Tune per query with [`Query::with_frontier_width`].
 pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 
-/// Width of the *first* chunk a level draws. Every chunk after it is
-/// [`DEFAULT_FRONTIER_WIDTH`] (or whatever
+/// Width of the *first* chunk a level draws. Later chunks grow by
+/// [`FRONTIER_RAMP_BASE`] up to [`DEFAULT_FRONTIER_WIDTH`] (or whatever
 /// [`Query::with_frontier_width`] set).
 ///
 /// Starting at one keeps time-to-first-result identical to plain
@@ -1505,29 +1507,12 @@ pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 /// width grows geometrically after negative work — recovered at the right
 /// layer (the frontier) instead of the wrong one (per-parent chunking).
 ///
-/// # Why one step and not a geometric ramp
-///
-/// The obvious schedule is geometric — 1, 2, 4, … up to the ceiling — and
-/// it was measured and rejected. Doubling reaches the ceiling in
-/// `log2(width)` chunks, but the *last* chunk of a geometric drain is only
-/// about half the candidates, so a level never produces a frontier wider
-/// than half of what a flat schedule would, and every level pays
-/// `log2(width)` expansions instead of one. On a fan-out join that took a
-/// fixture's widest frontier from 2048 rows down to 512, its mean frontier
-/// from 768 rows down to 31, and its expansions from 3 up to 74 — for the
-/// same total rows and the same total proposals. A quarter of the peak
-/// width and a twenty-fifth of the mean is a direct attack on the reason
-/// batching exists, and it cost 10% on a full drain to buy it.
-///
-/// Stepping straight to the ceiling after one narrow chunk gives the same
-/// time-to-first-result — the first chunk is what a one-row caller pays,
-/// and it is one binding either way — while keeping the peak frontier
-/// (measured 2039 against the flat schedule's 2048) and adding one extra
-/// expansion per level rather than fourteen. The price is a caller who
-/// wants a handful of rows but not all of them: `take(2)` now pays a
-/// full-width batch where a geometric ramp would have paid two rows. That
-/// is the deliberate trade — `exists!` and `next()` are the short-circuit
-/// shapes that actually occur, and they are exactly protected.
+/// Starting at one protects `.next()` and `exists!`; the ramp then trades
+/// low-demand granularity against full-drain batch width. The base controls
+/// that trade. Doubling was measured and rejected because its final chunk is
+/// only about half a drain, but base eight retains seven eighths
+/// asymptotically while reaching the ceiling in far fewer steps. See
+/// [`FRONTIER_RAMP_BASE`] for the measured rationale.
 pub const INITIAL_FRONTIER_WIDTH: usize = 1;
 
 /// Factor a level's chunk width grows by after each chunk, from

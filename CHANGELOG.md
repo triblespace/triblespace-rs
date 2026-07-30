@@ -114,9 +114,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panic. Debug builds now assert it (exhaustively in `propose`, which visits
   every row anyway; sampled with a stride in `confirm`), and
   `tests/estimate_relevance_contract.rs` pins the enforcement.
-- **The frontier width is a ceiling, and a level's first chunk is one
-  binding.** `INITIAL_FRONTIER_WIDTH` = 1; every chunk after it is the query's
-  full width. A query the caller stops after one row — `exists!`, `.next()` —
+- **The frontier width is a ceiling, and levels ramp by base eight from one
+  binding.** `INITIAL_FRONTIER_WIDTH` = 1; later chunks grow through
+  8, 64, 512, … up to the query's full width. A query the caller stops after
+  one row — `exists!`, `.next()` —
   now does exactly the work the pre-batching engine did instead of
   materialising a 16384-wide root frontier it will throw away; measured on a
   first-row-only join, the flat engine was **8.8x** slower than pre-batching
@@ -125,11 +126,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the residual engine's rule that search width grows geometrically after
   negative work — recovered at the frontier, which is the layer that can
   actually carry it, rather than at per-parent chunking, which could not.
-  A geometric 1, 2, 4, … ramp was measured and rejected: its last chunk holds
-  only half a level's candidates, so it took a fixture's widest frontier from
-  2048 rows to 512 and its mean from 768 to 31 while raising expansions from 3
-  to 74, for the same rows and proposals — a quarter of the peak width, and
-  10% slower on a full drain.
+  A geometric 1, 2, 4, … ramp was measured and rejected because its last chunk
+  holds only half a level's candidates. The failure was the base, not the
+  ramp: base eight retains seven eighths asymptotically and reaches a 16384
+  ceiling in six terms. Across 300 registry spans it retained 99.61% of the
+  flat schedule's aggregate widest frontier and 93.30% rather than 97.46% of
+  GPU-routed candidate work, at 44.7% more expansions. A conservative tail
+  merge recovers small remainders without exceeding the width ceiling.
 - **A 1:1 descent reuses the parent frontier's matrices instead of copying
   them.** When a level's draw yields exactly one surviving child per parent
   row, in order, over the whole frontier, with nothing left pending, no row

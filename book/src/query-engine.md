@@ -133,11 +133,13 @@ whole frontier at a time:
 5. When a level runs out of live candidates, retire it and continue with the
    next group, then with the next chunk one level up.
 
-### The width is a ceiling, and the first chunk is one row
+### The width is a ceiling, and the frontier ramps from one row
 
 `DEFAULT_FRONTIER_WIDTH` is how wide a chunk may *get*, not how wide the first
-one is. A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding; every
-chunk after it is the full width.
+one is. A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding. Later
+chunks multiply by `FRONTIER_RAMP_BASE` = 8 until they reach the ceiling. If
+the final remainder would be smaller than the chunk before it, the engine
+merges that tail early; the caller's ceiling remains a hard bound.
 
 That is what keeps time-to-first-result honest. A caller who stops after one
 row — `exists!`, `.next()` — must not pay to build a 16 384-wide frontier it
@@ -146,19 +148,18 @@ single-binding engine did. Measured on a first-row-only join, a flat
 full-width engine is 8.8x slower than the pre-batching engine; one narrow
 chunk closes the entire gap.
 
-The obvious schedule is geometric — 1, 2, 4, … up to the ceiling — and it was
-measured and rejected. Doubling reaches the ceiling in `log2(width)` chunks,
-but the last chunk of a geometric drain holds only about half the candidates,
-so a level never builds a frontier wider than half of what a flat schedule
-would, and every level pays `log2(width)` expansions instead of one. On a
-fan-out join that took a fixture's widest frontier from 2048 rows to 512, its
-mean frontier from 768 to 31, and its expansions from 3 to 74 — for the same
-rows and the same proposals. A quarter of the peak width is a direct attack on
-the reason batching exists, and it cost 10% on a full drain to buy it. One
-step gives the same first-row latency (the first chunk is one binding either
-way) and keeps the peak. The price is `take(2..width)`, which now pays a full
-batch — the deliberate trade, since `exists!` and `next()` are the
-short-circuit shapes that actually occur.
+The base is the latency/throughput trade, not an incidental tuning detail. A
+base-2 ramp was measured and rejected: its last chunk is only about half a
+drain, so it cut a fixture's useful frontier from 2048 rows to 512 and raised
+expansions from 3 to 74. The failure was the base, not geometric growth. At
+base 8, the last term is asymptotically seven eighths of the drain and a 16 384
+ceiling takes six rungs rather than doubling's fifteen. Across the 100-query
+registry on three backings, base 8 retained 99.61% of aggregate widest-frontier
+width and 93.30% of GPU-routed candidate work (against 97.46% for the flat
+schedule), at 44.7% more expansions. It therefore keeps almost all useful
+batch width while avoiding the flat schedule's enormous overshoot for callers
+that want only a handful of rows. The first row is protected exactly; larger
+short demands pay at most the next base-8 rung.
 
 ### A 1:1 descent copies nothing
 
@@ -297,7 +298,7 @@ search width geometrically after negative work; both are the same idea, and
 both were attached to the wrong object. Attached to a *level*, growth asks a
 source to resume. Attached to the *frontier*, it asks nothing of anyone — the
 engine already owns how many parent rows it expands at a time, so
-`INITIAL_FRONTIER_WIDTH` and `FRONTIER_RAMP` buy the time-to-first-result
+`INITIAL_FRONTIER_WIDTH` and `FRONTIER_RAMP_BASE` buy the time-to-first-result
 property the cursor was reaching for with none of its protocol cost.
 
 Narrowing a wide level is still a real problem; galloping intersection is the
