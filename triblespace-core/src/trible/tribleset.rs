@@ -16,6 +16,7 @@ use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
 use crate::patch::PATCH;
+use crate::patch::PATCHOwnerGuard;
 use crate::query::Variable;
 use crate::trible::AEVOrder;
 use crate::trible::AVEOrder;
@@ -169,6 +170,47 @@ pub struct TribleSetIterator<'a> {
 pub const PARALLEL_UNION_THRESHOLD: usize = 4096;
 
 impl TribleSet {
+    /// Whether every covering index currently shares one exact owner receipt.
+    fn owner_guards_are_shared(&self) -> bool {
+        self.eav.shares_owner_guard(&self.eva)
+            && self.eav.shares_owner_guard(&self.aev)
+            && self.eav.shares_owner_guard(&self.ave)
+            && self.eav.shares_owner_guard(&self.vea)
+            && self.eav.shares_owner_guard(&self.vae)
+    }
+
+    /// The archive-insert shortcut invariant: all six indexes share one
+    /// receipt and that receipt already retains the incoming allocation.
+    fn shared_owner_guard_retains(&self, owner: &Arc<dyn ArchiveOwner>) -> bool {
+        self.owner_guards_are_shared() && self.eav.owner_guard_retains(owner)
+    }
+
+    /// Join the conservative archive-owner receipts of all six public
+    /// indexes. Public PATCH fields may have evolved independently, so no
+    /// single index is authoritative for aggregate lifetime ownership.
+    fn combined_owner_guard(&self) -> PATCHOwnerGuard {
+        let guard = self.eav.owner_guard();
+        if self.owner_guards_are_shared() {
+            return guard;
+        }
+        guard
+            .join(self.eva.owner_guard())
+            .join(self.aev.owner_guard())
+            .join(self.ave.owner_guard())
+            .join(self.vea.owner_guard())
+            .join(self.vae.owner_guard())
+    }
+
+    /// Publish one receipt Arc to every index before any trie operation.
+    fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
+        self.eav.set_owner_guard(guard);
+        self.eva.set_owner_guard(guard);
+        self.aev.set_owner_guard(guard);
+        self.ave.set_owner_guard(guard);
+        self.vea.set_owner_guard(guard);
+        self.vae.set_owner_guard(guard);
+    }
+
     /// Union of two [`TribleSet`]s.
     ///
     /// The other [`TribleSet`] is consumed, and this [`TribleSet`] is updated
@@ -183,7 +225,17 @@ impl TribleSet {
     /// is inserted into `self`); when `other` is tiny (e.g. the per-
     /// `entity!{}` `+=` in a serial fold) the rayon overhead would
     /// dominate even at large `self`.
-    pub fn union(&mut self, other: Self) {
+    pub fn union(&mut self, mut other: Self) {
+        // Join all twelve receipts once. Installing the same Arc on both
+        // operands makes each subsequent per-index PATCH union's owner join
+        // collapse to the Arc::ptr_eq fast path. Do this before moving any
+        // Heads, including when public indexes have diverged independently.
+        let owners = self
+            .combined_owner_guard()
+            .join(other.combined_owner_guard());
+        self.set_owner_guard(&owners);
+        other.set_owner_guard(&owners);
+
         #[cfg(feature = "parallel")]
         {
             if other.len() >= PARALLEL_UNION_THRESHOLD {
@@ -415,12 +467,16 @@ impl TribleSet {
             return;
         }
 
-        self.eav = PATCH::from_archive_pair(first, second);
-        self.eva = PATCH::from_archive_pair(first, second);
-        self.aev = PATCH::from_archive_pair(first, second);
-        self.ave = PATCH::from_archive_pair(first, second);
-        self.vea = PATCH::from_archive_pair(first, second);
-        self.vae = PATCH::from_archive_pair(first, second);
+        let mut owners = self.combined_owner_guard();
+        owners.retain_archive_owner(first.owner());
+        self.set_owner_guard(&owners);
+
+        self.eav = PATCH::from_archive_pair_with_guard(first, second, &owners);
+        self.eva = PATCH::from_archive_pair_with_guard(first, second, &owners);
+        self.aev = PATCH::from_archive_pair_with_guard(first, second, &owners);
+        self.ave = PATCH::from_archive_pair_with_guard(first, second, &owners);
+        self.vea = PATCH::from_archive_pair_with_guard(first, second, &owners);
+        self.vae = PATCH::from_archive_pair_with_guard(first, second, &owners);
 
         for entry in &entries[2..] {
             self.insert_archive(entry);
@@ -433,6 +489,15 @@ impl TribleSet {
     /// `Leaf`. Each receiving PATCH's root owner set keeps the underlying
     /// archive bytes alive.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, TRIBLE_LEN>) {
+        if !self.shared_owner_guard_retains(entry.owner()) {
+            // Either public indexes have diverged or this allocation is new.
+            // Repair the complete conservative cover before installing any
+            // LocalLeaf. Once repaired, every PATCH retain below is a no-op.
+            let mut owners = self.combined_owner_guard();
+            owners.retain_archive_owner(entry.owner());
+            self.set_owner_guard(&owners);
+        }
+
         self.eav.insert_archive(entry);
         self.eva.insert_archive(entry);
         self.aev.insert_archive(entry);
@@ -670,6 +735,41 @@ mod tests {
         assert_index!(set.vae, "VAE");
     }
 
+    #[repr(C, align(16))]
+    struct AlignedArchiveTrible([u8; TRIBLE_LEN]);
+
+    fn archive_only_index(
+        raw: [u8; TRIBLE_LEN],
+        insert: for<'a> fn(&mut TribleSet, &ArchiveEntry<'a, TRIBLE_LEN>),
+    ) -> TribleSet {
+        let storage = Arc::new(AlignedArchiveTrible(raw));
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let mut set = TribleSet::new();
+        {
+            // SAFETY: the aligned allocation is retained by `owner`, which
+            // the selected PATCH adopts before this helper drops it.
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&storage.0), &owner) };
+            insert(&mut set, &entry);
+        }
+        drop(owner);
+        drop(storage);
+        set
+    }
+
+    fn assert_shared_owner_guard(set: &TribleSet) {
+        let guards = [
+            set.eav.owner_guard(),
+            set.eva.owner_guard(),
+            set.aev.owner_guard(),
+            set.ave.owner_guard(),
+            set.vea.owner_guard(),
+            set.vae.owner_guard(),
+        ];
+        assert!(guards[1..]
+            .iter()
+            .all(|guard| guard.ptr_eq(&guards[0])));
+    }
+
     fn many_intrinsic_rows(namespace: u8, count: usize) -> Vec<IntrinsicEntityRow> {
         (0..count)
             .map(|i| {
@@ -788,6 +888,131 @@ mod tests {
         let (_, same_right) = build_intrinsic_entity(same_rows);
         let same_union = same_left + same_right;
         assert_all_indexes(&same_union, &same_expected);
+    }
+
+    #[test]
+    fn archive_adoption_unifies_diverged_public_index_guards() {
+        let a = [0x11; TRIBLE_LEN];
+        let b = [0x22; TRIBLE_LEN];
+        let c = [0x33; TRIBLE_LEN];
+
+        let only_eav = archive_only_index(a, |set, entry| set.eav.insert_archive(entry));
+        let only_eva = archive_only_index(b, |set, entry| set.eva.insert_archive(entry));
+        let mut set = TribleSet::new();
+        set.eav = only_eav.eav;
+        set.eva = only_eva.eva;
+        assert!(!set.eav.owner_guard().ptr_eq(&set.eva.owner_guard()));
+
+        let storage = Arc::new(AlignedArchiveTrible(c));
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        {
+            // SAFETY: `owner` keeps this aligned allocation live until the
+            // aggregate installs its joined guard on every index.
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&storage.0), &owner) };
+            assert!(!set.shared_owner_guard_retains(entry.owner()));
+            set.insert_archive(&entry);
+            assert!(set.shared_owner_guard_retains(entry.owner()));
+
+            // Repeating this owner's row takes the shared-receipt fast path.
+            // Duplicate insertion is a semantic no-op and receipt identity
+            // remains unchanged.
+            let before = set.eav.owner_guard();
+            set.insert_archive(&entry);
+            assert!(before.ptr_eq(&set.eav.owner_guard()));
+        }
+        drop(owner);
+        drop(storage);
+
+        let noise = vec![0xabu8; TRIBLE_LEN * 32];
+        std::hint::black_box(&noise);
+        assert_shared_owner_guard(&set);
+        assert_eq!(
+            set.eav.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([a, c]),
+        );
+        assert_eq!(
+            set.eva.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([b, c]),
+        );
+        assert_eq!(set.aev.iter().copied().collect::<Vec<_>>(), vec![c]);
+        assert_eq!(set.ave.iter().copied().collect::<Vec<_>>(), vec![c]);
+        assert_eq!(set.vea.iter().copied().collect::<Vec<_>>(), vec![c]);
+        assert_eq!(set.vae.iter().copied().collect::<Vec<_>>(), vec![c]);
+    }
+
+    #[test]
+    fn union_unifies_all_twelve_diverged_public_index_guards() {
+        let rows = [
+            [0x41; TRIBLE_LEN],
+            [0x42; TRIBLE_LEN],
+            [0x43; TRIBLE_LEN],
+            [0x44; TRIBLE_LEN],
+            [0x45; TRIBLE_LEN],
+            [0x46; TRIBLE_LEN],
+        ];
+
+        let only_eav = archive_only_index(rows[0], |set, entry| set.eav.insert_archive(entry));
+        let only_eva = archive_only_index(rows[1], |set, entry| set.eva.insert_archive(entry));
+        let only_aev = archive_only_index(rows[2], |set, entry| set.aev.insert_archive(entry));
+        let only_ave = archive_only_index(rows[3], |set, entry| set.ave.insert_archive(entry));
+        let only_vea = archive_only_index(rows[4], |set, entry| set.vea.insert_archive(entry));
+        let only_vae = archive_only_index(rows[5], |set, entry| set.vae.insert_archive(entry));
+
+        let mut left = TribleSet::new();
+        left.eav = only_eav.eav;
+        left.eva = only_eva.eva;
+        left.aev = only_aev.aev;
+        let mut right = TribleSet::new();
+        right.ave = only_ave.ave;
+        right.vea = only_vea.vea;
+        right.vae = only_vae.vae;
+        assert!(!left.owner_guards_are_shared());
+        assert!(!right.owner_guards_are_shared());
+
+        let before = [
+            left.eav.owner_guard(),
+            left.eva.owner_guard(),
+            left.aev.owner_guard(),
+            right.ave.owner_guard(),
+            right.vea.owner_guard(),
+            right.vae.owner_guard(),
+        ];
+        for (i, guard) in before.iter().enumerate() {
+            assert!(before[i + 1..]
+                .iter()
+                .all(|other| !guard.ptr_eq(other)));
+        }
+
+        left.union(right);
+
+        let noise = vec![0xcdu8; TRIBLE_LEN * 64];
+        std::hint::black_box(&noise);
+        assert!(left.owner_guards_are_shared());
+        assert_shared_owner_guard(&left);
+        assert_eq!(
+            left.eav.iter().copied().collect::<Vec<_>>(),
+            vec![rows[0]],
+        );
+        assert_eq!(
+            left.eva.iter().copied().collect::<Vec<_>>(),
+            vec![rows[1]],
+        );
+        assert_eq!(
+            left.aev.iter().copied().collect::<Vec<_>>(),
+            vec![rows[2]],
+        );
+        assert_eq!(
+            left.ave.iter().copied().collect::<Vec<_>>(),
+            vec![rows[3]],
+        );
+        assert_eq!(
+            left.vea.iter().copied().collect::<Vec<_>>(),
+            vec![rows[4]],
+        );
+        assert_eq!(
+            left.vae.iter().copied().collect::<Vec<_>>(),
+            vec![rows[5]],
+        );
     }
 
     #[test]

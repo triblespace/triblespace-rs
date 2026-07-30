@@ -143,6 +143,49 @@ impl ArchiveOwners {
     }
 }
 
+/// Opaque lifetime receipt for archive-backed PATCH leaves.
+///
+/// The receipt deliberately exposes no trie heads or archive allocations.
+/// Crate-internal aggregate structures can only conservatively join receipts,
+/// add an archive owner, and install the resulting superset on a PATCH.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PATCHOwnerGuard(Option<Arc<ArchiveOwners>>);
+
+impl PATCHOwnerGuard {
+    /// Conservatively retain every owner named by either receipt.
+    pub(crate) fn join(self, other: Self) -> Self {
+        Self(ArchiveOwners::union(self.0, other.0))
+    }
+
+    /// Add one archive allocation before any LocalLeaf into it is installed.
+    pub(crate) fn retain_archive_owner(&mut self, owner: &Arc<dyn ArchiveOwner>) {
+        ArchiveOwners::retain(&mut self.0, owner);
+    }
+
+    #[cfg(debug_assertions)]
+    fn covers(&self, current: &Option<Arc<ArchiveOwners>>) -> bool {
+        let Some(current) = current else {
+            return true;
+        };
+        let Some(replacement) = self.0.as_ref() else {
+            return false;
+        };
+        current
+            .by_address
+            .keys()
+            .all(|address| replacement.by_address.contains_key(address))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("PATCH tagged pointers require 64-bit targets");
 
@@ -2253,10 +2296,6 @@ where
     #[cfg(debug_assertions)]
     fn debug_check_owner_invariant(&self) {
         debug_assert!(
-            self.root.is_some() || self.owners.is_none(),
-            "an empty PATCH must not retain archive owners",
-        );
-        debug_assert!(
             self.root.as_ref().map(|root| root.tag()) != Some(HeadTag::LocalLeaf)
                 || self.owners.is_some(),
             "a root LocalLeaf must retain its archive owner",
@@ -2308,6 +2347,61 @@ where
 
     pub(crate) fn root_hash(&self) -> Option<u128> {
         self.root.as_ref().map(|root| root.hash())
+    }
+
+    /// Clone the opaque archive-owner receipt without exposing the root Head.
+    pub(crate) fn owner_guard(&self) -> PATCHOwnerGuard {
+        PATCHOwnerGuard(self.owners.clone())
+    }
+
+    /// Whether this PATCH and another PATCH retain the exact same owner
+    /// receipt. This compares only opaque lifetime state; neither root Head is
+    /// exposed or inspected.
+    pub(crate) fn shares_owner_guard<OO, VV>(&self, other: &PATCH<KEY_LEN, OO, VV>) -> bool
+    where
+        OO: KeySchema<KEY_LEN>,
+    {
+        match (&self.owners, &other.owners) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    /// Whether the current receipt already retains `owner`.
+    ///
+    /// The representative check is the expected archive-ingest hot path. A
+    /// persistent-map lookup handles an older owner without changing receipt
+    /// identity.
+    pub(crate) fn owner_guard_retains(&self, owner: &Arc<dyn ArchiveOwner>) -> bool {
+        let Some(owners) = self.owners.as_ref() else {
+            return false;
+        };
+        let address = ArchiveOwners::address(owner);
+        owners.representative_address == address || owners.by_address.contains_key(&address)
+    }
+
+    /// Install a conservative owner superset before moving LocalLeaves.
+    ///
+    /// Aggregate callers first join every participating PATCH receipt. The
+    /// debug assertion catches accidental attempts to shrink a live PATCH's
+    /// owner cover. An empty PATCH may retain a receipt: the cover is
+    /// intentionally conservative so sibling indexes can share one Arc.
+    pub(crate) fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            guard.covers(&self.owners),
+            "a PATCH owner guard may only be replaced by a conservative superset",
+        );
+        let already_installed = match (&self.owners, &guard.0) {
+            (None, None) => true,
+            (Some(current), Some(replacement)) => Arc::ptr_eq(current, replacement),
+            _ => false,
+        };
+        if !already_installed {
+            self.owners = guard.0.clone();
+        }
+        self.debug_check_owner_invariant();
     }
 
     /// Returns the value associated with `key` if present.
@@ -2733,9 +2827,21 @@ where
     /// from the same archive owner. Because the batch cardinality is already
     /// known, both roots can remain LocalLeaves under one ordinary Branch; no
     /// heap seed or unary Branch is required.
+    #[cfg(test)]
     pub(crate) fn from_archive_pair(
         first: &ArchiveEntry<'_, KEY_LEN>,
         second: &ArchiveEntry<'_, KEY_LEN>,
+    ) -> Self {
+        let guard = PATCHOwnerGuard::default();
+        Self::from_archive_pair_with_guard(first, second, &guard)
+    }
+
+    /// Build an archive pair under a receipt already shared by an aggregate.
+    /// This avoids allocating one equivalent singleton owner set per index.
+    pub(crate) fn from_archive_pair_with_guard(
+        first: &ArchiveEntry<'_, KEY_LEN>,
+        second: &ArchiveEntry<'_, KEY_LEN>,
+        guard: &PATCHOwnerGuard,
     ) -> Self {
         let (first_head, first_owner, first_hash) = first.leaf::<O>();
         let (second_head, second_owner, second_hash) = second.leaf::<O>();
@@ -2743,6 +2849,12 @@ where
             std::sync::Arc::ptr_eq(first_owner, second_owner),
             "an archive bootstrap pair must share one owner",
         );
+        // Retaining here keeps the safe constructor sound even if a future
+        // crate-internal caller passes an unrelated receipt. The aggregate
+        // fast path has already retained this owner, so its Arc identity is
+        // preserved without another owner-map allocation.
+        let mut guard = guard.clone();
+        guard.retain_archive_owner(first_owner);
         let (depth, first_key, second_key) = first_head
             .first_divergence(&second_head, 0)
             .expect("an archive bootstrap pair must contain distinct keys");
@@ -2756,7 +2868,7 @@ where
         );
         let result = Self {
             root: Some(Head::new(root_key, branch)),
-            owners: Some(ArchiveOwners::singleton(first_owner)),
+            owners: guard.0,
         };
         result.debug_check_owner_invariant();
         result
