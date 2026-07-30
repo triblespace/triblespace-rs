@@ -15,8 +15,8 @@ use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
-use crate::patch::PATCH;
 use crate::patch::PATCHOwnerGuard;
+use crate::patch::PATCH;
 use crate::query::Variable;
 use crate::trible::AEVOrder;
 use crate::trible::AVEOrder;
@@ -492,6 +492,110 @@ impl TribleSet {
         for entry in &entries[2..] {
             self.insert_archive(entry);
         }
+    }
+
+    /// Test-only all-six construction probe over one validated archive slice.
+    ///
+    /// A single `u32` row permutation is reset to archive order and partitioned
+    /// in place for each schema. The reset is intentional: carrying the prior
+    /// schema's permutation is semantically valid but destroys archive-row
+    /// locality for the next build. `hashes` is likewise shared by all six
+    /// builds, so the experiment retains neither per-index row arrays nor
+    /// persistent leaf descriptors.
+    ///
+    /// # Safety
+    ///
+    /// Every row must be 16-byte aligned, immutable, duplicate-free, and kept
+    /// alive by `owner`. `hashes[row]` must be the PATCH key hash of `rows[row]`.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_archive_partition_for_test(
+        rows: &[[u8; TRIBLE_LEN]],
+        hashes: &[u128],
+        owner: &Arc<dyn ArchiveOwner>,
+    ) -> (Self, usize) {
+        assert_eq!(rows.len(), hashes.len());
+        assert!(
+            u32::try_from(rows.len()).is_ok(),
+            "the one-buffer probe uses u32 archive row indices",
+        );
+
+        let mut owners = PATCHOwnerGuard::default();
+        if !rows.is_empty() {
+            owners.retain_archive_owner(owner);
+        }
+        let mut permutation = vec![0u32; rows.len()];
+        let permutation_bytes = permutation.len() * std::mem::size_of::<u32>();
+        fn reset(permutation: &mut [u32]) {
+            for (row, slot) in permutation.iter_mut().enumerate() {
+                *slot = row as u32;
+            }
+        }
+
+        reset(&mut permutation);
+        let eav = unsafe {
+            PATCH::<TRIBLE_LEN, EAVOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let aev = unsafe {
+            PATCH::<TRIBLE_LEN, AEVOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let vae = unsafe {
+            PATCH::<TRIBLE_LEN, VAEOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let eva = unsafe {
+            PATCH::<TRIBLE_LEN, EVAOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let vea = unsafe {
+            PATCH::<TRIBLE_LEN, VEAOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let ave = unsafe {
+            PATCH::<TRIBLE_LEN, AVEOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+
+        let result = Self {
+            eav,
+            eva,
+            aev,
+            ave,
+            vea,
+            vae,
+        };
+        debug_assert!(result.owner_guards_are_shared());
+        (result, permutation_bytes)
     }
 
     /// Inserts an archive-backed trible into all six covering indexes

@@ -3632,6 +3632,181 @@ where
         (root, hash)
     }
 
+    /// Builds a canonical PATCH directly from an unordered row permutation by
+    /// partitioning that one buffer in place at each trie depth.
+    ///
+    /// This all-six archive experiment deliberately fuses ordering and trie
+    /// construction: no sorted pointer array or per-row leaf descriptor is
+    /// retained. `hashes[row]` is the one transient hash computed for that
+    /// archive row and shared by every index build.
+    ///
+    /// # Safety
+    ///
+    /// - Every `rows` entry must occur exactly once and index both `keys` and
+    ///   `hashes`.
+    /// - Every key pointer must be 16-byte aligned, immutable, and kept alive
+    ///   by an archive owner already retained in `guard`.
+    /// - `keys` must contain no duplicates.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_archive_partition_for_test(
+        keys: &[[u8; KEY_LEN]],
+        hashes: &[u128],
+        rows: &mut [u32],
+        guard: &PATCHOwnerGuard,
+    ) -> Self {
+        // Branch child tables share the randomness initialized alongside the
+        // SIP key. Initialize at this boundary so a prehashed caller cannot
+        // build under the zero permutation and later observe a changed lookup.
+        init_sip_key();
+        assert_eq!(keys.len(), hashes.len());
+        assert_eq!(keys.len(), rows.len());
+        if rows.is_empty() {
+            return Self::new();
+        }
+
+        let (root, _) =
+            unsafe { Self::build_archive_partition_head_for_test(keys, hashes, rows, 0) };
+        let result = Self {
+            root: Some(root.with_start(0)),
+            owners: guard.0.clone(),
+        };
+        result.debug_check_owner_invariant();
+        result
+    }
+
+    /// In-place MSD-radix worker for
+    /// [`Self::from_archive_partition_for_test`].
+    #[cfg(test)]
+    unsafe fn build_archive_partition_head_for_test(
+        keys: &[[u8; KEY_LEN]],
+        hashes: &[u128],
+        rows: &mut [u32],
+        depth: usize,
+    ) -> (Head<KEY_LEN, O, ()>, u128) {
+        debug_assert!(!rows.is_empty());
+        if rows.len() == 1 {
+            let row = rows[0] as usize;
+            let ptr = NonNull::from(&keys[row]);
+            // SAFETY: the caller proves that every archive key stays aligned,
+            // immutable, and covered by the shared root owner guard.
+            let head = unsafe { Head::new_local_leaf(0, ptr) };
+            return (head, hashes[row]);
+        }
+        assert!(
+            depth < KEY_LEN,
+            "duplicate archive keys cannot form a finite trie",
+        );
+
+        let key_index = O::TREE_TO_KEY[depth];
+        let mut counts = [0usize; 256];
+        for &row in rows.iter() {
+            counts[keys[row as usize][key_index] as usize] += 1;
+        }
+
+        let mut first_bucket = None;
+        let mut second_bucket = None;
+        for (byte, &count) in counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            if first_bucket.is_none() {
+                first_bucket = Some(byte);
+            } else {
+                second_bucket = Some(byte);
+                break;
+            }
+        }
+
+        let first_bucket = first_bucket.expect("a non-empty partition has one bucket");
+        if second_bucket.is_none() {
+            return unsafe {
+                Self::build_archive_partition_head_for_test(keys, hashes, rows, depth + 1)
+            };
+        }
+
+        // American-flag partition: `starts` defines each final bucket range,
+        // while `next` advances the first unfilled position in that range.
+        // Every swap permanently fills one destination position, so the pass
+        // is linear and needs no second permutation buffer.
+        let mut starts = [0usize; 256];
+        let mut next = [0usize; 256];
+        let mut offset = 0;
+        for byte in 0..256 {
+            starts[byte] = offset;
+            next[byte] = offset;
+            offset += counts[byte];
+        }
+        for byte in 0..256 {
+            let end = starts[byte] + counts[byte];
+            while next[byte] < end {
+                let row = rows[next[byte]] as usize;
+                let destination = keys[row][key_index] as usize;
+                if destination == byte {
+                    next[byte] += 1;
+                } else {
+                    let destination_slot = next[destination];
+                    rows.swap(next[byte], destination_slot);
+                    next[destination] += 1;
+                }
+            }
+        }
+
+        let second_bucket = second_bucket.expect("a Branch needs two child buckets");
+        let first_range = starts[first_bucket]..starts[first_bucket] + counts[first_bucket];
+        let (first_head, first_hash) = unsafe {
+            Self::build_archive_partition_head_for_test(
+                keys,
+                hashes,
+                &mut rows[first_range],
+                depth + 1,
+            )
+        };
+        let second_range = starts[second_bucket]..starts[second_bucket] + counts[second_bucket];
+        let (second_head, second_hash) = unsafe {
+            Self::build_archive_partition_head_for_test(
+                keys,
+                hashes,
+                &mut rows[second_range],
+                depth + 1,
+            )
+        };
+
+        let body = Branch::new_with_child_hashes(
+            depth,
+            first_head.with_key(first_bucket as u8),
+            second_head.with_key(second_bucket as u8),
+            first_hash,
+            second_hash,
+        );
+        let mut root = Head::new(0, body);
+        let mut hash = first_hash ^ second_hash;
+
+        for byte in second_bucket + 1..256 {
+            if counts[byte] == 0 {
+                continue;
+            }
+            let range = starts[byte]..starts[byte] + counts[byte];
+            let (child, child_hash) = unsafe {
+                Self::build_archive_partition_head_for_test(
+                    keys,
+                    hashes,
+                    &mut rows[range],
+                    depth + 1,
+                )
+            };
+            let mut editor = BranchMut::from_head(&mut root);
+            editor.modify_child(byte as u8, |old| {
+                debug_assert!(old.is_none());
+                Some(child.with_key(byte as u8))
+            });
+            drop(editor);
+            hash ^= child_hash;
+        }
+
+        root.publish_known_hash(hash);
+        (root, hash)
+    }
+
     /// Builds the smallest valid compressed trie for two distinct entries
     /// from the same archive owner. Because the batch cardinality is already
     /// known, both roots can remain LocalLeaves under one ordinary Branch; no
