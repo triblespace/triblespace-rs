@@ -3472,6 +3472,166 @@ impl<const KEY_LEN: usize, O> PATCH<KEY_LEN, O, ()>
 where
     O: KeySchema<KEY_LEN>,
 {
+    /// Builds one PATCH index bottom-up from keys already sorted in this
+    /// schema's tree order.
+    ///
+    /// This is deliberately a test-only probe. It tests whether archive
+    /// ingestion fundamentally needs online insertion, without committing the
+    /// production API to a second construction strategy. The recursive result
+    /// carries its exact XOR fingerprint beside the transient `Head`; that
+    /// lets every Branch publish a resident receipt even though LocalLeaves do
+    /// not grow a persistent hash descriptor.
+    ///
+    /// # Safety
+    ///
+    /// - Every key pointer must be 16-byte aligned and remain valid and
+    ///   immutable for as long as `owner` is retained.
+    /// - `owner` must keep the allocation containing every key alive.
+    /// - `keys` must be strictly increasing in `O`'s tree order.
+    #[cfg(test)]
+    unsafe fn from_sorted_archive_keys_for_test(
+        keys: &[[u8; KEY_LEN]],
+        owner: &Arc<dyn ArchiveOwner>,
+    ) -> Self {
+        if keys.is_empty() {
+            return Self::new();
+        }
+
+        #[cfg(debug_assertions)]
+        for pair in keys.windows(2) {
+            let ordering = (0..KEY_LEN)
+                .map(|depth| pair[0][O::TREE_TO_KEY[depth]].cmp(&pair[1][O::TREE_TO_KEY[depth]]))
+                .find(|ordering| !ordering.is_eq())
+                .unwrap_or(std::cmp::Ordering::Equal);
+            debug_assert_eq!(
+                ordering,
+                std::cmp::Ordering::Less,
+                "bottom-up archive input must be strictly tree-ordered",
+            );
+        }
+
+        let (root, _) = unsafe { Self::build_sorted_archive_head_for_test(keys, owner, 0) };
+        let mut guard = PATCHOwnerGuard::default();
+        guard.retain_archive_owner(owner);
+        let result = Self {
+            // Recursive builders return a context-free placeholder routing
+            // byte. The root still participates as a movable Head in later
+            // unions, so install its actual depth-zero byte too.
+            root: Some(root.with_start(0)),
+            owners: guard.0,
+        };
+        result.debug_check_owner_invariant();
+        result
+    }
+
+    /// Recursive worker for [`Self::from_sorted_archive_keys_for_test`].
+    ///
+    /// The returned Head has a placeholder routing byte. Its caller installs
+    /// the byte at that caller's divergence depth. `hash` is the exact XOR of
+    /// every leaf below the Head and is never persisted beside an individual
+    /// LocalLeaf.
+    #[cfg(test)]
+    unsafe fn build_sorted_archive_head_for_test(
+        keys: &[[u8; KEY_LEN]],
+        owner: &Arc<dyn ArchiveOwner>,
+        start_depth: usize,
+    ) -> (Head<KEY_LEN, O, ()>, u128) {
+        debug_assert!(!keys.is_empty());
+        if keys.len() == 1 {
+            let ptr = NonNull::from(&keys[0]);
+            // SAFETY: forwarded from the caller of the test-only bulk builder.
+            let entry = unsafe { ArchiveEntry::new(ptr, owner) };
+            let (head, _, hash) = entry.leaf::<O>();
+            return (head, hash);
+        }
+
+        let first = &keys[0];
+        let last = &keys[keys.len() - 1];
+        let mut end_depth = start_depth;
+        while end_depth < KEY_LEN {
+            let key_index = O::TREE_TO_KEY[end_depth];
+            if first[key_index] != last[key_index] {
+                break;
+            }
+            end_depth += 1;
+        }
+        assert!(
+            end_depth < KEY_LEN,
+            "strictly ordered archive keys must eventually diverge",
+        );
+
+        let key_index = O::TREE_TO_KEY[end_depth];
+        let mut group_start = 0;
+        let first_byte = keys[0][key_index];
+        let mut first_end = 1;
+        while first_end < keys.len() && keys[first_end][key_index] == first_byte {
+            first_end += 1;
+        }
+        debug_assert!(first_end < keys.len(), "a Branch needs two child groups");
+
+        let second_byte = keys[first_end][key_index];
+        let mut second_end = first_end + 1;
+        while second_end < keys.len() && keys[second_end][key_index] == second_byte {
+            second_end += 1;
+        }
+
+        let (first_head, first_hash) = unsafe {
+            Self::build_sorted_archive_head_for_test(
+                &keys[group_start..first_end],
+                owner,
+                end_depth + 1,
+            )
+        };
+        group_start = first_end;
+        let (second_head, second_hash) = unsafe {
+            Self::build_sorted_archive_head_for_test(
+                &keys[group_start..second_end],
+                owner,
+                end_depth + 1,
+            )
+        };
+        group_start = second_end;
+
+        let body = Branch::new_with_child_hashes(
+            end_depth,
+            first_head.with_key(first_byte),
+            second_head.with_key(second_byte),
+            first_hash,
+            second_hash,
+        );
+        let mut root = Head::new(0, body);
+        let mut hash = first_hash ^ second_hash;
+
+        while group_start < keys.len() {
+            let byte = keys[group_start][key_index];
+            let mut group_end = group_start + 1;
+            while group_end < keys.len() && keys[group_end][key_index] == byte {
+                group_end += 1;
+            }
+            let (child, child_hash) = unsafe {
+                Self::build_sorted_archive_head_for_test(
+                    &keys[group_start..group_end],
+                    owner,
+                    end_depth + 1,
+                )
+            };
+            let mut editor = BranchMut::from_head(&mut root);
+            editor.modify_child(byte, |old| {
+                debug_assert!(old.is_none());
+                Some(child.with_key(byte))
+            });
+            drop(editor);
+            hash ^= child_hash;
+            group_start = group_end;
+        }
+
+        // The child editor may have dirtied this Branch when it encountered a
+        // LocalLeaf with no resident descriptor. The recursion independently
+        // proved the exact aggregate, so publish it without descending again.
+        root.publish_known_hash(hash);
+        (root, hash)
+    }
+
     /// Builds the smallest valid compressed trie for two distinct entries
     /// from the same archive owner. Because the batch cardinality is already
     /// known, both roots can remain LocalLeaves under one ordinary Branch; no
@@ -3967,6 +4127,215 @@ mod tests {
         drop(owner);
         drop(storage);
         patch
+    }
+
+    fn sorted_archive_fixture(len: usize, leading_byte: u8) -> Arc<Vec<AlignedArchiveKey<64>>> {
+        let mut rows = Vec::with_capacity(len);
+        for index in 0..len {
+            let serial = u64::try_from(index + 1)
+                .expect("bottom-up fixture cardinality must fit u64")
+                .checked_add(u64::from(leading_byte) << 56)
+                .expect("bottom-up fixture serial must not overflow")
+                .to_be_bytes();
+            let mut key = [0u8; 64];
+            key[..8].copy_from_slice(&serial);
+
+            // Keep ordering controlled solely by the leading serial while
+            // making the remaining bytes nontrivial enough to exercise hash
+            // cost on the same 64-byte keys as a SimpleArchive index.
+            let mut state = index as u64 ^ 0x9e37_79b9_7f4a_7c15;
+            for chunk in key[8..].chunks_exact_mut(8) {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut mixed = state;
+                mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                mixed ^= mixed >> 31;
+                chunk.copy_from_slice(&mixed.to_be_bytes());
+            }
+            rows.push(AlignedArchiveKey(key));
+        }
+
+        Arc::new(rows)
+    }
+
+    fn aligned_archive_keys(rows: &[AlignedArchiveKey<64>]) -> &[[u8; 64]] {
+        assert_eq!(mem::size_of::<AlignedArchiveKey<64>>(), 64);
+        assert_eq!(mem::align_of::<AlignedArchiveKey<64>>(), 16);
+        // SAFETY: the repr(C, align(16)) wrapper has the same 64-byte size as
+        // its sole field, so this preserves element boundaries and lifetime.
+        unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<[u8; 64]>(), rows.len()) }
+    }
+
+    unsafe fn online_sorted_archive_index(
+        keys: &[[u8; 64]],
+        owner: &Arc<dyn ArchiveOwner>,
+    ) -> PATCH<64> {
+        let Some(first_key) = keys.first() else {
+            return PATCH::new();
+        };
+        let first = unsafe { ArchiveEntry::new(NonNull::from(first_key), owner) };
+        let Some(second_key) = keys.get(1) else {
+            let mut patch = PATCH::new();
+            patch.insert_archive(&first);
+            return patch;
+        };
+        let second = unsafe { ArchiveEntry::new(NonNull::from(second_key), owner) };
+        let mut patch = PATCH::from_archive_pair(&first, &second);
+        for key in &keys[2..] {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(key), owner) };
+            patch.insert_archive(&entry);
+        }
+        patch
+    }
+
+    fn assert_all_branch_hashes_resident<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(
+        head: &Head<KEY_LEN, O, ()>,
+    ) {
+        if let BodyRef::Branch(branch) = head.body_ref() {
+            assert!(
+                branch.cached_hash().is_some(),
+                "bottom-up Branch must retain its exact XOR receipt",
+            );
+            for child in branch.child_table.iter().flatten() {
+                assert_all_branch_hashes_resident(child);
+            }
+        }
+    }
+
+    #[test]
+    fn bottom_up_sorted_archive_matches_online_canonical_index() {
+        for (len, leading_byte) in [
+            (1usize, 0x00),
+            (2, 0x80),
+            (3, 0x80),
+            (257, 0x80),
+            (8_192, 0x00),
+        ] {
+            let storage = sorted_archive_fixture(len, leading_byte);
+            let keys = aligned_archive_keys(&storage);
+            let owner: Arc<dyn ArchiveOwner> = storage.clone();
+            let online = unsafe { online_sorted_archive_index(keys, &owner) };
+            let bottom_up = unsafe { PATCH::<64>::from_sorted_archive_keys_for_test(keys, &owner) };
+
+            assert_eq!(bottom_up.len(), len as u64);
+            assert_eq!(
+                bottom_up.root.as_ref().expect("non-empty fixture").key(),
+                leading_byte,
+                "the top-level Head must not retain its recursive placeholder byte",
+            );
+            assert_eq!(
+                bottom_up.iter_ordered().copied().collect_vec(),
+                online.iter_ordered().copied().collect_vec(),
+            );
+            assert_eq!(bottom_up.node_stats(), online.node_stats());
+            assert_eq!(bottom_up.branch_histogram(), online.branch_histogram());
+            assert_eq!(
+                bottom_up.branch_fanout_histogram(),
+                online.branch_fanout_histogram(),
+            );
+            assert_eq!(bottom_up.root_hash(), online.root_hash());
+            #[cfg(debug_assertions)]
+            bottom_up.debug_check_deep_hash_invariant();
+            if let Some(root) = bottom_up.root.as_ref() {
+                assert_all_branch_hashes_resident(root);
+            }
+
+            if leading_byte != 0 {
+                let mut novel_key = [0u8; 64];
+                novel_key[0] = leading_byte - 1;
+                novel_key[63] = 0x5a;
+                let novel_storage = Arc::new(AlignedArchiveKey(novel_key));
+                let novel_owner: Arc<dyn ArchiveOwner> = novel_storage.clone();
+                let novel =
+                    unsafe { ArchiveEntry::new(NonNull::from(&novel_storage.0), &novel_owner) };
+                let mut online_extended = online.clone();
+                let mut bottom_up_extended = bottom_up.clone();
+                online_extended.insert_archive(&novel);
+                bottom_up_extended.insert_archive(&novel);
+                assert_eq!(
+                    bottom_up_extended.iter_ordered().copied().collect_vec(),
+                    online_extended.iter_ordered().copied().collect_vec(),
+                    "a nonzero root routing byte must survive later divergence",
+                );
+                assert_eq!(bottom_up_extended.root_hash(), online_extended.root_hash());
+            }
+
+            // Leave the PATCH owner cover as the only live archive receipt,
+            // churn the allocator, then traverse every retained pointer.
+            let survivor = bottom_up.clone();
+            drop(bottom_up);
+            drop(online);
+            drop(owner);
+            drop(storage);
+            std::hint::black_box(vec![0xa5u8; len.saturating_mul(64).min(1 << 20)]);
+            assert_eq!(survivor.iter_ordered().count(), len);
+        }
+    }
+
+    /// Construction-only timing probe for the one-index falsifier. Run with:
+    ///
+    /// `cargo test -p triblespace-core --release bottom_up_archive_builder_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual 100k/1m construction benchmark"]
+    fn bottom_up_archive_builder_timing() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn time_one(keys: &[[u8; 64]], owner: &Arc<dyn ArchiveOwner>, bottom_up: bool) -> Duration {
+            let start = Instant::now();
+            let patch = if bottom_up {
+                unsafe { PATCH::<64>::from_sorted_archive_keys_for_test(keys, owner) }
+            } else {
+                unsafe { online_sorted_archive_index(keys, owner) }
+            };
+            let elapsed = start.elapsed();
+            black_box(patch.len());
+            black_box(patch.root.as_ref().and_then(Head::known_hash));
+            drop(patch);
+            elapsed
+        }
+
+        fn median(samples: &mut [Duration]) -> Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        for (len, rounds) in [(100_000usize, 5usize), (1_000_000, 3)] {
+            let storage = sorted_archive_fixture(len, 0);
+            let keys = aligned_archive_keys(&storage);
+            let owner: Arc<dyn ArchiveOwner> = storage.clone();
+
+            let oracle = unsafe { online_sorted_archive_index(keys, &owner) };
+            let candidate = unsafe { PATCH::<64>::from_sorted_archive_keys_for_test(keys, &owner) };
+            assert_eq!(candidate.len(), oracle.len());
+            assert_eq!(candidate.root_hash(), oracle.root_hash());
+            assert_eq!(candidate.node_stats(), oracle.node_stats());
+            drop(candidate);
+            drop(oracle);
+
+            let mut online_samples = Vec::with_capacity(rounds);
+            let mut bottom_up_samples = Vec::with_capacity(rounds);
+            for round in 0..rounds {
+                if round % 2 == 0 {
+                    online_samples.push(time_one(keys, &owner, false));
+                    bottom_up_samples.push(time_one(keys, &owner, true));
+                } else {
+                    bottom_up_samples.push(time_one(keys, &owner, true));
+                    online_samples.push(time_one(keys, &owner, false));
+                }
+            }
+
+            let online = median(&mut online_samples);
+            let bottom_up = median(&mut bottom_up_samples);
+            println!(
+                "bottom_up_archive_builder len={len} online_ms={:.3} bottom_up_ms={:.3} speedup={:.3}x online_ns_per_key={:.1} bottom_up_ns_per_key={:.1}",
+                online.as_secs_f64() * 1e3,
+                bottom_up.as_secs_f64() * 1e3,
+                online.as_secs_f64() / bottom_up.as_secs_f64(),
+                online.as_secs_f64() * 1e9 / len as f64,
+                bottom_up.as_secs_f64() * 1e9 / len as f64,
+            );
+        }
     }
 
     /// Build one exact archive-backed row per selected first-byte bucket.
