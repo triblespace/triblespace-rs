@@ -4256,24 +4256,32 @@ mod tests {
             .count()
     }
 
-    /// Drive the large scatter path while keeping child resolution on this
-    /// test thread. This makes the thread-local LocalLeaf hash census exact
-    /// without changing production instrumentation or introducing a global
-    /// counter that would race unrelated tests.
+    /// Drive the large scatter path on one dedicated rayon worker. This makes
+    /// the worker-local LocalLeaf hash census exact without changing
+    /// production instrumentation or introducing a global counter that would
+    /// race unrelated tests.
     #[cfg(feature = "parallel")]
     fn union_with_exhausted_parallel_budget(
         mut left: PATCH<16>,
         mut right: PATCH<16>,
-    ) -> PATCH<16> {
-        OwnerCover::merge_into(&mut left.owners, &right.owners);
-        let this = left.root.take().expect("left root");
-        let other = right.root.take().expect("right root");
-        let ctx = parallel_union::ParUnionCtx {
-            budget: AtomicUsize::new(0),
-        };
-        left.root = Some(Head::par_union_with_ctx(this, other, 0, &ctx, None, true));
-        left.debug_check_owner_invariant();
-        left
+    ) -> (PATCH<16>, usize) {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("dedicated parallel-union test pool");
+        pool.install(move || {
+            reset_local_leaf_hash_calls();
+            OwnerCover::merge_into(&mut left.owners, &right.owners);
+            let this = left.root.take().expect("left root");
+            let other = right.root.take().expect("right root");
+            let ctx = parallel_union::ParUnionCtx {
+                budget: AtomicUsize::new(0),
+            };
+            left.root = Some(Head::par_union_with_ctx(this, other, 0, &ctx, None, true));
+            left.debug_check_owner_invariant();
+            let hash_calls = local_leaf_hash_calls();
+            (left, hash_calls)
+        })
     }
 
     fn test_archive_owner(byte: u8) -> Arc<dyn ArchiveOwner> {
@@ -4677,9 +4685,10 @@ mod tests {
         // making the thread-local census exact: one hash per duplicate and no
         // hash for the other 7,936 input rows.
         reset_local_leaf_hash_calls();
-        let serial_scatter = union_with_exhausted_parallel_budget(left.clone(), right.clone());
+        let (serial_scatter, serial_hash_calls) =
+            union_with_exhausted_parallel_budget(left.clone(), right.clone());
         assert_eq!(serial_scatter.len(), 8_064);
-        assert_eq!(local_leaf_hash_calls(), 128);
+        assert_eq!(serial_hash_calls, 128);
         let before_verify = local_leaf_hash_calls();
         let serial_oracle = heap_hash_oracle(&serial_scatter);
         assert_eq!(branch_cached_hash(&serial_scatter), serial_oracle);
@@ -4722,9 +4731,9 @@ mod tests {
         // discovered structurally, but no cache above them can consume their
         // numeric overlap. Exhaust the spawn budget for an exact TLS census.
         reset_local_leaf_hash_calls();
-        let union = union_with_exhausted_parallel_budget(left, right);
+        let (union, union_hash_calls) = union_with_exhausted_parallel_budget(left, right);
         assert_eq!(union.len(), 8_064);
-        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(union_hash_calls, 0);
         assert_eq!(branch_cached_hash(&union), 0);
         deep_hash_audit(&union);
 

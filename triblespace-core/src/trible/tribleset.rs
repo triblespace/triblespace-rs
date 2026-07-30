@@ -1143,7 +1143,9 @@ mod tests {
         assert!(coherent.coherent_resident_identity().is_some());
 
         let mut diverged = coherent;
-        let removed = *diverged.eva.iter().next().expect("non-empty fixture");
+        let removed = <EVAOrder as crate::patch::KeySchema<TRIBLE_LEN>>::tree_ordered(
+            diverged.eva.iter().next().expect("non-empty fixture"),
+        );
         diverged.eva.remove(&removed);
         let extra = [0xabu8; TRIBLE_LEN];
         diverged.eva.insert(&Entry::new(&extra));
@@ -1159,16 +1161,93 @@ mod tests {
     #[test]
     #[ignore = "large shared-meet scheduling probe"]
     fn coherent_large_union_runs_the_shared_meet_lane() {
-        let rows = many_intrinsic_rows(8, PARALLEL_UNION_THRESHOLD);
-        let (_, expected) = expected_intrinsic_entity(rows.clone());
-        let (_, mut left) = build_intrinsic_entity(rows.clone());
-        let (_, right) = build_intrinsic_entity(rows);
+        use crate::patch::{local_leaf_hash_calls, reset_local_leaf_hash_calls};
 
-        assert!(left.coherent_resident_identity().is_some());
-        assert!(right.coherent_resident_identity().is_some());
-        left.union(right);
+        let fixture = |first_variant: u8| {
+            let mut variants = Vec::with_capacity(32);
+            let mut expected = BTreeSet::new();
+            for variant in first_variant..first_variant + 32 {
+                let storage = Arc::new(
+                    (0..128u16)
+                        .map(|bucket| {
+                            let bucket = bucket as u8;
+                            let mut row = [0; TRIBLE_LEN];
+                            for (start, end, sentinel) in
+                                [(0, 15, 0xe1), (16, 31, 0xa1), (32, 63, 0x51)]
+                            {
+                                row[start] = bucket;
+                                row[start + 1] = variant;
+                                row[end] = sentinel;
+                            }
+                            expected.insert(row);
+                            AlignedArchiveTrible(row)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let owner: Arc<dyn ArchiveOwner> = storage.clone();
+                let entries: Vec<_> = storage
+                    .iter()
+                    .map(|row| {
+                        // SAFETY: `storage` is immutable and retained by the
+                        // owner guard installed by `insert_archive_batch`.
+                        unsafe { ArchiveEntry::new(NonNull::from(&row.0), &owner) }
+                    })
+                    .collect();
+                let mut set = TribleSet::new();
+                set.insert_archive_batch(&entries);
+                variants.push(set);
+            }
 
-        assert_eq!(left.len(), PARALLEL_UNION_THRESHOLD);
+            while variants.len() > 1 {
+                let mut next = Vec::with_capacity(variants.len().div_ceil(2));
+                let mut iter = variants.into_iter();
+                while let Some(mut left) = iter.next() {
+                    if let Some(right) = iter.next() {
+                        left.union(right);
+                    }
+                    next.push(left);
+                }
+                variants = next;
+            }
+            let set = variants.pop().expect("non-empty fixture");
+            assert_eq!(set.len(), PARALLEL_UNION_THRESHOLD);
+            assert!(set.coherent_resident_identity().is_some());
+            (set, expected)
+        };
+
+        let (mut left, left_expected) = fixture(0);
+        let (right, right_expected) = fixture(31);
+        let expected: BTreeSet<_> = left_expected.union(&right_expected).copied().collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("dedicated shared-meet test pool");
+
+        let (ordinary, ordinary_hash_calls) = {
+            let mut ordinary = left.clone();
+            let other = right.clone();
+            pool.install(move || {
+                reset_local_leaf_hash_calls();
+                ordinary.eav.union(other.eav);
+                ordinary.eva.union(other.eva);
+                ordinary.aev.union(other.aev);
+                ordinary.ave.union(other.ave);
+                ordinary.vea.union(other.vea);
+                ordinary.vae.union(other.vae);
+                (ordinary, local_leaf_hash_calls())
+            })
+        };
+        assert_eq!(ordinary_hash_calls, 6 * 128);
+        assert_all_indexes(&ordinary, &expected);
+
+        let shared_hash_calls = pool.install(|| {
+            reset_local_leaf_hash_calls();
+            left.union(right);
+            local_leaf_hash_calls()
+        });
+        assert_eq!(shared_hash_calls, 128);
+
+        assert_eq!(left.len(), 2 * PARALLEL_UNION_THRESHOLD - 128);
         assert_all_indexes(&left, &expected);
         assert!(left.coherent_resident_identity().is_some());
     }
