@@ -35,8 +35,13 @@
 //! current bucket, to the corresponding bucket in the upper half.
 //! Incidentally this might flip the hash function used for this entry.
 
+#[cfg(feature = "patch-probe")]
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+#[cfg(not(feature = "patch-probe"))]
 use rand::thread_rng;
+#[cfg(feature = "patch-probe")]
+use rand::SeedableRng;
 use std::fmt::Debug;
 use std::sync::Once;
 
@@ -59,6 +64,9 @@ static INIT: Once = Once::new();
 /// used by all tables.
 pub fn init() {
     INIT.call_once(|| {
+        #[cfg(feature = "patch-probe")]
+        let mut rng = StdRng::seed_from_u64(0x5041_5443_485f_4254);
+        #[cfg(not(feature = "patch-probe"))]
         let mut rng = thread_rng();
         let mut bytes: [u8; 256] = [0; 256];
 

@@ -16,6 +16,8 @@ mod branch;
 pub mod bytetable;
 mod entry;
 mod leaf;
+#[cfg(feature = "patch-probe")]
+pub(crate) mod probe;
 
 use arrayvec::ArrayVec;
 
@@ -26,8 +28,13 @@ use leaf::*;
 
 /// Re-export of all byte table utilities.
 pub use bytetable::*;
+#[cfg(feature = "patch-probe")]
+use rand::rngs::StdRng;
+#[cfg(not(feature = "patch-probe"))]
 use rand::thread_rng;
 use rand::RngCore;
+#[cfg(feature = "patch-probe")]
+use rand::SeedableRng;
 use std::cmp::Reverse;
 use std::convert::TryInto;
 use std::fmt;
@@ -368,6 +375,9 @@ pub(crate) fn init_sip_key() {
     INIT.call_once(|| {
         bytetable::init();
 
+        #[cfg(feature = "patch-probe")]
+        let mut rng = StdRng::seed_from_u64(0x5041_5443_485f_5349);
+        #[cfg(not(feature = "patch-probe"))]
         let mut rng = thread_rng();
         unsafe {
             rng.fill_bytes(&mut SIP_KEY[..]);
@@ -863,6 +873,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::LocalLeaf(bytes) => {
                 use siphasher::sip128::SipHasher24;
                 use std::ptr::addr_of;
+                #[cfg(feature = "patch-probe")]
+                probe::record_local_leaf_hash();
                 // SAFETY: SIP_KEY is initialized at startup; we only read it.
                 let key = unsafe { *addr_of!(SIP_KEY) };
                 SipHasher24::new_with_key(&key).hash(&bytes[..]).into()

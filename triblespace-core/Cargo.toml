@@ -76,6 +76,10 @@ kani = []
 # rngid()/genid()). Zero cost when disabled — the production rngid
 # path is compiled identically without this feature.
 deterministic = []
+# Internal PATCH instrumentation used by an ignored, release-only diagnostic.
+# The feature is intentionally not forwarded by the facade crate and has no
+# effect on normal builds.
+patch-probe = []
 wasm = ["dep:wasmi"]
 parallel = ["dep:rayon", "blake3/rayon"]
 
