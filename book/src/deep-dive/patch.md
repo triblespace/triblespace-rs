@@ -120,17 +120,18 @@ H(parent after) = H(parent before) xor delta
 ```
 
 Thus a resident parent can remain exact across a duplicate insertion, failed
-removal, value-only replacement, or known-key insertion/removal even when the
-changed child itself is dirty. `delta == 0` describes equal key fingerprints,
-not structural identity or value provenance; the returned child must still be
-installed. When the operation cannot supply a delta, the child editor falls
-back to already-resident old and replacement receipts. If neither source is
-available, the parent becomes dirty. Structural mutation never calls
-`child.hash()` merely to maintain a cache. Reading a resident root hash is O(1);
-reading a dirty root folds the subtree in O(n) and does not memoize through a
-shared reference.
+removal, value-only replacement, or insertion/removal whose leaf fingerprint
+is supplied or resident, even when the changed child itself is dirty.
+`delta == 0` describes equal key fingerprints, not structural identity or value
+provenance; the returned child must still be installed. When the operation
+cannot supply a delta, the child editor falls back to already-resident old and
+replacement receipts. If neither source is available, the parent becomes
+dirty. Structural mutation never calls `child.hash()` merely to maintain a
+cache. Reading a resident root hash is O(1); reading a dirty root folds the
+subtree in O(n) and does not memoize through a shared reference.
 
-Union repairs more receipts without hashing disjoint LocalLeaves. For
+Serial union and the small parallel fallback repair more receipts without
+hashing disjoint LocalLeaves. For
 
 ```
 H(S) = XOR(hash(key) for key in S),
@@ -146,6 +147,11 @@ Disjoint byte partitions contribute zero; equal singleton keys contribute one
 leaf hash; child intersections combine by XOR. When both input roots are
 resident, this is enough to make the result root resident even if newly formed
 internal branches remain dirty.
+
+The large parallel scatter path still rebuilds aggregates eagerly and may hash
+dirty children. Carrying the same overlap receipts through its disjoint Rayon
+buckets is a separate implementation step; it does not change the serial
+algebra or cache invariant above.
 
 Set operations such as `difference` use whole-subtree equality shortcuts only
 when both candidate receipts are resident. Dirty trees descend structurally
