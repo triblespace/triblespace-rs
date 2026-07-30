@@ -430,7 +430,12 @@ fn checked_union_case(
     let mut result = left.clone();
     result.union(right.clone());
     assert_fixture_rows(storage, &format!("{name} union result"), &result, &expected);
-    assert_eq!(result, oracle, "{name}: result disagrees with heap oracle");
+
+    // Ordered row comparison above is the exact correctness oracle. Avoid a
+    // setup-time PATCH equality check here: equality consumes fingerprints,
+    // and a memoizing implementation may publish knowledge into descendants
+    // shared with the reusable operand templates. Timed equality workloads
+    // must be the first fingerprint consumers in this harness.
 
     // Union consumes its operands, so the benchmark feeds it cheap clones.
     // Prove fixture validation did not mutate the reusable templates.
@@ -626,13 +631,11 @@ fn removal_cases() -> Vec<RemovalCase> {
         &resident_expected,
     );
     assert!(!resident_result.iter().any(|row| row == &key));
-    assert_eq!(resident_result, resident_oracle);
 
     let mut dirty_result = dirty.clone();
     dirty_result.remove(&key);
     assert_local_rows("dirty removal result", &dirty_result, &dirty_expected);
     assert!(!dirty_result.iter().any(|row| row == &key));
-    assert_eq!(dirty_result, dirty_oracle);
 
     vec![
         RemovalCase {
@@ -699,7 +702,10 @@ fn checked_difference_case(
     let oracle = heap_oracle(&expected);
     let result = left.difference(&right);
     assert_local_rows(&format!("{name} difference result"), &result, &expected);
-    assert_eq!(result, oracle, "{name}: result disagrees with heap oracle");
+
+    // `assert_local_rows` compares the complete ordered result exactly. Do
+    // not consume a fingerprint during fixture validation: immutable cache
+    // publication can otherwise warm structure shared with `left` or `right`.
 
     // The operation borrows both inputs. Keep this explicit because receipt
     // experiments must not win by accidentally consuming or changing them.
@@ -839,10 +845,10 @@ fn checked_tribleset_case(
         &result,
         expected,
     );
-    assert_eq!(
-        result, oracle,
-        "{name}: TribleSet {operation} disagrees with heap oracle"
-    );
+
+    // All six indexes were compared row-for-row above. A TribleSet equality
+    // check would inspect only EAV and, for memoizing probes, could publish
+    // fingerprints into descendants shared with the benchmark templates.
 
     assert_tribleset_rows(
         FixtureStorage::Local,
