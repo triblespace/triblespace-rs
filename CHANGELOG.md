@@ -431,6 +431,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Catching a panic from a value dropped by `PATCH::remove` no longer exposes
+  a partially mutated trie.** Removal now retires the detached leaf until all
+  ancestor hashes, counts, representative pointers, and unary-branch collapses
+  are committed, then runs the value destructor last.
+
 - **PATCH no longer sends arbitrary associated values across threads.** Its
   reference-counted `Head` now requires `V: Send + Sync` before implementing
   either `Send` or `Sync`, matching the fact that cloned PATCH snapshots can

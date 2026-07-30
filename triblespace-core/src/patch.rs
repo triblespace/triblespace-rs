@@ -795,26 +795,36 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // NOTE: mut_children removed — prefer matching on BodyRef returned by
     // `body_mut()` and operating directly on the `&mut Branch` reference.
 
+    /// Detach a matching leaf and return its final structural owner without
+    /// dropping it. Holding that retired Head separates logical mutation from
+    /// physical reclamation throughout the recursive repair.
+    #[must_use = "drop the retired Head only after the replacement root is committed"]
     pub(crate) fn remove_leaf(
         slot: &mut Option<Self>,
         leaf_key: &[u8; KEY_LEN],
         start_depth: usize,
-    ) {
+    ) -> Option<Self> {
         if let Some(this) = slot {
             let end_depth = std::cmp::min(this.end_depth(), KEY_LEN);
             // Check reachable equality by asking the head to test the prefix
             // up to its end_depth. Using the head/leaf primitive centralises the
             // unsafe deref into Branch::childleaf()/Leaf::has_prefix.
             if !this.has_prefix::<KEY_LEN>(start_depth, leaf_key) {
-                return;
+                return None;
             }
             if this.tag() == HeadTag::Leaf {
-                slot.take();
+                // Keep the removed leaf alive until every ancestor has
+                // repaired its aggregates and collapsed any unary branch.
+                // The caller drops this retired Head only after the new root
+                // is fully committed, so a panicking `V::drop` cannot expose
+                // a half-mutated tree through `catch_unwind`.
+                slot.take()
             } else {
+                let mut retired = None;
                 let mut ed = crate::patch::branch::BranchMut::from_head(this);
                 let key = leaf_key[end_depth];
                 ed.modify_child(key, |mut opt| {
-                    Self::remove_leaf(&mut opt, leaf_key, end_depth);
+                    retired = Self::remove_leaf(&mut opt, leaf_key, end_depth);
                     opt
                 });
 
@@ -840,7 +850,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     // final pointer is committed back into the head.
                     drop(ed);
                 }
+                retired
             }
+        } else {
+            None
         }
     }
 
@@ -2211,8 +2224,13 @@ where
     /// Removes a key from the PATCH.
     ///
     /// If the key is not present, this is a no-op.
+    /// If the removed value's destructor panics, the removal is already fully
+    /// committed when the panic is raised.
     pub fn remove(&mut self, key: &[u8; KEY_LEN]) {
-        Head::remove_leaf(&mut self.root, key, 0);
+        let retired = Head::remove_leaf(&mut self.root, key, 0);
+        // Deliberately last: all structural mutation is committed before a
+        // removed value's destructor is allowed to run.
+        drop(retired);
     }
 
     /// Returns the number of keys in the PATCH.
@@ -3065,6 +3083,16 @@ mod tests {
     use std::iter::FromIterator;
     use std::mem;
 
+    struct PanicOnDrop(bool);
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            if self.0 {
+                panic!("intentional value drop panic");
+            }
+        }
+    }
+
     #[test]
     fn head_tag() {
         let head = Head::<64, IdentitySchema, ()>::new::<Leaf<64, ()>>(0, NonNull::dangling());
@@ -3367,6 +3395,178 @@ mod tests {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {}
             BodyRef::Branch(_) => panic!("root should have collapsed to a leaf"),
         }
+    }
+
+    #[test]
+    fn remove_commits_nested_structure_before_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_SIZE: usize = 4;
+        let removed = [0, 0, 0, 0];
+        let nested_sibling = [0, 0, 0, 1];
+        let root_sibling = [1, 0, 0, 0];
+        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, PanicOnDrop>::new();
+
+        for (key, should_panic) in [
+            (removed, true),
+            (nested_sibling, false),
+            (root_sibling, false),
+        ] {
+            let entry = Entry::with_value(&key, PanicOnDrop(should_panic));
+            tree.insert(&entry);
+            drop(entry);
+        }
+        assert_eq!(tree.node_stats().0, 2, "fixture must contain two branches");
+        assert_eq!(
+            tree.root.as_ref().expect("root branch").childleaf_key(),
+            &removed,
+            "the removed leaf must back the ancestor representative pointer",
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| tree.remove(&removed)));
+        assert!(result.is_err());
+
+        assert_eq!(tree.len(), 2);
+        assert!(tree.get(&removed).is_none());
+        assert!(tree.get(&nested_sibling).is_some());
+        assert!(tree.get(&root_sibling).is_some());
+        assert_eq!(
+            tree.iter_ordered().copied().collect::<Vec<_>>(),
+            vec![nested_sibling, root_sibling],
+        );
+        let fanout = tree.branch_fanout_histogram();
+        assert_eq!(fanout[0], 0);
+        assert_eq!(fanout[1], 0);
+    }
+
+    #[test]
+    fn remove_collapses_root_before_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_SIZE: usize = 4;
+        let removed = [0; KEY_SIZE];
+        let retained = [1; KEY_SIZE];
+        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, PanicOnDrop>::new();
+        for (key, should_panic) in [(removed, true), (retained, false)] {
+            let entry = Entry::with_value(&key, PanicOnDrop(should_panic));
+            tree.insert(&entry);
+            drop(entry);
+        }
+        assert_eq!(
+            tree.root.as_ref().expect("root branch").childleaf_key(),
+            &removed,
+            "the removed leaf must back the root representative pointer",
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| tree.remove(&removed)));
+        assert!(result.is_err());
+        assert_eq!(tree.len(), 1);
+        assert!(tree.get(&removed).is_none());
+        assert!(tree.get(&retained).is_some());
+        match tree.root.as_ref().expect("retained root").body_ref() {
+            BodyRef::Leaf(_) => {}
+            BodyRef::LocalLeaf(_) | BodyRef::Branch(_) => {
+                panic!("root should have collapsed to the retained heap leaf")
+            }
+        }
+    }
+
+    #[test]
+    fn remove_clears_singleton_root_before_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_SIZE: usize = 4;
+        let removed = [0; KEY_SIZE];
+        let replacement = [1; KEY_SIZE];
+        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, PanicOnDrop>::new();
+        let entry = Entry::with_value(&removed, PanicOnDrop(true));
+        tree.insert(&entry);
+        drop(entry);
+
+        let result = catch_unwind(AssertUnwindSafe(|| tree.remove(&removed)));
+        assert!(result.is_err());
+        assert!(tree.is_empty());
+        assert_eq!(tree.root_hash(), None);
+
+        let entry = Entry::with_value(&replacement, PanicOnDrop(false));
+        tree.insert(&entry);
+        drop(entry);
+        assert!(tree.get(&replacement).is_some());
+    }
+
+    #[test]
+    fn remove_commits_cow_snapshot_before_deferred_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_SIZE: usize = 4;
+        let removed = [0; KEY_SIZE];
+        let retained = [1; KEY_SIZE];
+        let mut edited = PATCH::<KEY_SIZE, IdentitySchema, PanicOnDrop>::new();
+        for (key, should_panic) in [(removed, true), (retained, false)] {
+            let entry = Entry::with_value(&key, PanicOnDrop(should_panic));
+            edited.insert(&entry);
+            drop(entry);
+        }
+        let snapshot = edited.clone();
+
+        // Copy-on-write means removal is not yet the final release of the
+        // removed value, so this call itself cannot run its destructor.
+        edited.remove(&removed);
+        assert!(edited.get(&removed).is_none());
+        assert!(edited.get(&retained).is_some());
+        assert!(snapshot.get(&removed).is_some());
+
+        // The untouched snapshot is now the final structural owner. Its
+        // eventual panic must not disturb the already committed edited root.
+        let result = catch_unwind(AssertUnwindSafe(|| drop(snapshot)));
+        assert!(result.is_err());
+        assert_eq!(edited.len(), 1);
+        assert!(edited.get(&retained).is_some());
+    }
+
+    #[test]
+    fn remove_repairs_surviving_branch_before_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_SIZE: usize = 4;
+        let removed = [0; KEY_SIZE];
+        let first_retained = [1; KEY_SIZE];
+        let second_retained = [2; KEY_SIZE];
+        let later = [3; KEY_SIZE];
+        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, PanicOnDrop>::new();
+        for (key, should_panic) in [
+            (removed, true),
+            (first_retained, false),
+            (second_retained, false),
+        ] {
+            let entry = Entry::with_value(&key, PanicOnDrop(should_panic));
+            tree.insert(&entry);
+            drop(entry);
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| tree.remove(&removed)));
+        assert!(result.is_err());
+
+        let mut oracle = PATCH::<KEY_SIZE, IdentitySchema, PanicOnDrop>::new();
+        for key in [first_retained, second_retained] {
+            let entry = Entry::with_value(&key, PanicOnDrop(false));
+            oracle.insert(&entry);
+            drop(entry);
+        }
+        assert_eq!(tree.root_hash(), oracle.root_hash());
+        assert_eq!(
+            tree.iter_ordered().copied().collect::<Vec<_>>(),
+            vec![first_retained, second_retained],
+        );
+
+        let entry = Entry::with_value(&later, PanicOnDrop(false));
+        tree.insert(&entry);
+        drop(entry);
+        tree.remove(&first_retained);
+        assert_eq!(
+            tree.iter_ordered().copied().collect::<Vec<_>>(),
+            vec![second_retained, later],
+        );
     }
 
     #[test]
