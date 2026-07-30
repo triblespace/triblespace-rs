@@ -4328,7 +4328,7 @@ mod tests {
     }
 
     #[test]
-    fn known_zero_union_hash_and_unknown_input_stay_distinct() {
+    fn known_zero_union_hash_requires_both_input_receipts() {
         type TestHead = Head<2, IdentitySchema, ()>;
         assert_eq!(
             TestHead::known_union_hash(Some(0x55), Some(0x55), 0),
@@ -4426,12 +4426,16 @@ mod tests {
     fn parallel_union_skips_overlap_receipts_below_dirty_roots() {
         let mut left = owned_archive_dirty_parent(0, 128, 0, 32);
         let mut right = owned_archive_dirty_parent(0, 128, 31, 32);
+        assert_ne!(branch_cached_hash(&left), 0);
+        assert_ne!(branch_cached_hash(&right), 0);
         demote_root_hash(&mut left);
         demote_root_hash(&mut right);
         assert_eq!(branch_cached_hash(&left), 0);
         assert_eq!(branch_cached_hash(&right), 0);
         assert_eq!(direct_dirty_branch_children(&left), 128);
         assert_eq!(direct_dirty_branch_children(&right), 128);
+        let mut spawned_left = left.clone();
+        let spawned_right = right.clone();
 
         // The same 128 duplicate LocalLeaves as the demanded-root fixture are
         // discovered structurally, but no cache above them can consume their
@@ -4446,6 +4450,17 @@ mod tests {
         let expected = heap_hash_oracle(&union);
         assert_eq!(union.root_hash(), Some(expected));
         assert_eq!(local_leaf_hash_calls(), 8_064);
+
+        // Exercise the ordinary spawned-task path as well. Its worker-local
+        // census is intentionally not asserted; structure plus the immediate
+        // fingerprint oracle cover the demand-disabled scatter pointer path.
+        reset_local_leaf_hash_calls();
+        spawned_left.union(spawned_right);
+        assert_eq!(spawned_left.len(), 8_064);
+        assert_eq!(branch_cached_hash(&spawned_left), 0);
+        let spawned_expected = heap_hash_oracle(&spawned_left);
+        assert_eq!(spawned_left.root_hash(), Some(spawned_expected));
+        deep_hash_audit(&spawned_left);
     }
 
     #[test]
