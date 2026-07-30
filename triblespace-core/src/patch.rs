@@ -4344,14 +4344,21 @@ mod tests {
         assert_eq!(direct_dirty_branch_children(&left), 128);
         assert_eq!(direct_dirty_branch_children(&right), 128);
 
-        // Exhausting the spawn budget keeps the overlap hashes on this thread,
-        // making the thread-local census exact: one hash per duplicate and no
-        // hash for the other 7,936 input rows.
-        reset_local_leaf_hash_calls();
-        let serial_scatter =
-            union_with_exhausted_parallel_budget(left.clone(), right.clone());
+        // Exhausting the spawn budget keeps child resolution serial, while a
+        // one-worker pool keeps `rayon::scope` and this thread-local census on
+        // the same worker: one hash per duplicate and no hash for the other
+        // 7,936 input rows.
+        let serial_scatter = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-worker test pool")
+            .install(|| {
+                reset_local_leaf_hash_calls();
+                let union = union_with_exhausted_parallel_budget(left.clone(), right.clone());
+                assert_eq!(local_leaf_hash_calls(), 128);
+                union
+            });
         assert_eq!(serial_scatter.len(), 8_064);
-        assert_eq!(local_leaf_hash_calls(), 128);
         let before_verify = local_leaf_hash_calls();
         let serial_oracle = heap_hash_oracle(&serial_scatter);
         assert_eq!(branch_cached_hash(&serial_scatter), serial_oracle);
