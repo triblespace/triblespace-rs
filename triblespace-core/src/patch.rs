@@ -934,10 +934,14 @@ pub(crate) enum BodyRef<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     Branch(&'a Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>),
 }
 
-/// Mutable borrow view of a Head body.
+/// Mutation-capable borrow view of a Head body.
 /// Returned by `body_mut()` and tied to the lifetime of the `&mut Head`.
+///
+/// Branches are copy-on-write and therefore unique before this view exposes
+/// them mutably. Heap leaves, like archive-local leaves, may still be shared
+/// by another PATCH snapshot, so both leaf variants are exposed read-only.
 pub(crate) enum BodyMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
-    Leaf(&'a mut Leaf<KEY_LEN, V>),
+    Leaf(&'a Leaf<KEY_LEN, V>),
     /// `LocalLeaf` is read-only by construction (it points into immutable
     /// archive bytes), so the mutable view yields a shared reference. Structural
     /// operations may move the Head while its PATCH owner guard remains live.
@@ -952,13 +956,32 @@ pub(crate) trait Body {
 #[repr(C)]
 pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     tptr: std::ptr::NonNull<u8>,
-    key_ordering: PhantomData<O>,
-    key_segments: PhantomData<O::Segmentation>,
+    // Schemas are static type-level descriptions, not values owned by Head.
+    // Function-result phantoms preserve their type identity without claiming
+    // their drop or auto-trait semantics.
+    key_ordering: PhantomData<fn() -> O>,
+    key_segments: PhantomData<fn() -> O::Segmentation>,
     value: PhantomData<V>,
 }
 
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Send for Head<KEY_LEN, O, V> {}
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Sync for Head<KEY_LEN, O, V> {}
+// SAFETY: Heads are atomic-reference-counted owners, so moving one Head may
+// leave another Head reading the same Leaf on a different thread. `V` must
+// therefore be both movable for eventual last-owner drop and shareable for
+// concurrent `get` calls. `O` and its segmentation are used only as static
+// type-level descriptions; no value of either type is stored or dropped.
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync> Send
+    for Head<KEY_LEN, O, V>
+{
+}
+
+// SAFETY: Sync needs the same combined value bounds as Send. A shared Head can
+// be cloned on another thread; that owning clone may outlive the borrow (for
+// example in thread-local storage on a persistent worker) and eventually drop
+// `V` there.
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync> Sync
+    for Head<KEY_LEN, O, V>
+{
+}
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // Tagged pointer layout (64-bit only):
@@ -1068,7 +1091,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(crate) fn body_mut(&mut self) -> BodyMut<'_, KEY_LEN, O, V> {
         unsafe {
             match self.body() {
-                BodyPtr::Leaf(mut leaf) => BodyMut::Leaf(leaf.as_mut()),
+                BodyPtr::Leaf(leaf) => BodyMut::Leaf(leaf.as_ref()),
                 BodyPtr::LocalLeaf(ptr) => BodyMut::LocalLeaf(ptr.as_ref()),
                 BodyPtr::Branch(mut branch) => {
                     // Ensure ownership: try copy-on-write and update local pointer if needed.
@@ -2591,6 +2614,28 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
 /// compared to other adaptive trie implementations, like ARTs or Judy Arrays
 ///
 /// The PATCH allows for cheap copy-on-write operations, with `clone` being O(1).
+///
+/// PATCH snapshots share their reference-counted leaves. Consequently a PATCH
+/// is `Send + Sync` only when its associated value is also `Send + Sync`.
+/// Moving one snapshot can leave another snapshot reading the same value on
+/// the source thread, and cloning through a shared reference can make the new
+/// snapshot the eventual last owner on a different thread.
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+/// use triblespace_core::patch::{IdentitySchema, PATCH};
+///
+/// fn assert_send<T: Send>() {}
+/// assert_send::<PATCH<1, IdentitySchema, Cell<u8>>>();
+/// ```
+///
+/// ```compile_fail
+/// use std::sync::MutexGuard;
+/// use triblespace_core::patch::{IdentitySchema, PATCH};
+///
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<PATCH<1, IdentitySchema, MutexGuard<'static, ()>>>();
+/// ```
 #[derive(Debug)]
 pub struct PATCH<const KEY_LEN: usize, O = IdentitySchema, V = ()>
 where
@@ -5899,6 +5944,39 @@ mod tests {
     }
 
     #[test]
+    fn patch_with_thread_safe_values_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<PATCH<1, IdentitySchema, u64>>();
+    }
+
+    #[test]
+    fn type_only_schema_markers_do_not_control_patch_auto_traits() {
+        use std::marker::PhantomData;
+        use std::rc::Rc;
+
+        #[derive(Copy, Clone, Debug)]
+        struct TypeOnlySegmentation(PhantomData<Rc<()>>);
+
+        impl KeySegmentation<1> for TypeOnlySegmentation {
+            const SEGMENTS: [usize; 1] = [0];
+        }
+
+        #[derive(Copy, Clone, Debug)]
+        struct TypeOnlySchema(PhantomData<Rc<()>>);
+
+        impl KeySchema<1> for TypeOnlySchema {
+            type Segmentation = TypeOnlySegmentation;
+            const SEGMENT_PERM: &'static [usize] = &[0];
+            const KEY_TO_TREE: [usize; 1] = [0];
+            const TREE_TO_KEY: [usize; 1] = [0];
+        }
+
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PATCH<1, TypeOnlySchema, u64>>();
+    }
+
+    #[test]
     fn empty_tree() {
         let _tree = PATCH::<64, IdentitySchema, ()>::new();
     }
@@ -5936,6 +6014,26 @@ mod tests {
         let entry = Entry::new(&[0; KEY_SIZE]);
         tree.insert(&entry);
         let _clone = tree.clone();
+    }
+
+    #[test]
+    fn consuming_shared_leaf_does_not_mutably_alias_value() {
+        const KEY_SIZE: usize = 4;
+        let key = [1u8; KEY_SIZE];
+        let mut retained = PATCH::<KEY_SIZE, IdentitySchema, String>::new();
+        let entry = Entry::with_value(&key, String::from("still borrowed"));
+        retained.insert(&entry);
+        drop(entry);
+
+        let unordered = retained.clone();
+        let value = retained.get(&key).expect("inserted value");
+        assert_eq!(unordered.into_iter().collect::<Vec<_>>(), vec![key]);
+        assert_eq!(value, "still borrowed");
+
+        let ordered = retained.clone();
+        let value = retained.get(&key).expect("inserted value");
+        assert_eq!(ordered.into_iter_ordered().collect::<Vec<_>>(), vec![key]);
+        assert_eq!(value, "still borrowed");
     }
 
     #[test]
