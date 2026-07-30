@@ -698,6 +698,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    #[inline]
+    fn is_archive_singleton_pair(&self, other: &Self) -> bool {
+        matches!(
+            (self.tag(), other.tag()),
+            (HeadTag::LocalLeaf, HeadTag::Leaf | HeadTag::LocalLeaf)
+                | (HeadTag::Leaf, HeadTag::LocalLeaf)
+        )
+    }
+
     pub(crate) fn count_segment(&self, at_depth: usize) -> u64 {
         match self.body_ref() {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
@@ -1042,6 +1051,29 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
     pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
+        // An archive-backed singleton has no cached fingerprint. Decide its
+        // exact identity first; a distinct union then hashes each child once
+        // and carries those hashes into the new Branch.
+        if this.is_archive_singleton_pair(&other) {
+            if let Some((depth, this_byte_key, other_byte_key)) =
+                this.first_divergence(&other, at_depth)
+            {
+                let this_hash = this.hash();
+                let other_hash = other.hash();
+                let old_key = this.key();
+                let new_body = Branch::new_with_owner_and_child_hashes(
+                    depth,
+                    this.with_key(this_byte_key),
+                    other.with_key(other_byte_key),
+                    None,
+                    this_hash,
+                    other_hash,
+                );
+                return Head::new(old_key, new_body);
+            }
+            return this;
+        }
+
         if this.hash() == other.hash() {
             return this;
         }
@@ -1154,6 +1186,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
+        // Singleton pairs have no fan-out work for Rayon.
+        if this.is_archive_singleton_pair(&other) {
+            return Self::union(this, other, at_depth);
+        }
+
         if this.hash() == other.hash() {
             return this;
         }
@@ -1332,6 +1369,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
+        if self.is_archive_singleton_pair(other) {
+            return self.intersect(other, at_depth);
+        }
         if self.hash() == other.hash() {
             return Some(self.clone());
         }
@@ -1451,6 +1491,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
+        if self.is_archive_singleton_pair(other) {
+            return self.difference(other, at_depth);
+        }
         if self.hash() == other.hash() {
             return None;
         }
@@ -1820,6 +1863,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // call the owned helper `union` directly.
 
     pub(crate) fn intersect(&self, other: &Self, at_depth: usize) -> Option<Self> {
+        if self.is_archive_singleton_pair(other) {
+            return if self.first_divergence(other, at_depth).is_none() {
+                Some(self.clone())
+            } else {
+                None
+            };
+        }
+
         if self.hash() == other.hash() {
             return Some(self.clone());
         }
@@ -1905,6 +1956,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// This is the set of elements that are in self but not in other.
     /// If the difference is empty, None is returned.
     pub(crate) fn difference(&self, other: &Self, at_depth: usize) -> Option<Self> {
+        if self.is_archive_singleton_pair(other) {
+            return if self.first_divergence(other, at_depth).is_none() {
+                None
+            } else {
+                Some(self.clone())
+            };
+        }
+
         if self.hash() == other.hash() {
             return None;
         }
@@ -3446,6 +3505,99 @@ mod tests {
     }
 
     #[test]
+    fn archive_singleton_pairs_follow_exact_key_identity() {
+        const KEY_SIZE: usize = 64;
+        #[repr(C, align(16))]
+        struct AlignedKey([u8; KEY_SIZE]);
+
+        let key_a = [0x44; KEY_SIZE];
+        let mut key_b = key_a;
+        key_b[KEY_SIZE - 1] = 0x55;
+        let storage = std::sync::Arc::new([AlignedKey(key_a), AlignedKey(key_b)]);
+        let _owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+
+        let local_a = unsafe { Head::new_local_leaf(0, NonNull::from(&storage[0].0)) };
+        let local_b = unsafe { Head::new_local_leaf(0, NonNull::from(&storage[1].0)) };
+        let heap_a_entry = Entry::new(&key_a);
+        let heap_b_entry = Entry::new(&key_b);
+        let heap_a = heap_a_entry.leaf::<IdentitySchema>();
+        let heap_b = heap_b_entry.leaf::<IdentitySchema>();
+
+        fn assert_pair(
+            left: &Head<64, IdentitySchema, ()>,
+            right: &Head<64, IdentitySchema, ()>,
+            equal: bool,
+        ) {
+            let union = Head::union(left.clone(), right.clone(), 0);
+            assert_eq!(union.count(), if equal { 1 } else { 2 });
+            assert_eq!(
+                left.intersect(right, 0).as_ref().map(Head::count),
+                equal.then_some(1)
+            );
+            assert_eq!(
+                left.difference(right, 0).as_ref().map(Head::count),
+                (!equal).then_some(1)
+            );
+        }
+
+        assert_pair(&local_a, &local_a, true);
+        assert_pair(&local_a, &local_b, false);
+        assert_pair(&heap_a, &local_a, true);
+        assert_pair(&local_a, &heap_a, true);
+        assert_pair(&heap_a, &local_b, false);
+        assert_pair(&local_a, &heap_b, false);
+        assert_pair(&heap_a, &heap_a, true);
+        assert_pair(&heap_a, &heap_b, false);
+    }
+
+    #[test]
+    fn archive_set_ops_retain_shared_backing() {
+        const KEY_SIZE: usize = 16;
+        #[repr(C, align(16))]
+        struct AlignedKey([u8; KEY_SIZE]);
+
+        let key_a = [0x10; KEY_SIZE];
+        let key_b = [0x20; KEY_SIZE];
+        let key_c = [0x30; KEY_SIZE];
+        let (left, right) = {
+            let storage = std::sync::Arc::new([
+                AlignedKey(key_a),
+                AlignedKey(key_b),
+                AlignedKey(key_c),
+            ]);
+            let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+            let mut left = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+            let mut right = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+            for index in [0, 1] {
+                let entry = unsafe { ArchiveEntry::new(NonNull::from(&storage[index].0), &owner) };
+                left.insert_archive(&entry);
+            }
+            for index in [1, 2] {
+                let entry = unsafe { ArchiveEntry::new(NonNull::from(&storage[index].0), &owner) };
+                right.insert_archive(&entry);
+            }
+            assert!(left.node_stats().3 > 0);
+            assert!(right.node_stats().3 > 0);
+            (left, right)
+        };
+
+        let mut union = left.clone();
+        union.union(right.clone());
+        assert_eq!(union.len(), 3);
+        assert!(union.get(&key_a).is_some());
+        assert!(union.get(&key_b).is_some());
+        assert!(union.get(&key_c).is_some());
+
+        let intersection = left.intersect(&right);
+        assert_eq!(intersection.len(), 1);
+        assert!(intersection.get(&key_b).is_some());
+
+        let difference = left.difference(&right);
+        assert_eq!(difference.len(), 1);
+        assert!(difference.get(&key_a).is_some());
+    }
+
+    #[test]
     fn tree_replace_existing() {
         const KEY_SIZE: usize = 64;
         let key = [1u8; KEY_SIZE];
@@ -3872,6 +4024,31 @@ mod tests {
         // left only has d
         assert_eq!(res.len(), 1);
         assert!(res.get(&d).is_some());
+    }
+
+    #[test]
+    fn difference_equal_singleton_from_one_child_branch_is_canonical_empty() {
+        const KEY_SIZE: usize = 16;
+        let removed_key = [0x10; KEY_SIZE];
+        let survivor_key = [0x20; KEY_SIZE];
+
+        let mut pair = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        pair.insert(&Entry::with_value(&removed_key, 1));
+        pair.insert(&Entry::with_value(&survivor_key, 2));
+
+        let mut removed = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        removed.insert(&Entry::with_value(&removed_key, 1));
+        let one_child_branch = pair.difference(&removed);
+        assert_eq!(one_child_branch.len(), 1);
+        assert!(matches!(
+            one_child_branch.root.as_ref().map(Head::body_ref),
+            Some(BodyRef::Branch(_))
+        ));
+
+        let mut survivor = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        survivor.insert(&Entry::with_value(&survivor_key, 2));
+        assert_eq!(one_child_branch, survivor);
+        assert!(one_child_branch.difference(&survivor).root.is_none());
     }
 
     #[test]

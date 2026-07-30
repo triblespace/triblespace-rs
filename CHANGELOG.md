@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PATCH set operations decide archive-backed leaf pairs by exact keys before
+  fingerprints.** `union`, `intersect`, and `difference` compare keys directly
+  whenever either singleton is a `LocalLeaf`; heap/heap pairs retain their
+  cached-fingerprint fast path. Distinct union carries each child's one
+  required hash into the new Branch, while equal intersection and difference
+  need no hash at all.
 - **Parallel SimpleArchive decoding builds each worker chunk bottom-up.** For
   aligned archives at or above the existing 4,096-row parallel threshold, each
   worker validates every canonical row, computes its construction hash once,
