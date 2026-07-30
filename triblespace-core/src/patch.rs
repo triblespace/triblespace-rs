@@ -1649,9 +1649,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     {
         match self.equality_mode(other) {
             EqualityMode::ExactKey => {
-                return self
-                    .exact_keys_equal(other, at_depth)
-                    .then(|| self.clone());
+                return self.exact_keys_equal(other, at_depth).then(|| self.clone());
             }
             EqualityMode::FingerprintImpossible => {}
             EqualityMode::Fingerprint if self.hash() == other.hash() => {
@@ -2151,9 +2149,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(crate) fn intersect(&self, other: &Self, at_depth: usize) -> Option<Self> {
         match self.equality_mode(other) {
             EqualityMode::ExactKey => {
-                return self
-                    .exact_keys_equal(other, at_depth)
-                    .then(|| self.clone());
+                return self.exact_keys_equal(other, at_depth).then(|| self.clone());
             }
             EqualityMode::FingerprintImpossible => {}
             EqualityMode::Fingerprint if self.hash() == other.hash() => {
