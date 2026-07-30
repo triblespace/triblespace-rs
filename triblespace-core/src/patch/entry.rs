@@ -105,23 +105,12 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     ///   the low 4 bits). Any `[u8; 64]` at an offset that's a
     ///   multiple of 16 from a 16-byte aligned base satisfies this.
     pub unsafe fn new(ptr: NonNull<[u8; KEY_LEN]>, owner: &'a Arc<dyn ArchiveOwner>) -> Self {
-        // The cached hash must use the same process-local key as PATCH Leaves
-        // even when callers construct ArchiveEntries before their first
-        // PATCH. A completed Once makes subsequent calls a single fast check.
-        crate::patch::init_sip_key();
         debug_assert_eq!(
             ptr.as_ptr() as usize & 0x0f,
             0,
             "ArchiveEntry pointer must be 16-byte aligned"
         );
-        let hash = unsafe {
-            use siphasher::sip128::SipHasher24;
-            use std::ptr::addr_of;
-            let key = *addr_of!(crate::patch::SIP_KEY);
-            SipHasher24::new_with_key(&key)
-                .hash(&ptr.as_ref()[..])
-                .into()
-        };
+        let hash = unsafe { hash_key(&ptr.as_ref()[..]) };
         Self { ptr, owner, hash }
     }
 

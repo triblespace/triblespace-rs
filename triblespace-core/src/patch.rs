@@ -597,6 +597,22 @@ pub(crate) fn init_sip_key() {
     });
 }
 
+/// Hash one PATCH key with the process-local set-fingerprint key.
+///
+/// Keeping this at the set boundary prevents heap leaves, archive entries,
+/// demand hashing, and deletion proofs from growing subtly different copies
+/// of the same unsafe key access.
+#[inline]
+pub(crate) fn hash_key(bytes: &[u8]) -> u128 {
+    init_sip_key();
+    use siphasher::sip128::SipHasher24;
+    use std::ptr::addr_of;
+    // SAFETY: `init_sip_key` completed the `Once`; the key is immutable after
+    // that publication and every later access is read-only.
+    let key = unsafe { *addr_of!(SIP_KEY) };
+    SipHasher24::new_with_key(&key).hash(bytes).into()
+}
+
 /// Builds a per-byte segment map from the segment lengths.
 ///
 /// The returned table maps each key byte to its segment index.
@@ -1123,11 +1139,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::LocalLeaf(bytes) => {
                 #[cfg(test)]
                 LOCAL_LEAF_HASH_CALLS.set(LOCAL_LEAF_HASH_CALLS.get() + 1);
-                use siphasher::sip128::SipHasher24;
-                use std::ptr::addr_of;
-                // SAFETY: SIP_KEY is initialized at startup; we only read it.
-                let key = unsafe { *addr_of!(SIP_KEY) };
-                SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
+                hash_key(&bytes[..])
             }
             BodyRef::Branch(branch) => {
                 if let Some(hash) = branch.cached_hash() {
@@ -1153,19 +1165,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(super) fn debug_semantic_hash(&self) -> u128 {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => {
-                use siphasher::sip128::SipHasher24;
-                use std::ptr::addr_of;
-                let key = unsafe { *addr_of!(SIP_KEY) };
-                let semantic: u128 = SipHasher24::new_with_key(&key).hash(&leaf.key[..]).into();
+                let semantic = hash_key(&leaf.key[..]);
                 debug_assert_eq!(leaf.hash, semantic, "heap Leaf hash mismatch");
                 semantic
             }
-            BodyRef::LocalLeaf(bytes) => {
-                use siphasher::sip128::SipHasher24;
-                use std::ptr::addr_of;
-                let key = unsafe { *addr_of!(SIP_KEY) };
-                SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
-            }
+            BodyRef::LocalLeaf(bytes) => hash_key(&bytes[..]),
             BodyRef::Branch(branch) => {
                 let semantic = branch
                     .child_table
@@ -2721,6 +2725,35 @@ where
         }
     }
 
+    /// Apply the symmetric one-key deletion law. A failed removal donates the
+    /// old root unchanged; a successful removal XORs the removed key out of a
+    /// resident old fingerprint. The key itself is hashed only in that latter
+    /// case and only when there is an old fingerprint worth maintaining.
+    #[inline]
+    fn publish_remove_one_delta(
+        &self,
+        old_count: u64,
+        old_hash: Option<u128>,
+        removed_key: &[u8; KEY_LEN],
+    ) {
+        let delta = old_count.checked_sub(self.len());
+        debug_assert!(
+            matches!(delta, Some(0 | 1)),
+            "one-key removal must change cardinality by zero or one",
+        );
+        let Some(root) = &self.root else {
+            return;
+        };
+        let derived = match delta {
+            Some(0) => old_hash,
+            Some(1) => old_hash.map(|hash| hash ^ hash_key(removed_key)),
+            _ => None,
+        };
+        if let Some(hash) = derived {
+            root.publish_known_hash(hash);
+        }
+    }
+
     /// Publish an operand hash when inclusion plus equal cardinality proves
     /// that operand and result are the same finite key set. Every candidate
     /// supplied by the caller must already be known to contain the result or
@@ -2758,6 +2791,27 @@ where
             .and_then(|_| left.1.zip(right.1))
             .map(|(left, right)| left ^ right);
         if let Some(hash) = inclusion_hash.or(disjoint_hash) {
+            root.publish_known_hash(hash);
+        }
+    }
+
+    /// Derive the exact difference cases visible from cardinality. An
+    /// unchanged result donates the left operand. When
+    /// `|A ∖ B| + |B| = |A|`, finite-set arithmetic proves `B ⊆ A`, so
+    /// the result fingerprint is `hash(A) XOR hash(B)`.
+    #[inline]
+    fn publish_difference_hash(&self, left: (u64, Option<u128>), right: (u64, Option<u128>)) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        let result_count = root.count();
+        let unchanged_hash = (result_count == left.0).then_some(left.1).flatten();
+        let contained_hash = result_count
+            .checked_add(right.0)
+            .filter(|&sum| sum == left.0)
+            .and_then(|_| left.1.zip(right.1))
+            .map(|(left, right)| left ^ right);
+        if let Some(hash) = unchanged_hash.or(contained_hash) {
             root.publish_known_hash(hash);
         }
     }
@@ -2809,10 +2863,13 @@ where
     ///
     /// If the key is not present, this is a no-op.
     pub fn remove(&mut self, key: &[u8; KEY_LEN]) {
+        let old_count = self.len();
+        let old_hash = self.root.as_ref().and_then(Head::known_hash);
         Head::remove_leaf(&mut self.root, key, 0);
         if self.root.is_none() {
             self.owners = None;
         }
+        self.publish_remove_one_delta(old_count, old_hash, key);
         self.debug_check_owner_invariant();
     }
 
@@ -3342,7 +3399,8 @@ where
         }
         if let Some(root) = &self.root {
             if let Some(other_root) = &other.root {
-                let candidate = [(root.count(), root.known_hash())];
+                let left = (root.count(), root.known_hash());
+                let right = (other_root.count(), other_root.known_hash());
                 #[cfg(feature = "parallel")]
                 let result = root.par_difference(other_root, 0);
                 #[cfg(not(feature = "parallel"))]
@@ -3352,8 +3410,7 @@ where
                     root: result,
                     owners,
                 };
-                // Difference is a subset of its left operand.
-                result.publish_inclusion_equal_hash(candidate);
+                result.publish_difference_hash(left, right);
                 result.debug_check_owner_invariant();
                 result
             } else {
@@ -4496,6 +4553,46 @@ mod tests {
         deep_hash_audit(&patch);
     }
 
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn remove_boundary_updates_a_resident_ancestor_over_dirty_children() {
+        let mut patch = owned_archive_dirty_parent(0, 2, 0, 2);
+        let snapshot = patch.clone();
+        let old_hash = branch_cached_hash(&patch);
+        assert_ne!(old_hash, 0);
+        assert!(direct_dirty_branch_children(&patch) > 0);
+
+        let mut removed = [0u8; 16];
+        removed[0] = 0;
+        removed[1] = 0;
+        let expected = old_hash ^ hash_key(&removed);
+
+        reset_local_leaf_hash_calls();
+        patch.remove(&removed);
+        assert_eq!(patch.len(), 3);
+        assert_eq!(branch_cached_hash(&patch), expected);
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert!(direct_dirty_branch_children(&patch) > 0);
+
+        // A miss may still traverse and COW a dirty child. Cardinality proves
+        // that the public operation left the key set unchanged and restores
+        // the old exact root without consulting that child.
+        let mut missing = removed;
+        missing[1] = 99;
+        patch.remove(&missing);
+        assert_eq!(patch.len(), 3);
+        assert_eq!(branch_cached_hash(&patch), expected);
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        assert_eq!(snapshot.len(), 4);
+        assert_eq!(snapshot.root_hash(), Some(old_hash));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&snapshot);
+        deep_hash_audit(&patch);
+    }
+
     #[test]
     fn promoted_dirty_results_remain_correct_through_later_unions() {
         const KEY_LEN: usize = 8;
@@ -4663,6 +4760,18 @@ mod tests {
         assert_eq!(difference.len(), left.len());
         assert_eq!(branch_cached_hash(&difference), expected);
         assert_eq!(difference.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // A proper contained subtraction is the other exact cardinality case:
+        // `|A ∖ B| + |B| = |A|` proves B is wholly inside A.
+        let containing = owned_archive_dirty_parent(0, 2, 0, 4);
+        let contained = owned_archive_dirty_parent(0, 2, 2, 2);
+        let contained_expected = branch_cached_hash(&containing) ^ branch_cached_hash(&contained);
+        reset_local_leaf_hash_calls();
+        let remainder = containing.difference(&contained);
+        assert_eq!(remainder.len(), 4);
+        assert_eq!(branch_cached_hash(&remainder), contained_expected);
+        assert_eq!(remainder.root_hash(), Some(contained_expected));
         assert_eq!(local_leaf_hash_calls(), 0);
 
         // Borrowed operands retain their own exact roots and dirty children.

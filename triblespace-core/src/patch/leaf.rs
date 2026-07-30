@@ -2,12 +2,10 @@ use core::sync::atomic;
 use core::sync::atomic::Ordering::Acquire;
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
-use siphasher::sip128::SipHasher24;
 use std::alloc::alloc;
 use std::alloc::dealloc;
 use std::alloc::handle_alloc_error;
 use std::alloc::Layout;
-use std::ptr::addr_of;
 
 use super::*;
 
@@ -28,18 +26,12 @@ impl<const KEY_LEN: usize, V> Body for Leaf<KEY_LEN, V> {
 
 impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
     pub(super) unsafe fn new(key: &[u8; KEY_LEN], value: V) -> NonNull<Self> {
-        // Entry values may be constructed before the first PATCH. Initialize
-        // the shared process-local key at the hash-construction boundary so a
-        // later PATCH never observes a stale zero-key leaf hash.
-        init_sip_key();
         unsafe {
             let layout = Layout::new::<Self>();
             let Some(ptr) = NonNull::new(alloc(layout) as *mut Self) else {
                 handle_alloc_error(layout);
             };
-            let hash = SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
-                .hash(&key[..])
-                .into();
+            let hash = hash_key(&key[..]);
 
             ptr.write(Self {
                 key: *key,
