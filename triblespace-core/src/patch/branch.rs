@@ -215,6 +215,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // this triggers siphash24; the
         // [`new_with_rchild_hash`] variant skips it when
         // the caller has the hash already.
+        #[cfg(feature = "patch-probe")]
+        if rchild.tag() == HeadTag::LocalLeaf {
+            probe::record_branch_new_local_hash();
+        }
         let rchild_hash = rchild.hash();
         Self::new_with_rchild_hash(end_depth, lchild, rchild, rchild_hash)
     }
@@ -235,6 +239,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         rchild: Head<KEY_LEN, O, V>,
         rchild_hash: u128,
     ) -> NonNull<Self> {
+        #[cfg(feature = "patch-probe")]
+        if lchild.tag() == HeadTag::LocalLeaf {
+            probe::record_branch_new_local_hash();
+        }
         let lchild_hash = lchild.hash();
         Self::new_with_child_hashes(end_depth, lchild, rchild, lchild_hash, rchild_hash)
     }
@@ -428,6 +436,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             // If a slot exists, operate on the existing child in-place.
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
+                #[cfg(feature = "patch-probe")]
+                if child.tag() == HeadTag::LocalLeaf {
+                    probe::record_modify_old_local_hash();
+                }
                 let old_child_hash = child.hash();
                 let old_child_segment_count = child.count_segment(end_depth);
                 let old_child_leaf_count = child.count();
@@ -436,6 +448,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
                 if let Some(new_child) = f(Some(child)) {
                     // Replace existing child
+                    #[cfg(feature = "patch-probe")]
+                    if new_child.tag() == HeadTag::LocalLeaf {
+                        probe::record_modify_new_local_hash();
+                    }
                     (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
@@ -469,6 +485,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
+                    #[cfg(feature = "patch-probe")]
+                    if inserted.tag() == HeadTag::LocalLeaf {
+                        probe::record_modify_new_local_hash();
+                    }
                     (*branch).hash ^= inserted.hash();
 
                     // Cuckoo insert loop, growing the table when necessary.
@@ -508,6 +528,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
+                #[cfg(feature = "patch-probe")]
+                if child.tag() == HeadTag::LocalLeaf {
+                    probe::record_modify_old_local_hash();
+                }
                 let old_child_hash = child.hash();
                 let old_child_segment_count = child.count_segment(end_depth);
                 let old_child_leaf_count = child.count();
@@ -518,6 +542,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Recursion result — its hash is cached on the
                     // returned Head (Branch.hash field), so calling
                     // .hash() is cheap.
+                    #[cfg(feature = "patch-probe")]
+                    if new_child.tag() == HeadTag::LocalLeaf {
+                        probe::record_modify_new_local_hash();
+                    }
                     (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
@@ -605,6 +633,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         for child in (*branch).child_table.iter().flatten() {
             agg_leaf_count += child.count();
             agg_segment_count += child.count_segment(end_depth);
+            #[cfg(feature = "patch-probe")]
+            if child.tag() == HeadTag::LocalLeaf {
+                probe::record_recompute_local_hash();
+            }
             agg_hash ^= child.hash();
             if first_childleaf.is_null() {
                 first_childleaf = child.childleaf_ptr();

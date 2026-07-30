@@ -11,6 +11,11 @@ static LOCAL_LEAF_HASHES: AtomicU64 = AtomicU64::new(0);
 static LEAF_NEW_HASHES: AtomicU64 = AtomicU64::new(0);
 static LOCAL_LEAF_REIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static LEAF_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static UNION_PRECHECK_LOCAL_HASHES: AtomicU64 = AtomicU64::new(0);
+static BRANCH_NEW_LOCAL_HASHES: AtomicU64 = AtomicU64::new(0);
+static MODIFY_OLD_LOCAL_HASHES: AtomicU64 = AtomicU64::new(0);
+static MODIFY_NEW_LOCAL_HASHES: AtomicU64 = AtomicU64::new(0);
+static RECOMPUTE_LOCAL_HASHES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg(test)]
@@ -20,6 +25,11 @@ pub(crate) struct Snapshot {
     pub(crate) leaf_new_hashes: u64,
     pub(crate) local_leaf_reifications: u64,
     pub(crate) leaf_allocations: u64,
+    pub(crate) union_precheck_local_hashes: u64,
+    pub(crate) branch_new_local_hashes: u64,
+    pub(crate) modify_old_local_hashes: u64,
+    pub(crate) modify_new_local_hashes: u64,
+    pub(crate) recompute_local_hashes: u64,
 }
 
 macro_rules! recorder {
@@ -43,6 +53,11 @@ pub(crate) fn record_local_leaf_reification() {
     LOCAL_LEAF_REIFICATIONS.fetch_add(1, Ordering::Relaxed);
 }
 recorder!(record_leaf_allocation, LEAF_ALLOCATIONS);
+recorder!(record_union_precheck_local_hash, UNION_PRECHECK_LOCAL_HASHES);
+recorder!(record_branch_new_local_hash, BRANCH_NEW_LOCAL_HASHES);
+recorder!(record_modify_old_local_hash, MODIFY_OLD_LOCAL_HASHES);
+recorder!(record_modify_new_local_hash, MODIFY_NEW_LOCAL_HASHES);
+recorder!(record_recompute_local_hash, RECOMPUTE_LOCAL_HASHES);
 
 #[cfg(test)]
 pub(crate) fn reset() {
@@ -51,6 +66,11 @@ pub(crate) fn reset() {
     LEAF_NEW_HASHES.store(0, Ordering::Relaxed);
     LOCAL_LEAF_REIFICATIONS.store(0, Ordering::Relaxed);
     LEAF_ALLOCATIONS.store(0, Ordering::Relaxed);
+    UNION_PRECHECK_LOCAL_HASHES.store(0, Ordering::Relaxed);
+    BRANCH_NEW_LOCAL_HASHES.store(0, Ordering::Relaxed);
+    MODIFY_OLD_LOCAL_HASHES.store(0, Ordering::Relaxed);
+    MODIFY_NEW_LOCAL_HASHES.store(0, Ordering::Relaxed);
+    RECOMPUTE_LOCAL_HASHES.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -61,5 +81,10 @@ pub(crate) fn snapshot() -> Snapshot {
         leaf_new_hashes: LEAF_NEW_HASHES.load(Ordering::Relaxed),
         local_leaf_reifications: LOCAL_LEAF_REIFICATIONS.load(Ordering::Relaxed),
         leaf_allocations: LEAF_ALLOCATIONS.load(Ordering::Relaxed),
+        union_precheck_local_hashes: UNION_PRECHECK_LOCAL_HASHES.load(Ordering::Relaxed),
+        branch_new_local_hashes: BRANCH_NEW_LOCAL_HASHES.load(Ordering::Relaxed),
+        modify_old_local_hashes: MODIFY_OLD_LOCAL_HASHES.load(Ordering::Relaxed),
+        modify_new_local_hashes: MODIFY_NEW_LOCAL_HASHES.load(Ordering::Relaxed),
+        recompute_local_hashes: RECOMPUTE_LOCAL_HASHES.load(Ordering::Relaxed),
     }
 }

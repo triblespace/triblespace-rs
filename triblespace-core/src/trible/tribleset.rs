@@ -783,12 +783,17 @@ mod tests {
     #[cfg(feature = "patch-probe")]
     fn format_probe_snapshot(snapshot: crate::patch::probe::Snapshot) -> String {
         format!(
-            "archive_entry_hashes={} local_leaf_hashes={} leaf_new_hashes={} local_leaf_reifications={} leaf_allocations={}",
+            "archive_entry_hashes={} local_leaf_hashes={} leaf_new_hashes={} local_leaf_reifications={} leaf_allocations={} union_precheck_local_hashes={} branch_new_local_hashes={} modify_old_local_hashes={} modify_new_local_hashes={} recompute_local_hashes={}",
             snapshot.archive_entry_hashes,
             snapshot.local_leaf_hashes,
             snapshot.leaf_new_hashes,
             snapshot.local_leaf_reifications,
             snapshot.leaf_allocations,
+            snapshot.union_precheck_local_hashes,
+            snapshot.branch_new_local_hashes,
+            snapshot.modify_old_local_hashes,
+            snapshot.modify_new_local_hashes,
+            snapshot.recompute_local_hashes,
         )
     }
 
