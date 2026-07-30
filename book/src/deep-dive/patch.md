@@ -124,7 +124,7 @@ Union repairs more receipts without hashing disjoint LocalLeaves. For
 H(S) = XOR(hash(key) for key in S),
 ```
 
-the recursive union also returns the intersection receipt and applies
+the recursive union can materialize the intersection receipt and applies
 
 ```
 H(A union B) = H(A) xor H(B) xor H(A intersection B).
@@ -133,7 +133,11 @@ H(A union B) = H(A) xor H(B) xor H(A intersection B).
 Disjoint byte partitions contribute zero; equal singleton keys contribute one
 leaf hash; child intersections combine by XOR. When both input roots are
 resident, this is enough to make the result root resident even if newly formed
-internal branches remain dirty.
+internal branches remain dirty. Receipt demand follows information already in
+use: an ancestor demand crosses dirty descendants, while a structural frame
+with two resident input roots creates a local demand to repair itself. Equal
+dirty LocalLeaves are not hashed when no resident cache will consume their
+overlap.
 
 Set operations such as `difference` use whole-subtree equality shortcuts only
 when both candidate receipts are resident. Dirty trees descend structurally
