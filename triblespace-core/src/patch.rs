@@ -2046,6 +2046,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             unreachable!();
         };
 
+        // Equal-depth branch prefixes can overlap while their byte partitions
+        // are disjoint (for example, two end_depth=0 roots covering opposite
+        // first-byte ranges). Prove that relation before allocating/scattering:
+        // A minus B is exactly A, so preserve the original structure and any
+        // resident aggregate rather than rebuilding an equivalent dirty root.
+        if !self_branch.child_table.iter().flatten().any(|self_child| {
+            other_branch
+                .child_table
+                .table_get(self_child.key())
+                .is_some()
+        }) {
+            return Some(self.clone());
+        }
+
         // Difference work is bounded by `self` (every key in self is
         // either kept or filtered against other).
         if (self_branch.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD {
