@@ -2456,7 +2456,13 @@ where
     /// debug assertion catches accidental attempts to shrink a live PATCH's
     /// owner cover. An empty PATCH may retain a receipt: the cover is
     /// intentionally conservative so sibling indexes can share one Arc.
-    pub(crate) fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
+    ///
+    /// # Safety
+    ///
+    /// `guard` must retain every archive allocation retained by the current
+    /// owner guard. The exact subset check is intentionally debug-only;
+    /// violating this requirement in release can leave a LocalLeaf dangling.
+    pub(crate) unsafe fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
         #[cfg(debug_assertions)]
         debug_assert!(
             guard.covers(&self.owners),

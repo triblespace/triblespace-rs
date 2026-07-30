@@ -203,12 +203,17 @@ impl TribleSet {
 
     /// Publish one receipt Arc to every index before any trie operation.
     fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
-        self.eav.set_owner_guard(guard);
-        self.eva.set_owner_guard(guard);
-        self.aev.set_owner_guard(guard);
-        self.ave.set_owner_guard(guard);
-        self.vea.set_owner_guard(guard);
-        self.vae.set_owner_guard(guard);
+        // SAFETY: every caller constructs `guard` by joining all six current
+        // receipts before optionally retaining another owner. It is therefore
+        // an exact superset of every receipt replaced below.
+        unsafe {
+            self.eav.set_owner_guard(guard);
+            self.eva.set_owner_guard(guard);
+            self.aev.set_owner_guard(guard);
+            self.ave.set_owner_guard(guard);
+            self.vea.set_owner_guard(guard);
+            self.vae.set_owner_guard(guard);
+        }
     }
 
     /// Union of two [`TribleSet`]s.
