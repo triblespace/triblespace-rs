@@ -268,9 +268,8 @@ pub(crate) fn try_from_blob_bottom_up_for_test(
         return Err(UnarchiveError::BadArchive);
     };
     let slice: &[[u8; 64]] = &packed_tribles;
-    assert_eq!(
-        slice.as_ptr() as usize & 0x0f,
-        0,
+    assert!(
+        slice.is_empty() || slice.as_ptr() as usize & 0x0f == 0,
         "the archive-backed bottom-up probe requires aligned bytes",
     );
     let owner: Arc<dyn ArchiveOwner> = Arc::new(blob.bytes.clone());
@@ -475,6 +474,47 @@ mod tests {
             assert_eq!(survivor.ave.iter_ordered().count(), len);
             assert_eq!(survivor.vea.iter_ordered().count(), len);
             assert_eq!(survivor.vae.iter_ordered().count(), len);
+        }
+    }
+
+    #[cfg(feature = "proptest")]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn arbitrary_canonical_rows_match_serial_in_all_six_orders(
+                raw_rows in prop::collection::vec(
+                    prop::collection::vec(any::<u8>(), 64),
+                    0..128,
+                ),
+                shared_prefix_len in 0usize..64,
+            ) {
+                let mut rows = raw_rows
+                    .into_iter()
+                    .map(|bytes| {
+                        let mut row: [u8; 64] = bytes.try_into().expect("fixed row width");
+                        row[..shared_prefix_len].fill(0x5a);
+                        if row[..16].iter().all(|byte| *byte == 0) {
+                            row[15] = 1;
+                        }
+                        if row[16..32].iter().all(|byte| *byte == 0) {
+                            row[31] = 1;
+                        }
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort_unstable();
+                rows.dedup();
+
+                let len = rows.len();
+                let blob = blob_from_rows(rows);
+                let serial = try_from_blob_serial_for_test(blob.clone()).unwrap();
+                let bottom_up = try_from_blob_bottom_up_for_test(blob).unwrap();
+
+                assert_all_six_parity(&bottom_up.set, &serial, len);
+            }
         }
     }
 
