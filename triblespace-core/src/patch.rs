@@ -198,6 +198,105 @@ impl OwnerCover {
         Self::merge_into(&mut result, right);
         result
     }
+
+    /// Whether `self` structurally retains every complete tree in `covered`.
+    ///
+    /// Owner-cover extension clones each old root either into the new root
+    /// vector or into a newly allocated pair spine. Pointer identity therefore
+    /// supplies a collision-free proof that every allocation retained by the
+    /// old cover is still retained by the replacement. This deliberately does
+    /// not enumerate or compare owner addresses.
+    #[cfg(debug_assertions)]
+    fn structurally_covers(&self, covered: &Self) -> bool {
+        covered.roots.iter().enumerate().all(|(covered_rank, tree)| {
+            let Some(tree) = tree else {
+                return true;
+            };
+            self.roots
+                .iter()
+                .enumerate()
+                .skip(covered_rank)
+                .any(|(candidate_rank, candidate)| {
+                    candidate.as_ref().is_some_and(|candidate| {
+                        candidate.structurally_contains(candidate_rank, tree, covered_rank)
+                    })
+                })
+        })
+    }
+}
+
+#[cfg(debug_assertions)]
+impl OwnerTree {
+    /// Prove that `covered` is one of this complete tree's shared subtrees.
+    /// Ranks are supplied by the forest slots, avoiding any traversal of the
+    /// owners below an already shared pair.
+    fn structurally_contains(
+        &self,
+        rank: usize,
+        covered: &Self,
+        covered_rank: usize,
+    ) -> bool {
+        if rank < covered_rank {
+            return false;
+        }
+        if rank == covered_rank {
+            return match (self, covered) {
+                (Self::Owner(left), Self::Owner(right)) => Arc::ptr_eq(left, right),
+                (Self::Pair(left), Self::Pair(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            };
+        }
+
+        let Self::Pair(pair) = self else {
+            debug_assert!(false, "a positive-rank owner tree must be a pair");
+            return false;
+        };
+        pair.left
+            .structurally_contains(rank - 1, covered, covered_rank)
+            || pair
+                .right
+                .structurally_contains(rank - 1, covered, covered_rank)
+    }
+}
+
+/// Opaque lifetime receipt for archive-backed PATCH leaves.
+///
+/// Aggregate structures can conservatively join receipts, add one archive
+/// owner, and install a proved superset. Trie heads and concrete owner-cover
+/// nodes remain private to PATCH.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PATCHOwnerGuard(Option<Arc<OwnerCover>>);
+
+impl PATCHOwnerGuard {
+    /// Conservatively retain every owner covered by either receipt.
+    pub(crate) fn join(self, other: Self) -> Self {
+        Self(OwnerCover::union(self.0, &other.0))
+    }
+
+    /// Add one archive allocation before any LocalLeaf into it is installed.
+    pub(crate) fn retain_archive_owner(&mut self, owner: &Arc<dyn ArchiveOwner>) {
+        OwnerCover::retain(&mut self.0, owner);
+    }
+
+    #[cfg(debug_assertions)]
+    fn structurally_covers(&self, current: &Option<Arc<OwnerCover>>) -> bool {
+        let Some(current) = current else {
+            return true;
+        };
+        let Some(replacement) = self.0.as_ref() else {
+            return false;
+        };
+        Arc::ptr_eq(current, replacement) || replacement.structurally_covers(current)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2354,10 +2453,6 @@ where
     #[cfg(debug_assertions)]
     fn debug_check_owner_invariant(&self) {
         debug_assert!(
-            self.root.is_some() || self.owners.is_none(),
-            "an empty PATCH must not retain archive owners",
-        );
-        debug_assert!(
             self.root.as_ref().map(|root| root.tag()) != Some(HeadTag::LocalLeaf)
                 || self.owners.is_some(),
             "a root LocalLeaf must retain its archive owner",
@@ -2409,6 +2504,63 @@ where
 
     pub(crate) fn root_hash(&self) -> Option<u128> {
         self.root.as_ref().map(|root| root.hash())
+    }
+
+    /// Clone the opaque archive-owner receipt without exposing the root Head.
+    pub(crate) fn owner_guard(&self) -> PATCHOwnerGuard {
+        PATCHOwnerGuard(self.owners.clone())
+    }
+
+    /// Whether this PATCH and another PATCH share the same owner-cover Arc.
+    pub(crate) fn shares_owner_guard<OO, VV>(&self, other: &PATCH<KEY_LEN, OO, VV>) -> bool
+    where
+        OO: KeySchema<KEY_LEN>,
+    {
+        match (&self.owners, &other.owners) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    /// Whether `owner` is the most recently appended owner in this cover.
+    ///
+    /// The forest is intentionally not an exact owner index. An older owner
+    /// may already occur below a root, but checking that would make archive
+    /// adoption depend on cover size. Conservatively appending it again keeps
+    /// the operation constant time and the lifetime law monotone.
+    pub(crate) fn owner_guard_latest_is(&self, owner: &Arc<dyn ArchiveOwner>) -> bool {
+        self.owners
+            .as_ref()
+            .is_some_and(|cover| cover.latest_address == OwnerCover::address(owner))
+    }
+
+    /// Install an opaque owner cover that is known to be a conservative
+    /// superset of this PATCH's current cover.
+    ///
+    /// Empty PATCHes may retain a receipt so all indexes of an aggregate can
+    /// share one cover Arc. The structural debug assertion proves the supplied
+    /// forest contains every complete subtree of the cover being replaced.
+    ///
+    /// # Safety
+    ///
+    /// `guard` must retain every archive allocation retained by the current
+    /// owner guard. Violating this requirement can leave a LocalLeaf dangling.
+    pub(crate) unsafe fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            guard.structurally_covers(&self.owners),
+            "a PATCH owner guard may only be replaced by a conservative structural superset",
+        );
+        let already_installed = match (&self.owners, &guard.0) {
+            (None, None) => true,
+            (Some(current), Some(replacement)) => Arc::ptr_eq(current, replacement),
+            _ => false,
+        };
+        if !already_installed {
+            self.owners = guard.0.clone();
+        }
+        self.debug_check_owner_invariant();
     }
 
     /// Returns the value associated with `key` if present.
@@ -2831,9 +2983,21 @@ where
     /// from the same archive owner. Because the batch cardinality is already
     /// known, both roots can remain LocalLeaves under one ordinary Branch; no
     /// heap seed or unary Branch is required.
+    #[cfg(test)]
     pub(crate) fn from_archive_pair(
         first: &ArchiveEntry<'_, KEY_LEN>,
         second: &ArchiveEntry<'_, KEY_LEN>,
+    ) -> Self {
+        let guard = PATCHOwnerGuard::default();
+        Self::from_archive_pair_with_guard(first, second, &guard)
+    }
+
+    /// Build an archive pair under a receipt already shared by an aggregate.
+    /// This avoids constructing one equivalent singleton cover per index.
+    pub(crate) fn from_archive_pair_with_guard(
+        first: &ArchiveEntry<'_, KEY_LEN>,
+        second: &ArchiveEntry<'_, KEY_LEN>,
+        guard: &PATCHOwnerGuard,
     ) -> Self {
         let (first_head, first_owner, first_hash) = first.leaf::<O>();
         let (second_head, second_owner, second_hash) = second.leaf::<O>();
@@ -2841,6 +3005,12 @@ where
             std::sync::Arc::ptr_eq(first_owner, second_owner),
             "an archive bootstrap pair must share one owner",
         );
+        // Retain here so this safe constructor remains sound even if a future
+        // crate-internal caller supplies an unrelated receipt. In the
+        // aggregate fast path the owner is already latest, preserving the
+        // shared Arc without another cover node.
+        let mut guard = guard.clone();
+        guard.retain_archive_owner(first_owner);
         let (depth, first_key, second_key) = first_head
             .first_divergence(&second_head, 0)
             .expect("an archive bootstrap pair must contain distinct keys");
@@ -2854,7 +3024,7 @@ where
         );
         let result = Self {
             root: Some(Head::new(root_key, branch)),
-            owners: Some(OwnerCover::singleton(first_owner)),
+            owners: guard.0,
         };
         result.debug_check_owner_invariant();
         result
@@ -3382,6 +3552,31 @@ mod tests {
         )
         .unwrap();
         assert!(Arc::ptr_eq(&identical_union, &singleton_union));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn owner_cover_join_structurally_proves_both_inputs() {
+        let left_owners: Vec<_> = (0..13).map(test_archive_owner).collect();
+        let right_owners: Vec<_> = (64..73).map(test_archive_owner).collect();
+        let mut left = None;
+        let mut right = None;
+        for owner in &left_owners {
+            OwnerCover::retain(&mut left, owner);
+        }
+        for owner in &right_owners {
+            OwnerCover::retain(&mut right, owner);
+        }
+        let left_snapshot = left.clone().unwrap();
+        let right_snapshot = right.clone().unwrap();
+
+        let joined = OwnerCover::union(left, &right).unwrap();
+
+        assert!(joined.structurally_covers(&left_snapshot));
+        assert!(joined.structurally_covers(&right_snapshot));
+
+        let unrelated = OwnerCover::singleton(&test_archive_owner(255));
+        assert!(!joined.structurally_covers(&unrelated));
     }
 
     #[test]
