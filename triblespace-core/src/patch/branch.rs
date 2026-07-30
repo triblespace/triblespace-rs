@@ -363,8 +363,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
             let hash = hash.unwrap_or(0);
-            addr_of_mut!((*ptr.as_ptr()).hash_lo)
-                .write(atomic::AtomicU64::new(hash as u64));
+            addr_of_mut!((*ptr.as_ptr()).hash_lo).write(atomic::AtomicU64::new(hash as u64));
             addr_of_mut!((*ptr.as_ptr()).hash_hi)
                 .write(atomic::AtomicU64::new((hash >> 64) as u64));
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
@@ -439,8 +438,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
                 {
                     let state = 1 | cached_hash.is_some().then_some(HASH_KNOWN).unwrap_or(0);
-                    addr_of_mut!((*ptr.as_ptr()).rc)
-                        .write(atomic::AtomicU32::new(state));
+                    addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(state));
                     addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
                     addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
                     addr_of_mut!((*ptr.as_ptr()).leaf_count).write((*branch).leaf_count);
@@ -495,8 +493,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
                 addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
                 let hash = cached_hash.unwrap_or(0);
-                addr_of_mut!((*ptr.as_ptr()).hash_lo)
-                    .write(atomic::AtomicU64::new(hash as u64));
+                addr_of_mut!((*ptr.as_ptr()).hash_lo).write(atomic::AtomicU64::new(hash as u64));
                 addr_of_mut!((*ptr.as_ptr()).hash_hi)
                     .write(atomic::AtomicU64::new((hash >> 64) as u64));
                 // Note that the child_table is already zeroed by the allocator and therefore None initialized.
@@ -608,8 +605,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    let inserted_hash =
-                        empty_slot_hash_hint.or_else(|| inserted.known_hash());
+                    let inserted_hash = empty_slot_hash_hint.or_else(|| inserted.known_hash());
                     let hash = match (cached_parent_hash, inserted_hash) {
                         (Some(parent), Some(inserted)) => Some(parent ^ inserted),
                         _ => None,
