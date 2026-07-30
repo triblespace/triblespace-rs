@@ -867,6 +867,66 @@ mod tests {
         );
     }
 
+    /// Operationally separates decode from its first fingerprint consumer.
+    /// The benchmark example measures wall time; this release-only probe
+    /// supplies the deterministic LocalLeaf hash-call witness behind it.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    #[ignore = "release-only SimpleArchive fingerprint accounting probe"]
+    fn simplearchive_first_fingerprint_hash_probe() {
+        use crate::blob::encodings::simplearchive::SimpleArchive;
+        use crate::inline::Encodes;
+        use crate::patch::{local_leaf_hash_calls, reset_local_leaf_hash_calls};
+
+        fn fixture_trible(i: u64) -> Trible {
+            let mut data = [0u8; TRIBLE_LEN];
+            data[..8].copy_from_slice(&i.to_be_bytes());
+            data[8] = 1;
+            data[16..24].copy_from_slice(&(i ^ 0xdead_beef_dead_beef).to_be_bytes());
+            data[24] = 2;
+            data[32..40].copy_from_slice(&i.to_be_bytes());
+            data[40..48].copy_from_slice(&i.wrapping_mul(31).to_be_bytes());
+            Trible::force_raw(data).expect("fixture entity and attribute are non-nil")
+        }
+
+        for workers in [1usize, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("rayon pool");
+            for n in [1_024usize, 10_000, 100_000] {
+                let mut source = TribleSet::new();
+                for i in 0..n as u64 {
+                    source.insert(&fixture_trible(i));
+                }
+                let archive = SimpleArchive::encode(&source);
+                drop(source);
+
+                let (decode_hashes, first_fingerprint_hashes, repeat_hashes) = pool.install(|| {
+                    reset_local_leaf_hash_calls();
+                    let decoded: TribleSet = archive.try_from_blob().expect("valid fixture");
+                    let decode_hashes = local_leaf_hash_calls();
+                    assert_eq!(decoded.len(), n);
+
+                    let before = local_leaf_hash_calls();
+                    std::hint::black_box(decoded.fingerprint());
+                    let first_fingerprint_hashes = local_leaf_hash_calls() - before;
+
+                    let before = local_leaf_hash_calls();
+                    std::hint::black_box(decoded.fingerprint());
+                    let repeat_hashes = local_leaf_hash_calls() - before;
+                    (decode_hashes, first_fingerprint_hashes, repeat_hashes)
+                });
+                assert_eq!(decode_hashes, 0, "decode must remain hash-lazy");
+                assert_eq!(repeat_hashes, 0, "the first consumer must memoize");
+                assert!(first_fingerprint_hashes <= n);
+                println!(
+                    "hash_probe,workers={workers},n={n},decode={decode_hashes},first_fingerprint={first_fingerprint_hashes},repeat={repeat_hashes}",
+                );
+            }
+        }
+    }
+
     #[test]
     fn intrinsic_entity_rows_are_canonical_hashed_and_indexed() {
         assert_eq!(std::mem::size_of::<IntrinsicEntityRow>(), TRIBLE_LEN);
