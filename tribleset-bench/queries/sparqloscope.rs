@@ -86,9 +86,12 @@
 //!   out of the registry and listed in [`SKIPPED_PATHS`] so the runner
 //!   can record SKIP rows. The `rpq` feature is a placeholder: it only
 //!   compiles once the engine regains a regular-path constraint.
-//! - The registry emits a single [`TribleSet`] monomorphization
-//!   ([`TRANSLATED`]); the archive/union/GPU tables of the original are
-//!   not vendored.
+//! - The registry emits three of upstream's four monomorphizations —
+//!   [`TRANSLATED`] (PATCH), [`TRANSLATED_ARCHIVE`] (succinct archive)
+//!   and, under the `gpu` capability, `TRANSLATED_WGPU` (device-wrapped
+//!   archive). Upstream's `TRANSLATED_UNION` is not vendored: nothing
+//!   here constructs a `Dataset<UnionFacts>` (see
+//!   [`wd_load`](crate::wd_load)).
 //! - Engine-semantics note: `find!` heads now have relational SET
 //!   semantics (hidden variables no longer multiply rows), so the
 //!   "hidden variables multiply rows" caveat above is historical; the
@@ -114,7 +117,7 @@ use subject::core::prelude::*;
 
 #[cfg(feature = "rpq")]
 use crate::wd_schema::entity_id;
-use crate::wd_schema::{attr, voc, Dataset};
+use crate::wd_schema::{attr, voc, ArchivedFacts, Dataset};
 
 use subject::core::inline::encodings::hash::Handle;
 use subject::core::query::{Binding, Constraint, Query};
@@ -325,11 +328,31 @@ fn phase_row() {
 /// Only one arm survives the lean-core cut (see [`Engine`]'s doc
 /// comment); the `match` stays so a future second engine slots back in
 /// at this one seam instead of at every call site.
+///
+/// The seam is also where the frontier census taps the engine's own
+/// counters: `Query::stats` hands out an `Arc` shared with every rayon
+/// clone, so stashing it here — before the iterator is consumed —
+/// makes `FrontierStats::widest` readable afterwards for every query
+/// in this module, with no per-call-site instrumentation.
 pub fn run<'a, C, P, R>(q: Query<C, P, R>) -> Rows<C, P, R>
 where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
+    // The W=1 control: the SAME engine, restricted to expanding one
+    // binding at a time. It is the only way to ask what the batch width
+    // bought without changing the code under it — but read the answer
+    // carefully. Index-order probing has nothing to sort when the batch
+    // holds one row and no duplicate keys to collapse, and a
+    // device-resolved parent band is resolving a single band. At W=1
+    // those two are not switched off; there is simply nothing for them
+    // to do. So `integrated - w1` is the gap between a batched engine
+    // and a single-binding one — three changes that only make sense
+    // together — and NOT a measurement of width as a tunable.
+    #[cfg(feature = "frontier-w1")]
+    let q = q.with_frontier_width(1);
+    #[cfg(feature = "frontier")]
+    crate::archq::note_frontier_stats(q.stats());
     match current_engine() {
         Engine::Residual => Rows(q),
     }
@@ -393,13 +416,12 @@ pub enum Kind {
 }
 
 /// A translated query, ready for the harness, monomorphized against
-/// one pattern backend `B` (here: [`TribleSet`] only).
+/// one pattern backend `B` ([`TribleSet`], [`ArchivedFacts`], or the
+/// device-wrapped archive under the `gpu` capability).
 pub struct Translated<B = TribleSet> {
     /// Query id — matches the `queries/<name>.sparql` file name.
     pub name: &'static str,
     pub kind: Kind,
-    // Called by the real runner; the stub only reads `name`/`kind`.
-    #[allow(dead_code)]
     pub run: fn(&Dataset<B>) -> Answer,
 }
 
@@ -3143,113 +3165,142 @@ pub fn number_of_literals<B: TriblePattern>(ds: &Dataset<B>) -> Answer {
 // Registry
 // ────────────────────────────────────────────────────────────────────
 
-/// All translated queries against the PATCH backend ([`TribleSet`]),
-/// in `query-set.tsv` order. The four `transitive-path-*` RPQ
-/// translations are `#[cfg(feature = "rpq")]`-gated out (the engine
-/// currently has no regular-path constraint) and are listed in
-/// [`SKIPPED_PATHS`] at their original registry positions so the
-/// runner can record SKIP rows.
-pub static TRANSLATED: &[Translated<TribleSet>] = &[
-    Translated { name: "join-2-small-large", kind: Kind::Engine, run: join_2_small_large::<TribleSet> },
-    Translated { name: "join-2-large-small", kind: Kind::Engine, run: join_2_large_small::<TribleSet> },
-    Translated { name: "join-2-large-large", kind: Kind::Engine, run: join_2_large_large::<TribleSet> },
-    Translated { name: "join-2-largest-result", kind: Kind::Engine, run: join_2_largest_result::<TribleSet> },
-    Translated { name: "join-2-large-large-with-large-result", kind: Kind::Engine, run: join_2_large_large_with_large_result::<TribleSet> },
-    Translated { name: "join-2-large-large-with-small-result", kind: Kind::Engine, run: join_2_large_large_with_small_result::<TribleSet> },
-    Translated { name: "join-3-star-largest-sum-of-join-sizes", kind: Kind::Engine, run: join_3_star_largest_sum_of_join_sizes::<TribleSet> },
-    Translated { name: "join-3-chain-largest-sum-of-join-sizes", kind: Kind::Engine, run: join_3_chain_largest_sum_of_join_sizes::<TribleSet> },
-    Translated { name: "join-xlarge-star-on-small-predicates", kind: Kind::Engine, run: join_xlarge_star_on_small_predicates::<TribleSet> },
-    Translated { name: "join-xlarge-chain-on-small-predicates", kind: Kind::Engine, run: join_xlarge_chain_on_small_predicates::<TribleSet> },
-    Translated { name: "optional-join-small-large", kind: Kind::Periphery, run: optional_join_small_large::<TribleSet> },
-    Translated { name: "optional-join-large-small", kind: Kind::Periphery, run: optional_join_large_small::<TribleSet> },
-    Translated { name: "optional-join-large-large", kind: Kind::Periphery, run: optional_join_large_large::<TribleSet> },
-    Translated { name: "optional-join-2-large-large-with-large-result", kind: Kind::Periphery, run: optional_join_2_large_large_with_large_result::<TribleSet> },
-    Translated { name: "optional-join-2-large-large-with-small-join-result-1", kind: Kind::Periphery, run: optional_join_2_large_large_with_small_join_result_1::<TribleSet> },
-    Translated { name: "optional-join-2-large-large-with-small-join-result-2", kind: Kind::Periphery, run: optional_join_2_large_large_with_small_join_result_2::<TribleSet> },
-    Translated { name: "optional-join-3-star-1", kind: Kind::Periphery, run: optional_join_3_star_1::<TribleSet> },
-    Translated { name: "optional-join-3-star-2", kind: Kind::Periphery, run: optional_join_3_star_2::<TribleSet> },
-    Translated { name: "optional-join-3-chain-1", kind: Kind::Periphery, run: optional_join_3_chain_1::<TribleSet> },
-    Translated { name: "optional-join-3-chain-2", kind: Kind::Periphery, run: optional_join_3_chain_2::<TribleSet> },
-    Translated { name: "minus-join-small-large", kind: Kind::Periphery, run: minus_join_small_large::<TribleSet> },
-    Translated { name: "minus-join-large-small", kind: Kind::Periphery, run: minus_join_large_small::<TribleSet> },
-    Translated { name: "minus-join-large-large", kind: Kind::Periphery, run: minus_join_large_large::<TribleSet> },
-    Translated { name: "minus-join-2-large-large-with-large-result", kind: Kind::Periphery, run: minus_join_2_large_large_with_large_result::<TribleSet> },
-    Translated { name: "minus-join-2-large-large-with-small-join-result-1", kind: Kind::Periphery, run: minus_join_2_large_large_with_small_join_result_1::<TribleSet> },
-    Translated { name: "minus-join-2-large-large-with-small-join-result-2", kind: Kind::Periphery, run: minus_join_2_large_large_with_small_join_result_2::<TribleSet> },
-    Translated { name: "minus-join-3-star-1", kind: Kind::Periphery, run: minus_join_3_star_1::<TribleSet> },
-    Translated { name: "minus-join-3-star-2", kind: Kind::Periphery, run: minus_join_3_star_2::<TribleSet> },
-    Translated { name: "minus-join-3-chain-1", kind: Kind::Periphery, run: minus_join_3_chain_1::<TribleSet> },
-    Translated { name: "minus-join-3-chain-2", kind: Kind::Periphery, run: minus_join_3_chain_2::<TribleSet> },
-    Translated { name: "exists-join-small-large", kind: Kind::Fold, run: exists_join_small_large::<TribleSet> },
-    Translated { name: "exists-join-large-small", kind: Kind::Fold, run: exists_join_large_small::<TribleSet> },
-    Translated { name: "exists-join-large-large", kind: Kind::Fold, run: exists_join_large_large::<TribleSet> },
-    Translated { name: "exists-join-2-large-large-with-large-result", kind: Kind::Fold, run: exists_join_2_large_large_with_large_result::<TribleSet> },
-    Translated { name: "exists-join-2-large-large-with-small-join-result-1", kind: Kind::Fold, run: exists_join_2_large_large_with_small_join_result_1::<TribleSet> },
-    Translated { name: "exists-join-2-large-large-with-small-join-result-2", kind: Kind::Fold, run: exists_join_2_large_large_with_small_join_result_2::<TribleSet> },
-    Translated { name: "exists-join-3-star-1", kind: Kind::Fold, run: exists_join_3_star_1::<TribleSet> },
-    Translated { name: "exists-join-3-star-2", kind: Kind::Fold, run: exists_join_3_star_2::<TribleSet> },
-    Translated { name: "exists-join-3-chain-1", kind: Kind::Fold, run: exists_join_3_chain_1::<TribleSet> },
-    Translated { name: "exists-join-3-chain-2", kind: Kind::Fold, run: exists_join_3_chain_2::<TribleSet> },
-    Translated { name: "union-no-constraint", kind: Kind::Engine, run: union_no_constraint::<TribleSet> },
-    Translated { name: "union-constraint-from-star", kind: Kind::Engine, run: union_constraint_from_star::<TribleSet> },
-    Translated { name: "union-constraint-small-join", kind: Kind::Engine, run: union_constraint_small_join::<TribleSet> },
-    Translated { name: "union-constraint-large-join", kind: Kind::Engine, run: union_constraint_large_join::<TribleSet> },
-    Translated { name: "union-constraint-filter-restrictive", kind: Kind::Engine, run: union_constraint_filter_restrictive::<TribleSet> },
-    Translated { name: "multicolumn-join-small", kind: Kind::Engine, run: multicolumn_join_small::<TribleSet> },
-    Translated { name: "multicolumn-join-large", kind: Kind::Engine, run: multicolumn_join_large::<TribleSet> },
-    Translated { name: "group-by-count-object-high-multiplicity", kind: Kind::Fold, run: group_by_count_object_high_multiplicity::<TribleSet> },
-    Translated { name: "group-by-count-object-low-multiplicity", kind: Kind::Fold, run: group_by_count_object_low_multiplicity::<TribleSet> },
-    Translated { name: "group-by-count-object-wrong-sort-order", kind: Kind::Fold, run: group_by_count_object_wrong_sort_order::<TribleSet> },
-    Translated { name: "group-by-complex-aggregate", kind: Kind::Fold, run: group_by_complex_aggregate::<TribleSet> },
-    Translated { name: "group-by-implicit-numeric-baseline", kind: Kind::Engine, run: group_by_implicit_numeric_baseline::<TribleSet> },
-    Translated { name: "group-by-implicit-numeric-sum", kind: Kind::Fold, run: group_by_implicit_numeric_sum::<TribleSet> },
-    Translated { name: "group-by-implicit-numeric-min", kind: Kind::Fold, run: group_by_implicit_numeric_min::<TribleSet> },
-    Translated { name: "group-by-implicit-numeric-max", kind: Kind::Fold, run: group_by_implicit_numeric_max::<TribleSet> },
-    Translated { name: "group-by-implicit-numeric-avg", kind: Kind::Fold, run: group_by_implicit_numeric_avg::<TribleSet> },
-    Translated { name: "group-by-implicit-string-baseline", kind: Kind::Engine, run: group_by_implicit_string_baseline::<TribleSet> },
-    Translated { name: "group-by-implicit-string-min", kind: Kind::Fold, run: group_by_implicit_string_min::<TribleSet> },
-    Translated { name: "group-by-implicit-string-max", kind: Kind::Fold, run: group_by_implicit_string_max::<TribleSet> },
-    Translated { name: "group-by-string-groupconcat", kind: Kind::Fold, run: group_by_string_groupconcat::<TribleSet> },
-    Translated { name: "distinct-count-object-high-multiplicity", kind: Kind::Fold, run: distinct_count_object_high_multiplicity::<TribleSet> },
-    Translated { name: "distinct-count-object-low-multiplicity", kind: Kind::Fold, run: distinct_count_object_low_multiplicity::<TribleSet> },
-    Translated { name: "distinct-count-object-wrong-sort-order", kind: Kind::Fold, run: distinct_count_object_wrong_sort_order::<TribleSet> },
-    Translated { name: "regex-3-contains", kind: Kind::Fold, run: regex_3_contains::<TribleSet> },
-    Translated { name: "regex-3-fixed", kind: Kind::Fold, run: regex_3_fixed::<TribleSet> },
-    Translated { name: "regex-3", kind: Kind::Fold, run: regex_3::<TribleSet> },
-    Translated { name: "regex-prefix-1", kind: Kind::Fold, run: regex_prefix_1::<TribleSet> },
-    Translated { name: "regex-prefix-2", kind: Kind::Fold, run: regex_prefix_2::<TribleSet> },
-    Translated { name: "regex-prefix-3", kind: Kind::Fold, run: regex_prefix_3::<TribleSet> },
-    Translated { name: "strlen", kind: Kind::Fold, run: strlen::<TribleSet> },
-    Translated { name: "strbefore", kind: Kind::Fold, run: strbefore::<TribleSet> },
-    Translated { name: "strafter", kind: Kind::Fold, run: strafter::<TribleSet> },
-    Translated { name: "strstarts", kind: Kind::Fold, run: strstarts::<TribleSet> },
-    Translated { name: "strends", kind: Kind::Fold, run: strends::<TribleSet> },
-    Translated { name: "result-size-tiny", kind: Kind::Engine, run: result_size_tiny::<TribleSet> },
-    Translated { name: "result-size-small", kind: Kind::Engine, run: result_size_small::<TribleSet> },
-    Translated { name: "result-size-medium", kind: Kind::Engine, run: result_size_medium::<TribleSet> },
-    Translated { name: "result-size-large", kind: Kind::Engine, run: result_size_large::<TribleSet> },
-    Translated { name: "result-size-xlarge", kind: Kind::Engine, run: result_size_xlarge::<TribleSet> },
-    Translated { name: "numeric-baseline", kind: Kind::Fold, run: numeric_baseline::<TribleSet> },
-    Translated { name: "numeric-abs", kind: Kind::Fold, run: numeric_abs::<TribleSet> },
-    Translated { name: "numeric-ceil", kind: Kind::Fold, run: numeric_ceil::<TribleSet> },
-    Translated { name: "numeric-floor", kind: Kind::Fold, run: numeric_floor::<TribleSet> },
-    Translated { name: "numeric-round", kind: Kind::Fold, run: numeric_round::<TribleSet> },
-    Translated { name: "numeric-add", kind: Kind::Fold, run: numeric_add::<TribleSet> },
-    Translated { name: "numeric-greater", kind: Kind::Engine, run: numeric_greater::<TribleSet> },
-    Translated { name: "numeric-filter-bin-search-fifty-fifty", kind: Kind::Engine, run: numeric_filter_bin_search_fifty_fifty::<TribleSet> },
-    Translated { name: "numeric-filter-bin-search-seventy-thirty", kind: Kind::Engine, run: numeric_filter_bin_search_seventy_thirty::<TribleSet> },
-    Translated { name: "numeric-filter-bin-search-ninetyfive-five", kind: Kind::Engine, run: numeric_filter_bin_search_ninetyfive_five::<TribleSet> },
-    Translated { name: "filter-few-results", kind: Kind::Engine, run: filter_few_results::<TribleSet> },
-    Translated { name: "filter-many-results", kind: Kind::Engine, run: filter_many_results::<TribleSet> },
-    Translated { name: "filter-language-en", kind: Kind::Engine, run: filter_language_en::<TribleSet> },
-    Translated { name: "date-year", kind: Kind::Fold, run: date_year::<TribleSet> },
-    Translated { name: "date-month", kind: Kind::Fold, run: date_month::<TribleSet> },
-    Translated { name: "date-day", kind: Kind::Fold, run: date_day::<TribleSet> },
-    Translated { name: "number-of-triples", kind: Kind::Engine, run: number_of_triples::<TribleSet> },
-    Translated { name: "number-of-subjects", kind: Kind::Fold, run: number_of_subjects::<TribleSet> },
-    Translated { name: "number-of-predicates", kind: Kind::Fold, run: number_of_predicates::<TribleSet> },
-    Translated { name: "number-of-objects", kind: Kind::Fold, run: number_of_objects::<TribleSet> },
-    Translated { name: "number-of-literals", kind: Kind::Fold, run: number_of_literals::<TribleSet> },
+/// One registry, several monomorphizations: every query function is
+/// generic over the pattern backend, so the same list instantiates the
+/// PATCH table, the succinct-archive table, and — under the `gpu`
+/// capability — the device-wrapped archive table. Row order is
+/// `query-set.tsv` order and identical between them by construction
+/// (the runner indexes them in lockstep, and the cross-arm gate
+/// compares row i against row i).
+///
+/// Vendored from `sparqloscope-bench/src/queries.rs` @ 73df472, minus
+/// its `TRANSLATED_UNION` table: `Dataset<UnionFacts>` has no caller
+/// here (see [`wd_load`](crate::wd_load)).
+macro_rules! registry {
+    ($( $name:literal / $kind:ident / $f:ident ),+ $(,)?) => {
+        /// All translated queries against the PATCH backend
+        /// ([`TribleSet`]), in `query-set.tsv` order. The four
+        /// `transitive-path-*` RPQ translations are
+        /// `#[cfg(feature = "rpq")]`-gated out (the engine currently
+        /// has no regular-path constraint) and are listed in
+        /// [`SKIPPED_PATHS`] at their original registry positions so
+        /// the runner can record SKIP rows.
+        pub static TRANSLATED: &[Translated<TribleSet>] = &[
+            $( Translated { name: $name, kind: Kind::$kind, run: $f::<TribleSet> } ),+
+        ];
+        /// The same queries against the succinct-archive backend.
+        pub static TRANSLATED_ARCHIVE: &[Translated<ArchivedFacts>] = &[
+            $( Translated { name: $name, kind: Kind::$kind, run: $f::<ArchivedFacts> } ),+
+        ];
+        /// The same queries against the device-wrapped archive.
+        #[cfg(feature = "gpu")]
+        pub static TRANSLATED_WGPU: &[Translated<crate::wd_schema::WgpuArchivedFacts>] = &[
+            $( Translated { name: $name, kind: Kind::$kind, run: $f::<crate::wd_schema::WgpuArchivedFacts> } ),+
+        ];
+    };
+}
+
+registry![
+    "join-2-small-large" / Engine / join_2_small_large,
+    "join-2-large-small" / Engine / join_2_large_small,
+    "join-2-large-large" / Engine / join_2_large_large,
+    "join-2-largest-result" / Engine / join_2_largest_result,
+    "join-2-large-large-with-large-result" / Engine / join_2_large_large_with_large_result,
+    "join-2-large-large-with-small-result" / Engine / join_2_large_large_with_small_result,
+    "join-3-star-largest-sum-of-join-sizes" / Engine / join_3_star_largest_sum_of_join_sizes,
+    "join-3-chain-largest-sum-of-join-sizes" / Engine / join_3_chain_largest_sum_of_join_sizes,
+    "join-xlarge-star-on-small-predicates" / Engine / join_xlarge_star_on_small_predicates,
+    "join-xlarge-chain-on-small-predicates" / Engine / join_xlarge_chain_on_small_predicates,
+    "optional-join-small-large" / Periphery / optional_join_small_large,
+    "optional-join-large-small" / Periphery / optional_join_large_small,
+    "optional-join-large-large" / Periphery / optional_join_large_large,
+    "optional-join-2-large-large-with-large-result" / Periphery / optional_join_2_large_large_with_large_result,
+    "optional-join-2-large-large-with-small-join-result-1" / Periphery / optional_join_2_large_large_with_small_join_result_1,
+    "optional-join-2-large-large-with-small-join-result-2" / Periphery / optional_join_2_large_large_with_small_join_result_2,
+    "optional-join-3-star-1" / Periphery / optional_join_3_star_1,
+    "optional-join-3-star-2" / Periphery / optional_join_3_star_2,
+    "optional-join-3-chain-1" / Periphery / optional_join_3_chain_1,
+    "optional-join-3-chain-2" / Periphery / optional_join_3_chain_2,
+    "minus-join-small-large" / Periphery / minus_join_small_large,
+    "minus-join-large-small" / Periphery / minus_join_large_small,
+    "minus-join-large-large" / Periphery / minus_join_large_large,
+    "minus-join-2-large-large-with-large-result" / Periphery / minus_join_2_large_large_with_large_result,
+    "minus-join-2-large-large-with-small-join-result-1" / Periphery / minus_join_2_large_large_with_small_join_result_1,
+    "minus-join-2-large-large-with-small-join-result-2" / Periphery / minus_join_2_large_large_with_small_join_result_2,
+    "minus-join-3-star-1" / Periphery / minus_join_3_star_1,
+    "minus-join-3-star-2" / Periphery / minus_join_3_star_2,
+    "minus-join-3-chain-1" / Periphery / minus_join_3_chain_1,
+    "minus-join-3-chain-2" / Periphery / minus_join_3_chain_2,
+    "exists-join-small-large" / Fold / exists_join_small_large,
+    "exists-join-large-small" / Fold / exists_join_large_small,
+    "exists-join-large-large" / Fold / exists_join_large_large,
+    "exists-join-2-large-large-with-large-result" / Fold / exists_join_2_large_large_with_large_result,
+    "exists-join-2-large-large-with-small-join-result-1" / Fold / exists_join_2_large_large_with_small_join_result_1,
+    "exists-join-2-large-large-with-small-join-result-2" / Fold / exists_join_2_large_large_with_small_join_result_2,
+    "exists-join-3-star-1" / Fold / exists_join_3_star_1,
+    "exists-join-3-star-2" / Fold / exists_join_3_star_2,
+    "exists-join-3-chain-1" / Fold / exists_join_3_chain_1,
+    "exists-join-3-chain-2" / Fold / exists_join_3_chain_2,
+    "union-no-constraint" / Engine / union_no_constraint,
+    "union-constraint-from-star" / Engine / union_constraint_from_star,
+    "union-constraint-small-join" / Engine / union_constraint_small_join,
+    "union-constraint-large-join" / Engine / union_constraint_large_join,
+    "union-constraint-filter-restrictive" / Engine / union_constraint_filter_restrictive,
+    "multicolumn-join-small" / Engine / multicolumn_join_small,
+    "multicolumn-join-large" / Engine / multicolumn_join_large,
+    "group-by-count-object-high-multiplicity" / Fold / group_by_count_object_high_multiplicity,
+    "group-by-count-object-low-multiplicity" / Fold / group_by_count_object_low_multiplicity,
+    "group-by-count-object-wrong-sort-order" / Fold / group_by_count_object_wrong_sort_order,
+    "group-by-complex-aggregate" / Fold / group_by_complex_aggregate,
+    "group-by-implicit-numeric-baseline" / Engine / group_by_implicit_numeric_baseline,
+    "group-by-implicit-numeric-sum" / Fold / group_by_implicit_numeric_sum,
+    "group-by-implicit-numeric-min" / Fold / group_by_implicit_numeric_min,
+    "group-by-implicit-numeric-max" / Fold / group_by_implicit_numeric_max,
+    "group-by-implicit-numeric-avg" / Fold / group_by_implicit_numeric_avg,
+    "group-by-implicit-string-baseline" / Engine / group_by_implicit_string_baseline,
+    "group-by-implicit-string-min" / Fold / group_by_implicit_string_min,
+    "group-by-implicit-string-max" / Fold / group_by_implicit_string_max,
+    "group-by-string-groupconcat" / Fold / group_by_string_groupconcat,
+    "distinct-count-object-high-multiplicity" / Fold / distinct_count_object_high_multiplicity,
+    "distinct-count-object-low-multiplicity" / Fold / distinct_count_object_low_multiplicity,
+    "distinct-count-object-wrong-sort-order" / Fold / distinct_count_object_wrong_sort_order,
+    "regex-3-contains" / Fold / regex_3_contains,
+    "regex-3-fixed" / Fold / regex_3_fixed,
+    "regex-3" / Fold / regex_3,
+    "regex-prefix-1" / Fold / regex_prefix_1,
+    "regex-prefix-2" / Fold / regex_prefix_2,
+    "regex-prefix-3" / Fold / regex_prefix_3,
+    "strlen" / Fold / strlen,
+    "strbefore" / Fold / strbefore,
+    "strafter" / Fold / strafter,
+    "strstarts" / Fold / strstarts,
+    "strends" / Fold / strends,
+    "result-size-tiny" / Engine / result_size_tiny,
+    "result-size-small" / Engine / result_size_small,
+    "result-size-medium" / Engine / result_size_medium,
+    "result-size-large" / Engine / result_size_large,
+    "result-size-xlarge" / Engine / result_size_xlarge,
+    "numeric-baseline" / Fold / numeric_baseline,
+    "numeric-abs" / Fold / numeric_abs,
+    "numeric-ceil" / Fold / numeric_ceil,
+    "numeric-floor" / Fold / numeric_floor,
+    "numeric-round" / Fold / numeric_round,
+    "numeric-add" / Fold / numeric_add,
+    "numeric-greater" / Engine / numeric_greater,
+    "numeric-filter-bin-search-fifty-fifty" / Engine / numeric_filter_bin_search_fifty_fifty,
+    "numeric-filter-bin-search-seventy-thirty" / Engine / numeric_filter_bin_search_seventy_thirty,
+    "numeric-filter-bin-search-ninetyfive-five" / Engine / numeric_filter_bin_search_ninetyfive_five,
+    "filter-few-results" / Engine / filter_few_results,
+    "filter-many-results" / Engine / filter_many_results,
+    "filter-language-en" / Engine / filter_language_en,
+    "date-year" / Fold / date_year,
+    "date-month" / Fold / date_month,
+    "date-day" / Fold / date_day,
+    "number-of-triples" / Engine / number_of_triples,
+    "number-of-subjects" / Fold / number_of_subjects,
+    "number-of-predicates" / Fold / number_of_predicates,
+    "number-of-objects" / Fold / number_of_objects,
+    "number-of-literals" / Fold / number_of_literals,
 ];
 
 /// Names of the vendored queries whose translations require `path!`

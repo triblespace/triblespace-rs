@@ -51,13 +51,23 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if self.variable.index == variable {
-            proposals.extend(self.set.iter().map(|v| IntoInline::to_inline(v).raw));
+            for row in 0..frontier.len() {
+                proposals.open(row as u32);
+                proposals.extend(self.set.iter().map(|v| IntoInline::to_inline(v).raw));
+            }
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// Membership does not depend on the parent binding, so the whole
+    /// batch's region is one pass and the tags are ignored.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if self.variable.index == variable {
             for i in 0..cands.len() {
                 let v = &cands.values()[i];

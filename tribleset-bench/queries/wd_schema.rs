@@ -17,6 +17,7 @@
 //! construction. The IRIs in [`voc`] are vendored byte-for-byte.
 
 use subject::core::attribute::Attribute;
+use subject::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use subject::core::blob::MemoryBlobStore;
 use subject::core::blob::TryFromBlob;
 #[cfg(feature = "rpq")]
@@ -33,6 +34,37 @@ use subject::core::prelude::BlobStoreGet;
 use subject::core::prelude::IntoBlob;
 use subject::core::repo::pile::PileReader;
 use subject::core::trible::TribleSet;
+
+/// The succinct-archive pattern backend the archive arm runs against.
+/// Vendored from `sparqloscope-bench/src/lib.rs` @ 73df472.
+pub type ArchivedFacts = SuccinctArchive<OrderedUniverse>;
+
+/// The union-of-index-segments backend
+/// [`Dataset::<UnionFacts>::load_pile`](crate::wd_load) serves queries
+/// from: a data branch's index annotation may cover the commit chain
+/// with several LSM shards, and the union constraint dedups across
+/// them.
+///
+/// VENDOR NOTE: upstream spells this
+/// `UnionArchive<'static, OrderedUniverse>` over a leaked segment
+/// slice. At this engine rev `UnionArchive` OWNS its shards
+/// (`Arc<[SuccinctArchive]>`, commit 6c346e04), so the lifetime
+/// parameter and the leak are both gone — a forced adaptation to the
+/// subject's API, not a redesign.
+pub type UnionFacts = subject::core::repo::index_home::UnionArchive<OrderedUniverse>;
+
+/// The device-wrapped archive backend, one WGPU adapter around one CPU
+/// archive.
+///
+/// VENDOR NOTE: upstream's gpu module wraps each attached pile shard
+/// separately and re-normalizes them behind
+/// `UnionArchiveConstraint::from_shards`. That constructor does not
+/// exist at this engine rev (`UnionArchiveConstraint::new` is private
+/// and takes plain `SuccinctArchiveConstraint`s), and the arm here has
+/// exactly one archive to wrap, so the wrapper *is* the backend —
+/// which is also how `run_arch_queries` already drives the device.
+#[cfg(feature = "gpu")]
+pub type WgpuArchivedFacts = subject::gpu::WgpuSuccinctArchive<OrderedUniverse>;
 
 /// Blob reader over either backing store the harness supports: the
 /// importer's in-memory store (a fresh `.nt` import) or a pile's mmap

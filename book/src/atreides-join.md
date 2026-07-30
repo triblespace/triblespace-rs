@@ -16,8 +16,8 @@ whose methods shape the search:
 2. **`estimate`** – predicts how many candidates remain for a variable under the
    current partial binding, or `None` when the variable is not this
    constraint's business.
-3. **`propose`** – enumerates candidate values for a variable (with
-   `propose_chunk` as its resumable form).
+3. **`propose`** – enumerates candidate values for a variable, for every
+   binding in the current frontier.
 4. **`confirm`** – kills candidates proposed by another constraint, without
    re-enumerating them.
 5. **`satisfied`** – returns `false` when the constraint has no completion from

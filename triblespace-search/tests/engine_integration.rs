@@ -10,7 +10,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::{
-    Binding, BindingStore, Constraint, ProposalBuffer, Variable, VariableContext,
+    Binding, BindingStore, Constraint, Frontier, ProposalBuffer, Variable, VariableContext,
 };
 
 use triblespace_search::bm25::BM25Builder;
@@ -67,7 +67,7 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
     // {1,3}; "quick" is in docs {1,3}; both sets happen to be
     // identical → both survive.
     let mut props = ProposalBuffer::new();
-    intersection.propose(doc.index, &Binding::default(), &mut props);
+    intersection.propose(doc.index, &Frontier::default(), &mut props);
     let ids: std::collections::HashSet<Id> = props
         .live_values(0)
         .map(|r| raw_value_to_id(r).unwrap())
@@ -101,7 +101,7 @@ fn intersection_with_absent_term_proposes_nothing() {
     assert_eq!(intersection.estimate(doc.index, &Binding::default()), Some(0));
 
     let mut props = ProposalBuffer::new();
-    intersection.propose(doc.index, &Binding::default(), &mut props);
+    intersection.propose(doc.index, &Frontier::default(), &mut props);
     assert_eq!(
         props.count_live(0),
         0,

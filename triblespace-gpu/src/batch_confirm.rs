@@ -1,11 +1,18 @@
 //! Batched WGPU confirmation for [`SuccinctArchive`] queries.
 //!
 //! The engine's [`Constraint::confirm`] protocol is kill-only: a confirmer
-//! receives one [`Candidates`] region (read-only values, killable `u32`
-//! liveness words) and may only zero words. That contract makes the archive's
-//! per-candidate membership probes embarrassingly parallel — every candidate's
-//! verdict is independent, and merging GPU verdicts back is a plain word-wise
-//! AND.
+//! receives one [`Candidates`] region (read-only values and parent tags,
+//! killable `u32` liveness words) and may only zero words. That contract
+//! makes the archive's per-candidate membership probes embarrassingly
+//! parallel — every candidate's verdict is independent, and merging GPU
+//! verdicts back is a plain word-wise AND.
+//!
+//! A region spans a whole [`Frontier`], so its candidates do **not** share
+//! one parent binding: entry `i` carries the frontier row it was proposed
+//! for, and it has to be checked against *that* row's bound values. This is
+//! what makes the batched tier reachable below the root — with a width-1
+//! frontier only the root's proposal is wide, and every deeper level offers
+//! the device a handful of candidates.
 //!
 //! [`WgpuSuccinctArchive`] wraps a CPU [`SuccinctArchive`] and keeps the
 //! structures the confirm probes touch resident on the default WGPU device:
@@ -19,27 +26,38 @@
 //! * **Unbound membership** (no other position bound; the confirmed variable
 //!   is E, A, or V): one fused kernel per region — binary search of each
 //!   candidate value in the resident universe plus an axis-boundary
-//!   occupancy check — writes one verdict word per candidate.
-//! * **Range restriction** (one or two other positions bound): the fixed row
-//!   range is computed once on the CPU from the bound values, then three
-//!   enqueued kernels — candidate search/probe fill, Jerky's batched wavelet
-//!   rank, and verdict fold — run with a single readback of the verdict
-//!   words.
+//!   occupancy check — writes one verdict word per candidate. Parent tags do
+//!   not enter: the verdict does not depend on the parent binding.
+//! * **Range restriction** (one or two other positions bound): the host
+//!   ships a *parent table* — one row per distinct parent tag in the region,
+//!   holding that parent's bound values — plus one table slot per candidate.
+//!   The device resolves the table to one row band per parent out of the
+//!   same resident universe and boundary tables the probes use, then every
+//!   candidate reads its own parent's band through its slot. The host never
+//!   searches the universe or ranks a wavelet; it copies bound values and
+//!   assigns slots.
 //!
 //! Below the threshold, on any device error, and for every other protocol
 //! method, the wrapper defers to the canonical CPU constraint, so results are
-//! bit-identical either way (the parity suite in
-//! `tests/batch_confirm_parity.rs` holds the two paths to identical liveness
-//! words).
+//! bit-identical either way. `tests/batch_confirm_parity.rs` holds the two
+//! paths to identical liveness words for every arm against a frontier of
+//! one; `tests/mixed_parent_parity.rs` does the same for engine-produced
+//! regions spanning many parents.
 
-use std::ops::Range;
+// The `#[cube]` kernels below nest their guards rather than joining them
+// with `&&`. That is load-bearing, not style: a device `&&` evaluates both
+// sides, so `d < m && universe[d * 8] == ..` would index past the resident
+// universe for the `d == m` (value absent) case that the guard exists to
+// exclude. Nesting is uniform across the kernels so no reader has to work
+// out which guards may be joined and which may not.
+#![allow(clippy::collapsible_if)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 use jerky::bit_vector::rank9sel::Rank9SelIndex;
 use jerky::bit_vector::{BitVector, Select};
-use jerky::char_sequences::WaveletMatrix;
 use jerky::gpu::{DeviceU32Buffer, GpuContext, GpuWaveletMatrix};
 use triblespace_core::blob::encodings::succinctarchive::{
     SuccinctArchive, SuccinctArchiveConstraint, SuccinctRotation, Universe,
@@ -47,11 +65,14 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{InlineEncoding, RawInline};
 use triblespace_core::query::{
-    and_words, Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, RawTerm, Term,
+    and_words, Binding, Candidates, Constraint, Frontier, ProposalBuffer, RawTerm, Term,
     TriblePattern, VariableId, VariableSet,
 };
 
 const THREADS: u32 = super::THREADS;
+
+/// Jerky's out-of-range marker for a batched rank result.
+const RANK_OUT_OF_RANGE: u32 = u32::MAX;
 
 /// Jerky's wavelet matrix resident on the default CubeCL WGPU device.
 pub type WgpuWaveletMatrix = GpuWaveletMatrix<WgpuRuntime>;
@@ -63,25 +84,58 @@ pub type WgpuContext = GpuContext<WgpuRuntime>;
 /// verdicts are computed on WGPU; smaller regions run the canonical CPU
 /// probes.
 ///
-/// Measured on an Apple M4 Max (Metal via wgpu, cubecl 0.10) with the
-/// ignored `confirm_crossover_sweep` benchmark in
-/// `tests/batch_confirm_parity.rs`: a 262,135-trible / 68,422-value
-/// synthetic archive, fully-live regions, release profile, best of 5 runs
-/// per point (milliseconds):
+/// Measured on an Apple M4 Max (Metal via wgpu, cubecl 0.10), release
+/// profile, with the two ignored sweep benchmarks. `cpu/gpu` is total CPU
+/// probe time over total device time for the same regions, so above 1.00 the
+/// device wins.
 ///
-/// | region | membership cpu | membership gpu | range cpu | range gpu |
-/// |-------:|---------------:|---------------:|----------:|----------:|
-/// |   1024 |          0.074 |          1.244 |     0.183 |     1.448 |
-/// |   4096 |          0.268 |          1.406 |     0.748 |     1.472 |
-/// |  16384 |          1.074 |          1.473 |     3.045 |     1.528 |
-/// |  65536 |          4.320 |          1.874 |    12.539 |     2.190 |
+/// **Mixed-parent regions** — `mixed_parent_crossover_sweep` in
+/// `tests/mixed_parent_parity.rs`: a 414,801-trible / 81,632-value archive
+/// driven through a real [`Query`](triblespace_core::query::Query) whose
+/// variable order is pinned, over frontier widths 256…16384 and fanouts
+/// 1/4/16, so every routed range confirm sees a genuine batch of parents.
+/// The spread in each cell is across those sweep points.
 ///
-/// The GPU round trip is nearly flat (~1.4–2.2 ms) while CPU cost scales
-/// linearly, putting the crossover at ~8k live candidates for the range
-/// shape (two wavelet ranks per candidate) and ~22k for the lighter
-/// membership shape. 16384 is the single-knob compromise: the range shape
-/// is a 2x win there, membership is within dispatch jitter of par (0.73x)
-/// and wins clearly from ~22k up.
+/// | mean region | 1-bound arm | 2-bound arm |
+/// |------------:|------------:|------------:|
+/// |       1 024 | 0.16 – 0.21 |           — |
+/// |       4 096 | 0.42 – 0.81 | 0.56 – 0.65 |
+/// |      16 384 | 1.62 – 2.72 | 1.92 – 2.42 |
+/// |      65 536 | 3.58 – 6.82 | 5.75 – 6.84 |
+/// |     262 144 |        6.87 | 10.2 – 11.1 |
+///
+/// **Frontier of one** — `confirm_crossover_sweep` in
+/// `tests/batch_confirm_parity.rs`, a 262,135-trible / 68,422-value archive,
+/// one parent, which is where the membership arm is measured (it is
+/// parent-independent, so a batch tells it nothing new):
+///
+/// | region | membership | range |
+/// |-------:|-----------:|------:|
+/// |  1 024 |       0.04 |  0.14 |
+/// |  4 096 |       0.16 |  0.64 |
+/// | 16 384 |       0.72 |  2.02 |
+/// | 65 536 |       2.41 |  3.32 |
+///
+/// The device round trip is nearly flat (~1.2–2.6 ms) while CPU probe cost
+/// scales linearly, putting both range shapes' crossover at ~6–8k
+/// candidates. The lighter membership arm — one universe search and one
+/// boundary compare per candidate, no wavelet rank at all — is still at
+/// 0.72x at 16 384 and only wins from ~24k up, so it is membership, not the
+/// range shapes, that sets the knob.
+///
+/// 16384 is the single-knob compromise: the range shapes are a 1.6–2.7x win
+/// there and membership costs 1.4x, and it equals
+/// [`DEFAULT_FRONTIER_WIDTH`](triblespace_core::query::DEFAULT_FRONTIER_WIDTH),
+/// so a level whose rows each contribute one candidate already reaches the
+/// batched tier. Lowering it to the range shapes' own crossover would trade
+/// their gain for a deeper membership loss.
+///
+/// The number is unchanged from the pre-frontier measurement, but what it
+/// buys is not: resolving parent bands on the device rather than on the host
+/// took the mixed-parent range shapes from 1.6–5.4x to 2.7–11.1x at width
+/// 16384 (device time for a 262k-candidate 2-bound region: 13.4 ms → 7.3 ms),
+/// because the host no longer ranks a wavelet once per frontier row before
+/// it can dispatch.
 pub const DEFAULT_MIN_CONFIRM_BATCH: usize = 16384;
 
 /// Observational dispatch counters for one [`WgpuSuccinctArchive`].
@@ -94,6 +148,10 @@ pub struct WgpuConfirmStats {
     pub gpu_confirms: u64,
     /// Region entries (live and dead) shipped through device confirms.
     pub gpu_candidates: u64,
+    /// Parent-table rows resolved on the device, summed over routed
+    /// confirms — one per distinct parent tag in a routed region, and the
+    /// measure of how wide the frontiers reaching the device actually are.
+    pub gpu_parents: u64,
     /// Confirm calls routed to the canonical CPU constraint by the
     /// live-candidate threshold.
     pub cpu_fallback_confirms: u64,
@@ -107,16 +165,18 @@ pub struct WgpuConfirmStats {
 struct ConfirmStats {
     gpu_confirms: AtomicU64,
     gpu_candidates: AtomicU64,
+    gpu_parents: AtomicU64,
     cpu_fallback_confirms: AtomicU64,
     cpu_fallback_candidates: AtomicU64,
     gpu_errors: AtomicU64,
 }
 
 impl ConfirmStats {
-    fn record_gpu(&self, candidates: usize) {
+    fn record_gpu(&self, candidates: usize, parents: usize) {
         self.gpu_confirms.fetch_add(1, Ordering::Relaxed);
         self.gpu_candidates
             .fetch_add(candidates as u64, Ordering::Relaxed);
+        self.gpu_parents.fetch_add(parents as u64, Ordering::Relaxed);
     }
 
     fn record_cpu(&self, candidates: usize) {
@@ -133,6 +193,7 @@ impl ConfirmStats {
         WgpuConfirmStats {
             gpu_confirms: self.gpu_confirms.load(Ordering::Relaxed),
             gpu_candidates: self.gpu_candidates.load(Ordering::Relaxed),
+            gpu_parents: self.gpu_parents.load(Ordering::Relaxed),
             cpu_fallback_confirms: self.cpu_fallback_confirms.load(Ordering::Relaxed),
             cpu_fallback_candidates: self.cpu_fallback_candidates.load(Ordering::Relaxed),
             gpu_errors: self.gpu_errors.load(Ordering::Relaxed),
@@ -142,6 +203,7 @@ impl ConfirmStats {
     fn reset(&self) {
         self.gpu_confirms.store(0, Ordering::Relaxed);
         self.gpu_candidates.store(0, Ordering::Relaxed);
+        self.gpu_parents.store(0, Ordering::Relaxed);
         self.cpu_fallback_confirms.store(0, Ordering::Relaxed);
         self.cpu_fallback_candidates.store(0, Ordering::Relaxed);
         self.gpu_errors.store(0, Ordering::Relaxed);
@@ -149,18 +211,18 @@ impl ConfirmStats {
 }
 
 /// Byte-lexicographic three-way comparison between universe entry `d` and
-/// candidate `i`, both stored as 8 big-endian `u32` words.
+/// entry `i` of `probes`, both stored as 8 big-endian `u32` words.
 ///
-/// Returns 0 when equal, 1 when the universe entry orders below the
-/// candidate, 2 when it orders above.
+/// Returns 0 when equal, 1 when the universe entry orders below the probe,
+/// 2 when it orders above.
 #[cube]
-fn value_order(universe: &Array<u32>, d: u32, cands: &Array<u32>, i: u32) -> u32 {
+fn value_order(universe: &Array<u32>, d: u32, probes: &Array<u32>, i: u32) -> u32 {
     let mut order = u32::new(0);
     let mut w = u32::new(0);
     while w < 8u32 {
         if order == 0u32 {
             let dv = universe[(d * 8u32 + w) as usize];
-            let cv = cands[(i * 8u32 + w) as usize];
+            let cv = probes[(i * 8u32 + w) as usize];
             if dv < cv {
                 order = 1u32;
             }
@@ -173,22 +235,36 @@ fn value_order(universe: &Array<u32>, d: u32, cands: &Array<u32>, i: u32) -> u32
     order
 }
 
-/// Lower-bound binary search for candidate `i` over the sorted resident
-/// universe of `m` entries. Returns `m` when every entry orders below the
-/// candidate; equality still has to be checked at the returned slot.
+/// Lower-bound binary search for entry `i` of `probes` over the sorted
+/// resident universe of `m` entries. Returns `m` when every entry orders
+/// below the probe; equality still has to be checked at the returned slot.
 #[cube]
-fn universe_lower_bound(universe: &Array<u32>, m: u32, cands: &Array<u32>, i: u32) -> u32 {
+fn universe_lower_bound(universe: &Array<u32>, m: u32, probes: &Array<u32>, i: u32) -> u32 {
     let mut lo = u32::new(0);
     let mut hi = m;
     while lo < hi {
         let mid = lo + (hi - lo) / 2u32;
-        if value_order(universe, mid, cands, i) == 1u32 {
+        if value_order(universe, mid, probes, i) == 1u32 {
             lo = mid + 1u32;
         } else {
             hi = mid;
         }
     }
     lo
+}
+
+/// The universe code of entry `i` of `probes`, or `m` when the value is
+/// absent from the universe.
+#[cube]
+fn universe_code(universe: &Array<u32>, m: u32, probes: &Array<u32>, i: u32) -> u32 {
+    let mut code = m;
+    let d = universe_lower_bound(universe, m, probes, i);
+    if d < m {
+        if value_order(universe, d, probes, i) == 0u32 {
+            code = d;
+        }
+    }
+    code
 }
 
 /// One verdict word per candidate for the unbound membership arms: live
@@ -210,10 +286,224 @@ fn membership_confirm_kernel(
     if i < n {
         let mut verdict = u32::new(0);
         if live[i as usize] != 0u32 {
-            let d = universe_lower_bound(universe, m, cands, i);
+            let d = universe_code(universe, m, cands, i);
             if d < m {
-                if value_order(universe, d, cands, i) == 0u32 {
-                    if bounds[(d + 1u32) as usize] > bounds[d as usize] {
+                if bounds[(d + 1u32) as usize] > bounds[d as usize] {
+                    verdict = 1u32;
+                }
+            }
+        }
+        verdicts[i as usize] = verdict;
+    }
+}
+
+/// Writes candidate `i`'s rank-probe pair given the row band `start..end`
+/// its parent restricts the archive to: probe positions are the band, probe
+/// values the candidate's universe code. Dead, absent, or empty-band
+/// candidates get `flag = 0` and a harmless `(0, code 0)` pair — an empty
+/// band restricts to nothing, exactly as the CPU arm's
+/// `restrict_range(..).is_empty()` does.
+#[cube]
+fn emit_candidate_probe(
+    cands: &Array<u32>,
+    live: &Array<u32>,
+    universe: &Array<u32>,
+    i: u32,
+    m: u32,
+    start: u32,
+    end: u32,
+    flags: &mut Array<u32>,
+    positions: &mut Array<u32>,
+    probes: &mut Array<u32>,
+) {
+    let mut flag = u32::new(0);
+    let mut code = u32::new(0);
+    let mut lo = u32::new(0);
+    let mut hi = u32::new(0);
+    if live[i as usize] != 0u32 {
+        if start < end {
+            let d = universe_code(universe, m, cands, i);
+            if d < m {
+                flag = 1u32;
+                code = d;
+                lo = start;
+                hi = end;
+            }
+        }
+    }
+    flags[i as usize] = flag;
+    positions[(2u32 * i) as usize] = lo;
+    positions[(2u32 * i + 1u32) as usize] = hi;
+    probes[(2u32 * i) as usize] = code;
+    probes[(2u32 * i + 1u32) as usize] = code;
+}
+
+/// Probe fill for the **single-bound** range arms. Each candidate reads its
+/// own parent's bound value through its table slot and resolves that
+/// parent's row band inline — the CPU arm's
+/// `base_range(domain, axis, value)`, read straight out of the resident
+/// boundary table instead of two `select1`s, with an absent value yielding
+/// an empty band exactly as `base_range`'s `else` branch does.
+///
+/// Resolving per candidate rather than per parent repeats one universe
+/// search for candidates that share a parent. That is deliberate: the search
+/// is a handful of coalesced compares in a thread that is running anyway,
+/// while a separate parent pass would cost a whole dispatch — measurably
+/// more than the redundancy at every region size above the routing
+/// threshold.
+#[cube(launch_unchecked)]
+fn base_probe_fill_kernel(
+    cands: &Array<u32>,
+    live: &Array<u32>,
+    universe: &Array<u32>,
+    slots: &Array<u32>,
+    parent_values: &Array<u32>,
+    bounds: &Array<u32>,
+    flags: &mut Array<u32>,
+    positions: &mut Array<u32>,
+    probes: &mut Array<u32>,
+    n: u32,
+    m: u32,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        let mut start = u32::new(0);
+        let mut end = u32::new(0);
+        if live[i as usize] != 0u32 {
+            let slot = slots[i as usize];
+            let d = universe_code(universe, m, parent_values, slot);
+            if d < m {
+                start = bounds[d as usize];
+                end = bounds[(d + 1u32) as usize];
+            }
+        }
+        emit_candidate_probe(
+            cands, live, universe, i, m, start, end, flags, positions, probes,
+        );
+    }
+}
+
+/// Parent pass for the **double-bound** range arms: the outer bound value's
+/// base range becomes a rank probe pair on the inner rotation, the inner
+/// bound value's code the probe symbol. Either value absent from the
+/// universe clears the flag, which
+/// [`restrict_probe_fill_kernel`] reads as an empty band — the CPU arm's
+/// nested `restrict_range(.., base_range(..))` with both `else` branches
+/// folded into one.
+///
+/// This pass cannot be fused into the candidate kernel: its result *is* a
+/// wavelet rank, and that is a dispatch of its own.
+#[cube(launch_unchecked)]
+fn parent_restrict_probe_kernel(
+    universe: &Array<u32>,
+    outer_bounds: &Array<u32>,
+    outer_values: &Array<u32>,
+    inner_values: &Array<u32>,
+    codes: &mut Array<u32>,
+    flags: &mut Array<u32>,
+    positions: &mut Array<u32>,
+    probes: &mut Array<u32>,
+    p: u32,
+    m: u32,
+) {
+    let j = ABSOLUTE_POS as u32;
+    if j < p {
+        let mut flag = u32::new(0);
+        let mut code = u32::new(0);
+        let mut lo = u32::new(0);
+        let mut hi = u32::new(0);
+        let outer = universe_code(universe, m, outer_values, j);
+        if outer < m {
+            let inner = universe_code(universe, m, inner_values, j);
+            if inner < m {
+                flag = 1u32;
+                code = inner;
+                lo = outer_bounds[outer as usize];
+                hi = outer_bounds[(outer + 1u32) as usize];
+            }
+        }
+        codes[j as usize] = code;
+        flags[j as usize] = flag;
+        positions[(2u32 * j) as usize] = lo;
+        positions[(2u32 * j + 1u32) as usize] = hi;
+        probes[(2u32 * j) as usize] = code;
+        probes[(2u32 * j + 1u32) as usize] = code;
+    }
+}
+
+/// Probe fill for the **double-bound** range arms: each candidate folds its
+/// own parent's rank pair into that parent's row band —
+/// `restrict_range`'s `base + rank(r.start, d) .. base + rank(r.end, d)` —
+/// and emits its own probe against it.
+#[cube(launch_unchecked)]
+fn restrict_probe_fill_kernel(
+    cands: &Array<u32>,
+    live: &Array<u32>,
+    universe: &Array<u32>,
+    slots: &Array<u32>,
+    parent_flags: &Array<u32>,
+    parent_codes: &Array<u32>,
+    parent_ranks: &Array<u32>,
+    inner_bounds: &Array<u32>,
+    flags: &mut Array<u32>,
+    positions: &mut Array<u32>,
+    probes: &mut Array<u32>,
+    n: u32,
+    m: u32,
+    out_of_range: u32,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        let mut start = u32::new(0);
+        let mut end = u32::new(0);
+        if live[i as usize] != 0u32 {
+            let slot = slots[i as usize];
+            if parent_flags[slot as usize] != 0u32 {
+                let lo = parent_ranks[(2u32 * slot) as usize];
+                let hi = parent_ranks[(2u32 * slot + 1u32) as usize];
+                // A band read out of the resident boundary tables is always
+                // a valid rank position, so `out_of_range` cannot occur
+                // here; an empty band is the kill-only reading if it ever
+                // did.
+                if lo != out_of_range {
+                    if hi != out_of_range {
+                        let base = inner_bounds[parent_codes[slot as usize] as usize];
+                        start = base + lo;
+                        end = base + hi;
+                    }
+                }
+            }
+        }
+        emit_candidate_probe(
+            cands, live, universe, i, m, start, end, flags, positions, probes,
+        );
+    }
+}
+
+/// Folds the batched wavelet ranks into verdict words: a flagged candidate
+/// survives exactly when its code occurs inside its parent's row band —
+/// `rank(r.start, d) != rank(r.end, d)`, the CPU arm's
+/// `restrict_range(..).is_empty().not()` with the shared `select1` base
+/// offset cancelled.
+#[cube(launch_unchecked)]
+fn range_verdict_kernel(
+    flags: &Array<u32>,
+    ranks: &Array<u32>,
+    verdicts: &mut Array<u32>,
+    n: u32,
+    out_of_range: u32,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        let mut verdict = u32::new(0);
+        if flags[i as usize] != 0u32 {
+            let lo = ranks[(2u32 * i) as usize];
+            let hi = ranks[(2u32 * i + 1u32) as usize];
+            // Same kill-only reading of an impossible out-of-range rank as
+            // in the parent fold.
+            if lo != out_of_range {
+                if hi != out_of_range {
+                    if lo != hi {
                         verdict = 1u32;
                     }
                 }
@@ -223,68 +513,8 @@ fn membership_confirm_kernel(
     }
 }
 
-/// Resolves each candidate to its universe code and fills the rank-probe
-/// pair for the range arms: probe positions are the fixed row range's
-/// endpoints, probe values the candidate's code. Dead or absent candidates
-/// get `flag = 0` and a harmless `(0, code 0)` probe pair.
-#[cube(launch_unchecked)]
-fn range_probe_fill_kernel(
-    cands: &Array<u32>,
-    live: &Array<u32>,
-    universe: &Array<u32>,
-    flags: &mut Array<u32>,
-    positions: &mut Array<u32>,
-    values: &mut Array<u32>,
-    n: u32,
-    m: u32,
-    r_start: u32,
-    r_end: u32,
-) {
-    let i = ABSOLUTE_POS as u32;
-    if i < n {
-        let mut flag = u32::new(0);
-        let mut code = u32::new(0);
-        let mut lo = u32::new(0);
-        let mut hi = u32::new(0);
-        if live[i as usize] != 0u32 {
-            let d = universe_lower_bound(universe, m, cands, i);
-            if d < m {
-                if value_order(universe, d, cands, i) == 0u32 {
-                    flag = 1u32;
-                    code = d;
-                    lo = r_start;
-                    hi = r_end;
-                }
-            }
-        }
-        flags[i as usize] = flag;
-        positions[(2u32 * i) as usize] = lo;
-        positions[(2u32 * i + 1u32) as usize] = hi;
-        values[(2u32 * i) as usize] = code;
-        values[(2u32 * i + 1u32) as usize] = code;
-    }
-}
-
-/// Folds the batched wavelet ranks into verdict words: a flagged candidate
-/// survives exactly when its code occurs inside the fixed row range —
-/// `rank(r.start, d) != rank(r.end, d)`, the CPU arm's
-/// `restrict_range(..).is_empty().not()` with the shared `select1` base
-/// offset cancelled.
-#[cube(launch_unchecked)]
-fn range_verdict_kernel(flags: &Array<u32>, ranks: &Array<u32>, verdicts: &mut Array<u32>, n: u32) {
-    let i = ABSOLUTE_POS as u32;
-    if i < n {
-        let mut verdict = u32::new(0);
-        if flags[i as usize] != 0u32 {
-            if ranks[(2u32 * i) as usize] != ranks[(2u32 * i + 1u32) as usize] {
-                verdict = 1u32;
-            }
-        }
-        verdicts[i as usize] = verdict;
-    }
-}
-
-/// The axis prefix a membership confirm probes.
+/// One of the three trible positions — which axis boundary table to read,
+/// and which position's value to take from a binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Axis {
     Entity,
@@ -292,47 +522,34 @@ enum Axis {
     Value,
 }
 
-/// Identical to core's private `base_range`: the row range of `value` on the
-/// axis whose prefix bit vector is `a`, empty when the value is absent from
-/// the universe. Reimplemented here over the archive's public surface.
-fn base_range<U>(universe: &U, a: &BitVector<Rank9SelIndex>, value: &RawInline) -> Range<usize>
-where
-    U: Universe,
-{
-    if let Some(d) = universe.search(value) {
-        let s = a.select1(d).unwrap() - d;
-        let e = a.select1(d + 1).unwrap() - (d + 1);
-        s..e
-    } else {
-        0..0
-    }
+/// What a routed confirm needs from each parent binding of the frontier.
+///
+/// The *bound set* is shared by every row of a frontier, so the arm — and
+/// therefore this plan — is classified once for the whole region. Only the
+/// bound *values*, and hence each parent's row band, vary by row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfirmPlan {
+    /// No other position is bound: an axis-occupancy probe per candidate,
+    /// identical for every parent.
+    Membership { axis: Axis },
+    /// One other position is bound: the parent's band is that value's base
+    /// range on `bound`; candidates probe `rotation`.
+    Base {
+        bound: Axis,
+        rotation: SuccinctRotation,
+    },
+    /// Two other positions are bound: the band is `outer`'s base range
+    /// narrowed through `inner_col` to `inner`'s value.
+    Restrict {
+        outer: Axis,
+        inner: Axis,
+        inner_col: SuccinctRotation,
+        rotation: SuccinctRotation,
+    },
 }
 
-/// Identical to core's private `restrict_range`: narrows row range `r`
-/// through the wavelet column `c` to the rows whose column symbol is
-/// `value`, mapped into the adjacent rotation via prefix `a`.
-fn restrict_range<U>(
-    universe: &U,
-    a: &BitVector<Rank9SelIndex>,
-    c: &WaveletMatrix<Rank9SelIndex>,
-    value: &RawInline,
-    r: &Range<usize>,
-) -> Range<usize>
-where
-    U: Universe,
-{
-    if let Some(d) = universe.search(value) {
-        let base = a.select1(d).unwrap() - d;
-        let s = base + c.rank(r.start, d).unwrap();
-        let e = base + c.rank(r.end, d).unwrap();
-        s..e
-    } else {
-        0..0
-    }
-}
-
-/// Packs candidate or universe values into big-endian `u32` words, so the
-/// kernels' word-wise `u32` comparison equals byte-lexicographic order.
+/// Packs values into big-endian `u32` words, so the kernels' word-wise `u32`
+/// comparison equals byte-lexicographic order.
 fn pack_be_words(values: &[RawInline]) -> Vec<u32> {
     let mut words = Vec::with_capacity(values.len() * 8);
     for value in values {
@@ -347,14 +564,46 @@ fn count_live(cands: &Candidates<'_>) -> usize {
     (0..cands.len()).filter(|&i| cands.is_live(i)).count()
 }
 
+/// The region's parent tags compacted into a table: one entry per *distinct*
+/// tag, in first-seen order, plus the table slot of every candidate.
+///
+/// Compacting matters twice over. The host resolves one band per table row
+/// rather than one per frontier row, so a region that touches three parents
+/// of a 16k-wide frontier costs three; and the device receives `slots.len()`
+/// plus `rows.len()` words instead of a band per candidate. Correct for any
+/// tag order — runs are the common shape, but nothing here assumes them.
+fn parent_table(frontier: &Frontier<'_>, cands: &Candidates<'_>) -> jerky::Result<(Vec<u32>, Vec<u32>)> {
+    let width = frontier.len();
+    let mut slot_of_row = vec![u32::MAX; width];
+    let mut slots = Vec::with_capacity(cands.len());
+    let mut rows: Vec<u32> = Vec::new();
+    for &parent in cands.parents() {
+        let row = parent as usize;
+        if row >= width {
+            return Err(jerky::Error::invalid_argument(format!(
+                "candidate parent tag {parent} exceeds the {width} rows of its frontier"
+            )));
+        }
+        let mut slot = slot_of_row[row];
+        if slot == u32::MAX {
+            slot = rows.len() as u32;
+            slot_of_row[row] = slot;
+            rows.push(parent);
+        }
+        slots.push(slot);
+    }
+    Ok((slots, rows))
+}
+
 /// A [`SuccinctArchive`] whose confirm probes can run batched on the default
 /// CubeCL WGPU device.
 ///
 /// Construction uploads the value universe (8 big-endian `u32` words per
 /// entry), one cumulative occupancy boundary table per axis
 /// (`bounds[d] = select1(d) - d`, so `bounds[d+1] > bounds[d]` iff code `d`
-/// occurs on that axis), and the six Ring wavelet matrices. Planning,
-/// estimates, and proposals always use the wrapped CPU archive; only
+/// occurs on that axis, and `bounds[d]..bounds[d+1]` *is* that code's base
+/// range), and the six Ring wavelet matrices. Planning, estimates, and
+/// proposals always use the wrapped CPU archive; only
 /// [`Constraint::confirm`] regions at or above
 /// [`min_confirm_batch`](Self::min_confirm_batch) live candidates dispatch to
 /// the device.
@@ -524,24 +773,25 @@ where
         }
     }
 
+    fn elemwise(&self, len: usize) -> (CubeCount, CubeDim) {
+        let cube_dim = CubeDim::new_1d(THREADS);
+        let cube_count = cubecl::calculate_cube_count_elemwise(self.context.client(), len, cube_dim);
+        (cube_count, cube_dim)
+    }
+
     /// Device evaluation of one unbound membership arm: one fused kernel,
     /// one readback, one AND into the region's liveness.
     fn confirm_membership_gpu(&self, axis: Axis, cands: &mut Candidates<'_>) -> jerky::Result<()> {
         let n = cands.len();
-        if n == 0 {
-            return Ok(());
-        }
         let cand_words = self.context.upload_u32(&pack_be_words(cands.values()))?;
         let mut live = cands.live_words();
         let live_words = self.context.upload_u32(&live)?;
         let mut verdict_words = self.context.empty_u32(n)?;
 
-        let client = self.context.client();
-        let cube_dim = CubeDim::new_1d(THREADS);
-        let cube_count = cubecl::calculate_cube_count_elemwise(client, n, cube_dim);
+        let (cube_count, cube_dim) = self.elemwise(n);
         unsafe {
             membership_confirm_kernel::launch_unchecked::<WgpuRuntime>(
-                client,
+                self.context.client(),
                 cube_count,
                 cube_dim,
                 cand_words.input_arg(),
@@ -560,73 +810,168 @@ where
         Ok(())
     }
 
-    /// Device evaluation of one range arm: probe fill, Jerky's batched
-    /// wavelet rank, and verdict fold enqueued back-to-back, one readback,
-    /// one AND into the region's liveness. `r` is the fixed row range the
-    /// CPU computed from the bound positions.
-    fn confirm_range_gpu(
+    /// Device evaluation of one **single-bound** range arm: probe fill
+    /// (which resolves each candidate's parent band inline), Jerky's batched
+    /// wavelet rank, and verdict fold — three dispatches, one readback, one
+    /// AND into the region's liveness.
+    ///
+    /// `slots` maps candidate `i` to its parent's row in `parent_values`, so
+    /// one dispatch serves a region spanning the whole frontier.
+    fn confirm_base_gpu(
         &self,
+        axis: Axis,
         rotation: SuccinctRotation,
-        r: &Range<usize>,
+        slots: &[u32],
+        parent_values: &[RawInline],
         cands: &mut Candidates<'_>,
     ) -> jerky::Result<()> {
         let n = cands.len();
-        if n == 0 {
-            return Ok(());
-        }
-        let wm = self.ring_col(rotation);
-        if r.start > r.end || r.end > wm.len() {
-            return Err(jerky::Error::invalid_argument(format!(
-                "confirm row range {}..{} exceeds the {} rows of {rotation:?}",
-                r.start,
-                r.end,
-                wm.len()
-            )));
-        }
-
+        let slot_words = self.context.upload_u32(slots)?;
+        let value_words = self.context.upload_u32(&pack_be_words(parent_values))?;
         let cand_words = self.context.upload_u32(&pack_be_words(cands.values()))?;
-        let mut live = cands.live_words();
-        let live_words = self.context.upload_u32(&live)?;
-        let mut flag_words = self.context.empty_u32(n)?;
+        let live_words = self.context.upload_u32(&cands.live_words())?;
+        let mut flags = self.context.empty_u32(n)?;
         let mut positions = self.context.empty_u32(2 * n)?;
-        let mut values = self.context.empty_u32(2 * n)?;
-        let mut ranks = self.context.empty_u32(2 * n)?;
-        let mut verdict_words = self.context.empty_u32(n)?;
+        let mut probes = self.context.empty_u32(2 * n)?;
 
-        let client = self.context.client();
-        let cube_dim = CubeDim::new_1d(THREADS);
-        let cube_count = cubecl::calculate_cube_count_elemwise(client, n, cube_dim);
+        let (cube_count, cube_dim) = self.elemwise(n);
         unsafe {
-            range_probe_fill_kernel::launch_unchecked::<WgpuRuntime>(
-                client,
-                cube_count.clone(),
+            base_probe_fill_kernel::launch_unchecked::<WgpuRuntime>(
+                self.context.client(),
+                cube_count,
                 cube_dim,
                 cand_words.input_arg(),
                 live_words.input_arg(),
                 self.universe_words.input_arg(),
-                flag_words.output_arg(),
+                slot_words.input_arg(),
+                value_words.input_arg(),
+                self.axis_bounds_buffer(axis).input_arg(),
+                flags.output_arg(),
                 positions.output_arg(),
-                values.output_arg(),
+                probes.output_arg(),
                 n as u32,
                 self.domain_len as u32,
-                r.start as u32,
-                r.end as u32,
             )
         };
-        wm.rank_batch_into(&positions, &values, &mut ranks)?;
+        self.fold_range_verdicts(rotation, &flags, &positions, &probes, cands)
+    }
+
+    /// Device evaluation of one **double-bound** range arm. The parent bands
+    /// need a wavelet rank of their own, so this shape pays a parent pass —
+    /// probe fill and one batched rank over the *table*, not the region —
+    /// before the candidate pass folds each parent's rank into its band.
+    /// Five dispatches, still one readback.
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_restrict_gpu(
+        &self,
+        outer: Axis,
+        inner: Axis,
+        inner_col: SuccinctRotation,
+        rotation: SuccinctRotation,
+        slots: &[u32],
+        outer_values: &[RawInline],
+        inner_values: &[RawInline],
+        cands: &mut Candidates<'_>,
+    ) -> jerky::Result<()> {
+        let n = cands.len();
+        let p = outer_values.len();
+        let outer_words = self.context.upload_u32(&pack_be_words(outer_values))?;
+        let inner_words = self.context.upload_u32(&pack_be_words(inner_values))?;
+        let mut parent_codes = self.context.empty_u32(p)?;
+        let mut parent_flags = self.context.empty_u32(p)?;
+        let mut parent_positions = self.context.empty_u32(2 * p)?;
+        let mut parent_probes = self.context.empty_u32(2 * p)?;
+        let mut parent_ranks = self.context.empty_u32(2 * p)?;
+
+        let (parent_count, cube_dim) = self.elemwise(p);
         unsafe {
-            range_verdict_kernel::launch_unchecked::<WgpuRuntime>(
-                client,
+            parent_restrict_probe_kernel::launch_unchecked::<WgpuRuntime>(
+                self.context.client(),
+                parent_count,
+                cube_dim,
+                self.universe_words.input_arg(),
+                self.axis_bounds_buffer(outer).input_arg(),
+                outer_words.input_arg(),
+                inner_words.input_arg(),
+                parent_codes.output_arg(),
+                parent_flags.output_arg(),
+                parent_positions.output_arg(),
+                parent_probes.output_arg(),
+                p as u32,
+                self.domain_len as u32,
+            )
+        };
+        self.ring_col(inner_col).rank_batch_into(
+            &parent_positions,
+            &parent_probes,
+            &mut parent_ranks,
+        )?;
+
+        let slot_words = self.context.upload_u32(slots)?;
+        let cand_words = self.context.upload_u32(&pack_be_words(cands.values()))?;
+        let live_words = self.context.upload_u32(&cands.live_words())?;
+        let mut flags = self.context.empty_u32(n)?;
+        let mut positions = self.context.empty_u32(2 * n)?;
+        let mut probes = self.context.empty_u32(2 * n)?;
+
+        let (cube_count, cube_dim) = self.elemwise(n);
+        unsafe {
+            restrict_probe_fill_kernel::launch_unchecked::<WgpuRuntime>(
+                self.context.client(),
                 cube_count,
                 cube_dim,
-                flag_words.input_arg(),
+                cand_words.input_arg(),
+                live_words.input_arg(),
+                self.universe_words.input_arg(),
+                slot_words.input_arg(),
+                parent_flags.input_arg(),
+                parent_codes.input_arg(),
+                parent_ranks.input_arg(),
+                self.axis_bounds_buffer(inner).input_arg(),
+                flags.output_arg(),
+                positions.output_arg(),
+                probes.output_arg(),
+                n as u32,
+                self.domain_len as u32,
+                RANK_OUT_OF_RANGE,
+            )
+        };
+        self.fold_range_verdicts(rotation, &flags, &positions, &probes, cands)
+    }
+
+    /// The tail both range arms share: Jerky's batched wavelet rank over the
+    /// filled probes, the verdict fold, one readback, one word-wise AND into
+    /// the region's liveness.
+    fn fold_range_verdicts(
+        &self,
+        rotation: SuccinctRotation,
+        flags: &DeviceU32Buffer<WgpuRuntime>,
+        positions: &DeviceU32Buffer<WgpuRuntime>,
+        probes: &DeviceU32Buffer<WgpuRuntime>,
+        cands: &mut Candidates<'_>,
+    ) -> jerky::Result<()> {
+        let n = cands.len();
+        let mut ranks = self.context.empty_u32(2 * n)?;
+        let mut verdict_words = self.context.empty_u32(n)?;
+        self.ring_col(rotation)
+            .rank_batch_into(positions, probes, &mut ranks)?;
+
+        let (cube_count, cube_dim) = self.elemwise(n);
+        unsafe {
+            range_verdict_kernel::launch_unchecked::<WgpuRuntime>(
+                self.context.client(),
+                cube_count,
+                cube_dim,
+                flags.input_arg(),
                 ranks.input_arg(),
                 verdict_words.output_arg(),
                 n as u32,
+                RANK_OUT_OF_RANGE,
             )
         };
 
         let verdicts = verdict_words.read();
+        let mut live = cands.live_words();
         and_words(&mut live, &verdicts);
         cands.set_live_words(&live);
         Ok(())
@@ -699,90 +1044,147 @@ where
         }
     }
 
-    /// The device evaluation of one confirm call, mirroring the CPU arm
-    /// dispatch. Returns `false` when the binding shape has no device
-    /// lowering (never happens for the canonical twelve arms) so the caller
-    /// can fall back.
-    fn confirm_gpu(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        cands: &mut Candidates<'_>,
-    ) -> jerky::Result<()> {
+    fn term(&self, axis: Axis) -> &RawTerm {
+        match axis {
+            Axis::Entity => &self.term_e,
+            Axis::Attribute => &self.term_a,
+            Axis::Value => &self.term_v,
+        }
+    }
+
+    /// Which shape of probe this confirm is, classified once for the whole
+    /// batch from any row — every row of a frontier shares its bound set, so
+    /// they all classify the same.
+    fn plan(&self, variable: VariableId, binding: &Binding) -> ConfirmPlan {
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
         let v_var = self.term_v.is_var(variable);
 
-        let e_bound = self.term_e.position_value(binding);
-        let a_bound = self.term_a.position_value(binding);
-        let v_bound = self.term_v.position_value(binding);
+        let e_bound = self.term_e.position_value(binding).is_some();
+        let a_bound = self.term_a.position_value(binding).is_some();
+        let v_bound = self.term_v.position_value(binding).is_some();
 
-        let archive = self.gpu.archive();
-        let (rotation, r) = match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => {
-                return self.gpu.confirm_membership_gpu(Axis::Entity, cands);
-            }
-            (None, None, None, false, true, false) => {
-                return self.gpu.confirm_membership_gpu(Axis::Attribute, cands);
-            }
-            (None, None, None, false, false, true) => {
-                return self.gpu.confirm_membership_gpu(Axis::Value, cands);
-            }
-            (Some(e), None, None, false, true, false) => (
-                SuccinctRotation::Eva,
-                base_range(&archive.domain, &archive.e_a, e),
-            ),
-            (Some(e), None, None, false, false, true) => (
-                SuccinctRotation::Eav,
-                base_range(&archive.domain, &archive.e_a, e),
-            ),
-            (None, Some(a), None, true, false, false) => (
-                SuccinctRotation::Ave,
-                base_range(&archive.domain, &archive.a_a, a),
-            ),
-            (None, Some(a), None, false, false, true) => (
-                SuccinctRotation::Aev,
-                base_range(&archive.domain, &archive.a_a, a),
-            ),
-            (None, None, Some(v), true, false, false) => (
-                SuccinctRotation::Vae,
-                base_range(&archive.domain, &archive.v_a, v),
-            ),
-            (None, None, Some(v), false, true, false) => (
-                SuccinctRotation::Vea,
-                base_range(&archive.domain, &archive.v_a, v),
-            ),
-            (None, Some(a), Some(v), true, false, false) => {
-                let r = base_range(&archive.domain, &archive.a_a, a);
-                (
-                    SuccinctRotation::Vae,
-                    restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, v, &r),
-                )
-            }
-            (Some(e), None, Some(v), false, true, false) => {
-                let r = base_range(&archive.domain, &archive.e_a, e);
-                (
-                    SuccinctRotation::Vea,
-                    restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, v, &r),
-                )
-            }
-            (Some(e), Some(a), None, false, false, true) => {
-                let r = base_range(&archive.domain, &archive.e_a, e);
-                (
-                    SuccinctRotation::Aev,
-                    restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, a, &r),
-                )
-            }
+        match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+            (false, false, false, true, false, false) => ConfirmPlan::Membership {
+                axis: Axis::Entity,
+            },
+            (false, false, false, false, true, false) => ConfirmPlan::Membership {
+                axis: Axis::Attribute,
+            },
+            (false, false, false, false, false, true) => ConfirmPlan::Membership {
+                axis: Axis::Value,
+            },
+            (true, false, false, false, true, false) => ConfirmPlan::Base {
+                bound: Axis::Entity,
+                rotation: SuccinctRotation::Eva,
+            },
+            (true, false, false, false, false, true) => ConfirmPlan::Base {
+                bound: Axis::Entity,
+                rotation: SuccinctRotation::Eav,
+            },
+            (false, true, false, true, false, false) => ConfirmPlan::Base {
+                bound: Axis::Attribute,
+                rotation: SuccinctRotation::Ave,
+            },
+            (false, true, false, false, false, true) => ConfirmPlan::Base {
+                bound: Axis::Attribute,
+                rotation: SuccinctRotation::Aev,
+            },
+            (false, false, true, true, false, false) => ConfirmPlan::Base {
+                bound: Axis::Value,
+                rotation: SuccinctRotation::Vae,
+            },
+            (false, false, true, false, true, false) => ConfirmPlan::Base {
+                bound: Axis::Value,
+                rotation: SuccinctRotation::Vea,
+            },
+            (false, true, true, true, false, false) => ConfirmPlan::Restrict {
+                outer: Axis::Attribute,
+                inner: Axis::Value,
+                inner_col: SuccinctRotation::Aev,
+                rotation: SuccinctRotation::Vae,
+            },
+            (true, false, true, false, true, false) => ConfirmPlan::Restrict {
+                outer: Axis::Entity,
+                inner: Axis::Value,
+                inner_col: SuccinctRotation::Eav,
+                rotation: SuccinctRotation::Vea,
+            },
+            (true, true, false, false, false, true) => ConfirmPlan::Restrict {
+                outer: Axis::Entity,
+                inner: Axis::Attribute,
+                inner_col: SuccinctRotation::Eva,
+                rotation: SuccinctRotation::Aev,
+            },
             _ => unreachable!("invalid trible constraint state"),
-        };
-
-        if r.is_empty() {
-            // Every restriction through an empty row range is empty; the CPU
-            // arm kills every candidate without probing, and so do we.
-            cands.kill_all();
-            return Ok(());
         }
-        self.gpu.confirm_range_gpu(rotation, &r, cands)
+    }
+
+    /// The `axis` position's value in each of the frontier rows named by
+    /// `rows` — the parent table's payload.
+    fn parent_values(
+        &self,
+        axis: Axis,
+        frontier: &Frontier<'_>,
+        rows: &[u32],
+    ) -> jerky::Result<Vec<RawInline>> {
+        let term = self.term(axis);
+        let mut values = Vec::with_capacity(rows.len());
+        for &row in rows {
+            let binding = frontier.row(row as usize);
+            let value = term.position_value(&binding).ok_or_else(|| {
+                jerky::Error::invalid_argument(format!(
+                    "frontier row {row} left a bound position of the arm unbound"
+                ))
+            })?;
+            values.push(*value);
+        }
+        Ok(values)
+    }
+
+    /// The device evaluation of one confirm call over a whole frontier,
+    /// mirroring the CPU arm dispatch. Returns the number of parent-table
+    /// rows the dispatch resolved.
+    fn confirm_gpu(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) -> jerky::Result<usize> {
+        match self.plan(variable, &frontier.row(0)) {
+            ConfirmPlan::Membership { axis } => {
+                self.gpu.confirm_membership_gpu(axis, cands)?;
+                Ok(0)
+            }
+            ConfirmPlan::Base { bound, rotation } => {
+                let (slots, rows) = parent_table(frontier, cands)?;
+                let values = self.parent_values(bound, frontier, &rows)?;
+                self.gpu
+                    .confirm_base_gpu(bound, rotation, &slots, &values, cands)?;
+                Ok(rows.len())
+            }
+            ConfirmPlan::Restrict {
+                outer,
+                inner,
+                inner_col,
+                rotation,
+            } => {
+                let (slots, rows) = parent_table(frontier, cands)?;
+                let outer_values = self.parent_values(outer, frontier, &rows)?;
+                let inner_values = self.parent_values(inner, frontier, &rows)?;
+                self.gpu.confirm_restrict_gpu(
+                    outer,
+                    inner,
+                    inner_col,
+                    rotation,
+                    &slots,
+                    &outer_values,
+                    &inner_values,
+                    cands,
+                )?;
+                Ok(rows.len())
+            }
+        }
     }
 }
 
@@ -798,43 +1200,39 @@ where
         self.inner.estimate(variable, binding)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        self.inner.propose(variable, binding, proposals)
-    }
-
-    fn propose_chunk(
+    fn propose(
         &self,
         variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
-        self.inner
-            .propose_chunk(variable, binding, cursor, budget, proposals)
+    ) {
+        self.inner.propose(variable, frontier, proposals)
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if !self.term_e.is_var(variable)
             && !self.term_a.is_var(variable)
             && !self.term_v.is_var(variable)
         {
             return;
         }
+        if frontier.is_empty() || cands.is_empty() {
+            return;
+        }
         let live = count_live(cands);
         if live < self.gpu.min_confirm_batch {
             self.gpu.stats.record_cpu(cands.len());
-            self.inner.confirm(variable, binding, cands);
+            self.inner.confirm(variable, frontier, cands);
             return;
         }
-        match self.confirm_gpu(variable, binding, cands) {
-            Ok(()) => self.gpu.stats.record_gpu(cands.len()),
+        match self.confirm_gpu(variable, frontier, cands) {
+            Ok(parents) => self.gpu.stats.record_gpu(cands.len(), parents),
             Err(_) => {
                 // The helpers only write liveness after a complete verdict
                 // readback, so a failed dispatch left the region untouched
                 // and the CPU arm computes it from scratch.
                 self.gpu.stats.record_error();
-                self.inner.confirm(variable, binding, cands);
+                self.inner.confirm(variable, frontier, cands);
             }
         }
     }

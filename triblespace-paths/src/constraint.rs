@@ -1,6 +1,6 @@
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, RawTerm, Term, VariableId,
+    Binding, Candidates, Constraint, Frontier, ProposalBuffer, RawTerm, Term, VariableId,
     VariableSet,
 };
 
@@ -66,44 +66,36 @@ impl<'a> Constraint<'a> for PathConstraint<'a> {
         self.candidates(variable, binding).map(<[u32]>::len)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        if let Some(ordinals) = self.candidates(variable, binding) {
-            proposals.extend(self.index.values(ordinals));
-        }
-    }
-
-    fn propose_chunk(
+    /// Proposes each row's own ordinal run. Which endpoint is bound is
+    /// uniform across the batch; the bound *value* is not, so the ordinal
+    /// slice is looked up once per row.
+    fn propose(
         &self,
         variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
-        let Some(ordinals) = self.candidates(variable, binding) else {
-            return false;
-        };
-        let start = if cursor.started {
-            ordinals.partition_point(|&ordinal| self.index.value(ordinal) <= cursor.key)
-        } else {
-            0
-        };
-        if budget == 0 {
-            return start < ordinals.len();
+    ) {
+        for row in 0..frontier.len() {
+            if let Some(ordinals) = self.candidates(variable, &frontier.row(row)) {
+                proposals.open(row as u32);
+                proposals.extend(self.index.values(ordinals));
+            }
         }
-        cursor.started = true;
-        let end = start.saturating_add(budget).min(ordinals.len());
-        for value in self.index.values(&ordinals[start..end]) {
-            cursor.key = value;
-            proposals.push(value);
-        }
-        end < ordinals.len()
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, candidates: &mut Candidates<'_>) {
-        if let Some(ordinals) = self.candidates(variable, binding) {
-            candidates.retain(|candidate| self.index.ordinal_in(ordinals, candidate));
-        }
+    /// Confirms each candidate against its own row's ordinal run — one
+    /// lookup per run of equal parent tags rather than one per candidate.
+    fn confirm(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        candidates: &mut Candidates<'_>,
+    ) {
+        candidates.for_each_parent(|row, run| {
+            if let Some(ordinals) = self.candidates(variable, &frontier.row(row as usize)) {
+                run.retain(|candidate| self.index.ordinal_in(ordinals, candidate));
+            }
+        });
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {

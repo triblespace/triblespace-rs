@@ -84,6 +84,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compressed-trie shape invariant. This adds one thin eight-byte Arc to PATCH
   while restoring the ownership-neutral 48-byte Branch header (sixteen bytes
   smaller than the per-Branch owner design).
+- **Breaking: `propose` and `confirm` operate on a frontier of bindings.** Both
+  methods take a `Frontier` — the whole collection of parent bindings at one
+  point of the search — instead of a single `Binding`; a single binding is a
+  frontier of one (`BindingStore::frontier`, `Frontier::default`) and behaves
+  exactly as before. `ProposalBuffer` is segmented (a proposer calls
+  `open(row)`; every entry carries a parent tag) and `Candidates` exposes the
+  tags plus `for_each_parent`, so one region spans a whole batch. The engine
+  expands up to `DEFAULT_FRONTIER_WIDTH` = 16384 rows per step
+  (`Query::with_frontier_width` to tune; width 1 is the pre-batching shape).
+  Motivation is measured: a region-size census over dblp finds a median
+  confirm region of 1–7 candidates at every scale, so batched tiers — the GPU
+  path's 16384-candidate crossover above all — engaged only at the root. The
+  variable choice stays per row: a row is never moved onto a variable it did
+  not choose, the frontier is partitioned by each row's own adaptive choice,
+  and `FrontierStats` reports how often that fragmented. Bag semantics and
+  worst-case optimality are unchanged; the cost is frontier memory,
+  `O(width × variables × depth)`.
+- **Breaking: `Constraint::estimate`'s relevance must not depend on bound
+  *values*.** Whether it answers `Some` or `None` may depend only on *which*
+  variables are bound, never on what they are bound to. Composites now read
+  relevance off the batch rather than per binding — `IntersectionConstraint`
+  ORs it across the rows in `propose` and takes it from row 0 in `confirm` —
+  and both are exact only under this rule. Every in-tree constraint already
+  satisfies it, including `EqualityConstraint`, whose `None` keys on a peer's
+  *boundness* and so is uniform across a frontier; but an out-of-tree
+  constraint that keys on the bound value instead is the natural way to get
+  this wrong, and it fails as **wrong rows in either direction**, not as a
+  panic. Debug builds now assert it (exhaustively in `propose`, which visits
+  every row anyway; sampled with a stride in `confirm`), and
+  `tests/estimate_relevance_contract.rs` pins the enforcement.
+- **The frontier width is a ceiling, and a level's first chunk is one
+  binding.** `INITIAL_FRONTIER_WIDTH` = 1; every chunk after it is the query's
+  full width. A query the caller stops after one row — `exists!`, `.next()` —
+  now does exactly the work the pre-batching engine did instead of
+  materialising a 16384-wide root frontier it will throw away; measured on a
+  first-row-only join, the flat engine was **8.8x** slower than pre-batching
+  and one narrow chunk closes the whole gap. This is the same insight as the
+  `INITIAL_CHUNK`/`WIDEN_FACTOR` pair removed with the widening path, and as
+  the residual engine's rule that search width grows geometrically after
+  negative work — recovered at the frontier, which is the layer that can
+  actually carry it, rather than at per-parent chunking, which could not.
+  A geometric 1, 2, 4, … ramp was measured and rejected: its last chunk holds
+  only half a level's candidates, so it took a fixture's widest frontier from
+  2048 rows to 512 and its mean from 768 to 31 while raising expansions from 3
+  to 74, for the same rows and proposals — a quarter of the peak width, and
+  10% slower on a full drain.
+- **A 1:1 descent reuses the parent frontier's matrices instead of copying
+  them.** When a level's draw yields exactly one surviving child per parent
+  row, in order, over the whole frontier, with nothing left pending, no row
+  was gained, lost or reordered — so the child block *is* the parent block
+  with one more slot written, and the child estimate rows are bit-identical
+  to the parent's. Both matrices are handed down rather than rebuilt. The
+  engine's standing invariants are what license it: confirmers may only kill
+  candidates and never revive them, and buffers are write-once, so the newly
+  bound variable's slot was previously unwritten. Ownership needs no separate
+  flag — the matrices already sit behind `Arc`, so `Arc::get_mut` succeeds
+  exactly when no rayon split holds the other half and the copying path runs
+  when it does not. `FrontierStats::inplace_descents`/`copied_descents`
+  report the split. This is what a chain-shaped query (fan-out 1 at every
+  level, where batching can never pay because there are no sibling parents)
+  stops being charged for. The fast path is gated on `proposed == rows`, an
+  `O(1)` test from what the engine already knows, so a fan-out descent never
+  pays for a path it cannot take: recognising a 1:1 draw needs the child rows
+  deferred until its shape is known, and charging that second pass to every
+  descent measured +10% and +20% on two fixtures.
+- **`FrontierStats::widest` reports the widest frontier a search reached.**
+  `mean_width` says what the typical expansion looked like; it cannot say
+  whether the ceiling was ever approached, and without that a benchmark
+  cannot distinguish "the engine does not scale with depth" from "the fixture
+  never filled a batch".
+- **Breaking: `propose_chunk`, `ProposeCursor` and the widening path are
+  removed.** No leaf source ever overrode them, they addressed a
+  time-to-first-result problem that pure conjunctive queries do not have
+  (depth-first already yields the instant the stack bottoms out), and their one
+  real case — a wide root — is a lottery on iteration order rather than a work
+  saving. With widening gone no level is appended to while its variable is
+  bound, so `BindingStore` loses its detached-buffer special case and asserts
+  the buffer-stability invariant instead. Narrowing a wide level remains open;
+  galloping intersection is the standing candidate, and it will not be bought
+  with a seek requirement on sources.
+- **`triblespace-gpu` confirms a whole frontier in one dispatch.**
+  `range_probe_fill_kernel` takes per-candidate row-range arrays instead of two
+  scalars, so the CPU computes one archive band per frontier row and the device
+  resolves each candidate through its parent tag. Membership arms are
+  parent-independent and needed no change. Verdicts still merge by word-wise
+  AND, and the parity suite still pins CPU and device to identical liveness
+  words.
+
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
   typed-Program engine is gone — `residual.rs`, the Program VM, query-time
   regular-path evaluation (`path!` and `RegularPathConstraint`), and the

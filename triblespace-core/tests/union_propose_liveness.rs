@@ -1,18 +1,9 @@
-//! `UnionConstraint::propose` must not resurrect entries that a nested
-//! constraint already killed inside its own propose.
-//!
-//! The union needs set semantics, so it sort-dedups its freshly appended
-//! region and republishes it with `rewrite_region`. Reading that region
-//! through the `Deref` yields values without liveness, and `rewrite_region`
-//! marks everything it is handed as live — so a value an inner `and!` arm
-//! killed on the way past comes back from the dead. The buffer is kill-only;
-//! this is the one primitive that could violate it.
+//! Does `UnionConstraint::propose`'s sort-dedup rewrite resurrect entries
+//! that a nested `IntersectionConstraint` already killed?
 
 use triblespace_core::inline::RawInline;
-use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, Query, VariableId, VariableSet,
+    Binding, Candidates, Constraint, Frontier, ProposalBuffer, VariableId, VariableSet,
 };
 
 fn v(i: u8) -> RawInline {
@@ -21,7 +12,7 @@ fn v(i: u8) -> RawInline {
     x
 }
 
-/// Proposes `values`, and confirms membership in `values`.
+/// Proposes `values` (per row) and confirms membership in `values`.
 struct Src {
     variable: VariableId,
     values: Vec<RawInline>,
@@ -34,23 +25,24 @@ impl<'a> Constraint<'a> for Src {
         s.set(self.variable);
         s
     }
-
     fn estimate(&self, var: VariableId, _b: &Binding) -> Option<usize> {
         (var == self.variable).then_some(self.estimate)
     }
-
-    fn propose(&self, var: VariableId, _b: &Binding, p: &mut ProposalBuffer) {
-        if var == self.variable {
+    fn propose(&self, var: VariableId, f: &Frontier<'_>, p: &mut ProposalBuffer) {
+        if var != self.variable {
+            return;
+        }
+        for row in 0..f.len() {
+            p.open(row as u32);
             p.extend_from_slice(&self.values);
         }
     }
-
-    fn confirm(&self, var: VariableId, _b: &Binding, c: &mut Candidates<'_>) {
-        if var == self.variable {
-            c.retain(|x| self.values.contains(x));
+    fn confirm(&self, var: VariableId, _f: &Frontier<'_>, c: &mut Candidates<'_>) {
+        if var != self.variable {
+            return;
         }
+        c.retain(|x| self.values.contains(x));
     }
-
     fn satisfied(&self, b: &Binding) -> bool {
         match b.get(self.variable) {
             Some(x) => self.values.contains(x),
@@ -61,13 +53,11 @@ impl<'a> Constraint<'a> for Src {
 
 type Dyn = Box<dyn Constraint<'static> + Send + Sync>;
 
-/// `or!( and!(wide, narrow), and!(other) )` over one variable.
+/// `or!( and!(wide, narrow), and!(other) )` on one variable.
 ///
-/// `wide` proposes {1,2,3} and `narrow` admits only {1}, so the first arm
-/// contributes {1} alone — `narrow` kills 2 and 3 while the intersection is
-/// still inside its own propose. The second arm contributes {5}. The union
-/// is therefore {1, 5}.
-fn rows() -> Vec<RawInline> {
+/// `wide` proposes {1,2,3}; `narrow` confirms only {1}. Correct answer is
+/// {1} ∪ {5} = {1,5}.
+fn rows(width: usize) -> Vec<RawInline> {
     let wide = Src {
         variable: 0,
         values: vec![v(1), v(2), v(3)],
@@ -76,9 +66,8 @@ fn rows() -> Vec<RawInline> {
     let narrow = Src {
         variable: 0,
         values: vec![v(1)],
-        // Deliberately the larger estimate, so the intersection picks `wide`
-        // as proposer and leaves `narrow` to confirm — which is what makes
-        // the kills happen inside the arm's own propose.
+        // Deliberately a LARGER estimate so the intersection lets `wide`
+        // propose and `narrow` confirm (i.e. kill 2 and 3).
         estimate: 100,
     };
     let other = Src {
@@ -86,21 +75,99 @@ fn rows() -> Vec<RawInline> {
         values: vec![v(5)],
         estimate: 1,
     };
-
-    let arm_a = IntersectionConstraint::new(vec![Box::new(wide) as Dyn, Box::new(narrow)]);
-    let arm_b = IntersectionConstraint::new(vec![Box::new(other) as Dyn]);
-    let union = UnionConstraint::new(vec![Box::new(arm_a) as Dyn, Box::new(arm_b)]);
-
-    Query::new(union, |b: &Binding| b.get(0).copied()).collect()
+    let arm_a = triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+        Box::new(wide) as Dyn,
+        Box::new(narrow),
+    ]);
+    let arm_b = triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+        Box::new(other) as Dyn,
+    ]);
+    let union = triblespace_core::query::unionconstraint::UnionConstraint::new(vec![
+        Box::new(arm_a) as Dyn,
+        Box::new(arm_b),
+    ]);
+    triblespace_core::query::Query::new(union, |b: &Binding| b.get(0).copied())
+        .with_frontier_width(width)
+        .collect()
 }
 
 #[test]
-fn union_propose_must_not_resurrect_a_nested_arms_kills() {
-    let mut got = rows();
+fn union_must_not_resurrect_a_nested_intersections_kills() {
+    for w in [1usize, 2, 4096] {
+        let mut got = rows(w);
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![v(1), v(5)],
+            "width {w}: union leaked values the inner intersection killed"
+        );
+    }
+}
+
+/// Same shape, but the union is reached through `confirm` rather than
+/// `propose` — a second constraint owns the proposal.
+#[test]
+fn union_confirm_path_is_clean() {
+    let feeder = Src {
+        variable: 0,
+        values: vec![v(1), v(2), v(3), v(5), v(9)],
+        estimate: 1,
+    };
+    let wide = Src {
+        variable: 0,
+        values: vec![v(1), v(2), v(3)],
+        estimate: 3,
+    };
+    let narrow = Src {
+        variable: 0,
+        values: vec![v(1)],
+        estimate: 100,
+    };
+    let other = Src {
+        variable: 0,
+        values: vec![v(5)],
+        estimate: 4,
+    };
+    let arm_a = triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+        Box::new(wide) as Dyn,
+        Box::new(narrow),
+    ]);
+    let arm_b = triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+        Box::new(other) as Dyn,
+    ]);
+    let union = triblespace_core::query::unionconstraint::UnionConstraint::new(vec![
+        Box::new(arm_a) as Dyn,
+        Box::new(arm_b),
+    ]);
+    let outer = triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+        Box::new(feeder) as Dyn,
+        Box::new(union),
+    ]);
+    let mut got: Vec<RawInline> =
+        triblespace_core::query::Query::new(outer, |b: &Binding| b.get(0).copied())
+            .with_frontier_width(4096)
+            .collect();
     got.sort_unstable();
+    assert_eq!(got, vec![v(1), v(5)]);
+}
+
+/// Direct unit-level probe of the buffer primitive itself.
+#[test]
+fn rewrite_region_resurrects_dead_entries() {
+    let mut buf = ProposalBuffer::new();
+    buf.open(0);
+    buf.push(v(1));
+    buf.push(v(2));
+    buf.push(v(3));
+    // Someone confirms and kills entry 1.
+    buf.region(0).kill(1);
+    assert_eq!(buf.count_live(0), 2);
+
+    let fresh: Vec<(u32, RawInline)> = buf.tagged(0).collect();
+    buf.rewrite_region(0, fresh);
     assert_eq!(
-        got,
-        vec![v(1), v(5)],
-        "union republished values the inner intersection had already killed"
+        buf.count_live(0),
+        2,
+        "tagged()+rewrite_region() round trip revived a killed entry"
     );
 }

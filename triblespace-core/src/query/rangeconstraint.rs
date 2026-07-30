@@ -60,12 +60,18 @@ impl<'a> Constraint<'a> for InlineRange {
     }
 
     /// Does not propose — the paired TribleSet constraint handles proposals.
-    fn propose(&self, _variable: VariableId, _binding: &Binding, _proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        _variable: VariableId,
+        _frontier: &Frontier<'_>,
+        _proposals: &mut ProposalBuffer,
+    ) {
         // Intentionally empty: this constraint only confirms.
     }
 
-    /// Retains only proposals whose raw bytes fall within [min, max] inclusive.
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// Retains only proposals whose raw bytes fall within [min, max]
+    /// inclusive — parent-independent, so the tags are ignored.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if self.variable == variable {
             for i in 0..cands.len() {
                 let v = &cands.values()[i];

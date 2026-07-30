@@ -1,6 +1,7 @@
 use super::*;
 use crate::query::Binding;
 use crate::query::Constraint;
+use crate::query::Frontier;
 use crate::query::Candidates;
 use crate::query::ProposalBuffer;
 use crate::query::Variable;
@@ -92,18 +93,27 @@ where
         Some(self.cached_estimate)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if variable != self.variable_v {
             return;
         }
         let code_range = self.archive.domain.search_range(&self.min, &self.max);
-        proposals.extend(
-            self.archive
-                .enumerate_domain_in_range(&self.archive.v_a, code_range),
-        );
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            proposals.extend(
+                self.archive
+                    .enumerate_domain_in_range(&self.archive.v_a, code_range.clone()),
+            );
+        }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// The range test does not depend on the parent binding.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if variable == self.variable_v {
             cands.retain(|v| *v >= self.min && *v <= self.max);
         }

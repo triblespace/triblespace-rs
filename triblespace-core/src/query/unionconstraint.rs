@@ -1,5 +1,3 @@
-use std::mem;
-
 use super::*;
 use itertools::Itertools;
 
@@ -87,45 +85,92 @@ where
             .reduce(|acc, e| acc + e)
     }
 
-    /// Collects proposals from every *satisfied* variant, then sorts and
-    /// deduplicates. Dead variants (where [`satisfied`](Constraint::satisfied)
-    /// returns `false`) are skipped so their stale bindings cannot inject
-    /// values that no live variant would produce.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+    /// Collects proposals from every variant that is satisfied *for a
+    /// given row*, then sorts and deduplicates per row. Dead variants
+    /// (where [`satisfied`](Constraint::satisfied) returns `false`) are
+    /// skipped so their stale bindings cannot inject values that no live
+    /// variant would produce.
+    ///
+    /// With a batch, "dead" is per row: a variant alive nowhere is skipped
+    /// entirely (the single-binding behaviour), a variant alive everywhere
+    /// proposes untouched, and a variant alive for only some rows has the
+    /// rest of its contribution dropped again before the sort.
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        let rows = frontier.len();
         let base = proposals.len();
-        self.constraints
-            .iter()
-            .filter(|c| c.satisfied(binding))
-            .for_each(|c| c.propose(variable, binding, proposals));
+        let mut satisfied = vec![false; rows];
+        for c in self.constraints.iter() {
+            let mut any = false;
+            let mut all = true;
+            for (row, slot) in satisfied.iter_mut().enumerate() {
+                *slot = c.satisfied(&frontier.row(row));
+                any |= *slot;
+                all &= *slot;
+            }
+            if !any {
+                continue;
+            }
+            let variant_base = proposals.len();
+            c.propose(variable, frontier, proposals);
+            if !all {
+                proposals.retain_region(variant_base, |row, _| satisfied[row as usize]);
+            }
+        }
         // Freshness rule: a proposer may rewrite its own freshly-appended
         // region before returning — indices freeze once the caller can see
-        // them. The union's set semantics need the sort-dedup.
-        //
-        // Read `live_values`, not the values alone: a variant is free to kill
-        // inside its own propose (an `and!` arm whose narrow side confirms as
-        // it goes), and `rewrite_region` republishes everything it is handed
-        // as live. Collecting through the `Deref` would carry those corpses
-        // back in — the buffer is kill-only, so a value that died here must
-        // stay dead.
-        let mut fresh: Vec<RawInline> = proposals.live_values(base).copied().collect();
+        // them. The union's set semantics need the sort-dedup, and the key
+        // is `(row, value)`: the set is per parent binding, not across the
+        // batch. Sorting by that key also restores contiguous segments.
+        // `tagged` yields only live entries, which matters here: a variant
+        // may kill inside its own propose (an `and!` arm whose narrow side
+        // confirms as it goes), and `rewrite_region` republishes everything
+        // it is handed as live, so reading the dead back would resurrect
+        // them.
+        let mut fresh: Vec<(u32, RawInline)> = proposals.tagged(base).collect();
         fresh.sort_unstable();
         fresh.dedup();
         proposals.rewrite_region(base, fresh);
     }
 
-    /// Confirms proposals against every *satisfied* variant independently
-    /// (each on a scratch copy of the region's liveness) and ors the per-variant
-    /// survivors together. A value passes if *any* live variant confirms it.
-    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
-        let mut any = vec![0u32; cands.len()];
-        let mut scratch;
-        for c in self.constraints.iter().filter(|c| c.satisfied(binding)) {
-            scratch = cands.live_words();
-            c.confirm(variable, binding, &mut cands.scratch(&mut scratch));
-            or_words(&mut any, &scratch);
+    /// Confirms proposals against every variant that is satisfied for the
+    /// candidate's own row (each on a scratch copy of the region's
+    /// liveness) and ors the per-variant survivors together. A value passes
+    /// if *any* live variant confirms it.
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
+        let rows = frontier.len();
+        let mut any_live = vec![0u32; cands.len()];
+        let mut satisfied = vec![false; rows];
+        for c in self.constraints.iter() {
+            let mut any = false;
+            let mut all = true;
+            for (row, slot) in satisfied.iter_mut().enumerate() {
+                *slot = c.satisfied(&frontier.row(row));
+                any |= *slot;
+                all &= *slot;
+            }
+            if !any {
+                continue;
+            }
+            let mut scratch = cands.live_words();
+            if !all {
+                // A variant that is dead for a row must not vote for that
+                // row's candidates.
+                for (i, word) in scratch.iter_mut().enumerate() {
+                    if !satisfied[cands.parent(i) as usize] {
+                        *word = 0;
+                    }
+                }
+            }
+            c.confirm(variable, frontier, &mut cands.scratch(&mut scratch));
+            or_words(&mut any_live, &scratch);
         }
         for i in 0..cands.len() {
-            if any[i] == 0 {
+            if any_live[i] == 0 {
                 cands.kill(i);
             }
         }

@@ -55,36 +55,45 @@ impl<'c> Constraint<'c> for EqualityConstraint {
         }
     }
 
-    /// When the peer variable is bound, proposes its value.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        if variable == self.a {
-            if let Some(v) = binding.get(self.b) {
-                proposals.push(*v);
-            }
+    /// Proposes each row's own peer value — the peer is bound across the
+    /// whole batch or unbound across the whole batch, but the *value*
+    /// differs per row, so this is one push per row.
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        let peer = if variable == self.a {
+            self.b
         } else if variable == self.b {
-            if let Some(v) = binding.get(self.a) {
+            self.a
+        } else {
+            return;
+        };
+        for row in 0..frontier.len() {
+            if let Some(v) = frontier.row(row).get(peer) {
+                proposals.open(row as u32);
                 proposals.push(*v);
             }
         }
     }
 
-    /// Retains only proposals that match the peer variable's binding.
-    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+    /// Retains only proposals that match their own row's peer binding.
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         let peer = if variable == self.a {
-            binding.get(self.b)
+            self.b
         } else if variable == self.b {
-            binding.get(self.a)
+            self.a
         } else {
             return;
         };
-        if let Some(peer) = peer {
-            for i in 0..cands.len() {
-                let v = &cands.values()[i];
-                if cands.is_live(i) && v != peer {
-                    cands.kill(i);
-                }
-            }
-        }
+        cands.for_each_parent(|row, run| {
+            let Some(peer) = frontier.row(row as usize).get(peer) else {
+                return;
+            };
+            run.retain(|value| value == peer);
+        });
     }
 
     /// Returns `false` when both variables are bound to different values.

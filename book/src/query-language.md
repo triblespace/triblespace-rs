@@ -480,12 +480,17 @@ the protocol can participate in `find!`. Four methods are required:
 |---|---|
 | `variables` | Declare the variables touched by the constraint. |
 | `estimate` | Quote a candidate count for one variable under the current binding, or `None` if the variable is not yours. |
-| `propose` | Append candidate values for a variable to the proposal buffer. |
-| `confirm` | Kill candidates proposed by someone else that violate this constraint. |
+| `propose` | Append candidate values for a variable to the proposal buffer, for every binding in the frontier. |
+| `confirm` | Kill candidates proposed by someone else that violate this constraint under their own binding. |
 
-Three more have defaults you can override: `propose_chunk` (resumable
-proposing, defaulting to "everything at once"), `satisfied` (defaulting to
-`true`), and `influence` (defaulting to "every variable I touch except this
+`propose` and `confirm` take a `Frontier` — a batch of parent bindings, of
+which a single binding is the width-1 case. Loop over `Frontier::rows`, calling
+`ProposalBuffer::open(row)` before each row's candidates; on the confirm side,
+ignore the parent tags if your verdict does not depend on the binding, or walk
+the region with `Candidates::for_each_parent` if it does.
+
+Two more methods have defaults you can override: `satisfied` (defaulting to
+`true`) and `influence` (defaulting to "every variable I touch except this
 one").
 
 The rules a custom constraint has to respect are short:

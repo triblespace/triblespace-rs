@@ -1,5 +1,6 @@
 use crate::query::Binding;
 use crate::query::Constraint;
+use crate::query::Frontier;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -72,7 +73,12 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         Some(self.cached_estimate)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if variable != self.variable_v {
             return;
         }
@@ -80,14 +86,18 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         // VEA tree order: V(32) → E(16) → A(16).
         // With empty prefix, infixes_range on V(32 bytes) gives us all
         // values in [min, max]. The trie prunes branches outside the range.
-        self.set
-            .vea
-            .infixes_range::<0, INLINE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
-                proposals.push(*v);
-            });
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            self.set
+                .vea
+                .infixes_range::<0, INLINE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
+                    proposals.push(*v);
+                });
+        }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// The range test does not depend on the parent binding.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if variable == self.variable_v {
             cands.retain(|v| *v >= self.min && *v <= self.max);
         }

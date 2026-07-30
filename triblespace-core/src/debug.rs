@@ -2,6 +2,7 @@
 pub mod query {
     use crate::query::Binding;
     use crate::query::Constraint;
+    use crate::query::Frontier;
     use crate::query::VariableId;
     use crate::query::VariableSet;
     use crate::inline::RawInline;
@@ -34,13 +35,23 @@ use crate::query::ProposalBuffer;
             self.constraint.estimate(variable, binding)
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+        fn propose(
+            &self,
+            variable: VariableId,
+            frontier: &Frontier<'_>,
+            proposals: &mut ProposalBuffer,
+        ) {
             self.record.borrow_mut().push(variable);
-            self.constraint.propose(variable, binding, proposals);
+            self.constraint.propose(variable, frontier, proposals);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
-            self.constraint.confirm(variable, binding, cands);
+        fn confirm(
+            &self,
+            variable: VariableId,
+            frontier: &Frontier<'_>,
+            cands: &mut Candidates<'_>,
+        ) {
+            self.constraint.confirm(variable, frontier, cands);
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {
@@ -88,12 +99,22 @@ use crate::query::ProposalBuffer;
             self.estimates[variable].or_else(|| self.constraint.estimate(variable, binding))
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-            self.constraint.propose(variable, binding, proposals);
+        fn propose(
+            &self,
+            variable: VariableId,
+            frontier: &Frontier<'_>,
+            proposals: &mut ProposalBuffer,
+        ) {
+            self.constraint.propose(variable, frontier, proposals);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
-            self.constraint.confirm(variable, binding, cands);
+        fn confirm(
+            &self,
+            variable: VariableId,
+            frontier: &Frontier<'_>,
+            cands: &mut Candidates<'_>,
+        ) {
+            self.constraint.confirm(variable, frontier, cands);
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {

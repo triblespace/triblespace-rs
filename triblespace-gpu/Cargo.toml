@@ -37,3 +37,7 @@ required-features = ["wgpu"]
 [[test]]
 name = "batch_confirm_parity"
 required-features = ["wgpu"]
+
+[[test]]
+name = "mixed_parent_parity"
+required-features = ["wgpu"]

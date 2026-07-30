@@ -5,6 +5,7 @@ use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::query::Binding;
 use crate::query::Constraint;
+use crate::query::Frontier;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -61,18 +62,27 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         Some(count.min(usize::MAX as u64) as usize)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if variable != self.variable_e {
             return;
         }
-        self.set
-            .eav
-            .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |e| {
-                proposals.push(id_into_value(e));
-            });
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            self.set
+                .eav
+                .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |e| {
+                    proposals.push(id_into_value(e));
+                });
+        }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// The range test does not depend on the parent binding.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if variable == self.variable_e {
             cands.retain(|v| {
                 let Some(id) = id_from_value(v) else {
@@ -143,18 +153,27 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         Some(count.min(usize::MAX as u64) as usize)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if variable != self.variable_a {
             return;
         }
-        self.set
-            .aev
-            .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |a| {
-                proposals.push(id_into_value(a));
-            });
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            self.set
+                .aev
+                .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |a| {
+                    proposals.push(id_into_value(a));
+                });
+        }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// The range test does not depend on the parent binding.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if variable == self.variable_a {
             cands.retain(|v| {
                 let Some(id) = id_from_value(v) else {

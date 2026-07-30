@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    Binding, BindingStore, Constraint, ProposalBuffer, ProposeCursor, Query, Variable,
+    Binding, BindingStore, Constraint, Frontier, ProposalBuffer, Query, Variable,
 };
 use triblespace_paths::{
     Automaton, GraphEdge, PathConstraint, PathIndex, PathSummary, Step, Transition,
@@ -408,7 +408,7 @@ fn endpoint_views_are_sorted_exact_and_mutually_derived() {
 }
 
 #[test]
-fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
+fn constraint_supports_constants_and_repeated_variables() {
     let index =
         PathIndex::from_edges(plus(6), [edge(1, 6, 2), edge(2, 6, 3), edge(3, 6, 4)]).unwrap();
     let start = Variable::<UnknownInline>::new(0);
@@ -419,21 +419,22 @@ fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
     assert_eq!(constraint.estimate(start.index, &binding.view()), Some(3));
     binding.bind(start.index, &vertex(1));
     assert_eq!(constraint.estimate(end.index, &binding.view()), Some(3));
-    let mut chunked = ProposalBuffer::new();
-    let mut cursor = ProposeCursor::default();
-    assert!(constraint.propose_chunk(end.index, &binding.view(), &mut cursor, 0, &mut chunked));
-    assert!(!cursor.started);
-    while constraint.propose_chunk(end.index, &binding.view(), &mut cursor, 1, &mut chunked) {}
+    let mut proposed = ProposalBuffer::new();
+    constraint.propose(end.index, &binding.frontier(), &mut proposed);
     assert_eq!(
-        chunked.live_values(0).copied().collect::<Vec<_>>(),
+        proposed.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(2), vertex(3), vertex(4)]
     );
 
-    binding.unset(start.index);
+    let mut binding = BindingStore::new();
     binding.bind(end.index, &vertex(4));
     let mut candidates = ProposalBuffer::new();
     candidates.extend([vertex(1), vertex(2), vertex(4)]);
-    constraint.confirm(start.index, &binding.view(), &mut candidates.region(0));
+    constraint.confirm(
+        start.index,
+        &binding.frontier(),
+        &mut candidates.region(0),
+    );
     assert_eq!(
         candidates.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(1), vertex(2)]
@@ -458,7 +459,7 @@ fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
     assert_eq!(same.estimate(start.index, &Binding::default()), Some(2));
     assert!(same.satisfied(&Binding::default()));
     let mut proposals = ProposalBuffer::new();
-    same.propose(start.index, &Binding::default(), &mut proposals);
+    same.propose(start.index, &Frontier::default(), &mut proposals);
     assert_eq!(
         proposals.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(1), vertex(2)]
@@ -466,7 +467,10 @@ fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
 }
 
 #[test]
-fn zero_inline_is_not_confused_with_an_unstarted_chunk_cursor() {
+fn a_zero_vertex_is_proposed_like_any_other() {
+    // The all-zero inline used to double as "cursor not started" in the
+    // resumable-propose path; that path is gone, but a zero-valued
+    // endpoint is still a real vertex and must survive proposing.
     let index = PathIndex::from_edges(
         plus(6),
         [GraphEdge {
@@ -478,28 +482,45 @@ fn zero_inline_is_not_confused_with_an_unstarted_chunk_cursor() {
     .unwrap();
     let start = Variable::<UnknownInline>::new(0);
     let constraint = index.constraint(start, Inline::<UnknownInline>::new(vertex(1)));
-    let mut cursor = ProposeCursor::default();
     let mut proposals = ProposalBuffer::new();
-
-    assert!(constraint.propose_chunk(
-        start.index,
-        &Binding::default(),
-        &mut cursor,
-        0,
-        &mut proposals,
-    ));
-    assert!(!cursor.started);
-    assert!(!constraint.propose_chunk(
-        start.index,
-        &Binding::default(),
-        &mut cursor,
-        1,
-        &mut proposals,
-    ));
+    constraint.propose(start.index, &Frontier::default(), &mut proposals);
     assert_eq!(
         proposals.live_values(0).copied().collect::<Vec<_>>(),
         vec![[0; 32]]
     );
+}
+
+#[test]
+fn propose_segments_a_batch_by_parent_row() {
+    // Two parents with different bound starts: one propose call, one
+    // region, each candidate tagged with the row it belongs to.
+    let index =
+        PathIndex::from_edges(plus(6), [edge(1, 6, 2), edge(2, 6, 3), edge(3, 6, 4)]).unwrap();
+    let start = Variable::<UnknownInline>::new(0);
+    let end = Variable::<UnknownInline>::new(1);
+    let constraint = PathConstraint::new(&index, start, end);
+
+    let mut first = BindingStore::new();
+    first.bind(start.index, &vertex(1));
+    let mut second = BindingStore::new();
+    second.bind(start.index, &vertex(2));
+
+    // Each store is a frontier of one; proposing over both in turn gives
+    // the same tagged region a batched source would produce in one call.
+    let mut proposals = ProposalBuffer::new();
+    constraint.propose(end.index, &first.frontier(), &mut proposals);
+    let base = proposals.len();
+    constraint.propose(end.index, &second.frontier(), &mut proposals);
+    proposals.remap_region(base, &[1]);
+
+    // `plus(6)` is transitive: vertex 1 reaches {2,3,4}, vertex 2 reaches
+    // {3,4}. One region, five candidates, each tagged with its own row.
+    assert_eq!(
+        proposals.live_values(0).copied().collect::<Vec<_>>(),
+        vec![vertex(2), vertex(3), vertex(4), vertex(3), vertex(4)]
+    );
+    let tags: Vec<u32> = (0..proposals.len()).map(|i| proposals.parent_of(i)).collect();
+    assert_eq!(tags, vec![0, 0, 0, 1, 1]);
 }
 
 #[test]

@@ -31,9 +31,16 @@
 //! - `harkonnen/F{6..15}/…` — the R2 white-box fixtures, one engine
 //!   decision each. All run everywhere except F10, which is gpu-gated
 //!   because it reads the routing threshold out of `triblespace-gpu`.
-//! - `sparqloscope/<query>/total` — the vendored TRANSLATED registry;
-//!   without a wd Dataset every query records SKIP "dataset absent"
-//!   (the census still lands in the pile).
+//! - `sparqloscope/<query>/total` — the vendored TRANSLATED registry,
+//!   run against the `--data` pile's v2 dataset (resolved through its
+//!   `manifest` branch by [`wd_load`], bounded by `--rung`), with
+//!   `sparqloscope_arch/<query>/total` beside it against the
+//!   `SuccinctArchive` built over the SAME bounded set and
+//!   `sparqloscope_gpu/<query>/total` against that archive on the
+//!   device (gpu-gated). All three must ANSWER identically: a
+//!   disagreement records `gate_fail:cross-arm …` AND exits non-zero.
+//!   A pile with no v2 manifest, or no `--data` at all, records SKIP
+//!   for every query (the census still lands in the pile).
 //!
 //! Panics in any measure are caught (`quiet_catch`) and recorded as
 //! `panic:<reason>` outcomes; the run continues.
@@ -57,6 +64,9 @@ mod ledger;
 
 #[path = "../queries/wd_schema.rs"]
 mod wd_schema;
+
+#[path = "../queries/wd_load.rs"]
+mod wd_load;
 
 #[path = "../queries/sparqloscope.rs"]
 mod queries;
@@ -471,8 +481,8 @@ fn run_arch_queries(
     let archive = {
         let ds = archq::shell(archq::CountingArchive::new(archive));
         println!(
-            "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}",
-            "regions/live-count", "confirms", "max", "p95", "median", ">=thresh"
+            "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}{:>10}",
+            "regions/live-count", "confirms", "max", "p95", "median", ">=thresh", "width"
         );
         for q in archq::arch_queries() {
             ds.facts.reset();
@@ -513,6 +523,78 @@ fn run_arch_queries(
                         answer.value,
                         ds.facts.top_regions(4)
                     );
+                    // The claim under test is "wide regions at EVERY
+                    // level", which the flat histogram above cannot
+                    // distinguish from "one enormous root region".
+                    // Depth = variables already bound at the confirm.
+                    #[cfg(feature = "frontier")]
+                    let widths: std::collections::BTreeMap<usize, u64> =
+                        ds.facts.depth_widths().into_iter().collect();
+                    for (depth, d) in ds.facts.depth_rows() {
+                        #[cfg(feature = "frontier")]
+                        let width = format!(
+                            "{:>10}",
+                            widths.get(&depth).copied().unwrap_or(0)
+                        );
+                        #[cfg(not(feature = "frontier"))]
+                        let width = format!("{:>10}", "n/a");
+                        println!(
+                            "      depth {depth:<2}{:>26}{:>12}{:>11}{:>10}{:>10}{width}",
+                            d.confirms, d.max, d.p95, d.median, d.ge_threshold
+                        );
+                        // The depth resolution is the whole claim ("wide
+                        // regions at EVERY level", not one big root), so
+                        // it belongs on the session axis in the pile and
+                        // not only in this run's stdout.
+                        for (suffix, value) in [
+                            ("confirms", d.confirms),
+                            ("max", d.max),
+                            ("p95", d.p95),
+                            ("median", d.median),
+                            ("ge_threshold", d.ge_threshold),
+                            ("live_total", d.live_total),
+                        ] {
+                            led.outcome(
+                                &format!("arch_regions/{}/depth{depth}/{suffix}", q.name),
+                                "signal",
+                                Some(value),
+                            );
+                        }
+                        #[cfg(feature = "frontier")]
+                        led.outcome(
+                            &format!("arch_regions/{}/depth{depth}/width", q.name),
+                            "signal",
+                            Some(widths.get(&depth).copied().unwrap_or(0)),
+                        );
+                    }
+                    // The engine's own view of the same quantity.
+                    #[cfg(feature = "frontier")]
+                    {
+                        let f = archq::frontier_summary();
+                        println!(
+                            "      frontier: widest {} | expansions {} | mean width {:.1} \
+                             | proposals {} | descents {} in-place / {} copied",
+                            f.widest,
+                            f.expansions,
+                            f.mean_width(),
+                            f.proposals,
+                            f.inplace_descents,
+                            f.copied_descents
+                        );
+                        for (suffix, value) in [
+                            ("frontier_widest", f.widest),
+                            ("frontier_expansions", f.expansions),
+                            ("frontier_rows", f.rows),
+                            ("frontier_inplace", f.inplace_descents),
+                            ("frontier_copied", f.copied_descents),
+                        ] {
+                            led.outcome(
+                                &format!("arch_regions/{}/{suffix}", q.name),
+                                "signal",
+                                Some(value),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -659,6 +741,401 @@ fn run_arch_queries(
                         s.gpu_errors
                     );
                 }
+            }
+        }
+    }
+
+    cross_arm_failure
+}
+
+// ---------------------------------------------------------------------------
+// SPARQLoscope arm
+// ---------------------------------------------------------------------------
+
+/// The measure-key prefixes of the three sparqloscope backings: the
+/// six-PATCH `TribleSet`, the succinct archive built over the SAME
+/// bounded set, and the device wrapper around that archive.
+const SPARQL_GROUPS: [&str; 3] = ["sparqloscope", "sparqloscope_arch", "sparqloscope_gpu"];
+
+/// Record `reason` against every measure the sparqloscope arms would
+/// have produced, and print the per-`Kind` census. An absent measure
+/// and a skipped measure are different facts, so the registry lands in
+/// the pile either way.
+fn skip_sparqloscope(led: &mut ledger::ResultsLedger, reason: &str) {
+    // Without the gpu capability the device arm is not compiled at all,
+    // which is a different reason from the caller's.
+    let gpu_reason = if cfg!(feature = "gpu") { reason } else { "skip:gpu" };
+    let (mut engine_kind, mut fold_kind, mut periphery_kind) = (0usize, 0usize, 0usize);
+    for t in queries::TRANSLATED {
+        match t.kind {
+            queries::Kind::Engine => engine_kind += 1,
+            queries::Kind::Fold => fold_kind += 1,
+            queries::Kind::Periphery => periphery_kind += 1,
+        }
+        for group in SPARQL_GROUPS {
+            let why = if group == "sparqloscope_gpu" { gpu_reason } else { reason };
+            led.outcome(&format!("{group}/{}/total", t.name), why, None);
+        }
+    }
+    for suffix in ARCH_ROUTING_SUFFIXES {
+        led.outcome(
+            &format!("sparqloscope_gpu/routing/{suffix}"),
+            gpu_reason,
+            None,
+        );
+    }
+    println!(
+        "  sparqloscope census              {} {reason} ({engine_kind} engine / {fold_kind} fold / {periphery_kind} periphery)",
+        queries::TRANSLATED.len(),
+    );
+}
+
+/// Stable fold of a query's answer VALUE, used as its cross-iteration
+/// identity.
+///
+/// `Answer::rows` is 1 for the scalar aggregates that make up most of
+/// the registry, so gating on rows would be vacuous — the answer could
+/// change between iterations (or between engine revs) with the gate
+/// still green. The value string is the actual result, so that is what
+/// is held identical.
+fn answer_ident(value: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut h);
+    h.finish() as usize
+}
+
+/// Run one registry monomorphization against one backing, one measure
+/// per query (`<group>/<query>/total`).
+///
+/// Returns each query's answer VALUE (`None` where it panicked) so the
+/// next backing can be gated against it, plus the panic count and
+/// whether a cross-arm disagreement was seen. The registries are
+/// index-aligned by construction (one `registry!` macro, one row list),
+/// so `baseline[i]` and `table[i]` are the same query.
+fn run_sparqloscope_arm<B>(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    group: &str,
+    table: &[queries::Translated<B>],
+    ds: &wd_schema::Dataset<B>,
+    baseline: Option<&[Option<String>]>,
+) -> (Vec<Option<String>>, usize, bool) {
+    let mut answers: Vec<Option<String>> = Vec::with_capacity(table.len());
+    let mut panicked = 0usize;
+    let mut cross_arm_failure = false;
+    for (i, t) in table.iter().enumerate() {
+        let mut m = Measure::new(format!("{group}/{}/total", t.name));
+        let mut value: Option<String> = None;
+        for k in 0..(cfg.arch_warmup + cfg.arch_iters) {
+            let recording = k >= cfg.arch_warmup;
+            m.iterate(recording, base, || {
+                let answer = (t.run)(ds);
+                let ident = answer_ident(&answer.value);
+                value = Some(answer.value);
+                ident
+            });
+        }
+        if m.panicked.is_some() {
+            panicked += 1;
+            value = None;
+        }
+        // The backings must ANSWER identically or the timings beside
+        // each other mean nothing. Compared on the value itself rather
+        // than on `answer_ident`, so the failure line names the two
+        // results instead of two hashes.
+        if let Some(expected) = baseline.and_then(|b| b[i].as_deref()) {
+            if let Some(got) = value.as_deref() {
+                if expected != got {
+                    cross_arm_failure = true;
+                    eprintln!(
+                        "CROSS-ARM IDENTITY FAILURE: {} — TribleSet {expected}, {group} {got}",
+                        t.name
+                    );
+                    m.gate
+                        .get_or_insert(format!("cross-arm {got} vs {expected}"));
+                }
+            }
+        }
+        // `rows_meaningful: false` — the identity is the answer digest,
+        // not a cardinality, so it is not telemetry to report as rows.
+        m.emit(led, false);
+        // Print the answer beside every measure, on every arm. The
+        // cross-arm gate above is only as good as its inputs, and a
+        // reader must be able to see that the arms agree on real
+        // numbers rather than trust that they agreed on nothing.
+        println!("      answer {}", value.as_deref().unwrap_or("<panicked>"));
+        answers.push(value);
+    }
+    (answers, panicked, cross_arm_failure)
+}
+
+/// Load the `--data` dataset pile and run the vendored registry against
+/// every backing the subject offers: the six-PATCH `TribleSet`
+/// (`sparqloscope/…`), the `SuccinctArchive` built over the SAME
+/// bounded set (`sparqloscope_arch/…`), and — under the `gpu`
+/// capability — that archive wrapped in `WgpuSuccinctArchive`
+/// (`sparqloscope_gpu/…`).
+///
+/// All three arms share one load, so the graph under them is identical
+/// by construction and the per-query answers are directly comparable;
+/// a disagreement returns `true` and the runner exits non-zero.
+///
+/// Iteration counts come from `--arch-iters`/`--arch-warmup`, the same
+/// knobs the archive arm uses: one pass of a wide join over a real
+/// dataset costs orders of magnitude more than a synthetic fixture.
+fn run_sparqloscope(led: &mut ledger::ResultsLedger, cfg: &Cfg, base: &Instant) -> bool {
+    // The rpq translations are held out of the registry entirely, so
+    // they skip regardless of whether a dataset loaded.
+    for name in queries::SKIPPED_PATHS {
+        for group in SPARQL_GROUPS {
+            led.outcome(&format!("{group}/{name}/total"), "skip:rpq", None);
+        }
+    }
+
+    let Some(path) = &cfg.data else {
+        skip_sparqloscope(led, "skip:no-data");
+        return false;
+    };
+
+    // The PATCH load is bounded by the same `--rung` the ladder arm
+    // uses, capped by MAX_RAM: a v2 dataset pile holds hundreds of
+    // millions of tribles, of which only a prefix fits in a resident
+    // TribleSet.
+    let budget = cfg.rung.min(MAX_RAM);
+    let loaded = match fixtures::quiet_catch(|| {
+        wd_schema::Dataset::load_pile_patch(path, budget)
+    }) {
+        Ok(Ok(l)) => l,
+        Ok(Err(e)) => {
+            println!("  sparqloscope: no dataset in {}: {e}", path.display());
+            skip_sparqloscope(led, "skip:no-dataset");
+            return false;
+        }
+        Err(msg) => {
+            println!("  sparqloscope: dataset load panicked: {msg}");
+            skip_sparqloscope(led, "panic:load");
+            return false;
+        }
+    };
+    let ds = &loaded.dataset;
+    // State the fraction, not just the size: the queries answer over
+    // the loaded prefix, and a count from a prefix must never be read
+    // as a count over the dataset.
+    println!(
+        "sparql   : loaded {} tribles ({} commits, {:.2}s) of {} in the whole dataset ({} source triples)",
+        ds.tribles, loaded.commits, loaded.load_secs, loaded.manifest_tribles, ds.triples
+    );
+
+    let (mut engine_kind, mut fold_kind, mut periphery_kind) = (0usize, 0usize, 0usize);
+    for t in queries::TRANSLATED {
+        match t.kind {
+            queries::Kind::Engine => engine_kind += 1,
+            queries::Kind::Fold => fold_kind += 1,
+            queries::Kind::Periphery => periphery_kind += 1,
+        }
+    }
+
+    // -- arm 1: the six-PATCH TribleSet ---------------------------------
+    let (patch_answers, panicked, _) = run_sparqloscope_arm(
+        led,
+        cfg,
+        base,
+        "sparqloscope",
+        queries::TRANSLATED,
+        ds,
+        None,
+    );
+    println!(
+        "  sparqloscope census              {} ran, {panicked} panicked ({engine_kind} engine / {fold_kind} fold / {periphery_kind} periphery) + {} rpq",
+        queries::TRANSLATED.len() - panicked,
+        queries::SKIPPED_PATHS.len()
+    );
+
+    // -- arm 2: the succinct archive over the SAME bounded set ----------
+    // Built from `ds`, not attached from the pile: the branch head's
+    // index annotation covers the WHOLE dataset (see
+    // `wd_load::Dataset::<UnionFacts>::load_pile`), and an arm over a
+    // different graph cannot be row-compared with this one.
+    let built = Instant::now();
+    let arch_ds = match fixtures::quiet_catch(|| ds.to_archive()) {
+        Ok(a) => a,
+        Err(msg) => {
+            println!("  sparqloscope: archive build panicked: {msg}");
+            for t in queries::TRANSLATED {
+                for group in ["sparqloscope_arch", "sparqloscope_gpu"] {
+                    led.outcome(&format!("{group}/{}/total", t.name), "panic:archive", None);
+                }
+            }
+            for suffix in ARCH_ROUTING_SUFFIXES {
+                led.outcome(
+                    &format!("sparqloscope_gpu/routing/{suffix}"),
+                    "panic:archive",
+                    None,
+                );
+            }
+            return false;
+        }
+    };
+    println!(
+        "sparql   : archive over the same {} tribles (built in {:.2}s)",
+        arch_ds.tribles,
+        built.elapsed().as_secs_f64()
+    );
+    let (_, arch_panicked, mut cross_arm_failure) = run_sparqloscope_arm(
+        led,
+        cfg,
+        base,
+        "sparqloscope_arch",
+        queries::TRANSLATED_ARCHIVE,
+        &arch_ds,
+        Some(&patch_answers),
+    );
+    println!(
+        "  sparqloscope_arch census         {} ran, {arch_panicked} panicked",
+        queries::TRANSLATED_ARCHIVE.len() - arch_panicked
+    );
+
+    // -- arm 3: that archive on the device ------------------------------
+    #[cfg(not(feature = "gpu"))]
+    {
+        drop(arch_ds);
+        for t in queries::TRANSLATED {
+            led.outcome(
+                &format!("sparqloscope_gpu/{}/total", t.name),
+                "skip:gpu",
+                None,
+            );
+        }
+        for suffix in ARCH_ROUTING_SUFFIXES {
+            led.outcome(
+                &format!("sparqloscope_gpu/routing/{suffix}"),
+                "skip:gpu",
+                None,
+            );
+        }
+        println!(
+            "  {:<32} SKIP (gpu: no triblespace-gpu on the subject)",
+            "sparqloscope_gpu census"
+        );
+    }
+    #[cfg(feature = "gpu")]
+    {
+        // Destructure rather than clone: the CPU arm is finished with
+        // the archive and `WgpuSuccinctArchive::new` takes it by value,
+        // so the device arm inherits the very same rows plus every
+        // shared blob reader.
+        let wd_schema::Dataset {
+            facts,
+            paths,
+            reader,
+            meta,
+            meta_reader,
+            triples,
+            tribles,
+        } = arch_ds;
+        let attach_begin = base.elapsed().as_nanos() as u64;
+        let attach = Instant::now();
+        let attached =
+            fixtures::quiet_catch(|| subject::gpu::WgpuSuccinctArchive::new(facts));
+        let attach_ns = attach.elapsed().as_nanos() as u64;
+        let gpu = match attached {
+            Ok(Ok(gpu)) => {
+                led.span("sparqloscope_gpu/attach/total", attach_begin, attach_ns);
+                led.outcome("sparqloscope_gpu/attach/total", "signal", None);
+                println!(
+                    "  {:<32} signal (1 span, {:.0} ms, min_confirm_batch {})",
+                    "sparqloscope_gpu/attach/total",
+                    attach_ns as f64 / 1e6,
+                    gpu.min_confirm_batch()
+                );
+                Some(gpu)
+            }
+            Ok(Err(e)) => {
+                let reason = format!("gate_fail:attach {e:?}");
+                led.outcome("sparqloscope_gpu/attach/total", &reason, None);
+                println!("  {:<32} {reason}", "sparqloscope_gpu/attach/total");
+                None
+            }
+            Err(msg) => {
+                let reason = format!("panic:{msg}");
+                led.outcome("sparqloscope_gpu/attach/total", &reason, None);
+                println!("  {:<32} {reason}", "sparqloscope_gpu/attach/total");
+                None
+            }
+        };
+        match gpu {
+            None => {
+                for t in queries::TRANSLATED {
+                    led.outcome(
+                        &format!("sparqloscope_gpu/{}/total", t.name),
+                        "skip:attach",
+                        None,
+                    );
+                }
+                for suffix in ARCH_ROUTING_SUFFIXES {
+                    led.outcome(
+                        &format!("sparqloscope_gpu/routing/{suffix}"),
+                        "skip:attach",
+                        None,
+                    );
+                }
+            }
+            Some(gpu) => {
+                let gpu_ds = wd_schema::Dataset {
+                    facts: gpu,
+                    paths,
+                    reader,
+                    meta,
+                    meta_reader,
+                    triples,
+                    tribles,
+                };
+                // Arm-total routing, not per-query: without it a "no
+                // difference" timing cannot be told apart from "the
+                // device never ran". The registry is 100 queries of
+                // every shape, so the interesting question here is how
+                // much of the whole registry was batchable at all — the
+                // per-query resolution lives on the five-query
+                // `arch_gpu` arm above.
+                gpu_ds.facts.reset_stats();
+                let (_, gpu_panicked, gpu_cross_arm) = run_sparqloscope_arm(
+                    led,
+                    cfg,
+                    base,
+                    "sparqloscope_gpu",
+                    queries::TRANSLATED_WGPU,
+                    &gpu_ds,
+                    Some(&patch_answers),
+                );
+                cross_arm_failure |= gpu_cross_arm;
+                let s = gpu_ds.facts.stats();
+                for (suffix, value) in [
+                    ("gpu_confirms", s.gpu_confirms),
+                    ("gpu_candidates", s.gpu_candidates),
+                    ("cpu_fallback_confirms", s.cpu_fallback_confirms),
+                    ("cpu_fallback_candidates", s.cpu_fallback_candidates),
+                    ("gpu_errors", s.gpu_errors),
+                ] {
+                    led.outcome(
+                        &format!("sparqloscope_gpu/routing/{suffix}"),
+                        "signal",
+                        Some(value),
+                    );
+                }
+                println!(
+                    "  sparqloscope_gpu census          {} ran, {gpu_panicked} panicked",
+                    queries::TRANSLATED_WGPU.len() - gpu_panicked
+                );
+                println!(
+                    "      routing (whole arm): {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
+                    s.gpu_confirms,
+                    s.gpu_candidates,
+                    s.cpu_fallback_confirms,
+                    s.cpu_fallback_candidates,
+                    s.gpu_errors
+                );
             }
         }
     }
@@ -1061,31 +1538,13 @@ fn main() {
     );
 
     // -- sparqloscope ------------------------------------------------------
-    // No wd Dataset loader is vendored (the pile manifest schema and
-    // loaders stay in sparqloscope-bench, and no wd dataset exists on
-    // this machine), so the whole registry records SKIP — the census
-    // itself is the deliverable and must land in the pile.
-    let (mut engine_kind, mut fold_kind, mut periphery_kind) = (0usize, 0usize, 0usize);
-    for t in queries::TRANSLATED {
-        match t.kind {
-            queries::Kind::Engine => engine_kind += 1,
-            queries::Kind::Fold => fold_kind += 1,
-            queries::Kind::Periphery => periphery_kind += 1,
-        }
-        led.outcome(
-            &format!("sparqloscope/{}/total", t.name),
-            "skip:dataset-absent",
-            None,
-        );
-    }
-    for name in queries::SKIPPED_PATHS {
-        led.outcome(&format!("sparqloscope/{name}/total"), "skip:rpq", None);
-    }
-    println!(
-        "  sparqloscope census              {} dataset-absent ({engine_kind} engine / {fold_kind} fold / {periphery_kind} periphery) + {} rpq",
-        queries::TRANSLATED.len(),
-        queries::SKIPPED_PATHS.len()
-    );
+    // The registry runs against a v2 DATASET pile (`--data`), which is
+    // not the same shape as a ladder pile: its data branch is anonymous
+    // and reachable only through the `manifest` branch, so this arm
+    // resolves its own dataset rather than reusing the ladder set above
+    // (see `wd_load`). Without one the whole registry records SKIP —
+    // the census itself is the deliverable and must land in the pile.
+    cross_arm_failure |= run_sparqloscope(&mut led, &cfg, &base);
 
     // -- close -------------------------------------------------------------
     let end_ns = base.elapsed().as_nanos() as u64;

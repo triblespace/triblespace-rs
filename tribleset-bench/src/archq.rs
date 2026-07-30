@@ -51,8 +51,12 @@ use subject::core::prelude::BlobStore;
 use subject::core::prelude::TribleSet;
 #[cfg(feature = "protocol-v2")]
 use subject::core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, Term, VariableId, VariableSet,
+    Binding, Candidates, Constraint, ProposalBuffer, Term, VariableId, VariableSet,
 };
+#[cfg(all(feature = "protocol-v2", not(feature = "frontier")))]
+use subject::core::query::ProposeCursor;
+#[cfg(feature = "frontier")]
+use subject::core::query::Frontier;
 use subject::core::query::TriblePattern;
 
 use crate::queries::{self, Answer};
@@ -209,6 +213,87 @@ pub struct RegionStats {
     pub live_total: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Frontier-width sink
+// ---------------------------------------------------------------------------
+
+/// Every `FrontierStats` handle the arch-arm queries produced since the
+/// last [`reset_frontier_stats`].
+///
+/// The census wants the engine's own answer to "how wide did the frontier
+/// actually get" beside its confirm-seam observation of the same thing.
+/// `Query::stats` hands out an `Arc` shared with every rayon clone, so the
+/// handle can be stashed BEFORE the iterator is consumed and read after —
+/// which is the only ordering available, since `find!` consumes the query.
+///
+/// `frontier`-gated: pre-batch engines have no `FrontierStats` to report.
+#[cfg(feature = "frontier")]
+static FRONTIER_SINK: Mutex<Vec<std::sync::Arc<subject::core::query::FrontierStats>>> =
+    Mutex::new(Vec::new());
+
+/// Stash a query's frontier counters; called by `countq!` in the vendored
+/// translations, once per `find!` the query runs.
+#[cfg(feature = "frontier")]
+pub fn note_frontier_stats(stats: std::sync::Arc<subject::core::query::FrontierStats>) {
+    FRONTIER_SINK.lock().expect("frontier sink").push(stats);
+}
+
+/// Drop everything stashed so far (called between queries).
+#[cfg(feature = "frontier")]
+pub fn reset_frontier_stats() {
+    FRONTIER_SINK.lock().expect("frontier sink").clear();
+}
+
+/// What the engine itself saw of the frontiers it expanded, summed or
+/// maxed over every `find!` the query ran.
+#[cfg(feature = "frontier")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrontierSummary {
+    /// Rows in the widest single expansion — `FrontierStats::widest`.
+    /// The number that says whether the batch ceiling was ever
+    /// approached at all.
+    pub widest: u64,
+    pub expansions: u64,
+    pub rows: u64,
+    pub proposals: u64,
+    pub inplace_descents: u64,
+    pub copied_descents: u64,
+}
+
+#[cfg(feature = "frontier")]
+impl FrontierSummary {
+    pub fn mean_width(&self) -> f64 {
+        if self.expansions == 0 {
+            0.0
+        } else {
+            self.rows as f64 / self.expansions as f64
+        }
+    }
+}
+
+/// Summarize the stashed handles. Read AFTER the query's iterator has
+/// been exhausted — the counters are live until then.
+#[cfg(feature = "frontier")]
+pub fn frontier_summary() -> FrontierSummary {
+    let sink = FRONTIER_SINK.lock().expect("frontier sink");
+    let mut out = FrontierSummary::default();
+    for s in sink.iter() {
+        out.expansions += s.expansions();
+        out.rows += s.rows();
+        out.proposals += s.proposals();
+        // The ceiling question needs counters the batched protocol
+        // shipped without; a subject that cannot answer reports zero
+        // rather than a guess.
+        #[cfg(feature = "frontier-widest")]
+        {
+            out.widest = out.widest.max(s.widest());
+            out.inplace_descents += s.inplace_descents();
+            out.copied_descents += s.copied_descents();
+        }
+    }
+    out
+}
+
 /// Nearest-rank quantile over a value→occurrences histogram.
 #[cfg(feature = "protocol-v2")]
 fn quantile(hist: &BTreeMap<u64, u64>, total: u64, q: f64) -> u64 {
@@ -250,6 +335,24 @@ where
     archive: SuccinctArchive<U>,
     /// live-candidate count → number of confirms with that count.
     hist: Mutex<BTreeMap<u64, u64>>,
+    /// DEPTH → the same histogram, restricted to confirms at that depth.
+    ///
+    /// Depth is the number of variables the parent binding already had
+    /// bound, which is the level of the search the region belongs to.
+    /// The flat histogram cannot distinguish "one enormous root region
+    /// and nothing below" from "wide regions at every level", and that
+    /// distinction is exactly the claim under test.
+    depth_hist: Mutex<BTreeMap<usize, BTreeMap<u64, u64>>>,
+    /// depth → widest `Frontier::len()` seen at a confirm on that depth.
+    ///
+    /// The confirm-seam view of frontier width: how many parent rows the
+    /// batched protocol actually carried into the region. Independent of
+    /// `FrontierStats::widest`, which the ENGINE reports per expansion —
+    /// two instruments on the same quantity, and they should agree up to
+    /// frontier fragmentation (a fragmented expansion reaches `confirm`
+    /// as several narrower groups).
+    #[cfg(feature = "frontier")]
+    depth_width: Mutex<BTreeMap<usize, u64>>,
 }
 
 #[cfg(feature = "protocol-v2")]
@@ -261,12 +364,20 @@ where
         Self {
             archive,
             hist: Mutex::new(BTreeMap::new()),
+            depth_hist: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "frontier")]
+            depth_width: Mutex::new(BTreeMap::new()),
         }
     }
 
     /// Drop the accumulated histogram (called between queries).
     pub fn reset(&self) {
         self.hist.lock().expect("region histogram").clear();
+        self.depth_hist.lock().expect("depth histogram").clear();
+        #[cfg(feature = "frontier")]
+        self.depth_width.lock().expect("depth width").clear();
+        #[cfg(feature = "frontier")]
+        reset_frontier_stats();
     }
 
     /// Summarize the histogram accumulated since the last [`reset`].
@@ -305,13 +416,69 @@ where
         self.archive
     }
 
-    fn record(&self, live: usize) {
+    /// The per-depth census: for each depth, `(confirms, max, median,
+    /// ge_threshold, live_total)`.
+    ///
+    /// Answers the question the flat histogram cannot: whether wide
+    /// regions occur at every level of the search or only at the root.
+    pub fn depth_rows(&self) -> Vec<(usize, RegionStats)> {
+        let by_depth = self.depth_hist.lock().expect("depth histogram");
+        by_depth
+            .iter()
+            .map(|(&depth, hist)| {
+                let confirms: u64 = hist.values().sum();
+                (
+                    depth,
+                    RegionStats {
+                        confirms,
+                        max: hist.keys().next_back().copied().unwrap_or(0),
+                        p95: quantile(hist, confirms, 0.95),
+                        median: quantile(hist, confirms, 0.5),
+                        ge_threshold: hist
+                            .range((CONFIRM_THRESHOLD as u64)..)
+                            .map(|(_, &n)| n)
+                            .sum(),
+                        live_total: hist.iter().map(|(&v, &n)| v * n).sum(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// depth → widest parent frontier carried into a confirm there.
+    #[cfg(feature = "frontier")]
+    pub fn depth_widths(&self) -> Vec<(usize, u64)> {
+        self.depth_width
+            .lock()
+            .expect("depth width")
+            .iter()
+            .map(|(&d, &w)| (d, w))
+            .collect()
+    }
+
+    fn record(&self, live: usize, depth: usize) {
         *self
             .hist
             .lock()
             .expect("region histogram")
             .entry(live as u64)
             .or_insert(0) += 1;
+        *self
+            .depth_hist
+            .lock()
+            .expect("depth histogram")
+            .entry(depth)
+            .or_default()
+            .entry(live as u64)
+            .or_insert(0) += 1;
+    }
+
+    /// Note the parent-frontier width a confirm at `depth` was handed.
+    #[cfg(feature = "frontier")]
+    fn record_width(&self, depth: usize, width: usize) {
+        let mut widths = self.depth_width.lock().expect("depth width");
+        let slot = widths.entry(depth).or_insert(0);
+        *slot = (*slot).max(width as u64);
     }
 }
 
@@ -362,10 +529,12 @@ where
         self.inner.estimate(variable, binding)
     }
 
+    #[cfg(not(feature = "frontier"))]
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         self.inner.propose(variable, binding, proposals)
     }
 
+    #[cfg(not(feature = "frontier"))]
     fn propose_chunk(
         &self,
         variable: VariableId,
@@ -378,6 +547,16 @@ where
             .propose_chunk(variable, binding, cursor, budget, proposals)
     }
 
+    #[cfg(feature = "frontier")]
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        self.inner.propose(variable, frontier, proposals)
+    }
+
     /// Records the region's LIVE count, then confirms exactly as the
     /// canonical constraint does.
     ///
@@ -385,13 +564,31 @@ where
     /// mirrors `WgpuSuccinctArchiveConstraint::confirm`: those calls
     /// never reach the routing decision there either, so counting them
     /// would inflate the census with regions the GPU never sees.
+    #[cfg(not(feature = "frontier"))]
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         if !self.variables().is_set(variable) {
             return;
         }
         let live = (0..cands.len()).filter(|&i| cands.is_live(i)).count();
-        self.owner.record(live);
+        // Pre-frontier `Binding` exposes the bitset as a field, not a
+        // method — the census stays era-portable by naming the field.
+        self.owner.record(live, binding.bound.count());
         self.inner.confirm(variable, binding, cands)
+    }
+
+    /// Batched protocol: the region now spans a whole frontier, so this
+    /// census measures exactly what the routing decision sees — one
+    /// number per `confirm` call, not per parent binding.
+    #[cfg(feature = "frontier")]
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
+        if !self.variables().is_set(variable) {
+            return;
+        }
+        let live = (0..cands.len()).filter(|&i| cands.is_live(i)).count();
+        let depth = frontier.bound().count();
+        self.owner.record(live, depth);
+        self.owner.record_width(depth, frontier.len());
+        self.inner.confirm(variable, frontier, cands)
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {

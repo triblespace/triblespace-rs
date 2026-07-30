@@ -15,7 +15,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::RawInline;
 use triblespace_core::query::{
-    Binding, BindingStore, Constraint, ProposalBuffer, Variable, VariableContext, VariableId,
+    BindingStore, Constraint, Frontier, ProposalBuffer, Variable, VariableContext, VariableId,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::WgpuSuccinctArchive;
@@ -147,7 +147,7 @@ fn kills_for(seed: u64, len: usize) -> Vec<usize> {
 fn confirm_liveness<'a, C: Constraint<'a>>(
     constraint: &C,
     variable: VariableId,
-    binding: &Binding,
+    frontier: &Frontier<'_>,
     candidates: &[RawInline],
     kills: &[usize],
 ) -> Vec<u32> {
@@ -157,7 +157,7 @@ fn confirm_liveness<'a, C: Constraint<'a>>(
     for &k in kills {
         region.kill(k);
     }
-    constraint.confirm(variable, binding, &mut region);
+    constraint.confirm(variable, frontier, &mut region);
     region.live_words()
 }
 
@@ -182,7 +182,7 @@ fn vars() -> Vars {
 fn check_arm(
     fixture: &Fixture,
     variable: VariableId,
-    binding: &Binding,
+    frontier: &Frontier<'_>,
     candidates: &[RawInline],
     kills: &[usize],
     context: &str,
@@ -203,8 +203,8 @@ fn check_arm(
     );
 
     let before = fixture.gpu.stats();
-    let cpu = confirm_liveness(&cpu_constraint, variable, binding, candidates, kills);
-    let gpu = confirm_liveness(&gpu_constraint, variable, binding, candidates, kills);
+    let cpu = confirm_liveness(&cpu_constraint, variable, frontier, candidates, kills);
+    let gpu = confirm_liveness(&gpu_constraint, variable, frontier, candidates, kills);
     let after = fixture.gpu.stats();
 
     assert_eq!(cpu, gpu, "CPU and GPU liveness diverge for {context}");
@@ -249,7 +249,7 @@ fn assert_mixed(liveness: &[u32], kills: &[usize], context: &str) {
 fn membership_confirm_parity_all_axes() {
     let fixture = fixture();
     let v = vars();
-    let binding = Binding::default();
+    let frontier = Frontier::default();
     for seed in 0..6u64 {
         let candidates = candidate_pool(&fixture, seed, 64 + (seed as usize * 37) % 80);
         let kills = kills_for(seed, candidates.len());
@@ -259,7 +259,7 @@ fn membership_confirm_parity_all_axes() {
             (v.v.index, "value"),
         ] {
             let context = format!("membership/{axis}/seed{seed}");
-            let cpu = check_arm(&fixture, variable, &binding, &candidates, &kills, &context);
+            let cpu = check_arm(&fixture, variable, &frontier, &candidates, &kills, &context);
             assert_mixed(&cpu, &kills, &context);
         }
     }
@@ -286,14 +286,14 @@ fn single_bound_range_confirm_parity() {
             let mut binding = BindingStore::new();
             binding.bind(bound_var, &bound);
             let context = format!("range/{name}/seed{seed}");
-            check_arm(&fixture, confirm_var, &binding.view(), &candidates, &kills, &context);
+            check_arm(&fixture, confirm_var, &binding.frontier(), &candidates, &kills, &context);
 
             // Bound value absent from the archive: the range is empty and
             // every candidate dies on both paths.
             let mut binding = BindingStore::new();
             binding.bind(bound_var, &fixture.absent[seed as usize % fixture.absent.len()]);
             let context = format!("range-empty/{name}/seed{seed}");
-            let cpu = check_arm(&fixture, confirm_var, &binding.view(), &candidates, &kills, &context);
+            let cpu = check_arm(&fixture, confirm_var, &binding.frontier(), &candidates, &kills, &context);
             assert!(
                 cpu.iter().all(|w| *w == 0),
                 "{context}: empty range must kill everything"
@@ -320,7 +320,7 @@ fn double_bound_range_confirm_parity() {
         check_arm(
             &fixture,
             v.e.index,
-            &binding.view(),
+            &binding.frontier(),
             &candidates,
             &kills,
             &format!("range/av-bound/confirm-e/seed{seed}"),
@@ -333,7 +333,7 @@ fn double_bound_range_confirm_parity() {
         check_arm(
             &fixture,
             v.a.index,
-            &binding.view(),
+            &binding.frontier(),
             &candidates,
             &kills,
             &format!("range/ev-bound/confirm-a/seed{seed}"),
@@ -346,7 +346,7 @@ fn double_bound_range_confirm_parity() {
         check_arm(
             &fixture,
             v.v.index,
-            &binding.view(),
+            &binding.frontier(),
             &candidates,
             &kills,
             &format!("range/ea-bound/confirm-v/seed{seed}"),
@@ -358,7 +358,7 @@ fn double_bound_range_confirm_parity() {
 fn all_dead_region_stays_all_dead() {
     let fixture = fixture();
     let v = vars();
-    let binding = Binding::default();
+    let frontier = Frontier::default();
     let candidates = candidate_pool(&fixture, 41, 32);
     let kills: Vec<usize> = (0..candidates.len()).collect();
     let gpu_live = {
@@ -369,7 +369,7 @@ fn all_dead_region_stays_all_dead() {
             vars_gpu.v,
             &fixture.gpu,
         );
-        confirm_liveness(&constraint, v.v.index, &binding, &candidates, &kills)
+        confirm_liveness(&constraint, v.v.index, &frontier, &candidates, &kills)
     };
     assert!(gpu_live.iter().all(|w| *w == 0));
 }
@@ -379,7 +379,7 @@ fn below_threshold_falls_back_to_cpu() {
     let mut fixture = fixture();
     fixture.gpu.set_min_confirm_batch(usize::MAX);
     let v = vars();
-    let binding = Binding::default();
+    let frontier = Frontier::default();
     let candidates = candidate_pool(&fixture, 17, 48);
 
     let vars_cpu = vars();
@@ -398,8 +398,8 @@ fn below_threshold_falls_back_to_cpu() {
     );
 
     let before = fixture.gpu.stats();
-    let cpu = confirm_liveness(&cpu_constraint, v.v.index, &binding, &candidates, &[]);
-    let gpu = confirm_liveness(&gpu_constraint, v.v.index, &binding, &candidates, &[]);
+    let cpu = confirm_liveness(&cpu_constraint, v.v.index, &frontier, &candidates, &[]);
+    let gpu = confirm_liveness(&gpu_constraint, v.v.index, &frontier, &candidates, &[]);
     let after = fixture.gpu.stats();
 
     assert_eq!(cpu, gpu);
@@ -457,7 +457,7 @@ fn confirm_crossover_sweep() {
         triblespace_gpu::WgpuSuccinctArchiveConstraint::new(vars_gpu.e, vars_gpu.a, vars_gpu.v, &gpu);
 
     let bench = |variable: VariableId,
-                 binding: &Binding,
+                 frontier: &Frontier<'_>,
                  candidates: &[RawInline],
                  shape: &str| {
         let mut buffer = ProposalBuffer::new();
@@ -468,7 +468,7 @@ fn confirm_crossover_sweep() {
         // Warm up device pipelines outside the timed region.
         {
             let mut region = buffer.region(0);
-            gpu_constraint.confirm(variable, binding, &mut region);
+            gpu_constraint.confirm(variable, frontier, &mut region);
             region.set_live_words(&all_live);
         }
 
@@ -480,14 +480,14 @@ fn confirm_crossover_sweep() {
             let mut region = buffer.region(0);
             region.set_live_words(&all_live);
             let started = Instant::now();
-            cpu_constraint.confirm(variable, binding, &mut region);
+            cpu_constraint.confirm(variable, frontier, &mut region);
             cpu_best = cpu_best.min(started.elapsed().as_secs_f64() * 1e3);
             cpu_words = region.live_words();
 
             let mut region = buffer.region(0);
             region.set_live_words(&all_live);
             let started = Instant::now();
-            gpu_constraint.confirm(variable, binding, &mut region);
+            gpu_constraint.confirm(variable, frontier, &mut region);
             gpu_best = gpu_best.min(started.elapsed().as_secs_f64() * 1e3);
             gpu_words = region.live_words();
             region.set_live_words(&all_live);
@@ -526,7 +526,7 @@ fn confirm_crossover_sweep() {
                     }
                 })
                 .collect();
-            let (cpu_ms, gpu_ms) = bench(variable, &binding.view(), &candidates, shape);
+            let (cpu_ms, gpu_ms) = bench(variable, &binding.frontier(), &candidates, shape);
             println!(
                 "{:>8} {:>12.3} {:>12.3} {:>8.2}",
                 size,

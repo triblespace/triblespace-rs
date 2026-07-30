@@ -64,10 +64,12 @@ interest. Selectors power history traversals such as `parents`,
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,
-`estimate`, `propose`/`propose_chunk`, `confirm`, `satisfied`, and
-`influence`—let the Atreides solver navigate the search space without a
-separate planner. Constraints are stateless: every method receives the current
-binding, so the engine can backtrack, chunk, and split without telling anyone.
+`estimate`, `propose`, `confirm`, `satisfied`, and `influence`—let the Atreides
+solver navigate the search space without a separate planner. `propose` and
+`confirm` take a *frontier*: a whole batch of parent bindings, of which a
+single binding is the width-1 case. Constraints are stateless: every method
+receives the bindings it needs as a parameter, so the engine can backtrack,
+batch, and split without telling anyone.
 Estimates guide variable ordering and never change results; `confirm` may only
 kill candidates, never add or revive them. Custom data sources and application
 predicates participate in queries by implementing this trait.

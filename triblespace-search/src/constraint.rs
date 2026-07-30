@@ -37,7 +37,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, Variable, VariableId, VariableSet,
+    Binding, Candidates, Constraint, Frontier, ProposalBuffer, Variable, VariableId, VariableSet,
 };
 
 use crate::bm25::BM25Index;
@@ -388,14 +388,23 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if variable != self.doc.index {
             return;
         }
-        proposals.extend_from_slice(&self.entries);
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            proposals.extend_from_slice(&self.entries);
+        }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// Membership in the posting set does not depend on the parent binding.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if variable != self.doc.index {
             return;
         }
@@ -560,12 +569,17 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
         }
     }
 
-    fn propose(&self, _variable: VariableId, _binding: &Binding, _proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        _variable: VariableId,
+        _frontier: &Frontier<'_>,
+        _proposals: &mut ProposalBuffer,
+    ) {
         // Intentionally empty: exact pairwise cosine is a predicate, not an
         // ANN domain source. `SimilarTo` owns directional retrieval.
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -580,16 +594,20 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
         } else {
             self.a.index
         };
-        let Some(&peer_value) = binding.get(peer) else {
-            // Peer unbound: the pair is unresolved, keep every candidate
-            // alive until the engine binds the other side.
-            return;
-        };
-        if variable == self.a.index {
-            cands.retain(|candidate| self.pair_matches(*candidate, peer_value));
-        } else {
-            cands.retain(|candidate| self.pair_matches(peer_value, *candidate));
-        }
+        // The peer's *value* varies row by row, so the pair test is per
+        // parent run.
+        cands.for_each_parent(|row, run| {
+            let Some(&peer_value) = frontier.row(row as usize).get(peer) else {
+                // Peer unbound: the pair is unresolved, keep every candidate
+                // alive until the engine binds the other side.
+                return;
+            };
+            if variable == self.a.index {
+                run.retain(|candidate| self.pair_matches(*candidate, peer_value));
+            } else {
+                run.retain(|candidate| self.pair_matches(peer_value, *candidate));
+            }
+        });
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
@@ -718,14 +736,24 @@ impl<'a> Constraint<'a> for SimilarTo {
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if variable != self.var.index {
             return;
         }
-        proposals.extend_from_slice(&self.candidates);
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            proposals.extend_from_slice(&self.candidates);
+        }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// Membership in the retrieved neighbourhood does not depend on the
+    /// parent binding.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if variable != self.var.index {
             return;
         }
@@ -831,10 +859,9 @@ mod tests {
         let terms = hash_tokens("fox");
         let c = idx.matches(doc, &terms, 0.0);
 
-        let binding = Binding::default();
         // "fox" appears in doc 1 and doc 3.
-        assert_eq!(c.estimate(doc.index, &binding), Some(2));
-        assert_eq!(c.estimate(255, &binding), None);
+        assert_eq!(c.estimate(doc.index, &Binding::default()), Some(2));
+        assert_eq!(c.estimate(255, &Binding::default()), None);
     }
 
     #[test]
@@ -846,7 +873,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let mut props = ProposalBuffer::new();
-        c.propose(doc.index, &Binding::default(), &mut props);
+        c.propose(doc.index, &Frontier::default(), &mut props);
         assert_eq!(props.len(), 2);
 
         let ids: HashSet<Id> = props
@@ -869,7 +896,7 @@ mod tests {
         props.push(id_to_raw_value(id(1)));
         props.push(id_to_raw_value(id(2)));
         props.push(id_to_raw_value(id(3)));
-        c.confirm(doc.index, &Binding::default(), &mut props.region(0));
+        c.confirm(doc.index, &Frontier::default(), &mut props.region(0));
 
         assert_eq!(props.count_live(0), 2);
         let ids: HashSet<Id> = live(&props)
@@ -912,7 +939,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let mut props = ProposalBuffer::new();
-        c.propose(doc.index, &Binding::default(), &mut props);
+        c.propose(doc.index, &Frontier::default(), &mut props);
         let ids: HashSet<Id> = props
             .iter()
             .map(|r| raw_value_to_id(r).expect("genid"))
@@ -937,8 +964,8 @@ mod tests {
 
         let mut props_a = ProposalBuffer::new();
         let mut props_b = ProposalBuffer::new();
-        explicit.propose(doc_a.index, &Binding::default(), &mut props_a);
-        sugar.propose(doc_b.index, &Binding::default(), &mut props_b);
+        explicit.propose(doc_a.index, &Frontier::default(), &mut props_a);
+        sugar.propose(doc_b.index, &Frontier::default(), &mut props_b);
 
         let set_a: HashSet<Id> = props_a
             .iter()
@@ -988,7 +1015,7 @@ mod tests {
         let c_mid = idx.matches(doc, &terms, (s1 + s2) / 2.0);
 
         let mut low_props = ProposalBuffer::new();
-        c_low.propose(doc.index, &Binding::default(), &mut low_props);
+        c_low.propose(doc.index, &Frontier::default(), &mut low_props);
         let low_ids: HashSet<Id> = low_props
             .iter()
             .map(|r| raw_value_to_id(r).unwrap())
@@ -997,7 +1024,7 @@ mod tests {
         assert!(low_ids.contains(&id(2)));
 
         let mut mid_props = ProposalBuffer::new();
-        c_mid.propose(doc.index, &Binding::default(), &mut mid_props);
+        c_mid.propose(doc.index, &Frontier::default(), &mut mid_props);
         let mid_ids: HashSet<Id> = mid_props
             .iter()
             .map(|r| raw_value_to_id(r).unwrap())
@@ -1050,7 +1077,7 @@ mod tests {
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
 
         let mut props = ProposalBuffer::new();
-        c.propose(doc.index, &Binding::default(), &mut props);
+        c.propose(doc.index, &Frontier::default(), &mut props);
         assert!(props.is_empty());
     }
 
@@ -1064,7 +1091,7 @@ mod tests {
 
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
         let mut props = ProposalBuffer::new();
-        c.propose(doc.index, &Binding::default(), &mut props);
+        c.propose(doc.index, &Frontier::default(), &mut props);
         assert!(props.is_empty());
     }
 
@@ -1086,7 +1113,7 @@ mod tests {
         assert_eq!(constraint.estimate(doc.index, &Binding::default()), Some(3));
 
         let mut props = ProposalBuffer::new();
-        constraint.propose(doc.index, &Binding::default(), &mut props);
+        constraint.propose(doc.index, &Frontier::default(), &mut props);
         assert_eq!(
             &props[..],
             [entries[0], entries[1], entries[3]],
@@ -1152,7 +1179,7 @@ mod tests {
         binding.bind(a.index, &handles[0].raw);
 
         let mut no_domain = ProposalBuffer::new();
-        c.propose(b.index, &binding.view(), &mut no_domain);
+        c.propose(b.index, &binding.frontier(), &mut no_domain);
         assert!(
             no_domain.is_empty(),
             "exact cosine must never source an ANN domain"
@@ -1162,7 +1189,7 @@ mod tests {
         for handle in handles.iter() {
             bind_b.push(handle.raw);
         }
-        c.confirm(b.index, &binding.view(), &mut bind_b.region(0));
+        c.confirm(b.index, &binding.frontier(), &mut bind_b.region(0));
         assert_eq!(live(&bind_b), [handles[0].raw, handles[2].raw]);
 
         let mut peer_binding = BindingStore::new();
@@ -1171,7 +1198,7 @@ mod tests {
         for handle in handles.iter() {
             bind_a.push(handle.raw);
         }
-        c.confirm(a.index, &peer_binding.view(), &mut bind_a.region(0));
+        c.confirm(a.index, &peer_binding.frontier(), &mut bind_a.region(0));
         assert_eq!(live(&bind_a), [handles[0].raw, handles[2].raw]);
     }
 
@@ -1193,7 +1220,7 @@ mod tests {
         for handle in handles.iter() {
             props.push(handle.raw);
         }
-        c.confirm(b.index, &Binding::default(), &mut props.region(0));
+        c.confirm(b.index, &Frontier::default(), &mut props.region(0));
         assert_eq!(props.count_live(0), handles.len());
     }
 
@@ -1238,7 +1265,7 @@ mod tests {
         binding.bind(a.index, &handles[0].raw);
         let mut candidates = ProposalBuffer::new();
         candidates.push(outside.raw);
-        c.confirm(b.index, &binding.view(), &mut candidates.region(0));
+        c.confirm(b.index, &binding.frontier(), &mut candidates.region(0));
         assert_eq!(live(&candidates), [outside.raw]);
     }
 
@@ -1257,7 +1284,7 @@ mod tests {
         let mut candidates = ProposalBuffer::new();
         candidates.push(b_handle.raw);
         view.cosine_at_least(a, b, 1.01)
-            .confirm(b.index, &binding.view(), &mut candidates.region(0));
+            .confirm(b.index, &binding.frontier(), &mut candidates.region(0));
         assert_eq!(
             candidates.count_live(0),
             0,
@@ -1298,13 +1325,13 @@ mod tests {
         accepted.push(handles[0].raw);
         accepted.push(handles[1].raw);
         view.cosine_at_least(x, x, 0.99)
-            .confirm(x.index, &Binding::default(), &mut accepted.region(0));
+            .confirm(x.index, &Frontier::default(), &mut accepted.region(0));
         assert_eq!(accepted.count_live(0), 2);
 
         let mut rejected = ProposalBuffer::new();
         rejected.push(handles[0].raw);
         view.cosine_at_least(x, x, 1.01)
-            .confirm(x.index, &Binding::default(), &mut rejected.region(0));
+            .confirm(x.index, &Frontier::default(), &mut rejected.region(0));
         assert_eq!(rejected.count_live(0), 0);
     }
 
@@ -1356,7 +1383,7 @@ mod tests {
         );
 
         let mut props = ProposalBuffer::new();
-        constraint.propose(neighbour.index, &Binding::default(), &mut props);
+        constraint.propose(neighbour.index, &Frontier::default(), &mut props);
         assert_eq!(
             &props[..],
             [candidates[0], candidates[1], candidates[3]],
@@ -1367,7 +1394,7 @@ mod tests {
         mixed.push(embedding_raw(1));
         mixed.push(embedding_raw(9));
         mixed.push(embedding_raw(2));
-        constraint.confirm(neighbour.index, &Binding::default(), &mut mixed.region(0));
+        constraint.confirm(neighbour.index, &Frontier::default(), &mut mixed.region(0));
         assert_eq!(live(&mixed), [embedding_raw(1), embedding_raw(2)]);
 
         let mut bound = BindingStore::new();

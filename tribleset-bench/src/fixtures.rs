@@ -45,12 +45,20 @@ use subject::core::prelude::*;
 // hand-written `Constraint` wrapper, F12's programmatic chain, and F13's
 // hand-rolled variable context.
 use subject::core::query::{
-    Binding, Constraint, ProposalBuffer, ProposeCursor, VariableContext, VariableId, VariableSet,
+    Binding, Constraint, ProposalBuffer, VariableContext, VariableId, VariableSet,
 };
+// `ProposeCursor` is the resumable-narrowing cursor; it exists only on
+// subjects between the chunked-propose era and engine/batched-frontier.
+#[cfg(all(feature = "protocol-v2", not(feature = "frontier")))]
+use subject::core::query::ProposeCursor;
 // `Candidates` is the post-owned-mask confirm region; only F11's hand-written
 // Constraint impl names it, and it does not exist on older subjects.
 #[cfg(feature = "protocol-v2")]
 use subject::core::query::Candidates;
+// `Frontier` is the batch of parent bindings propose/confirm take from
+// engine/batched-frontier onward.
+#[cfg(feature = "frontier")]
+use subject::core::query::Frontier;
 use subject::core::repo::pile::Pile;
 use subject::core::repo::{self, Repository};
 
@@ -1011,19 +1019,18 @@ pub fn f9_total(set: &TribleSet) -> usize {
 // which is the property routing may never change. Timings across the
 // boundary are the interesting signal but are not a gate.
 //
-// !!! SIZING CAVEAT, to be revisited when leaf sources gain
-// `propose_chunk` overrides (see F14). Today no source overrides it, so
-// the default ships a whole level in one call and the confirm region
-// `IntersectionConstraint` hands its siblings IS the level size — which
-// is why a level of `F10_BELOW` / `F10_ABOVE` candidates straddles the
-// threshold exactly. Once sources chunk, the regions become the engine's
-// geometric budgets (`INITIAL_CHUNK` 64, then x`WIDEN_FACTOR`: 256,
-// 1024, 4096, 16384, ...), and a level only produces a full
-// 16384-entry region once it exceeds 64 + 256 + 1024 + 4096 = 5440
-// candidates *plus* the threshold, i.e. 21 824. At that point these two
-// levels would BOTH sit below the routing boundary and the fixture would
-// silently stop straddling anything: re-derive `F10_BELOW` /
-// `F10_ABOVE` from the chunk schedule rather than from the level size.
+// !!! SIZING CAVEAT. The confirm region `IntersectionConstraint` hands
+// its siblings is the whole level, so a level of `F10_BELOW` /
+// `F10_ABOVE` candidates straddles the threshold exactly. This holds on
+// both protocol eras but for different reasons: before
+// engine/batched-frontier because a proposer shipped the level in one
+// call, and after it because the region spans the whole frontier — here
+// a frontier of one, since the fixture's root level has no parent. Any
+// future change that makes a level arrive in pieces (a chunk schedule, a
+// width cap below the level size) would leave both sides under the
+// routing boundary and the fixture would silently stop straddling
+// anything: re-derive `F10_BELOW` / `F10_ABOVE` from whatever bounds the
+// region then, not from the level size.
 // ---------------------------------------------------------------------------
 
 /// F10: the routing threshold, read from the engine so this fixture
@@ -1143,10 +1150,12 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for LyingEstimate<C> {
             .map(|e| (e.saturating_mul(self.mul) / self.div).max(1))
     }
 
+    #[cfg(not(feature = "frontier"))]
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         self.inner.propose(variable, binding, proposals)
     }
 
+    #[cfg(not(feature = "frontier"))]
     fn propose_chunk(
         &self,
         variable: VariableId,
@@ -1159,8 +1168,26 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for LyingEstimate<C> {
             .propose_chunk(variable, binding, cursor, budget, proposals)
     }
 
+    #[cfg(not(feature = "frontier"))]
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         self.inner.confirm(variable, binding, cands)
+    }
+
+    /// Batched protocol: the wrapper only ever lies about estimates, so
+    /// both methods forward the frontier verbatim.
+    #[cfg(feature = "frontier")]
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        self.inner.propose(variable, frontier, proposals)
+    }
+
+    #[cfg(feature = "frontier")]
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
+        self.inner.confirm(variable, frontier, cands)
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
@@ -1471,17 +1498,18 @@ pub fn f13_total(set: &TribleSet) -> usize {
 //
 // INTERROGATES: time-to-first-result at a very wide level.
 //
-// The engine already has the machinery for lazy proposing —
-// `propose_chunk`, `ProposeCursor`, `INITIAL_CHUNK` = 64 and a x4
-// geometric widen — but no leaf SOURCE overrides `propose_chunk` yet, so
-// the default ships the entire level on the first call and TTFR at a
-// wide level costs a full enumeration. This is THE fixture that will
-// measure that when sources gain overrides: the survivors are minted
-// with order byte 0x00 so they sort FIRST in the proposer's value order,
-// which means a chunked proposer could answer from its first 64-entry
-// chunk while an eager one must materialize and mask all
-// `F14_REGION` candidates first. `ttfr` and `total` are recorded
-// separately precisely so that gap becomes visible when it opens.
+// A proposer ships the whole level in one call, so TTFR at a wide level
+// costs a full enumeration. The resumable-narrowing machinery that once
+// promised otherwise (`propose_chunk`, `ProposeCursor`, a geometric
+// widen) was deleted in engine/batched-frontier: it was dormant, and
+// depth-first already yields the instant the stack bottoms out, so pure
+// conjunctive queries never had the problem it solved. The fixture keeps
+// its shape because the measurement is still the interesting one — the
+// survivors are minted with order byte 0x00 so they sort FIRST in the
+// proposer's value order, which is what any future narrowing scheme
+// (galloping intersection is the standing candidate) would have to
+// exploit. `ttfr` and `total` are recorded separately precisely so that
+// gap becomes visible if it ever opens.
 //
 // As in F9, both sides carry identical cardinality so the selectivity
 // cannot be laundered into the plan.

@@ -15,15 +15,14 @@ what buys a property the engine does provide.
 
 A constraint restricts the values that query variables may take. It is not a
 node in a plan; it is a participant the engine interrogates. The whole
-interface is seven methods, and the engine calls them in a fixed rhythm:
+interface is six methods, and the engine calls them in a fixed rhythm:
 
 | Method | Role | Called |
 |---|---|---|
 | `variables` | Declares which variables the constraint touches. | Once, at query start. |
-| `estimate` | Predicts the candidate count for one variable under the current binding. | Before each binding decision. |
-| `propose` | Enumerates candidate values for a variable into a buffer. | On the tightest constraint for that variable — an intersection picks it among its children. |
-| `propose_chunk` | Resumable `propose`: appends up to a budget of further candidates. | Instead of `propose`, when the engine wants the level in pieces. |
-| `confirm` | Kills candidates that violate this constraint. | On every *other* constraint touching that variable. |
+| `estimate` | Predicts the candidate count for one variable under one binding. | Before each binding decision. |
+| `propose` | Enumerates candidate values for a variable, for a whole batch of bindings, into a buffer. | On the tightest constraint for that variable — an intersection picks it among its children. |
+| `confirm` | Kills candidates that violate this constraint under their own binding. | On every *other* constraint touching that variable. |
 | `satisfied` | Reports whether the constraint is still consistent with the binding. | Once at query start on the whole tree; then by a union before it proposes or confirms, to skip dead arms. |
 | `influence` | Names the variables whose estimates go stale when one variable is bound. | Once per variable, at query start. |
 
@@ -31,27 +30,67 @@ interface is seven methods, and the engine calls them in a fixed rhythm:
 is how "irrelevant" is distinguished from "unknown cost". An estimate is a cost
 quote and nothing else: it steers variable ordering, never correctness. A
 constraint that lies about its cardinality makes the search slower, not wrong.
+Whether the answer is `Some` or `None` must depend only on which variables are
+bound, never on their values — a batch shares one bound set, and composites
+read relevance off the batch.
 
-Only four of the seven need an implementation. `propose_chunk` defaults to
-"deliver everything on the first call and report exhaustion", `satisfied`
-defaults to `true`, and `influence` defaults to "every variable I touch except
-this one". A new data source therefore joins the engine with `variables`,
-`estimate`, `propose`, and `confirm`.
+Only four of the six need an implementation: `satisfied` defaults to `true` and
+`influence` defaults to "every variable I touch except this one". A new data
+source therefore joins the engine with `variables`, `estimate`, `propose`, and
+`confirm` — iteration and point queries, nothing more. That minimum is what
+keeps hash maps, PATCHes, succinct archives and device-resident structures all
+admissible; a seek or leapfrog requirement would disqualify half of them.
 
 Composition is by two constraints rather than by an algebra:
 [`IntersectionConstraint`](triblespace::core::query::intersectionconstraint::IntersectionConstraint)
 (built by [`and!`](triblespace::core::prelude::and)) and
 [`UnionConstraint`](triblespace::core::query::unionconstraint::UnionConstraint)
 (built by [`or!`](triblespace::core::prelude::or)). Both are ordinary
-constraints implementing the same seven methods, so a `TribleSet` pattern, a
+constraints implementing the same six methods, so a `TribleSet` pattern, a
 `HashSet` membership test, and an application predicate mix in one query
 without any of them knowing about the others.
+
+## Propose and confirm take a batch
+
+`propose` and `confirm` do not take one binding. They take a
+[`Frontier`](triblespace::core::query::Frontier): the whole collection of
+parent bindings sitting at one point of the search. A single binding is a
+frontier of one, which is exactly the older single-binding protocol.
+
+The reason is measured. With a width-1 frontier only the root level ever
+proposes widely; every deeper level asks a source for the candidates of one
+parent, and over real data (a region-size census on dblp) that is a median of
+1–7 candidates at every scale, p95 around 200. Any batched tier — a GPU
+dispatch that pays off at 16 384 candidates, a SIMD probe — therefore engaged
+once at the root and never again. Batching the *parents* is what makes a
+level's region large at every depth.
+
+A frontier is cheap because bindings are indexes, not values (see below): it is
+an index matrix over the shared level buffers plus a `select` list of row
+numbers, so restricting one to a subset costs four bytes per row and never
+copies a row. Correspondingly, the
+[`ProposalBuffer`](triblespace::core::query::ProposalBuffer) is *segmented*: a
+proposer calls `open(row)` before appending a row's candidates, and every entry
+carries that **parent tag**. `Candidates` exposes the tags, so one region can
+span a whole batch and a confirmer can still tell whose each candidate is.
+
+Sources split cleanly along that seam. A verdict that does not depend on the
+parent binding — set membership, a byte range, a constant — ignores the tags
+and filters the whole region in one pass. One that does walks the region with
+`Candidates::for_each_parent`, which yields maximal runs of equal tag, so a
+per-binding setup is paid once per run instead of once per candidate.
+
+Nothing about the batch changes what the query means. Worst-case optimality is
+untouched — expanding *n* prefixes together is the same total work as expanding
+them one at a time, and the AGM bound is a statement about output size, not
+traversal order. The cost is frontier memory, `O(width × variables × depth)`:
+depth-first's `O(depth)` frontier traded for a wide one.
 
 ## Statelessness is the load-bearing choice
 
 Every method receives the current [`Binding`](triblespace::core::query::Binding)
-as a parameter. A constraint keeps no cursor, no half-finished enumeration, no
-record of where the search has been.
+— or a batch of them — as a parameter. A constraint keeps no cursor, no
+half-finished enumeration, no record of where the search has been.
 
 That single decision pays for most of the engine's structure:
 
@@ -64,17 +103,11 @@ That single decision pays for most of the engine's structure:
   those iterators, and a borrowed enumeration would tie the constraint's
   lifetime to the engine's — the self-referential trap that a stateful protocol
   cannot avoid.
-- **Resumption is plain data.** When the engine wants a level in pieces it
-  hands `propose_chunk` a
-  [`ProposeCursor`](triblespace::core::query::ProposeCursor): a `started` flag
-  and 32 opaque bytes the source interprets however it likes (a last-delivered
-  value, a rank offset). The source re-finds its place from that cursor on
-  every call. Because the cursor is POD, it survives `Query::clone` and the
-  rayon splitter without any cooperation from the source.
-
-The price is that a source with an expensive seek pays it again on every
-resume. That is the trade the engine takes, and the geometric chunk schedule
-below is what keeps the number of resumes logarithmic.
+- **A level is proposed once.** Because no source is ever asked to resume, a
+  level's buffer is written exactly once and never appended to while its
+  variable is bound. That makes "a bound variable's buffer is stable for the
+  lifetime of its binding" an unconditional invariant, which is what lets a
+  binding be an *index* into that buffer instead of a copy of the value.
 
 ## Depth-first search with dynamic variable ordering
 
@@ -82,21 +115,96 @@ The ordering is the engine's core performance idea, not an implementation
 detail.
 
 [`Query::new`](triblespace::core::query::Query::new) asks every variable for an
-estimate against the empty binding and sorts the unbound set by it. Then the
-search repeats one step:
+estimate against the empty binding. Then the search repeats one step, over a
+whole frontier at a time:
 
-1. Refresh the estimates that the most recent binding could have changed — the
-   `influence` sets of the variables bound since the last refresh, minus the
-   ones already bound.
-2. Re-sort the unbound variables and take the most specific one.
-3. Ask the constraint tree to `propose` candidates for it. An intersection
-   internally lets its tightest child propose and runs the remaining children
-   as confirmers over that child's output, so the buffer the engine sees has
-   already survived every clause.
-4. Bind the first live candidate and descend.
-5. When a level runs out of live candidates and its source is exhausted, unset
-   the variable, push it back into the unbound set, and continue with the next
-   candidate one level up.
+1. For each row of the frontier, pick its most specific unbound variable from
+   *that row's own* estimates.
+2. Partition the frontier by that choice and take the next group.
+3. Ask the constraint tree to `propose` candidates for the group's variable,
+   over all of the group's rows in one call. An intersection internally lets
+   each row's tightest child propose and runs the remaining children as
+   confirmers over that output, so the buffer the engine sees has already
+   survived every clause.
+4. Turn the next chunk of surviving candidates into the child frontier and
+   descend. Each child row inherits its parent's estimates and refreshes
+   exactly the ones the new binding could have changed — the `influence` set
+   of the variable just bound.
+5. When a level runs out of live candidates, retire it and continue with the
+   next group, then with the next chunk one level up.
+
+### The width is a ceiling, and the first chunk is one row
+
+`DEFAULT_FRONTIER_WIDTH` is how wide a chunk may *get*, not how wide the first
+one is. A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding; every
+chunk after it is the full width.
+
+That is what keeps time-to-first-result honest. A caller who stops after one
+row — `exists!`, `.next()` — must not pay to build a 16 384-wide frontier it
+will never look at, and with a first chunk of one it does exactly the work the
+single-binding engine did. Measured on a first-row-only join, a flat
+full-width engine is 8.8x slower than the pre-batching engine; one narrow
+chunk closes the entire gap.
+
+The obvious schedule is geometric — 1, 2, 4, … up to the ceiling — and it was
+measured and rejected. Doubling reaches the ceiling in `log2(width)` chunks,
+but the last chunk of a geometric drain holds only about half the candidates,
+so a level never builds a frontier wider than half of what a flat schedule
+would, and every level pays `log2(width)` expansions instead of one. On a
+fan-out join that took a fixture's widest frontier from 2048 rows to 512, its
+mean frontier from 768 to 31, and its expansions from 3 to 74 — for the same
+rows and the same proposals. A quarter of the peak width is a direct attack on
+the reason batching exists, and it cost 10% on a full drain to buy it. One
+step gives the same first-row latency (the first chunk is one binding either
+way) and keeps the peak. The price is `take(2..width)`, which now pays a full
+batch — the deliberate trade, since `exists!` and `next()` are the
+short-circuit shapes that actually occur.
+
+### A 1:1 descent copies nothing
+
+Step 4 normally builds the child frontier by copying each drawn candidate's
+parent row and filling in the newly bound slot. When the draw is **1:1** — one
+surviving child per parent row, in order, covering the whole frontier, with
+nothing left pending — that copy is pure waste: no row was gained, lost or
+reordered, so the child block *is* the parent block with one more slot
+written, and the child's estimate rows are bit-identical to the parent's.
+
+The two standing invariants are what make it sound. Confirmers may only kill
+candidates, never revive them, so a surviving row keeps its identity. Buffers
+are write-once, so the newly bound variable's slot in every row was previously
+unwritten and filling it destroys nothing. And because such a draw leaves the
+level spent, the parent frontier is never asked for anything again, so its
+matrices are handed *down* rather than shared — which is what lets a whole
+chain of 1:1 descents run without a single matrix copy instead of only the
+first one.
+
+Ownership needs no separate flag. The matrices already sit behind `Arc` so a
+rayon split copies refcounts, and `Arc::get_mut` therefore succeeds exactly
+when no split or steal holds the other half; when it says no, the copying path
+runs. `FrontierStats` counts both paths.
+
+The fast path is gated so that it costs nothing when it cannot fire.
+Recognising a 1:1 draw means deferring the child rows until the draw's shape
+is known, and that deferral is a second pass — measured at +10% and +20% on
+two fixtures when charged to every descent. So the engine asks first, from
+what it already knows: a level holding `proposed` candidates for `rows`
+parents can only yield one child per parent if `proposed == rows`. Every
+fan-out level fails that `O(1)` test and runs the fused single-pass build
+exactly as before.
+
+This matters most for the shape batching can never help: a chain with fan-out
+one at every level has no sibling parents to widen the frontier with, so it
+can only ever be *charged* for the machinery. Removing the per-level row copy
+is what brings it back to the single-binding engine's cost.
+
+**A row is never moved onto a variable it did not choose**, however tempting
+that is for batch size. `propose` owns candidate support and first-seen order,
+and the protocol supplies no cross-variable support-equivalence law, so an
+estimate-compatible variable is not an interchangeable action. All the leeway
+lives in the bucketing described next — which is exactly why agreement, and so
+an unsplit batch, is the common case.
+[`FrontierStats`](triblespace::core::query::FrontierStats) counts expansions,
+rows and groups, so fragmentation is observed rather than assumed.
 
 Specificity is deliberately coarse. The sort key is the *bit length* of the
 estimate (`ilog2(n) + 1`), so counts inside the same power-of-two bucket are
@@ -168,22 +276,33 @@ This is also what makes an accelerator safe to bolt on. A device that computes
 verdicts for a whole region cannot corrupt the search, because the only thing
 it can do with its answer is clear bits that the CPU would also have cleared.
 
-## Chunked proposing
+## What the engine refuses: resumable narrowing
 
-A level whose source has a million candidates should not have to materialize a
-million candidates before the engine can try the first one. `propose_chunk`
-lets the engine pull a level in pieces: the first request asks for 64
-candidates, and each refill asks for four times the previous budget.
+An earlier design let a source deliver a level in geometrically growing chunks
+through a resumable cursor, so a level with a million candidates would not have
+to materialize a million before the engine could try the first one. It is
+gone, and the reasons are worth recording because the idea recurs.
 
-Geometric growth keeps both ends bounded. Time-to-first-result at a wide level
-is bounded by the first chunk rather than by the level's cardinality, while the
-total enumeration work stays within a constant factor of eager proposing and
-the number of refill calls stays logarithmic in the level width.
+It was never adopted by a single leaf source, so the machinery only ever ran
+its own default. It answers a time-to-first-result question that a pure
+conjunctive query does not ask — depth-first already yields the instant the
+stack bottoms out, and the measurement bore that out (0.004 ms against 0.017 ms
+for the design it was meant to improve). And its one real case, a wide root, is
+a lottery on iteration order rather than a saving: chunking helps only if the
+surviving candidates happen to sort early.
 
-The contract on the source is small but strict: never deliver the same value
-twice across the calls of one enumeration (that would inflate row multiplicity,
-see below), and always advance the cursor when the budget is nonzero, so a
-caller that loops on refill terminates.
+What did survive is the *geometric* part. The deleted cursor carried an
+`INITIAL_CHUNK`/`WIDEN_FACTOR` pair, and the residual engine before it grew its
+search width geometrically after negative work; both are the same idea, and
+both were attached to the wrong object. Attached to a *level*, growth asks a
+source to resume. Attached to the *frontier*, it asks nothing of anyone — the
+engine already owns how many parent rows it expands at a time, so
+`INITIAL_FRONTIER_WIDTH` and `FRONTIER_RAMP` buy the time-to-first-result
+property the cursor was reaching for with none of its protocol cost.
+
+Narrowing a wide level is still a real problem; galloping intersection is the
+standing candidate for it. What the engine will not do is require a *seek* from
+sources, because that requirement is what would disqualify half of them.
 
 ## Parallel execution
 
@@ -192,13 +311,20 @@ With the `parallel` feature a query is also a rayon producer:
 walks the same state machine and hands one half of a level's candidates to a
 sibling:
 
-- While the top of the search stack has a single pending candidate *and* its
-  source is exhausted, bind it and descend. Descending through a level whose
-  cursor is still live would clone that cursor into the sibling and enumerate
-  its tail twice, so such a level is bisected instead.
-- When the top has two or more pending candidates, bisect them. The right half
-  takes the materialized tail and is marked exhausted; the left half keeps the
-  cursor. Every unmaterialized candidate therefore has exactly one owner.
+- While the top of the search stack has fewer than two pending candidates, take
+  the step: either the level is spent and gets retired, or the single candidate
+  becomes a one-row child frontier and the search descends.
+- When the top has two or more pending candidates, bisect them and hand the
+  tail to a sibling. A candidate's parent tag names a row of the *parent*
+  frontier, and the sibling is a whole-state clone that keeps that frontier
+  verbatim — its matrices sit behind `Arc`, so the clone is refcounts rather
+  than megabytes — so the tags address exactly the same rows on both sides. The
+  left half keeps entries `[0..mid)` and every consumed entry sits below its
+  consumption watermark, so its own indexes still resolve to the same values.
+- Splitting narrows the frontier: the two halves each expand a slice of what
+  one would have expanded together. That is the deliberate trade — batch width
+  buys per-level dispatch size, work-stealing buys core utilisation — and rayon
+  only asks for a split under stealing pressure.
 - A leaf just drives the ordinary sequential `Iterator::next` and folds the
   results. No engine logic is duplicated for the parallel path.
 

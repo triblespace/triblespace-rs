@@ -1,6 +1,44 @@
 use super::*;
 use smallvec::SmallVec;
 
+/// Debug check for the `estimate` relevance contract: whether a constraint
+/// answers `Some` or `None` must depend only on *which* variables are bound,
+/// never on their values. Composites read relevance off one row of the batch,
+/// so a constraint that flips mid-frontier silently changes the bag — and in
+/// either direction, which is why it is worth catching rather than
+/// documenting alone.
+///
+/// Sampled rather than exhaustive: checking every row of a 16k frontier on
+/// every confirm would make debug builds unusable. Rows are walked with a
+/// stride so the sample spans the whole batch and always includes the last
+/// row, and frontiers of `MAX_ROWS` or fewer are checked completely. A
+/// violation that is uniform across the sampled rows but not the skipped ones
+/// would slip through; a constraint whose relevance depends on values is
+/// overwhelmingly unlikely to agree on a spread this wide by accident.
+///
+/// Not `#[cfg(debug_assertions)]`: `debug_assert!` still *compiles* its body
+/// in release (it expands to `if cfg!(debug_assertions)`), so gating this
+/// would break the release build. It is simply never called there.
+fn frontier_relevance_is_uniform<'a, C: Constraint<'a>>(
+    constraints: &[C],
+    variable: VariableId,
+    frontier: &Frontier<'_>,
+) -> bool {
+    const MAX_ROWS: usize = 64;
+    let rows = frontier.len();
+    if rows < 2 {
+        return true;
+    }
+    let stride = rows.div_ceil(MAX_ROWS);
+    constraints.iter().all(|c| {
+        let expected = c.estimate(variable, &frontier.row(0)).is_some();
+        (0..rows)
+            .step_by(stride)
+            .chain(std::iter::once(rows - 1))
+            .all(|i| c.estimate(variable, &frontier.row(i)).is_some() == expected)
+    })
+}
+
 /// Logical conjunction of constraints (AND).
 ///
 /// All children must agree on every variable binding. Built by the
@@ -52,68 +90,161 @@ where
             .min()
     }
 
-    /// Sorts children by estimate, lets the tightest one propose, then
-    /// confirms through the rest in ascending estimate order — kills land
-    /// in the region's liveness words; nothing is compacted. Children that return `None` for this variable
-    /// are skipped entirely.
+    /// Lets each row's tightest child propose, then confirms through the
+    /// rest — kills land in the region's liveness words; nothing is
+    /// compacted. Children that return `None` for this variable are
+    /// skipped.
+    ///
+    /// The tightest child is a *per-row* decision, exactly as the variable
+    /// choice is: an estimate is a function of the row's binding, and one
+    /// row's binding can make the archive the selective source while
+    /// another's makes a hash set selective. Rows that agree — the common
+    /// case — travel as one batch with no row copied; genuine disagreement
+    /// pays for one [`Frontier::with_select`] sub-batch per source, which
+    /// is what keeps each `propose`/`confirm` pass homogeneous enough for a
+    /// batched executor to dispatch it as a unit.
     ///
     /// Only the tail region this call appended (from the incoming buffer
-    /// length onward) is confirmed, so proposals appended by
-    /// sibling constraints in an enclosing composite are never filtered
-    /// through this intersection's children.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        let mut cursor = ProposeCursor::default();
-        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
-    }
-
-    /// Chunked propose: the tightest child delivers its next chunk and the
-    /// remaining children chunk-confirm it through a mask before it reaches
-    /// the caller — candidates never sit unconfirmed in the buffer. The
-    /// cursor is threaded straight to the tightest child; the child choice
-    /// is stable across one level's chunk sequence because estimates only
-    /// depend on the binding, which is fixed while a level enumerates.
-    fn propose_chunk(
+    /// length onward) is confirmed, so proposals appended by sibling
+    /// constraints in an enclosing composite are never filtered through
+    /// this intersection's children.
+    fn propose(
         &self,
         variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
-        let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
-            .constraints
+    ) {
+        let rows = frontier.len();
+        if rows == 0 {
+            return;
+        }
+
+        // Per-row: the tightest child, and which children have an opinion
+        // about `variable` at all.
+        let mut choice: Vec<usize> = Vec::with_capacity(rows);
+        let mut relevant: SmallVec<[bool; 8]> = SmallVec::from_elem(false, self.constraints.len());
+        // Rows on which each child claimed the variable. Only read by the
+        // debug assertion below — this loop already visits every row, so the
+        // contract check is exhaustive here rather than sampled.
+        let mut relevant_rows: SmallVec<[usize; 8]> =
+            SmallVec::from_elem(0, self.constraints.len());
+        for row in 0..rows {
+            let binding = frontier.row(row);
+            let mut best = usize::MAX;
+            let mut best_child = usize::MAX;
+            for (i, c) in self.constraints.iter().enumerate() {
+                if let Some(estimate) = c.estimate(variable, &binding) {
+                    relevant[i] = true;
+                    relevant_rows[i] += 1;
+                    if best_child == usize::MAX || estimate < best {
+                        best = estimate;
+                        best_child = i;
+                    }
+                }
+            }
+            choice.push(best_child);
+        }
+        // NOT a `debug_assert!`. The per-row tally above runs in every build
+        // — release included — so the only thing `debug_assert!` bought was
+        // discarding the conclusion we had already paid for. And the failure
+        // it guards is silent: a violating constraint does not crash, it
+        // returns a DIFFERENT BAG. Measured on the contract fixture, 18 rows
+        // at width 1 against 11 at width 4096, with nothing to indicate the
+        // seven that vanished. A wrong answer nobody can see is worse than a
+        // panic, so this one is paid for in release too. The `confirm`-side
+        // twin stays debug-only: its uniformity scan is work done ONLY for
+        // the check, which is a different trade.
+        assert!(
+            relevant_rows.iter().all(|&n| n == 0 || n == rows),
+            "Constraint::estimate returned Some for some rows of a frontier \
+             and None for others on variable {variable}. Whether the answer \
+             is Some or None must depend only on which variables are bound, \
+             not on their values (see Constraint::estimate). This propose \
+             ORs relevance across the batch, so a child that claims the \
+             variable on any row is then allowed to confirm every row."
+        );
+
+        // No child constrains this variable anywhere in the batch.
+        if choice.iter().all(|&c| c == usize::MAX) {
+            return;
+        }
+
+        let confirmers: SmallVec<[usize; 8]> = relevant
             .iter()
-            .filter_map(|c| Some((c.estimate(variable, binding)?, c)))
+            .enumerate()
+            .filter_map(|(i, &r)| r.then_some(i))
             .collect();
-        if relevant_constraints.is_empty() {
-            return false;
-        }
-        relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
 
-        let base = proposals.len();
-        let more = relevant_constraints[0]
-            .1
-            .propose_chunk(variable, binding, cursor, budget, proposals);
-
-        let mut region = proposals.region(base);
-        for (_, c) in relevant_constraints[1..].iter() {
-            c.confirm(variable, binding, &mut region);
+        let single = choice.iter().all(|&c| c == choice[0]);
+        if single {
+            let base = proposals.len();
+            self.constraints[choice[0]].propose(variable, frontier, proposals);
+            let mut region = proposals.region(base);
+            for &i in confirmers.iter().filter(|&&i| i != choice[0]) {
+                self.constraints[i].confirm(variable, frontier, &mut region);
+            }
+            return;
         }
-        more
+
+        let mut select: Vec<u32> = Vec::new();
+        let mut positions: Vec<u32> = Vec::new();
+        for proposer in 0..self.constraints.len() {
+            positions.clear();
+            positions.extend(
+                choice
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c == proposer)
+                    .map(|(row, _)| row as u32),
+            );
+            if positions.is_empty() {
+                continue;
+            }
+            select.clear();
+            frontier.compose(positions.iter().copied(), &mut select);
+            let sub = frontier.with_select(&select);
+
+            let base = proposals.len();
+            self.constraints[proposer].propose(variable, &sub, proposals);
+            let mut region = proposals.region(base);
+            for &i in confirmers.iter().filter(|&&i| i != proposer) {
+                self.constraints[i].confirm(variable, &sub, &mut region);
+            }
+            // The child tagged its candidates with sub-batch row numbers;
+            // lift them back into this frontier's coordinates before the
+            // region reaches our caller.
+            proposals.remap_region(base, &positions);
+        }
     }
 
     /// Confirms proposals through all children that constrain `variable`,
-    /// in order of increasing estimate, all killing into the shared mask.
-    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+    /// all killing into the shared mask.
+    ///
+    /// Ordering the children by estimate is a pure cost heuristic — kills
+    /// conjoin regardless — so the batch's first row supplies the ordering
+    /// for the whole pass rather than each row re-deciding it.
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
+        if frontier.is_empty() {
+            return;
+        }
+        let binding = frontier.row(0);
+        debug_assert!(
+            frontier_relevance_is_uniform(&self.constraints, variable, frontier),
+            "Constraint::estimate returned Some for some rows of a frontier \
+             and None for others on variable {variable}. Whether the answer \
+             is Some or None must depend only on which variables are bound, \
+             not on their values (see Constraint::estimate). Reading \
+             relevance off row 0 — as this does — otherwise changes the bag."
+        );
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
-            .filter_map(|c| Some((c.estimate(variable, binding)?, c)))
+            .filter_map(|c| Some((c.estimate(variable, &binding)?, c)))
             .collect();
         relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
 
         for (_, c) in relevant_constraints.iter() {
-            c.confirm(variable, binding, cands);
+            c.confirm(variable, frontier, cands);
         }
     }
 

@@ -19,6 +19,26 @@ rpq = []
 # post-`Candidates` protocol (engine/owned-mask, 2026-07-27 onward).
 # Subjects older than that record F11 as skip:protocol.
 protocol-v2 = []
+# `propose`/`confirm` take a `Frontier` (a batch of parent bindings)
+# instead of one `Binding`, and `propose_chunk`/`ProposeCursor` are gone
+# (engine/batched-frontier, 2026-07-28 onward). Refines `protocol-v2`:
+# the hand-written wrappers in F11 and the confirm-region census pick
+# their method signatures off this. Never enable it without
+# `protocol-v2` — bench.sh only ever probes for it alongside.
+frontier = []
+# `FrontierStats` gained `widest`/`inplace_descents`/`copied_descents`
+# (engine/batched-frontier-harvest, 2026-07-28 onward). The batched
+# protocol shipped before those counters existed, so the census reports
+# expansions and mean width against a plain `frontier` subject and the
+# ceiling question only against one that can answer it. Refines
+# `frontier`; never enable it alone.
+frontier-widest = []
+# The W=1 control arm: pins every translated query to
+# `with_frontier_width(1)`, reducing the SAME engine to expanding one
+# binding at a time. Not a capability probe — a deliberate ablation, so
+# bench.sh never enables it; build the control arm by hand. See the note
+# at `queries::run` for what the resulting gap does and does not measure.
+frontier-w1 = ["frontier"]
 # F10 straddles `triblespace-gpu`'s `DEFAULT_MIN_CONFIRM_BATCH` and READS
 # the constant out of the subject rather than copying it, so the fixture
 # can only compile against a subject that ships the gpu crate (the
