@@ -350,6 +350,19 @@ mod repr {
             self.live.len()
         }
 
+        /// Bit position of entry 0 within the first word
+        /// [`live_words`](Self::live_words) hands out.
+        ///
+        /// Always `0` here: one word per candidate makes a region a plain
+        /// sub-slice, so entry `i` is word `i`. Under `liveness-bitmask` it is
+        /// `base % 32` and entry `i` is bit `bit_offset() + i`. Only code that
+        /// indexes liveness *bits* rather than *candidates* — i.e. a device
+        /// kernel writing packed verdict words — has any business reading it;
+        /// every CPU-side access goes through `is_live`/`kill`/`retain`.
+        pub fn bit_offset(&self) -> usize {
+            0
+        }
+
         /// Copies the liveness words out (scratch for OR-composition).
         pub fn live_words(&self) -> Vec<u32> {
             self.live.to_vec()
@@ -856,6 +869,20 @@ mod repr {
             self.words.len()
         }
 
+        /// Bit position of entry 0 within the first word
+        /// [`live_words`](Self::live_words) hands out — `base % 32`, where
+        /// `base` is the buffer index this region starts at.
+        ///
+        /// Entry `i` is bit `(bit_offset() + i) % 32` of word
+        /// `(bit_offset() + i) / 32`. Only code that indexes liveness *bits*
+        /// rather than *candidates* — i.e. a device kernel writing packed
+        /// verdict words — has any business reading it; every CPU-side access
+        /// goes through the masked methods above, which is what keeps the
+        /// neighbouring regions' bits out of reach.
+        pub fn bit_offset(&self) -> usize {
+            self.bit_offset
+        }
+
         /// Copies the liveness words out (scratch for OR-composition).
         ///
         /// NEUTRAL MASKING (read side): the bits this region does not own are
@@ -1112,6 +1139,60 @@ mod tests {
         for base in [0usize, 1, 5, 31, 32, 33, 63, 64, 69, 70] {
             let r = b.region(base);
             assert_eq!(r.live_words().len(), r.live_word_len());
+        }
+    }
+
+    /// The word geometry a device kernel has to reproduce: the region's words
+    /// hold `bit_offset() + len()` bits, and `bit_offset()` is below one word.
+    #[test]
+    fn bit_offset_describes_the_word_geometry() {
+        let mut b = filled(70);
+        for base in [0usize, 1, 5, 31, 32, 33, 63, 64, 69, 70] {
+            let r = b.region(base);
+            let offset = r.bit_offset();
+            assert!(offset < 32, "bit offset {offset} is not below a word");
+            if LIVENESS_BITMASK {
+                assert_eq!(offset, base % 32);
+                assert_eq!(r.live_word_len(), (offset + r.len()).div_ceil(32));
+            } else {
+                assert_eq!(offset, 0);
+                assert_eq!(r.live_word_len(), r.len());
+            }
+        }
+    }
+
+    /// The reconstruction a packed device kernel performs, pinned on the host:
+    /// entry `i` of a region is bit `bit_offset() + i` of the words
+    /// `live_words` hands out (word `i` in the baseline layout). Getting this
+    /// wrong is a silent wrong-answer bug, so spell it here — this is the
+    /// *host-side contract* the kernel is written against, not a test of any
+    /// kernel.
+    #[test]
+    fn live_words_reconstruct_is_live_bit_by_bit() {
+        let mut b = filled(70);
+        {
+            let mut r = b.region(0);
+            for i in [0usize, 1, 30, 31, 32, 33, 40, 63, 64, 69] {
+                r.kill(i);
+            }
+        }
+        for base in [0usize, 1, 5, 31, 32, 33, 63, 64, 69, 70] {
+            let r = b.region(base);
+            let words = r.live_words();
+            let offset = r.bit_offset();
+            for i in 0..r.len() {
+                let reconstructed = if LIVENESS_BITMASK {
+                    let bit = offset + i;
+                    (words[bit / 32] >> (bit % 32)) & 1 != 0
+                } else {
+                    words[i] != 0
+                };
+                assert_eq!(
+                    reconstructed,
+                    r.is_live(i),
+                    "entry {i} of region({base}) reconstructs wrong"
+                );
+            }
         }
     }
 

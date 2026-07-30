@@ -150,9 +150,10 @@ precisely so the kill path stays branch-identical to what it is being measured
 against. Two things get harder when a word stops belonging to one candidate: a
 kill becomes a read-modify-write on a word shared with 31 neighbours, and a
 region no longer starts on a word boundary, so its first and last words carry
-liveness bits owned by *neighbouring* regions of the same buffer. The device
-confirm path is not ported for that second reason — see below — and under the
-feature `triblespace-gpu` routes confirmation to the canonical CPU arm.
+liveness bits owned by *neighbouring* regions of the same buffer. The invariant
+is enforced at the boundary of the type: every write path masks to the owned
+bits and every read path zeroes the bits it does not own, so no caller — the
+device confirm path included, see below — can reach a neighbour's liveness.
 
 ## Confirmation is kill-only
 
@@ -352,13 +353,18 @@ parity suite holds to identical liveness words. The substitution is legal
 precisely because of the kill-only contract: verdicts computed anywhere merge
 back by word-wise AND, and a device can never revive a dead entry.
 
-That merge is also where the packed liveness layout stops the device path: the
-kernels write one verdict word per candidate, which only lines up with liveness
-when a word *is* one candidate. Packed, the verdicts would have to be reduced to
-bits on the device, and the AND into a region's first and last word would have
-to be an atomic masked update, because those words are shared with neighbouring
-regions. Under `liveness-bitmask` the kernels are therefore not used at all and
-every confirm takes the CPU arm.
+The packed liveness layout changes the shape of that merge but not its
+character. Word-per-candidate, a kernel's flat index is the candidate and it
+writes one verdict word each. Packed, the flat index becomes the *bit position*
+in the region's liveness words — so candidate `i` sits at bit
+`bit_offset + i` — and one `plane_ballot` per 32-lane plane produces a whole
+packed verdict word with every bit already in place, stored by a single lane.
+No rotation, no read-modify-write, no atomic. The AND and the write-back are
+unchanged in both layouts, because the device works on a *private* copy taken
+through `live_words()` and merged through `set_live_words()`, and those two mask
+the neighbouring regions' bits out and back in. The kernel needs one device
+property for this — planes exactly 32 lanes wide — which the host checks before
+dispatching, demoting to the CPU arm if it does not hold.
 
 The threshold is measured, not guessed. On an Apple M4 Max (Metal via wgpu),
 against a 262,135-trible archive with fully live regions, the GPU round trip is

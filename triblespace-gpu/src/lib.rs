@@ -3,13 +3,14 @@
 use std::fmt;
 
 // The liveness layout is a *core* feature, but this crate's device confirm
-// path assumes one liveness word per candidate (it writes one verdict word per
-// candidate and merges with a word-wise AND). Cargo features are per-crate, so
-// nothing otherwise stops a build from enabling
-// `triblespace-core/liveness-bitmask` while leaving this crate's mirror feature
-// off — and the result would compile cleanly and silently AND per-candidate
-// verdicts into packed liveness words, i.e. wrong query answers with no
-// diagnostic anywhere. Tie the two together at compile time instead.
+// kernels are compiled against one layout or the other: a verdict word per
+// candidate, or a packed word per 32 candidates written by a plane ballot at a
+// region-dependent bit offset. Cargo features are per-crate, so nothing
+// otherwise stops a build from enabling `triblespace-core/liveness-bitmask`
+// while leaving this crate's mirror feature off — and the result would compile
+// cleanly and silently AND per-candidate verdicts into packed liveness words,
+// i.e. wrong query answers with no diagnostic anywhere. Tie the two together at
+// compile time instead.
 const _: () = assert!(
     triblespace_core::query::LIVENESS_BITMASK == cfg!(feature = "liveness-bitmask"),
     "triblespace-gpu must be built with the `liveness-bitmask` feature exactly when \

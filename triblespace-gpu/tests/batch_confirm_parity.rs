@@ -1,20 +1,35 @@
 //! GPU-vs-CPU parity for batched succinct-archive confirm.
 //!
 //! The acceptance bar: for the same archive, binding, and candidate region,
-//! the device-routed [`Constraint::confirm`] must produce liveness words
-//! identical to the canonical CPU constraint — across every routed arm,
-//! including candidates that are already dead (they must stay dead) and
-//! duplicated candidate values.
+//! the device-routed [`Constraint::confirm`] must produce liveness identical
+//! to the canonical CPU constraint — across every routed arm, including
+//! candidates that are already dead (they must stay dead) and duplicated
+//! candidate values.
 //!
-//! There is nothing to compare in a `liveness-bitmask` build: the device path
-//! is not ported and `confirm` routes everything to the CPU arm, so the suite
-//! would be asserting the CPU constraint against itself. It also spells the
-//! word-per-candidate layout directly (`vec![1u32; n]` as "all live"), which is
-//! wrong once a word carries 32 candidates. Compile it out rather than let it
-//! fail for the wrong reason. `required-features` in Cargo.toml cannot express
-//! a negation, hence the crate-level `cfg`.
-
-#![cfg(not(feature = "liveness-bitmask"))]
+//! # Why every case runs at several region bases
+//!
+//! A confirm region is `[base..]` of a [`ProposalBuffer`]. Under
+//! `liveness-bitmask` that is *not* a word-aligned sub-slice: candidate `i` is
+//! bit `base % 32 + i` of the region's words, and the region's first word
+//! carries up to 31 bits belonging to the entries *before* `base`. A device
+//! kernel that packs verdicts has to place its bits at that offset, and must
+//! leave the neighbours' bits alone. Both mistakes are silent — wrong query
+//! answers, no diagnostic — and a suite that only ever builds
+//! `buffer.region(0)` has `bit_offset == 0` everywhere and structurally cannot
+//! see either.
+//!
+//! So every parity case runs at all of [`BASES`], and asserts three things:
+//!
+//! * the region's verdicts match the CPU arm's, at each base;
+//! * the region's verdicts do not depend on the base — they are a function of
+//!   the candidate values and the binding and of nothing else;
+//! * every entry *below* the base comes back exactly as it went in: live ones
+//!   live, pre-killed ones dead. That is the bug class that matters, and it is
+//!   only observable from outside the region.
+//!
+//! Liveness is read back through `ProposalBuffer::is_live`, never through
+//! `live_words`, so nothing in this file spells a word layout and the suite is
+//! meaningful under both representations.
 
 use std::collections::HashSet;
 
@@ -29,6 +44,15 @@ use triblespace_core::query::{
 };
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::WgpuSuccinctArchive;
+
+/// Buffer indices the confirmed region is made to start at.
+///
+/// Packed, the region's bit offset is `base % 32`, so these cover offset 0
+/// (aligned), 1 (just past the boundary), 5 (interior), and 31 (the region's
+/// first word holds exactly one of its candidates and 31 of a neighbour's) —
+/// each of them once at a base below a word and once at a base past one, plus
+/// a base far enough in that whole words precede the region.
+const BASES: [usize; 9] = [0, 1, 5, 31, 32, 33, 63, 64, 1000];
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -60,6 +84,19 @@ fn free_value(tag: u8, ordinal: u32) -> RawInline {
     value[1] = 0x55;
     value[28..].copy_from_slice(&ordinal.to_be_bytes());
     value
+}
+
+/// The entries placed *before* the confirmed region — the neighbouring
+/// region's candidates, which this confirm has no business deciding about.
+fn prefix_entries(base: usize) -> Vec<RawInline> {
+    (0..base).map(|i| free_value(0x30, i as u32)).collect()
+}
+
+/// Which prefix entries are pre-killed. A confirm must neither revive these
+/// nor kill the others; both directions are checked, because a whole-word
+/// write gets one of them wrong whichever way it goes.
+fn prefix_is_dead(i: usize) -> bool {
+    i % 7 == 3
 }
 
 struct Fixture {
@@ -152,23 +189,60 @@ fn kills_for(seed: u64, len: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Runs one confirm call over a fresh region and returns the region's final
-/// liveness words.
+/// The liveness of a whole buffer after one confirm, split at the region's
+/// base. Booleans, not words: the point is to say nothing about the layout.
+struct Outcome {
+    /// Liveness of the confirmed region's candidates, region-relative.
+    region: Vec<bool>,
+    /// Liveness of the entries below the region's base, buffer-relative.
+    prefix: Vec<bool>,
+}
+
+/// Builds a buffer of `base` neighbour entries followed by `candidates`,
+/// pre-kills part of both, runs one confirm over `[base..]`, and reports the
+/// liveness of *every* entry in the buffer.
 fn confirm_liveness<'a, C: Constraint<'a>>(
     constraint: &C,
     variable: VariableId,
     binding: &Binding,
+    base: usize,
     candidates: &[RawInline],
     kills: &[usize],
-) -> Vec<u32> {
+) -> Outcome {
     let mut buffer = ProposalBuffer::new();
+    buffer.extend_from_slice(&prefix_entries(base));
     buffer.extend_from_slice(candidates);
-    let mut region = buffer.region(0);
-    for &k in kills {
-        region.kill(k);
+    {
+        // The neighbour's kills, applied through a region that owns them.
+        let mut neighbour = buffer.region(0);
+        for i in 0..base {
+            if prefix_is_dead(i) {
+                neighbour.kill(i);
+            }
+        }
     }
-    constraint.confirm(variable, binding, &mut region);
-    region.live_words()
+    {
+        let mut region = buffer.region(base);
+        for &k in kills {
+            region.kill(k);
+        }
+        constraint.confirm(variable, binding, &mut region);
+    }
+    Outcome {
+        region: (base..buffer.len()).map(|i| buffer.is_live(i)).collect(),
+        prefix: (0..base).map(|i| buffer.is_live(i)).collect(),
+    }
+}
+
+/// Asserts the entries below the region survived the confirm untouched.
+fn assert_prefix_undisturbed(prefix: &[bool], arm: &str, context: &str) {
+    for (i, live) in prefix.iter().enumerate() {
+        assert_eq!(
+            *live,
+            !prefix_is_dead(i),
+            "{arm} confirm disturbed entry {i}, which lies outside the region, for {context}"
+        );
+    }
 }
 
 struct Vars {
@@ -186,9 +260,11 @@ fn vars() -> Vars {
     }
 }
 
-/// One parity check: identical liveness under the CPU and GPU constraints,
-/// dead entries stay dead, and every duplicate value pair agrees. Returns
-/// the CPU liveness for arm-coverage assertions.
+/// One parity check, repeated at every base in [`BASES`]: identical region
+/// liveness under the CPU and GPU constraints, dead entries stay dead, every
+/// duplicate value pair agrees, the entries outside the region are untouched,
+/// and the verdicts are the same whatever the base. Returns the region
+/// liveness for arm-coverage assertions.
 fn check_arm(
     fixture: &Fixture,
     variable: VariableId,
@@ -196,7 +272,7 @@ fn check_arm(
     candidates: &[RawInline],
     kills: &[usize],
     context: &str,
-) -> Vec<u32> {
+) -> Vec<bool> {
     let vars_cpu = vars();
     let cpu_constraint = SuccinctArchiveConstraint::new(
         vars_cpu.e,
@@ -212,44 +288,66 @@ fn check_arm(
         &fixture.gpu,
     );
 
-    let before = fixture.gpu.stats();
-    let cpu = confirm_liveness(&cpu_constraint, variable, binding, candidates, kills);
-    let gpu = confirm_liveness(&gpu_constraint, variable, binding, candidates, kills);
-    let after = fixture.gpu.stats();
-
-    assert_eq!(cpu, gpu, "CPU and GPU liveness diverge for {context}");
-    assert_eq!(
-        after.gpu_confirms,
-        before.gpu_confirms + 1,
-        "confirm was not device-routed for {context}"
-    );
-    for &k in kills {
-        assert_eq!(gpu[k], 0, "killed entry {k} was revived for {context}");
-    }
     let killed: HashSet<usize> = kills.iter().copied().collect();
-    for i in 0..candidates.len() {
-        for j in (i + 1)..candidates.len() {
-            if candidates[i] == candidates[j] && !killed.contains(&i) && !killed.contains(&j) {
-                assert_eq!(
-                    gpu[i] != 0,
-                    gpu[j] != 0,
-                    "duplicate candidates {i} and {j} disagree for {context}"
-                );
+    let mut settled: Option<Vec<bool>> = None;
+    for base in BASES {
+        let context = format!("{context}/base{base}");
+
+        let before = fixture.gpu.stats();
+        let cpu = confirm_liveness(&cpu_constraint, variable, binding, base, candidates, kills);
+        let gpu = confirm_liveness(&gpu_constraint, variable, binding, base, candidates, kills);
+        let after = fixture.gpu.stats();
+
+        assert_eq!(
+            cpu.region, gpu.region,
+            "CPU and GPU liveness diverge for {context}"
+        );
+        assert_eq!(
+            after.gpu_confirms,
+            before.gpu_confirms + 1,
+            "confirm was not device-routed for {context}"
+        );
+
+        assert_prefix_undisturbed(&cpu.prefix, "CPU", &context);
+        assert_prefix_undisturbed(&gpu.prefix, "GPU", &context);
+
+        for &k in kills {
+            assert!(!gpu.region[k], "killed entry {k} was revived for {context}");
+        }
+        for i in 0..candidates.len() {
+            for j in (i + 1)..candidates.len() {
+                if candidates[i] == candidates[j] && !killed.contains(&i) && !killed.contains(&j) {
+                    assert_eq!(
+                        gpu.region[i], gpu.region[j],
+                        "duplicate candidates {i} and {j} disagree for {context}"
+                    );
+                }
             }
         }
+
+        // A region's verdicts are a function of its candidates and the
+        // binding. If they move with the base, some bit landed at the wrong
+        // offset.
+        if let Some(previous) = &settled {
+            assert_eq!(
+                previous, &gpu.region,
+                "region verdicts changed with the region's base for {context}"
+            );
+        }
+        settled = Some(gpu.region);
     }
-    cpu
+    settled.expect("BASES is non-empty")
 }
 
 /// Asserts the arm was informative: at least one survivor and at least one
 /// non-prekilled kill, so parity is not vacuous.
-fn assert_mixed(liveness: &[u32], kills: &[usize], context: &str) {
+fn assert_mixed(liveness: &[bool], kills: &[usize], context: &str) {
     let killed: HashSet<usize> = kills.iter().copied().collect();
-    let survivors = liveness.iter().filter(|w| **w != 0).count();
+    let survivors = liveness.iter().filter(|live| **live).count();
     let fresh_kills = liveness
         .iter()
         .enumerate()
-        .filter(|(i, w)| **w == 0 && !killed.contains(i))
+        .filter(|(i, live)| !**live && !killed.contains(i))
         .count();
     assert!(survivors > 0, "{context}: no survivors — vacuous parity");
     assert!(fresh_kills > 0, "{context}: no kills — vacuous parity");
@@ -269,8 +367,8 @@ fn membership_confirm_parity_all_axes() {
             (v.v.index, "value"),
         ] {
             let context = format!("membership/{axis}/seed{seed}");
-            let cpu = check_arm(&fixture, variable, &binding, &candidates, &kills, &context);
-            assert_mixed(&cpu, &kills, &context);
+            let live = check_arm(&fixture, variable, &binding, &candidates, &kills, &context);
+            assert_mixed(&live, &kills, &context);
         }
     }
 }
@@ -303,9 +401,10 @@ fn single_bound_range_confirm_parity() {
             let mut binding = BindingStore::new();
             binding.bind(bound_var, &fixture.absent[seed as usize % fixture.absent.len()]);
             let context = format!("range-empty/{name}/seed{seed}");
-            let cpu = check_arm(&fixture, confirm_var, &binding.view(), &candidates, &kills, &context);
+            let live =
+                check_arm(&fixture, confirm_var, &binding.view(), &candidates, &kills, &context);
             assert!(
-                cpu.iter().all(|w| *w == 0),
+                live.iter().all(|survived| !*survived),
                 "{context}: empty range must kill everything"
             );
         }
@@ -371,17 +470,22 @@ fn all_dead_region_stays_all_dead() {
     let binding = Binding::default();
     let candidates = candidate_pool(&fixture, 41, 32);
     let kills: Vec<usize> = (0..candidates.len()).collect();
-    let gpu_live = {
-        let vars_gpu = vars();
-        let constraint = triblespace_gpu::WgpuSuccinctArchiveConstraint::new(
-            vars_gpu.e,
-            vars_gpu.a,
-            vars_gpu.v,
-            &fixture.gpu,
+    let vars_gpu = vars();
+    let constraint = triblespace_gpu::WgpuSuccinctArchiveConstraint::new(
+        vars_gpu.e,
+        vars_gpu.a,
+        vars_gpu.v,
+        &fixture.gpu,
+    );
+    for base in BASES {
+        let outcome =
+            confirm_liveness(&constraint, v.v.index, &binding, base, &candidates, &kills);
+        assert!(
+            outcome.region.iter().all(|live| !*live),
+            "an all-dead region gained a survivor at base {base}"
         );
-        confirm_liveness(&constraint, v.v.index, &binding, &candidates, &kills)
-    };
-    assert!(gpu_live.iter().all(|w| *w == 0));
+        assert_prefix_undisturbed(&outcome.prefix, "GPU", &format!("all-dead/base{base}"));
+    }
 }
 
 #[test]
@@ -407,14 +511,17 @@ fn below_threshold_falls_back_to_cpu() {
         &fixture.gpu,
     );
 
-    let before = fixture.gpu.stats();
-    let cpu = confirm_liveness(&cpu_constraint, v.v.index, &binding, &candidates, &[]);
-    let gpu = confirm_liveness(&gpu_constraint, v.v.index, &binding, &candidates, &[]);
-    let after = fixture.gpu.stats();
+    for base in BASES {
+        let before = fixture.gpu.stats();
+        let cpu = confirm_liveness(&cpu_constraint, v.v.index, &binding, base, &candidates, &[]);
+        let gpu = confirm_liveness(&gpu_constraint, v.v.index, &binding, base, &candidates, &[]);
+        let after = fixture.gpu.stats();
 
-    assert_eq!(cpu, gpu);
-    assert_eq!(after.gpu_confirms, before.gpu_confirms);
-    assert_eq!(after.cpu_fallback_confirms, before.cpu_fallback_confirms + 1);
+        assert_eq!(cpu.region, gpu.region, "threshold fallback diverges at base {base}");
+        assert_eq!(after.gpu_confirms, before.gpu_confirms);
+        assert_eq!(after.cpu_fallback_confirms, before.cpu_fallback_confirms + 1);
+        assert_prefix_undisturbed(&gpu.prefix, "CPU-fallback", &format!("threshold/base{base}"));
+    }
 }
 
 /// Region-size sweep printing the CPU/GPU crossover for both routed confirm
@@ -472,7 +579,11 @@ fn confirm_crossover_sweep() {
                  shape: &str| {
         let mut buffer = ProposalBuffer::new();
         buffer.extend_from_slice(candidates);
-        let all_live = vec![1u32; candidates.len()];
+        // Layout-agnostic "revive everything": `set_live_words` keeps only the
+        // bits the region owns, so all-ones sets exactly those (and in the
+        // word-per-candidate layout `u32::MAX` is simply a nonzero, i.e. live,
+        // word). Sized from `live_word_len`, never from the candidate count.
+        let all_live = vec![u32::MAX; buffer.region(0).live_word_len()];
         let reps = 5;
 
         // Warm up device pipelines outside the timed region.
@@ -484,25 +595,26 @@ fn confirm_crossover_sweep() {
 
         let mut cpu_best = f64::MAX;
         let mut gpu_best = f64::MAX;
-        let mut cpu_words = Vec::new();
-        let mut gpu_words = Vec::new();
+        let mut cpu_live = Vec::new();
+        let mut gpu_live = Vec::new();
         for _ in 0..reps {
             let mut region = buffer.region(0);
             region.set_live_words(&all_live);
             let started = Instant::now();
             cpu_constraint.confirm(variable, binding, &mut region);
             cpu_best = cpu_best.min(started.elapsed().as_secs_f64() * 1e3);
-            cpu_words = region.live_words();
+            cpu_live = (0..buffer.len()).map(|i| buffer.is_live(i)).collect();
 
             let mut region = buffer.region(0);
             region.set_live_words(&all_live);
             let started = Instant::now();
             gpu_constraint.confirm(variable, binding, &mut region);
             gpu_best = gpu_best.min(started.elapsed().as_secs_f64() * 1e3);
-            gpu_words = region.live_words();
-            region.set_live_words(&all_live);
+            gpu_live = (0..buffer.len()).map(|i| buffer.is_live(i)).collect();
+
+            buffer.region(0).set_live_words(&all_live);
         }
-        assert_eq!(cpu_words, gpu_words, "sweep parity failed for {shape}");
+        assert_eq!(cpu_live, gpu_live, "sweep parity failed for {shape}");
         (cpu_best, gpu_best)
     };
 

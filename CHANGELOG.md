@@ -22,11 +22,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its first and last words shared with neighbouring regions; every write masks
   to the bits it owns and every word handed out is zeroed outside them.
   `Candidates::live_word_len` is the new (and only) source of truth for how many
-  words a region's liveness occupies. `triblespace-gpu` mirrors the feature and
-  const-asserts agreement with core, and routes confirmation to the canonical
-  CPU arm under it: its kernels write one verdict word per candidate, which has
-  no meaning once a word carries 32. Prototype, not yet justified against the
-  baseline.
+  words a region's liveness occupies, and `Candidates::bit_offset` reports where
+  entry 0 sits inside the first of them — the one piece of the layout code that
+  indexes liveness *bits* rather than candidates needs. `triblespace-gpu`
+  mirrors the feature and const-asserts agreement with core. Prototype, not yet
+  justified against the baseline.
+- **The device confirm path follows the packed layout, via a plane ballot.**
+  `triblespace-gpu`'s confirm kernels no longer assume one verdict word per
+  candidate. Under `liveness-bitmask` the kernel's flat index becomes the *bit
+  position* in the region's liveness word array rather than the candidate
+  index, so candidate `i` is bit `bit_offset + i` and a 32-lane plane's
+  `plane_ballot` yields a whole packed verdict word with every bit already in
+  the position the word wants it in: no rotation by the region's bit offset, no
+  read-modify-write of a word two lanes share, no atomic, and one store per 32
+  candidates. Out-of-region bit slots vote `false`, which is the value that
+  survives `live_words`'s zeroing and `set_live_words`'s masking unchanged, so
+  a confirm still cannot reach the neighbouring regions that share its first
+  and last word. The host sizes every buffer from `live_word_len`, dispatches
+  `bit_offset + n` slots, and refuses the device — demoting to the CPU arm and
+  counting a device error — unless the adapter reports planes of exactly 32
+  lanes, the width both supported targets (NVIDIA warps, Apple Silicon) have
+  and the width the packed store's exclusivity argument rests on. This replaces
+  the previous behaviour of routing every `liveness-bitmask` confirm to the CPU.
 - **A bounded oracle checks the regular-path closure kernel.** A Kani harness
   symbolically selects every subgraph of a five-edge, two-vertex labeled
   universe, while an ordinary deterministic test exhausts all 256 graphs whose
@@ -64,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The batch-confirm parity suite exercises non-zero region bit offsets.**
+  `triblespace-gpu`'s parity tests built every region with `buffer.region(0)`,
+  so the region's bit offset was always zero and the suite structurally could
+  not catch a packed write landing at the wrong offset or trampling a
+  neighbour. Every case now runs at bases 0, 1, 5, 31, 32, 33, 63, 64 and 1000,
+  reads liveness back through `ProposalBuffer::is_live` instead of spelling a
+  word layout, and asserts three things at each base: the region's verdicts
+  match the CPU arm's, the verdicts do not move with the base, and every entry
+  *below* the base comes back exactly as it went in — live ones live,
+  pre-killed ones dead. The suite also no longer compiles itself out under
+  `liveness-bitmask`.
 - **Parallel SimpleArchive decoding builds each worker chunk bottom-up.** For
   aligned archives at or above the existing 4,096-row parallel threshold, each
   worker validates every canonical row, computes its construction hash once,

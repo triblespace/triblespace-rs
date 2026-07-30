@@ -238,3 +238,27 @@ prioritized for efficient zero-copy access.
   make collection evict it despite weak budget retention; see the ignored
   `weak_pin_on_already_tenured_blob_stays_old_after_compact_bug` regression in
   `repo::yard` tests.
+- The packed device confirm path assumes `UNIT_POS_PLANE` relates linearly to
+  the cube-local invocation index — condition (c) on
+  `membership_confirm_ballot_kernel`. It is true on Metal and CUDA and is what
+  makes ballot bit `L` the verdict of the lane at `plane_base + L`, but the
+  WGSL subgroups extension leaves the invocation-to-subgroup mapping
+  implementation-defined and a violation shows up only as wrong query answers.
+  A standalone "pack N predicate bits with a ballot and compare against a CPU
+  pack" kernel, run over `n x bit_offset` grids, would turn the assumption into
+  a measurement on each adapter we ship on; it is also the test the
+  shared-memory-atomic alternative would need.
+- The packed confirm kernels hardcode ballot component 0 and are gated on
+  `plane_size_min == plane_size_max == 32` (`require_plane_packing`). Widening
+  to 64-lane planes needs a *dynamic* index into `Vector<u32, Const<4>>`
+  (`ballot[UNIT_POS_PLANE / 32]`), which cubecl 0.10 has no in-tree usage of
+  and which naga's MSL backend would defeat anyway — it writes components
+  1..3 as literal zeros. Only worth doing if a 64-wide target enters scope.
+- The confirm round trip is dominated by fixed cost, not by the verdict
+  buffer: three fresh device allocations per membership confirm, six per range
+  confirm, and one blocking readback. Packing the verdicts 32x shrinks the part
+  that was already ~10% of the trip. The order-of-magnitude move is keeping the
+  region's liveness resident on the device across confirms — at which point two
+  confirms over adjacent regions of the same buffer really do collide on the
+  shared edge word and the merge has to become `atomicAnd`, which kill-only
+  makes idempotent and order-free.
