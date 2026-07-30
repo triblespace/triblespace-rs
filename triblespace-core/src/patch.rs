@@ -4239,6 +4239,47 @@ mod tests {
     }
 
     #[test]
+    fn heap_remove_carries_known_delta_through_a_dirty_child() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+        let mut d = c;
+        d[1] = 1;
+        let mut inserted = a;
+        inserted[1] = 2;
+
+        // The exact outer root covers two dirty archive-backed children.
+        // Inserting a heap key below one dirty child still carries its known
+        // fingerprint delta through that child and repairs the outer root.
+        let mut patch = owned_archive_pair([a, c]);
+        patch.union(owned_archive_pair([b, d]));
+        let before_insert = branch_cached_hash(&patch);
+        assert_ne!(before_insert, 0);
+
+        reset_local_leaf_hash_calls();
+        patch.insert(&Entry::new(&inserted));
+        let after_insert = branch_cached_hash(&patch);
+        assert_ne!(after_insert, 0);
+        assert_ne!(after_insert, before_insert);
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // Removing that known heap leaf is the inverse delta. The dirty child
+        // remains dirty, but the exact ancestor returns to its original cache
+        // without reading either archive leaf.
+        patch.remove(&inserted);
+        assert_eq!(branch_cached_hash(&patch), before_insert);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c, d]),
+        );
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
     fn promoted_dirty_results_remain_correct_through_later_unions() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
