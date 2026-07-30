@@ -4469,6 +4469,117 @@ mod tests {
     }
 
     #[test]
+    fn exact_owner_union_keeps_disjoint_dirty_local_leaves_alive_without_hashing() {
+        const KEY_LEN: usize = 8;
+        let left_key = [0u8; KEY_LEN];
+        let mut right_key = left_key;
+        right_key[0] = 1;
+
+        // Each fixture has already dropped every source Arc: its PATCH guard
+        // is the sole remaining lifetime witness for the LocalLeaf bytes.
+        let mut left = owned_archive_single(left_key);
+        let right = owned_archive_single(right_key);
+        assert_eq!(left.owners.as_ref().unwrap().owner_count(), 1);
+        assert_eq!(right.owners.as_ref().unwrap().owner_count(), 1);
+
+        let expected = heap_hash_oracle(&left) ^ heap_hash_oracle(&right);
+        reset_local_leaf_hash_calls();
+        left.union(right);
+
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&left), 0);
+        let cover = left.owners.as_ref().expect("union must retain both owners");
+        let stats = cover.stats();
+        assert_eq!(cover.owner_count(), 2);
+        assert_eq!(stats.owners, 2);
+        assert_eq!(stats.branches, 1);
+        assert_eq!(stats.max_depth, 1);
+        assert_eq!(
+            left.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([left_key, right_key]),
+        );
+        deep_hash_audit(&left);
+
+        // Deferred verification still dereferences both rows safely after the
+        // consumed source lineage and its standalone owner receipt are gone.
+        let before = local_leaf_hash_calls();
+        assert_eq!(left.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls() - before, 2);
+        assert_eq!(branch_cached_hash(&left), 0);
+    }
+
+    #[test]
+    fn exact_owner_diamond_stays_bounded_around_dirty_branch_heads() {
+        const KEY_LEN: usize = 8;
+        let left_key = [0u8; KEY_LEN];
+        let mut right_key = left_key;
+        right_key[0] = 1;
+
+        let left_storage = Arc::new(AlignedArchiveKey(left_key));
+        let right_storage = Arc::new(AlignedArchiveKey(right_key));
+        let left_owner: Arc<dyn ArchiveOwner> = left_storage.clone();
+        let right_owner: Arc<dyn ArchiveOwner> = right_storage.clone();
+        let (mut first, mut second) = {
+            let left_entry = unsafe {
+                ArchiveEntry::new(NonNull::from(&left_storage.0), &left_owner)
+            };
+            let right_entry = unsafe {
+                ArchiveEntry::new(NonNull::from(&right_storage.0), &right_owner)
+            };
+
+            let mut first = PATCH::<KEY_LEN, IdentitySchema>::new();
+            first.insert_archive(&left_entry);
+            first.insert_archive(&right_entry);
+
+            let mut second = PATCH::<KEY_LEN, IdentitySchema>::new();
+            second.insert_archive(&right_entry);
+            second.insert_archive(&left_entry);
+            (first, second)
+        };
+
+        assert_eq!(branch_cached_hash(&first), 0);
+        assert_eq!(branch_cached_hash(&second), 0);
+        let first_owner_root = Arc::as_ptr(&first.owners.as_ref().unwrap().root) as usize;
+        let second_owner_root = Arc::as_ptr(&second.owners.as_ref().unwrap().root) as usize;
+        assert_ne!(first_owner_root, second_owner_root);
+        let expected = heap_hash_oracle(&first);
+
+        // Leave each PATCH receipt as the only owner of its archive bytes.
+        drop(left_owner);
+        drop(right_owner);
+        drop(left_storage);
+        drop(right_storage);
+
+        // Exercise the PATCH-level diamond, not just OwnerCover directly:
+        // every Head merge walks two dirty Branches while the independently
+        // materialized exact receipts repeatedly join in opposite directions.
+        for _ in 0..256 {
+            let mut next_first = first.clone();
+            let mut next_second = second.clone();
+            next_first.union(second.clone());
+            next_second.union(first.clone());
+            first = next_first;
+            second = next_second;
+
+            for (patch, owner_root) in [
+                (&first, first_owner_root),
+                (&second, second_owner_root),
+            ] {
+                let cover = patch.owners.as_ref().expect("dirty Head lost its owners");
+                let stats = cover.stats();
+                assert_eq!(cover.owner_count(), 2);
+                assert_eq!(stats.owners, 2);
+                assert_eq!(stats.branches, 1);
+                assert_eq!(stats.max_depth, 1);
+                assert_eq!(Arc::as_ptr(&cover.root) as usize, owner_root);
+                assert_eq!(branch_cached_hash(patch), 0);
+                deep_hash_audit(patch);
+                assert_eq!(patch.root_hash(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
     fn archive_singleton_is_a_guarded_root_local_leaf() {
         const KEY_SIZE: usize = 8;
         let key = [0x5au8; KEY_SIZE];
