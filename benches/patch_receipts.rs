@@ -98,6 +98,32 @@ fn archive_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
     decoded.eav
 }
 
+/// Turn an exact archive template into a semantically identical dirty one
+/// using only public operations.
+///
+/// The separately decoded singleton is a root LocalLeaf and therefore has no
+/// resident fingerprint. Unioning it into a set that already contains its key
+/// cannot change the rows, but the exact union formula cannot retain the
+/// parent's fingerprint without both input fingerprints. This is the fixture
+/// shape needed to exercise an undemanded parallel union rather than asking
+/// the implementation to recover overlap receipts for two resident roots.
+fn demote_via_duplicate(
+    mut exact: EavPatch,
+    duplicate: [u8; TRIBLE_LEN],
+) -> EavPatch {
+    assert!(exact.iter().any(|row| row == &duplicate));
+    let expected_len = exact.len();
+    let singleton = archive_patch(std::slice::from_ref(&duplicate));
+    assert_eq!(singleton.node_stats(), (0, 0, 0, 1));
+
+    exact.union(singleton);
+    assert_eq!(exact.len(), expected_len);
+    let stats = exact.node_stats();
+    assert_eq!(stats.2, 0);
+    assert_eq!(stats.3, expected_len);
+    exact
+}
+
 fn archive_variant(bucket_start: u16, bucket_count: u16, variant: u8) -> EavPatch {
     let rows = ordered_archive_rows(bucket_start, bucket_count, variant, 1);
     archive_patch(&rows)
@@ -299,6 +325,27 @@ fn union_cases() -> Vec<UnionCase> {
     assert_eq!(union_rows(&disjoint_left_rows, &disjoint_right_rows).len(), 8_192);
     assert_eq!(union_rows(&overlap_left_rows, &overlap_right_rows).len(), 8_064);
 
+    // Balanced variant unions produce an exact root over dirty direct
+    // children. Demote both operands independently so dirty_disjoint and
+    // dirty_overlap128 exercise the no-root-demand path. Each helper call
+    // decodes its own singleton archive owner.
+    let dirty_disjoint_left = demote_via_duplicate(
+        archive_variants_in(0, 128, 0, 32),
+        raw_trible(0, 0),
+    );
+    let dirty_disjoint_right = demote_via_duplicate(
+        archive_variants_in(128, 128, 0, 32),
+        raw_trible(128, 0),
+    );
+    let dirty_overlap_left = demote_via_duplicate(
+        archive_variants_in(0, 128, 0, 32),
+        raw_trible(0, 0),
+    );
+    let dirty_overlap_right = demote_via_duplicate(
+        archive_variants_in(0, 128, 31, 32),
+        raw_trible(0, 31),
+    );
+
     vec![
         clean_union_case(4_095),
         clean_union_case(4_096),
@@ -306,17 +353,17 @@ fn union_cases() -> Vec<UnionCase> {
         checked_union_case(
             "dirty_disjoint",
             FixtureStorage::Local,
-            archive_variants_in(0, 128, 0, 32),
+            dirty_disjoint_left,
             &disjoint_left_rows,
-            archive_variants_in(128, 128, 0, 32),
+            dirty_disjoint_right,
             &disjoint_right_rows,
         ),
         checked_union_case(
             "dirty_overlap128",
             FixtureStorage::Local,
-            archive_variants_in(0, 128, 0, 32),
+            dirty_overlap_left,
             &overlap_left_rows,
-            archive_variants_in(0, 128, 31, 32),
+            dirty_overlap_right,
             &overlap_right_rows,
         ),
     ]
