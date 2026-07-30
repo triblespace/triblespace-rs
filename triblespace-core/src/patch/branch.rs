@@ -472,7 +472,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// slot (Some) or None to remove/leave empty. This consolidates the
     /// insert/update/remove logic in one place and updates branch aggregates
     /// and `childleaf` as needed. The `branch_nn` pointer may be updated in
-    /// place when the underlying allocation grows.
+    /// place when the underlying allocation grows. Child replacement may
+    /// mutate a uniquely owned Branch in place, so pointer identity cannot
+    /// prove a no-op across the callback: every occupied edit makes the
+    /// fingerprint unknown. Set-level operations may publish a stronger
+    /// algebraic proof at their PATCH boundary after the structural edit.
     pub(super) fn modify_child<F>(branch_nn: &mut NonNull<Self>, key: u8, f: F)
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
@@ -480,15 +484,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
-            // Incremental maintenance is valid only when the parent and every
-            // replaced contribution are already known; otherwise dirtiness
-            // propagates upward.
-            let cached_parent_hash = (*branch).cached_hash();
 
             // If a slot exists, operate on the existing child in-place.
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
-                let old_child_hash = cached_parent_hash.and_then(|_| child.known_hash());
                 let old_child_segment_count = child.count_segment(end_depth);
                 let old_child_leaf_count = child.count();
 
@@ -496,11 +495,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
                 if let Some(new_child) = f(Some(child)) {
                     // Replace existing child
-                    let new_child_hash = new_child.known_hash();
-                    let hash = match (cached_parent_hash, old_child_hash, new_child_hash) {
-                        (Some(parent), Some(old), Some(new)) => Some(parent ^ old ^ new),
-                        _ => None,
-                    };
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
@@ -513,13 +507,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     if slot.replace(new_child.with_key(key)).is_some() {
                         unreachable!();
                     }
-                    (&mut *branch).replace_cached_hash(hash);
+                    (&mut *branch).replace_cached_hash(None);
                 } else {
                     // Remove existing child
-                    let hash = match (cached_parent_hash, old_child_hash) {
-                        (Some(parent), Some(old)) => Some(parent ^ old),
-                        _ => None,
-                    };
                     (*branch).segment_count -= old_child_segment_count;
                     (*branch).leaf_count -= old_child_leaf_count;
 
@@ -528,7 +518,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                             (*branch).childleaf = other.childleaf_ptr();
                         }
                     }
-                    (&mut *branch).replace_cached_hash(hash);
+                    (&mut *branch).replace_cached_hash(None);
                 }
             } else {
                 // No current slot — the closure can choose to insert a child.
@@ -538,11 +528,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    let inserted_hash = inserted.known_hash();
-                    let hash = match (cached_parent_hash, inserted_hash) {
-                        (Some(parent), Some(inserted)) => Some(parent ^ inserted),
-                        _ => None,
-                    };
                     // Cuckoo insert loop, growing the table when necessary.
                     let mut branch_ptr = branch_nn.as_ptr();
                     while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
@@ -552,7 +537,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         // Refresh local pointer after potential reallocation.
                         branch_ptr = branch_nn.as_ptr();
                     }
-                    (&mut *branch_ptr).replace_cached_hash(hash);
+                    (&mut *branch_ptr).replace_cached_hash(None);
                 }
             }
             // Debug invariant check (no-op in release builds).
