@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PATCH rejects unequal LocalLeaf/Branch cardinalities before hashing.** Set
+  operations skip the uncached `LocalLeaf` fingerprint when the other subtree's
+  cached count is not one. Unary Branches remain eligible for fingerprint
+  equality, so this optimization does not assume that every Branch has at least
+  two leaves; pairs without a `LocalLeaf` retain their existing hash path.
 - **PATCH set operations decide archive-backed leaf pairs by exact keys before
   fingerprints.** `union`, `intersect`, and `difference` compare keys directly
   whenever either singleton is a `LocalLeaf`; heap/heap pairs retain their

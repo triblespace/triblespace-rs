@@ -707,6 +707,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         )
     }
 
+    /// Returns whether cardinality still permits equal fingerprints when an
+    /// archive-backed leaf is involved. A `LocalLeaf` represents exactly one
+    /// key, while a Branch's count is cached; all pairs without a `LocalLeaf`
+    /// retain the existing fingerprint path unchanged.
+    #[inline]
+    fn local_leaf_cardinality_allows_equality(&self, other: &Self) -> bool {
+        match (self.tag(), other.tag()) {
+            (HeadTag::LocalLeaf, _) => other.count() == 1,
+            (_, HeadTag::LocalLeaf) => self.count() == 1,
+            _ => true,
+        }
+    }
+
     pub(crate) fn count_segment(&self, at_depth: usize) -> u64 {
         match self.body_ref() {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
@@ -1074,7 +1087,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return this;
         }
 
-        if this.hash() == other.hash() {
+        if this.local_leaf_cardinality_allows_equality(&other)
+            && this.hash() == other.hash()
+        {
             return this;
         }
 
@@ -1191,7 +1206,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Self::union(this, other, at_depth);
         }
 
-        if this.hash() == other.hash() {
+        if this.local_leaf_cardinality_allows_equality(&other)
+            && this.hash() == other.hash()
+        {
             return this;
         }
 
@@ -1372,7 +1389,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if self.is_archive_singleton_pair(other) {
             return self.intersect(other, at_depth);
         }
-        if self.hash() == other.hash() {
+        if self.local_leaf_cardinality_allows_equality(other)
+            && self.hash() == other.hash()
+        {
             return Some(self.clone());
         }
         if self.first_divergence(other, at_depth).is_some() {
@@ -1494,7 +1513,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if self.is_archive_singleton_pair(other) {
             return self.difference(other, at_depth);
         }
-        if self.hash() == other.hash() {
+        if self.local_leaf_cardinality_allows_equality(other)
+            && self.hash() == other.hash()
+        {
             return None;
         }
         if self.first_divergence(other, at_depth).is_some() {
@@ -1871,7 +1892,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             };
         }
 
-        if self.hash() == other.hash() {
+        if self.local_leaf_cardinality_allows_equality(other)
+            && self.hash() == other.hash()
+        {
             return Some(self.clone());
         }
 
@@ -1964,7 +1987,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             };
         }
 
-        if self.hash() == other.hash() {
+        if self.local_leaf_cardinality_allows_equality(other)
+            && self.hash() == other.hash()
+        {
             return None;
         }
 
@@ -3548,6 +3573,80 @@ mod tests {
         assert_pair(&local_a, &heap_b, false);
         assert_pair(&heap_a, &heap_a, true);
         assert_pair(&heap_a, &heap_b, false);
+    }
+
+    #[test]
+    fn local_leaf_and_unary_branch_keep_equal_fingerprint_path() {
+        const KEY_SIZE: usize = 16;
+        #[repr(C, align(16))]
+        struct AlignedKey([u8; KEY_SIZE]);
+
+        let storage = std::sync::Arc::new([
+            AlignedKey([0x10; KEY_SIZE]),
+            AlignedKey([0x20; KEY_SIZE]),
+        ]);
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let mut pair = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+        for key in storage.iter() {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
+            pair.insert_archive(&entry);
+        }
+
+        // Deliberately retain a unary Branch representation. Cardinality one
+        // is not enough to infer its tag or reject equality with a LocalLeaf.
+        let mut unary = pair.root.as_ref().expect("pair has a root").clone();
+        let removed_slot = match unary.body_ref() {
+            BodyRef::Branch(branch) => branch
+                .child_table
+                .iter()
+                .flatten()
+                .find(|child| child.childleaf_key() == &storage[0].0)
+                .expect("first archive key is present")
+                .key(),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => panic!("pair root must be a Branch"),
+        };
+        {
+            let mut editor = crate::patch::branch::BranchMut::from_head(&mut unary);
+            editor.modify_child(removed_slot, |_| None);
+        }
+        assert!(matches!(unary.body_ref(), BodyRef::Branch(_)));
+        assert_eq!(unary.count(), 1);
+
+        let local = match unary.body_ref() {
+            BodyRef::Branch(branch) => branch
+                .child_table
+                .iter()
+                .flatten()
+                .next()
+                .expect("unary Branch has one child")
+                .clone(),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => unreachable!(),
+        };
+        assert_eq!(local.tag(), HeadTag::LocalLeaf);
+        assert_eq!(local.count(), 1);
+        assert_eq!(local.hash(), unary.hash());
+
+        // The equal-fingerprint shortcut returns its left operand unchanged.
+        // These shape checks therefore prove that the count-one case reaches
+        // fingerprints rather than taking the unequal-cardinality descent.
+        let union = Head::union(local.clone(), unary.clone(), 0);
+        assert_eq!(union.tag(), HeadTag::LocalLeaf);
+        let intersection = unary
+            .intersect(&local, 0)
+            .expect("equal singleton sets intersect");
+        assert!(matches!(intersection.body_ref(), BodyRef::Branch(_)));
+        assert!(unary.difference(&local, 0).is_none());
+
+        #[cfg(feature = "parallel")]
+        {
+            let union = Head::par_union(local.clone(), unary.clone(), 0);
+            assert_eq!(union.tag(), HeadTag::LocalLeaf);
+            let intersection = unary
+                .par_intersect(&local, 0)
+                .expect("equal singleton sets intersect");
+            assert!(matches!(intersection.body_ref(), BodyRef::Branch(_)));
+            assert!(unary.par_difference(&local, 0).is_none());
+        }
     }
 
     #[test]
