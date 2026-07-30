@@ -496,7 +496,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
                 if let Some(new_child) = f(Some(child)) {
                     // Replace existing child
-                    let new_child_hash = new_child.known_hash();
+                    let new_child_hash =
+                        cached_parent_hash.and_then(|_| new_child.known_hash());
                     let hash = match (cached_parent_hash, old_child_hash, new_child_hash) {
                         (Some(parent), Some(old), Some(new)) => Some(parent ^ old ^ new),
                         _ => None,
@@ -538,7 +539,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    let inserted_hash = inserted.known_hash();
+                    let inserted_hash =
+                        cached_parent_hash.and_then(|_| inserted.known_hash());
                     let hash = match (cached_parent_hash, inserted_hash) {
                         (Some(parent), Some(inserted)) => Some(parent ^ inserted),
                         _ => None,
