@@ -1368,7 +1368,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
 // union, intersect, query operations, etc.) which don't care about V
 // shape and so remain in the V-generic impl block.
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
-    pub(crate) fn replace_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Self {
+    /// Replace the matching leaf while deferring reclamation of the old leaf.
+    ///
+    /// The returned retirement slot must be dropped only after the caller has
+    /// published the returned head. `V::drop` is arbitrary user code and may
+    /// panic; running it from inside a [`BranchMut`] edit would expose a taken
+    /// child slot and stale aggregates if the panic were caught.
+    pub(crate) fn replace_leaf(
+        mut this: Self,
+        leaf: Self,
+        start_depth: usize,
+    ) -> (Self, Option<Self>) {
         if let Some((depth, this_byte_key, leaf_byte_key)) =
             this.first_divergence(&leaf, start_depth)
         {
@@ -1379,24 +1389,30 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 leaf.with_key(leaf_byte_key),
             );
 
-            return Head::new(old_key, new_body);
+            return (Head::new(old_key, new_body), None);
         }
 
         let end_depth = this.end_depth();
         if end_depth == KEY_LEN {
             let old_key = this.key();
-            return leaf.with_key(old_key);
+            return (leaf.with_key(old_key), Some(this));
         } else {
             // Use the editor view for branch mutation instead of raw pointer ops.
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
+            let mut retired = None;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::replace_leaf(old, inserted, end_depth)),
+                Some(old) => {
+                    let (replacement, old_leaf) = Head::replace_leaf(old, inserted, end_depth);
+                    retired = old_leaf;
+                    Some(replacement)
+                }
                 None => Some(inserted),
             });
+            drop(ed);
+            return (this, retired);
         }
-        this
     }
 
     /// Sequential PATCH-trie union. Always serial; the parallel
@@ -2636,15 +2652,24 @@ where
     }
 
     /// Inserts a key into the PATCH, replacing the value if it already exists.
+    ///
+    /// If the replaced value's destructor panics, the replacement is already
+    /// fully committed when the panic is raised.
     pub fn replace(&mut self, entry: &Entry<KEY_LEN, V>) {
-        if self.root.is_some() {
+        let retired_leaf = if self.root.is_some() {
             let this = self.root.take().expect("root should not be empty");
-            let new_head = Head::replace_leaf(this, entry.leaf(), 0);
+            let (new_head, retired_leaf) = Head::replace_leaf(this, entry.leaf(), 0);
             self.root.replace(new_head);
+            retired_leaf
         } else {
             self.root.replace(entry.leaf());
-        }
+            None
+        };
         self.debug_check_owner_invariant();
+
+        // Deliberately last: replacement may release the final shared
+        // reference to user-owned `V`, whose destructor may panic.
+        drop(retired_leaf);
     }
 
     /// Removes a key from the PATCH.
@@ -4658,6 +4683,68 @@ mod tests {
 
         let after = tree.root.as_ref().expect("root exists");
         assert_eq!(after.childleaf_key(), &new_key);
+    }
+
+    #[test]
+    fn replace_commits_nested_structure_before_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_LEN: usize = 4;
+        let replaced = [0, 0, 0, 0];
+        let nested_sibling = [0, 0, 0, 1];
+        let root_sibling = [1, 0, 0, 0];
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema, PanicOnDrop>::new();
+
+        for (key, should_panic) in [
+            (replaced, true),
+            (nested_sibling, false),
+            (root_sibling, false),
+        ] {
+            let entry = Entry::with_value(&key, PanicOnDrop(should_panic));
+            patch.insert(&entry);
+            drop(entry);
+        }
+        let old_hash = patch.root_hash().expect("fixture hash");
+        let old_nodes = patch.node_stats();
+
+        let replacement = Entry::with_value(&replaced, PanicOnDrop(false));
+        let result = catch_unwind(AssertUnwindSafe(|| patch.replace(&replacement)));
+        assert!(result.is_err());
+
+        assert_eq!(patch.len(), 3);
+        assert_eq!(patch.get(&replaced).map(|value| value.0), Some(false));
+        assert_eq!(patch.get(&nested_sibling).map(|value| value.0), Some(false));
+        assert_eq!(patch.get(&root_sibling).map(|value| value.0), Some(false));
+        assert_eq!(patch.root_hash(), Some(old_hash));
+        assert_eq!(patch.node_stats(), old_nodes);
+        assert_eq!(
+            patch.iter_ordered().copied().collect::<Vec<_>>(),
+            vec![replaced, nested_sibling, root_sibling],
+        );
+    }
+
+    #[test]
+    fn replace_commits_singleton_root_before_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_LEN: usize = 4;
+        let key = [7; KEY_LEN];
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema, PanicOnDrop>::new();
+        let original = Entry::with_value(&key, PanicOnDrop(true));
+        patch.insert(&original);
+        drop(original);
+
+        let replacement = Entry::with_value(&key, PanicOnDrop(false));
+        let result = catch_unwind(AssertUnwindSafe(|| patch.replace(&replacement)));
+        assert!(result.is_err());
+
+        assert_eq!(patch.len(), 1);
+        assert_eq!(patch.get(&key).map(|value| value.0), Some(false));
+        assert_eq!(patch.root_hash(), Some(hash_key(&key)));
+        assert!(matches!(
+            patch.root.as_ref().expect("replacement root").body_ref(),
+            BodyRef::Leaf(_),
+        ));
     }
 
     #[test]
