@@ -723,6 +723,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    #[inline]
+    fn is_singleton(&self) -> bool {
+        matches!(self.tag(), HeadTag::Leaf | HeadTag::LocalLeaf)
+    }
+
     pub(crate) fn count_segment(&self, at_depth: usize) -> u64 {
         match self.body_ref() {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
