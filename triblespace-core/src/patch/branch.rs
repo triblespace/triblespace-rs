@@ -537,8 +537,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    let inserted_hash =
-                        empty_slot_hash_hint.or_else(|| inserted.known_hash());
+                    let inserted_hash = empty_slot_hash_hint.or_else(|| inserted.known_hash());
                     (*branch).hash = match (cached_parent_hash, inserted_hash) {
                         (Some(parent), Some(inserted)) => parent ^ inserted,
                         _ => 0,
