@@ -12,6 +12,8 @@ use crate::metadata::MetaDescribe;
 use crate::patch::hash_key;
 use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
+#[cfg(test)]
+use crate::patch::BranchBuildStats;
 use crate::trible::Fragment;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
@@ -241,6 +243,26 @@ pub(crate) fn try_from_blob_serial_for_test(
 pub(crate) fn try_from_blob_bottom_up_for_test(
     blob: Blob<SimpleArchive>,
 ) -> Result<BottomUpArchiveProbe, UnarchiveError> {
+    try_from_blob_bottom_up_inner_for_test::<false>(blob, std::ptr::null_mut())
+}
+
+/// Counted twin used only by the untimed oracle portion of the ignored
+/// benchmark. Timed samples continue through the uninstrumented wrapper.
+#[cfg(test)]
+pub(crate) fn try_from_blob_bottom_up_with_stats_for_test(
+    blob: Blob<SimpleArchive>,
+) -> Result<(BottomUpArchiveProbe, BranchBuildStats), UnarchiveError> {
+    let mut stats = BranchBuildStats::default();
+    let probe = try_from_blob_bottom_up_inner_for_test::<true>(blob, &mut stats)?;
+    Ok((probe, stats))
+}
+
+#[cfg(test)]
+fn try_from_blob_bottom_up_inner_for_test<const COUNT: bool>(
+    blob: Blob<SimpleArchive>,
+    stats: *mut BranchBuildStats,
+) -> Result<BottomUpArchiveProbe, UnarchiveError> {
+    debug_assert!(!COUNT || !stats.is_null());
     let total_start = std::time::Instant::now();
     let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
         return Err(UnarchiveError::BadArchive);
@@ -276,8 +298,17 @@ pub(crate) fn try_from_blob_bottom_up_for_test(
     let hash_bytes = hashes.capacity() * std::mem::size_of::<u128>();
 
     let build_start = std::time::Instant::now();
-    let (set, permutation_bytes) =
-        unsafe { TribleSet::from_archive_partition_for_test(slice, &hashes, &owner) };
+    let (set, permutation_bytes) = if COUNT {
+        let (set, permutation_bytes, measured) = unsafe {
+            TribleSet::from_archive_partition_with_stats_for_test(slice, &hashes, &owner)
+        };
+        unsafe {
+            stats.write(measured);
+        }
+        (set, permutation_bytes)
+    } else {
+        unsafe { TribleSet::from_archive_partition_for_test(slice, &hashes, &owner) }
+    };
     let partition_and_build = build_start.elapsed();
 
     Ok(BottomUpArchiveProbe {
@@ -467,8 +498,8 @@ mod tests {
         );
     }
 
-    /// End-to-end serial production vs fused all-six MSD construction timing.
-    /// Run with:
+    /// End-to-end serial production vs fused all-six MSD construction timing,
+    /// with one separate untimed direct-capacity growth census. Run with:
     ///
     /// `cargo test -p triblespace-core --release all_six_bottom_up_archive_timing -- --ignored --nocapture`
     #[test]
@@ -482,9 +513,26 @@ mod tests {
         for (len, rounds) in [(100_000usize, 5usize), (1_000_000, 3)] {
             let blob = fixture_blob(len);
             let baseline_oracle = try_from_blob_serial_for_test(blob.clone()).unwrap();
-            let candidate_oracle = try_from_blob_bottom_up_for_test(blob.clone()).unwrap();
+            let (candidate_oracle, build_stats) =
+                try_from_blob_bottom_up_with_stats_for_test(blob.clone()).unwrap();
             assert_all_six_parity(&candidate_oracle.set, &baseline_oracle, len);
             assert_eq!(candidate_oracle.row_hashes, len);
+            let structural_stats = [
+                candidate_oracle.set.eav.node_stats(),
+                candidate_oracle.set.eva.node_stats(),
+                candidate_oracle.set.aev.node_stats(),
+                candidate_oracle.set.ave.node_stats(),
+                candidate_oracle.set.vea.node_stats(),
+                candidate_oracle.set.vae.node_stats(),
+            ];
+            assert_eq!(
+                build_stats.branches,
+                structural_stats.iter().map(|stats| stats.0).sum::<u64>(),
+            );
+            assert_eq!(
+                build_stats.final_slots,
+                structural_stats.iter().map(|stats| stats.1).sum::<u64>(),
+            );
             let hash_bytes = candidate_oracle.hash_bytes;
             let permutation_bytes = candidate_oracle.permutation_bytes;
             drop(candidate_oracle.set);
@@ -533,7 +581,7 @@ mod tests {
             let validation = median(&mut validation_samples);
             let build = median(&mut build_samples);
             println!(
-                "all_six_bottom_up_archive len={len} baseline_ms={:.3} candidate_ms={:.3} speedup={:.3}x validation_hash_ms={:.3} partition_build_ms={:.3} hash_bytes={hash_bytes} permutation_bytes={permutation_bytes} transient_bytes={} transient_mib={:.3}",
+                "all_six_bottom_up_archive len={len} baseline_ms={:.3} candidate_ms={:.3} speedup={:.3}x validation_hash_ms={:.3} partition_build_ms={:.3} hash_bytes={hash_bytes} permutation_bytes={permutation_bytes} transient_bytes={} transient_mib={:.3} branches={} initial_slots={} grow_calls={} heads_moved_by_grow={} grow_scanned_slots={} grow_allocated_slots={} final_slots={}",
                 baseline.as_secs_f64() * 1e3,
                 candidate.as_secs_f64() * 1e3,
                 baseline.as_secs_f64() / candidate.as_secs_f64(),
@@ -541,6 +589,13 @@ mod tests {
                 build.as_secs_f64() * 1e3,
                 hash_bytes + permutation_bytes,
                 (hash_bytes + permutation_bytes) as f64 / (1024.0 * 1024.0),
+                build_stats.branches,
+                build_stats.initial_slots,
+                build_stats.grow_calls,
+                build_stats.heads_moved_by_grow,
+                build_stats.grow_scanned_slots,
+                build_stats.grow_allocated_slots,
+                build_stats.final_slots,
             );
         }
     }
