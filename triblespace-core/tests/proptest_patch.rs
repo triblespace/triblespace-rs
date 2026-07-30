@@ -1,12 +1,14 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
-use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
+use triblespace_core::patch::{Entry, IdentitySchema, KeySchema, PATCH};
 
 triblespace_core::key_segmentation!(ThreeSegments, 12, [4, 4, 4]);
 triblespace_core::key_schema!(ThreeSegmentSchema, ThreeSegments, 12, [0, 1, 2]);
+triblespace_core::key_schema!(PermutedThreeSegmentSchema, ThreeSegments, 12, [2, 0, 1]);
 
 type TestPatch = PATCH<8, IdentitySchema, ()>;
 type SegmentedPatch = PATCH<12, ThreeSegmentSchema, ()>;
+type PermutedPatch = PATCH<12, PermutedThreeSegmentSchema, ()>;
 
 fn arb_key() -> impl Strategy<Value = [u8; 8]> {
     prop::array::uniform8(any::<u8>())
@@ -48,6 +50,35 @@ proptest! {
         patch.remove(&key);
         prop_assert!(!patch.has_prefix(&key));
         prop_assert_eq!(patch.len(), 0);
+    }
+
+    #[test]
+    fn nonidentity_removals_match_a_canonical_rebuild(
+        operations in vec((any::<[u8; 12]>(), any::<bool>()), 0..50),
+    ) {
+        let mut patch = PermutedPatch::new();
+        let mut expected = std::collections::BTreeSet::new();
+        for (key, _) in &operations {
+            patch.insert(&Entry::new(key));
+            expected.insert(*key);
+        }
+        for (key, remove) in &operations {
+            if *remove {
+                patch.remove(&PermutedThreeSegmentSchema::tree_ordered(key));
+                expected.remove(key);
+            }
+        }
+
+        let mut rebuilt = PermutedPatch::new();
+        for key in &expected {
+            rebuilt.insert(&Entry::new(key));
+        }
+        let actual = patch.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        prop_assert_eq!(actual, expected);
+        // Equality consumes the independently maintained PATCH fingerprints,
+        // so a tree-ordered/canonical hash mix-up cannot hide behind correct
+        // structural iteration.
+        prop_assert_eq!(patch, rebuilt);
     }
 
     // ── Set algebra ────────────────────────────────────────────────────
