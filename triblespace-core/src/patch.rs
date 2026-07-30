@@ -2857,6 +2857,32 @@ where
         self.root.as_ref().map(|root| root.hash())
     }
 
+    /// Test-only cache-state constructor: retain an exact root aggregate while
+    /// clearing every direct Branch child's aggregate. This state occurs when
+    /// an outer operation knows the result fingerprint independently of dirty
+    /// descendants, but cannot otherwise be constructed through public cache
+    /// consumers (which memoize the descendants they traverse).
+    #[cfg(test)]
+    pub(crate) fn demote_direct_branch_hashes_retaining_root_for_test(&mut self) -> usize {
+        let exact_root = self.root_hash();
+        let Some(root) = self.root.as_mut() else {
+            return 0;
+        };
+        let BodyMut::Branch(root_branch) = root.body_mut() else {
+            return 0;
+        };
+
+        let mut demoted = 0;
+        for child in root_branch.child_table.iter_mut().flatten() {
+            if let BodyMut::Branch(child_branch) = child.body_mut() {
+                child_branch.replace_cached_hash(None);
+                demoted += 1;
+            }
+        }
+        debug_assert_eq!(root_branch.cached_hash(), exact_root);
+        demoted
+    }
+
     /// Expensive debug oracle: derive the root hash from leaf bytes while
     /// recursively checking every resident Branch cache. Kept explicit rather
     /// than attached to each mutation so ordinary debug insertion does not

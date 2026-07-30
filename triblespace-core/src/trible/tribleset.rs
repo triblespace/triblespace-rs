@@ -882,7 +882,15 @@ mod tests {
                 .num_threads(workers)
                 .build()
                 .expect("probe pool");
-            let (stages, union_calls, first_eq_calls, second_eq_calls) = pool.install(|| {
+            let (
+                stages,
+                union_calls,
+                first_eq_calls,
+                second_eq_calls,
+                exact_union_calls,
+                exact_first_eq_calls,
+                exact_second_eq_calls,
+            ) = pool.install(|| {
                 let mut stages = Vec::new();
                 for variant_count in [1u8, 2, 4, 8, 16, 32, 64] {
                     let target = merged_variants(variant_count);
@@ -908,11 +916,50 @@ mod tests {
                 assert_eq!(left, oracle);
                 let second_eq_calls = local_leaf_hash_calls() - before;
 
-                (stages, union_calls, first_eq_calls, second_eq_calls)
+                // Construct the state the Criterion fixture's name/comment
+                // intended: an exact root over dirty direct descendants.
+                let mut exact_left = merged_variants(64);
+                macro_rules! demote_index {
+                    ($index:expr) => {
+                        assert_eq!(
+                            $index.demote_direct_branch_hashes_retaining_root_for_test(),
+                            128
+                        );
+                    };
+                }
+                demote_index!(exact_left.eav);
+                demote_index!(exact_left.eva);
+                demote_index!(exact_left.aev);
+                demote_index!(exact_left.ave);
+                demote_index!(exact_left.vea);
+                demote_index!(exact_left.vae);
+                let duplicate = archive_set(&[raw_trible(0, 0)]);
+
+                reset_local_leaf_hash_calls();
+                exact_left.union(duplicate);
+                let exact_union_calls = local_leaf_hash_calls();
+
+                let before = local_leaf_hash_calls();
+                assert_eq!(exact_left, oracle);
+                let exact_first_eq_calls = local_leaf_hash_calls() - before;
+
+                let before = local_leaf_hash_calls();
+                assert_eq!(exact_left, oracle);
+                let exact_second_eq_calls = local_leaf_hash_calls() - before;
+
+                (
+                    stages,
+                    union_calls,
+                    first_eq_calls,
+                    second_eq_calls,
+                    exact_union_calls,
+                    exact_first_eq_calls,
+                    exact_second_eq_calls,
+                )
             });
 
             eprintln!(
-                "exact_duplicate workers={workers}: stages={stages:?}, union={union_calls}, first_eq={first_eq_calls}, second_eq={second_eq_calls}"
+                "exact_duplicate workers={workers}: stages={stages:?}, actual=(union={union_calls}, first_eq={first_eq_calls}, second_eq={second_eq_calls}), intended_exact_over_dirty=(union={exact_union_calls}, first_eq={exact_first_eq_calls}, second_eq={exact_second_eq_calls})"
             );
         }
     }
