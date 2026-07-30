@@ -3983,7 +3983,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_remove_preserves_exact_hash_across_nested_cow() {
+    fn failed_remove_preserves_structure_and_exact_hash() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
         let mut b = a;
@@ -4019,13 +4019,18 @@ mod tests {
                 .expect("expected the same-prefix child")
                 .tptr
         };
+        let before_root = patch.root.as_ref().unwrap().tptr;
         let before_nested = nested_branch_ptr(&patch);
         let snapshot = patch.clone();
 
         reset_local_leaf_hash_calls();
         patch.remove(&missing);
 
-        assert_ne!(nested_branch_ptr(&patch), before_nested);
+        // `has_prefix` proves exact absence before opening a mutable path, so a
+        // failed removal preserves both the outer root and its nested branch.
+        assert_eq!(patch.root.as_ref().unwrap().tptr, before_root);
+        assert_eq!(nested_branch_ptr(&patch), before_nested);
+        assert_eq!(snapshot.root.as_ref().unwrap().tptr, before_root);
         assert_eq!(branch_cached_hash(&patch), cached_hash);
         assert_eq!(branch_cached_hash(&snapshot), cached_hash);
         assert_eq!(local_leaf_hash_calls(), 0);
