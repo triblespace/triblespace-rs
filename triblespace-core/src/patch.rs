@@ -454,6 +454,11 @@ std::thread_local! {
     // their accounting thread-local prevents unrelated parallel unit tests
     // from racing a reset or contributing incidental verification hashes.
     static LOCAL_LEAF_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Causal counters for the ignored receipt-composition probe. The probe
+    /// deliberately stays below every rayon threshold, so thread-local
+    /// accounting is exact and adds no synchronization to the measured path.
+    static COMPOSITION_HEAD_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RESIDENT_EQUALITY_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -464,6 +469,34 @@ pub(crate) fn reset_local_leaf_hash_calls() {
 #[cfg(test)]
 pub(crate) fn local_leaf_hash_calls() -> usize {
     LOCAL_LEAF_HASH_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_composition_probe_counters() {
+    LOCAL_LEAF_HASH_CALLS.set(0);
+    COMPOSITION_HEAD_VISITS.set(0);
+    RESIDENT_EQUALITY_PRUNES.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn composition_probe_counters() -> (usize, usize, usize) {
+    (
+        COMPOSITION_HEAD_VISITS.get(),
+        RESIDENT_EQUALITY_PRUNES.get(),
+        LOCAL_LEAF_HASH_CALLS.get(),
+    )
+}
+
+#[cfg(test)]
+#[inline]
+fn record_composition_head_visit() {
+    COMPOSITION_HEAD_VISITS.set(COMPOSITION_HEAD_VISITS.get() + 1);
+}
+
+#[cfg(test)]
+#[inline]
+fn record_resident_equality_prune() {
+    RESIDENT_EQUALITY_PRUNES.set(RESIDENT_EQUALITY_PRUNES.get() + 1);
 }
 
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
@@ -1156,6 +1189,35 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Clear every Branch receipt in this subtree without changing topology.
+    /// Used only to normalize independently-built archive fixtures for the
+    /// receipt-composition benchmark.
+    #[cfg(test)]
+    fn clear_branch_receipts_for_test(&mut self) {
+        let BodyMut::Branch(branch) = self.body_mut() else {
+            return;
+        };
+        for child in branch.child_table.iter_mut().flatten() {
+            child.clear_branch_receipts_for_test();
+        }
+        branch.replace_cached_hash(None);
+    }
+
+    #[cfg(test)]
+    fn collect_branch_receipts_for_test(&self, known: &mut usize, dirty: &mut usize) {
+        let BodyRef::Branch(branch) = self.body_ref() else {
+            return;
+        };
+        if branch.cached_hash().is_some() {
+            *known += 1;
+        } else {
+            *dirty += 1;
+        }
+        for child in branch.child_table.iter().flatten() {
+            child.collect_branch_receipts_for_test(known, dirty);
+        }
+    }
+
     /// Recompute a subtree hash from leaf keys while ignoring every Branch
     /// cache, asserting each nonzero cache against the resulting semantics.
     /// This is deliberately separate from `hash()` so deep debug audits do not
@@ -1431,6 +1493,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// hashes a `LocalLeaf` merely to keep the result cache warm. The first
     /// actual fingerprint consumer pays for whatever dirty region remains.
     pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
+        #[cfg(test)]
+        record_composition_head_visit();
         if this.same_body(&other) {
             return this;
         }
@@ -1466,6 +1530,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if this.count() == other.count() {
             if let (Some(left), Some(right)) = (this_hash, other_hash) {
                 if left == right {
+                    #[cfg(test)]
+                    record_resident_equality_prune();
                     return this;
                 }
             }
@@ -2294,6 +2360,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // call the owned helper `union` directly.
 
     pub(crate) fn intersect(&self, other: &Self, at_depth: usize) -> Option<Self> {
+        #[cfg(test)]
+        record_composition_head_visit();
         if self.same_body(other) {
             return Some(self.clone());
         }
@@ -2308,6 +2376,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if self.count() == other.count() {
             if let (Some(left), Some(right)) = (self.known_hash(), other.known_hash()) {
                 if left == right {
+                    #[cfg(test)]
+                    record_resident_equality_prune();
                     return Some(self.clone());
                 }
             }
@@ -2393,6 +2463,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// This is the set of elements that are in self but not in other.
     /// If the difference is empty, None is returned.
     pub(crate) fn difference(&self, other: &Self, at_depth: usize) -> Option<Self> {
+        #[cfg(test)]
+        record_composition_head_visit();
         if self.same_body(other) {
             return None;
         }
@@ -2407,6 +2479,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if self.count() == other.count() {
             if let (Some(left), Some(right)) = (self.known_hash(), other.known_hash()) {
                 if left == right {
+                    #[cfg(test)]
+                    record_resident_equality_prune();
                     return None;
                 }
             }
@@ -2954,6 +3028,34 @@ where
 
     pub(crate) fn root_hash(&self) -> Option<u128> {
         self.root.as_ref().map(|root| root.hash())
+    }
+
+    /// Normalize an exact archive fixture to one resident root over entirely
+    /// dirty Branch descendants. Topology, LocalLeaves, and owner receipts are
+    /// unchanged, isolating the value of descendant hash receipts.
+    #[cfg(test)]
+    pub(crate) fn normalize_root_only_receipt_for_test(&mut self) {
+        let Some(root) = self.root.as_mut() else {
+            return;
+        };
+        let exact = root.hash();
+        root.clear_branch_receipts_for_test();
+        root.publish_known_hash(exact);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn branch_receipt_stats_for_test(&self) -> (usize, usize) {
+        let mut known = 0;
+        let mut dirty = 0;
+        if let Some(root) = &self.root {
+            root.collect_branch_receipts_for_test(&mut known, &mut dirty);
+        }
+        (known, dirty)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_receipt_is_known_for_test(&self) -> bool {
+        self.root.as_ref().and_then(Head::known_hash).is_some()
     }
 
     /// Expensive debug oracle: derive the root hash from leaf bytes while

@@ -341,7 +341,9 @@ fn parallel_unarchive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch::{KeySchema, PATCH};
+    use crate::patch::{
+        composition_probe_counters, reset_composition_probe_counters, KeySchema, PATCH,
+    };
     use crate::trible::{AEVOrder, AVEOrder, EAVOrder, EVAOrder, VAEOrder, VEAOrder};
     use std::hint::black_box;
     use std::time::{Duration, Instant};
@@ -542,6 +544,448 @@ mod tests {
                 hash_bytes + permutation_bytes,
                 (hash_bytes + permutation_bytes) as f64 / (1024.0 * 1024.0),
             );
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    enum ReceiptState {
+        RootOnly,
+        AllInternal,
+    }
+
+    impl ReceiptState {
+        fn name(self) -> &'static str {
+            match self {
+                Self::RootOnly => "root_only",
+                Self::AllInternal => "all_internal",
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    enum CompositionOperation {
+        Union,
+        Intersect,
+        Difference,
+    }
+
+    impl CompositionOperation {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Union => "union",
+                Self::Intersect => "intersect",
+                Self::Difference => "difference",
+            }
+        }
+
+        fn apply(self, mut left: TribleSet, right: TribleSet) -> TribleSet {
+            match self {
+                Self::Union => {
+                    left.union(right);
+                    left
+                }
+                Self::Intersect => left.intersect(&right),
+                Self::Difference => left.difference(&right),
+            }
+        }
+
+        fn expected_rows(self, left: &[[u8; 64]], right: &[[u8; 64]]) -> Vec<[u8; 64]> {
+            match self {
+                Self::Union => {
+                    let mut rows = Vec::with_capacity(left.len() + right.len());
+                    rows.extend_from_slice(left);
+                    rows.extend_from_slice(right);
+                    rows.sort_unstable();
+                    rows.dedup();
+                    rows
+                }
+                Self::Intersect => left
+                    .iter()
+                    .copied()
+                    .filter(|row| right.binary_search(row).is_ok())
+                    .collect(),
+                Self::Difference => left
+                    .iter()
+                    .copied()
+                    .filter(|row| right.binary_search(row).is_err())
+                    .collect(),
+            }
+        }
+    }
+
+    struct CompositionGeometry {
+        name: &'static str,
+        left: Vec<[u8; 64]>,
+        right: Vec<[u8; 64]>,
+        operations: &'static [CompositionOperation],
+    }
+
+    fn composition_row(prefix: u8, lane: u8, ordinal: u32) -> [u8; 64] {
+        assert_ne!(prefix, 0, "entity and attribute ids must remain non-nil");
+        let mut row = [0u8; 64];
+        for start in [0usize, 16, 32] {
+            row[start] = prefix;
+            row[start + 1] = lane;
+            row[start + 2..start + 6].copy_from_slice(&ordinal.to_be_bytes());
+        }
+        row
+    }
+
+    fn region_rows(prefix: u8, len: usize) -> Vec<[u8; 64]> {
+        (0..len)
+            .map(|ordinal| composition_row(prefix, 1, ordinal as u32))
+            .collect()
+    }
+
+    fn composition_geometries() -> Vec<CompositionGeometry> {
+        const UNION_ONLY: &[CompositionOperation] = &[CompositionOperation::Union];
+        const ALL_SET_OPERATIONS: &[CompositionOperation] = &[
+            CompositionOperation::Union,
+            CompositionOperation::Intersect,
+            CompositionOperation::Difference,
+        ];
+
+        // Two adjacent slices of one canonical EAV sequence model the reduction
+        // inputs produced by `parallel_unarchive`. They are globally disjoint,
+        // but their A/V-first indexes still collide structurally.
+        let canonical_left = (0..512).map(fixture_row).collect();
+        let canonical_right = (512..1_024).map(fixture_row).collect();
+
+        // S, L, and R are complete first-byte regions in every index because
+        // each segment carries the same routing prefix. A=S+L and B=S+R expose
+        // one large, semantically equal Branch per index while preventing every
+        // PATCH-level cardinality donation law.
+        let shared = region_rows(0x20, 256);
+        let left_only = region_rows(0x40, 256);
+        let right_only = region_rows(0x60, 256);
+        let mut aligned_left = shared.clone();
+        aligned_left.extend_from_slice(&left_only);
+        aligned_left.sort_unstable();
+        let mut aligned_right = shared;
+        aligned_right.extend_from_slice(&right_only);
+        aligned_right.sort_unstable();
+
+        // Every top-level bucket contains one shared and one side-specific
+        // LocalLeaf. No equal non-singleton subtree exists, so resident Branch
+        // receipts cannot prune; the exact leaf collision poisons the rebuilt
+        // path in both receipt states.
+        let mut scattered_left = Vec::with_capacity(128);
+        let mut scattered_right = Vec::with_capacity(128);
+        for bucket in 1u8..=64 {
+            let shared = composition_row(bucket, 0x10, 0);
+            scattered_left.extend([shared, composition_row(bucket, 0x20, 0)]);
+            scattered_right.extend([shared, composition_row(bucket, 0x30, 0)]);
+        }
+        scattered_left.sort_unstable();
+        scattered_right.sort_unstable();
+
+        vec![
+            CompositionGeometry {
+                name: "canonical_disjoint_chunks",
+                left: canonical_left,
+                right: canonical_right,
+                operations: UNION_ONLY,
+            },
+            CompositionGeometry {
+                name: "branch_aligned_partial_overlap",
+                left: aligned_left,
+                right: aligned_right,
+                operations: ALL_SET_OPERATIONS,
+            },
+            CompositionGeometry {
+                name: "leaf_scattered_partial_overlap",
+                left: scattered_left,
+                right: scattered_right,
+                operations: ALL_SET_OPERATIONS,
+            },
+        ]
+    }
+
+    fn normalize_root_only_receipts(set: &mut TribleSet) {
+        set.eav.normalize_root_only_receipt_for_test();
+        set.eva.normalize_root_only_receipt_for_test();
+        set.aev.normalize_root_only_receipt_for_test();
+        set.ave.normalize_root_only_receipt_for_test();
+        set.vea.normalize_root_only_receipt_for_test();
+        set.vae.normalize_root_only_receipt_for_test();
+    }
+
+    fn tribleset_receipt_stats(set: &TribleSet) -> (usize, usize) {
+        [
+            set.eav.branch_receipt_stats_for_test(),
+            set.eva.branch_receipt_stats_for_test(),
+            set.aev.branch_receipt_stats_for_test(),
+            set.ave.branch_receipt_stats_for_test(),
+            set.vea.branch_receipt_stats_for_test(),
+            set.vae.branch_receipt_stats_for_test(),
+        ]
+        .into_iter()
+        .fold((0, 0), |(known, dirty), (index_known, index_dirty)| {
+            (known + index_known, dirty + index_dirty)
+        })
+    }
+
+    fn all_roots_known(set: &TribleSet) -> bool {
+        set.eav.root_receipt_is_known_for_test()
+            && set.eva.root_receipt_is_known_for_test()
+            && set.aev.root_receipt_is_known_for_test()
+            && set.ave.root_receipt_is_known_for_test()
+            && set.vea.root_receipt_is_known_for_test()
+            && set.vae.root_receipt_is_known_for_test()
+    }
+
+    fn build_composition_set(rows: &[[u8; 64]], state: ReceiptState) -> TribleSet {
+        assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut set = try_from_blob_bottom_up_for_test(blob_from_rows(rows.to_vec()))
+            .expect("composition fixture must be a canonical archive")
+            .set;
+        let all_internal = tribleset_receipt_stats(&set);
+        assert!(all_internal.0 > 6, "fixture needs Branch descendants");
+        assert_eq!(all_internal.1, 0, "bottom-up fixture must be fully known");
+        assert!(all_roots_known(&set));
+
+        if state == ReceiptState::RootOnly {
+            normalize_root_only_receipts(&mut set);
+            let root_only = tribleset_receipt_stats(&set);
+            assert_eq!(root_only.0, 6, "only the six roots should remain known");
+            assert!(root_only.1 > 0, "root-only control needs dirty descendants");
+            assert!(all_roots_known(&set));
+        }
+        set
+    }
+
+    #[derive(Copy, Clone)]
+    struct CompositionSample {
+        structure: Duration,
+        first_fingerprint: Duration,
+        second_fingerprint: Duration,
+        head_visits: usize,
+        equality_prunes: usize,
+        structure_leaf_hashes: usize,
+        first_leaf_hashes: usize,
+        second_leaf_hashes: usize,
+        result_root_known: bool,
+    }
+
+    fn composition_sample(
+        geometry: &CompositionGeometry,
+        operation: CompositionOperation,
+        state: ReceiptState,
+        expected: &[[u8; 64]],
+    ) -> CompositionSample {
+        let left = build_composition_set(&geometry.left, state);
+        let right = build_composition_set(&geometry.right, state);
+
+        reset_composition_probe_counters();
+        let structure_start = Instant::now();
+        let result = operation.apply(black_box(left), black_box(right));
+        let structure = structure_start.elapsed();
+        let after_structure = composition_probe_counters();
+        let result_root_known = result.eav.root_receipt_is_known_for_test();
+
+        let first_start = Instant::now();
+        let first = black_box(result.fingerprint());
+        let first_fingerprint = first_start.elapsed();
+        let after_first = composition_probe_counters();
+
+        let second_start = Instant::now();
+        let second = black_box(result.fingerprint());
+        let second_fingerprint = second_start.elapsed();
+        let after_second = composition_probe_counters();
+
+        assert_eq!(first, second);
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(
+            result.eav.iter_ordered().copied().collect::<Vec<_>>(),
+            expected,
+        );
+
+        CompositionSample {
+            structure,
+            first_fingerprint,
+            second_fingerprint,
+            head_visits: after_structure.0,
+            equality_prunes: after_structure.1,
+            structure_leaf_hashes: after_structure.2,
+            first_leaf_hashes: after_first.2 - after_structure.2,
+            second_leaf_hashes: after_second.2 - after_first.2,
+            result_root_known,
+        }
+    }
+
+    fn median_duration(
+        samples: &[CompositionSample],
+        project: impl Fn(&CompositionSample) -> Duration,
+    ) -> Duration {
+        let mut values: Vec<_> = samples.iter().map(project).collect();
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
+    fn summarize_composition_samples(samples: &[CompositionSample]) -> CompositionSample {
+        let causal = samples[0];
+        assert!(samples.iter().all(|sample| {
+            sample.head_visits == causal.head_visits
+                && sample.equality_prunes == causal.equality_prunes
+                && sample.structure_leaf_hashes == causal.structure_leaf_hashes
+                && sample.first_leaf_hashes == causal.first_leaf_hashes
+                && sample.second_leaf_hashes == causal.second_leaf_hashes
+                && sample.result_root_known == causal.result_root_known
+        }));
+        CompositionSample {
+            structure: median_duration(samples, |sample| sample.structure),
+            first_fingerprint: median_duration(samples, |sample| sample.first_fingerprint),
+            second_fingerprint: median_duration(samples, |sample| sample.second_fingerprint),
+            ..causal
+        }
+    }
+
+    fn assert_composition_prediction(
+        geometry: &CompositionGeometry,
+        state: ReceiptState,
+        expected_len: usize,
+        sample: &CompositionSample,
+    ) {
+        assert_eq!(
+            sample.structure_leaf_hashes, 0,
+            "structural composition must remain hash-lazy",
+        );
+        assert_eq!(
+            sample.second_leaf_hashes, 0,
+            "second fingerprint is memoized"
+        );
+
+        match geometry.name {
+            "canonical_disjoint_chunks" => {
+                assert_eq!(sample.equality_prunes, 0);
+                assert!(sample.result_root_known);
+                assert_eq!(sample.first_leaf_hashes, 0);
+            }
+            "branch_aligned_partial_overlap" => match state {
+                ReceiptState::AllInternal => {
+                    assert_eq!(sample.equality_prunes, 6, "one shared Branch per index");
+                    assert!(sample.result_root_known);
+                    assert_eq!(sample.first_leaf_hashes, 0);
+                }
+                ReceiptState::RootOnly => {
+                    assert_eq!(sample.equality_prunes, 0);
+                    assert!(!sample.result_root_known);
+                    assert_eq!(sample.first_leaf_hashes, expected_len);
+                }
+            },
+            "leaf_scattered_partial_overlap" => {
+                assert_eq!(sample.equality_prunes, 0);
+                assert!(!sample.result_root_known);
+                assert_eq!(sample.first_leaf_hashes, expected_len);
+            }
+            _ => unreachable!("unknown composition geometry"),
+        }
+    }
+
+    fn print_composition_summary(
+        geometry: &CompositionGeometry,
+        operation: CompositionOperation,
+        state: ReceiptState,
+        expected_len: usize,
+        sample: CompositionSample,
+    ) {
+        println!(
+            "bottom_up_receipt_composition geometry={} operation={} state={} left_rows={} right_rows={} result_rows={} structure_us={:.3} head_visits={} equality_prunes={} structure_leaf_hashes={} result_root_known={} first_fingerprint_us={:.3} first_leaf_hashes={} second_fingerprint_us={:.3} second_leaf_hashes={}",
+            geometry.name,
+            operation.name(),
+            state.name(),
+            geometry.left.len(),
+            geometry.right.len(),
+            expected_len,
+            sample.structure.as_secs_f64() * 1e6,
+            sample.head_visits,
+            sample.equality_prunes,
+            sample.structure_leaf_hashes,
+            sample.result_root_known,
+            sample.first_fingerprint.as_secs_f64() * 1e6,
+            sample.first_leaf_hashes,
+            sample.second_fingerprint.as_secs_f64() * 1e6,
+            sample.second_leaf_hashes,
+        );
+    }
+
+    /// Causal matrix for descendant receipt value during composition. Run with:
+    ///
+    /// `cargo test -p triblespace-core --release bottom_up_receipt_composition_matrix -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "manual receipt-composition benchmark"]
+    fn bottom_up_receipt_composition_matrix() {
+        const ROUNDS: usize = 7;
+
+        for geometry in composition_geometries() {
+            for &operation in geometry.operations {
+                let expected = operation.expected_rows(&geometry.left, &geometry.right);
+                let mut root_only_samples = Vec::with_capacity(ROUNDS);
+                let mut all_internal_samples = Vec::with_capacity(ROUNDS);
+
+                for round in 0..ROUNDS {
+                    let root_only = || {
+                        composition_sample(&geometry, operation, ReceiptState::RootOnly, &expected)
+                    };
+                    let all_internal = || {
+                        composition_sample(
+                            &geometry,
+                            operation,
+                            ReceiptState::AllInternal,
+                            &expected,
+                        )
+                    };
+                    if round % 2 == 0 {
+                        root_only_samples.push(root_only());
+                        all_internal_samples.push(all_internal());
+                    } else {
+                        all_internal_samples.push(all_internal());
+                        root_only_samples.push(root_only());
+                    }
+                }
+
+                let root_only = summarize_composition_samples(&root_only_samples);
+                let all_internal = summarize_composition_samples(&all_internal_samples);
+                assert_composition_prediction(
+                    &geometry,
+                    ReceiptState::RootOnly,
+                    expected.len(),
+                    &root_only,
+                );
+                assert_composition_prediction(
+                    &geometry,
+                    ReceiptState::AllInternal,
+                    expected.len(),
+                    &all_internal,
+                );
+
+                match geometry.name {
+                    "branch_aligned_partial_overlap" => assert!(
+                        all_internal.head_visits < root_only.head_visits,
+                        "resident shared-Branch receipts must prune structural descent",
+                    ),
+                    "canonical_disjoint_chunks" | "leaf_scattered_partial_overlap" => assert_eq!(
+                        all_internal.head_visits, root_only.head_visits,
+                        "without an equal Branch, receipts must not change structural descent",
+                    ),
+                    _ => unreachable!(),
+                }
+
+                print_composition_summary(
+                    &geometry,
+                    operation,
+                    ReceiptState::RootOnly,
+                    expected.len(),
+                    root_only,
+                );
+                print_composition_summary(
+                    &geometry,
+                    operation,
+                    ReceiptState::AllInternal,
+                    expected.len(),
+                    all_internal,
+                );
+            }
         }
     }
 }
