@@ -5254,6 +5254,43 @@ mod tests {
         }
     }
 
+    fn print_cardinality_patch_census(
+        fixture: &CardinalityPatchFixture,
+        len: usize,
+        geometry: CardinalityGeometry,
+    ) {
+        let measure = |expected: u64, run: &mut dyn FnMut() -> u64| {
+            reset_local_leaf_hash_calls();
+            assert_eq!(run(), expected);
+            local_leaf_hash_calls()
+        };
+        let union_calls = measure(fixture.union_len, &mut || {
+            let mut union = fixture.left.clone();
+            union.union(fixture.right.clone());
+            union.len()
+        });
+        let intersect_calls = measure(fixture.intersect_len, &mut || {
+            fixture.left.intersect(&fixture.right).len()
+        });
+        let difference_calls = measure(fixture.difference_len, &mut || {
+            fixture.left.difference(&fixture.right).len()
+        });
+        for (operation, calls) in [
+            ("union", union_calls),
+            ("intersect", intersect_calls),
+            ("difference", difference_calls),
+        ] {
+            println!(
+                "PATCH_CARDINALITY_CENSUS,{},patch,{},{},{},{}",
+                cardinality_variant(),
+                len,
+                geometry.label(),
+                operation,
+                calls
+            );
+        }
+    }
+
     fn cardinality_samples(
         iterations: usize,
         samples: usize,
@@ -5376,12 +5413,13 @@ mod tests {
         );
     }
 
-    /// Deterministic causal census over fixed LocalLeaf/Branch shapes. Larger
-    /// public PATCH fixtures stay in the wall-time probe because randomized
-    /// cuckoo-table layout changes their absolute LocalLeaf hash-call count.
+    /// Deterministic census over fixed direct shapes and public PATCH fixtures.
+    /// The probe initializer pins cuckoo-table layout across process-isolated
+    /// control and candidate binaries.
     #[test]
     #[ignore = "manual release LocalLeaf cardinality hash census"]
     fn cardinality_gate_hash_census() {
+        bytetable::init_cardinality_probe();
         assert!(
             option_env!("PATCH_CARDINALITY_HASH_CENSUS").is_some(),
             "rebuild with PATCH_CARDINALITY_HASH_CENSUS=1"
@@ -5395,11 +5433,21 @@ mod tests {
                 print_cardinality_direct_census(&fixture, branch_len, order);
             }
         }
+        for len in [1024, 4096] {
+            for geometry in [
+                CardinalityGeometry::Disjoint,
+                CardinalityGeometry::HalfOverlap,
+            ] {
+                let fixture = CardinalityPatchFixture::new(len, geometry);
+                print_cardinality_patch_census(&fixture, len, geometry);
+            }
+        }
     }
 
     #[test]
     #[ignore = "manual release LocalLeaf cardinality wall-time benchmark"]
     fn cardinality_gate_wall_time_benchmark() {
+        bytetable::init_cardinality_probe();
         assert!(
             option_env!("PATCH_CARDINALITY_HASH_CENSUS").is_none(),
             "wall timing must be rebuilt without census instrumentation"

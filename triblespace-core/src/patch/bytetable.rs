@@ -78,6 +78,25 @@ pub fn init() {
     });
 }
 
+/// Fix the global byte-table permutations for process-isolated A/B probes.
+/// This must run before [`init`]; both odd affine multipliers are bijections
+/// over `u8`, preserving the production table contracts without run-to-run
+/// layout noise. Probe branches only.
+#[cfg(test)]
+pub(crate) fn init_cardinality_probe() {
+    INIT.call_once(|| unsafe {
+        let mut hash = [0; 256];
+        let mut rand = [0; 256];
+        for index in 0..256 {
+            let byte = index as u8;
+            hash[index] = byte.wrapping_mul(197).wrapping_add(101);
+            rand[index] = byte.wrapping_mul(73).wrapping_add(41);
+        }
+        RANDOM_PERMUTATION_HASH = hash;
+        RANDOM_PERMUTATION_RAND = rand;
+    });
+}
+
 /// Types must implement this trait in order to be storable in the byte table.
 ///
 /// # Safety
