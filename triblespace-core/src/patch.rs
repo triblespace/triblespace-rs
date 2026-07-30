@@ -3876,7 +3876,19 @@ mod tests {
             groups = next;
         }
 
-        groups.pop().expect("at least one archive variant")
+        let mut result = groups.pop().expect("at least one archive variant");
+
+        // Fully structural union deliberately leaves this naturally-built
+        // root dirty. These parallel tests need the more specific state their
+        // names promise: one exact root over dirty direct children. Install
+        // the independently-derived aggregate without traversing (and thereby
+        // cleaning) those LocalLeaf children.
+        let exact = heap_hash_oracle(&result);
+        let BodyMut::Branch(root) = result.root.as_mut().unwrap().body_mut() else {
+            panic!("fixture root must be a Branch");
+        };
+        root.hash = exact;
+        result
     }
 
     #[cfg(feature = "parallel")]
