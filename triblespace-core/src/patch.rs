@@ -3660,6 +3660,10 @@ where
         init_sip_key();
         assert_eq!(keys.len(), hashes.len());
         assert_eq!(keys.len(), rows.len());
+        assert!(
+            u32::try_from(rows.len()).is_ok(),
+            "archive row ordinals must fit the partition metadata",
+        );
         if rows.is_empty() {
             return Self::new();
         }
@@ -3722,105 +3726,114 @@ where
         );
 
         let key_index = O::TREE_TO_KEY[end_depth];
-        let mut counts = [0usize; 256];
+        let mut ends = [0u32; 256];
+        let mut occupied = ByteSet::new_empty();
         for &row in rows.iter() {
-            counts[keys[row as usize][key_index] as usize] += 1;
-        }
-
-        let mut first_bucket = None;
-        let mut second_bucket = None;
-        for (byte, &count) in counts.iter().enumerate() {
-            if count == 0 {
-                continue;
+            let byte = keys[row as usize][key_index];
+            let count = &mut ends[byte as usize];
+            if *count == 0 {
+                occupied.insert(byte);
             }
-            if first_bucket.is_none() {
-                first_bucket = Some(byte);
-            } else {
-                second_bucket = Some(byte);
-                break;
-            }
+            *count += 1;
         }
 
-        let first_bucket = first_bucket.expect("a non-empty partition has one bucket");
-        let second_bucket = second_bucket.expect("a unique multi-row node has two buckets");
+        let mut child_buckets = occupied;
+        let first_bucket = child_buckets
+            .drain_next_ascending()
+            .expect("a non-empty partition has one bucket");
+        let second_bucket = child_buckets
+            .drain_next_ascending()
+            .expect("a unique multi-row node has two buckets");
 
-        // American-flag partition: `starts` defines each final bucket range,
-        // while `next` advances the first unfilled position in that range.
-        // Every swap permanently fills one destination position, so the pass
-        // is linear and needs no second permutation buffer.
-        let mut starts = [0usize; 256];
-        let mut next = [0usize; 256];
-        let mut offset = 0;
-        for byte in 0..256 {
-            starts[byte] = offset;
-            next[byte] = offset;
-            offset += counts[byte];
+        // Turn the histogram into cumulative exclusive ends. `next` advances
+        // the first unfilled position in each occupied range. u32 is exact:
+        // the public probe rejects archives whose row ordinals do not fit it.
+        let mut next = [0u32; 256];
+        let mut offset = 0u32;
+        let mut prefix_buckets = occupied;
+        while let Some(byte) = prefix_buckets.drain_next_ascending() {
+            let count = ends[byte as usize];
+            next[byte as usize] = offset;
+            offset += count;
+            ends[byte as usize] = offset;
         }
-        for byte in 0..256 {
-            let end = starts[byte] + counts[byte];
-            while next[byte] < end {
-                let row = rows[next[byte]] as usize;
+        debug_assert_eq!(offset as usize, rows.len());
+
+        // American-flag partition. Every swap permanently fills one
+        // destination position, so the pass is linear and needs no second
+        // permutation buffer. Absent byte buckets require no work.
+        let mut partition_buckets = occupied;
+        while let Some(byte) = partition_buckets.drain_next_ascending() {
+            let bucket = byte as usize;
+            while next[bucket] < ends[bucket] {
+                let position = next[bucket] as usize;
+                let row = rows[position] as usize;
                 let destination = keys[row][key_index] as usize;
-                if destination == byte {
-                    next[byte] += 1;
+                if destination == bucket {
+                    next[bucket] += 1;
                 } else {
-                    let destination_slot = next[destination];
-                    rows.swap(next[byte], destination_slot);
+                    let destination_slot = next[destination] as usize;
+                    debug_assert!(destination_slot < ends[destination] as usize);
+                    rows.swap(position, destination_slot);
                     next[destination] += 1;
                 }
             }
         }
 
-        let first_range = starts[first_bucket]..starts[first_bucket] + counts[first_bucket];
+        let first_end = ends[first_bucket as usize] as usize;
         let (first_head, first_hash) = unsafe {
             Self::build_archive_partition_head_for_test(
                 keys,
                 hashes,
-                &mut rows[first_range],
+                &mut rows[..first_end],
                 end_depth + 1,
             )
         };
-        let second_range = starts[second_bucket]..starts[second_bucket] + counts[second_bucket];
+        let second_end = ends[second_bucket as usize] as usize;
         let (second_head, second_hash) = unsafe {
             Self::build_archive_partition_head_for_test(
                 keys,
                 hashes,
-                &mut rows[second_range],
+                &mut rows[first_end..second_end],
                 end_depth + 1,
             )
         };
 
         let body = Branch::new_with_child_hashes(
             end_depth,
-            first_head.with_key(first_bucket as u8),
-            second_head.with_key(second_bucket as u8),
+            first_head.with_key(first_bucket),
+            second_head.with_key(second_bucket),
             first_hash,
             second_hash,
         );
         let mut root = Head::new(0, body);
         let mut hash = first_hash ^ second_hash;
-        let has_extra = counts[second_bucket + 1..].iter().any(|&count| count != 0);
-        if !has_extra {
+        let Some(mut byte) = child_buckets.drain_next_ascending() else {
+            debug_assert_eq!(second_end, rows.len());
             return (root, hash);
-        }
+        };
         let mut editor = BranchMut::from_head(&mut root);
+        let mut range_start = second_end;
 
-        for byte in second_bucket + 1..256 {
-            if counts[byte] == 0 {
-                continue;
-            }
-            let range = starts[byte]..starts[byte] + counts[byte];
+        loop {
+            let range_end = ends[byte as usize] as usize;
             let (child, child_hash) = unsafe {
                 Self::build_archive_partition_head_for_test(
                     keys,
                     hashes,
-                    &mut rows[range],
+                    &mut rows[range_start..range_end],
                     end_depth + 1,
                 )
             };
             hash ^= child_hash;
-            editor.install_child_growing(child.with_key(byte as u8));
+            editor.install_child_growing(child.with_key(byte));
+            range_start = range_end;
+            let Some(next_byte) = child_buckets.drain_next_ascending() else {
+                break;
+            };
+            byte = next_byte;
         }
+        debug_assert_eq!(range_start, rows.len());
 
         // Bulk installation deliberately leaves the first-two aggregates
         // untouched until every remaining child is present. Rebuild counts,
