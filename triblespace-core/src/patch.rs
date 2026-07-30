@@ -1439,7 +1439,23 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
     pub(crate) fn union(this: Self, other: Self, at_depth: usize) -> Self {
-        Self::union_with_overlap(this, other, at_depth, None)
+        Self::union_with_overlap(this, other, at_depth, None, true)
+    }
+
+    /// Union while exporting the exact intersection fingerprint consumed by
+    /// an aggregate-level sibling operation.
+    fn union_export_meet(this: Self, other: Self, at_depth: usize) -> (Self, ExactHash) {
+        let mut overlap = 0;
+        let merged = Self::union_with_overlap(this, other, at_depth, Some(&mut overlap), true);
+        (merged, ExactHash(overlap))
+    }
+
+    /// Union structurally while deliberately leaving overlap-dependent
+    /// internal aggregates dirty. An aggregate-level caller must install the
+    /// exact result root after its witness operation returns a shared meet
+    /// receipt.
+    fn union_deferred_meet(this: Self, other: Self, at_depth: usize) -> Self {
+        Self::union_with_overlap(this, other, at_depth, None, false)
     }
 
     #[inline]
@@ -1463,6 +1479,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         mut other: Self,
         at_depth: usize,
         overlap_out: Option<&mut u128>,
+        allow_local_demand: bool,
     ) -> Self {
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
@@ -1537,8 +1554,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // resident ancestor may legally cover them. Otherwise, two resident
         // roots create a local demand so this frame preserves the same cache
         // state as eager exact-overlap union.
-        let need_overlap =
-            overlap_out.is_some() || (this_hash.is_some() && other_hash.is_some());
+        let need_overlap = overlap_out.is_some()
+            || (allow_local_demand && this_hash.is_some() && other_hash.is_some());
 
         if this_depth < other_depth {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
@@ -1552,11 +1569,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                         inserted,
                         this_depth,
                         need_overlap.then_some(&mut overlap),
+                        allow_local_demand,
                     ))
                 }
                 None => Some(inserted),
             });
-            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
+            let known_hash = need_overlap
+                .then(|| Self::known_union_hash(this_hash, other_hash, overlap))
+                .flatten();
             ed.hash = known_hash.unwrap_or(0);
             drop(ed);
             if let Some(out) = overlap_out {
@@ -1579,11 +1599,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                         inserted,
                         other_depth,
                         need_overlap.then_some(&mut overlap),
+                        allow_local_demand,
                     ))
                 }
                 None => Some(inserted),
             });
-            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
+            let known_hash = need_overlap
+                .then(|| Self::known_union_hash(this_hash, other_hash, overlap))
+                .flatten();
             ed.hash = known_hash.unwrap_or(0);
             drop(ed);
             if let Some(out) = overlap_out {
@@ -1628,13 +1651,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                         inserted,
                         this_depth,
                         need_overlap.then_some(&mut child_overlap),
+                        allow_local_demand,
                     ))
                 }
                 None => Some(inserted),
             });
             overlap ^= child_overlap;
         }
-        let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
+        let known_hash = need_overlap
+            .then(|| Self::known_union_hash(this_hash, other_hash, overlap))
+            .flatten();
         ed.hash = known_hash.unwrap_or(0);
         drop(ed);
         if let Some(out) = overlap_out {
@@ -1656,7 +1682,34 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         V: Send + Sync,
     {
         let ctx = parallel_union::ParUnionCtx::new();
-        Self::par_union_with_ctx(this, other, at_depth, &ctx, None)
+        Self::par_union_with_ctx(this, other, at_depth, &ctx, None, true)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn par_union_export_meet(
+        this: Self,
+        other: Self,
+        at_depth: usize,
+    ) -> (Self, ExactHash)
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        let ctx = parallel_union::ParUnionCtx::new();
+        let mut overlap = 0;
+        let merged =
+            Self::par_union_with_ctx(this, other, at_depth, &ctx, Some(&mut overlap), true);
+        (merged, ExactHash(overlap))
+    }
+
+    #[cfg(feature = "parallel")]
+    fn par_union_deferred_meet(this: Self, other: Self, at_depth: usize) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        let ctx = parallel_union::ParUnionCtx::new();
+        Self::par_union_with_ctx(this, other, at_depth, &ctx, None, false)
     }
 
     /// Recursive parallel-aware union with the same optional overlap demand as
@@ -1671,6 +1724,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         at_depth: usize,
         ctx: &parallel_union::ParUnionCtx,
         overlap_out: Option<&mut u128>,
+        allow_local_demand: bool,
     ) -> Self
     where
         O: Send + Sync,
@@ -1682,7 +1736,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // Singleton pairs have no fan-out work for rayon and the serial rule
         // decides them exactly without a fingerprint.
         if this_depth == KEY_LEN && other_depth == KEY_LEN {
-            return Self::union_with_overlap(this, other, at_depth, overlap_out);
+            return Self::union_with_overlap(
+                this,
+                other,
+                at_depth,
+                overlap_out,
+                allow_local_demand,
+            );
         }
 
         // Capture the logical input receipts before the capacity-driven swap
@@ -1720,7 +1780,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
         if this_depth != other_depth {
             // Asymmetric — no fan-out opportunity, serial path wins.
-            return Self::union_with_overlap(this, other, at_depth, overlap_out);
+            return Self::union_with_overlap(
+                this,
+                other,
+                at_depth,
+                overlap_out,
+                allow_local_demand,
+            );
         }
 
         // Equal depth, hashes differ → branch merge. Swap when
@@ -1743,11 +1809,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => unreachable!(),
         };
         if small {
-            return Self::union_with_overlap(this, other, at_depth, overlap_out);
+            return Self::union_with_overlap(
+                this,
+                other,
+                at_depth,
+                overlap_out,
+                allow_local_demand,
+            );
         }
 
-        let need_overlap =
-            overlap_out.is_some() || (this_hash.is_some() && other_hash.is_some());
+        let need_overlap = overlap_out.is_some()
+            || (allow_local_demand && this_hash.is_some() && other_hash.is_some());
 
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
@@ -1822,6 +1894,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                                 this_depth,
                                 ctx,
                                 need_overlap.then_some(&mut child_overlap),
+                                allow_local_demand,
                             );
                             // SAFETY: each task has a distinct
                             // key `k`, so both writes at `i` are
@@ -1845,6 +1918,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                             o,
                             this_depth,
                             need_overlap.then_some(&mut child_overlap),
+                            allow_local_demand,
                         );
                         unsafe {
                             this_arr_ptr.write_at(i, Some(head));
@@ -1869,7 +1943,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let overlap = overlap_receipts
                 .map(|receipts| receipts.into_iter().fold(0, |hash, child| hash ^ child))
                 .unwrap_or(0);
-            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
+            let known_hash = need_overlap
+                .then(|| Self::known_union_hash(this_hash, other_hash, overlap))
+                .flatten();
             ed.finish_union_aggregates(known_hash);
             drop(ed);
             if let Some(out) = overlap_out {
@@ -2708,6 +2784,73 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
 /// compared to other adaptive trie implementations, like ARTs or Judy Arrays
 ///
 /// The PATCH allows for cheap copy-on-write operations, with `clone` being O(1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ExactHash(u128);
+
+impl ExactHash {
+    const ZERO: Self = Self(0);
+
+    #[inline]
+    fn union(self, other: Self, meet: Self) -> Self {
+        Self(self.0 ^ other.0 ^ meet.0)
+    }
+}
+
+/// A non-empty PATCH root whose exact fingerprint is already resident.
+///
+/// Count participates in the identity gate so an aggregate cannot reuse one
+/// index's meet receipt for a public sibling index with a different key set.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PatchResidentIdentity {
+    count: u64,
+    hash: ExactHash,
+}
+
+impl PatchResidentIdentity {
+    #[inline]
+    fn union_hash(self, other: Self, meet: ExactHash) -> ExactHash {
+        self.hash.union(other.hash, meet)
+    }
+}
+
+/// Exact meet exported by one PATCH ordering, tied to the resident identities
+/// of the two semantic input sets.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SharedMeetReceipt {
+    left: PatchResidentIdentity,
+    right: PatchResidentIdentity,
+    meet: ExactHash,
+    result_count: u64,
+}
+
+impl SharedMeetReceipt {
+    #[inline]
+    fn union_hash(self) -> ExactHash {
+        self.left.union_hash(self.right, self.meet)
+    }
+
+    #[inline]
+    pub(crate) fn matches(
+        self,
+        left: PatchResidentIdentity,
+        right: PatchResidentIdentity,
+    ) -> bool {
+        self.left == left && self.right == right
+    }
+}
+
+/// Internal receipt policy for one PATCH union.
+///
+/// `DeferredMeet` is valid only when an aggregate sibling runs `ExportMeet`
+/// over the same semantic inputs and installs the resulting exact root hash
+/// after all structural unions have joined.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum UnionReceiptMode {
+    Ordinary,
+    ExportMeet,
+    DeferredMeet,
+}
+
 #[derive(Debug)]
 pub struct PATCH<const KEY_LEN: usize, O = IdentitySchema, V = ()>
 where
@@ -2719,6 +2862,42 @@ where
     /// The concrete Arc is thin, so this adds eight bytes per PATCH while
     /// removing sixteen bytes from every Branch.
     owners: Option<Arc<OwnerCover>>,
+}
+
+/// A structurally complete union whose root cache awaits a sibling ordering's
+/// exact meet receipt.
+///
+/// Holding the mutable PATCH borrow prevents any intervening mutation. Dropping
+/// the token without finishing is safe: overlap-dependent caches remain dirty.
+#[must_use = "finish with the witness meet receipt or leave the union root dirty"]
+pub(crate) struct DeferredMeetUnion<
+    'a,
+    const KEY_LEN: usize,
+    O: KeySchema<KEY_LEN>,
+    V,
+> {
+    patch: &'a mut PATCH<KEY_LEN, O, V>,
+    left: PatchResidentIdentity,
+    right: PatchResidentIdentity,
+    result_count: u64,
+}
+
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
+    DeferredMeetUnion<'a, KEY_LEN, O, V>
+{
+    /// Consume a matching sibling receipt and install the exact result root.
+    /// A mismatched receipt or changed result shape fails closed: the root
+    /// remains dirty rather than accepting an unrelated fingerprint.
+    pub(crate) fn finish(self, receipt: SharedMeetReceipt) {
+        if self.left != receipt.left
+            || self.right != receipt.right
+            || self.result_count != receipt.result_count
+            || self.patch.len() != self.result_count
+        {
+            return;
+        }
+        self.patch.install_root_exact_hash(receipt.union_hash());
+    }
 }
 
 /// A prefix-located PATCH infix traversal whose exact cardinality has already
@@ -2920,6 +3099,54 @@ where
 
     pub(crate) fn root_hash(&self) -> Option<u128> {
         self.root.as_ref().map(|root| root.hash())
+    }
+
+    /// Return the root's exact identity only when its fingerprint is already
+    /// resident. This never crosses a dirty Branch or hashes a LocalLeaf.
+    pub(crate) fn resident_identity(&self) -> Option<PatchResidentIdentity> {
+        let root = self.root.as_ref()?;
+        Some(PatchResidentIdentity {
+            count: root.count(),
+            hash: ExactHash(root.known_hash()?),
+        })
+    }
+
+    /// Install an aggregate-proved exact result fingerprint at this root.
+    ///
+    /// Dirty Branches are edited through `BranchMut`, preserving PATCH's
+    /// copy-on-write rules. Heap leaves already carry their immutable exact
+    /// hash. A LocalLeaf root cannot arise from the non-empty resident inputs
+    /// admitted by the aggregate identity gate, so it remains conservatively
+    /// uncached if this internal contract is violated.
+    fn install_root_exact_hash(&mut self, hash: ExactHash) {
+        let Some(root) = self.root.as_mut() else {
+            debug_assert_eq!(hash, ExactHash::ZERO);
+            return;
+        };
+
+        if let Some(resident) = root.known_hash() {
+            if resident == hash.0 {
+                return;
+            }
+            debug_assert_eq!(resident, hash.0, "resident result hash disagrees with receipt");
+        }
+
+        match root.tag() {
+            HeadTag::Leaf => {
+                debug_assert!(false, "heap leaves always expose a resident hash");
+            }
+            HeadTag::LocalLeaf => {
+                debug_assert!(
+                    false,
+                    "shared-meet identity gate cannot produce a dirty singleton root"
+                );
+            }
+            _ => {
+                let mut branch = crate::patch::branch::BranchMut::from_head(root);
+                branch.hash = hash.0;
+            }
+        }
+        self.debug_check_owner_invariant();
     }
 
     /// Expensive debug oracle: derive the root hash from leaf bytes while
@@ -3276,11 +3503,77 @@ where
     /// The other PATCH is consumed, and this PATCH is updated in place.
     /// Key-set semantics are preserved, but when duplicate keys carry
     /// different values, which value survives is unspecified.
-    pub fn union(&mut self, mut other: Self)
+    pub fn union(&mut self, other: Self)
     where
         O: Send + Sync,
         V: Send + Sync,
     {
+        let _ = self.union_with_receipt_mode(other, UnionReceiptMode::Ordinary);
+    }
+
+    /// Union one aggregate witness lane and return an identity-bound exact
+    /// meet receipt.
+    pub(crate) fn union_export_meet(&mut self, other: Self) -> SharedMeetReceipt
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        let left = self
+            .resident_identity()
+            .expect("ExportMeet requires a resident non-empty left root");
+        let right = other
+            .resident_identity()
+            .expect("ExportMeet requires a resident non-empty right root");
+        let meet = self
+            .union_with_receipt_mode(other, UnionReceiptMode::ExportMeet)
+            .expect("ExportMeet always returns a receipt");
+        let receipt = SharedMeetReceipt {
+            left,
+            right,
+            meet,
+            result_count: self.len(),
+        };
+        self.install_root_exact_hash(receipt.union_hash());
+        receipt
+    }
+
+    /// Union one aggregate peer lane without materializing overlap hashes and
+    /// retain its mutable borrow in a fail-closed completion token.
+    pub(crate) fn union_deferred_meet(
+        &mut self,
+        other: Self,
+    ) -> DeferredMeetUnion<'_, KEY_LEN, O, V>
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        let left = self
+            .resident_identity()
+            .expect("DeferredMeet requires a resident non-empty left root");
+        let right = other
+            .resident_identity()
+            .expect("DeferredMeet requires a resident non-empty right root");
+        let receipt = self.union_with_receipt_mode(other, UnionReceiptMode::DeferredMeet);
+        debug_assert!(receipt.is_none());
+        let result_count = self.len();
+        DeferredMeetUnion {
+            patch: self,
+            left,
+            right,
+            result_count,
+        }
+    }
+
+    fn union_with_receipt_mode(
+        &mut self,
+        mut other: Self,
+        mode: UnionReceiptMode,
+    ) -> Option<ExactHash>
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        let mut meet = (mode == UnionReceiptMode::ExportMeet).then_some(ExactHash::ZERO);
         if let Some(other_root) = other.root.take() {
             if self.root.is_some() {
                 // Extend the installed lifetime guard before Head::union can
@@ -3292,9 +3585,30 @@ where
                 OwnerCover::merge_into(&mut self.owners, &other.owners);
                 let this = self.root.take().expect("root should not be empty");
                 #[cfg(feature = "parallel")]
-                let merged = Head::par_union(this, other_root, 0);
+                let merged = match mode {
+                    UnionReceiptMode::Ordinary => Head::par_union(this, other_root, 0),
+                    UnionReceiptMode::ExportMeet => {
+                        let (merged, exported) =
+                            Head::par_union_export_meet(this, other_root, 0);
+                        meet = Some(exported);
+                        merged
+                    }
+                    UnionReceiptMode::DeferredMeet => {
+                        Head::par_union_deferred_meet(this, other_root, 0)
+                    }
+                };
                 #[cfg(not(feature = "parallel"))]
-                let merged = Head::union(this, other_root, 0);
+                let merged = match mode {
+                    UnionReceiptMode::Ordinary => Head::union(this, other_root, 0),
+                    UnionReceiptMode::ExportMeet => {
+                        let (merged, exported) = Head::union_export_meet(this, other_root, 0);
+                        meet = Some(exported);
+                        merged
+                    }
+                    UnionReceiptMode::DeferredMeet => {
+                        Head::union_deferred_meet(this, other_root, 0)
+                    }
+                };
                 self.root.replace(merged);
             } else {
                 self.root.replace(other_root);
@@ -3302,6 +3616,7 @@ where
             }
         }
         self.debug_check_owner_invariant();
+        meet
     }
 
     /// Intersects this PATCH with another PATCH.
@@ -3986,7 +4301,9 @@ mod tests {
         let ctx = parallel_union::ParUnionCtx {
             budget: AtomicUsize::new(0),
         };
-        left.root = Some(Head::par_union_with_ctx(this, other, 0, &ctx, None));
+        left.root = Some(Head::par_union_with_ctx(
+            this, other, 0, &ctx, None, true,
+        ));
         left.debug_check_owner_invariant();
         left
     }
@@ -4514,6 +4831,46 @@ mod tests {
             before,
             "known input roots plus the overlap receipt must repair the root cache",
         );
+    }
+
+    #[test]
+    fn exported_meet_repairs_a_deferred_cow_root() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut c = a;
+        c[0] = 2;
+
+        let left = owned_archive_pair([a, b]);
+        let right = owned_archive_pair([b, c]);
+        let left_identity = left.resident_identity().expect("left root is exact");
+        let right_identity = right.resident_identity().expect("right root is exact");
+
+        // Both operations start from shared Branch allocations. The witness
+        // materializes the one duplicate hash; the peer must not repeat it.
+        let mut witness = left.clone();
+        reset_local_leaf_hash_calls();
+        let meet = witness.union_export_meet(right.clone());
+        assert_eq!(local_leaf_hash_calls(), 1);
+        assert!(meet.matches(left_identity, right_identity));
+        let result_hash = meet.union_hash();
+        assert_eq!(witness.root_hash(), Some(result_hash.0));
+
+        let mut deferred_only = left.clone();
+        reset_local_leaf_hash_calls();
+        let pending = deferred_only.union_deferred_meet(right.clone());
+        assert_eq!(local_leaf_hash_calls(), 0);
+        drop(pending);
+        assert_eq!(branch_cached_hash(&deferred_only), 0);
+
+        let mut peer = left;
+        let pending = peer.union_deferred_meet(right);
+        pending.finish(meet);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(peer.root_hash(), Some(result_hash.0));
+        assert_eq!(peer, witness);
+        deep_hash_audit(&peer);
     }
 
     fn owner_cover_in_order(owners: &[Arc<dyn ArchiveOwner>], order: &[usize]) -> Arc<OwnerCover> {

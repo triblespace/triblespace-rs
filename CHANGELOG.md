@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Experimental coherent `TribleSet` unions share one PATCH meet receipt.**
+  Large parallel unions whose six public indexes agree on a resident
+  `(count, exact hash)` identity run all six structural merges concurrently,
+  export `H(left intersect right)` from one witness ordering, and install the
+  resulting union root hash into five deferred peers through PATCH's
+  copy-on-write editor. Diverged or dirty public indexes keep the ordinary
+  independent-union path.
+
 - **Experimental PATCH union can leave internal hashes lazy.** A zero Branch
   aggregate is treated as a conservative uncached sentinel, serial union
   propagates exact intersection-hash receipts only when a resident cache can

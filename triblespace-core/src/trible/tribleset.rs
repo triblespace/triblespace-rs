@@ -17,6 +17,7 @@ use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
 use crate::patch::PATCH;
 use crate::patch::PATCHOwnerGuard;
+use crate::patch::PatchResidentIdentity;
 use crate::query::Variable;
 use crate::trible::AEVOrder;
 use crate::trible::AVEOrder;
@@ -173,6 +174,26 @@ pub struct TribleSetIterator<'a> {
 pub const PARALLEL_UNION_THRESHOLD: usize = 4096;
 
 impl TribleSet {
+    /// Exact non-empty identity shared by all six public indexes, without
+    /// hashing through a dirty root.
+    ///
+    /// Public fields may have diverged independently, so equality with EAV's
+    /// `(count, exact hash)` is the admission proof for sharing one
+    /// order-independent meet receipt across sibling unions.
+    fn coherent_resident_identity(&self) -> Option<PatchResidentIdentity> {
+        let witness = self.eav.resident_identity()?;
+        [
+            self.eva.resident_identity(),
+            self.aev.resident_identity(),
+            self.ave.resident_identity(),
+            self.vea.resident_identity(),
+            self.vae.resident_identity(),
+        ]
+        .into_iter()
+        .all(|identity| identity == Some(witness))
+        .then_some(witness)
+    }
+
     /// Whether all six public indexes currently share one owner-cover Arc.
     fn owner_guards_are_shared(&self) -> bool {
         self.eav.shares_owner_guard(&self.eva)
@@ -236,6 +257,20 @@ impl TribleSet {
     /// `entity!{}` `+=` in a serial fold) the rayon overhead would
     /// dominate even at large `self`.
     pub fn union(&mut self, mut other: Self) {
+        // One PATCH ordering may export H(self ∩ other) for all six because
+        // every ordering hashes the same canonical 64-byte trible leaves.
+        // Public fields can diverge, so admit this path only when both
+        // aggregates prove one resident (count, hash) identity across all of
+        // their indexes. Keep the ordinary lane for small unions: sharing is
+        // most useful when the six index operations already amortise rayon.
+        #[cfg(feature = "parallel")]
+        let shared_meet_inputs = (other.len() >= PARALLEL_UNION_THRESHOLD)
+            .then(|| {
+                self.coherent_resident_identity()
+                    .zip(other.coherent_resident_identity())
+            })
+            .flatten();
+
         // Join all twelve receipts once. Installing the same Arc on both
         // operands makes every per-index PATCH union's owner merge collapse
         // to the Arc::ptr_eq fast path. This must happen before moving Heads,
@@ -265,6 +300,46 @@ impl TribleSet {
                     vea: ovea,
                     vae: ovae,
                 } = other;
+
+                if let Some((left_identity, right_identity)) = shared_meet_inputs {
+                    // All six structural unions begin together. EAV exports
+                    // the sole numeric meet receipt; the five peers suppress
+                    // overlap-dependent cache repair but never wait for EAV.
+                    // Rayon joins every lane before the receipt is consumed.
+                    let ((meet, eva_pending), ((aev_pending, ave_pending), (vea_pending, vae_pending))) = rayon::join(
+                        move || {
+                            rayon::join(
+                                move || eav.union_export_meet(oeav),
+                                move || eva.union_deferred_meet(oeva),
+                            )
+                        },
+                        move || {
+                            rayon::join(
+                                move || {
+                                    rayon::join(
+                                        move || aev.union_deferred_meet(oaev),
+                                        move || ave.union_deferred_meet(oave),
+                                    )
+                                },
+                                move || {
+                                    rayon::join(
+                                        move || vea.union_deferred_meet(ovea),
+                                        move || vae.union_deferred_meet(ovae),
+                                    )
+                                },
+                            )
+                        },
+                    );
+
+                    debug_assert!(meet.matches(left_identity, right_identity));
+                    eva_pending.finish(meet);
+                    aev_pending.finish(meet);
+                    ave_pending.finish(meet);
+                    vea_pending.finish(meet);
+                    vae_pending.finish(meet);
+                    return;
+                }
+
                 // Nested join trees the six tasks across rayon workers
                 // with much lower per-call overhead than `scope`.
                 rayon::join(
@@ -1059,6 +1134,35 @@ mod tests {
         std::hint::black_box(&noise);
         assert_eq!(set.len(), 2);
         assert_eq!(set.eav.iter().count(), 2);
+    }
+
+    #[test]
+    fn shared_meet_identity_gate_rejects_a_diverged_public_index() {
+        let (_, coherent) = build_intrinsic_entity(many_intrinsic_rows(7, 4));
+        assert!(coherent.coherent_resident_identity().is_some());
+
+        let mut diverged = coherent;
+        let extra = [0xabu8; TRIBLE_LEN];
+        diverged.eva.insert(&Entry::new(&extra));
+        assert!(diverged.coherent_resident_identity().is_none());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[ignore = "large shared-meet scheduling probe"]
+    fn coherent_large_union_runs_the_shared_meet_lane() {
+        let rows = many_intrinsic_rows(8, PARALLEL_UNION_THRESHOLD);
+        let (_, expected) = expected_intrinsic_entity(rows.clone());
+        let (_, mut left) = build_intrinsic_entity(rows.clone());
+        let (_, right) = build_intrinsic_entity(rows);
+
+        assert!(left.coherent_resident_identity().is_some());
+        assert!(right.coherent_resident_identity().is_some());
+        left.union(right);
+
+        assert_eq!(left.len(), PARALLEL_UNION_THRESHOLD);
+        assert_all_indexes(&left, &expected);
+        assert!(left.coherent_resident_identity().is_some());
     }
 
     #[test]
