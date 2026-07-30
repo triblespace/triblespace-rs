@@ -207,17 +207,30 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_L
         Some(lo | (hi << 64))
     }
 
-    /// Publish an exact fingerprint, or mark the cache unknown. Structural
-    /// callers may clear the state only while uniquely borrowing the Branch;
-    /// immutable hash consumers may concurrently publish identical values.
+    /// Publish the exact value computed by an immutable hash consumer.
+    /// Concurrent consumers may race, but immutable structure guarantees that
+    /// they all publish the same semantic value.
     #[inline]
-    pub(crate) fn store_cached_hash(&self, hash: Option<u128>) {
+    pub(crate) fn publish_cached_hash(&self, hash: u128) {
+        if let Some(resident) = self.cached_hash() {
+            debug_assert_eq!(resident, hash, "immutable Branch hash changed");
+            return;
+        }
+        self.hash_lo.store(hash as u64, Relaxed);
+        self.hash_hi.store((hash >> 64) as u64, Relaxed);
+        self.rc.fetch_or(HASH_KNOWN, Release);
+    }
+
+    /// Replace or clear the cache while structurally mutating a uniquely
+    /// borrowed Branch. Requiring `&mut self` keeps invalidation from racing
+    /// safe immutable consumers.
+    #[inline]
+    pub(crate) fn replace_cached_hash(&mut self, hash: Option<u128>) {
+        *self.rc.get_mut() &= RC_MASK;
         if let Some(hash) = hash {
-            self.hash_lo.store(hash as u64, Relaxed);
-            self.hash_hi.store((hash >> 64) as u64, Relaxed);
-            self.rc.fetch_or(HASH_KNOWN, Release);
-        } else {
-            self.rc.fetch_and(RC_MASK, Release);
+            *self.hash_lo.get_mut() = hash as u64;
+            *self.hash_hi.get_mut() = (hash >> 64) as u64;
+            *self.rc.get_mut() |= HASH_KNOWN;
         }
     }
 
@@ -552,7 +565,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         (Some(parent), Some(old), Some(new)) => Some(parent ^ old ^ new),
                         _ => None,
                     };
-                    (*branch).store_cached_hash(hash);
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
@@ -565,13 +577,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     if slot.replace(new_child.with_key(key)).is_some() {
                         unreachable!();
                     }
+                    (&mut *branch).replace_cached_hash(hash);
                 } else {
                     // Remove existing child
                     let hash = match (cached_parent_hash, old_child_hash) {
                         (Some(parent), Some(old)) => Some(parent ^ old),
                         _ => None,
                     };
-                    (*branch).store_cached_hash(hash);
                     (*branch).segment_count -= old_child_segment_count;
                     (*branch).leaf_count -= old_child_leaf_count;
 
@@ -580,6 +592,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                             (*branch).childleaf = other.childleaf_ptr();
                         }
                     }
+                    (&mut *branch).replace_cached_hash(hash);
                 }
             } else {
                 // No current slot — the closure can choose to insert a child.
@@ -595,8 +608,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         (Some(parent), Some(inserted)) => Some(parent ^ inserted),
                         _ => None,
                     };
-                    (*branch).store_cached_hash(hash);
-
                     // Cuckoo insert loop, growing the table when necessary.
                     let mut branch_ptr = branch_nn.as_ptr();
                     while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
@@ -606,6 +617,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         // Refresh local pointer after potential reallocation.
                         branch_ptr = branch_nn.as_ptr();
                     }
+                    (&mut *branch_ptr).replace_cached_hash(hash);
                 }
             }
             // Debug invariant check (no-op in release builds).
@@ -678,7 +690,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         (*branch).leaf_count = agg_leaf_count;
         (*branch).segment_count = agg_segment_count;
-        (*branch).store_cached_hash(Some(agg_hash));
+        (&mut *branch).replace_cached_hash(Some(agg_hash));
         if !first_childleaf.is_null() {
             (*branch).childleaf = first_childleaf;
         }
@@ -712,7 +724,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         (*branch).leaf_count = agg_leaf_count;
         (*branch).segment_count = agg_segment_count;
-        (*branch).store_cached_hash(known_hash);
+        (&mut *branch).replace_cached_hash(known_hash);
         if !first_childleaf.is_null() {
             (*branch).childleaf = first_childleaf;
         }

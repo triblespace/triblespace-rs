@@ -1117,7 +1117,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     .iter()
                     .flatten()
                     .fold(0, |hash, child| hash ^ child.hash());
-                branch.store_cached_hash(Some(hash));
+                branch.publish_cached_hash(hash);
                 hash
             }
         }
@@ -3903,7 +3903,7 @@ mod tests {
         let BodyMut::Branch(branch) = root.body_mut() else {
             panic!("expected a Branch root");
         };
-        branch.store_cached_hash(None);
+        branch.replace_cached_hash(None);
     }
 
     fn deep_hash_audit<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(patch: &PATCH<KEY_LEN, O>) {
@@ -3918,18 +3918,18 @@ mod tests {
         let mut patch = PATCH::<2>::new();
         patch.insert(&Entry::new(&[0, 0]));
         patch.insert(&Entry::new(&[1, 0]));
-        let BodyRef::Branch(branch) = patch.root.as_ref().unwrap().body_ref() else {
+        let BodyMut::Branch(branch) = patch.root.as_mut().unwrap().body_mut() else {
             panic!("fixture root must be a Branch");
         };
         let original = branch.cached_hash();
         assert!(original.is_some());
 
-        branch.store_cached_hash(None);
+        branch.replace_cached_hash(None);
         assert_eq!(branch.cached_hash(), None);
-        branch.store_cached_hash(Some(0));
+        branch.replace_cached_hash(Some(0));
         assert_eq!(branch.cached_hash(), Some(0));
 
-        branch.store_cached_hash(original);
+        branch.replace_cached_hash(original);
         deep_hash_audit(&patch);
     }
 
@@ -4108,7 +4108,7 @@ mod tests {
         let BodyMut::Branch(root) = patch.root.as_mut().unwrap().body_mut() else {
             panic!("fixture root must be a Branch");
         };
-        root.store_cached_hash(Some(exact_root_hash));
+        root.replace_cached_hash(Some(exact_root_hash));
 
         // An unrelated known heap child can extend the exact parent without
         // consulting either dirty sibling. The ordinary local debug audit must
