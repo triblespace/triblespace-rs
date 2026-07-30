@@ -393,7 +393,7 @@ mod branch_head_carry {
     mod ann {
         use triblespace_core::prelude::*;
         attributes! {
-            "DD00000000000000DD00000000000002" as pub note: inlineencodings::ShortString;
+            "3420CB991983F9BF8D9CA88E5D622643" as pub note: inlineencodings::ShortString;
         }
     }
 
