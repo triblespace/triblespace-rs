@@ -512,13 +512,32 @@ pub(crate) trait Body {
 #[repr(C)]
 pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     tptr: std::ptr::NonNull<u8>,
-    key_ordering: PhantomData<O>,
-    key_segments: PhantomData<O::Segmentation>,
+    // Schemas are static type-level descriptions, not values owned by Head.
+    // Function-result phantoms preserve their type identity without claiming
+    // their drop or auto-trait semantics.
+    key_ordering: PhantomData<fn() -> O>,
+    key_segments: PhantomData<fn() -> O::Segmentation>,
     value: PhantomData<V>,
 }
 
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Send for Head<KEY_LEN, O, V> {}
-unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Sync for Head<KEY_LEN, O, V> {}
+// SAFETY: Heads are atomic-reference-counted owners, so moving one Head may
+// leave another Head reading the same Leaf on a different thread. `V` must
+// therefore be both movable for eventual last-owner drop and shareable for
+// concurrent `get` calls. `O` and its segmentation are used only as static
+// type-level descriptions; no value of either type is stored or dropped.
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync> Send
+    for Head<KEY_LEN, O, V>
+{
+}
+
+// SAFETY: Sync needs the same combined value bounds as Send. A shared Head can
+// be cloned on another thread; that owning clone may outlive the borrow (for
+// example in thread-local storage on a persistent worker) and eventually drop
+// `V` there.
+unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V: Send + Sync> Sync
+    for Head<KEY_LEN, O, V>
+{
+}
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // Tagged pointer layout (64-bit only):
@@ -2053,6 +2072,28 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
 /// compared to other adaptive trie implementations, like ARTs or Judy Arrays
 ///
 /// The PATCH allows for cheap copy-on-write operations, with `clone` being O(1).
+///
+/// PATCH snapshots share their reference-counted leaves. Consequently a PATCH
+/// is `Send + Sync` only when its associated value is also `Send + Sync`.
+/// Moving one snapshot can leave another snapshot reading the same value on
+/// the source thread, and cloning through a shared reference can make the new
+/// snapshot the eventual last owner on a different thread.
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+/// use triblespace_core::patch::{IdentitySchema, PATCH};
+///
+/// fn assert_send<T: Send>() {}
+/// assert_send::<PATCH<1, IdentitySchema, Cell<u8>>>();
+/// ```
+///
+/// ```compile_fail
+/// use std::sync::MutexGuard;
+/// use triblespace_core::patch::{IdentitySchema, PATCH};
+///
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<PATCH<1, IdentitySchema, MutexGuard<'static, ()>>>();
+/// ```
 #[derive(Debug)]
 pub struct PATCH<const KEY_LEN: usize, O = IdentitySchema, V = ()>
 where
@@ -3048,6 +3089,39 @@ mod tests {
     #[test]
     fn option_head_size() {
         assert_eq!(mem::size_of::<Option<Head<64, IdentitySchema, ()>>>(), 8);
+    }
+
+    #[test]
+    fn patch_with_thread_safe_values_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<PATCH<1, IdentitySchema, u64>>();
+    }
+
+    #[test]
+    fn type_only_schema_markers_do_not_control_patch_auto_traits() {
+        use std::marker::PhantomData;
+        use std::rc::Rc;
+
+        #[derive(Copy, Clone, Debug)]
+        struct TypeOnlySegmentation(PhantomData<Rc<()>>);
+
+        impl KeySegmentation<1> for TypeOnlySegmentation {
+            const SEGMENTS: [usize; 1] = [0];
+        }
+
+        #[derive(Copy, Clone, Debug)]
+        struct TypeOnlySchema(PhantomData<Rc<()>>);
+
+        impl KeySchema<1> for TypeOnlySchema {
+            type Segmentation = TypeOnlySegmentation;
+            const SEGMENT_PERM: &'static [usize] = &[0];
+            const KEY_TO_TREE: [usize; 1] = [0];
+            const TREE_TO_KEY: [usize; 1] = [0];
+        }
+
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PATCH<1, TypeOnlySchema, u64>>();
     }
 
     #[test]

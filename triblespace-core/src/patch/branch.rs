@@ -141,8 +141,8 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for BranchMut<'a, 
 
 #[repr(C, align(16))]
 pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> {
-    key_ordering: PhantomData<O>,
-    key_segments: PhantomData<O::Segmentation>,
+    key_ordering: PhantomData<fn() -> O>,
+    key_segments: PhantomData<fn() -> O::Segmentation>,
     /// Phantom `V`: the value type is no longer stored on the branch
     /// itself (the childleaf is just `*const [u8; KEY_LEN]`), but it
     /// stays carried so child `Head<KEY_LEN, O, V>` slots in

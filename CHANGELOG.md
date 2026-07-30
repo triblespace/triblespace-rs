@@ -431,6 +431,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PATCH no longer sends arbitrary associated values across threads.** Its
+  reference-counted `Head` now requires `V: Send + Sync` before implementing
+  either `Send` or `Sync`, matching the fact that cloned PATCH snapshots can
+  read one shared leaf concurrently and the last owner may drop its value on a
+  different thread. Compile-fail documentation pins both halves of the value
+  bound; non-owning schema markers remain type-level only.
+
 - **Consuming one cloned PATCH snapshot no longer creates a mutable reference
   to a leaf shared by another snapshot.** The internal mutation view now keeps
   reference-counted leaves read-only while retaining copy-on-write mutable
