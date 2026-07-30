@@ -221,6 +221,47 @@ impl ResultsLedger {
         }
     }
 
+    /// Commit and push whatever has accumulated, keeping the session open.
+    ///
+    /// # Why an interrupted run used to lose everything
+    ///
+    /// Measures accumulated in `pending` and were committed exactly once, in
+    /// [`finish`]. But each measure PRINTS its console line the moment it
+    /// completes, so a run that is killed after two hours of printing results
+    /// leaves nothing on disk — the log text and the pile disagree completely.
+    ///
+    /// That is not hypothetical. On 2026-07-30 a query phase was stopped to
+    /// hand the host to another agent after ~21 minutes of arms that had all
+    /// printed; the results pile contained only the *previous* phase. I then
+    /// reported those printed measures as durable, because watching them
+    /// scroll past is indistinguishable from watching them persist.
+    ///
+    /// Called from a measure's `emit`, this makes the invariant a reader
+    /// naturally assumes actually true: *if it printed, it is on disk.*
+    ///
+    /// # What an interrupted run then looks like
+    ///
+    /// Checkpoints do not write the session's `end_ns` — only [`finish`] does.
+    /// So an interrupted run is not merely present-but-short, it is
+    /// *identifiably incomplete*: a session with spans and no end. That is
+    /// strictly better than the two alternatives, losing it silently or
+    /// having it look finished.
+    ///
+    /// Cost is one commit and push per measure, against measures that take
+    /// seconds to minutes each. Empty checkpoints are skipped so a gated or
+    /// skipped measure does not append an empty commit.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.ws
+            .commit(std::mem::take(&mut self.pending), "tribleset-bench checkpoint");
+        self.repo
+            .push(&mut self.ws)
+            .map_err(|e| anyhow!("checkpoint results: {e:?}"))?;
+        Ok(())
+    }
+
     /// Close the session (end/duration), commit, push, close the pile.
     pub fn finish(mut self, end_ns: u64) -> Result<()> {
         let session_ref = ExclusiveId::force_ref(&self.session);

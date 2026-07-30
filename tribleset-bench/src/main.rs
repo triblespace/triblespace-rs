@@ -544,6 +544,17 @@ impl Measure {
             ),
         };
         led.outcome(&self.name, &outcome, rows);
+        // Persist BEFORE printing, so the console line is evidence the measure
+        // is on disk rather than merely computed. A run killed mid-suite then
+        // keeps every measure it announced; previously it kept none, because
+        // the single commit lived in `finish`.
+        //
+        // A checkpoint failure must not discard the measure silently — it is
+        // reported and the run continues, since one unwritable checkpoint is
+        // not a reason to abandon a two-hour suite.
+        if let Err(e) = led.checkpoint() {
+            eprintln!("  warning: checkpoint after {} failed: {e:#}", self.name);
+        }
         match rows {
             Some(n) => println!("  {:<32} {outcome} ({} spans, {n} rows)", self.name, self.spans.len()),
             None => println!("  {:<32} {outcome} ({} spans)", self.name, self.spans.len()),
