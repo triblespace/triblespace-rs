@@ -473,6 +473,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Catching a panic from reclamation during `PATCH::remove` no longer exposes
+  a partially mutated trie.** Removal now commits every ancestor aggregate and
+  collapse before dropping a detached heap value, and an emptied archive PATCH
+  clears its owner cover before reclaiming the final archive allocation.
+
 - **PATCH archive leaves remain owned across every detachment boundary.**
   Intersection, difference, removal, ordinary insertion/replacement, and both
   consuming iterators now materialize a direct `LocalLeaf` before its parent
