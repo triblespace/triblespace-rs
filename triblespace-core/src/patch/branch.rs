@@ -103,18 +103,18 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         }
     }
 
-    /// Finish a bulk union rewrite from its algebraic root-hash receipt.
+    /// Finish a bulk rewrite without traversing children for their hashes.
     ///
     /// Counts and the representative child pointer are structural and can be
     /// rebuilt in one table scan. The hash is different: asking every child
     /// for it would cross dirty archive-backed subtrees and defeat lazy hash
-    /// maintenance. `known_hash` is therefore the union-wide receipt derived
-    /// from the two input roots and their exact overlap; `None` (and exact
-    /// zero) installs the conservative zero sentinel.
+    /// maintenance. `known_hash` can install an independently derived exact
+    /// aggregate; `None` (and exact zero) installs the conservative zero
+    /// sentinel.
     #[cfg(feature = "parallel")]
-    pub fn finish_union_aggregates(&mut self, known_hash: Option<u128>) {
+    pub fn finish_bulk_aggregates(&mut self, known_hash: Option<u128>) {
         unsafe {
-            Branch::finish_union_aggregates(&mut self.branch_nn, known_hash);
+            Branch::finish_bulk_aggregates(&mut self.branch_nn, known_hash);
         }
     }
 }
@@ -634,14 +634,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         branch_nn.as_ref().debug_check_invariants();
     }
 
-    /// Rebuild the non-hash aggregates after a bulk union rewrite and install
-    /// the union-wide hash receipt without traversing a child for its hash.
+    /// Rebuild non-hash aggregates after a bulk rewrite and optionally install
+    /// an independently-derived hash without traversing a child for it.
     ///
     /// `known_hash` is exact when present. Zero remains the shared encoding
     /// for both an exact-zero XOR and an unknown cache, so either case is
     /// conservatively verified on demand by [`Head::hash`].
     #[cfg(feature = "parallel")]
-    pub(crate) unsafe fn finish_union_aggregates(
+    pub(crate) unsafe fn finish_bulk_aggregates(
         branch_nn: &mut NonNull<Self>,
         known_hash: Option<u128>,
     ) {

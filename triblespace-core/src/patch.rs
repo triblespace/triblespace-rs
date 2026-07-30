@@ -486,12 +486,11 @@ const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
 ///      drain "both" pairs, for each: claim 1 unit from the
 ///      shared budget — if successful, spawn the child union as
 ///      a `rayon::scope` task; if budget is exhausted, run the
-///      child serially via `Head::union_with_overlap`.
+///      child serially via `Head::union`.
 ///   2. Install phase (purely serial): scatter-collected resolved
 ///      heads + single-side pass-throughs land in the parent
-///      branch. Structural aggregates are rebuilt in one pass while
-///      a demanded hash is installed from the two input roots and the
-///      XOR of exact per-child overlap receipts.
+///      branch. Non-hash aggregates are rebuilt in one pass; the new
+///      branch stays fingerprint-dirty until a consumer asks.
 ///
 /// The budget is a single shared atomic — `num_threads²` total
 /// spawns across the entire descent, after which everything is
@@ -1438,32 +1437,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// Sequential PATCH-trie union. Always serial; the parallel
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
-    pub(crate) fn union(this: Self, other: Self, at_depth: usize) -> Self {
-        Self::union_with_overlap(this, other, at_depth, None)
-    }
-
-    #[inline]
-    fn known_union_hash(
-        left: Option<u128>,
-        right: Option<u128>,
-        overlap: u128,
-    ) -> Option<u128> {
-        Some(left? ^ right? ^ overlap)
-    }
-
-    /// Recursive serial union. `overlap_out` is a demand/sink for the exact
-    /// `H(left ∩ right)` receipt. A structural frame also creates a local
-    /// demand when both input aggregates are resident, because the receipt can
-    /// repair its own result cache. With no inherited or local consumer, equal
-    /// dirty LocalLeaves stay unhashed. The receipt identity is:
-    ///
-    /// `H(left ∪ right) = H(left) xor H(right) xor H(left ∩ right)`.
-    fn union_with_overlap(
-        mut this: Self,
-        mut other: Self,
-        at_depth: usize,
-        overlap_out: Option<&mut u128>,
-    ) -> Self {
+    /// Union is a structural operation. It preserves a resident hash when the
+    /// result can be derived from already-resident child hashes, but never
+    /// hashes a `LocalLeaf` merely to keep the result cache warm. The first
+    /// actual fingerprint consumer pays for whatever dirty region remains.
+    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
         let this_hash = this.known_hash();
@@ -1485,17 +1463,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     this_hash,
                     other_hash,
                 );
-                if let Some(out) = overlap_out {
-                    *out = 0;
-                }
                 return Head::new(old_key, new_body);
-            }
-
-            // Reusing an equal singleton needs no cache repair of its own.
-            // Materialize its intersection hash only when an ancestor asked
-            // for it; a top-level duplicate LocalLeaf union stays hash-free.
-            if let Some(out) = overlap_out {
-                *out = this_hash.or(other_hash).unwrap_or_else(|| this.hash());
             }
             return this;
         }
@@ -1506,9 +1474,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if this.count() == other.count() {
             if let (Some(left), Some(right)) = (this_hash, other_hash) {
                 if left == right {
-                    if let Some(out) = overlap_out {
-                        *out = left;
-                    }
                     return this;
                 }
             }
@@ -1525,43 +1490,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 this_hash,
                 other_hash,
             );
-
-            if let Some(out) = overlap_out {
-                *out = 0;
-            }
             return Head::new(old_key, new_body);
         }
-
-        // Only a structural merge can create a new cache that needs repair.
-        // An inherited demand stays live through dirty children because a
-        // resident ancestor may legally cover them. Otherwise, two resident
-        // roots create a local demand so this frame preserves the same cache
-        // state as eager exact-overlap union.
-        let need_overlap =
-            overlap_out.is_some() || (this_hash.is_some() && other_hash.is_some());
 
         if this_depth < other_depth {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = other.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            let mut overlap = 0;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => {
-                    Some(Head::union_with_overlap(
-                        old,
-                        inserted,
-                        this_depth,
-                        need_overlap.then_some(&mut overlap),
-                    ))
-                }
+                Some(old) => Some(Head::union(old, inserted, this_depth)),
                 None => Some(inserted),
             });
-            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
-            ed.hash = known_hash.unwrap_or(0);
             drop(ed);
-            if let Some(out) = overlap_out {
-                *out = overlap;
-            }
             return this;
         }
 
@@ -1571,31 +1511,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
             let inserted = this_head.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            let mut overlap = 0;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => {
-                    Some(Head::union_with_overlap(
-                        old,
-                        inserted,
-                        other_depth,
-                        need_overlap.then_some(&mut overlap),
-                    ))
-                }
+                Some(old) => Some(Head::union(old, inserted, other_depth)),
                 None => Some(inserted),
             });
-            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
-            ed.hash = known_hash.unwrap_or(0);
             drop(ed);
-            if let Some(out) = overlap_out {
-                *out = overlap;
-            }
             return other.with_key(old_key);
         }
 
         // Equal depth, hashes differ → walk `other`'s children and resolve
-        // collisions through the canonical child mutation primitive. Each
-        // recursive call returns its overlap receipt through an outer local;
-        // once the batch is complete we install the union-wide cache formula.
+        // collisions through the canonical child mutation primitive. Its
+        // resident-only delta accounting keeps the parent clean exactly when
+        // every changed contribution is already known; otherwise it marks the
+        // parent dirty without forcing a hash.
         //
         // Union is commutative; mutating either side in place is
         // semantically equivalent. Swap when `other`'s child_table
@@ -1611,7 +1539,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             unreachable!();
         };
         let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
-        let mut overlap = 0;
 
         for other_child in other_branch_ref
             .child_table
@@ -1620,26 +1547,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         {
             let inserted = other_child.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            let mut child_overlap = 0;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => {
-                    Some(Head::union_with_overlap(
-                        old,
-                        inserted,
-                        this_depth,
-                        need_overlap.then_some(&mut child_overlap),
-                    ))
-                }
+                Some(old) => Some(Head::union(old, inserted, this_depth)),
                 None => Some(inserted),
             });
-            overlap ^= child_overlap;
         }
-        let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
-        ed.hash = known_hash.unwrap_or(0);
         drop(ed);
-        if let Some(out) = overlap_out {
-            *out = overlap;
-        }
         this
     }
 
@@ -1656,21 +1569,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         V: Send + Sync,
     {
         let ctx = parallel_union::ParUnionCtx::new();
-        Self::par_union_with_ctx(this, other, at_depth, &ctx, None)
+        Self::par_union_with_ctx(this, other, at_depth, &ctx)
     }
 
-    /// Recursive parallel-aware union with the same optional overlap demand as
-    /// serial [`Self::union_with_overlap`]. The large equal-depth arm scatters
-    /// child pairs, resolves them in parallel, and XOR-reduces receipts only
-    /// when an ancestor or this frame's two resident inputs consume them; no
-    /// child is traversed merely to produce a discarded receipt.
+    /// Recursive parallel-aware union. The large equal-depth arm scatters
+    /// child pairs and resolves them in parallel. Bulk collection rebuilds the
+    /// structural aggregates but deliberately leaves the hash dirty rather
+    /// than traversing archive-backed children.
     #[cfg(feature = "parallel")]
     fn par_union_with_ctx(
         mut this: Self,
         mut other: Self,
         at_depth: usize,
         ctx: &parallel_union::ParUnionCtx,
-        overlap_out: Option<&mut u128>,
     ) -> Self
     where
         O: Send + Sync,
@@ -1682,20 +1593,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // Singleton pairs have no fan-out work for rayon and the serial rule
         // decides them exactly without a fingerprint.
         if this_depth == KEY_LEN && other_depth == KEY_LEN {
-            return Self::union_with_overlap(this, other, at_depth, overlap_out);
+            return Self::union(this, other, at_depth);
         }
 
-        // Capture the logical input receipts before the capacity-driven swap
-        // below. The union formula is symmetric, but tying these names to the
-        // original inputs keeps the proof boundary explicit.
         let this_hash = this.known_hash();
         let other_hash = other.known_hash();
         if this.count() == other.count() {
             if let (Some(left), Some(right)) = (this_hash, other_hash) {
                 if left == right {
-                    if let Some(out) = overlap_out {
-                        *out = left;
-                    }
                     return this;
                 }
             }
@@ -1712,15 +1617,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 this_hash,
                 other_hash,
             );
-            if let Some(out) = overlap_out {
-                *out = 0;
-            }
             return Head::new(old_key, new_body);
         }
 
         if this_depth != other_depth {
             // Asymmetric — no fan-out opportunity, serial path wins.
-            return Self::union_with_overlap(this, other, at_depth, overlap_out);
+            return Self::union(this, other, at_depth);
         }
 
         // Equal depth, hashes differ → branch merge. Swap when
@@ -1743,11 +1645,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => unreachable!(),
         };
         if small {
-            return Self::union_with_overlap(this, other, at_depth, overlap_out);
+            return Self::union(this, other, at_depth);
         }
-
-        let need_overlap =
-            overlap_out.is_some() || (this_hash.is_some() && other_hash.is_some());
 
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
@@ -1784,24 +1683,25 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     }
                 }
             }
+            let known_hash = if both == crate::patch::bytetable::ByteSet::new_empty() {
+                match (this_hash, other_hash) {
+                    (Some(left), Some(right)) => Some(left ^ right),
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
             // Reuse `this_arr` as the resolved-head target. A both-side slot is
             // taken before dispatch, so each task writes into a distinct empty
             // slot; if a task panics, rayon joins the remaining work and normal
-            // array drops reclaim every result that was already written. Keep
-            // demanded scalar receipts in a separate sidecar so the head array
-            // remains compact. With no consumer, avoid even initializing that
-            // 4 KiB transient array.
+            // array drops reclaim every result that was already written.
             let this_arr_ptr = parallel_union::ScatterPtr(this_arr.as_mut_ptr());
-            let mut overlap_receipts = need_overlap.then(|| [0u128; 256]);
-            let overlap_ptr = overlap_receipts
-                .as_mut()
-                .map(|receipts| parallel_union::ScatterPtr(receipts.as_mut_ptr()));
 
             rayon::scope(|s| {
                 // Drain `both` pairs serially in the parent; per
                 // pair, either claim a spawn unit and dispatch as a
-                // task, or run serially via `union_with_overlap` here on
+                // task, or run serially via `union` here on
                 // the parent thread. The atomic budget is shared
                 // with all nested `par_union_with_ctx` calls.
                 while let Some(k) = both.drain_next_ascending() {
@@ -1815,42 +1715,23 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     let o = other_arr[i].take().expect("both ⇒ other");
                     if ctx.try_claim() {
                         s.spawn(move |_| {
-                            let mut child_overlap = 0;
-                            let head = Self::par_union_with_ctx(
-                                t,
-                                o,
-                                this_depth,
-                                ctx,
-                                need_overlap.then_some(&mut child_overlap),
-                            );
+                            let head = Self::par_union_with_ctx(t, o, this_depth, ctx);
                             // SAFETY: each task has a distinct
                             // key `k`, so both writes at `i` are
                             // non-aliasing with every other task.
                             unsafe {
                                 this_arr_ptr.write_at(i, Some(head));
-                                if let Some(overlap_ptr) = overlap_ptr {
-                                    overlap_ptr.write_at(i, child_overlap);
-                                }
                             }
                         });
                     } else {
                         // Budget exhausted — fall back to fully
                         // serial union on this pair, then scatter its
-                        // result and receipt. SAFETY: same disjointness
+                        // result. SAFETY: same disjointness
                         // invariant; the parent thread races only
                         // with tasks targeting distinct keys.
-                        let mut child_overlap = 0;
-                        let head = Self::union_with_overlap(
-                            t,
-                            o,
-                            this_depth,
-                            need_overlap.then_some(&mut child_overlap),
-                        );
+                        let head = Self::union(t, o, this_depth);
                         unsafe {
                             this_arr_ptr.write_at(i, Some(head));
-                            if let Some(overlap_ptr) = overlap_ptr {
-                                overlap_ptr.write_at(i, child_overlap);
-                            }
                         }
                     }
                 }
@@ -1866,15 +1747,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 }
             }
 
-            let overlap = overlap_receipts
-                .map(|receipts| receipts.into_iter().fold(0, |hash, child| hash ^ child))
-                .unwrap_or(0);
-            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
-            ed.finish_union_aggregates(known_hash);
+            ed.finish_bulk_aggregates(known_hash);
             drop(ed);
-            if let Some(out) = overlap_out {
-                *out = overlap;
-            }
             return this;
         }
     }
@@ -3986,7 +3860,7 @@ mod tests {
         let ctx = parallel_union::ParUnionCtx {
             budget: AtomicUsize::new(0),
         };
-        left.root = Some(Head::par_union_with_ctx(this, other, 0, &ctx, None));
+        left.root = Some(Head::par_union_with_ctx(this, other, 0, &ctx));
         left.debug_check_owner_invariant();
         left
     }
@@ -4136,14 +4010,15 @@ mod tests {
         disjoint_insert[0] = 2;
 
         // Both input roots are exact because the archive-pair constructor has
-        // both leaf hashes. Their union repairs the root algebraically, while
-        // each same-prefix collision constructs a dirty two-LocalLeaf child.
+        // both leaf hashes. Structural union deliberately leaves the
+        // overlapping result dirty, while each same-prefix collision creates
+        // a dirty two-LocalLeaf child.
         let mut patch = owned_archive_pair([a, c]);
         let other = owned_archive_pair([b, d]);
         reset_local_leaf_hash_calls();
         patch.union(other);
         assert_eq!(local_leaf_hash_calls(), 0);
-        assert_ne!(branch_cached_hash(&patch), 0);
+        assert_eq!(branch_cached_hash(&patch), 0);
         let dirty_children = match patch.root.as_ref().unwrap().body_ref() {
             BodyRef::Branch(root) => root
                 .child_table
@@ -4157,6 +4032,16 @@ mod tests {
         };
         assert_eq!(dirty_children, 2);
         deep_hash_audit(&patch);
+
+        // Model an independent algebraic consumer installing an exact root
+        // aggregate over those dirty descendants. This keeps the original
+        // mutation invariant under test without making union itself a hash
+        // consumer.
+        let exact_root_hash = heap_hash_oracle(&patch);
+        let BodyMut::Branch(root) = patch.root.as_mut().unwrap().body_mut() else {
+            panic!("fixture root must be a Branch");
+        };
+        root.hash = exact_root_hash;
 
         // An unrelated known heap child can extend the exact parent without
         // consulting either dirty sibling. The ordinary local debug audit must
@@ -4327,26 +4212,14 @@ mod tests {
         assert_eq!(local_leaf_hash_calls(), 3);
     }
 
-    #[test]
-    fn known_zero_union_hash_requires_both_input_receipts() {
-        type TestHead = Head<2, IdentitySchema, ()>;
-        assert_eq!(
-            TestHead::known_union_hash(Some(0x55), Some(0x55), 0),
-            Some(0),
-        );
-        assert_eq!(
-            TestHead::known_union_hash(None, Some(0x55), 0),
-            None,
-        );
-    }
-
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_union_threshold_preserves_dirty_descendants_without_hashing() {
         // Each input has exactly 4,096 rows: the inclusive threshold boundary.
         // Its root hash is resident, but every direct child is a dirty Branch
         // over 32 archive-backed leaves. The two first-byte ranges are
-        // disjoint, so the exact overlap receipt is zero.
+        // disjoint, so the result hash is derivable from the two resident
+        // input hashes without touching a LocalLeaf.
         let mut left = owned_archive_dirty_parent(0, 128, 0, 32);
         let right = owned_archive_dirty_parent(128, 128, 0, 32);
         assert_eq!(left.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
@@ -4370,8 +4243,8 @@ mod tests {
             "the parallel bulk finalizer must not hash disjoint dirty children",
         );
 
-        // Immediate verification consumes the installed root receipt rather
-        // than descending into all 8,192 LocalLeaves.
+        // Immediate verification consumes the algebraically derived root
+        // cache rather than descending into all 8,192 LocalLeaves.
         let before = local_leaf_hash_calls();
         assert_eq!(left.root_hash(), Some(expected_hash));
         assert_eq!(local_leaf_hash_calls(), before);
@@ -4380,7 +4253,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn parallel_union_hash_work_tracks_overlap_and_spawned_receipts_are_exact() {
+    fn parallel_union_defers_overlapping_hash_work_until_requested() {
         // The two 4,096-row inputs share exactly variant 31: one leaf in each
         // of 128 root buckets. Their direct child hashes are deliberately
         // dirty, so structural descent must identify those 128 equal keys.
@@ -4391,39 +4264,34 @@ mod tests {
         assert_eq!(direct_dirty_branch_children(&left), 128);
         assert_eq!(direct_dirty_branch_children(&right), 128);
 
-        // Exhausting the spawn budget keeps the overlap hashes on this thread,
-        // making the thread-local census exact: one hash per duplicate and no
-        // hash for the other 7,936 input rows.
+        // Exhausting the spawn budget keeps structural work on this thread.
+        // Composition still does not hash the 128 duplicates merely to keep a
+        // new cache warm.
         reset_local_leaf_hash_calls();
         let serial_scatter =
             union_with_exhausted_parallel_budget(left.clone(), right.clone());
         assert_eq!(serial_scatter.len(), 8_064);
-        assert_eq!(local_leaf_hash_calls(), 128);
-        let before_verify = local_leaf_hash_calls();
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&serial_scatter), 0);
         let serial_oracle = heap_hash_oracle(&serial_scatter);
-        assert_eq!(branch_cached_hash(&serial_scatter), serial_oracle);
         assert_eq!(serial_scatter.root_hash(), Some(serial_oracle));
-        assert_eq!(local_leaf_hash_calls(), before_verify);
+        assert_eq!(local_leaf_hash_calls(), 8_064);
 
-        // The ordinary context spends its budget on rayon tasks. Their scalar
-        // receipts use a distinct sidecar from the resolved Heads; compare the
-        // installed cache with an independent heap-backed oracle to cover the
-        // cross-thread scatter writes.
+        // The ordinary context spends its budget on rayon tasks. It has no
+        // scalar fingerprint sidecar; validate its structure independently.
         let mut parallel = left;
         reset_local_leaf_hash_calls();
         parallel.union(right);
         assert_eq!(parallel.len(), 8_064);
-        let before_verify = local_leaf_hash_calls();
+        assert_eq!(branch_cached_hash(&parallel), 0);
         let parallel_oracle = heap_hash_oracle(&parallel);
-        assert_eq!(branch_cached_hash(&parallel), parallel_oracle);
         assert_eq!(parallel.root_hash(), Some(parallel_oracle));
-        assert_eq!(local_leaf_hash_calls(), before_verify);
         deep_hash_audit(&parallel);
     }
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn parallel_union_skips_overlap_receipts_below_dirty_roots() {
+    fn parallel_union_stays_hash_free_below_dirty_roots() {
         let mut left = owned_archive_dirty_parent(0, 128, 0, 32);
         let mut right = owned_archive_dirty_parent(0, 128, 31, 32);
         assert_ne!(branch_cached_hash(&left), 0);
@@ -4437,9 +4305,9 @@ mod tests {
         let mut spawned_left = left.clone();
         let spawned_right = right.clone();
 
-        // The same 128 duplicate LocalLeaves as the demanded-root fixture are
-        // discovered structurally, but no cache above them can consume their
-        // numeric overlap. Exhaust the spawn budget for an exact TLS census.
+        // The same 128 duplicate LocalLeaves as the resident-root fixture are
+        // discovered structurally. Exhaust the spawn budget for an exact TLS
+        // census.
         reset_local_leaf_hash_calls();
         let union = union_with_exhausted_parallel_budget(left, right);
         assert_eq!(union.len(), 8_064);
@@ -4453,7 +4321,7 @@ mod tests {
 
         // Exercise the ordinary spawned-task path as well. Its worker-local
         // census is intentionally not asserted; structure plus the immediate
-        // fingerprint oracle cover the demand-disabled scatter pointer path.
+        // fingerprint oracle cover the fingerprint-free scatter path.
         reset_local_leaf_hash_calls();
         spawned_left.union(spawned_right);
         assert_eq!(spawned_left.len(), 8_064);
@@ -4464,7 +4332,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_overlap_prefers_a_cached_heap_leaf_hash() {
+    fn singleton_overlap_reuses_the_left_leaf_without_hashing() {
         const KEY_LEN: usize = 2;
         let key = [7, 9];
         let mut local = owned_archive_single(key);
@@ -4480,7 +4348,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_cached_roots_repair_without_deferring_duplicate_hashes() {
+    fn overlapping_cached_roots_do_not_make_composition_a_hash_consumer() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
         let mut b = a;
@@ -4497,9 +4365,10 @@ mod tests {
         left.union(right);
         assert_eq!(
             local_leaf_hash_calls(),
-            1,
-            "only the equal LocalLeaf pair should materialize an overlap hash",
+            0,
+            "structural union must not hash an equal LocalLeaf merely to repair a cache",
         );
+        assert_eq!(branch_cached_hash(&left), 0);
         assert_eq!(
             left.iter().copied().collect::<HashSet<_>>(),
             HashSet::from([a, b, c])
@@ -4507,12 +4376,11 @@ mod tests {
         deep_hash_audit(&left);
 
         let expected = heap_hash_oracle(&left);
-        let before = local_leaf_hash_calls();
         assert_eq!(left.root_hash(), Some(expected));
         assert_eq!(
             local_leaf_hash_calls(),
-            before,
-            "known input roots plus the overlap receipt must repair the root cache",
+            3,
+            "the first fingerprint consumer hashes the three result leaves once",
         );
     }
 
