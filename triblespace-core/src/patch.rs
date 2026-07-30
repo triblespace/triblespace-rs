@@ -1106,7 +1106,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return this;
         }
 
-        if this.hash() == other.hash() {
+        if this.is_singleton() == other.is_singleton()
+            && this.hash() == other.hash()
+        {
             return this;
         }
 
@@ -1224,7 +1226,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Self::union(this, other, at_depth);
         }
 
-        if this.hash() == other.hash() {
+        if this.is_singleton() == other.is_singleton()
+            && this.hash() == other.hash()
+        {
             return this;
         }
 
@@ -1405,7 +1409,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if self.is_archive_singleton_pair(other) {
             return self.intersect(other, at_depth);
         }
-        if self.hash() == other.hash() {
+        if self.is_singleton() == other.is_singleton()
+            && self.hash() == other.hash()
+        {
             return Some(self.clone());
         }
         if self.first_divergence(other, at_depth).is_some() {
@@ -1527,7 +1533,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if self.is_archive_singleton_pair(other) {
             return self.difference(other, at_depth);
         }
-        if self.hash() == other.hash() {
+        if self.is_singleton() == other.is_singleton()
+            && self.hash() == other.hash()
+        {
             return None;
         }
         if self.first_divergence(other, at_depth).is_some() {
@@ -1904,7 +1912,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             };
         }
 
-        if self.hash() == other.hash() {
+        if self.is_singleton() == other.is_singleton()
+            && self.hash() == other.hash()
+        {
             return Some(self.clone());
         }
 
@@ -1997,7 +2007,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             };
         }
 
-        if self.hash() == other.hash() {
+        if self.is_singleton() == other.is_singleton()
+            && self.hash() == other.hash()
+        {
             return None;
         }
 
