@@ -397,14 +397,9 @@ impl OwnerNode {
 
     fn same_shape(&self, other: &Self) -> bool {
         match (self, other) {
-            (
-                Self::Owner {
-                    address: left, ..
-                },
-                Self::Owner {
-                    address: right, ..
-                },
-            ) => left == right,
+            (Self::Owner { address: left, .. }, Self::Owner { address: right, .. }) => {
+                left == right
+            }
             (
                 Self::Branch {
                     mask: left_mask,
@@ -994,8 +989,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     #[inline]
     fn same_body(&self, other: &Self) -> bool {
         let body_and_tag = Self::BODY_MASK | Self::TAG_MASK;
-        (self.tptr.as_ptr() as u64 & body_and_tag)
-            == (other.tptr.as_ptr() as u64 & body_and_tag)
+        (self.tptr.as_ptr() as u64 & body_and_tag) == (other.tptr.as_ptr() as u64 & body_and_tag)
     }
 
     #[inline]
@@ -3893,9 +3887,7 @@ mod tests {
         root.child_table
             .iter()
             .flatten()
-            .filter(|child| {
-                matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0)
-            })
+            .filter(|child| matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0))
             .count()
     }
 
@@ -3995,13 +3987,11 @@ mod tests {
         assert_eq!(local_leaf_hash_calls(), 0);
 
         let intersection = original.intersect(&snapshot);
-        assert!(
-            intersection
-                .root
-                .as_ref()
-                .unwrap()
-                .same_body(snapshot.root.as_ref().unwrap()),
-        );
+        assert!(intersection
+            .root
+            .as_ref()
+            .unwrap()
+            .same_body(snapshot.root.as_ref().unwrap()),);
         assert!(original.difference(&snapshot).is_empty());
         assert_eq!(original, snapshot);
         assert_eq!(local_leaf_hash_calls(), 0);
@@ -4365,8 +4355,7 @@ mod tests {
         // Composition still does not hash the 128 duplicates merely to keep a
         // new cache warm.
         reset_local_leaf_hash_calls();
-        let serial_scatter =
-            union_with_exhausted_parallel_budget(left.clone(), right.clone());
+        let serial_scatter = union_with_exhausted_parallel_budget(left.clone(), right.clone());
         assert_eq!(serial_scatter.len(), 8_064);
         assert_eq!(local_leaf_hash_calls(), 0);
         assert_eq!(branch_cached_hash(&serial_scatter), 0);
@@ -4564,10 +4553,7 @@ mod tests {
         assert!(first.root.same_shape(&second.root));
         assert!(first.root.same_shape(&third.root));
         for owner in &owners {
-            assert!(OwnerNode::contains(
-                &first.root,
-                OwnerCover::address(owner)
-            ));
+            assert!(OwnerNode::contains(&first.root, OwnerCover::address(owner)));
         }
         let unrelated = test_archive_owner(255);
         assert!(!OwnerNode::contains(
@@ -4811,12 +4797,10 @@ mod tests {
         let left_owner: Arc<dyn ArchiveOwner> = left_storage.clone();
         let right_owner: Arc<dyn ArchiveOwner> = right_storage.clone();
         let (mut first, mut second) = {
-            let left_entry = unsafe {
-                ArchiveEntry::new(NonNull::from(&left_storage.0), &left_owner)
-            };
-            let right_entry = unsafe {
-                ArchiveEntry::new(NonNull::from(&right_storage.0), &right_owner)
-            };
+            let left_entry =
+                unsafe { ArchiveEntry::new(NonNull::from(&left_storage.0), &left_owner) };
+            let right_entry =
+                unsafe { ArchiveEntry::new(NonNull::from(&right_storage.0), &right_owner) };
 
             let mut first = PATCH::<KEY_LEN, IdentitySchema>::new();
             first.insert_archive(&left_entry);
@@ -4852,10 +4836,7 @@ mod tests {
             first = next_first;
             second = next_second;
 
-            for (patch, owner_root) in [
-                (&first, first_owner_root),
-                (&second, second_owner_root),
-            ] {
+            for (patch, owner_root) in [(&first, first_owner_root), (&second, second_owner_root)] {
                 let cover = patch.owners.as_ref().expect("dirty Head lost its owners");
                 let stats = cover.stats();
                 assert_eq!(cover.owner_count(), 2);
