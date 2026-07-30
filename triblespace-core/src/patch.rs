@@ -5194,47 +5194,6 @@ mod tests {
         }
     }
 
-    fn print_cardinality_patch_census(
-        fixture: &CardinalityPatchFixture,
-        len: usize,
-        geometry: CardinalityGeometry,
-    ) {
-        let mut union = fixture.left.clone();
-        let right = fixture.right.clone();
-        reset_local_leaf_hash_calls();
-        union.union(right);
-        assert_eq!(union.len(), fixture.union_len);
-        println!(
-            "PATCH_CARDINALITY_CENSUS,{},patch,{},{},union,{}",
-            cardinality_variant(),
-            len,
-            geometry.label(),
-            local_leaf_hash_calls()
-        );
-
-        reset_local_leaf_hash_calls();
-        let intersection = fixture.left.intersect(&fixture.right);
-        assert_eq!(intersection.len(), fixture.intersect_len);
-        println!(
-            "PATCH_CARDINALITY_CENSUS,{},patch,{},{},intersect,{}",
-            cardinality_variant(),
-            len,
-            geometry.label(),
-            local_leaf_hash_calls()
-        );
-
-        reset_local_leaf_hash_calls();
-        let difference = fixture.left.difference(&fixture.right);
-        assert_eq!(difference.len(), fixture.difference_len);
-        println!(
-            "PATCH_CARDINALITY_CENSUS,{},patch,{},{},difference,{}",
-            cardinality_variant(),
-            len,
-            geometry.label(),
-            local_leaf_hash_calls()
-        );
-    }
-
     fn cardinality_samples(
         iterations: usize,
         samples: usize,
@@ -5357,6 +5316,9 @@ mod tests {
         );
     }
 
+    /// Deterministic causal census over fixed LocalLeaf/Branch shapes. Larger
+    /// public PATCH fixtures stay in the wall-time probe because randomized
+    /// cuckoo-table layout changes their absolute LocalLeaf hash-call count.
     #[test]
     #[ignore = "manual release LocalLeaf cardinality hash census"]
     fn cardinality_gate_hash_census() {
@@ -5371,15 +5333,6 @@ mod tests {
                 CardinalityOrder::BranchLocal,
             ] {
                 print_cardinality_direct_census(&fixture, branch_len, order);
-            }
-        }
-        for len in [1024, 4096] {
-            for geometry in [
-                CardinalityGeometry::Disjoint,
-                CardinalityGeometry::HalfOverlap,
-            ] {
-                let fixture = CardinalityPatchFixture::new(len, geometry);
-                print_cardinality_patch_census(&fixture, len, geometry);
             }
         }
     }
