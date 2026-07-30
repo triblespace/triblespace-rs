@@ -566,8 +566,8 @@ mod parallel_union {
     }
     impl<T> Copy for ScatterPtr<T> {}
 
-    unsafe impl<T> Send for ScatterPtr<T> {}
-    unsafe impl<T> Sync for ScatterPtr<T> {}
+    unsafe impl<T: Send> Send for ScatterPtr<T> {}
+    unsafe impl<T: Send> Sync for ScatterPtr<T> {}
 
     impl<T> ScatterPtr<T> {
         /// SAFETY: `i` must be in-bounds of the underlying buffer,
