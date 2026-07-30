@@ -79,6 +79,27 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         }
     }
 
+    /// Counted twin of [`Self::install_child_growing`] for the untimed archive
+    /// construction census. `resident_children` is the number of Heads already
+    /// present before `head` is attempted, and therefore the exact number moved
+    /// by every fallback growth while that Head remains displaced.
+    #[cfg(test)]
+    pub fn install_child_growing_counted(
+        &mut self,
+        head: Head<KEY_LEN, O, V>,
+        resident_children: usize,
+        stats: &mut BranchBuildStats,
+    ) {
+        unsafe {
+            Branch::install_child_growing_counted(
+                &mut self.branch_nn,
+                head,
+                resident_children,
+                stats,
+            );
+        }
+    }
+
     /// Finish a bulk rewrite without traversing children for their hashes.
     ///
     /// Counts and the representative child pointer are structural and can be
@@ -274,6 +295,69 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             Some(lchild_hash),
             Some(rchild_hash),
         )
+    }
+
+    /// Test-only direct-capacity variant for a Branch whose complete fanout is
+    /// known before allocation. Binary Branches deliberately keep using
+    /// [`Self::new_with_child_hashes`], preserving their direct two-slot path.
+    ///
+    /// `size` is the minimal power-of-two slot capacity for the known fanout.
+    /// The first two children must be inserted through the byte table when the
+    /// allocation is wider than two slots, because raw slots zero and one are
+    /// no longer necessarily lookup locations. The archive construction
+    /// boundary initializes byte-table randomness before this method is used.
+    #[cfg(test)]
+    pub(super) fn new_with_child_hashes_capacity(
+        end_depth: usize,
+        lchild: Head<KEY_LEN, O, V>,
+        rchild: Head<KEY_LEN, O, V>,
+        lchild_hash: u128,
+        rchild_hash: u128,
+        size: usize,
+    ) -> NonNull<Self> {
+        assert!(
+            size > 2 && size <= 256 && size.is_power_of_two(),
+            "direct Branch capacity must be a power of two in 4..=256",
+        );
+        unsafe {
+            // SAFETY: the asserted size bound makes the trailing-table layout
+            // valid and keeps its length representable by a Branch Head tag.
+            let layout = Layout::from_size_align_unchecked(
+                BRANCH_BASE_SIZE + (TABLE_ENTRY_SIZE * size),
+                BRANCH_ALIGN,
+            );
+            let Some(ptr) =
+                NonNull::new(std::ptr::slice_from_raw_parts(alloc_zeroed(layout), size)
+                    as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
+            else {
+                handle_alloc_error(layout);
+            };
+
+            let hash = lchild_hash ^ rchild_hash;
+            addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1 | HASH_KNOWN));
+            addr_of_mut!((*ptr.as_ptr()).end_depth).write(end_depth as u32);
+            addr_of_mut!((*ptr.as_ptr()).childleaf).write(lchild.childleaf_ptr());
+            addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
+            addr_of_mut!((*ptr.as_ptr()).segment_count)
+                .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
+            addr_of_mut!((*ptr.as_ptr()).hash_lo).write(atomic::AtomicU64::new(hash as u64));
+            addr_of_mut!((*ptr.as_ptr()).hash_hi)
+                .write(atomic::AtomicU64::new((hash >> 64) as u64));
+
+            if let Some(displaced) = (*ptr.as_ptr()).child_table.table_insert(lchild) {
+                Self::rc_dec(ptr);
+                drop(displaced);
+                unreachable!("the first child must fit an empty direct-capacity Branch");
+            }
+            if let Some(displaced) = (*ptr.as_ptr()).child_table.table_insert(rchild) {
+                // The first child is owned by the Branch and is reclaimed by
+                // rc_dec; the returned second child has not entered the table.
+                Self::rc_dec(ptr);
+                drop(displaced);
+                unreachable!("two distinct children must fit a direct-capacity Branch");
+            }
+            ptr
+        }
     }
 
     /// Construct a branch whose aggregate is cached only when both child
@@ -538,11 +622,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    let hash = cached_parent_hash.and_then(|parent| {
-                        inserted
-                            .known_hash()
-                            .map(|inserted| parent ^ inserted)
-                    });
+                    let hash = cached_parent_hash
+                        .and_then(|parent| inserted.known_hash().map(|inserted| parent ^ inserted));
                     // Cuckoo insert loop, growing the table when necessary.
                     let mut branch_ptr = branch_nn.as_ptr();
                     while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
@@ -581,6 +662,30 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let mut branch_ptr = branch_nn.as_ptr();
         while let Some(displaced) = (*branch_ptr).child_table.table_insert(to_insert) {
             to_insert = displaced;
+            Self::grow(branch_nn);
+            branch_ptr = branch_nn.as_ptr();
+        }
+    }
+
+    /// Counted test-only form of [`Self::install_child_growing`]. The ordinary
+    /// method remains the timed and production path, so telemetry cannot make
+    /// a candidate look faster merely by avoiding instrumentation work.
+    #[cfg(test)]
+    pub(crate) unsafe fn install_child_growing_counted(
+        branch_nn: &mut NonNull<Self>,
+        head: Head<KEY_LEN, O, V>,
+        resident_children: usize,
+        stats: &mut BranchBuildStats,
+    ) {
+        let mut to_insert = head;
+        let mut branch_ptr = branch_nn.as_ptr();
+        while let Some(displaced) = (*branch_ptr).child_table.table_insert(to_insert) {
+            to_insert = displaced;
+            let old_slots = dst_len(addr_of!((*branch_ptr).child_table));
+            stats.grow_calls += 1;
+            stats.heads_moved_by_grow += resident_children as u64;
+            stats.grow_scanned_slots += old_slots as u64;
+            stats.grow_allocated_slots += (old_slots * 2) as u64;
             Self::grow(branch_nn);
             branch_ptr = branch_nn.as_ptr();
         }

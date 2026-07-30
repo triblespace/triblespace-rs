@@ -14,6 +14,8 @@ use crate::inline::encodings::hash::Blake3;
 use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
+#[cfg(test)]
+use crate::patch::BranchBuildStats;
 use crate::patch::Entry;
 use crate::patch::PATCHOwnerGuard;
 use crate::patch::PATCH;
@@ -513,6 +515,40 @@ impl TribleSet {
         hashes: &[u128],
         owner: &Arc<dyn ArchiveOwner>,
     ) -> (Self, usize) {
+        unsafe {
+            Self::from_archive_partition_inner_for_test::<false>(
+                rows,
+                hashes,
+                owner,
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// Counted twin used only for an untimed allocation census.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_archive_partition_with_stats_for_test(
+        rows: &[[u8; TRIBLE_LEN]],
+        hashes: &[u128],
+        owner: &Arc<dyn ArchiveOwner>,
+    ) -> (Self, usize, BranchBuildStats) {
+        let mut stats = BranchBuildStats::default();
+        let (result, permutation_bytes) = unsafe {
+            Self::from_archive_partition_inner_for_test::<true>(rows, hashes, owner, &mut stats)
+        };
+        (result, permutation_bytes, stats)
+    }
+
+    /// The `false` monomorphization receives no telemetry object and erases all
+    /// counter branches, keeping ordinary and timed construction unchanged.
+    #[cfg(test)]
+    unsafe fn from_archive_partition_inner_for_test<const COUNT: bool>(
+        rows: &[[u8; TRIBLE_LEN]],
+        hashes: &[u128],
+        owner: &Arc<dyn ArchiveOwner>,
+        stats: *mut BranchBuildStats,
+    ) -> (Self, usize) {
+        debug_assert!(!COUNT || !stats.is_null());
         assert_eq!(rows.len(), hashes.len());
         assert!(
             u32::try_from(rows.len()).is_ok(),
@@ -532,59 +568,47 @@ impl TribleSet {
         }
 
         reset(&mut permutation);
-        let eav = unsafe {
-            PATCH::<TRIBLE_LEN, EAVOrder>::from_archive_partition_for_test(
-                rows,
-                hashes,
-                &mut permutation,
-                &owners,
-            )
-        };
+        let eav =
+            unsafe {
+                PATCH::<TRIBLE_LEN, EAVOrder>::from_archive_partition_with_stats_sink_for_test::<
+                    COUNT,
+                >(rows, hashes, &mut permutation, &owners, stats)
+            };
         reset(&mut permutation);
-        let aev = unsafe {
-            PATCH::<TRIBLE_LEN, AEVOrder>::from_archive_partition_for_test(
-                rows,
-                hashes,
-                &mut permutation,
-                &owners,
-            )
-        };
+        let aev =
+            unsafe {
+                PATCH::<TRIBLE_LEN, AEVOrder>::from_archive_partition_with_stats_sink_for_test::<
+                    COUNT,
+                >(rows, hashes, &mut permutation, &owners, stats)
+            };
         reset(&mut permutation);
-        let vae = unsafe {
-            PATCH::<TRIBLE_LEN, VAEOrder>::from_archive_partition_for_test(
-                rows,
-                hashes,
-                &mut permutation,
-                &owners,
-            )
-        };
+        let vae =
+            unsafe {
+                PATCH::<TRIBLE_LEN, VAEOrder>::from_archive_partition_with_stats_sink_for_test::<
+                    COUNT,
+                >(rows, hashes, &mut permutation, &owners, stats)
+            };
         reset(&mut permutation);
-        let eva = unsafe {
-            PATCH::<TRIBLE_LEN, EVAOrder>::from_archive_partition_for_test(
-                rows,
-                hashes,
-                &mut permutation,
-                &owners,
-            )
-        };
+        let eva =
+            unsafe {
+                PATCH::<TRIBLE_LEN, EVAOrder>::from_archive_partition_with_stats_sink_for_test::<
+                    COUNT,
+                >(rows, hashes, &mut permutation, &owners, stats)
+            };
         reset(&mut permutation);
-        let vea = unsafe {
-            PATCH::<TRIBLE_LEN, VEAOrder>::from_archive_partition_for_test(
-                rows,
-                hashes,
-                &mut permutation,
-                &owners,
-            )
-        };
+        let vea =
+            unsafe {
+                PATCH::<TRIBLE_LEN, VEAOrder>::from_archive_partition_with_stats_sink_for_test::<
+                    COUNT,
+                >(rows, hashes, &mut permutation, &owners, stats)
+            };
         reset(&mut permutation);
-        let ave = unsafe {
-            PATCH::<TRIBLE_LEN, AVEOrder>::from_archive_partition_for_test(
-                rows,
-                hashes,
-                &mut permutation,
-                &owners,
-            )
-        };
+        let ave =
+            unsafe {
+                PATCH::<TRIBLE_LEN, AVEOrder>::from_archive_partition_with_stats_sink_for_test::<
+                    COUNT,
+                >(rows, hashes, &mut permutation, &owners, stats)
+            };
 
         let result = Self {
             eav,
@@ -881,9 +905,7 @@ mod tests {
             set.vea.owner_guard(),
             set.vae.owner_guard(),
         ];
-        assert!(guards[1..]
-            .iter()
-            .all(|guard| guard.ptr_eq(&guards[0])));
+        assert!(guards[1..].iter().all(|guard| guard.ptr_eq(&guards[0])));
     }
 
     fn many_intrinsic_rows(namespace: u8, count: usize) -> Vec<IntrinsicEntityRow> {
@@ -1203,9 +1225,7 @@ mod tests {
             right.vae.owner_guard(),
         ];
         for (i, guard) in before.iter().enumerate() {
-            assert!(before[i + 1..]
-                .iter()
-                .all(|other| !guard.ptr_eq(other)));
+            assert!(before[i + 1..].iter().all(|other| !guard.ptr_eq(other)));
         }
 
         left.union(right);
@@ -1214,30 +1234,12 @@ mod tests {
         std::hint::black_box(&noise);
         assert!(left.owner_guards_are_shared());
         assert_shared_owner_guard(&left);
-        assert_eq!(
-            left.eav.iter().copied().collect::<Vec<_>>(),
-            vec![rows[0]],
-        );
-        assert_eq!(
-            left.eva.iter().copied().collect::<Vec<_>>(),
-            vec![rows[1]],
-        );
-        assert_eq!(
-            left.aev.iter().copied().collect::<Vec<_>>(),
-            vec![rows[2]],
-        );
-        assert_eq!(
-            left.ave.iter().copied().collect::<Vec<_>>(),
-            vec![rows[3]],
-        );
-        assert_eq!(
-            left.vea.iter().copied().collect::<Vec<_>>(),
-            vec![rows[4]],
-        );
-        assert_eq!(
-            left.vae.iter().copied().collect::<Vec<_>>(),
-            vec![rows[5]],
-        );
+        assert_eq!(left.eav.iter().copied().collect::<Vec<_>>(), vec![rows[0]],);
+        assert_eq!(left.eva.iter().copied().collect::<Vec<_>>(), vec![rows[1]],);
+        assert_eq!(left.aev.iter().copied().collect::<Vec<_>>(), vec![rows[2]],);
+        assert_eq!(left.ave.iter().copied().collect::<Vec<_>>(), vec![rows[3]],);
+        assert_eq!(left.vea.iter().copied().collect::<Vec<_>>(), vec![rows[4]],);
+        assert_eq!(left.vae.iter().copied().collect::<Vec<_>>(), vec![rows[5]],);
     }
 
     #[test]
