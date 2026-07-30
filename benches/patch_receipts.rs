@@ -5,9 +5,7 @@
 //! use ordinary `Entry` insertion over equally deterministic trible bytes.
 //! Neither path reaches through PATCH internals.
 
-use criterion::{
-    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
@@ -98,7 +96,9 @@ fn heap_tribleset(rows: &[[u8; TRIBLE_LEN]]) -> TribleSet {
 fn archive_tribleset(rows: &[[u8; TRIBLE_LEN]]) -> TribleSet {
     let source = heap_tribleset(rows);
     let archive: Blob<SimpleArchive> = SimpleArchive::encode(&source);
-    archive.try_from_blob().expect("fixture archive must decode")
+    archive
+        .try_from_blob()
+        .expect("fixture archive must decode")
 }
 
 fn archive_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
@@ -115,10 +115,7 @@ fn archive_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
 /// retain the parent's fingerprint without both input fingerprints. This is
 /// the fixture shape needed to exercise an undemanded parallel union without
 /// adding another archive owner to the benchmark operand.
-fn demote_via_duplicate(
-    mut exact: EavPatch,
-    duplicate: [u8; TRIBLE_LEN],
-) -> EavPatch {
+fn demote_via_duplicate(mut exact: EavPatch, duplicate: [u8; TRIBLE_LEN]) -> EavPatch {
     assert!(exact.iter().any(|row| row == &duplicate));
     let expected_len = exact.len();
     let singleton_rows = std::slice::from_ref(&duplicate);
@@ -158,7 +155,10 @@ fn archive_variant(bucket_start: u16, bucket_count: u16, variant: u8) -> EavPatc
 }
 
 fn balanced_merge<T>(mut values: Vec<T>, mut merge: impl FnMut(&mut T, T)) -> T {
-    assert!(!values.is_empty(), "balanced merge needs at least one value");
+    assert!(
+        !values.is_empty(),
+        "balanced merge needs at least one value"
+    );
     while values.len() > 1 {
         let mut next = Vec::with_capacity(values.len().div_ceil(2));
         let mut iter = values.into_iter();
@@ -191,11 +191,7 @@ fn archive_variants(variant_count: u8) -> EavPatch {
     archive_variants_in(0, BUCKETS as u16, 0, variant_count)
 }
 
-fn archive_tribleset_variant(
-    bucket_start: u16,
-    bucket_count: u16,
-    variant: u8,
-) -> TribleSet {
+fn archive_tribleset_variant(bucket_start: u16, bucket_count: u16, variant: u8) -> TribleSet {
     let rows = ordered_archive_rows(bucket_start, bucket_count, variant, 1);
     archive_tribleset(&rows)
 }
@@ -208,9 +204,7 @@ fn archive_tribleset_variants_in(
 ) -> TribleSet {
     balanced_merge(
         (variant_start as u16..variant_start as u16 + variant_count as u16)
-            .map(|variant| {
-                archive_tribleset_variant(bucket_start, bucket_count, variant as u8)
-            })
+            .map(|variant| archive_tribleset_variant(bucket_start, bucket_count, variant as u8))
             .collect(),
         |left, right| left.union(right),
     )
@@ -228,10 +222,7 @@ fn heap_oracle(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
     oracle
 }
 
-fn union_rows(
-    left: &[[u8; TRIBLE_LEN]],
-    right: &[[u8; TRIBLE_LEN]],
-) -> Vec<[u8; TRIBLE_LEN]> {
+fn union_rows(left: &[[u8; TRIBLE_LEN]], right: &[[u8; TRIBLE_LEN]]) -> Vec<[u8; TRIBLE_LEN]> {
     let mut rows = Vec::with_capacity(left.len() + right.len());
     rows.extend_from_slice(left);
     rows.extend_from_slice(right);
@@ -244,10 +235,7 @@ fn without_rows(
     rows: &[[u8; TRIBLE_LEN]],
     removed: impl Fn(&[u8; TRIBLE_LEN]) -> bool,
 ) -> Vec<[u8; TRIBLE_LEN]> {
-    rows.iter()
-        .copied()
-        .filter(|row| !removed(row))
-        .collect()
+    rows.iter().copied().filter(|row| !removed(row)).collect()
 }
 
 fn assert_local_rows(label: &str, patch: &EavPatch, expected: &[[u8; TRIBLE_LEN]]) {
@@ -311,7 +299,11 @@ fn assert_tribleset_rows(
     ] {
         match storage {
             FixtureStorage::Heap => {
-                assert_eq!(stats.2, expected.len() as u64, "{label}/{index}: heap leaves");
+                assert_eq!(
+                    stats.2,
+                    expected.len() as u64,
+                    "{label}/{index}: heap leaves"
+                );
                 assert_eq!(stats.3, 0, "{label}/{index}: unexpected LocalLeaves");
             }
             FixtureStorage::Local => {
@@ -426,25 +418,18 @@ fn checked_union_case(
     // roots branch at depth zero. Their union therefore reaches the
     // equal-depth branch merge instead of the first-divergence shortcut.
     assert_ne!(left_rows.first().unwrap()[0], left_rows.last().unwrap()[0]);
-    assert_ne!(right_rows.first().unwrap()[0], right_rows.last().unwrap()[0]);
-    assert_fixture_rows(storage, &format!("{name} left source"), &left, left_rows);
-    assert_fixture_rows(
-        storage,
-        &format!("{name} right source"),
-        &right,
-        right_rows,
+    assert_ne!(
+        right_rows.first().unwrap()[0],
+        right_rows.last().unwrap()[0]
     );
+    assert_fixture_rows(storage, &format!("{name} left source"), &left, left_rows);
+    assert_fixture_rows(storage, &format!("{name} right source"), &right, right_rows);
 
     let expected = union_rows(left_rows, right_rows);
     let oracle = heap_oracle(&expected);
     let mut result = left.clone();
     result.union(right.clone());
-    assert_fixture_rows(
-        storage,
-        &format!("{name} union result"),
-        &result,
-        &expected,
-    );
+    assert_fixture_rows(storage, &format!("{name} union result"), &result, &expected);
     assert_eq!(result, oracle, "{name}: result disagrees with heap oracle");
 
     // Union consumes its operands, so the benchmark feeds it cheap clones.
@@ -493,29 +478,27 @@ fn union_cases() -> Vec<UnionCase> {
     let disjoint_right_rows = ordered_archive_rows(128, 128, 0, 32);
     let overlap_left_rows = ordered_archive_rows(0, 128, 0, 32);
     let overlap_right_rows = ordered_archive_rows(0, 128, 31, 32);
-    assert_eq!(union_rows(&disjoint_left_rows, &disjoint_right_rows).len(), 8_192);
-    assert_eq!(union_rows(&overlap_left_rows, &overlap_right_rows).len(), 8_064);
+    assert_eq!(
+        union_rows(&disjoint_left_rows, &disjoint_right_rows).len(),
+        8_192
+    );
+    assert_eq!(
+        union_rows(&overlap_left_rows, &overlap_right_rows).len(),
+        8_064
+    );
 
     // Balanced variant unions produce an exact root over dirty direct
     // children. Demote both operands independently so dirty_disjoint and
     // dirty_overlap128 exercise the no-root-demand path. Each helper derives
     // its duplicate leaf under the corresponding fixture's existing owners.
-    let dirty_disjoint_left = demote_via_duplicate(
-        archive_variants_in(0, 128, 0, 32),
-        raw_trible(0, 0),
-    );
-    let dirty_disjoint_right = demote_via_duplicate(
-        archive_variants_in(128, 128, 0, 32),
-        raw_trible(128, 0),
-    );
-    let dirty_overlap_left = demote_via_duplicate(
-        archive_variants_in(0, 128, 0, 32),
-        raw_trible(0, 0),
-    );
-    let dirty_overlap_right = demote_via_duplicate(
-        archive_variants_in(0, 128, 31, 32),
-        raw_trible(0, 31),
-    );
+    let dirty_disjoint_left =
+        demote_via_duplicate(archive_variants_in(0, 128, 0, 32), raw_trible(0, 0));
+    let dirty_disjoint_right =
+        demote_via_duplicate(archive_variants_in(128, 128, 0, 32), raw_trible(128, 0));
+    let dirty_overlap_left =
+        demote_via_duplicate(archive_variants_in(0, 128, 0, 32), raw_trible(0, 0));
+    let dirty_overlap_right =
+        demote_via_duplicate(archive_variants_in(0, 128, 31, 32), raw_trible(0, 31));
 
     vec![
         clean_union_case(4_095),
@@ -547,8 +530,7 @@ fn bench_union(c: &mut Criterion) {
 
     for case in &cases {
         group.throughput(Throughput::Elements(case.left.len() + case.right.len()));
-        for (workload, equality_repeats) in
-            [("union_only", 0), ("union_eq1", 1), ("union_eq8", 8)]
+        for (workload, equality_repeats) in [("union_only", 0), ("union_eq1", 1), ("union_eq8", 8)]
         {
             group.bench_function(BenchmarkId::new(case.name, workload), |b| {
                 b.iter_batched(
@@ -619,7 +601,11 @@ fn removal_cases() -> Vec<RemovalCase> {
 
     // Difference is borrowed: prove both source operands retained their exact
     // rows before the timing harness starts cloning either template.
-    assert_local_rows("resident removal source after difference", &resident, &resident_rows);
+    assert_local_rows(
+        "resident removal source after difference",
+        &resident,
+        &resident_rows,
+    );
     assert_local_rows(
         "subtraction source after difference",
         &removed_variant,
@@ -634,7 +620,11 @@ fn removal_cases() -> Vec<RemovalCase> {
 
     let mut resident_result = resident.clone();
     resident_result.remove(&key);
-    assert_local_rows("resident removal result", &resident_result, &resident_expected);
+    assert_local_rows(
+        "resident removal result",
+        &resident_result,
+        &resident_expected,
+    );
     assert!(!resident_result.iter().any(|row| row == &key));
     assert_eq!(resident_result, resident_oracle);
 
@@ -713,7 +703,11 @@ fn checked_difference_case(
 
     // The operation borrows both inputs. Keep this explicit because receipt
     // experiments must not win by accidentally consuming or changing them.
-    assert_local_rows(&format!("{name} left source after difference"), &left, left_rows);
+    assert_local_rows(
+        &format!("{name} left source after difference"),
+        &left,
+        left_rows,
+    );
     assert_local_rows(
         &format!("{name} right source after difference"),
         &right,
@@ -925,8 +919,7 @@ fn bench_tribleset_union(c: &mut Criterion) {
 
     for case in &cases {
         group.throughput(Throughput::Elements(8_192));
-        for (workload, equality_repeats) in
-            [("union_only", 0), ("union_eq1", 1), ("union_eq8", 8)]
+        for (workload, equality_repeats) in [("union_only", 0), ("union_eq1", 1), ("union_eq8", 8)]
         {
             group.bench_function(BenchmarkId::new(case.name, workload), |b| {
                 b.iter_batched(
