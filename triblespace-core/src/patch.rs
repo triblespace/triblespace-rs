@@ -2774,6 +2774,29 @@ where
         }
     }
 
+    /// Derive every exact union case visible from operand/result
+    /// cardinalities: equality with either operand proves a subset union,
+    /// while `|A ∪ B| = |A| + |B|` proves disjointness and therefore XOR.
+    #[inline]
+    fn publish_union_hash(&self, left: (u64, Option<u128>), right: (u64, Option<u128>)) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        let result_count = root.count();
+        let inclusion_hash = [left, right]
+            .into_iter()
+            .find_map(|(count, hash)| (count == result_count).then_some(hash).flatten());
+        let disjoint_hash = left
+            .0
+            .checked_add(right.0)
+            .filter(|&sum| sum == result_count)
+            .and_then(|_| left.1.zip(right.1))
+            .map(|(left, right)| left ^ right);
+        if let Some(hash) = inclusion_hash.or(disjoint_hash) {
+            root.publish_known_hash(hash);
+        }
+    }
+
     /// Inserts a shared key into the PATCH.
     ///
     /// Takes an [Entry] object that can be created from a key,
@@ -3296,10 +3319,7 @@ where
                 #[cfg(not(feature = "parallel"))]
                 let merged = Head::union(this, other_root, 0);
                 self.root.replace(merged);
-                self.publish_inclusion_equal_hash([
-                    (this_count, this_hash),
-                    (other_count, other_hash),
-                ]);
+                self.publish_union_hash((this_count, this_hash), (other_count, other_hash));
             } else {
                 self.root.replace(other_root);
                 self.owners = other.owners.take();
@@ -4349,15 +4369,16 @@ mod tests {
         disjoint_insert[0] = 2;
 
         // Both input roots are exact because the archive-pair constructor has
-        // both leaf hashes. Structural union deliberately leaves the
-        // overlapping result dirty, while each same-prefix collision creates
-        // a dirty two-LocalLeaf child.
+        // both leaf hashes. Their key sets are globally disjoint despite
+        // overlapping both first-byte buckets, so cardinality proves the
+        // result hash while each collision remains a dirty LocalLeaf child.
         let mut patch = owned_archive_pair([a, c]);
         let other = owned_archive_pair([b, d]);
+        let union_hash = patch.root_hash().unwrap() ^ other.root_hash().unwrap();
         reset_local_leaf_hash_calls();
         patch.union(other);
         assert_eq!(local_leaf_hash_calls(), 0);
-        assert_eq!(branch_cached_hash(&patch), 0);
+        assert_eq!(branch_cached_hash(&patch), union_hash);
         let dirty_children = match patch.root.as_ref().unwrap().body_ref() {
             BodyRef::Branch(root) => root
                 .child_table
@@ -4371,16 +4392,6 @@ mod tests {
         };
         assert_eq!(dirty_children, 2);
         deep_hash_audit(&patch);
-
-        // Model an independent algebraic consumer installing an exact root
-        // aggregate over those dirty descendants. This keeps the original
-        // mutation invariant under test without making union itself a hash
-        // consumer.
-        let exact_root_hash = heap_hash_oracle(&patch);
-        let BodyMut::Branch(root) = patch.root.as_mut().unwrap().body_mut() else {
-            panic!("fixture root must be a Branch");
-        };
-        root.replace_cached_hash(Some(exact_root_hash));
 
         // An unrelated known heap child can extend the exact parent without
         // consulting either dirty sibling. The ordinary local debug audit must
