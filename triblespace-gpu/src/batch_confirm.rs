@@ -1,11 +1,11 @@
 //! Batched WGPU confirmation for [`SuccinctArchive`] queries.
 //!
 //! The engine's [`Constraint::confirm`] protocol is kill-only: a confirmer
-//! receives one [`Candidates`] region (read-only values, killable `u32`
-//! liveness words) and may only zero words. That contract makes the archive's
-//! per-candidate membership probes embarrassingly parallel — every candidate's
-//! verdict is independent, and merging GPU verdicts back is a plain word-wise
-//! AND.
+//! receives one [`Candidates`] region (read-only values, killable liveness
+//! bits packed into `u32` words) and may only clear them. That contract makes
+//! the archive's per-candidate membership probes embarrassingly parallel —
+//! every candidate's verdict is independent, and merging GPU verdicts back is
+//! a plain word-wise AND.
 //!
 //! [`WgpuSuccinctArchive`] wraps a CPU [`SuccinctArchive`] and keeps the
 //! structures the confirm probes touch resident on the default WGPU device:
@@ -19,7 +19,7 @@
 //! * **Unbound membership** (no other position bound; the confirmed variable
 //!   is E, A, or V): one fused kernel per region — binary search of each
 //!   candidate value in the resident universe plus an axis-boundary
-//!   occupancy check — writes one verdict word per candidate.
+//!   occupancy check — writes one packed verdict word per 32 candidates.
 //! * **Range restriction** (one or two other positions bound): the fixed row
 //!   range is computed once on the CPU from the bound values, then three
 //!   enqueued kernels — candidate search/probe fill, Jerky's batched wavelet
@@ -32,29 +32,26 @@
 //! `tests/batch_confirm_parity.rs` holds the two paths to identical liveness
 //! words).
 //!
-//! # `liveness-bitmask` builds
+//! # Packed verdict words
 //!
-//! Both liveness layouts run on the device; only the verdict buffer's shape
-//! differs. With core's default layout (one `u32` per candidate) a kernel
-//! writes one verdict word per candidate and the flat index *is* the
-//! candidate index. Under `triblespace-core/liveness-bitmask` a word carries
-//! 32 candidates and a region does not start on a word boundary, so the
-//! kernels write **packed** verdict words: the flat index becomes the bit
-//! position in the region's liveness word array, one `plane_ballot` per plane
-//! yields a whole 32-candidate word already in the right bit order, and one
-//! lane per word stores it. See `membership_confirm_ballot_kernel` for the
-//! layout argument and its store-exclusivity conditions, and
+//! Core's liveness is bit-packed: a `u32` carries 32 candidates and a region
+//! does not start on a word boundary. So the kernels write **packed** verdict
+//! words — the flat index is the bit position in the region's liveness word
+//! array, one `plane_ballot` per plane yields a whole 32-candidate word
+//! already in the right bit order, and one lane per word stores it. See
+//! `membership_confirm_ballot_kernel` for the layout argument and its
+//! store-exclusivity conditions, and
 //! `WgpuSuccinctArchive::require_plane_packing` for the device property they
 //! rest on.
 //!
-//! The host merge is identical in both layouts — `live_words()`,
-//! [`and_words`], `set_live_words()` over a *private* copy — because those
-//! three are already an abstraction over liveness *words* rather than over
-//! candidates. The device never touches the shared `ProposalBuffer` liveness,
-//! so a confirm cannot disturb the neighbouring regions that share its first
-//! and last word: the copy-in/copy-out boundary is the guard, `live_words()`
-//! zeroes the bits the region does not own on the way out, and
-//! `set_live_words()` refuses to write them on the way back in.
+//! The host merge — `live_words()`, [`and_words`], `set_live_words()` over a
+//! *private* copy — knows nothing about the packing, because those three are
+//! an abstraction over liveness *words* rather than over candidates. The
+//! device never touches the shared `ProposalBuffer` liveness, so a confirm
+//! cannot disturb the neighbouring regions that share its first and last
+//! word: the copy-in/copy-out boundary is the guard, `live_words()` zeroes the
+//! bits the region does not own on the way out, and `set_live_words()`
+//! refuses to write them on the way back in.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,7 +80,6 @@ const THREADS: u32 = super::THREADS;
 // `linear_cube_index * CUBE_DIM + local_index` and `CUBE_DIM` is a multiple of
 // 32. Nothing else would notice a change to `THREADS`; this would produce wrong
 // query answers and no diagnostic, so make it a compile error instead.
-#[cfg(feature = "liveness-bitmask")]
 const _: () = assert!(
     THREADS % 32 == 0,
     "packed confirm needs a cube dim that is a multiple of the 32-bit liveness word"
@@ -227,40 +223,10 @@ fn universe_lower_bound(universe: &Array<u32>, m: u32, cands: &Array<u32>, i: u3
     lo
 }
 
-/// One verdict word per candidate for the unbound membership arms: live
-/// candidates keep their word at 1 exactly when their value occurs in the
-/// universe *and* the axis boundary table shows at least one row on the
-/// confirmed axis — the same probe as the CPU arm's
-/// `base_range(..).is_empty().not()`.
-#[cfg(not(feature = "liveness-bitmask"))]
-#[cube(launch_unchecked)]
-fn membership_confirm_kernel(
-    cands: &Array<u32>,
-    live: &Array<u32>,
-    universe: &Array<u32>,
-    bounds: &Array<u32>,
-    verdicts: &mut Array<u32>,
-    n: u32,
-    m: u32,
-) {
-    let i = ABSOLUTE_POS as u32;
-    if i < n {
-        let mut verdict = u32::new(0);
-        if live[i as usize] != 0u32 {
-            let d = universe_lower_bound(universe, m, cands, i);
-            if d < m {
-                if value_order(universe, d, cands, i) == 0u32 {
-                    if bounds[(d + 1u32) as usize] > bounds[d as usize] {
-                        verdict = 1u32;
-                    }
-                }
-            }
-        }
-        verdicts[i as usize] = verdict;
-    }
-}
-
-/// The same membership probe, writing **packed** verdict words: one
+/// Packed verdict words for the unbound membership arms: a live candidate's
+/// bit survives exactly when its value occurs in the universe *and* the axis
+/// boundary table shows at least one row on the confirmed axis — the same
+/// probe as the CPU arm's `base_range(..).is_empty().not()`. One
 /// `plane_ballot` per plane, one store per 32 candidates.
 ///
 /// # The flat index is a bit position, not a candidate
@@ -316,7 +282,6 @@ fn membership_confirm_kernel(
 /// path this crate builds, so a ballot inside the liveness branch would be
 /// betting on semantics the backend does not promise. The branch costs nothing
 /// to keep *below* the ballot — dead candidates still skip the binary search.
-#[cfg(feature = "liveness-bitmask")]
 #[cube(launch_unchecked)]
 fn membership_confirm_ballot_kernel(
     cands: &Array<u32>,
@@ -371,53 +336,12 @@ fn membership_confirm_ballot_kernel(
 /// pair for the range arms: probe positions are the fixed row range's
 /// endpoints, probe values the candidate's code. Dead or absent candidates
 /// get `flag = 0` and a harmless `(0, code 0)` probe pair.
-#[cfg(not(feature = "liveness-bitmask"))]
-#[cube(launch_unchecked)]
-fn range_probe_fill_kernel(
-    cands: &Array<u32>,
-    live: &Array<u32>,
-    universe: &Array<u32>,
-    flags: &mut Array<u32>,
-    positions: &mut Array<u32>,
-    values: &mut Array<u32>,
-    n: u32,
-    m: u32,
-    r_start: u32,
-    r_end: u32,
-) {
-    let i = ABSOLUTE_POS as u32;
-    if i < n {
-        let mut flag = u32::new(0);
-        let mut code = u32::new(0);
-        let mut lo = u32::new(0);
-        let mut hi = u32::new(0);
-        if live[i as usize] != 0u32 {
-            let d = universe_lower_bound(universe, m, cands, i);
-            if d < m {
-                if value_order(universe, d, cands, i) == 0u32 {
-                    flag = 1u32;
-                    code = d;
-                    lo = r_start;
-                    hi = r_end;
-                }
-            }
-        }
-        flags[i as usize] = flag;
-        positions[(2u32 * i) as usize] = lo;
-        positions[(2u32 * i + 1u32) as usize] = hi;
-        values[(2u32 * i) as usize] = code;
-        values[(2u32 * i + 1u32) as usize] = code;
-    }
-}
-
-/// The same probe fill against packed liveness.
 ///
-/// This one keeps the **candidate** as its flat index: `flags`, `positions`
-/// and `values` are per-candidate arrays that Jerky's `rank_batch_into`
-/// consumes and that know nothing about liveness. Only the liveness *input*
-/// changes shape, from `live[i] != 0` to the bit `bit_offset + i`. The packing
-/// happens one kernel later, in `range_verdict_ballot_kernel`.
-#[cfg(feature = "liveness-bitmask")]
+/// Unlike the two verdict kernels this one keeps the **candidate** as its flat
+/// index: `flags`, `positions` and `values` are per-candidate arrays that
+/// Jerky's `rank_batch_into` consumes and that know nothing about liveness.
+/// Only the liveness *input* is bit-addressed, at `bit_offset + i`. The
+/// packing happens one kernel later, in `range_verdict_ballot_kernel`.
 #[cube(launch_unchecked)]
 fn range_probe_fill_packed_kernel(
     cands: &Array<u32>,
@@ -458,27 +382,11 @@ fn range_probe_fill_packed_kernel(
     }
 }
 
-/// Folds the batched wavelet ranks into verdict words: a flagged candidate
-/// survives exactly when its code occurs inside the fixed row range —
-/// `rank(r.start, d) != rank(r.end, d)`, the CPU arm's
+/// Folds the batched wavelet ranks into packed verdict words: a flagged
+/// candidate survives exactly when its code occurs inside the fixed row range
+/// — `rank(r.start, d) != rank(r.end, d)`, the CPU arm's
 /// `restrict_range(..).is_empty().not()` with the shared `select1` base
 /// offset cancelled.
-#[cfg(not(feature = "liveness-bitmask"))]
-#[cube(launch_unchecked)]
-fn range_verdict_kernel(flags: &Array<u32>, ranks: &Array<u32>, verdicts: &mut Array<u32>, n: u32) {
-    let i = ABSOLUTE_POS as u32;
-    if i < n {
-        let mut verdict = u32::new(0);
-        if flags[i as usize] != 0u32 {
-            if ranks[(2u32 * i) as usize] != ranks[(2u32 * i + 1u32) as usize] {
-                verdict = 1u32;
-            }
-        }
-        verdicts[i as usize] = verdict;
-    }
-}
-
-/// The same fold, writing packed verdict words.
 ///
 /// Identical in structure to `membership_confirm_ballot_kernel` — flat index
 /// is the bit position `b`, out-of-region slots vote `false`, one ballot per
@@ -487,7 +395,6 @@ fn range_verdict_kernel(flags: &Array<u32>, ranks: &Array<u32>, verdicts: &mut A
 /// Note that `flags` and `ranks` are still indexed by the **candidate**
 /// `b - bit_offset`, because `range_probe_fill_packed_kernel` wrote them
 /// per-candidate.
-#[cfg(feature = "liveness-bitmask")]
 #[cube(launch_unchecked)]
 fn range_verdict_ballot_kernel(
     flags: &Array<u32>,
@@ -784,7 +691,6 @@ where
     /// Returning an error rather than branching keeps the demotion honest:
     /// `confirm_routed` counts it as a device error and recomputes the region
     /// on the CPU arm.
-    #[cfg(feature = "liveness-bitmask")]
     fn require_plane_packing(&self) -> jerky::Result<()> {
         use cubecl::ir::features::Plane;
 
@@ -810,16 +716,13 @@ where
     /// one readback, one AND into the region's liveness.
     ///
     /// Every size here comes from the region's *word* geometry — `bit_offset`
-    /// and `live_word_len`, never the candidate count — so the same body
-    /// serves both liveness layouts. In the word-per-candidate layout
-    /// `bit_offset` is `0` and `live_word_len` is `n`, which reduces the
-    /// arithmetic below to what it always was.
+    /// and `live_word_len`, never the candidate count — because a region's
+    /// candidates start at an arbitrary bit of its first word.
     fn confirm_membership_gpu(&self, axis: Axis, cands: &mut Candidates<'_>) -> jerky::Result<()> {
         let n = cands.len();
         if n == 0 {
             return Ok(());
         }
-        #[cfg(feature = "liveness-bitmask")]
         self.require_plane_packing()?;
 
         let bit_offset = cands.bit_offset();
@@ -831,7 +734,7 @@ where
 
         let client = self.context.client();
         let cube_dim = CubeDim::new_1d(THREADS);
-        // Bit slots, not candidates: the packed kernel's flat index is a bit
+        // Bit slots, not candidates: the kernel's flat index is a bit
         // position, and the region's first `bit_offset` bits belong to the
         // neighbour below it.
         let cube_count = cubecl::calculate_cube_count_elemwise(client, bit_offset + n, cube_dim);
@@ -852,42 +755,8 @@ where
         Ok(())
     }
 
-    /// Launches the membership confirm kernel for the word-per-candidate
-    /// liveness layout: flat index is the candidate, one verdict word out per
-    /// candidate.
-    #[cfg(not(feature = "liveness-bitmask"))]
-    #[allow(clippy::too_many_arguments)]
-    fn launch_membership_confirm(
-        &self,
-        axis: Axis,
-        cube_count: CubeCount,
-        cube_dim: CubeDim,
-        cand_words: &DeviceU32Buffer<WgpuRuntime>,
-        live_words: &DeviceU32Buffer<WgpuRuntime>,
-        verdict_words: &mut DeviceU32Buffer<WgpuRuntime>,
-        n: u32,
-        _bit_offset: u32,
-    ) {
-        unsafe {
-            membership_confirm_kernel::launch_unchecked::<WgpuRuntime>(
-                self.context.client(),
-                cube_count,
-                cube_dim,
-                cand_words.input_arg(),
-                live_words.input_arg(),
-                self.universe_words.input_arg(),
-                self.axis_bounds_buffer(axis).input_arg(),
-                verdict_words.output_arg(),
-                n,
-                self.domain_len as u32,
-            )
-        };
-    }
-
-    /// Launches the membership confirm kernel for the bit-packed liveness
-    /// layout: flat index is the bit position, one verdict word out per 32
-    /// candidates.
-    #[cfg(feature = "liveness-bitmask")]
+    /// Launches the membership confirm kernel: flat index is the bit
+    /// position, one verdict word out per 32 candidates.
     #[allow(clippy::too_many_arguments)]
     fn launch_membership_confirm(
         &self,
@@ -941,7 +810,6 @@ where
             )));
         }
 
-        #[cfg(feature = "liveness-bitmask")]
         self.require_plane_packing()?;
 
         let bit_offset = cands.bit_offset();
@@ -958,8 +826,8 @@ where
         let client = self.context.client();
         let cube_dim = CubeDim::new_1d(THREADS);
         // The probe fill stays candidate-indexed (its outputs feed Jerky's
-        // per-candidate rank batch); only the verdict fold indexes bits. The
-        // two counts coincide in the word-per-candidate layout.
+        // per-candidate rank batch); only the verdict fold indexes bits, and
+        // it has to cover the region's leading `bit_offset` slots too.
         let probe_count = cubecl::calculate_cube_count_elemwise(client, n, cube_dim);
         let verdict_count = cubecl::calculate_cube_count_elemwise(client, bit_offset + n, cube_dim);
         self.launch_range_probe_fill(
@@ -992,45 +860,8 @@ where
         Ok(())
     }
 
-    /// Launches the range probe fill for the word-per-candidate layout.
-    #[cfg(not(feature = "liveness-bitmask"))]
-    #[allow(clippy::too_many_arguments)]
-    fn launch_range_probe_fill(
-        &self,
-        cube_count: CubeCount,
-        cube_dim: CubeDim,
-        cand_words: &DeviceU32Buffer<WgpuRuntime>,
-        live_words: &DeviceU32Buffer<WgpuRuntime>,
-        flag_words: &mut DeviceU32Buffer<WgpuRuntime>,
-        positions: &mut DeviceU32Buffer<WgpuRuntime>,
-        values: &mut DeviceU32Buffer<WgpuRuntime>,
-        n: u32,
-        r_start: u32,
-        r_end: u32,
-        _bit_offset: u32,
-    ) {
-        unsafe {
-            range_probe_fill_kernel::launch_unchecked::<WgpuRuntime>(
-                self.context.client(),
-                cube_count,
-                cube_dim,
-                cand_words.input_arg(),
-                live_words.input_arg(),
-                self.universe_words.input_arg(),
-                flag_words.output_arg(),
-                positions.output_arg(),
-                values.output_arg(),
-                n,
-                self.domain_len as u32,
-                r_start,
-                r_end,
-            )
-        };
-    }
-
-    /// Launches the range probe fill for the bit-packed layout — same
-    /// per-candidate outputs, bit-indexed liveness input.
-    #[cfg(feature = "liveness-bitmask")]
+    /// Launches the range probe fill — per-candidate outputs, bit-indexed
+    /// liveness input.
     #[allow(clippy::too_many_arguments)]
     fn launch_range_probe_fill(
         &self,
@@ -1066,34 +897,7 @@ where
         };
     }
 
-    /// Launches the range verdict fold for the word-per-candidate layout.
-    #[cfg(not(feature = "liveness-bitmask"))]
-    #[allow(clippy::too_many_arguments)]
-    fn launch_range_verdict(
-        &self,
-        cube_count: CubeCount,
-        cube_dim: CubeDim,
-        flag_words: &DeviceU32Buffer<WgpuRuntime>,
-        ranks: &DeviceU32Buffer<WgpuRuntime>,
-        verdict_words: &mut DeviceU32Buffer<WgpuRuntime>,
-        n: u32,
-        _bit_offset: u32,
-    ) {
-        unsafe {
-            range_verdict_kernel::launch_unchecked::<WgpuRuntime>(
-                self.context.client(),
-                cube_count,
-                cube_dim,
-                flag_words.input_arg(),
-                ranks.input_arg(),
-                verdict_words.output_arg(),
-                n,
-            )
-        };
-    }
-
-    /// Launches the range verdict fold for the bit-packed layout.
-    #[cfg(feature = "liveness-bitmask")]
+    /// Launches the range verdict fold — packed verdict words out.
     #[allow(clippy::too_many_arguments)]
     fn launch_range_verdict(
         &self,
@@ -1273,8 +1077,7 @@ where
     }
 
     /// Routes one confirm call between the device and the canonical CPU arm,
-    /// by the documented live-candidate threshold. Layout-independent: both
-    /// liveness representations have device kernels.
+    /// by the documented live-candidate threshold.
     fn confirm_routed(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         let live = count_live(cands);
         if live < self.gpu.min_confirm_batch {

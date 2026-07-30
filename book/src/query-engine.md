@@ -122,8 +122,8 @@ why this is worst-case optimal.
 `propose` writes into a
 [`ProposalBuffer`](triblespace::core::query::ProposalBuffer) — the engine's
 candidate store for one variable at one level. Entries are plain 32-byte
-`RawInline` values at fixed stride. Alongside them the buffer keeps one `u32`
-liveness word per entry.
+`RawInline` values at fixed stride. Alongside them the buffer keeps a liveness
+bit per entry, packed 32 to a `u32`.
 
 Entries are effectively write-once. A proposer may rewrite the region it
 appended in the current call before it returns — that is how a union applies
@@ -131,29 +131,22 @@ its sort-dedup — but once the caller can see the region, the indices are
 frozen, because kills bind to them.
 
 Nothing is ever compacted. A candidate that fails confirmation has its liveness
-word zeroed and stays exactly where it was; the engine iterates the live
+bit cleared and stays exactly where it was; the engine iterates the live
 entries. That costs a scan over dead entries and buys two things: an entry's
 index is stable for the lifetime of the level, so a kill can be recorded by
 index alone, and no confirmer ever has to agree with another about where a
 candidate now lives.
 
-The word-per-entry liveness layout, rather than a packed bitmask, is the
-deliberate baseline: every lane — CPU thread or GPU invocation — writes its own
-word, so there is no read-modify-write contention on a shared word.
-
-The packed alternative exists behind the same API, as the default-off
-`triblespace-core/liveness-bitmask` feature: 32 candidates per `u32`, with
-`count_live`/`next_live` folding whole words through `count_ones`/
-`trailing_zeros`. It is a prototype to be justified against the baseline rather
-than assumed better, and it is a compile-time choice rather than a runtime one
-precisely so the kill path stays branch-identical to what it is being measured
-against. Two things get harder when a word stops belonging to one candidate: a
-kill becomes a read-modify-write on a word shared with 31 neighbours, and a
-region no longer starts on a word boundary, so its first and last words carry
-liveness bits owned by *neighbouring* regions of the same buffer. The invariant
-is enforced at the boundary of the type: every write path masks to the owned
-bits and every read path zeroes the bits it does not own, so no caller — the
-device confirm path included, see below — can reach a neighbour's liveness.
+Packing liveness 32 to a word is what makes that scan cheap: `count_live` and
+`next_live` fold whole words through `count_ones` and `trailing_zeros` rather
+than looking at candidates one at a time. Two things get harder in exchange,
+and both are paid for inside the buffer's own module. A kill becomes a
+read-modify-write on a word shared with 31 neighbours. And a region no longer
+starts on a word boundary, so its first and last words carry liveness bits
+owned by *neighbouring* regions of the same buffer. The invariant is enforced
+at the boundary of the type: every write path masks to the owned bits and every
+read path zeroes the bits it does not own, so no caller — the device confirm
+path included, see below — can reach a neighbour's liveness.
 
 ## Confirmation is kill-only
 
@@ -353,18 +346,17 @@ parity suite holds to identical liveness words. The substitution is legal
 precisely because of the kill-only contract: verdicts computed anywhere merge
 back by word-wise AND, and a device can never revive a dead entry.
 
-The packed liveness layout changes the shape of that merge but not its
-character. Word-per-candidate, a kernel's flat index is the candidate and it
-writes one verdict word each. Packed, the flat index becomes the *bit position*
-in the region's liveness words — so candidate `i` sits at bit
-`bit_offset + i` — and one `plane_ballot` per 32-lane plane produces a whole
-packed verdict word with every bit already in place, stored by a single lane.
-No rotation, no read-modify-write, no atomic. The AND and the write-back are
-unchanged in both layouts, because the device works on a *private* copy taken
-through `live_words()` and merged through `set_live_words()`, and those two mask
-the neighbouring regions' bits out and back in. The kernel needs one device
-property for this — planes exactly 32 lanes wide — which the host checks before
-dispatching, demoting to the CPU arm if it does not hold.
+The packed liveness layout shapes how a kernel writes its verdicts. The flat
+index is the *bit position* in the region's liveness words — so candidate `i`
+sits at bit `bit_offset + i` — and one `plane_ballot` per 32-lane plane
+produces a whole packed verdict word with every bit already in place, stored by
+a single lane. No rotation, no read-modify-write, no atomic. The AND and the
+write-back are ordinary word operations, because the device works on a
+*private* copy taken through `live_words()` and merged through
+`set_live_words()`, and those two mask the neighbouring regions' bits out and
+back in. The kernel needs one device property for this — planes exactly 32
+lanes wide — which the host checks before dispatching, demoting to the CPU arm
+if it does not hold.
 
 The threshold is measured, not guessed. On an Apple M4 Max (Metal via wgpu),
 against a 262,135-trible archive with fully live regions, the GPU round trip is

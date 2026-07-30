@@ -118,10 +118,10 @@ where
     /// survivors together. A value passes if *any* live variant confirms it.
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         // `any` accumulates, per candidate, whether *some* live variant kept
-        // it. It is sized in liveness **words**, not candidates: under the
-        // `liveness-bitmask` representation one word carries 32 candidates and
-        // a region that starts mid-word needs one word more than a candidate
-        // count implies. `live_word_len` is the only thing that knows.
+        // it. It is sized in liveness **words**, not candidates: one word
+        // carries 32 candidates and a region that starts mid-word needs one
+        // word more than a candidate count implies. `live_word_len` is the
+        // only thing that knows.
         let mut any = vec![0u32; cands.live_word_len()];
         let mut scratch;
         for c in self.constraints.iter().filter(|c| c.satisfied(binding)) {

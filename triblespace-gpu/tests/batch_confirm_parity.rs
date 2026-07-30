@@ -8,8 +8,8 @@
 //!
 //! # Why every case runs at several region bases
 //!
-//! A confirm region is `[base..]` of a [`ProposalBuffer`]. Under
-//! `liveness-bitmask` that is *not* a word-aligned sub-slice: candidate `i` is
+//! A confirm region is `[base..]` of a [`ProposalBuffer`]. Liveness is
+//! bit-packed, so that is *not* a word-aligned sub-slice: candidate `i` is
 //! bit `base % 32 + i` of the region's words, and the region's first word
 //! carries up to 31 bits belonging to the entries *before* `base`. A device
 //! kernel that packs verdicts has to place its bits at that offset, and must
@@ -28,8 +28,8 @@
 //!   only observable from outside the region.
 //!
 //! Liveness is read back through `ProposalBuffer::is_live`, never through
-//! `live_words`, so nothing in this file spells a word layout and the suite is
-//! meaningful under both representations.
+//! `live_words`, so nothing in this file spells a word layout and the suite
+//! would keep its meaning against a different one.
 
 use std::collections::HashSet;
 

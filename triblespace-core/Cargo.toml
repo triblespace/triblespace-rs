@@ -79,15 +79,6 @@ kani = []
 deterministic = []
 wasm = ["dep:wasmi"]
 parallel = ["dep:rayon", "blake3/rayon"]
-# Pack query-candidate liveness as 32 bits per u32 instead of one u32 per
-# candidate (`query::liveness`). PROTOTYPE, default off: the word-per-candidate
-# layout is the measurement baseline, and the choice is compile-time rather than
-# a runtime branch so the kill path stays branch-identical to it.
-#
-# Any crate whose code assumes one liveness word per candidate must mirror this
-# feature and assert agreement against `query::LIVENESS_BITMASK` — see
-# triblespace-gpu, whose confirm kernels do exactly that.
-liveness-bitmask = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }

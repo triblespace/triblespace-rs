@@ -27,8 +27,7 @@ pub mod hashmapconstraint;
 pub mod hashsetconstraint;
 /// [`IntersectionConstraint`](intersectionconstraint::IntersectionConstraint) — logical AND.
 pub mod intersectionconstraint;
-/// [`ProposalBuffer`]/[`Candidates`] and their two liveness representations
-/// (word-per-candidate by default, bit-packed under `liveness-bitmask`).
+/// [`ProposalBuffer`]/[`Candidates`] and their bit-packed liveness.
 mod liveness;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
@@ -61,10 +60,10 @@ use crate::inline::RawInline;
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
 
-/// Re-exports of the candidate buffer and its liveness word helpers. The
-/// concrete liveness layout is chosen by the `liveness-bitmask` feature; see
-/// the `liveness` module for the trap that layout introduces.
-pub use liveness::{and_words, or_words, Candidates, ProposalBuffer, LIVENESS_BITMASK};
+/// Re-exports of the candidate buffer and its liveness word helpers. Liveness
+/// is bit-packed, 32 candidates per `u32`; see the `liveness` module for the
+/// region-boundary trap that layout introduces.
+pub use liveness::{and_words, or_words, Candidates, ProposalBuffer};
 
 impl<T: InlineEncoding> Term<T> {
     /// Erases the schema type, yielding the runtime representation
@@ -321,9 +320,8 @@ impl<T: InlineEncoding> Variable<T> {
 ///   stable, so its index stays valid for exactly the lifetime of the
 ///   binding.
 /// * Buffers are write-once: confirmers kill entries by clearing their
-///   liveness (a parallel word, or a bit under `liveness-bitmask`), and
-///   nothing ever moves or rewrites a stored value once the engine can see
-///   it.
+///   liveness bit, and nothing ever moves or rewrites a stored value once
+///   the engine can see it.
 ///
 /// `Binding` is therefore a *view* — the index row plus a borrow of the
 /// buffers it indexes into — constructed for the duration of one

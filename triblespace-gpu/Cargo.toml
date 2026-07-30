@@ -19,13 +19,6 @@ features = ["wgpu", "cuda"]
 default = ["wgpu"]
 wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky", "dep:itertools"]
 cuda = ["dep:cubecl", "cubecl/cuda"]
-# Mirror of `triblespace-core/liveness-bitmask`. This crate's device confirm
-# kernels are compiled against one liveness layout or the other — a verdict
-# word per candidate, or a packed word per 32 candidates written by a plane
-# ballot — and a build where the two crates disagree would compile cleanly and
-# produce wrong query answers. Cargo features are per-crate, so lib.rs
-# const-asserts that this and core's feature agree; enable both or neither.
-liveness-bitmask = ["triblespace-core/liveness-bitmask"]
 
 [dependencies]
 cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
