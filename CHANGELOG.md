@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bit-packed candidate liveness, behind a default-off feature.**
+  `triblespace-core/liveness-bitmask` swaps the query engine's one-`u32`-per-
+  candidate liveness for 32 candidates per `u32`, with `count_live`/`next_live`
+  folding whole words through `count_ones`/`trailing_zeros`. Both
+  representations live in `query::liveness`, expose the same API, and are
+  covered by the same test module, so the suite is a differential spec rather
+  than a test of one layout. The choice is compile-time rather than a runtime
+  branch so the kill path stays branch-identical to the baseline it is being
+  measured against. `Candidates` now carries a bit offset — a packed region
+  cannot sub-slice at an arbitrary bit the way a word slice can — which makes
+  its first and last words shared with neighbouring regions; every write masks
+  to the bits it owns and every word handed out is zeroed outside them.
+  `Candidates::live_word_len` is the new (and only) source of truth for how many
+  words a region's liveness occupies. `triblespace-gpu` mirrors the feature and
+  const-asserts agreement with core, and routes confirmation to the canonical
+  CPU arm under it: its kernels write one verdict word per candidate, which has
+  no meaning once a word carries 32. Prototype, not yet justified against the
+  baseline.
 - **A bounded oracle checks the regular-path closure kernel.** A Kani harness
   symbolically selects every subgraph of a five-edge, two-vertex labeled
   universe, while an ordinary deterministic test exhausts all 256 graphs whose

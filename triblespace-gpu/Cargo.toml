@@ -19,6 +19,13 @@ features = ["wgpu", "cuda"]
 default = ["wgpu"]
 wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky", "dep:itertools"]
 cuda = ["dep:cubecl", "cubecl/cuda"]
+# Mirror of `triblespace-core/liveness-bitmask`. This crate's device confirm
+# kernels write one verdict word per candidate and merge with a word-wise AND,
+# which is only meaningful in the word-per-candidate layout — so under this
+# feature `confirm` routes to the canonical CPU arm instead. Cargo features are
+# per-crate, so lib.rs const-asserts that this and core's feature agree; enable
+# both or neither.
+liveness-bitmask = ["triblespace-core/liveness-bitmask"]
 
 [dependencies]
 cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }

@@ -27,6 +27,9 @@ pub mod hashmapconstraint;
 pub mod hashsetconstraint;
 /// [`IntersectionConstraint`](intersectionconstraint::IntersectionConstraint) — logical AND.
 pub mod intersectionconstraint;
+/// [`ProposalBuffer`]/[`Candidates`] and their two liveness representations
+/// (word-per-candidate by default, bit-packed under `liveness-bitmask`).
+mod liveness;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
 #[doc(hidden)]
@@ -57,6 +60,11 @@ use crate::inline::RawInline;
 
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
+
+/// Re-exports of the candidate buffer and its liveness word helpers. The
+/// concrete liveness layout is chosen by the `liveness-bitmask` feature; see
+/// the `liveness` module for the trap that layout introduces.
+pub use liveness::{and_words, or_words, Candidates, ProposalBuffer, LIVENESS_BITMASK};
 
 impl<T: InlineEncoding> Term<T> {
     /// Erases the schema type, yielding the runtime representation
@@ -312,9 +320,10 @@ impl<T: InlineEncoding> Variable<T> {
 ///   their level is re-pushed). While a variable is bound, its buffer is
 ///   stable, so its index stays valid for exactly the lifetime of the
 ///   binding.
-/// * Buffers are write-once: confirmers kill entries by clearing a
-///   parallel liveness word, and nothing ever moves or rewrites a stored
-///   value once the engine can see it.
+/// * Buffers are write-once: confirmers kill entries by clearing their
+///   liveness (a parallel word, or a bit under `liveness-bitmask`), and
+///   nothing ever moves or rewrites a stored value once the engine can see
+///   it.
 ///
 /// `Binding` is therefore a *view* — the index row plus a borrow of the
 /// buffers it indexes into — constructed for the duration of one
@@ -615,269 +624,6 @@ const INITIAL_CHUNK: usize = 64;
 /// the number of refill calls stays logarithmic.
 const WIDEN_FACTOR: usize = 4;
 
-/// Growable buffer of candidate values for one variable at one search level
-/// — the write target of [`Constraint::propose`] and the engine's per-level
-/// candidate store.
-///
-/// Entries are plain `RawInline` (fixed-stride 32-byte POD), stored
-/// contiguously and **write-once**: nothing ever moves or rewrites a stored
-/// value. Each entry carries a parallel liveness word (`u32`, nonzero =
-/// live): confirmers kill entries instead of removing them, and the engine
-/// iterates live entries directly — there is no compaction. The pairing of
-/// value and liveness is structural (one type owns both), and the buffer
-/// derefs to `[RawInline]` for reading.
-///
-/// The word-per-entry liveness layout is the deliberate baseline: every
-/// lane — CPU or GPU — writes its own word with no read-modify-write
-/// contention. A bit-packed representation is a planned alternative behind
-/// this same API, to be justified against this baseline.
-#[derive(Clone, Debug, Default)]
-pub struct ProposalBuffer {
-    entries: Vec<RawInline>,
-    live: Vec<u32>,
-}
-
-impl ProposalBuffer {
-    /// Creates an empty buffer.
-    pub fn new() -> Self {
-        ProposalBuffer {
-            entries: Vec::new(),
-            live: Vec::new(),
-        }
-    }
-
-    /// Appends a candidate, live.
-    pub fn push(&mut self, value: RawInline) {
-        self.entries.push(value);
-        self.live.push(1);
-    }
-
-    /// Appends every candidate from `iter`, live.
-    pub fn extend(&mut self, iter: impl IntoIterator<Item = RawInline>) {
-        for value in iter {
-            self.push(value);
-        }
-    }
-
-    /// Appends every candidate from `slice`, live.
-    pub fn extend_from_slice(&mut self, slice: &[RawInline]) {
-        self.entries.extend_from_slice(slice);
-        self.live.resize(self.entries.len(), 1);
-    }
-
-    /// Drops all candidates, keeping capacity.
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.live.clear();
-    }
-
-    /// Current capacity in entries.
-    pub fn capacity(&self) -> usize {
-        self.entries.capacity()
-    }
-
-    /// Reserves capacity for exactly `additional` further entries.
-    pub fn reserve_exact(&mut self, additional: usize) {
-        self.entries.reserve_exact(additional);
-        self.live.reserve_exact(additional);
-    }
-
-    /// Index of the first live entry at or after `from`, if any.
-    pub fn next_live(&self, from: usize) -> Option<usize> {
-        self.live[from.min(self.live.len())..]
-            .iter()
-            .position(|w| *w != 0)
-            .map(|offset| from + offset)
-    }
-
-    /// Number of live entries at or after `from`.
-    pub fn count_live(&self, from: usize) -> usize {
-        self.live[from.min(self.live.len())..]
-            .iter()
-            .filter(|w| **w != 0)
-            .count()
-    }
-
-    /// Whether entry `i` is live.
-    pub fn is_live(&self, i: usize) -> bool {
-        self.live[i] != 0
-    }
-
-    /// Iterates the live entry values at or after `from` — the engine's own
-    /// consumption view, also handy for inspecting survivors in tests.
-    pub fn live_values(&self, from: usize) -> impl Iterator<Item = &RawInline> {
-        self.entries[from..]
-            .iter()
-            .zip(self.live[from..].iter())
-            .filter(|(_, w)| **w != 0)
-            .map(|(v, _)| v)
-    }
-
-    /// The confirmable region from `base` onward: entry values paired with
-    /// their killable liveness words.
-    pub fn region(&mut self, base: usize) -> Candidates<'_> {
-        Candidates {
-            values: &self.entries[base..],
-            live: &mut self.live[base..],
-        }
-    }
-
-    /// Moves every entry of `other` (values and liveness together) onto
-    /// the end of this buffer, leaving `other` empty. Existing entries —
-    /// and therefore every index a binding holds into them — are
-    /// untouched.
-    pub fn append(&mut self, other: &mut ProposalBuffer) {
-        self.entries.append(&mut other.entries);
-        self.live.append(&mut other.live);
-    }
-
-    /// Splits off and returns the tail starting at `at` (values and
-    /// liveness together).
-    pub fn split_off(&mut self, at: usize) -> ProposalBuffer {
-        ProposalBuffer {
-            entries: self.entries.split_off(at),
-            live: self.live.split_off(at),
-        }
-    }
-
-    /// Rewrites the freshly-proposed region `[base..]` with `values`, all
-    /// live. Only a proposer may call this, and only on the region it
-    /// appended in the current call, before returning — after that,
-    /// indices are frozen because kills bind to them. Used by
-    /// [`UnionConstraint`](unionconstraint::UnionConstraint) for its
-    /// sort-dedup.
-    pub fn rewrite_region(&mut self, base: usize, values: Vec<RawInline>) {
-        self.entries.truncate(base);
-        self.live.truncate(base);
-        for value in values {
-            self.push(value);
-        }
-    }
-}
-
-impl std::ops::Deref for ProposalBuffer {
-    type Target = [RawInline];
-
-    fn deref(&self) -> &[RawInline] {
-        &self.entries
-    }
-}
-
-impl<'a> IntoIterator for &'a ProposalBuffer {
-    type Item = &'a RawInline;
-    type IntoIter = std::slice::Iter<'a, RawInline>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.entries.iter()
-    }
-}
-
-/// A confirmable view over one proposal region: entry values read-only,
-/// liveness killable — the argument of [`Constraint::confirm`].
-///
-/// Confirmers may only kill entries, never revive them, so any number of
-/// confirmers writing into the same region compute their conjunction —
-/// sequentially (each skipping already-dead entries) or in parallel over
-/// copies merged with [`and_words`]/[`or_words`]. Index `i` refers to
-/// `values()[i]`.
-pub struct Candidates<'a> {
-    values: &'a [RawInline],
-    live: &'a mut [u32],
-}
-
-impl<'a> Candidates<'a> {
-    /// The candidate values of this region.
-    pub fn values(&self) -> &[RawInline] {
-        self.values
-    }
-
-    /// Number of entries (live and dead) in this region.
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    /// True when the region has no entries.
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    /// Whether entry `i` is still live.
-    pub fn is_live(&self, i: usize) -> bool {
-        self.live[i] != 0
-    }
-
-    /// Marks entry `i` dead.
-    pub fn kill(&mut self, i: usize) {
-        self.live[i] = 0;
-    }
-
-    /// Kills every live entry whose value fails `keep` — the region-side
-    /// equivalent of `Vec::retain`, skipping entries already dead. Lives on
-    /// the pair type deliberately: values and liveness are one object here,
-    /// so there is no loose pairing to misalign.
-    pub fn retain(&mut self, mut keep: impl FnMut(&RawInline) -> bool) {
-        for (i, value) in self.values.iter().enumerate() {
-            if self.live[i] != 0 && !keep(value) {
-                self.live[i] = 0;
-            }
-        }
-    }
-
-    /// Kills every entry (a confirmer that can prove total inconsistency).
-    pub fn kill_all(&mut self) {
-        self.live.fill(0);
-    }
-
-    /// Reborrows this region mutably (for passing to several confirmers in
-    /// sequence).
-    pub fn reborrow(&mut self) -> Candidates<'_> {
-        Candidates {
-            values: self.values,
-            live: self.live,
-        }
-    }
-
-    /// Copies the liveness words out (scratch for OR-composition).
-    pub fn live_words(&self) -> Vec<u32> {
-        self.live.to_vec()
-    }
-
-    /// Replaces the liveness words (merge result of OR-composition).
-    pub fn set_live_words(&mut self, words: &[u32]) {
-        debug_assert_eq!(words.len(), self.live.len());
-        self.live.copy_from_slice(words);
-    }
-
-    /// A detached scratch region over `words` with the same values —
-    /// used by OR-composition to collect per-variant verdicts.
-    pub fn scratch<'b>(&self, words: &'b mut [u32]) -> Candidates<'b>
-    where
-        'a: 'b,
-    {
-        Candidates {
-            values: self.values,
-            live: words,
-        }
-    }
-}
-
-/// Word-wise AND of `other` into `words` (conjunction of live sets).
-pub fn and_words(words: &mut [u32], other: &[u32]) {
-    debug_assert_eq!(words.len(), other.len());
-    for (w, o) in words.iter_mut().zip(other.iter()) {
-        *w &= *o;
-    }
-}
-
-/// Word-wise OR of `other` into `words` (disjunction of live sets).
-pub fn or_words(words: &mut [u32], other: &[u32]) {
-    debug_assert_eq!(words.len(), other.len());
-    for (w, o) in words.iter_mut().zip(other.iter()) {
-        *w |= *o;
-    }
-}
-
-
 /// The cooperative protocol that every query participant implements.
 ///
 /// A constraint restricts the values that can be assigned to query variables.
@@ -1144,10 +890,10 @@ impl LevelValues {
     /// borrow a `static` array of them.
     const fn empty() -> Self {
         LevelValues {
-            buffer: ProposalBuffer {
-                entries: Vec::new(),
-                live: Vec::new(),
-            },
+            // `ProposalBuffer`'s fields are private to the `liveness` module
+            // now that there are two layouts of them; `new` is `const` for
+            // exactly this call site.
+            buffer: ProposalBuffer::new(),
             pos: 0,
             cursor: ProposeCursor {
                 started: false,

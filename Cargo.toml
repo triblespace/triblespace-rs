@@ -85,6 +85,13 @@ net = ["dep:triblespace-net"]
 search = ["dep:triblespace-search"]
 parallel = ["triblespace-core/parallel"]
 gpu = ["dep:triblespace-gpu", "parallel"]
+# Bit-packed query-candidate liveness (prototype, default off). Forwards to
+# triblespace-gpu too when that optional dep is in the build, because the two
+# crates' features must agree — triblespace-gpu const-asserts it.
+liveness-bitmask = [
+    "triblespace-core/liveness-bitmask",
+    "triblespace-gpu?/liveness-bitmask",
+]
 
 [[bench]]
 name = "benchmark"

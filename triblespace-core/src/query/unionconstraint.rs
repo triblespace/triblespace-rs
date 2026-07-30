@@ -117,18 +117,33 @@ where
     /// (each on a scratch copy of the region's liveness) and ors the per-variant
     /// survivors together. A value passes if *any* live variant confirms it.
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
-        let mut any = vec![0u32; cands.len()];
+        // `any` accumulates, per candidate, whether *some* live variant kept
+        // it. It is sized in liveness **words**, not candidates: under the
+        // `liveness-bitmask` representation one word carries 32 candidates and
+        // a region that starts mid-word needs one word more than a candidate
+        // count implies. `live_word_len` is the only thing that knows.
+        let mut any = vec![0u32; cands.live_word_len()];
         let mut scratch;
         for c in self.constraints.iter().filter(|c| c.satisfied(binding)) {
+            // Each variant votes on its own copy of the region's liveness, so
+            // one variant's kills cannot hide a candidate from the next. The
+            // scratch keeps the region's bit alignment, which is what lets the
+            // votes be merged word-wise.
             scratch = cands.live_words();
             c.confirm(variable, binding, &mut cands.scratch(&mut scratch));
             or_words(&mut any, &scratch);
         }
-        for i in 0..cands.len() {
-            if any[i] == 0 {
-                cands.kill(i);
-            }
-        }
+        // Kill-only by construction: every `scratch` started as a copy of the
+        // liveness on entry and confirmers may only clear, so `any` is a
+        // subset of what was already live — writing it back kills exactly the
+        // candidates no variant confirmed and revives nothing.
+        //
+        // Write through `set_live_words` rather than a kill loop because that
+        // is the one path that knows about region boundaries: bit-packed, the
+        // first and last words of a region carry bits owned by *neighbouring*
+        // regions of the same buffer, and it masks them out. Do not
+        // "simplify" this into a direct word copy.
+        cands.set_live_words(&any);
     }
 
     /// Returns `true` when **at least one** variant is satisfied.

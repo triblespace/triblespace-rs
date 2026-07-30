@@ -5,6 +5,16 @@
 //! identical to the canonical CPU constraint — across every routed arm,
 //! including candidates that are already dead (they must stay dead) and
 //! duplicated candidate values.
+//!
+//! There is nothing to compare in a `liveness-bitmask` build: the device path
+//! is not ported and `confirm` routes everything to the CPU arm, so the suite
+//! would be asserting the CPU constraint against itself. It also spells the
+//! word-per-candidate layout directly (`vec![1u32; n]` as "all live"), which is
+//! wrong once a word carries 32 candidates. Compile it out rather than let it
+//! fail for the wrong reason. `required-features` in Cargo.toml cannot express
+//! a negation, hence the crate-level `cfg`.
+
+#![cfg(not(feature = "liveness-bitmask"))]
 
 use std::collections::HashSet;
 

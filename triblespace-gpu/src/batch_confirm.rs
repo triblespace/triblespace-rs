@@ -31,6 +31,15 @@
 //! bit-identical either way (the parity suite in
 //! `tests/batch_confirm_parity.rs` holds the two paths to identical liveness
 //! words).
+//!
+//! # `liveness-bitmask` builds
+//!
+//! Everything above assumes core's default liveness layout: one `u32` per
+//! candidate. Under `triblespace-core/liveness-bitmask` a word carries 32
+//! candidates, the verdict-to-liveness AND stops being meaningful, and the
+//! first and last word of a region are shared with neighbouring regions. The
+//! kernels are not ported; `confirm` routes every call to the canonical CPU
+//! arm instead. See `WgpuSuccinctArchiveConstraint::confirm_routed`.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -343,6 +352,10 @@ fn pack_be_words(values: &[RawInline]) -> Vec<u32> {
     words
 }
 
+/// Live entries in a region, through the index API so it is independent of the
+/// liveness layout. Only the threshold dispatch needs it, and that dispatch is
+/// compiled out of `liveness-bitmask` builds.
+#[cfg_attr(feature = "liveness-bitmask", allow(dead_code))]
 fn count_live(cands: &Candidates<'_>) -> usize {
     (0..cands.len()).filter(|&i| cands.is_live(i)).count()
 }
@@ -703,6 +716,10 @@ where
     /// dispatch. Returns `false` when the binding shape has no device
     /// lowering (never happens for the canonical twelve arms) so the caller
     /// can fall back.
+    ///
+    /// Unreachable — but still type-checked — in a `liveness-bitmask` build;
+    /// see `confirm_routed`.
+    #[cfg_attr(feature = "liveness-bitmask", allow(dead_code))]
     fn confirm_gpu(
         &self,
         variable: VariableId,
@@ -784,6 +801,54 @@ where
         }
         self.gpu.confirm_range_gpu(rotation, &r, cands)
     }
+
+    /// Routes one confirm call between the device and the canonical CPU arm.
+    ///
+    /// The word-per-candidate build keeps the documented threshold dispatch.
+    #[cfg(not(feature = "liveness-bitmask"))]
+    fn confirm_routed(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+        let live = count_live(cands);
+        if live < self.gpu.min_confirm_batch {
+            self.gpu.stats.record_cpu(cands.len());
+            self.inner.confirm(variable, binding, cands);
+            return;
+        }
+        match self.confirm_gpu(variable, binding, cands) {
+            Ok(()) => self.gpu.stats.record_gpu(cands.len()),
+            Err(_) => {
+                // The helpers only write liveness after a complete verdict
+                // readback, so a failed dispatch left the region untouched
+                // and the CPU arm computes it from scratch.
+                self.gpu.stats.record_error();
+                self.inner.confirm(variable, binding, cands);
+            }
+        }
+    }
+
+    /// Routes one confirm call — bit-packed liveness build: always the CPU arm.
+    ///
+    /// TODO(liveness-bitmask): port the confirm kernels. The device path is
+    /// unavailable here because its whole merge contract is "one verdict word
+    /// per candidate, AND-ed into one liveness word per candidate". Bit-packed,
+    /// 32 candidates share a word, so:
+    ///
+    /// * the verdict buffer would have to be packed on the device (a ballot /
+    ///   subgroup reduction, or a second pass), and
+    /// * the merge into the region's first and last words would have to be an
+    ///   `atomicAnd` of a masked word, because those words are shared with the
+    ///   *neighbouring* regions of the same buffer — a plain read-modify-write
+    ///   there can kill candidates this region does not own.
+    ///
+    /// A wrong port has no compile-time signal and no cheap runtime one, so
+    /// until the kernels are written and the parity suite extended, the
+    /// bit-packed build takes the canonical CPU probes. That is also what this
+    /// prototype exists to measure: CPU correctness and CPU cost of the packed
+    /// layout. Every call is counted as a CPU fallback, which it is.
+    #[cfg(feature = "liveness-bitmask")]
+    fn confirm_routed(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+        self.gpu.stats.record_cpu(cands.len());
+        self.inner.confirm(variable, binding, cands);
+    }
 }
 
 impl<'a, U> Constraint<'a> for WgpuSuccinctArchiveConstraint<'a, U>
@@ -821,22 +886,7 @@ where
         {
             return;
         }
-        let live = count_live(cands);
-        if live < self.gpu.min_confirm_batch {
-            self.gpu.stats.record_cpu(cands.len());
-            self.inner.confirm(variable, binding, cands);
-            return;
-        }
-        match self.confirm_gpu(variable, binding, cands) {
-            Ok(()) => self.gpu.stats.record_gpu(cands.len()),
-            Err(_) => {
-                // The helpers only write liveness after a complete verdict
-                // readback, so a failed dispatch left the region untouched
-                // and the CPU arm computes it from scratch.
-                self.gpu.stats.record_error();
-                self.inner.confirm(variable, binding, cands);
-            }
-        }
+        self.confirm_routed(variable, binding, cands);
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
