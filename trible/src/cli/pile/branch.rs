@@ -1120,7 +1120,11 @@ pub fn run(cmd: Command) -> Result<()> {
 
                     let mut ungroupable: Vec<(Id, String)> = Vec::new();
 
-                    for raw_bid in &pin_snapshot {
+                    // PATCH's ordinary iterator is intentionally unordered.
+                    // Consolidation keeps the first already-dominant active
+                    // member, so walk IDs canonically to make the surviving
+                    // branch deterministic across processes and hash seeds.
+                    for raw_bid in pin_snapshot.iter_ordered() {
                         let bid = Id::new(*raw_bid).expect("pin snapshot contains nil id");
                         let mh = *pin_snapshot
                             .get(raw_bid)
