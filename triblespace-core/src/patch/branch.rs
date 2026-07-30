@@ -69,22 +69,6 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
-    /// Like [`modify_child`] but treats the supplied `inserted_hash` as a known
-    /// contribution for the empty-slot insertion case. This lets archive
-    /// ingest maintain a clean parent around a LocalLeaf without recomputing
-    /// siphash24 once per index — the caller already has it from
-    /// `ArchiveEntry::hash`.
-    ///
-    /// The hint MUST equal the hash of whatever `f(None)` returns.
-    /// When the slot is non-empty, both old and replacement contributions must
-    /// already be cached or the parent becomes dirty.
-    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: u128, f: F)
-    where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
-    {
-        Branch::modify_child_with_inserted_hint(&mut self.branch_nn, key, inserted_hash, f);
-    }
-
     /// Insert `head` into the child table, growing the allocation if cuckoo
     /// placement fails. Does *not* update the branch's aggregates —
     /// pair with [`Self::finish_bulk_aggregates`] for bulk rewrites.
@@ -271,31 +255,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let lchild_hash = lchild.known_hash();
         let rchild_hash = rchild.known_hash();
         Self::new_with_optional_child_hashes(end_depth, lchild, rchild, lchild_hash, rchild_hash)
-    }
-
-    /// Variant of [`Self::new`] that takes a precomputed
-    /// `rchild_hash` and uses it instead of calling `rchild.hash()`.
-    /// Lets archive-ingest divergence paths reuse the
-    /// `ArchiveEntry::hash` they already have instead of recomputing
-    /// siphash24 over the LocalLeaf bytes.
-    ///
-    /// `rchild_hash` MUST equal `rchild.hash()`. The left contribution is used
-    /// only when it is already cached; a dirty left subtree makes the new
-    /// parent dirty instead of forcing a recursive hash.
-    pub(super) fn new_with_rchild_hash(
-        end_depth: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
-        rchild_hash: u128,
-    ) -> NonNull<Self> {
-        let lchild_hash = lchild.known_hash();
-        Self::new_with_optional_child_hashes(
-            end_depth,
-            lchild,
-            rchild,
-            lchild_hash,
-            Some(rchild_hash),
-        )
     }
 
     /// Variant used when a known archive batch bootstraps a Branch directly
@@ -518,22 +477,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
-        Self::modify_child_impl(branch_nn, key, None, f);
-    }
-
-    /// Shared child mutation machinery. `empty_slot_hash_hint` is consulted
-    /// only when `f(None)` inserts a child; an occupied replacement always
-    /// derives both contributions from the resident heads. `Some(0)` is a
-    /// legitimate known-zero contribution and must remain distinct from no
-    /// hint.
-    fn modify_child_impl<F>(
-        branch_nn: &mut NonNull<Self>,
-        key: u8,
-        empty_slot_hash_hint: Option<u128>,
-        f: F,
-    ) where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
-    {
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
@@ -595,7 +538,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    let inserted_hash = empty_slot_hash_hint.or_else(|| inserted.known_hash());
+                    let inserted_hash = inserted.known_hash();
                     let hash = match (cached_parent_hash, inserted_hash) {
                         (Some(parent), Some(inserted)) => Some(parent ^ inserted),
                         _ => None,
@@ -616,21 +559,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             #[cfg(debug_assertions)]
             branch_nn.as_ref().debug_check_invariants();
         }
-    }
-
-    /// Variant of [`Self::modify_child`] that takes a precomputed
-    /// `inserted_hash` as a known empty-slot contribution. The hint MUST equal
-    /// the hash of whatever `f(None)` returns. A non-empty replacement keeps
-    /// the parent clean only when both child hashes are already cached.
-    pub(super) fn modify_child_with_inserted_hint<F>(
-        branch_nn: &mut NonNull<Self>,
-        key: u8,
-        inserted_hash: u128,
-        f: F,
-    ) where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
-    {
-        Self::modify_child_impl(branch_nn, key, Some(inserted_hash), f);
     }
 
     // Note: upsert_child removed in favor of explicit insert_child / update_child

@@ -1341,7 +1341,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 }
 
-// Archive-aware insertion path, available only when V = ().
+// Archive-backed leaf construction, available only when V = ().
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     /// Constructs a `LocalLeaf` Head pointing directly at a `[u8; KEY_LEN]`
     /// trible inside an archive's mmap'd buffer. Restricting construction to
@@ -1381,43 +1381,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                 value: PhantomData,
             }
         }
-    }
-
-    /// Inserts a LocalLeaf whose hash was already computed by ArchiveEntry.
-    /// The enclosing PATCH retains the leaf's archive owner independently of
-    /// trie shape, so LocalLeaves can move through ordinary Branch operations.
-    pub(crate) fn insert_archive_leaf(
-        mut this: Self,
-        leaf: Self,
-        leaf_hash: u128,
-        start_depth: usize,
-    ) -> Self {
-        if let Some((depth, this_byte_key, leaf_byte_key)) =
-            this.first_divergence(&leaf, start_depth)
-        {
-            let old_key = this.key();
-            let new_body = crate::patch::branch::Branch::new_with_rchild_hash(
-                depth,
-                this.with_key(this_byte_key),
-                leaf.with_key(leaf_byte_key),
-                leaf_hash,
-            );
-            return Head::new(old_key, new_body);
-        }
-
-        let end_depth = this.end_depth();
-        if end_depth != KEY_LEN {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
-            let inserted = leaf.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child_with_inserted_hint(key, leaf_hash, |opt| match opt {
-                None => Some(inserted),
-                Some(old) => Some(Head::insert_archive_leaf(
-                    old, inserted, leaf_hash, end_depth,
-                )),
-            });
-        }
-        this
     }
 }
 
@@ -3506,7 +3469,10 @@ where
         let (leaf_head, leaf_owner, leaf_hash) = entry.leaf::<O>();
         OwnerCover::retain(&mut self.owners, leaf_owner);
         if let Some(this) = self.root.take() {
-            let new_head = Head::insert_archive_leaf(this, leaf_head, leaf_hash, 0);
+            // Trie mutation is storage-agnostic. Archive-specific hash
+            // knowledge belongs to the PATCH operation boundary below, where
+            // cardinality proves whether this was a duplicate or a new key.
+            let new_head = Head::insert_leaf(this, leaf_head, 0);
             self.root.replace(new_head);
         } else {
             self.root.replace(leaf_head);
