@@ -50,17 +50,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batches stay empty, singleton tribles remain root LocalLeaves, and batches of
   two or more same-owner rows directly create ordinary Branches over two
   LocalLeaves before continuing online insertion. Each PATCH now
-  conservatively retains its archive allocations in a persistent root owner
+  exactly retains its archive allocations in a persistent root owner
   cover, independently of trie shape: collapse, cross-owner union,
   intersection, difference, cloning,
   and consuming iteration can keep archive rows local without branch-boundary
   reification. This removes the owner field from every Branch (64-byte to
   48-byte header) for one thin owner-cover Arc on PATCH. The cover is a
-  balanced binary-carry forest: unshared sequential adoption is amortized
-  constant time, snapshots share complete subtrees, and no exact global owner
-  index is maintained. The six indexes in a `TribleSet` share one cover Arc:
+  canonical binary Patricia set keyed by owner allocation address: only branch
+  nodes allocate, owner leaves stay inline, masks strictly decrease to bound
+  depth by `usize::BITS`, snapshots share untouched branch Arcs, and exact
+  membership prevents diamonds or older-owner adoption from duplicating
+  lifetime guards. A separate latest-owner discriminator preserves the common
+  O(1) ingestion check. The six indexes in a `TribleSet` share one cover Arc:
   archive adoption repairs divergent public indexes once, and set union joins
-  all twelve input covers once before the six PATCH unions move any heads.
+  all twelve input covers transactionally before the six PATCH unions move any
+  heads.
   `SimpleArchive` keeps
   fused validation/construction in both its serial and parallel chunk paths,
   while intrinsic entities avoid the former heap seed and reuse both
