@@ -4280,6 +4280,49 @@ mod tests {
     }
 
     #[test]
+    fn local_leaf_remove_demotes_without_eager_hashing() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut c = a;
+        c[0] = 2;
+
+        let storage = Arc::new([
+            AlignedArchiveKey(a),
+            AlignedArchiveKey(b),
+            AlignedArchiveKey(c),
+        ]);
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let entries: [ArchiveEntry<'_, KEY_LEN>; 3] = std::array::from_fn(|i| unsafe {
+            ArchiveEntry::new(NonNull::from(&storage[i].0), &owner)
+        });
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema>::from_archive_pair(
+            &entries[0],
+            &entries[1],
+        );
+        patch.insert_archive(&entries[2]);
+        assert_ne!(branch_cached_hash(&patch), 0);
+
+        // A LocalLeaf deliberately carries no resident per-leaf fingerprint.
+        // A successful removal therefore cannot derive a numeric delta without
+        // rehashing that archive row: demote the surviving Branch instead.
+        reset_local_leaf_hash_calls();
+        patch.remove(&c);
+        assert_eq!(branch_cached_hash(&patch), 0);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b]),
+        );
+        deep_hash_audit(&patch);
+
+        let expected = heap_hash_oracle(&patch);
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 2);
+    }
+
+    #[test]
     fn promoted_dirty_results_remain_correct_through_later_unions() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
