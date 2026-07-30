@@ -989,8 +989,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     #[inline]
     fn same_body(&self, other: &Self) -> bool {
         let body_and_tag = Self::BODY_MASK | Self::TAG_MASK;
-        (self.tptr.as_ptr() as u64 & body_and_tag)
-            == (other.tptr.as_ptr() as u64 & body_and_tag)
+        let this_body = self.tptr.as_ptr() as u64 & body_and_tag;
+        let other_body = other.tptr.as_ptr() as u64 & body_and_tag;
+        this_body == other_body
     }
 
     #[inline]
@@ -4094,17 +4095,59 @@ mod tests {
         assert_eq!(local_leaf_hash_calls(), 0);
 
         let intersection = original.intersect(&snapshot);
-        assert!(
-            intersection
-                .root
-                .as_ref()
-                .unwrap()
-                .same_body(snapshot.root.as_ref().unwrap()),
-        );
+        assert!(intersection
+            .root
+            .as_ref()
+            .unwrap()
+            .same_body(snapshot.root.as_ref().unwrap()));
         assert!(original.difference(&snapshot).is_empty());
         assert_eq!(original, snapshot);
         assert_eq!(local_leaf_hash_calls(), 0);
         deep_hash_audit(&original);
+    }
+
+    #[test]
+    fn head_shared_body_shortcuts_preserve_an_unpublished_branch_cache() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+
+        let mut patch = owned_archive_single(a);
+        patch.union(owned_archive_single(b));
+        let root = patch.root.as_ref().expect("fixture must be non-empty");
+        let BodyRef::Branch(branch) = root.body_ref() else {
+            panic!("fixture root must be a Branch");
+        };
+        assert_eq!(branch.cached_hash(), None);
+
+        let rerouted = root.clone().with_key(root.key().wrapping_add(1));
+        reset_local_leaf_hash_calls();
+
+        let union = Head::union(root.clone(), rerouted.clone(), 0);
+        assert!(union.same_body(root));
+        assert!(root
+            .intersect(&rerouted, 0)
+            .expect("shared bodies intersect to themselves")
+            .same_body(root));
+        assert!(root.difference(&rerouted, 0).is_none());
+
+        #[cfg(feature = "parallel")]
+        {
+            assert!(Head::par_union(root.clone(), rerouted.clone(), 0).same_body(root));
+            assert!(root
+                .par_intersect(&rerouted, 0)
+                .expect("shared bodies intersect to themselves")
+                .same_body(root));
+            assert!(root.par_difference(&rerouted, 0).is_none());
+        }
+
+        let BodyRef::Branch(branch) = root.body_ref() else {
+            unreachable!("the root body cannot change");
+        };
+        assert_eq!(branch.cached_hash(), None);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&patch);
     }
 
     #[test]
