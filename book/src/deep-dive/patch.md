@@ -41,13 +41,25 @@ still adapting to sparse and dense fan-out.
 
 ## Archive-backed leaves
 
-An ordinary `Leaf` owns its key and value. A `LocalLeaf` instead points directly
-at immutable, aligned key bytes in an archive. The enclosing PATCH retains an
-exact persistent set of archive owners at its root; every LocalLeaf reachable
-from that root is covered by an owner, and retaining extra owners is harmless.
-This keeps archive lifetime independent of trie shape, so copy-on-write,
-resizing, and set operations can move Heads without reifying their bytes into
-heap leaves.
+An ordinary `Leaf` owns its key and value. Archive-backed keys have two Head
+representations. A raw `LocalLeaf` points directly at immutable, aligned key
+bytes and leaves its fingerprint unknown. A `HashedLocalLeaf` points at an
+immutable, 16-byte-aligned process-local descriptor containing the raw key
+pointer and its exact 128-bit fingerprint. `SimpleArchive` builds one
+descriptor slab for all rows and shares each descriptor across all six
+`TribleSet` indexes; arbitrary `ArchiveEntry` callers can retain the smaller,
+hash-lazy raw representation. On 64-bit targets the descriptor is 32 bytes per
+row (one pointer, padding, and one `u128` hash), making the memory-for-compute
+tradeoff explicit rather than hiding six duplicate hashes in the indexes.
+
+Neither representation changes the eight-byte Head or the portable archive
+format. Branches always unwrap a backed leaf to a raw key pointer for their
+representative `childleaf`, so routing does not inherit descriptor
+indirection. The enclosing PATCH retains an exact persistent set of archive
+owners at its root. For descriptor-backed SimpleArchives, one composite owner
+keeps both the canonical bytes and the process-local slab alive. This keeps
+archive lifetime independent of trie shape, so copy-on-write, resizing, and set
+operations can move Heads without reifying their bytes into heap leaves.
 
 The owner set is a Patricia trie keyed by allocation address. Its shape is
 canonical for an address set, its height is bounded by the machine word width,
@@ -97,9 +109,10 @@ factors keep memory usage steady without ART’s specialised node types.
 
 ## Hash receipts
 
-Heap leaves store a SipHash-2-4 fingerprint of their key. Archive-backed
-LocalLeaves deliberately do not: their canonical representation is just the
-archive bytes. A branch's receipt obeys the one-way invariant
+Heap leaves and descriptor-backed archive leaves store a SipHash-2-4
+fingerprint of their key. Raw LocalLeaves deliberately do not: their canonical
+representation is just the archive bytes. A branch's receipt obeys the one-way
+invariant
 
 ```
 branch.hash == 0  OR  branch.hash == XOR(hash(key) for key below branch)
@@ -118,7 +131,7 @@ calls `child.hash()` merely to maintain a cache. Reading a resident root hash is
 O(1); reading a dirty root folds the subtree in O(n) and does not memoize through
 a shared reference.
 
-Union repairs more receipts without hashing disjoint LocalLeaves. For
+Union repairs more receipts without hashing disjoint raw LocalLeaves. For
 
 ```
 H(S) = XOR(hash(key) for key in S),

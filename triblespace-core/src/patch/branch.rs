@@ -48,7 +48,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
                     branch_nn: nn,
                 }
             }
-            BodyMut::Leaf(_) | BodyMut::LocalLeaf(_) => {
+            BodyMut::Leaf(_) | BodyMut::LocalLeaf(_) | BodyMut::HashedLocalLeaf(_) => {
                 panic!("BranchMut requires a Branch body")
             }
         }
@@ -157,9 +157,10 @@ pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Si
     /// Thin pointer to the key bytes of a representative descendant
     /// leaf, used for prefix-matching shortcuts. Points either into a
     /// heap [`Leaf`]'s inline `key` field (offset 0 thanks to
-    /// `#[repr(C)]`) or into archive memory referenced by a
-    /// `LocalLeaf`. The unified `*const [u8; KEY_LEN]` representation
-    /// lets both leaf flavors serve as the childleaf.
+    /// `#[repr(C)]`) or into archive memory referenced by a raw
+    /// `LocalLeaf` or a `HashedLocalLeaf` descriptor. Keeping this as the
+    /// unified raw-key pointer makes Branch routing independent of leaf-body
+    /// representation.
     pub childleaf: *const [u8; KEY_LEN],
     pub leaf_count: u64,
     pub segment_count: u64,
@@ -242,8 +243,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_L
 
     /// Returns the key bytes of the representative child leaf. The
     /// pointer is set to a heap `Leaf`'s `key` field (offset 0) or to
-    /// a `LocalLeaf`'s archive-resident bytes; both yield the same
-    /// reference shape.
+    /// archive-resident bytes unwrapped from either backed-leaf flavor; all
+    /// yield the same reference shape.
     pub fn childleaf_key(&self) -> &[u8; KEY_LEN] {
         unsafe { &*self.childleaf }
     }

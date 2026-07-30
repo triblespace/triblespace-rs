@@ -1,19 +1,20 @@
 //! Measures heap-allocation behaviour of `SimpleArchive` ingestion to
-//! verify the `LocalLeaf` path actually eliminates per-trible heap
-//! `Leaf` allocations.
+//! verify the archive-leaf path replaces per-trible heap `Leaf`
+//! allocations with one compact descriptor slab.
 //!
 //! Strategy: install a counting global allocator, build a TribleSet
 //! through the normal `insert` path (forcing heap Leaves), encode to
 //! a `SimpleArchive` blob, then decode through `try_from_blob` while
 //! counting allocations performed during the decode. The Leaf-heap
-//! path costs ~96 bytes per trible; the LocalLeaf path costs zero
-//! per-trible alloc bytes (Branch overhead grows with tree shape,
-//! not trible count).
+//! path costs ~96 bytes per trible; the descriptor-backed path adds one
+//! 32-byte process-local descriptor per trible (Branch overhead grows with
+//! tree shape, not trible count).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use anybytes::Bytes;
 use std::time::Instant;
 use triblespace::core::blob::encodings::simplearchive::{try_from_blob_heap_only, SimpleArchive};
 use triblespace::core::blob::Blob;
@@ -242,7 +243,9 @@ fn simplearchive_batch_layout_and_all_index_parity() {
 #[test]
 fn simplearchive_parallel_chunks_remain_all_local() {
     let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
-    const N: usize = 4_096;
+    // One row over a multiple of four forces the four-worker splitter to map
+    // a shorter final chunk onto the exact tail of the descriptor slab.
+    const N: usize = 4_097;
 
     let mut source = TribleSet::new();
     for i in 0..N as u64 {
@@ -273,6 +276,52 @@ fn simplearchive_parallel_chunks_remain_all_local() {
     assert_eq!(decoded.ave.iter_ordered().count(), N);
     assert_eq!(decoded.vea.iter_ordered().count(), N);
     assert_eq!(decoded.vae.iter_ordered().count(), N);
+}
+
+#[test]
+fn simplearchive_unaligned_bytes_stay_descriptor_backed() {
+    let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
+    let mut source = TribleSet::new();
+    for i in 0..3 {
+        source.insert(&make_trible(i));
+    }
+    let canonical: Blob<SimpleArchive> = SimpleArchive::encode(&source);
+
+    // Place the canonical bytes at an intentionally non-16-aligned offset in
+    // one stable Vec allocation. Raw LocalLeaf Heads cannot tag this address;
+    // the descriptor-backed decoder must nevertheless keep all six indexes
+    // archive-backed rather than falling back to heap Leafs.
+    let mut storage = vec![0u8; canonical.bytes.len() + 16];
+    let base = storage.as_ptr() as usize;
+    let offset = (0..16)
+        .find(|&offset| (base + offset) & 0x0f != 0)
+        .expect("one offset in a 16-byte window must be unaligned");
+    storage[offset..offset + canonical.bytes.len()].copy_from_slice(&canonical.bytes);
+    storage.truncate(offset + canonical.bytes.len());
+    let bytes = Bytes::from_source(storage).slice(offset..);
+    assert_ne!(bytes.as_ptr() as usize & 0x0f, 0);
+
+    let decoded: TribleSet = Blob::<SimpleArchive>::new(bytes).try_from_blob().unwrap();
+    assert_eq!(decoded.len(), source.len());
+    assert_eq!(
+        decoded.eav.iter_ordered().copied().collect::<Vec<_>>(),
+        source.eav.iter_ordered().copied().collect::<Vec<_>>()
+    );
+    for stats in [
+        decoded.eav.node_stats(),
+        decoded.eva.node_stats(),
+        decoded.aev.node_stats(),
+        decoded.ave.node_stats(),
+        decoded.vea.node_stats(),
+        decoded.vae.node_stats(),
+    ] {
+        assert_eq!(stats.2, 0, "unaligned decode materialized heap Leafs");
+        assert_eq!(
+            stats.3,
+            source.len() as u64,
+            "unaligned decode lost backed leaves"
+        );
+    }
 }
 
 fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
@@ -328,8 +377,9 @@ fn measure_at(n: usize) {
         measure(|| -> TribleSet { try_from_blob_heap_only(archive.clone()).unwrap() });
     assert_eq!(heap_set.len(), N);
 
-    // LocalLeaf archive ingest: identical validation/iteration, but
-    // each trible lands as a LocalLeaf backed by the shared owner Arc.
+    // Descriptor-backed archive ingest: identical validation/iteration, but
+    // each trible lands in one shared descriptor slab retained with the
+    // canonical bytes by a composite owner Arc.
     let (archive_set, archive_allocs, archive_bytes) =
         measure(|| -> TribleSet { archive.clone().try_from_blob().unwrap() });
     assert_eq!(archive_set.len(), N);

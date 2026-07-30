@@ -1,4 +1,5 @@
 use super::*;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Reference-counted handle to a heap-allocated leaf node in a PATCH trie.
@@ -62,13 +63,69 @@ impl<const KEY_LEN: usize, V> Drop for Entry<KEY_LEN, V> {
     }
 }
 
+#[derive(Copy, Clone)]
+struct ArchiveLeafSource<const KEY_LEN: usize> {
+    /// Ephemeral tagged pointer used only while an ArchiveEntry is on the
+    /// ingest stack. Bit zero distinguishes a descriptor body from raw key
+    /// bytes; both source allocations are 16-byte aligned, so the tag is free.
+    /// Keeping the discriminator here preserves ArchiveEntry's 32-byte layout.
+    tagged: NonNull<u8>,
+    key: PhantomData<NonNull<[u8; KEY_LEN]>>,
+}
+
+impl<const KEY_LEN: usize> ArchiveLeafSource<KEY_LEN> {
+    const HASHED: usize = 1;
+
+    unsafe fn raw(ptr: NonNull<[u8; KEY_LEN]>) -> Self {
+        debug_assert_eq!(ptr.as_ptr() as usize & 0x0f, 0);
+        Self {
+            tagged: ptr.cast(),
+            key: PhantomData,
+        }
+    }
+
+    unsafe fn hashed(descriptor: NonNull<ArchiveLeafDescriptor<KEY_LEN>>) -> Self {
+        debug_assert_eq!(descriptor.as_ptr() as usize & 0x0f, 0);
+        let tagged = unsafe {
+            NonNull::new_unchecked(
+                (descriptor.as_ptr() as *mut u8).map_addr(|address| address | Self::HASHED),
+            )
+        };
+        Self {
+            tagged,
+            key: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn descriptor(self) -> Option<NonNull<ArchiveLeafDescriptor<KEY_LEN>>> {
+        if self.tagged.as_ptr() as usize & Self::HASHED == 0 {
+            return None;
+        }
+        let ptr = self
+            .tagged
+            .as_ptr()
+            .map_addr(|address| address & !Self::HASHED);
+        Some(unsafe { NonNull::new_unchecked(ptr.cast()) })
+    }
+
+    #[inline]
+    fn key_ptr(self) -> NonNull<[u8; KEY_LEN]> {
+        match self.descriptor() {
+            Some(descriptor) => unsafe { descriptor.as_ref().key_ptr() },
+            None => self.tagged.cast(),
+        }
+    }
+}
+
 /// Insertion entry for archive-backed PATCHes (`V = ()` only).
 ///
-/// Holds a thin pointer into an archive's bytes plus a *borrow* of
-/// the `Arc<dyn ArchiveOwner>` that keeps those bytes alive. When
-/// inserted via [`PATCH::insert_archive`], the entry's key becomes a
-/// `Head::new_local_leaf` and the owner joins the PATCH's persistent root
-/// owner set. Trie shape and owner identity are independent.
+/// Holds either a thin pointer into an archive's bytes or a pointer to an
+/// immutable process-local descriptor carrying those bytes and their exact
+/// process-local fingerprint. It also borrows the `Arc<dyn ArchiveOwner>` that
+/// keeps every referenced allocation alive. When inserted via
+/// [`PATCH::insert_archive`], the owner joins the PATCH's persistent root owner
+/// set. Trie shape, leaf representation, and owner identity are independent.
 ///
 /// The owner is borrowed (not owned) so the ingest hot loop pays
 /// **zero** atomic ref-count traffic per trible — the receiving PATCH only
@@ -79,10 +136,10 @@ impl<const KEY_LEN: usize, V> Drop for Entry<KEY_LEN, V> {
 /// Only valid for `V = ()` because archive bytes don't carry a value
 /// field — the constructor's type parameter enforces this.
 pub struct ArchiveEntry<'a, const KEY_LEN: usize> {
-    pub(super) ptr: NonNull<[u8; KEY_LEN]>,
+    source: ArchiveLeafSource<KEY_LEN>,
     pub(super) owner: &'a Arc<dyn ArchiveOwner>,
-    /// Pre-computed siphash24 of the trible bytes (matches what
-    /// `Head::hash()` would compute on the resulting `LocalLeaf`).
+    /// Pre-computed siphash24 of the key bytes (matches `Head::hash()` for
+    /// either archive-backed leaf representation).
     /// Cached once at `ArchiveEntry::new` so the 6-way fan-out across
     /// covering indexes runs one hash instead of six.
     pub(super) hash: u128,
@@ -122,22 +179,63 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
                 .hash(&ptr.as_ref()[..])
                 .into()
         };
-        Self { ptr, owner, hash }
+        Self {
+            source: unsafe { ArchiveLeafSource::raw(ptr) },
+            owner,
+            hash,
+        }
+    }
+
+    /// Creates an entry backed by immutable process-local descriptor metadata.
+    ///
+    /// This constructor is crate-private because descriptors are an ingest
+    /// representation, not part of PATCH's public archive-entry protocol. The
+    /// public [`Self::new`] path remains the general raw-archive API.
+    ///
+    /// # Safety
+    ///
+    /// - `descriptor` must remain valid and immutable for every Head created
+    ///   from this entry.
+    /// - `owner` must retain both the descriptor allocation and the key bytes
+    ///   referenced by that descriptor for the full lifetime of those Heads.
+    /// - `descriptor.hash` must be the exact PATCH fingerprint of
+    ///   `descriptor.key` under the current process-local [`SIP_KEY`].
+    pub(crate) unsafe fn from_descriptor(
+        descriptor: NonNull<ArchiveLeafDescriptor<KEY_LEN>>,
+        owner: &'a Arc<dyn ArchiveOwner>,
+    ) -> Self {
+        debug_assert_eq!(
+            descriptor.as_ptr() as usize & 0x0f,
+            0,
+            "archive leaf descriptor must be 16-byte aligned"
+        );
+        let hash = unsafe { descriptor.as_ref().hash() };
+        Self {
+            source: unsafe { ArchiveLeafSource::hashed(descriptor) },
+            owner,
+            hash,
+        }
     }
 
     /// Returns the archive-resident key bytes borrowed for this entry's
     /// lifetime. Used to reject duplicate bootstrap pairs before constructing
     /// the two-child root Branch.
     pub(crate) fn key(&self) -> &[u8; KEY_LEN] {
-        unsafe { self.ptr.as_ref() }
+        unsafe { self.source.key_ptr().as_ref() }
     }
 
-    /// Returns a `LocalLeaf` head for this entry, the borrowed owner
-    /// Arc, and the pre-computed leaf hash.
+    /// Returns the matching archive-backed leaf Head, the borrowed owner Arc,
+    /// and the pre-computed leaf hash.
     pub(super) fn leaf<O: KeySchema<KEY_LEN>>(
         &self,
     ) -> (Head<KEY_LEN, O, ()>, &'a Arc<dyn ArchiveOwner>, u128) {
-        unsafe { (Head::new_local_leaf(0, self.ptr), self.owner, self.hash) }
+        let head = unsafe {
+            match self.source.descriptor() {
+                Some(descriptor) => Head::new_hashed_local_leaf(0, descriptor),
+                None => Head::new_local_leaf(0, self.source.key_ptr()),
+            }
+        };
+        (head, self.owner, self.hash)
     }
 
     /// Borrows the owner Arc without cloning.
@@ -157,7 +255,8 @@ impl<'a, const KEY_LEN: usize> Clone for ArchiveEntry<'a, KEY_LEN> {
 impl<'a, const KEY_LEN: usize> core::fmt::Debug for ArchiveEntry<'a, KEY_LEN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ArchiveEntry")
-            .field("ptr", &self.ptr)
+            .field("ptr", &self.source.key_ptr())
+            .field("cached_descriptor", &self.source.descriptor().is_some())
             .field("owner", &"<archive owner>")
             .finish()
     }

@@ -11,6 +11,73 @@ use std::ptr::addr_of;
 
 use super::*;
 
+/// Process-local metadata shared by every PATCH index that references one
+/// archive-resident key.
+///
+/// A [`Head`] carrying the `HashedLocalLeaf` tag points at this descriptor,
+/// rather than at the key bytes themselves. The descriptor is deliberately
+/// not serialized: its hash uses PATCH's process-local [`SIP_KEY`], and its
+/// key pointer is meaningful only while the owning process keeps the archive
+/// allocation alive. [`Branch::childleaf`] remains a raw key pointer, so the
+/// descriptor adds no indirection to branch routing after construction.
+///
+/// `align(16)` reserves the low four pointer bits for [`HeadTag`]. Its size is
+/// consequently a multiple of 16, so every element of a descriptor slab is a
+/// valid tagged-pointer body.
+#[derive(Debug)]
+#[repr(C, align(16))]
+pub(crate) struct ArchiveLeafDescriptor<const KEY_LEN: usize> {
+    key: NonNull<[u8; KEY_LEN]>,
+    hash: u128,
+}
+
+// SAFETY: construction requires the pointed-to key to remain initialized and
+// immutable for the descriptor's complete lifetime. The descriptor itself is
+// immutable after publication. SimpleArchive enforces the lifetime half by
+// retaining both the key bytes and descriptor slab in one composite owner.
+unsafe impl<const KEY_LEN: usize> Send for ArchiveLeafDescriptor<KEY_LEN> {}
+unsafe impl<const KEY_LEN: usize> Sync for ArchiveLeafDescriptor<KEY_LEN> {}
+
+impl<const KEY_LEN: usize> ArchiveLeafDescriptor<KEY_LEN> {
+    /// Construct process-local metadata for one archive-resident key.
+    ///
+    /// # Safety
+    ///
+    /// - `key` must remain valid, fully initialized, and immutable for the
+    ///   complete lifetime of this descriptor, including concurrent access.
+    /// - The allocation that eventually owns this descriptor must remain live
+    ///   for every `Head::HashedLocalLeaf` that points at it.
+    /// - The descriptor must be placed at a 16-byte-aligned stable address
+    ///   before a Head is constructed from it. A boxed slice of this type
+    ///   satisfies that requirement.
+    pub(crate) unsafe fn new(key: NonNull<[u8; KEY_LEN]>) -> Self {
+        init_sip_key();
+        let hash = unsafe {
+            SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
+                .hash(&key.as_ref()[..])
+                .into()
+        };
+        Self { key, hash }
+    }
+
+    #[inline]
+    pub(crate) fn key_ptr(&self) -> NonNull<[u8; KEY_LEN]> {
+        self.key
+    }
+
+    #[inline]
+    pub(crate) fn key(&self) -> &[u8; KEY_LEN] {
+        // SAFETY: this is precisely the invariant required by `new`; all safe
+        // access remains bounded by a shared descriptor borrow.
+        unsafe { self.key.as_ref() }
+    }
+
+    #[inline]
+    pub(crate) fn hash(&self) -> u128 {
+        self.hash
+    }
+}
+
 #[derive(Debug)]
 #[repr(C, align(16))]
 pub(crate) struct Leaf<const KEY_LEN: usize, V> {

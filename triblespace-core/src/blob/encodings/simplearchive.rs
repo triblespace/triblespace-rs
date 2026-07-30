@@ -9,6 +9,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::patch::ArchiveEntry;
+use crate::patch::ArchiveLeafDescriptor;
 use crate::patch::ArchiveOwner;
 use crate::trible::Fragment;
 use crate::trible::Trible;
@@ -102,6 +103,69 @@ impl std::error::Error for UnarchiveError {}
 #[cfg(feature = "parallel")]
 const PARALLEL_UNARCHIVE_THRESHOLD: usize = 4096;
 
+/// One process-local owner for both halves of descriptor-backed archive
+/// leaves. `_bytes` keeps every raw key pointer valid; `descriptors` keeps the
+/// tagged Head bodies valid. Neither the descriptor slab nor its SIP_KEY
+/// fingerprints are part of the portable SimpleArchive encoding.
+struct SimpleArchiveLeafOwner {
+    _bytes: Bytes,
+    descriptors: Box<[ArchiveLeafDescriptor<64>]>,
+}
+
+/// Decoder-time access to a composite owner through both its concrete type
+/// (for descriptor indexing) and its erased type (for PATCH owner covers).
+/// Both Arcs point at the same allocation.
+struct SimpleArchiveLeafBacking {
+    composite: Arc<SimpleArchiveLeafOwner>,
+    owner: Arc<dyn ArchiveOwner>,
+}
+
+#[derive(Copy, Clone)]
+struct SimpleArchiveLeafSlice<'a> {
+    owner: &'a Arc<dyn ArchiveOwner>,
+    descriptors: &'a [ArchiveLeafDescriptor<64>],
+}
+
+impl SimpleArchiveLeafBacking {
+    fn new(bytes: &Bytes, rows: &[[u8; 64]]) -> Self {
+        // Prototype tradeoff: descriptor construction happens before
+        // `serial_unarchive` validates even the first row. Malformed archives
+        // therefore pay the full slab allocation and hashing pass before
+        // failing. Keeping descriptor publication immutable makes this path
+        // small and auditable, but it deliberately gives up the former fused
+        // fail-fast validation/insertion behavior; measurements must include
+        // this extra pass rather than describing it as free.
+        // Build all process-local descriptors before publishing any pointers
+        // into their slab. `into_boxed_slice` fixes one 16-aligned allocation
+        // whose element addresses remain stable for the composite owner's
+        // lifetime.
+        let descriptors: Box<_> = rows
+            .iter()
+            .map(|row| {
+                // SAFETY: `row` lives in the immutable `bytes` allocation
+                // retained below. The resulting descriptor is moved only
+                // until the boxed slab is finalized, before a Head observes
+                // its address.
+                unsafe { ArchiveLeafDescriptor::new(NonNull::from(row)) }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let composite = Arc::new(SimpleArchiveLeafOwner {
+            _bytes: bytes.clone(),
+            descriptors,
+        });
+        let owner: Arc<dyn ArchiveOwner> = composite.clone();
+        Self { composite, owner }
+    }
+
+    fn rows(&self) -> SimpleArchiveLeafSlice<'_> {
+        SimpleArchiveLeafSlice {
+            owner: &self.owner,
+            descriptors: &self.composite.descriptors,
+        }
+    }
+}
+
 impl TryFromBlob<SimpleArchive> for TribleSet {
     type Error = UnarchiveError;
 
@@ -111,8 +175,8 @@ impl TryFromBlob<SimpleArchive> for TribleSet {
 }
 
 /// Decode a [`SimpleArchive`] blob into a [`TribleSet`] forcing the
-/// heap-`Leaf` ingest path (no `LocalLeaf`). Exposed for measurement
-/// so the LocalLeaf path can be compared against the legacy heap
+/// heap-`Leaf` ingest path (no archive-backed leaf). Exposed for measurement
+/// so descriptor-backed decoding can be compared against the legacy heap
 /// behaviour on identical input.
 pub fn try_from_blob_heap_only(blob: Blob<SimpleArchive>) -> Result<TribleSet, UnarchiveError> {
     try_from_blob_inner(blob, /*archive_backed:*/ false)
@@ -127,41 +191,36 @@ fn try_from_blob_inner(
     };
     let slice: &[[u8; 64]] = &packed_tribles;
 
-    // ArchiveEntry / LocalLeaf require the trible pointer to be
-    // 16-byte aligned (the low 4 bits encode `HeadTag::LocalLeaf`).
-    // Every 64-byte stride preserves alignment, so it's enough to
-    // check the slice base. Modern allocators (and mmap'd files)
-    // satisfy this; the heap-Leaf fallback handles the rare miss.
-    let owner: Option<Arc<dyn ArchiveOwner>> =
-        if archive_backed && (slice.as_ptr() as usize) & 0x0f == 0 {
-            Some(Arc::new(blob.bytes.clone()))
-        } else {
-            None
-        };
+    // SimpleArchive's process-local descriptor slab is 16-byte aligned even
+    // when the portable byte view is not. Heads tag descriptor pointers while
+    // Branch childleaf fields retain the raw key pointers, so archive-backed
+    // decoding no longer needs an allocator-alignment fallback.
+    let backing = archive_backed.then(|| SimpleArchiveLeafBacking::new(&blob.bytes, slice));
 
     #[cfg(feature = "parallel")]
     {
         if slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
-            return parallel_unarchive(slice, owner);
+            return parallel_unarchive(slice, backing);
         }
     }
 
-    serial_unarchive(slice, owner.as_ref())
+    serial_unarchive(slice, backing.as_ref().map(SimpleArchiveLeafBacking::rows))
 }
 
-/// Serial fallback. Validates ordering + redundancy inline with
-/// insertion — every byte read once. When `owner` is `Some`, each
-/// trible is inserted as an `ArchiveEntry` (LocalLeaf-backed); when
-/// `None`, the heap-Leaf path is taken.
+/// Serial construction after any descriptor prepass. Ordering and redundancy
+/// are validated inline with insertion. When `archive` is `Some`, each trible
+/// is inserted as a descriptor-backed `ArchiveEntry`; when `None`, the
+/// heap-Leaf path is taken directly without that prepass.
 fn serial_unarchive(
     slice: &[[u8; 64]],
-    owner: Option<&Arc<dyn ArchiveOwner>>,
+    archive: Option<SimpleArchiveLeafSlice<'_>>,
 ) -> Result<TribleSet, UnarchiveError> {
+    debug_assert!(archive.is_none_or(|archive| archive.descriptors.len() == slice.len()));
     let mut tribles = TribleSet::new();
     let mut first_archive_entry = None;
     let mut archive_batch_started = false;
     let mut prev_trible: Option<&[u8; 64]> = None;
-    for t in slice.iter() {
+    for (index, t) in slice.iter().enumerate() {
         let Some(trible) = Trible::as_transmute_force_raw(t) else {
             return Err(UnarchiveError::BadTrible);
         };
@@ -174,19 +233,20 @@ fn serial_unarchive(
             }
         }
         prev_trible = Some(t);
-        match owner {
-            Some(owner_arc) => {
-                // SAFETY: `t` points into the archive bytes kept alive
-                // by `owner_arc`, and base-alignment + 64-byte stride
-                // guarantees this element is 16-byte aligned.
-                let ptr = NonNull::from(t);
-                let entry = unsafe { ArchiveEntry::new(ptr, owner_arc) };
+        match archive {
+            Some(archive) => {
+                let descriptor = NonNull::from(&archive.descriptors[index]);
+                // SAFETY: the erased owner and concrete descriptor view point
+                // at the same composite allocation. It owns this descriptor
+                // slab and the immutable Bytes allocation referenced by every
+                // descriptor key pointer.
+                let entry = unsafe { ArchiveEntry::from_descriptor(descriptor, archive.owner) };
                 if archive_batch_started {
                     tribles.insert_archive(&entry);
                 } else if let Some(first) = first_archive_entry.take() {
                     // The first two validated rows are a same-owner, distinct
                     // stack batch. They directly bootstrap each PATCH index
-                    // as a Branch over two LocalLeaves.
+                    // as a Branch over two descriptor-backed leaves.
                     tribles.insert_archive_batch(&[first, entry]);
                     archive_batch_started = true;
                 } else {
@@ -197,8 +257,8 @@ fn serial_unarchive(
         }
     }
     if let Some(first) = first_archive_entry {
-        // A PATCH root can be a LocalLeaf because its owner cover is independent
-        // of trie shape.
+        // A PATCH root can be descriptor-backed because its owner cover is
+        // independent of trie shape.
         tribles.insert_archive_batch(&[first]);
     }
     Ok(tribles)
@@ -212,7 +272,7 @@ fn serial_unarchive(
 #[cfg(feature = "parallel")]
 fn parallel_unarchive(
     slice: &[[u8; 64]],
-    owner: Option<Arc<dyn ArchiveOwner>>,
+    backing: Option<SimpleArchiveLeafBacking>,
 ) -> Result<TribleSet, UnarchiveError> {
     use rayon::prelude::*;
 
@@ -237,10 +297,23 @@ fn parallel_unarchive(
 
     // Phase 2: per-chunk serial unarchive in parallel. Every chunk
     // shares the same archive owner, so persistent owner-cover union later
-    // deduplicates the guard while adopting LocalLeaves wholesale.
+    // deduplicates the guard while adopting descriptor-backed leaves wholesale.
     let chunk_sets: Result<Vec<TribleSet>, UnarchiveError> = chunks
         .par_iter()
-        .map(|chunk| serial_unarchive(chunk, owner.as_ref()))
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let archive = backing.as_ref().map(|backing| {
+                let start = chunk_index * chunk_size;
+                let end = start + chunk.len();
+                let rows = backing.rows();
+                debug_assert!(end <= rows.descriptors.len());
+                SimpleArchiveLeafSlice {
+                    owner: rows.owner,
+                    descriptors: &rows.descriptors[start..end],
+                }
+            });
+            serial_unarchive(chunk, archive)
+        })
         .collect();
 
     // Phase 3: reduce the per-chunk sets via TribleSet::union (the

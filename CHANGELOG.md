@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **SimpleArchive decoding shares one hashed leaf descriptor across all six
+  PATCH indexes.** A single process-local, 16-byte-aligned descriptor slab
+  stores each raw archive key pointer with its exact SIP_KEY fingerprint. The
+  portable archive bytes and slab are retained by one composite PATCH owner;
+  Heads remain eight-byte tagged pointers and Branch representatives remain
+  raw key pointers. The public raw `ArchiveEntry`/`LocalLeaf` path remains
+  available for arbitrary archive owners and hash-lazy controls. This first
+  prototype allocates and hashes the complete descriptor slab before archive
+  validation, so malformed input no longer fails before that process-local
+  work is paid.
+
 - **Experimental PATCH union can leave internal hashes lazy.** A zero Branch
   aggregate is treated as a conservative uncached sentinel, serial union
   propagates exact intersection-hash receipts only when a resident cache can

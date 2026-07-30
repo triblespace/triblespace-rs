@@ -26,7 +26,8 @@ use arrayvec::ArrayVec;
 /// Re-export of [`Entry`](entry::Entry).
 use branch::*;
 pub use entry::{ArchiveEntry, Entry};
-use leaf::*;
+pub(crate) use leaf::ArchiveLeafDescriptor;
+use leaf::Leaf;
 
 /// Re-export of all byte table utilities.
 pub use bytetable::*;
@@ -40,9 +41,10 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::{Arc, Once};
 
-/// Marker trait for opaque owners of bytes referenced by archive-backed
-/// PATCH leaves. The trait is intentionally empty: an owner exists solely to
-/// keep its allocation alive while a `LocalLeaf` points into it.
+/// Marker trait for opaque allocations referenced by archive-backed PATCH
+/// leaves. The trait is intentionally empty: an owner exists solely to keep
+/// raw key bytes and any process-local descriptor slab alive while a leaf Head
+/// points into them.
 pub trait ArchiveOwner: Send + Sync + 'static {}
 
 impl<T: Send + Sync + 'static + ?Sized> ArchiveOwner for T {}
@@ -345,7 +347,7 @@ impl PATCHOwnerGuard {
         Self(OwnerCover::union(self.0, &other.0))
     }
 
-    /// Add one archive allocation before any LocalLeaf into it is installed.
+    /// Add one archive allocation before any backed leaf into it is installed.
     pub(crate) fn retain_archive_owner(&mut self, owner: &Arc<dyn ArchiveOwner>) {
         OwnerCover::retain(&mut self.0, owner);
     }
@@ -869,12 +871,12 @@ pub(crate) enum HeadTag {
     // compares branch sizes — `tag_a > tag_b` ⟺ `size_a > size_b`, and the
     // 2× swap threshold reduces to a single tag-byte compare.
     //
-    // `LocalLeaf` (9) is appended at the end so the Branch widths' `1 << tag`
-    // arithmetic and the Leaf-vs-Branch threshold comparisons are unaffected.
-    // It represents a leaf whose key bytes live in an archive's mmap'd buffer,
-    // referenced via a thin pointer in the Head body slot rather than via a
-    // heap-allocated `Leaf<KEY_LEN, V>`. Lifetime is guaranteed by the owner
-    // set on the enclosing PATCH value.
+    // Archive-backed leaves are appended after the Branch widths so the
+    // widths' `1 << tag` arithmetic and Leaf-vs-Branch threshold comparisons
+    // are unaffected. `LocalLeaf` points directly at archive key bytes;
+    // `HashedLocalLeaf` points at process-local metadata containing the raw key
+    // pointer and its exact SIP_KEY fingerprint. Lifetime for both is
+    // guaranteed by the owner set on the enclosing PATCH value.
     Leaf = 0,
     Branch2 = 1,
     Branch4 = 2,
@@ -885,14 +887,15 @@ pub(crate) enum HeadTag {
     Branch128 = 7,
     Branch256 = 8,
     LocalLeaf = 9,
+    HashedLocalLeaf = 10,
 }
 
 impl HeadTag {
     #[inline]
     fn from_raw(raw: u8) -> Self {
-        debug_assert!(raw <= HeadTag::LocalLeaf as u8);
+        debug_assert!(raw <= HeadTag::HashedLocalLeaf as u8);
         // SAFETY: `HeadTag` is `#[repr(u8)]` with a contiguous discriminant
-        // range 0..=9. The tag bits are written by Head::new/set_body and
+        // range 0..=10. The tag bits are written by Head::new/set_body and
         // Branch::tag, which only emit valid discriminants.
         unsafe { std::mem::transmute(raw) }
     }
@@ -904,6 +907,9 @@ pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     /// mmap'd buffer. Lifetime is implicit — guaranteed by the enclosing
     /// PATCH's owner cover.
     LocalLeaf(NonNull<[u8; KEY_LEN]>),
+    /// Pointer to process-local immutable metadata retained by the enclosing
+    /// PATCH's owner cover together with the archive key bytes it references.
+    HashedLocalLeaf(NonNull<ArchiveLeafDescriptor<KEY_LEN>>),
     Branch(branch::BranchNN<KEY_LEN, O, V>),
 }
 
@@ -915,6 +921,9 @@ pub(crate) enum BodyRef<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     /// lifetime is bound to `&'a Head` via the body pointer; the actual
     /// underlying allocation is kept alive by the enclosing PATCH.
     LocalLeaf(&'a [u8; KEY_LEN]),
+    /// Immutable process-local metadata whose raw key allocation is retained
+    /// by the same enclosing PATCH owner cover.
+    HashedLocalLeaf(&'a ArchiveLeafDescriptor<KEY_LEN>),
     Branch(&'a Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>),
 }
 
@@ -926,6 +935,9 @@ pub(crate) enum BodyMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     /// archive bytes), so the mutable view yields a shared reference. Structural
     /// operations may move the Head while its PATCH owner guard remains live.
     LocalLeaf(&'a [u8; KEY_LEN]),
+    /// Descriptor-backed archive leaves are immutable for the same reason as
+    /// raw LocalLeaves, so their mutable view is shared too.
+    HashedLocalLeaf(&'a ArchiveLeafDescriptor<KEY_LEN>),
     Branch(&'a mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>),
 }
 
@@ -983,7 +995,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     /// Exact structural identity, independent of the contextual routing byte
     /// stored in the Head. Branch and heap-leaf bodies are immutable while
-    /// shared, and LocalLeaf bytes are immutable for their retained-owner
+    /// shared, and archive leaf bodies are immutable for their retained-owner
     /// lifetime, so one body pointer denotes one key set without consulting a
     /// probabilistic fingerprint.
     #[inline]
@@ -1037,6 +1049,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             match self.tag() {
                 HeadTag::Leaf => BodyPtr::Leaf(ptr.cast()),
                 HeadTag::LocalLeaf => BodyPtr::LocalLeaf(ptr.cast()),
+                HeadTag::HashedLocalLeaf => BodyPtr::HashedLocalLeaf(ptr.cast()),
                 branch_tag => {
                     let count = 1 << (branch_tag as usize);
                     BodyPtr::Branch(NonNull::new_unchecked(std::ptr::slice_from_raw_parts(
@@ -1054,6 +1067,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             match self.body() {
                 BodyPtr::Leaf(mut leaf) => BodyMut::Leaf(leaf.as_mut()),
                 BodyPtr::LocalLeaf(ptr) => BodyMut::LocalLeaf(ptr.as_ref()),
+                BodyPtr::HashedLocalLeaf(ptr) => BodyMut::HashedLocalLeaf(ptr.as_ref()),
                 BodyPtr::Branch(mut branch) => {
                     // Ensure ownership: try copy-on-write and update local pointer if needed.
                     let mut branch_nn = branch;
@@ -1068,26 +1082,26 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
-    /// Returns an immutable borrow of the body (Leaf, LocalLeaf, or Branch)
-    /// tied to &self.
+    /// Returns an immutable borrow of the body tied to `&self`.
     pub(crate) fn body_ref(&self) -> BodyRef<'_, KEY_LEN, O, V> {
         match self.body() {
             BodyPtr::Leaf(nn) => BodyRef::Leaf(unsafe { nn.as_ref() }),
             BodyPtr::LocalLeaf(nn) => BodyRef::LocalLeaf(unsafe { nn.as_ref() }),
+            BodyPtr::HashedLocalLeaf(nn) => BodyRef::HashedLocalLeaf(unsafe { nn.as_ref() }),
             BodyPtr::Branch(nn) => BodyRef::Branch(unsafe { nn.as_ref() }),
         }
     }
 
     pub(crate) fn count(&self) -> u64 {
         match self.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => 1,
             BodyRef::Branch(branch) => branch.leaf_count,
         }
     }
 
     pub(crate) fn count_segment(&self, at_depth: usize) -> u64 {
         match self.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => 1,
             BodyRef::Branch(branch) => branch.count_segment(at_depth),
         }
     }
@@ -1100,6 +1114,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => Some(leaf.hash),
             BodyRef::LocalLeaf(_) => None,
+            BodyRef::HashedLocalLeaf(descriptor) => Some(descriptor.hash()),
             BodyRef::Branch(branch) => branch.cached_hash(),
         }
     }
@@ -1116,6 +1131,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 let key = unsafe { *addr_of!(SIP_KEY) };
                 SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
             }
+            BodyRef::HashedLocalLeaf(descriptor) => descriptor.hash(),
             BodyRef::Branch(branch) => {
                 if let Some(hash) = branch.cached_hash() {
                     return hash;
@@ -1153,6 +1169,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 let key = unsafe { *addr_of!(SIP_KEY) };
                 SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
             }
+            BodyRef::HashedLocalLeaf(descriptor) => {
+                use siphasher::sip128::SipHasher24;
+                use std::ptr::addr_of;
+                let key = unsafe { *addr_of!(SIP_KEY) };
+                let semantic: u128 = SipHasher24::new_with_key(&key)
+                    .hash(&descriptor.key()[..])
+                    .into();
+                debug_assert_eq!(
+                    descriptor.hash(),
+                    semantic,
+                    "archive descriptor hash mismatch"
+                );
+                semantic
+            }
             BodyRef::Branch(branch) => {
                 let semantic = branch
                     .child_table
@@ -1170,7 +1200,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     pub(crate) fn end_depth(&self) -> usize {
         match self.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => KEY_LEN,
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => KEY_LEN,
             BodyRef::Branch(branch) => branch.end_depth as usize,
         }
     }
@@ -1184,6 +1214,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => &leaf.key as *const [u8; KEY_LEN],
             BodyRef::LocalLeaf(bytes) => bytes as *const [u8; KEY_LEN],
+            BodyRef::HashedLocalLeaf(descriptor) => descriptor.key_ptr().as_ptr(),
             BodyRef::Branch(branch) => branch.childleaf_ptr(),
         }
     }
@@ -1192,6 +1223,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => &leaf.key,
             BodyRef::LocalLeaf(bytes) => bytes,
+            BodyRef::HashedLocalLeaf(descriptor) => descriptor.key(),
             BodyRef::Branch(branch) => branch.childleaf_key(),
         }
     }
@@ -1252,7 +1284,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             if !this.has_prefix::<KEY_LEN>(start_depth, leaf_key) {
                 return;
             }
-            if matches!(this.tag(), HeadTag::Leaf | HeadTag::LocalLeaf) {
+            if matches!(
+                this.tag(),
+                HeadTag::Leaf | HeadTag::LocalLeaf | HeadTag::HashedLocalLeaf
+            ) {
                 slot.take();
             } else {
                 let mut ed = crate::patch::branch::BranchMut::from_head(this);
@@ -1359,6 +1394,46 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                     ((addr as u64 & Self::BODY_MASK)
                         | ((key as u64) << 56)
                         | (HeadTag::LocalLeaf as u64)) as usize
+                },
+            ));
+            Self {
+                tptr,
+                key_ordering: PhantomData,
+                key_segments: PhantomData,
+                value: PhantomData,
+            }
+        }
+    }
+
+    /// Constructs a descriptor-backed archive leaf. Unlike [`Self::new_local_leaf`],
+    /// the Head body points at process-local metadata rather than directly at
+    /// archive bytes; [`Self::childleaf_ptr`] deliberately unwraps the raw key
+    /// pointer before installing a representative on a Branch.
+    ///
+    /// # Safety
+    ///
+    /// - `descriptor` must remain valid and immutable for at least as long as
+    ///   this Head exists.
+    /// - The descriptor's raw key pointer must remain valid and immutable for
+    ///   the same lifetime.
+    /// - The enclosing PATCH owner cover must retain an allocation that owns
+    ///   both the descriptor and its raw key bytes.
+    /// - `descriptor` must be 16-byte aligned; this is debug-asserted.
+    unsafe fn new_hashed_local_leaf(
+        key: u8,
+        descriptor: NonNull<ArchiveLeafDescriptor<KEY_LEN>>,
+    ) -> Self {
+        unsafe {
+            let tptr = std::ptr::NonNull::new_unchecked((descriptor.as_ptr() as *mut u8).map_addr(
+                |addr| {
+                    debug_assert_eq!(
+                        addr as u64 & Self::TAG_MASK,
+                        0,
+                        "archive leaf descriptor must be 16-byte aligned"
+                    );
+                    ((addr as u64 & Self::BODY_MASK)
+                        | ((key as u64) << 56)
+                        | (HeadTag::HashedLocalLeaf as u64)) as usize
                 },
             ));
             Self {
@@ -1657,7 +1732,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // scatter machinery.
         let small = match other.body_ref() {
             BodyRef::Branch(b) => (b.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD,
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => unreachable!(),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => {
+                unreachable!()
+            }
         };
         if small {
             return Self::union(this, other, at_depth);
@@ -2060,6 +2137,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     bytes, prefix, at_depth, f,
                 )
             }
+            BodyRef::HashedLocalLeaf(descriptor) => {
+                leaf::key_ops::infixes::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O, F>(
+                    descriptor.key(),
+                    prefix,
+                    at_depth,
+                    f,
+                )
+            }
             BodyRef::Branch(branch) => {
                 branch.infixes::<PREFIX_LEN, INFIX_LEN, F>(prefix, at_depth, f)
             }
@@ -2085,6 +2170,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     bytes, prefix, at_depth, min_infix, max_infix, f,
                 )
             }
+            BodyRef::HashedLocalLeaf(descriptor) => {
+                leaf::key_ops::infixes_range::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O, F>(
+                    descriptor.key(),
+                    prefix,
+                    at_depth,
+                    min_infix,
+                    max_infix,
+                    f,
+                )
+            }
             BodyRef::Branch(branch) => branch.infixes_range::<PREFIX_LEN, INFIX_LEN, F>(
                 prefix, at_depth, min_infix, max_infix, f,
             ),
@@ -2105,6 +2200,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::LocalLeaf(bytes) => {
                 leaf::key_ops::first_infix_range::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O>(
                     bytes, prefix, at_depth, min_infix, max_infix,
+                )
+            }
+            BodyRef::HashedLocalLeaf(descriptor) => {
+                leaf::key_ops::first_infix_range::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O>(
+                    descriptor.key(),
+                    prefix,
+                    at_depth,
+                    min_infix,
+                    max_infix,
                 )
             }
             BodyRef::Branch(branch) => branch
@@ -2128,6 +2232,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     bytes, prefix, at_depth, min_infix, max_infix,
                 )
             }
+            BodyRef::HashedLocalLeaf(descriptor) => {
+                leaf::key_ops::count_range::<KEY_LEN, PREFIX_LEN, INFIX_LEN, O>(
+                    descriptor.key(),
+                    prefix,
+                    at_depth,
+                    min_infix,
+                    max_infix,
+                )
+            }
             BodyRef::Branch(branch) => {
                 branch.count_range::<PREFIX_LEN, INFIX_LEN>(prefix, at_depth, min_infix, max_infix)
             }
@@ -2147,6 +2260,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::LocalLeaf(bytes) => {
                 leaf::key_ops::has_prefix::<KEY_LEN, O>(bytes, at_depth, prefix)
             }
+            BodyRef::HashedLocalLeaf(descriptor) => {
+                leaf::key_ops::has_prefix::<KEY_LEN, O>(descriptor.key(), at_depth, prefix)
+            }
             BodyRef::Branch(branch) => branch.has_prefix::<PREFIX_LEN>(at_depth, prefix),
         }
     }
@@ -2160,7 +2276,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             assert!(PREFIX_LEN <= KEY_LEN);
         }
         match self.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => 1,
             BodyRef::Branch(branch) => branch.traversal_depth::<PREFIX_LEN>(at_depth, prefix),
         }
     }
@@ -2175,15 +2291,32 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 if !leaf::key_ops::matches::<KEY_LEN, O>(bytes, at_depth, key) {
                     return None;
                 }
-                // SAFETY: LocalLeaf is only constructed by the SimpleArchive
-                // ingestion path (step 3), which constrains the PATCH to
-                // `V = ()`. The `Option<&V>` here therefore points at a
+                // SAFETY: raw LocalLeaf construction is available only on
+                // `Head<_, _, ()>`, which constrains the PATCH to `V = ()`.
+                // The `Option<&V>` here therefore points at a
                 // zero-sized value; a static `()` provides the address.
                 // For non-`()` V this branch is unreachable because
                 // `Head::new_local_leaf` is defined only for `V = ()`.
                 static UNIT: () = ();
                 let unit_ref: &V = unsafe {
                     debug_assert_eq!(std::mem::size_of::<V>(), 0, "LocalLeaf requires V = ()");
+                    &*(&UNIT as *const () as *const V)
+                };
+                Some(unit_ref)
+            }
+            BodyRef::HashedLocalLeaf(descriptor) => {
+                if !leaf::key_ops::matches::<KEY_LEN, O>(descriptor.key(), at_depth, key) {
+                    return None;
+                }
+                // SAFETY: descriptor-backed archive leaves share the same
+                // `V = ()` construction boundary as raw LocalLeaves.
+                static UNIT: () = ();
+                let unit_ref: &V = unsafe {
+                    debug_assert_eq!(
+                        std::mem::size_of::<V>(),
+                        0,
+                        "HashedLocalLeaf requires V = ()"
+                    );
                     &*(&UNIT as *const () as *const V)
                 };
                 Some(unit_ref)
@@ -2201,6 +2334,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::Leaf(leaf) => leaf.segmented_len::<O, PREFIX_LEN>(at_depth, prefix),
             BodyRef::LocalLeaf(bytes) => {
                 leaf::key_ops::segmented_len::<KEY_LEN, PREFIX_LEN, O>(bytes, at_depth, prefix)
+            }
+            BodyRef::HashedLocalLeaf(descriptor) => {
+                leaf::key_ops::segmented_len::<KEY_LEN, PREFIX_LEN, O>(
+                    descriptor.key(),
+                    at_depth,
+                    prefix,
+                )
             }
             BodyRef::Branch(branch) => branch.segmented_len::<PREFIX_LEN>(at_depth, prefix),
         }
@@ -2262,14 +2402,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 
     /// Diagnostic: accumulate (branch nodes, total child-table slots,
-    /// heap-`Leaf` nodes, `LocalLeaf` slots) over the subtree. Used to
+    /// heap-`Leaf` nodes, archive-backed leaf slots) over the subtree. Used to
     /// decompose a PATCH's *structural* byte size (vs resident RSS).
     /// `branches` × `BRANCH_BASE_SIZE` + `slots` × 8 is the branch
     /// allocation total; heap leaves add one `Leaf` node each.
     pub(crate) fn node_stats(&self, acc: &mut (u64, u64, u64, u64)) {
         match self.body_ref() {
             BodyRef::Leaf(_) => acc.2 += 1,
-            BodyRef::LocalLeaf(_) => acc.3 += 1,
+            BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => acc.3 += 1,
             BodyRef::Branch(branch) => {
                 acc.0 += 1;
                 acc.1 += branch.child_table.len() as u64;
@@ -2558,10 +2698,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Clone for Head<KEY_LEN, O, 
         unsafe {
             match self.body() {
                 BodyPtr::Leaf(leaf) => Self::new(self.key(), Leaf::rc_inc(leaf)),
-                BodyPtr::LocalLeaf(_) => {
-                    // LocalLeaf has no refcount. Its enclosing PATCH values
-                    // retain the archive allocation, so cloning the Head only
-                    // copies the tagged pointer.
+                BodyPtr::LocalLeaf(_) | BodyPtr::HashedLocalLeaf(_) => {
+                    // Archive-backed leaf bodies have no per-Head refcount.
+                    // Their enclosing PATCH values retain the raw allocation
+                    // (and descriptor slab when present), so cloning the Head
+                    // only copies the tagged pointer.
                     Self {
                         tptr: self.tptr,
                         key_ordering: PhantomData,
@@ -2584,9 +2725,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
         unsafe {
             match self.body() {
                 BodyPtr::Leaf(leaf) => Leaf::rc_dec(leaf),
-                BodyPtr::LocalLeaf(_) => {
+                BodyPtr::LocalLeaf(_) | BodyPtr::HashedLocalLeaf(_) => {
                     // No-op: the enclosing PATCH owner cover, not the leaf,
-                    // retains the archive bytes.
+                    // retains the archive bytes and optional descriptor slab.
                 }
                 BodyPtr::Branch(branch) => Branch::rc_dec(branch),
             }
@@ -2616,7 +2757,7 @@ where
 {
     // Field order is deliberate: Heads drop before the owner guard.
     root: Option<Head<KEY_LEN, O, V>>,
-    /// Conservative lifetime guard for every LocalLeaf anywhere below root.
+    /// Conservative lifetime guard for every archive-backed leaf below root.
     /// The concrete Arc is thin, so this adds eight bytes per PATCH while
     /// removing sixteen bytes from every Branch.
     owners: Option<Arc<OwnerCover>>,
@@ -2764,7 +2905,7 @@ where
     }
 
     /// Diagnostic structural census: returns
-    /// `(branch_nodes, child_table_slots, heap_leaf_nodes, local_leaf_slots)`.
+    /// `(branch_nodes, child_table_slots, heap_leaf_nodes, archive_leaf_slots)`.
     /// Structural branch bytes ≈ `branches * BRANCH_BASE_SIZE + slots * 8`;
     /// heap leaves add a `Leaf` node each (the key is shared across the six
     /// orderings, so count it once per trible, not once per ordering).
@@ -2779,9 +2920,11 @@ where
     #[cfg(debug_assertions)]
     fn debug_check_owner_invariant(&self) {
         debug_assert!(
-            self.root.as_ref().map(|root| root.tag()) != Some(HeadTag::LocalLeaf)
-                || self.owners.is_some(),
-            "a root LocalLeaf must retain its archive owner",
+            !matches!(
+                self.root.as_ref().map(|root| root.tag()),
+                Some(HeadTag::LocalLeaf) | Some(HeadTag::HashedLocalLeaf)
+            ) || self.owners.is_some(),
+            "a root archive-backed leaf must retain its owner",
         );
     }
 
@@ -2880,7 +3023,7 @@ where
     /// # Safety
     ///
     /// `guard` must retain every archive allocation retained by the current
-    /// owner guard. Violating this requirement can leave a LocalLeaf dangling.
+    /// owner guard. Violating this requirement can leave an archive leaf dangling.
     pub(crate) unsafe fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
         #[cfg(debug_assertions)]
         debug_assert!(
@@ -3296,7 +3439,7 @@ where
 
             while let Some(head) = stack.pop() {
                 match head.body_ref() {
-                    BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {}
+                    BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => {}
                     BodyRef::Branch(b) => {
                         let size = b.child_table.len();
                         let idx = size.trailing_zeros() as usize - 1;
@@ -3322,8 +3465,9 @@ where
 }
 
 /// Archive-backed insertion path, available only for `V = ()` because
-/// [`ArchiveEntry`] does not carry a value. Every inserted key remains a
-/// LocalLeaf while the PATCH's root owner cover retains its allocation.
+/// [`ArchiveEntry`] does not carry a value. Every inserted key remains an
+/// archive-backed leaf while the PATCH's root owner cover retains its
+/// allocation.
 impl<const KEY_LEN: usize, O> PATCH<KEY_LEN, O, ()>
 where
     O: KeySchema<KEY_LEN>,
@@ -3450,7 +3594,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
             if let Some(child) = iter.next() {
                 if let Some(child) = child {
                     match child.body_ref() {
-                        BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                        BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => {
                             self.remaining = self.remaining.saturating_sub(1);
                             // Use the safe accessor on the child reference to obtain the leaf key bytes.
                             return Some(child.childleaf_key());
@@ -3503,7 +3647,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHOrderedIterator<'a
         if let Some(root) = &patch.root {
             r.stack.push(ArrayVec::new());
             match root.body_ref() {
-                BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => {
                     r.stack[0].push(root);
                 }
                 BodyRef::Branch(branch) => {
@@ -3520,7 +3664,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHOrderedIterator<'a
 // --- Owned consuming iterators ---
 /// Iterator that owns a PATCH and yields keys in key-order. The iterator
 /// consumes the PATCH, drains owned Heads through a queue, and keeps the
-/// PATCH's archive-owner cover alive until every LocalLeaf has been copied out.
+/// PATCH's archive-owner cover alive until every backed leaf has been copied out.
 pub struct PATCHIntoIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     // Field order is deliberate: queued Heads drop before the owner guard.
     queue: Vec<Head<KEY_LEN, O, V>>,
@@ -3548,6 +3692,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator for PATCHIntoItera
                 BodyMut::LocalLeaf(bytes) => {
                     self.remaining = self.remaining.saturating_sub(1);
                     return Some(*bytes);
+                }
+                BodyMut::HashedLocalLeaf(descriptor) => {
+                    self.remaining = self.remaining.saturating_sub(1);
+                    return Some(*descriptor.key());
                 }
                 BodyMut::Branch(branch) => {
                     for slot in branch.child_table.iter_mut().rev() {
@@ -3589,6 +3737,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
                 BodyMut::LocalLeaf(bytes) => {
                     self.remaining = self.remaining.saturating_sub(1);
                     return Some(*bytes);
+                }
+                BodyMut::HashedLocalLeaf(descriptor) => {
+                    self.remaining = self.remaining.saturating_sub(1);
+                    return Some(*descriptor.key());
                 }
                 BodyMut::Branch(branch) => {
                     let slice: &mut [Option<Head<KEY_LEN, O, V>>] = &mut branch.child_table;
@@ -3659,7 +3811,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
         loop {
             if let Some(child) = level.pop() {
                 match child.body_ref() {
-                    BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                    BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => {
                         self.remaining = self.remaining.saturating_sub(1);
                         return Some(child.childleaf_key());
                     }
@@ -3817,6 +3969,30 @@ mod tests {
         drop(owner);
         drop(storage);
         patch
+    }
+
+    fn hashed_descriptor_for_key<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(
+        patch: &PATCH<KEY_LEN, O>,
+        key: &[u8; KEY_LEN],
+    ) -> Option<*const ArchiveLeafDescriptor<KEY_LEN>> {
+        fn visit<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(
+            head: &Head<KEY_LEN, O, ()>,
+            key: &[u8; KEY_LEN],
+        ) -> Option<*const ArchiveLeafDescriptor<KEY_LEN>> {
+            match head.body_ref() {
+                BodyRef::HashedLocalLeaf(descriptor) if descriptor.key() == key => {
+                    Some(descriptor as *const _)
+                }
+                BodyRef::Branch(branch) => branch
+                    .child_table
+                    .iter()
+                    .flatten()
+                    .find_map(|child| visit(child, key)),
+                BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => None,
+            }
+        }
+
+        patch.root.as_ref().and_then(|root| visit(root, key))
     }
 
     /// Build one exact archive-backed row per selected first-byte bucket.
@@ -3982,7 +4158,7 @@ mod tests {
         patch.insert(&Entry::new(&[1, 0]));
         let original = match patch.root.as_ref().unwrap().body_ref() {
             BodyRef::Branch(branch) => branch.cached_hash(),
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => {
                 panic!("fixture root must be a Branch")
             }
         };
@@ -4267,7 +4443,7 @@ mod tests {
                     |child| matches!(child.body_ref(), BodyRef::Branch(branch) if branch.cached_hash().is_none()),
                 )
                 .count(),
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 0,
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => 0,
         };
         assert_eq!(dirty_children, 2);
         deep_hash_audit(&patch);
@@ -5095,6 +5271,106 @@ mod tests {
     }
 
     #[test]
+    fn simplearchive_shares_one_hashed_descriptor_per_row_across_indexes() {
+        assert_eq!(std::mem::align_of::<ArchiveLeafDescriptor<64>>(), 16);
+        assert_eq!(std::mem::size_of::<ArchiveLeafDescriptor<64>>(), 32);
+        assert_eq!(std::mem::size_of::<ArchiveEntry<'static, 64>>(), 32);
+        assert_eq!(std::mem::size_of::<Head<64, IdentitySchema, ()>>(), 8);
+
+        let mut source = TribleSet::new();
+        for discriminator in 1u8..=3 {
+            let mut raw = [0u8; 64];
+            raw[15] = discriminator;
+            raw[31] = discriminator;
+            raw[63] = discriminator;
+            source.insert(&Trible::force_raw(raw).expect("non-nil test trible"));
+        }
+        let expected_hashes = [
+            source.eav.root_hash(),
+            source.eva.root_hash(),
+            source.aev.root_hash(),
+            source.ave.root_hash(),
+            source.vea.root_hash(),
+            source.vae.root_hash(),
+        ];
+        let blob: Blob<SimpleArchive> = SimpleArchive::encode(&source);
+        drop(source);
+        let decoded = TribleSet::try_from_blob(blob).expect("descriptor archive decodes");
+
+        reset_local_leaf_hash_calls();
+        let decoded_hashes = [
+            decoded.eav.root_hash(),
+            decoded.eva.root_hash(),
+            decoded.aev.root_hash(),
+            decoded.ave.root_hash(),
+            decoded.vea.root_hash(),
+            decoded.vae.root_hash(),
+        ];
+        assert_eq!(decoded_hashes, expected_hashes);
+        assert_eq!(
+            local_leaf_hash_calls(),
+            0,
+            "descriptor-backed roots must reuse their resident row hashes"
+        );
+
+        let raw_row_ptrs: Vec<_> = decoded
+            .eav
+            .iter_ordered()
+            .map(|row| row as *const [u8; 64])
+            .collect();
+        let mut descriptor_ptrs = Vec::new();
+        for row in decoded.eav.iter_ordered() {
+            let descriptors = [
+                hashed_descriptor_for_key(&decoded.eav, row),
+                hashed_descriptor_for_key(&decoded.eva, row),
+                hashed_descriptor_for_key(&decoded.aev, row),
+                hashed_descriptor_for_key(&decoded.ave, row),
+                hashed_descriptor_for_key(&decoded.vea, row),
+                hashed_descriptor_for_key(&decoded.vae, row),
+            ];
+            let descriptor = descriptors[0].expect("EAV row must be descriptor-backed");
+            assert_eq!(descriptor as usize & 0x0f, 0);
+            descriptor_ptrs.push(descriptor as usize);
+            assert!(descriptors
+                .iter()
+                .all(|candidate| *candidate == Some(descriptor)));
+
+            // Branch representatives and public iterators must still expose
+            // the raw canonical bytes, not the process-local descriptor body.
+            let raw_ptr = row as *const [u8; 64];
+            let descriptor_ref = unsafe { &*descriptor };
+            assert_eq!(descriptor_ref.key_ptr().as_ptr().cast_const(), raw_ptr);
+        }
+
+        descriptor_ptrs.sort_unstable();
+        descriptor_ptrs.dedup();
+        assert_eq!(descriptor_ptrs.len(), decoded.len());
+        assert!(descriptor_ptrs
+            .windows(2)
+            .all(|pair| { pair[1] - pair[0] == std::mem::size_of::<ArchiveLeafDescriptor<64>>() }));
+
+        fn assert_root_representative_is_raw<O: KeySchema<64>>(
+            patch: &PATCH<64, O>,
+            raw_rows: &[*const [u8; 64]],
+            descriptors: &[usize],
+        ) {
+            let BodyRef::Branch(branch) = patch.root.as_ref().unwrap().body_ref() else {
+                panic!("three archive rows must form a Branch root");
+            };
+            let representative = branch.childleaf_ptr();
+            assert!(raw_rows.contains(&representative));
+            assert!(!descriptors.contains(&(representative as usize)));
+        }
+
+        assert_root_representative_is_raw(&decoded.eav, &raw_row_ptrs, &descriptor_ptrs);
+        assert_root_representative_is_raw(&decoded.eva, &raw_row_ptrs, &descriptor_ptrs);
+        assert_root_representative_is_raw(&decoded.aev, &raw_row_ptrs, &descriptor_ptrs);
+        assert_root_representative_is_raw(&decoded.ave, &raw_row_ptrs, &descriptor_ptrs);
+        assert_root_representative_is_raw(&decoded.vea, &raw_row_ptrs, &descriptor_ptrs);
+        assert_root_representative_is_raw(&decoded.vae, &raw_row_ptrs, &descriptor_ptrs);
+    }
+
+    #[test]
     fn archive_batch_uses_irreducible_zero_one_two_layouts() {
         #[repr(C, align(16))]
         struct AlignedTrible([u8; 64]);
@@ -5630,7 +5906,9 @@ mod tests {
                 .find(|c| c.childleaf_key() == &before_childleaf)
                 .expect("child exists")
                 .key(),
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => panic!("root should be a branch"),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => {
+                panic!("root should be a branch")
+            }
         };
 
         // Replace that child with a new leaf that has a different childleaf key.
@@ -5685,7 +5963,7 @@ mod tests {
         assert_eq!(tree.get(&key2), Some(&2u32));
         let root = tree.root.as_ref().expect("root exists");
         match root.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {}
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) | BodyRef::HashedLocalLeaf(_) => {}
             BodyRef::Branch(_) => panic!("root should have collapsed to a leaf"),
         }
     }

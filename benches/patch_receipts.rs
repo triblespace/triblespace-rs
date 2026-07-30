@@ -13,10 +13,12 @@
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
+use std::ptr::NonNull;
+use std::sync::Arc;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
 use triblespace::core::inline::Encodes;
-use triblespace::core::patch::{Entry, PATCH};
+use triblespace::core::patch::{ArchiveEntry, ArchiveOwner, Entry, PATCH};
 use triblespace::core::trible::{EAVOrder, Trible, TribleSet, TRIBLE_LEN};
 
 const BUCKETS: u8 = 128;
@@ -111,6 +113,37 @@ fn archive_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
     archive_tribleset(rows).eav
 }
 
+/// Build the deliberately hash-lazy control used by the `demoted_*` cases.
+/// Normal SimpleArchive decode now produces descriptor-backed leaves with a
+/// resident row fingerprint; this fixture uses the still-supported public
+/// raw ArchiveEntry API so the benchmark can retain an unknown-leaf control
+/// without weakening the production decoder.
+#[repr(C, align(16))]
+struct AlignedArchiveRow([u8; TRIBLE_LEN]);
+
+fn raw_local_tribleset(rows: &[[u8; TRIBLE_LEN]]) -> TribleSet {
+    let storage = Arc::new(
+        rows.iter()
+            .copied()
+            .map(AlignedArchiveRow)
+            .collect::<Vec<_>>(),
+    );
+    let owner: Arc<dyn ArchiveOwner> = storage.clone();
+    let mut set = TribleSet::new();
+    for row in storage.iter() {
+        // SAFETY: `AlignedArchiveRow` gives every element a tagged-pointer
+        // compatible address. The immutable Vec cannot move or mutate while
+        // its erased Arc is retained by the receiving PATCH owner covers.
+        let entry = unsafe { ArchiveEntry::new(NonNull::from(&row.0), &owner) };
+        set.insert_archive(&entry);
+    }
+    set
+}
+
+fn raw_local_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
+    raw_local_tribleset(rows).eav
+}
+
 /// Turn an exact archive template into a semantically identical dirty one
 /// using only public operations.
 ///
@@ -197,6 +230,25 @@ fn archive_variants(variant_count: u8) -> EavPatch {
     archive_variants_in(0, BUCKETS as u16, 0, variant_count)
 }
 
+fn raw_local_variant(bucket_start: u16, bucket_count: u16, variant: u8) -> EavPatch {
+    let rows = ordered_archive_rows(bucket_start, bucket_count, variant, 1);
+    raw_local_patch(&rows)
+}
+
+fn raw_local_variants_in(
+    bucket_start: u16,
+    bucket_count: u16,
+    variant_start: u8,
+    variant_count: u8,
+) -> EavPatch {
+    balanced_merge(
+        (variant_start as u16..variant_start as u16 + variant_count as u16)
+            .map(|variant| raw_local_variant(bucket_start, bucket_count, variant as u8))
+            .collect(),
+        |left, right| left.union(right),
+    )
+}
+
 fn archive_tribleset_variant(bucket_start: u16, bucket_count: u16, variant: u8) -> TribleSet {
     let rows = ordered_archive_rows(bucket_start, bucket_count, variant, 1);
     archive_tribleset(&rows)
@@ -218,6 +270,25 @@ fn archive_tribleset_variants_in(
 
 fn archive_tribleset_variants(variant_count: u8) -> TribleSet {
     archive_tribleset_variants_in(0, BUCKETS as u16, 0, variant_count)
+}
+
+fn raw_local_tribleset_variant(bucket_start: u16, bucket_count: u16, variant: u8) -> TribleSet {
+    let rows = ordered_archive_rows(bucket_start, bucket_count, variant, 1);
+    raw_local_tribleset(&rows)
+}
+
+fn raw_local_tribleset_variants_in(
+    bucket_start: u16,
+    bucket_count: u16,
+    variant_start: u8,
+    variant_count: u8,
+) -> TribleSet {
+    balanced_merge(
+        (variant_start as u16..variant_start as u16 + variant_count as u16)
+            .map(|variant| raw_local_tribleset_variant(bucket_start, bucket_count, variant as u8))
+            .collect(),
+        |left, right| left.union(right),
+    )
 }
 
 fn heap_oracle(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
@@ -498,18 +569,18 @@ fn union_cases() -> Vec<UnionCase> {
         8_064
     );
 
-    // Balanced variant unions produce an exact root over dirty direct
+    // Raw-local variant unions produce an exact root over dirty direct
     // children. Demote both operands independently so dirty_disjoint and
     // dirty_overlap128 exercise the no-root-demand path. Each helper derives
     // its duplicate leaf under the corresponding fixture's existing owners.
     let dirty_disjoint_left =
-        demote_via_duplicate(archive_variants_in(0, 128, 0, 32), raw_trible(0, 0));
+        demote_via_duplicate(raw_local_variants_in(0, 128, 0, 32), raw_trible(0, 0));
     let dirty_disjoint_right =
-        demote_via_duplicate(archive_variants_in(128, 128, 0, 32), raw_trible(128, 0));
+        demote_via_duplicate(raw_local_variants_in(128, 128, 0, 32), raw_trible(128, 0));
     let dirty_overlap_left =
-        demote_via_duplicate(archive_variants_in(0, 128, 0, 32), raw_trible(0, 0));
+        demote_via_duplicate(raw_local_variants_in(0, 128, 0, 32), raw_trible(0, 0));
     let dirty_overlap_right =
-        demote_via_duplicate(archive_variants_in(0, 128, 31, 32), raw_trible(0, 31));
+        demote_via_duplicate(raw_local_variants_in(0, 128, 31, 32), raw_trible(0, 31));
 
     vec![
         clean_union_case(4_095),
@@ -883,19 +954,19 @@ fn tribleset_union_cases() -> Vec<TribleSetBinaryCase> {
     let expected = union_rows(&left_rows, &right_rows);
     assert_eq!(expected.len(), 8_064);
 
-    // The balanced templates have exact roots over dirty direct children.
-    // Build a fresh second pair before demotion so the two benchmark cases
-    // have the same rows and topology without cross-case refcount coupling;
-    // only the singleton no-op changes root knowledge in the demoted pair.
+    // Normal SimpleArchive templates use resident descriptor hashes. Build the
+    // demoted controls separately from raw ArchiveEntries: their rows and trie
+    // topology match, while only the leaf hash representation differs before
+    // the singleton no-op clears root knowledge.
     let exact_left = archive_tribleset_variants_in(0, 128, 0, 32);
     let exact_right = archive_tribleset_variants_in(0, 128, 31, 32);
     let demoted_left = demote_tribleset_via_duplicate(
-        archive_tribleset_variants_in(0, 128, 0, 32),
+        raw_local_tribleset_variants_in(0, 128, 0, 32),
         &left_rows,
         raw_trible(0, 0),
     );
     let demoted_right = demote_tribleset_via_duplicate(
-        archive_tribleset_variants_in(0, 128, 31, 32),
+        raw_local_tribleset_variants_in(0, 128, 31, 32),
         &right_rows,
         raw_trible(0, 31),
     );
