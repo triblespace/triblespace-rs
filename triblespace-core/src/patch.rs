@@ -23,22 +23,6 @@ mod leaf;
 
 use arrayvec::ArrayVec;
 
-/// Test-only accounting for allocation work while a known archive partition
-/// is assembled into Branches. Explicit per-build sinks avoid global counters
-/// and parallel-test interference; timed calls use the uncounted recursive
-/// monomorphization.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct BranchBuildStats {
-    pub(crate) branches: u64,
-    pub(crate) initial_slots: u64,
-    pub(crate) grow_calls: u64,
-    pub(crate) heads_moved_by_grow: u64,
-    pub(crate) grow_scanned_slots: u64,
-    pub(crate) grow_allocated_slots: u64,
-    pub(crate) final_slots: u64,
-}
-
 /// Re-export of [`Entry`](entry::Entry).
 use branch::*;
 pub use entry::{ArchiveEntry, Entry};
@@ -3651,10 +3635,10 @@ where
     /// Builds a canonical PATCH directly from an unordered row permutation by
     /// partitioning that one buffer in place at each trie depth.
     ///
-    /// This all-six archive experiment deliberately fuses ordering and trie
-    /// construction: no sorted pointer array or per-row leaf descriptor is
-    /// retained. `hashes[row]` is the one transient hash computed for that
-    /// archive row and shared by every index build.
+    /// Archive construction deliberately fuses ordering and trie construction:
+    /// no sorted pointer array or per-row leaf descriptor is retained.
+    /// `hashes[row]` is the one transient hash computed for that archive row
+    /// and shared by every index build.
     ///
     /// # Safety
     ///
@@ -3663,39 +3647,13 @@ where
     /// - Every key pointer must be 16-byte aligned, immutable, and kept alive
     ///   by an archive owner already retained in `guard`.
     /// - `keys` must contain no duplicates.
-    #[cfg(test)]
-    pub(crate) unsafe fn from_archive_partition_for_test(
+    #[cfg(any(test, feature = "parallel"))]
+    pub(crate) unsafe fn from_archive_partition(
         keys: &[[u8; KEY_LEN]],
         hashes: &[u128],
         rows: &mut [u32],
         guard: &PATCHOwnerGuard,
     ) -> Self {
-        unsafe {
-            Self::from_archive_partition_with_stats_sink_for_test::<false>(
-                keys,
-                hashes,
-                rows,
-                guard,
-                std::ptr::null_mut(),
-            )
-        }
-    }
-
-    /// Counted or zero-cost-uninstrumented implementation of
-    /// [`Self::from_archive_partition_for_test`]. The all-six census passes one
-    /// shared sink through every index; ordinary and timed construction uses
-    /// the `false` monomorphization, in which every counter branch disappears.
-    /// When `COUNT` is true, `stats` must be a valid exclusive pointer for the
-    /// complete call; when false it is never dereferenced and may be null.
-    #[cfg(test)]
-    pub(crate) unsafe fn from_archive_partition_with_stats_sink_for_test<const COUNT: bool>(
-        keys: &[[u8; KEY_LEN]],
-        hashes: &[u128],
-        rows: &mut [u32],
-        guard: &PATCHOwnerGuard,
-        stats: *mut BranchBuildStats,
-    ) -> Self {
-        debug_assert!(!COUNT || !stats.is_null());
         // Branch child tables share the randomness initialized alongside the
         // SIP key. Initialize at this boundary so a prehashed caller cannot
         // build under the zero permutation and later observe a changed lookup.
@@ -3710,9 +3668,7 @@ where
             return Self::new();
         }
 
-        let (root, _) = unsafe {
-            Self::build_archive_partition_head_for_test::<COUNT>(keys, hashes, rows, 0, stats)
-        };
+        let (root, _) = unsafe { Self::build_archive_partition_head(keys, hashes, rows, 0) };
         let result = Self {
             root: Some(root.with_start(0)),
             owners: guard.0.clone(),
@@ -3722,7 +3678,7 @@ where
     }
 
     /// Representative-LCP plus in-place MSD-radix worker for
-    /// [`Self::from_archive_partition_for_test`].
+    /// [`Self::from_archive_partition`].
     ///
     /// After examining `k` rows, `end_depth` is the minimum LCP length between
     /// the representative and those rows, bounded below by the incoming
@@ -3730,13 +3686,12 @@ where
     /// unique multi-row input at least two byte buckets exist at `end_depth`.
     /// Finding that compressed boundary row-major avoids one whole-slice pass
     /// for every shared byte of a long prefix.
-    #[cfg(test)]
-    unsafe fn build_archive_partition_head_for_test<const COUNT: bool>(
+    #[cfg(any(test, feature = "parallel"))]
+    unsafe fn build_archive_partition_head(
         keys: &[[u8; KEY_LEN]],
         hashes: &[u128],
         rows: &mut [u32],
         depth: usize,
-        stats: *mut BranchBuildStats,
     ) -> (Head<KEY_LEN, O, ()>, u128) {
         debug_assert!(!rows.is_empty());
         if rows.len() == 1 {
@@ -3798,15 +3753,9 @@ where
         } else {
             fanout.next_power_of_two()
         };
-        if COUNT {
-            let stats = unsafe { &mut *stats };
-            stats.branches += 1;
-            stats.initial_slots += initial_slots as u64;
-        }
-
         // Turn the histogram into cumulative exclusive ends. `next` advances
         // the first unfilled position in each occupied range. u32 is exact:
-        // the public probe rejects archives whose row ordinals do not fit it.
+        // the construction boundary rejects chunks whose ordinals do not fit.
         let mut next = [0u32; 256];
         let mut offset = 0u32;
         let mut prefix_buckets = occupied;
@@ -3841,22 +3790,15 @@ where
 
         let first_end = ends[first_bucket as usize] as usize;
         let (first_head, first_hash) = unsafe {
-            Self::build_archive_partition_head_for_test::<COUNT>(
-                keys,
-                hashes,
-                &mut rows[..first_end],
-                end_depth + 1,
-                stats,
-            )
+            Self::build_archive_partition_head(keys, hashes, &mut rows[..first_end], end_depth + 1)
         };
         let second_end = ends[second_bucket as usize] as usize;
         let (second_head, second_hash) = unsafe {
-            Self::build_archive_partition_head_for_test::<COUNT>(
+            Self::build_archive_partition_head(
                 keys,
                 hashes,
                 &mut rows[first_end..second_end],
                 end_depth + 1,
-                stats,
             )
         };
 
@@ -3884,39 +3826,23 @@ where
         let mut hash = first_hash ^ second_hash;
         let Some(mut byte) = first_extra else {
             debug_assert_eq!(second_end, rows.len());
-            if COUNT {
-                let stats = unsafe { &mut *stats };
-                stats.final_slots += 2;
-            }
             return (root, hash);
         };
         let mut editor = BranchMut::from_head(&mut root);
         let mut range_start = second_end;
-        let mut resident_children = 2usize;
 
         loop {
             let range_end = ends[byte as usize] as usize;
             let (child, child_hash) = unsafe {
-                Self::build_archive_partition_head_for_test::<COUNT>(
+                Self::build_archive_partition_head(
                     keys,
                     hashes,
                     &mut rows[range_start..range_end],
                     end_depth + 1,
-                    stats,
                 )
             };
             hash ^= child_hash;
-            if COUNT {
-                let stats = unsafe { &mut *stats };
-                editor.install_child_growing_counted(
-                    child.with_key(byte),
-                    resident_children,
-                    stats,
-                );
-            } else {
-                editor.install_child_growing(child.with_key(byte));
-            }
-            resident_children += 1;
+            editor.install_child_growing(child.with_key(byte));
             range_start = range_end;
             let Some(next_byte) = child_buckets.drain_next_ascending() else {
                 break;
@@ -3924,11 +3850,6 @@ where
             byte = next_byte;
         }
         debug_assert_eq!(range_start, rows.len());
-        debug_assert_eq!(resident_children, fanout);
-        if COUNT {
-            let stats = unsafe { &mut *stats };
-            stats.final_slots += editor.child_table.len() as u64;
-        }
 
         // Bulk installation deliberately leaves the first-two aggregates
         // untouched until every remaining child is present. Rebuild counts,
@@ -4534,13 +4455,9 @@ mod tests {
                 .map(|key| hash_key(&key[..]))
                 .collect::<Vec<_>>();
             let mut rows = (0..fanout as u32).rev().collect::<Vec<_>>();
-            let mut stats = BranchBuildStats::default();
 
-            let patch = unsafe {
-                PATCH::<64>::from_archive_partition_with_stats_sink_for_test::<true>(
-                    keys, &hashes, &mut rows, &guard, &mut stats,
-                )
-            };
+            let patch =
+                unsafe { PATCH::<64>::from_archive_partition(keys, &hashes, &mut rows, &guard) };
 
             let mut expected = keys.to_vec();
             expected.sort_unstable();
@@ -4556,28 +4473,13 @@ mod tests {
                 Some(hashes.iter().copied().fold(0, |acc, hash| acc ^ hash)),
             );
             assert_eq!(patch.branch_fanout_histogram()[fanout], 1);
-            assert_eq!(stats.branches, 1);
-            assert_eq!(stats.initial_slots, fanout.next_power_of_two() as u64);
-            assert_eq!(stats.final_slots, patch.total_table_slots());
-            assert!(stats.final_slots >= stats.initial_slots);
-            assert!(stats.final_slots <= 256);
-            assert!(stats.final_slots.is_power_of_two());
-            assert_eq!(
-                stats.grow_calls,
-                (stats.final_slots / stats.initial_slots).ilog2() as u64,
-            );
-            assert_eq!(
-                stats.grow_scanned_slots,
-                stats.final_slots - stats.initial_slots,
-            );
-            assert_eq!(
-                stats.grow_allocated_slots,
-                2 * (stats.final_slots - stats.initial_slots),
-            );
-            assert!(stats.heads_moved_by_grow <= (fanout as u64 - 1) * stats.grow_calls,);
-            if stats.initial_slots == 256 {
-                assert_eq!(stats.grow_calls, 0);
-                assert_eq!(stats.heads_moved_by_grow, 0);
+            let initial_slots = fanout.next_power_of_two() as u64;
+            let final_slots = patch.total_table_slots();
+            assert!(final_slots >= initial_slots);
+            assert!(final_slots <= 256);
+            assert!(final_slots.is_power_of_two());
+            if initial_slots == 256 {
+                assert_eq!(final_slots, 256);
             }
 
             let survivor = patch.clone();

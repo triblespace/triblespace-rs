@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Parallel `SimpleArchive` decoding builds aligned chunks bottom-up.** Each
+  worker validates and hashes its canonical rows once, reuses one sparse `u32`
+  permutation across all six PATCH orders, and allocates branch tables from
+  their known fanout. Small archives, unaligned heap-backed input, and chunks
+  whose row ordinals exceed `u32` retain the existing online paths.
+
 - **Experimental PATCH union can leave internal hashes lazy.** A zero Branch
   aggregate is treated as a conservative uncached sentinel, serial union
   propagates exact intersection-hash receipts only when a resident cache can

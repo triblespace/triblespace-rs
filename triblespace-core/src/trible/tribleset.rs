@@ -14,8 +14,6 @@ use crate::inline::encodings::hash::Blake3;
 use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
-#[cfg(test)]
-use crate::patch::BranchBuildStats;
 use crate::patch::Entry;
 use crate::patch::PATCHOwnerGuard;
 use crate::patch::PATCH;
@@ -496,63 +494,29 @@ impl TribleSet {
         }
     }
 
-    /// Test-only all-six construction probe over one validated archive slice.
+    /// Builds all six indexes over one validated archive slice.
     ///
     /// A single `u32` row permutation is reset to archive order and partitioned
     /// in place for each schema. The reset is intentional: carrying the prior
     /// schema's permutation is semantically valid but destroys archive-row
     /// locality for the next build. `hashes` is likewise shared by all six
-    /// builds, so the experiment retains neither per-index row arrays nor
+    /// builds, so construction retains neither per-index row arrays nor
     /// persistent leaf descriptors.
     ///
     /// # Safety
     ///
     /// Every row must be 16-byte aligned, immutable, duplicate-free, and kept
     /// alive by `owner`. `hashes[row]` must be the PATCH key hash of `rows[row]`.
-    #[cfg(test)]
-    pub(crate) unsafe fn from_archive_partition_for_test(
+    #[cfg(any(test, feature = "parallel"))]
+    pub(crate) unsafe fn from_archive_partition(
         rows: &[[u8; TRIBLE_LEN]],
         hashes: &[u128],
         owner: &Arc<dyn ArchiveOwner>,
-    ) -> (Self, usize) {
-        unsafe {
-            Self::from_archive_partition_inner_for_test::<false>(
-                rows,
-                hashes,
-                owner,
-                std::ptr::null_mut(),
-            )
-        }
-    }
-
-    /// Counted twin used only for an untimed allocation census.
-    #[cfg(test)]
-    pub(crate) unsafe fn from_archive_partition_with_stats_for_test(
-        rows: &[[u8; TRIBLE_LEN]],
-        hashes: &[u128],
-        owner: &Arc<dyn ArchiveOwner>,
-    ) -> (Self, usize, BranchBuildStats) {
-        let mut stats = BranchBuildStats::default();
-        let (result, permutation_bytes) = unsafe {
-            Self::from_archive_partition_inner_for_test::<true>(rows, hashes, owner, &mut stats)
-        };
-        (result, permutation_bytes, stats)
-    }
-
-    /// The `false` monomorphization receives no telemetry object and erases all
-    /// counter branches, keeping ordinary and timed construction unchanged.
-    #[cfg(test)]
-    unsafe fn from_archive_partition_inner_for_test<const COUNT: bool>(
-        rows: &[[u8; TRIBLE_LEN]],
-        hashes: &[u128],
-        owner: &Arc<dyn ArchiveOwner>,
-        stats: *mut BranchBuildStats,
-    ) -> (Self, usize) {
-        debug_assert!(!COUNT || !stats.is_null());
+    ) -> Self {
         assert_eq!(rows.len(), hashes.len());
         assert!(
             u32::try_from(rows.len()).is_ok(),
-            "the one-buffer probe uses u32 archive row indices",
+            "archive row ordinals must fit the partition metadata",
         );
 
         let mut owners = PATCHOwnerGuard::default();
@@ -560,55 +524,32 @@ impl TribleSet {
             owners.retain_archive_owner(owner);
         }
         let mut permutation = vec![0u32; rows.len()];
-        let permutation_bytes = permutation.len() * std::mem::size_of::<u32>();
         fn reset(permutation: &mut [u32]) {
             for (row, slot) in permutation.iter_mut().enumerate() {
                 *slot = row as u32;
             }
         }
 
-        reset(&mut permutation);
-        let eav =
-            unsafe {
-                PATCH::<TRIBLE_LEN, EAVOrder>::from_archive_partition_with_stats_sink_for_test::<
-                    COUNT,
-                >(rows, hashes, &mut permutation, &owners, stats)
-            };
-        reset(&mut permutation);
-        let aev =
-            unsafe {
-                PATCH::<TRIBLE_LEN, AEVOrder>::from_archive_partition_with_stats_sink_for_test::<
-                    COUNT,
-                >(rows, hashes, &mut permutation, &owners, stats)
-            };
-        reset(&mut permutation);
-        let vae =
-            unsafe {
-                PATCH::<TRIBLE_LEN, VAEOrder>::from_archive_partition_with_stats_sink_for_test::<
-                    COUNT,
-                >(rows, hashes, &mut permutation, &owners, stats)
-            };
-        reset(&mut permutation);
-        let eva =
-            unsafe {
-                PATCH::<TRIBLE_LEN, EVAOrder>::from_archive_partition_with_stats_sink_for_test::<
-                    COUNT,
-                >(rows, hashes, &mut permutation, &owners, stats)
-            };
-        reset(&mut permutation);
-        let vea =
-            unsafe {
-                PATCH::<TRIBLE_LEN, VEAOrder>::from_archive_partition_with_stats_sink_for_test::<
-                    COUNT,
-                >(rows, hashes, &mut permutation, &owners, stats)
-            };
-        reset(&mut permutation);
-        let ave =
-            unsafe {
-                PATCH::<TRIBLE_LEN, AVEOrder>::from_archive_partition_with_stats_sink_for_test::<
-                    COUNT,
-                >(rows, hashes, &mut permutation, &owners, stats)
-            };
+        macro_rules! build_index {
+            ($order:ty) => {{
+                reset(&mut permutation);
+                unsafe {
+                    PATCH::<TRIBLE_LEN, $order>::from_archive_partition(
+                        rows,
+                        hashes,
+                        &mut permutation,
+                        &owners,
+                    )
+                }
+            }};
+        }
+
+        let eav = build_index!(EAVOrder);
+        let aev = build_index!(AEVOrder);
+        let vae = build_index!(VAEOrder);
+        let eva = build_index!(EVAOrder);
+        let vea = build_index!(VEAOrder);
+        let ave = build_index!(AVEOrder);
 
         let result = Self {
             eav,
@@ -619,7 +560,7 @@ impl TribleSet {
             vae,
         };
         debug_assert!(result.owner_guards_are_shared());
-        (result, permutation_bytes)
+        result
     }
 
     /// Inserts an archive-backed trible into all six covering indexes

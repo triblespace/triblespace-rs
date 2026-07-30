@@ -79,27 +79,6 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         }
     }
 
-    /// Counted twin of [`Self::install_child_growing`] for the untimed archive
-    /// construction census. `resident_children` is the number of Heads already
-    /// present before `head` is attempted, and therefore the exact number moved
-    /// by every fallback growth while that Head remains displaced.
-    #[cfg(test)]
-    pub fn install_child_growing_counted(
-        &mut self,
-        head: Head<KEY_LEN, O, V>,
-        resident_children: usize,
-        stats: &mut BranchBuildStats,
-    ) {
-        unsafe {
-            Branch::install_child_growing_counted(
-                &mut self.branch_nn,
-                head,
-                resident_children,
-                stats,
-            );
-        }
-    }
-
     /// Finish a bulk rewrite without traversing children for their hashes.
     ///
     /// Counts and the representative child pointer are structural and can be
@@ -297,8 +276,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         )
     }
 
-    /// Test-only direct-capacity variant for a Branch whose complete fanout is
-    /// known before allocation. Binary Branches deliberately keep using
+    /// Direct-capacity variant for a Branch whose complete fanout is known
+    /// before allocation. Binary Branches deliberately keep using
     /// [`Self::new_with_child_hashes`], preserving their direct two-slot path.
     ///
     /// `size` is the minimal power-of-two slot capacity for the known fanout.
@@ -306,7 +285,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// allocation is wider than two slots, because raw slots zero and one are
     /// no longer necessarily lookup locations. The archive construction
     /// boundary initializes byte-table randomness before this method is used.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "parallel"))]
     pub(super) fn new_with_child_hashes_capacity(
         end_depth: usize,
         lchild: Head<KEY_LEN, O, V>,
@@ -662,30 +641,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let mut branch_ptr = branch_nn.as_ptr();
         while let Some(displaced) = (*branch_ptr).child_table.table_insert(to_insert) {
             to_insert = displaced;
-            Self::grow(branch_nn);
-            branch_ptr = branch_nn.as_ptr();
-        }
-    }
-
-    /// Counted test-only form of [`Self::install_child_growing`]. The ordinary
-    /// method remains the timed and production path, so telemetry cannot make
-    /// a candidate look faster merely by avoiding instrumentation work.
-    #[cfg(test)]
-    pub(crate) unsafe fn install_child_growing_counted(
-        branch_nn: &mut NonNull<Self>,
-        head: Head<KEY_LEN, O, V>,
-        resident_children: usize,
-        stats: &mut BranchBuildStats,
-    ) {
-        let mut to_insert = head;
-        let mut branch_ptr = branch_nn.as_ptr();
-        while let Some(displaced) = (*branch_ptr).child_table.table_insert(to_insert) {
-            to_insert = displaced;
-            let old_slots = dst_len(addr_of!((*branch_ptr).child_table));
-            stats.grow_calls += 1;
-            stats.heads_moved_by_grow += resident_children as u64;
-            stats.grow_scanned_slots += old_slots as u64;
-            stats.grow_allocated_slots += (old_slots * 2) as u64;
             Self::grow(branch_nn);
             branch_ptr = branch_nn.as_ptr();
         }
