@@ -397,14 +397,9 @@ impl OwnerNode {
 
     fn same_shape(&self, other: &Self) -> bool {
         match (self, other) {
-            (
-                Self::Owner {
-                    address: left, ..
-                },
-                Self::Owner {
-                    address: right, ..
-                },
-            ) => left == right,
+            (Self::Owner { address: left, .. }, Self::Owner { address: right, .. }) => {
+                left == right
+            }
             (
                 Self::Branch {
                     mask: left_mask,
@@ -1459,11 +1454,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 
     #[inline]
-    fn known_union_hash(
-        left: Option<u128>,
-        right: Option<u128>,
-        overlap: u128,
-    ) -> Option<u128> {
+    fn known_union_hash(left: Option<u128>, right: Option<u128>, overlap: u128) -> Option<u128> {
         Some(left? ^ right? ^ overlap)
     }
 
@@ -1563,15 +1554,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let key = inserted.key();
             let mut overlap = 0;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => {
-                    Some(Head::union_with_overlap(
-                        old,
-                        inserted,
-                        this_depth,
-                        need_overlap.then_some(&mut overlap),
-                        allow_local_demand,
-                    ))
-                }
+                Some(old) => Some(Head::union_with_overlap(
+                    old,
+                    inserted,
+                    this_depth,
+                    need_overlap.then_some(&mut overlap),
+                    allow_local_demand,
+                )),
                 None => Some(inserted),
             });
             let known_hash = need_overlap
@@ -1593,15 +1582,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let key = inserted.key();
             let mut overlap = 0;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => {
-                    Some(Head::union_with_overlap(
-                        old,
-                        inserted,
-                        other_depth,
-                        need_overlap.then_some(&mut overlap),
-                        allow_local_demand,
-                    ))
-                }
+                Some(old) => Some(Head::union_with_overlap(
+                    old,
+                    inserted,
+                    other_depth,
+                    need_overlap.then_some(&mut overlap),
+                    allow_local_demand,
+                )),
                 None => Some(inserted),
             });
             let known_hash = need_overlap
@@ -1645,15 +1632,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let key = inserted.key();
             let mut child_overlap = 0;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => {
-                    Some(Head::union_with_overlap(
-                        old,
-                        inserted,
-                        this_depth,
-                        need_overlap.then_some(&mut child_overlap),
-                        allow_local_demand,
-                    ))
-                }
+                Some(old) => Some(Head::union_with_overlap(
+                    old,
+                    inserted,
+                    this_depth,
+                    need_overlap.then_some(&mut child_overlap),
+                    allow_local_demand,
+                )),
                 None => Some(inserted),
             });
             overlap ^= child_overlap;
@@ -1686,11 +1671,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 
     #[cfg(feature = "parallel")]
-    fn par_union_export_meet(
-        this: Self,
-        other: Self,
-        at_depth: usize,
-    ) -> (Self, ExactHash)
+    fn par_union_export_meet(this: Self, other: Self, at_depth: usize) -> (Self, ExactHash)
     where
         O: Send + Sync,
         V: Send + Sync,
@@ -2830,11 +2811,7 @@ impl SharedMeetReceipt {
     }
 
     #[inline]
-    pub(crate) fn matches(
-        self,
-        left: PatchResidentIdentity,
-        right: PatchResidentIdentity,
-    ) -> bool {
+    pub(crate) fn matches(self, left: PatchResidentIdentity, right: PatchResidentIdentity) -> bool {
         self.left == left && self.right == right
     }
 }
@@ -2870,21 +2847,14 @@ where
 /// Holding the mutable PATCH borrow prevents any intervening mutation. Dropping
 /// the token without finishing is safe: overlap-dependent caches remain dirty.
 #[must_use = "finish with the witness meet receipt or leave the union root dirty"]
-pub(crate) struct DeferredMeetUnion<
-    'a,
-    const KEY_LEN: usize,
-    O: KeySchema<KEY_LEN>,
-    V,
-> {
+pub(crate) struct DeferredMeetUnion<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     patch: &'a mut PATCH<KEY_LEN, O, V>,
     left: PatchResidentIdentity,
     right: PatchResidentIdentity,
     result_count: u64,
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
-    DeferredMeetUnion<'a, KEY_LEN, O, V>
-{
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> DeferredMeetUnion<'a, KEY_LEN, O, V> {
     /// Consume a matching sibling receipt and install the exact result root.
     /// A mismatched receipt or changed result shape fails closed: the root
     /// remains dirty rather than accepting an unrelated fingerprint.
@@ -3128,7 +3098,10 @@ where
             if resident == hash.0 {
                 return;
             }
-            debug_assert_eq!(resident, hash.0, "resident result hash disagrees with receipt");
+            debug_assert_eq!(
+                resident, hash.0,
+                "resident result hash disagrees with receipt"
+            );
         }
 
         match root.tag() {
@@ -3588,8 +3561,7 @@ where
                 let merged = match mode {
                     UnionReceiptMode::Ordinary => Head::par_union(this, other_root, 0),
                     UnionReceiptMode::ExportMeet => {
-                        let (merged, exported) =
-                            Head::par_union_export_meet(this, other_root, 0);
+                        let (merged, exported) = Head::par_union_export_meet(this, other_root, 0);
                         meet = Some(exported);
                         merged
                     }
@@ -4280,9 +4252,7 @@ mod tests {
         root.child_table
             .iter()
             .flatten()
-            .filter(|child| {
-                matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0)
-            })
+            .filter(|child| matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0))
             .count()
     }
 
@@ -4301,9 +4271,7 @@ mod tests {
         let ctx = parallel_union::ParUnionCtx {
             budget: AtomicUsize::new(0),
         };
-        left.root = Some(Head::par_union_with_ctx(
-            this, other, 0, &ctx, None, true,
-        ));
+        left.root = Some(Head::par_union_with_ctx(this, other, 0, &ctx, None, true));
         left.debug_check_owner_invariant();
         left
     }
@@ -4651,10 +4619,7 @@ mod tests {
             TestHead::known_union_hash(Some(0x55), Some(0x55), 0),
             Some(0),
         );
-        assert_eq!(
-            TestHead::known_union_hash(None, Some(0x55), 0),
-            None,
-        );
+        assert_eq!(TestHead::known_union_hash(None, Some(0x55), 0), None,);
     }
 
     #[cfg(feature = "parallel")]
@@ -4712,8 +4677,7 @@ mod tests {
         // making the thread-local census exact: one hash per duplicate and no
         // hash for the other 7,936 input rows.
         reset_local_leaf_hash_calls();
-        let serial_scatter =
-            union_with_exhausted_parallel_budget(left.clone(), right.clone());
+        let serial_scatter = union_with_exhausted_parallel_budget(left.clone(), right.clone());
         assert_eq!(serial_scatter.len(), 8_064);
         assert_eq!(local_leaf_hash_calls(), 128);
         let before_verify = local_leaf_hash_calls();
@@ -4956,10 +4920,7 @@ mod tests {
         assert!(first.root.same_shape(&second.root));
         assert!(first.root.same_shape(&third.root));
         for owner in &owners {
-            assert!(OwnerNode::contains(
-                &first.root,
-                OwnerCover::address(owner)
-            ));
+            assert!(OwnerNode::contains(&first.root, OwnerCover::address(owner)));
         }
         let unrelated = test_archive_owner(255);
         assert!(!OwnerNode::contains(
@@ -5203,12 +5164,10 @@ mod tests {
         let left_owner: Arc<dyn ArchiveOwner> = left_storage.clone();
         let right_owner: Arc<dyn ArchiveOwner> = right_storage.clone();
         let (mut first, mut second) = {
-            let left_entry = unsafe {
-                ArchiveEntry::new(NonNull::from(&left_storage.0), &left_owner)
-            };
-            let right_entry = unsafe {
-                ArchiveEntry::new(NonNull::from(&right_storage.0), &right_owner)
-            };
+            let left_entry =
+                unsafe { ArchiveEntry::new(NonNull::from(&left_storage.0), &left_owner) };
+            let right_entry =
+                unsafe { ArchiveEntry::new(NonNull::from(&right_storage.0), &right_owner) };
 
             let mut first = PATCH::<KEY_LEN, IdentitySchema>::new();
             first.insert_archive(&left_entry);
@@ -5244,10 +5203,7 @@ mod tests {
             first = next_first;
             second = next_second;
 
-            for (patch, owner_root) in [
-                (&first, first_owner_root),
-                (&second, second_owner_root),
-            ] {
+            for (patch, owner_root) in [(&first, first_owner_root), (&second, second_owner_root)] {
                 let cover = patch.owners.as_ref().expect("dirty Head lost its owners");
                 let stats = cover.stats();
                 assert_eq!(cover.owner_count(), 2);
