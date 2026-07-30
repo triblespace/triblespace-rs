@@ -22,7 +22,6 @@ pub fn attributes(input: TokenStream) -> TokenStream {
     ))
 }
 
-
 #[proc_macro]
 pub fn pattern(input: TokenStream) -> TokenStream {
     let base_path = core_base_path();

@@ -877,7 +877,6 @@ pub fn or_words(words: &mut [u32], other: &[u32]) {
     }
 }
 
-
 /// The cooperative protocol that every query participant implements.
 ///
 /// A constraint restricts the values that can be assigned to query variables.
@@ -1465,9 +1464,7 @@ pub use parallel::QueryParIter;
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
-    use rayon::iter::plumbing::{
-        bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer,
-    };
+    use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     /// Parallel iterator over the results of a [`Query`]. Obtained via
@@ -1666,9 +1663,7 @@ mod parallel {
             bridge_unindexed(self, consumer)
         }
     }
-
 }
-
 
 /// Iterate over query results, converting each variable via
 /// [`TryFromInline`](crate::inline::TryFromInline).
@@ -1835,23 +1830,6 @@ mod tests {
         }
         variables
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     pub mod knights {
         use crate::prelude::*;
@@ -2060,10 +2038,6 @@ mod tests {
         assert_eq!(&*record.borrow(), &[b.index, a.index]);
     }
 
-
-
-
-
     #[derive(Clone)]
     struct SetAdmissionProbe {
         descendants: std::sync::Arc<std::sync::Mutex<Vec<RawInline>>>,
@@ -2076,6 +2050,4 @@ mod tests {
         const B: RawInline = [5; 32];
         const LEAF_VALUE: RawInline = [6; 32];
     }
-
-
 }

@@ -408,10 +408,7 @@ fn q5b_semijoin<S: TriblePattern>(src: &S, qa: &DblpAttrs) -> usize {
 #[allow(dead_code)]
 fn q5c_exists<S: TriblePattern>(src: &S, qa: &DblpAttrs) -> bool {
     let has_signature = qa.has_signature.clone();
-    exists!(temp!(
-        (s, o),
-        pattern!(src, [{ ?s @ has_signature: ?o }])
-    ))
+    exists!(temp!((s, o), pattern!(src, [{ ?s @ has_signature: ?o }])))
 }
 
 /// The wired matrix: q1/q3/q4/q5 over any TriblePattern source. Returns the
@@ -813,8 +810,12 @@ fn pile_checkout(
         .expect("list branches");
     let mut named: Vec<(Id, String, TribleSet)> = Vec::new();
     for id in branch_ids {
-        let Ok(Some(meta_handle)) = pile.head(id) else { continue };
-        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue };
+        let Ok(Some(meta_handle)) = pile.head(id) else {
+            continue;
+        };
+        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
+            continue;
+        };
         let handles: Vec<Inline<Handle<LongString>>> = find!(
             (n: Inline<Handle<LongString>>),
             pattern!(&meta, [{ metadata::name: ?n }])
@@ -822,7 +823,9 @@ fn pile_checkout(
         .map(|(n,)| n)
         .collect();
         let [h] = handles[..] else { continue };
-        let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else { continue };
+        let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else {
+            continue;
+        };
         named.push((id, name.as_ref().to_owned(), meta));
     }
     let (branch_id, branch_name, branch_meta) = match branch {
@@ -831,7 +834,10 @@ fn pile_checkout(
             .find(|(_, n, _)| n == want)
             .unwrap_or_else(|| panic!("no branch named {want:?} in pile")),
         None => {
-            let mut data: Vec<_> = named.into_iter().filter(|(_, n, _)| n != "manifest").collect();
+            let mut data: Vec<_> = named
+                .into_iter()
+                .filter(|(_, n, _)| n != "manifest")
+                .collect();
             match data.len() {
                 1 => data.remove(0),
                 n => panic!(
@@ -848,7 +854,9 @@ fn pile_checkout(
     )
     .map(|(c,)| c)
     .collect();
-    let [head] = heads[..] else { panic!("branch {branch_name:?} has no unique head commit") };
+    let [head] = heads[..] else {
+        panic!("branch {branch_name:?} has no unique head commit")
+    };
     let chain = commit_chain(&reader, head);
 
     // Rung -> k: one walk, per-commit tribles = SimpleArchive blob len / 64.
@@ -868,7 +876,10 @@ fn pile_checkout(
         handles.push(*handle);
         cum.push(total);
     }
-    assert!(!handles.is_empty(), "branch {branch_name:?} has no content commits");
+    assert!(
+        !handles.is_empty(),
+        "branch {branch_name:?} has no content commits"
+    );
     let (k, carve) = if chunk_aligned {
         (snap_to_chunk(&cum, rung), None)
     } else if rung < cum[0] {
@@ -938,7 +949,11 @@ fn pile_checkout(
     }
     drop(ws);
     repo.close().expect("close pile");
-    (out.expect("at least one iteration"), samples, ident.unwrap_or(0))
+    (
+        out.expect("at least one iteration"),
+        samples,
+        ident.unwrap_or(0),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -957,7 +972,10 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
 /// the first and second half of the run — the "no signal" verdict.
 fn report(name: &str, mut s: Vec<f64>) -> bool {
     if s.len() < 8 {
-        println!("  {name:<14} NO SIGNAL (only {} samples, need >= 8)", s.len());
+        println!(
+            "  {name:<14} NO SIGNAL (only {} samples, need >= 8)",
+            s.len()
+        );
         return false;
     }
     let half = s.len() / 2;
@@ -976,7 +994,10 @@ fn report(name: &str, mut s: Vec<f64>) -> bool {
         drift * 100.0
     );
     if drift > 0.10 {
-        println!("  {name:<14} NO SIGNAL (floor moved {:.1}% between halves)", drift * 100.0);
+        println!(
+            "  {name:<14} NO SIGNAL (floor moved {:.1}% between halves)",
+            drift * 100.0
+        );
         return false;
     }
     true
@@ -1127,7 +1148,10 @@ fn main() {
             }
         },
         None => {
-            println!("  {:<14} SKIP (no pile — synthetic in-process data)", "checkout");
+            println!(
+                "  {:<14} SKIP (no pile — synthetic in-process data)",
+                "checkout"
+            );
             match quiet_catch(|| build_dblp_shaped(cfg.rung, &qa)) {
                 Ok((set, root)) => {
                     println!("dataset  : synthetic DBLP-shaped, {} tribles", set.len());
@@ -1255,7 +1279,10 @@ fn main() {
                     }
                 }
             } else {
-                println!("  {:<14} SKIP (build_ram gate — no archive to wrap)", "q*_gpu");
+                println!(
+                    "  {:<14} SKIP (build_ram gate — no archive to wrap)",
+                    "q*_gpu"
+                );
             }
         }
     }
@@ -1349,15 +1376,17 @@ fn main() {
         }
     }
     let f_keys = [
-        "F1-ttfr", "F1-total", "F2-ttfr", "F2-total", "F3-ttfr", "F3-total", "F4-ttfr",
-        "F4-total", "F5-ttfr", "F5-total",
+        "F1-ttfr", "F1-total", "F2-ttfr", "F2-total", "F3-ttfr", "F3-total", "F4-ttfr", "F4-total",
+        "F5-ttfr", "F5-total",
     ];
     // F1/F2/F4 (slots 0..=3 and 6..=7) never run on this branch — their
     // measures are path!-based. They SKIP explicitly and keep the "never
     // ran" sentinel in the identity tuple instead of masquerading as 0-row
     // measures (their `f_ident` entries stay `None`, so the sentinel falls
     // out of the same `Some`-gated assignment that serves ran-measures).
-    let f_skipped = [true, true, true, true, false, false, true, true, false, false];
+    let f_skipped = [
+        true, true, true, true, false, false, true, true, false, false,
+    ];
     let mut f_final = [PANIC_COUNT; 5];
     for (k, v) in f_ident.iter().enumerate() {
         if let (Some(n), None) = (v, &f_panicked[2 * k + 1]) {
@@ -1407,7 +1436,11 @@ fn main() {
     }
     println!(
         "SIGNAL   : {}",
-        if signal.is_empty() { "(none)".to_owned() } else { signal.join(" ") }
+        if signal.is_empty() {
+            "(none)".to_owned()
+        } else {
+            signal.join(" ")
+        }
     );
     if !no_signal.is_empty() {
         println!("NO-SIGNAL: {}", no_signal.join(" "));

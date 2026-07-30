@@ -363,9 +363,8 @@ mod tests {
     #[test]
     fn project_two_fields_skipping_the_rest() {
         // the exact projecting-parse pattern the archive importers want.
-        let mut b = bytes(
-            r#"{"noise":{"big":[0,1,2,3]},"uuid":"u-1","more":123,"role":"assistant"}"#,
-        );
+        let mut b =
+            bytes(r#"{"noise":{"big":[0,1,2,3]},"uuid":"u-1","more":123,"role":"assistant"}"#);
         let mut uuid = None;
         let mut role = None;
         expect(&mut b, b'{').unwrap();
@@ -377,8 +376,26 @@ mod tests {
             expect(&mut b, b':').unwrap();
             skip_ws(&mut b);
             match key.as_str() {
-                "uuid" => uuid = Some(parse_string(&mut b).unwrap().view::<str>().unwrap().as_ref().to_owned()),
-                "role" => role = Some(parse_string(&mut b).unwrap().view::<str>().unwrap().as_ref().to_owned()),
+                "uuid" => {
+                    uuid = Some(
+                        parse_string(&mut b)
+                            .unwrap()
+                            .view::<str>()
+                            .unwrap()
+                            .as_ref()
+                            .to_owned(),
+                    )
+                }
+                "role" => {
+                    role = Some(
+                        parse_string(&mut b)
+                            .unwrap()
+                            .view::<str>()
+                            .unwrap()
+                            .as_ref()
+                            .to_owned(),
+                    )
+                }
                 _ => skip_value(&mut b).unwrap(),
             }
             skip_ws(&mut b);

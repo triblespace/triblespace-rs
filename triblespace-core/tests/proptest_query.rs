@@ -2,13 +2,14 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use std::collections::HashSet;
 use triblespace_core::id::rngid;
-use triblespace_core::prelude::*;
-use triblespace_core::query::{
-    Binding, BindingStore, Candidates, Constraint, ContainsConstraint, ProposalBuffer, ProposeCursor, TriblePattern, Variable, VariableContext,
-};
-use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
+use triblespace_core::prelude::*;
+use triblespace_core::query::{
+    Binding, BindingStore, Candidates, Constraint, ContainsConstraint, ProposalBuffer,
+    ProposeCursor, TriblePattern, Variable, VariableContext,
+};
+use triblespace_core::trible::{Fragment, Trible};
 
 mod test_ns {
     use triblespace_core::prelude::*;
@@ -1030,16 +1031,19 @@ fn widening_a_level_keeps_its_variable_resolvable() {
         seen: std::sync::Arc::clone(&seen),
     };
 
-    let results: Vec<[u8; 32]> = triblespace_core::query::Query::new(source, |binding: &Binding| {
-        binding.get(0).copied()
-    })
-    .collect();
+    let results: Vec<[u8; 32]> =
+        triblespace_core::query::Query::new(source, |binding: &Binding| binding.get(0).copied())
+            .collect();
     assert_eq!(results, values);
 
     let seen = seen.lock().unwrap();
     // 500 values over budgets 64, 256, 1024 — three calls, the last of
     // which reports exhaustion.
-    assert!(seen.len() >= 3, "expected several chunks, got {}", seen.len());
+    assert!(
+        seen.len() >= 3,
+        "expected several chunks, got {}",
+        seen.len()
+    );
     // The level is pushed while its variable is unbound...
     assert_eq!(seen[0], None);
     // ...and every widen after that happens with the variable still bound

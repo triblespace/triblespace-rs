@@ -6,8 +6,8 @@
 
 pub mod json;
 pub mod json_tree;
-pub mod scanner;
 pub mod ntriples;
+pub mod scanner;
 
 use triblespace_core_macros::attributes;
 

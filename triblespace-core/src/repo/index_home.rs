@@ -1087,9 +1087,7 @@ impl SuccinctRollup {
 
     /// Union-query several attached physical shards (shards are Arc-cheap
     /// view clones — no data copies).
-    pub fn union(
-        segments: &[SuccinctArchive<OrderedUniverse>],
-    ) -> UnionArchive<OrderedUniverse> {
+    pub fn union(segments: &[SuccinctArchive<OrderedUniverse>]) -> UnionArchive<OrderedUniverse> {
         UnionArchive::new(segments.to_vec())
     }
 }
@@ -1378,7 +1376,6 @@ impl<U> UnionArchive<U> {
     }
 }
 
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct UnionCompleteWalkCounts {
@@ -1458,7 +1455,6 @@ where
     }
 }
 
-
 impl<'a, U> Constraint<'a> for UnionArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -1526,4 +1522,3 @@ where
         )
     }
 }
-

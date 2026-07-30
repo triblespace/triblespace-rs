@@ -641,8 +641,7 @@ mod tests {
             let remote_branch_id = genid();
             let commit_blob: Blob<SimpleArchive> = TribleSet::new().to_blob();
             let _commit_handle = store.put::<SimpleArchive, _>(commit_blob.clone()).unwrap();
-            let remote_meta =
-                branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob));
+            let remote_meta = branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob));
             let remote_meta_handle = store.put::<SimpleArchive, _>(remote_meta).unwrap();
             (*remote_branch_id, remote_meta_handle.raw)
         };

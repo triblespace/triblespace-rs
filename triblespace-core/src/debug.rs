@@ -1,14 +1,14 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
+    use crate::inline::RawInline;
     use crate::query::Binding;
+    use crate::query::Candidates;
     use crate::query::Constraint;
+    use crate::query::ProposalBuffer;
     use crate::query::VariableId;
     use crate::query::VariableSet;
-    use crate::inline::RawInline;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use crate::query::Candidates;
-use crate::query::ProposalBuffer;
 
     /// Constraint wrapper that records which variables are proposed during query execution.
     pub struct DebugConstraint<C> {

@@ -458,8 +458,12 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         .expect("list branches");
     let mut named: Vec<(Id, String, TribleSet)> = Vec::new();
     for id in branch_ids {
-        let Ok(Some(meta_handle)) = pile.head(id) else { continue };
-        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue };
+        let Ok(Some(meta_handle)) = pile.head(id) else {
+            continue;
+        };
+        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
+            continue;
+        };
         let handles: Vec<Inline<Handle<LongString>>> = find!(
             (n: Inline<Handle<LongString>>),
             pattern!(&meta, [{ metadata::name: ?n }])
@@ -467,7 +471,9 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         .map(|(n,)| n)
         .collect();
         let [h] = handles[..] else { continue };
-        let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else { continue };
+        let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else {
+            continue;
+        };
         named.push((id, name.as_ref().to_owned(), meta));
     }
     let (_branch_id, branch_name, branch_meta) = match branch {
@@ -476,7 +482,10 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
             .find(|(_, n, _)| n == want)
             .unwrap_or_else(|| panic!("no branch named {want:?} in pile")),
         None => {
-            let mut data: Vec<_> = named.into_iter().filter(|(_, n, _)| n != "manifest").collect();
+            let mut data: Vec<_> = named
+                .into_iter()
+                .filter(|(_, n, _)| n != "manifest")
+                .collect();
             match data.len() {
                 1 => data.remove(0),
                 n => panic!(
@@ -493,7 +502,9 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     )
     .map(|(c,)| c)
     .collect();
-    let [head] = heads[..] else { panic!("branch {branch_name:?} has no unique head commit") };
+    let [head] = heads[..] else {
+        panic!("branch {branch_name:?} has no unique head commit")
+    };
 
     // Oldest-first linear chain walk.
     let mut chain: Vec<(CommitHandle, TribleSet)> = Vec::new();
@@ -536,7 +547,10 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         cum.push(total);
         entries.push((handle, meta, content));
     }
-    assert!(!entries.is_empty(), "branch {branch_name:?} has no content commits");
+    assert!(
+        !entries.is_empty(),
+        "branch {branch_name:?} has no content commits"
+    );
     let k = snap_to_chunk(&cum, rung);
     println!(
         "rung     : target {rung} -> snapped {} (chunk-aligned, k={k}/{} commits) on branch {branch_name:?}",
@@ -621,7 +635,10 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
 
 fn report(name: &str, mut s: Vec<f64>) -> bool {
     if s.len() < 8 {
-        println!("  {name:<14} NO SIGNAL (only {} samples, need >= 8)", s.len());
+        println!(
+            "  {name:<14} NO SIGNAL (only {} samples, need >= 8)",
+            s.len()
+        );
         return false;
     }
     let half = s.len() / 2;
@@ -640,7 +657,10 @@ fn report(name: &str, mut s: Vec<f64>) -> bool {
         drift * 100.0
     );
     if drift > 0.10 {
-        println!("  {name:<14} NO SIGNAL (floor moved {:.1}% between halves)", drift * 100.0);
+        println!(
+            "  {name:<14} NO SIGNAL (floor moved {:.1}% between halves)",
+            drift * 100.0
+        );
         return false;
     }
     true
@@ -862,7 +882,11 @@ fn main() {
     }
     println!(
         "SIGNAL   : {}",
-        if signal.is_empty() { "(none)".to_owned() } else { signal.join(" ") }
+        if signal.is_empty() {
+            "(none)".to_owned()
+        } else {
+            signal.join(" ")
+        }
     );
     if !no_signal.is_empty() {
         println!("NO-SIGNAL: {}", no_signal.join(" "));

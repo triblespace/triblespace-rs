@@ -59,7 +59,10 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
 
     // The intersection's estimate is the minimum of the two
     // children's estimates — both are 2, so 2.
-    assert_eq!(intersection.estimate(doc.index, &Binding::default()), Some(2));
+    assert_eq!(
+        intersection.estimate(doc.index, &Binding::default()),
+        Some(2)
+    );
 
     // `propose` should yield the intersection of the two posting
     // lists: the tightest child appends its candidates and the other
@@ -98,7 +101,10 @@ fn intersection_with_absent_term_proposes_nothing() {
 
     // The "banana" constraint's estimate is 0, so the
     // intersection's minimum-estimate is 0.
-    assert_eq!(intersection.estimate(doc.index, &Binding::default()), Some(0));
+    assert_eq!(
+        intersection.estimate(doc.index, &Binding::default()),
+        Some(0)
+    );
 
     let mut props = ProposalBuffer::new();
     intersection.propose(doc.index, &Binding::default(), &mut props);

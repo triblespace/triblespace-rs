@@ -3,19 +3,19 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::IntoInline;
+use crate::inline::RawInline;
+use crate::inline::TryFromInline;
 use crate::query::Binding;
+use crate::query::Candidates;
 use crate::query::Constraint;
 use crate::query::ContainsConstraint;
+use crate::query::ProposalBuffer;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::inline::RawInline;
-use crate::inline::IntoInline;
-use crate::inline::TryFromInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
-use crate::query::Candidates;
-use crate::query::ProposalBuffer;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///

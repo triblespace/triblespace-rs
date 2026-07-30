@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
-use triblespace::core::query::BindingStore;
-use triblespace::core::query::Constraint;
-use triblespace::core::query::TriblePattern;
-use triblespace::core::query::VariableContext;
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::UnknownInline;
-use triblespace::prelude::*;
+use triblespace::core::query::BindingStore;
+use triblespace::core::query::Constraint;
 use triblespace::core::query::ProposalBuffer;
+use triblespace::core::query::TriblePattern;
+use triblespace::core::query::VariableContext;
+use triblespace::prelude::*;
 
 #[test]
 fn propose_and_confirm() {
@@ -47,7 +47,9 @@ fn propose_and_confirm() {
     let attrs: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(
         attrs,
-        [GenId::inline_from(a1).raw, GenId::inline_from(a2).raw].into_iter().collect()
+        [GenId::inline_from(a1).raw, GenId::inline_from(a2).raw]
+            .into_iter()
+            .collect()
     );
 
     proposals.push(GenId::inline_from(e1).raw);
@@ -92,7 +94,9 @@ fn propose_and_confirm_bound_attribute() {
     let entities: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(
         entities,
-        [GenId::inline_from(e1).raw, GenId::inline_from(e2).raw].into_iter().collect()
+        [GenId::inline_from(e1).raw, GenId::inline_from(e2).raw]
+            .into_iter()
+            .collect()
     );
 
     constraint.confirm(e_var.index, &binding.view(), &mut proposals.region(0));
@@ -189,7 +193,10 @@ fn propose_and_confirm_two_bound() {
 
     let mut proposals = ProposalBuffer::new();
     constraint.propose(a_var.index, &binding.view(), &mut proposals);
-    assert_eq!(proposals.live_values(0).copied().collect::<Vec<_>>(), vec![GenId::inline_from(a2).raw]);
+    assert_eq!(
+        proposals.live_values(0).copied().collect::<Vec<_>>(),
+        vec![GenId::inline_from(a2).raw]
+    );
 
     constraint.confirm(a_var.index, &binding.view(), &mut proposals.region(0));
     assert_eq!(proposals.count_live(0), 1);
@@ -201,7 +208,10 @@ fn propose_and_confirm_two_bound() {
 
     let mut proposals = ProposalBuffer::new();
     constraint.propose(e_var.index, &binding.view(), &mut proposals);
-    assert_eq!(proposals.live_values(0).copied().collect::<Vec<_>>(), vec![GenId::inline_from(e2).raw]);
+    assert_eq!(
+        proposals.live_values(0).copied().collect::<Vec<_>>(),
+        vec![GenId::inline_from(e2).raw]
+    );
 
     constraint.confirm(e_var.index, &binding.view(), &mut proposals.region(0));
     assert_eq!(proposals.count_live(0), 1);
