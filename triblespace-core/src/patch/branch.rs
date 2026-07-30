@@ -226,11 +226,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_L
     /// safe immutable consumers.
     #[inline]
     pub(crate) fn replace_cached_hash(&mut self, hash: Option<u128>) {
-        *self.rc.get_mut() &= RC_MASK;
+        let state = self.rc.get_mut();
+        debug_assert_eq!(
+            *state & RC_MASK,
+            1,
+            "cache replacement requires a uniquely owned Branch",
+        );
+        *state &= RC_MASK;
         if let Some(hash) = hash {
             *self.hash_lo.get_mut() = hash as u64;
             *self.hash_hi.get_mut() = (hash >> 64) as u64;
-            *self.rc.get_mut() |= HASH_KNOWN;
+            *state |= HASH_KNOWN;
         }
     }
 
