@@ -3799,6 +3799,11 @@ where
         );
         let mut root = Head::new(0, body);
         let mut hash = first_hash ^ second_hash;
+        let has_extra = counts[second_bucket + 1..].iter().any(|&count| count != 0);
+        if !has_extra {
+            return (root, hash);
+        }
+        let mut editor = BranchMut::from_head(&mut root);
 
         for byte in second_bucket + 1..256 {
             if counts[byte] == 0 {
@@ -3813,16 +3818,16 @@ where
                     end_depth + 1,
                 )
             };
-            let mut editor = BranchMut::from_head(&mut root);
-            editor.modify_child(byte as u8, |old| {
-                debug_assert!(old.is_none());
-                Some(child.with_key(byte as u8))
-            });
-            drop(editor);
             hash ^= child_hash;
+            editor.install_child_growing(child.with_key(byte as u8));
         }
 
-        root.publish_known_hash(hash);
+        // Bulk installation deliberately leaves the first-two aggregates
+        // untouched until every remaining child is present. Rebuild counts,
+        // choose any valid representative, and publish the independently
+        // accumulated exact XOR in one physical table scan.
+        editor.finish_bulk_aggregates(Some(hash));
+        drop(editor);
         (root, hash)
     }
 

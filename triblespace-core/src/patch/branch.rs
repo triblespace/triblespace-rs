@@ -86,7 +86,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     /// for it would cross dirty archive-backed subtrees and defeat lazy hash
     /// maintenance. `known_hash` can install an independently derived exact
     /// aggregate, including zero; `None` marks the cache unknown.
-    #[cfg(feature = "parallel")]
+    #[cfg(any(test, feature = "parallel"))]
     pub fn finish_bulk_aggregates(&mut self, known_hash: Option<u128>) {
         unsafe {
             Branch::finish_bulk_aggregates(&mut self.branch_nn, known_hash);
@@ -590,7 +590,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// an independently-derived hash without traversing a child for it.
     ///
     /// `known_hash` is exact when present, including exact zero.
-    #[cfg(feature = "parallel")]
+    #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn finish_bulk_aggregates(
         branch_nn: &mut NonNull<Self>,
         known_hash: Option<u128>,
