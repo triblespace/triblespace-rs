@@ -2084,6 +2084,12 @@ fn consolidate_groups(
                 .collect()
         };
 
+        // Set when any pair's relationship could not be determined, which
+        // disqualifies the whole group from an automatic merge: the merge
+        // reconciles the NON-SUBSUMED set, and an undetermined pair means we
+        // do not know what that set is.
+        let mut undetermined = false;
+
         // Compute subsumption: a head is subsumed if another head
         // has it as an ancestor.
         let mut subsumed: HashSet<[u8; 32]> = HashSet::new();
@@ -2100,16 +2106,32 @@ fn consolidate_groups(
                         continue;
                     }
                     match is_ancestor_of(unique_heads[i], unique_heads[j], reader, &parent_attr) {
-                        Ok(true) => {
+                        Ok(Ancestry::Yes) => {
                             subsumed.insert(unique_heads[i].raw);
                             let hh: Inline<Hash<Blake3>> = Handle::to_hash(unique_heads[i]);
                             let hex: String = hh.from_inline();
                             println!("  ({}... subsumed)", &hex[..23]);
                             break;
                         }
-                        Ok(false) => {}
+                        Ok(Ancestry::No) => {}
+                        Ok(Ancestry::Unknown) => {
+                            // Missing blobs mean this pair's relationship was
+                            // never determined. Treating it as "divergent"
+                            // is what produced merges of a branch with its
+                            // own ancestor, so the group is disqualified
+                            // rather than guessed at.
+                            let hh: Inline<Hash<Blake3>> = Handle::to_hash(unique_heads[i]);
+                            let hex: String = hh.from_inline();
+                            eprintln!(
+                                "  warning: ancestry of {}... is UNDETERMINED (missing commit \
+                                 blobs); not treating it as divergent",
+                                &hex[..23]
+                            );
+                            undetermined = true;
+                        }
                         Err(e) => {
                             eprintln!("  warning: ancestry check failed: {e:#}");
+                            undetermined = true;
                         }
                     }
                 }
@@ -2124,6 +2146,21 @@ fn consolidate_groups(
 
         if non_subsumed.is_empty() {
             println!("  -> all heads subsumed, skipping");
+            continue;
+        }
+
+        // An undetermined pair means the non-subsumed SET is unknown, and the
+        // merge is over exactly that set. Merging anyway is how a branch got
+        // reconciled with its own ancestor. Report and leave the group alone;
+        // the operator's move is to restore the missing blobs (or accept the
+        // loss) and re-run, not to have a merge invented from absent data.
+        if undetermined {
+            println!(
+                "  -> SKIPPING: {} head(s) look non-subsumed but at least one \
+                 ancestry check was undetermined (missing commit blobs).",
+                non_subsumed.len()
+            );
+            println!("     Restore the missing blobs and re-run; refusing to merge on a guess.");
             continue;
         }
 
@@ -2226,27 +2263,75 @@ fn tombstone_branches(
     Ok(count)
 }
 
+/// What an ancestry walk established.
+///
+/// # Why this is not `bool`
+///
+/// The walk reads commit blobs to follow `repo::parent`. When a blob is
+/// absent — a truncated pile, a GC'd graph, a partial replica — an arm of
+/// the history cannot be examined, and the honest answer is neither yes nor
+/// no. Returning `false` there conflates "I looked and it is not an
+/// ancestor" with "I could not look", which is the same defect
+/// [`BranchName`] documents one function up in this file: an indeterminate
+/// result rendered as a definite one.
+///
+/// Here the consequence is worse than a bad label. `consolidate` treats
+/// "not an ancestor" as "these are divergent heads" and writes a merge. So
+/// a pile with missing blobs produced a merge commit reconciling a branch
+/// **with its own ancestor** — a fork that never existed, invented from
+/// absent data.
+///
+/// # The asymmetry that makes this cheap
+///
+/// Soundness is not symmetric, and exploiting that keeps the walk as fast
+/// as before:
+///
+/// * A **positive** answer stays definite even with gaps. Reaching the
+///   ancestor along some path *proves* descendance; unreadable blobs
+///   elsewhere cannot unprove it.
+/// * A **negative** answer requires a *complete* walk. Not finding the
+///   ancestor only means "not an ancestor" if every arm was examined.
+///
+/// So the walk proceeds exactly as it did, notes whether any blob was
+/// missed, and only the final negative is downgraded to [`Ancestry::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ancestry {
+    /// Reached the ancestor. Definite regardless of gaps elsewhere.
+    Yes,
+    /// Did not reach it, and every reachable commit was readable.
+    No,
+    /// Did not reach it, but at least one commit blob was unreadable, so
+    /// some of the history was never examined.
+    Unknown,
+}
+
 fn is_ancestor_of(
     ancestor: Inline<Handle<SimpleArchive>>,
     descendant: Inline<Handle<SimpleArchive>>,
     reader: &impl BlobStoreGet,
     parent_attr: &Id,
-) -> Result<bool> {
+) -> Result<Ancestry> {
     use std::collections::HashSet;
 
     let mut visited: HashSet<[u8; 32]> = HashSet::new();
     let mut stack: Vec<Inline<Handle<SimpleArchive>>> = vec![descendant];
+    // Set when an arm of the DAG could not be read, which makes only a
+    // NEGATIVE conclusion unsound — see the type's docs.
+    let mut incomplete = false;
 
     while let Some(current) = stack.pop() {
         if current.raw == ancestor.raw {
-            return Ok(true);
+            return Ok(Ancestry::Yes);
         }
         if !visited.insert(current.raw) {
             continue;
         }
         let commit: TribleSet = match reader.get(current) {
             Ok(c) => c,
-            Err(_) => continue, // Missing blob — stop traversal on this branch.
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
         };
         for t in commit.iter() {
             if t.a() == parent_attr {
@@ -2254,7 +2339,11 @@ fn is_ancestor_of(
             }
         }
     }
-    Ok(false)
+    Ok(if incomplete {
+        Ancestry::Unknown
+    } else {
+        Ancestry::No
+    })
 }
 
 /// What a branch's name resolution actually established.
@@ -2383,6 +2472,92 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// A missing commit blob must NOT read as "not an ancestor".
+    ///
+    /// This is the defect that let `consolidate` merge a branch with its own
+    /// ancestor: the walk pruned unreadable arms and returned `false`, which
+    /// the caller took to mean "divergent heads" and reconciled. The property
+    /// under test is the ASYMMETRY that makes the fix sound and cheap — a
+    /// positive answer survives gaps, a negative one does not.
+    #[test]
+    fn missing_commit_blobs_make_a_negative_ancestry_undetermined_not_negative() {
+        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::trible::Trible;
+
+        let parent_attr = triblespace_core::repo::parent.id();
+
+        // Two independent stores so we can control exactly which blobs the
+        // reader can see. `full` has both commits; `holed` has only the child,
+        // so the walk can read the child, learn of the parent, and then fail
+        // to read it — the truncated/GC'd/partial-replica case.
+        let mut full = MemoryBlobStore::new();
+        let mut holed = MemoryBlobStore::new();
+
+        // The root commit: content-addressed, so the same bytes in both stores
+        // yield the same handle.
+        let root_set = TribleSet::new();
+        let root: Inline<Handle<SimpleArchive>> =
+            full.put::<SimpleArchive, _>(root_set.clone().to_blob()).expect("put root");
+
+        // A child whose only fact is `parent -> root`.
+        let child_entity = triblespace_core::id::fucid();
+        let mut child_set = TribleSet::new();
+        child_set.insert(&Trible::new(&child_entity, &parent_attr, &root));
+        let child: Inline<Handle<SimpleArchive>> =
+            full.put::<SimpleArchive, _>(child_set.clone().to_blob()).expect("put child");
+        let child_holed: Inline<Handle<SimpleArchive>> =
+            holed.put::<SimpleArchive, _>(child_set.to_blob()).expect("put child (holed)");
+        assert_eq!(
+            child.raw, child_holed.raw,
+            "content addressing: identical bytes must yield one handle"
+        );
+
+        let full_reader = full.reader().expect("full reader");
+        let holed_reader = holed.reader().expect("holed reader");
+
+        // Complete data, real relationship -> definite YES.
+        assert_eq!(
+            is_ancestor_of(root, child, &full_reader, &parent_attr).expect("walk"),
+            Ancestry::Yes,
+            "root is an ancestor of child when both are readable"
+        );
+
+        // Complete data, no relationship -> definite NO. `unrelated` is a
+        // handle for bytes never stored, so it can never be reached.
+        let unrelated: Inline<Handle<SimpleArchive>> = {
+            let mut other = TribleSet::new();
+            other.insert(&Trible::new(
+                &triblespace_core::id::fucid(),
+                &parent_attr,
+                &child,
+            ));
+            IntoBlob::<SimpleArchive>::to_blob(other).get_handle()
+        };
+        assert_eq!(
+            is_ancestor_of(unrelated, child, &full_reader, &parent_attr).expect("walk"),
+            Ancestry::No,
+            "a complete walk that finds nothing is a definite negative"
+        );
+
+        // THE REGRESSION: the child is readable and names `root` as its
+        // parent, but root's blob is absent. Asking whether `unrelated` is an
+        // ancestor cannot be answered — and must not answer "No".
+        assert_eq!(
+            is_ancestor_of(unrelated, child, &holed_reader, &parent_attr).expect("walk"),
+            Ancestry::Unknown,
+            "an unreadable arm must make a negative UNDETERMINED, never negative"
+        );
+
+        // The asymmetry: a positive answer is still definite despite the gap,
+        // because reaching the ancestor proves descendance and no unread blob
+        // can unprove it.
+        assert_eq!(
+            is_ancestor_of(child, child, &holed_reader, &parent_attr).expect("walk"),
+            Ancestry::Yes,
+            "a reachable positive stays definite even with unreadable arms"
+        );
+    }
 
     /// The regression this file exists to prevent.
     ///
