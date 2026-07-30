@@ -188,12 +188,8 @@ fn check_arm(
     context: &str,
 ) -> Vec<u32> {
     let vars_cpu = vars();
-    let cpu_constraint = SuccinctArchiveConstraint::new(
-        vars_cpu.e,
-        vars_cpu.a,
-        vars_cpu.v,
-        fixture.gpu.archive(),
-    );
+    let cpu_constraint =
+        SuccinctArchiveConstraint::new(vars_cpu.e, vars_cpu.a, vars_cpu.v, fixture.gpu.archive());
     let vars_gpu = vars();
     let gpu_constraint = triblespace_gpu::WgpuSuccinctArchiveConstraint::new(
         vars_gpu.e,
@@ -273,8 +269,18 @@ fn single_bound_range_confirm_parity() {
     let arms: [(VariableId, VariableId, &[RawInline], &str); 6] = [
         (v.e.index, v.a.index, &fixture.entities, "e-bound/confirm-a"),
         (v.e.index, v.v.index, &fixture.entities, "e-bound/confirm-v"),
-        (v.a.index, v.e.index, &fixture.attributes, "a-bound/confirm-e"),
-        (v.a.index, v.v.index, &fixture.attributes, "a-bound/confirm-v"),
+        (
+            v.a.index,
+            v.e.index,
+            &fixture.attributes,
+            "a-bound/confirm-e",
+        ),
+        (
+            v.a.index,
+            v.v.index,
+            &fixture.attributes,
+            "a-bound/confirm-v",
+        ),
         (v.v.index, v.e.index, &fixture.values, "v-bound/confirm-e"),
         (v.v.index, v.a.index, &fixture.values, "v-bound/confirm-a"),
     ];
@@ -286,14 +292,31 @@ fn single_bound_range_confirm_parity() {
             let mut binding = BindingStore::new();
             binding.bind(bound_var, &bound);
             let context = format!("range/{name}/seed{seed}");
-            check_arm(&fixture, confirm_var, &binding.view(), &candidates, &kills, &context);
+            check_arm(
+                &fixture,
+                confirm_var,
+                &binding.view(),
+                &candidates,
+                &kills,
+                &context,
+            );
 
             // Bound value absent from the archive: the range is empty and
             // every candidate dies on both paths.
             let mut binding = BindingStore::new();
-            binding.bind(bound_var, &fixture.absent[seed as usize % fixture.absent.len()]);
+            binding.bind(
+                bound_var,
+                &fixture.absent[seed as usize % fixture.absent.len()],
+            );
             let context = format!("range-empty/{name}/seed{seed}");
-            let cpu = check_arm(&fixture, confirm_var, &binding.view(), &candidates, &kills, &context);
+            let cpu = check_arm(
+                &fixture,
+                confirm_var,
+                &binding.view(),
+                &candidates,
+                &kills,
+                &context,
+            );
             assert!(
                 cpu.iter().all(|w| *w == 0),
                 "{context}: empty range must kill everything"
@@ -383,12 +406,8 @@ fn below_threshold_falls_back_to_cpu() {
     let candidates = candidate_pool(&fixture, 17, 48);
 
     let vars_cpu = vars();
-    let cpu_constraint = SuccinctArchiveConstraint::new(
-        vars_cpu.e,
-        vars_cpu.a,
-        vars_cpu.v,
-        fixture.gpu.archive(),
-    );
+    let cpu_constraint =
+        SuccinctArchiveConstraint::new(vars_cpu.e, vars_cpu.a, vars_cpu.v, fixture.gpu.archive());
     let vars_gpu = vars();
     let gpu_constraint = triblespace_gpu::WgpuSuccinctArchiveConstraint::new(
         vars_gpu.e,
@@ -404,7 +423,10 @@ fn below_threshold_falls_back_to_cpu() {
 
     assert_eq!(cpu, gpu);
     assert_eq!(after.gpu_confirms, before.gpu_confirms);
-    assert_eq!(after.cpu_fallback_confirms, before.cpu_fallback_confirms + 1);
+    assert_eq!(
+        after.cpu_fallback_confirms,
+        before.cpu_fallback_confirms + 1
+    );
 }
 
 /// Region-size sweep printing the CPU/GPU crossover for both routed confirm
@@ -453,13 +475,11 @@ fn confirm_crossover_sweep() {
     let cpu_constraint =
         SuccinctArchiveConstraint::new(vars_cpu.e, vars_cpu.a, vars_cpu.v, gpu.archive());
     let vars_gpu = vars();
-    let gpu_constraint =
-        triblespace_gpu::WgpuSuccinctArchiveConstraint::new(vars_gpu.e, vars_gpu.a, vars_gpu.v, &gpu);
+    let gpu_constraint = triblespace_gpu::WgpuSuccinctArchiveConstraint::new(
+        vars_gpu.e, vars_gpu.a, vars_gpu.v, &gpu,
+    );
 
-    let bench = |variable: VariableId,
-                 binding: &Binding,
-                 candidates: &[RawInline],
-                 shape: &str| {
+    let bench = |variable: VariableId, binding: &Binding, candidates: &[RawInline], shape: &str| {
         let mut buffer = ProposalBuffer::new();
         buffer.extend_from_slice(candidates);
         let all_live = vec![1u32; candidates.len()];
@@ -513,7 +533,10 @@ fn confirm_crossover_sweep() {
         ),
     ] {
         println!("\n== {shape} ==");
-        println!("{:>8} {:>12} {:>12} {:>8}", "region", "cpu ms", "gpu ms", "cpu/gpu");
+        println!(
+            "{:>8} {:>12} {:>12} {:>8}",
+            "region", "cpu ms", "gpu ms", "cpu/gpu"
+        );
         let binding = binding_fn();
         for size in [1024usize, 4096, 16384, 65536] {
             let mut state = 0xBEEF ^ size as u64;

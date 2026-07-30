@@ -98,16 +98,13 @@ pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummar
                 Ok(m) => m,
                 Err(_) => continue, // unreadable pin metadata — not a usable branch
             };
-            let name = meta
-                .iter()
-                .find(|t| t.a() == &name_attr)
-                .and_then(|t| {
-                    let h = *t.v::<Handle<LongString>>();
-                    src_reader
-                        .get::<View<str>, LongString>(h)
-                        .ok()
-                        .map(|v| v.to_string())
-                });
+            let name = meta.iter().find(|t| t.a() == &name_attr).and_then(|t| {
+                let h = *t.v::<Handle<LongString>>();
+                src_reader
+                    .get::<View<str>, LongString>(h)
+                    .ok()
+                    .map(|v| v.to_string())
+            });
             branches.push(BranchInfo {
                 id: bid,
                 name,
@@ -117,8 +114,7 @@ pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummar
 
         // Resolve --branch by name or hex id (case-insensitive hex).
         let info = match branches.iter().find(|b| {
-            b.name.as_deref() == Some(branch)
-                || branch.eq_ignore_ascii_case(&format!("{:x}", b.id))
+            b.name.as_deref() == Some(branch) || branch.eq_ignore_ascii_case(&format!("{:x}", b.id))
         }) {
             Some(i) => i,
             None => {
@@ -167,11 +163,7 @@ pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummar
             let root_raw: [u8; 32] = info.meta_handle.raw;
             let roots = [Inline::<Handle<UnknownBlob>>::new(root_raw)];
             let mut total_blobs: usize = 0;
-            for r in repo::transfer(
-                &src_reader,
-                dst_pile,
-                repo::reachable(&src_reader, roots),
-            ) {
+            for r in repo::transfer(&src_reader, dst_pile, repo::reachable(&src_reader, roots)) {
                 match r {
                     Ok(_) => total_blobs += 1,
                     Err(repo::TransferError::Store(e)) => {
@@ -239,10 +231,8 @@ mod tests {
     /// Fresh per-test scratch directory. Honors `TMPDIR`, so pointing
     /// `TMPDIR` at the session scratchpad keeps all test piles there.
     fn scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "trible-extract-test-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("trible-extract-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -425,22 +415,15 @@ mod tests {
             &Inline::<Handle<UnknownBlob>>::new([9u8; 32]),
         ));
         let content_blob: Blob<SimpleArchive> = content.to_blob();
-        let commit_set =
-            repo::commit::commit_metadata(&key, [], None, Some(content_blob), None);
-        let _: CommitHandle = pile
-            .put::<SimpleArchive, _>(commit_set.clone())
-            .unwrap();
+        let commit_set = repo::commit::commit_metadata(&key, [], None, Some(content_blob), None);
+        let _: CommitHandle = pile.put::<SimpleArchive, _>(commit_set.clone()).unwrap();
 
         let name_handle: Inline<Handle<LongString>> = pile
             .put(IntoBlob::<LongString>::to_blob("broken".to_string()))
             .unwrap();
         let bid = genid();
-        let bmeta = repo::branch::branch_metadata(
-            &key,
-            *bid,
-            name_handle,
-            Some(commit_set.to_blob()),
-        );
+        let bmeta =
+            repo::branch::branch_metadata(&key, *bid, name_handle, Some(commit_set.to_blob()));
         let bh = pile.put(bmeta).unwrap();
         pile.update(*bid, None, Some(bh)).unwrap();
         pile.close().unwrap();

@@ -6,10 +6,10 @@
 use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::query::Constraint;
+use triblespace::core::query::ProposalBuffer;
 use triblespace::core::query::VariableContext;
 use triblespace::prelude::inlineencodings::R256BE;
 use triblespace::prelude::*;
-use triblespace::core::query::ProposalBuffer;
 
 attributes! {
     "BB00000000000000BB00000000000000" as range_test_score: R256BE;

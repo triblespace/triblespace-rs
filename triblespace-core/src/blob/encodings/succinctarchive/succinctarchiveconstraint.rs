@@ -2,11 +2,11 @@ use std::ops::Not;
 use std::ops::Range;
 
 use super::*;
-use crate::query::*;
 use crate::inline::encodings::genid::GenId;
-use jerky::bit_vector::Select;
 use crate::query::Candidates;
 use crate::query::ProposalBuffer;
+use crate::query::*;
+use jerky::bit_vector::Select;
 
 pub struct SuccinctArchiveConstraint<'a, U>
 where
@@ -51,7 +51,11 @@ where
     }
 }
 
-pub(super) fn base_range<U>(universe: &U, a: &BitVector<Rank9SelIndex>, value: &RawInline) -> Range<usize>
+pub(super) fn base_range<U>(
+    universe: &U,
+    a: &BitVector<Rank9SelIndex>,
+    value: &RawInline,
+) -> Range<usize>
 where
     U: Universe,
 {

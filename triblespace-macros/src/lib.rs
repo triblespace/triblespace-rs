@@ -26,8 +26,7 @@ use syn::Type;
 use syn::Visibility;
 
 use triblespace_macros_common::{
-    attributes_impl, entity_impl, pattern_changes_impl, pattern_impl,
-    value_formatter_impl,
+    attributes_impl, entity_impl, pattern_changes_impl, pattern_impl, value_formatter_impl,
 };
 
 mod instrumentation_attributes {
@@ -321,7 +320,6 @@ pub fn attributes(input: TokenStream) -> TokenStream {
         Err(e) => e.to_compile_error().into(),
     }
 }
-
 
 /// Expands a bracketed trible pattern into a query constraint.
 ///

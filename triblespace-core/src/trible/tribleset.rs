@@ -15,8 +15,8 @@ use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
-use crate::patch::PATCH;
 use crate::patch::PATCHOwnerGuard;
+use crate::patch::PATCH;
 use crate::query::Variable;
 use crate::trible::AEVOrder;
 use crate::trible::AVEOrder;
@@ -777,9 +777,7 @@ mod tests {
             set.vea.owner_guard(),
             set.vae.owner_guard(),
         ];
-        assert!(guards[1..]
-            .iter()
-            .all(|guard| guard.ptr_eq(&guards[0])));
+        assert!(guards[1..].iter().all(|guard| guard.ptr_eq(&guards[0])));
     }
 
     fn many_intrinsic_rows(namespace: u8, count: usize) -> Vec<IntrinsicEntityRow> {
@@ -1099,9 +1097,7 @@ mod tests {
             right.vae.owner_guard(),
         ];
         for (i, guard) in before.iter().enumerate() {
-            assert!(before[i + 1..]
-                .iter()
-                .all(|other| !guard.ptr_eq(other)));
+            assert!(before[i + 1..].iter().all(|other| !guard.ptr_eq(other)));
         }
 
         left.union(right);
@@ -1110,30 +1106,12 @@ mod tests {
         std::hint::black_box(&noise);
         assert!(left.owner_guards_are_shared());
         assert_shared_owner_guard(&left);
-        assert_eq!(
-            left.eav.iter().copied().collect::<Vec<_>>(),
-            vec![rows[0]],
-        );
-        assert_eq!(
-            left.eva.iter().copied().collect::<Vec<_>>(),
-            vec![rows[1]],
-        );
-        assert_eq!(
-            left.aev.iter().copied().collect::<Vec<_>>(),
-            vec![rows[2]],
-        );
-        assert_eq!(
-            left.ave.iter().copied().collect::<Vec<_>>(),
-            vec![rows[3]],
-        );
-        assert_eq!(
-            left.vea.iter().copied().collect::<Vec<_>>(),
-            vec![rows[4]],
-        );
-        assert_eq!(
-            left.vae.iter().copied().collect::<Vec<_>>(),
-            vec![rows[5]],
-        );
+        assert_eq!(left.eav.iter().copied().collect::<Vec<_>>(), vec![rows[0]],);
+        assert_eq!(left.eva.iter().copied().collect::<Vec<_>>(), vec![rows[1]],);
+        assert_eq!(left.aev.iter().copied().collect::<Vec<_>>(), vec![rows[2]],);
+        assert_eq!(left.ave.iter().copied().collect::<Vec<_>>(), vec![rows[3]],);
+        assert_eq!(left.vea.iter().copied().collect::<Vec<_>>(), vec![rows[4]],);
+        assert_eq!(left.vae.iter().copied().collect::<Vec<_>>(), vec![rows[5]],);
     }
 
     #[test]

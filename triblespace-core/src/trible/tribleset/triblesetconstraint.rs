@@ -3,18 +3,18 @@ use core::panic;
 use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::ID_LEN;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::InlineEncoding;
+use crate::inline::INLINE_LEN;
 use crate::query::Binding;
+use crate::query::Candidates;
 use crate::query::Constraint;
+use crate::query::ProposalBuffer;
 use crate::query::RawTerm;
 use crate::query::Term;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::InlineEncoding;
-use crate::inline::INLINE_LEN;
-use crate::query::Candidates;
-use crate::query::ProposalBuffer;
 
 /// A triple-pattern lookup against a [`TribleSet`].
 ///
@@ -525,7 +525,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             // `has_prefix` against the appropriate index.
             (_, Some(a), _, true, false, true) => cands.retain(|value| {
                 // pattern(x, a, x): proposal is both entity and value.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
@@ -534,7 +536,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             }),
             (_, None, _, true, false, true) => cands.retain(|value| {
                 // pattern(x, ?, x): proposal is entity == value, any attr.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
@@ -542,7 +546,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             }),
             (_, _, Some(v), true, true, false) => cands.retain(|value| {
                 // pattern(x, x, v): proposal is entity == attribute.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
@@ -551,7 +557,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             }),
             (_, _, None, true, true, false) => cands.retain(|value| {
                 // pattern(x, x, ?): proposal is entity == attribute, any v.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
@@ -559,7 +567,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             }),
             (Some(e), _, _, false, true, true) => cands.retain(|value| {
                 // pattern(e, x, x): proposal is attribute == value.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
@@ -568,7 +578,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             }),
             (None, _, _, false, true, true) => cands.retain(|value| {
                 // pattern(?, x, x): proposal is attribute == value, any e.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
@@ -576,7 +588,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             }),
             (_, _, _, true, true, true) => cands.retain(|value| {
                 // pattern(x, x, x): proposal plays all three roles.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
@@ -617,12 +631,12 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 mod tests {
     use crate::find;
     use crate::id::rngid;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
     use crate::query::TriblePattern;
     use crate::query::Variable;
     use crate::trible::Trible;
     use crate::trible::TribleSet;
-    use crate::inline::encodings::UnknownInline;
-    use crate::inline::Inline;
 
     #[test]
     fn constant() {
@@ -648,8 +662,8 @@ mod tests {
         // value positions) enumerates self-edge entities without
         // panicking. Adds 3 self-edges and 2 non-self tribles for
         // the same attribute; the query should return exactly 3.
-        use crate::inline::encodings::genid::GenId;
         use crate::and;
+        use crate::inline::encodings::genid::GenId;
 
         // Helper: encode a 16-byte id as a GenId-style Inline value
         // (32 bytes: upper 16 zero, lower 16 = id).
@@ -692,7 +706,12 @@ mod tests {
             )
         };
         let r: Vec<_> = q.collect();
-        assert_eq!(3, r.len(), "expected 3 self-edges with bound attr, got {}", r.len());
+        assert_eq!(
+            3,
+            r.len(),
+            "expected 3 self-edges with bound attr, got {}",
+            r.len()
+        );
     }
 
     #[test]
@@ -799,6 +818,11 @@ mod tests {
             set.pattern(x, x, x)
         };
         let r: Vec<_> = q.collect();
-        assert_eq!(2, r.len(), "expected 2 self-self-self triples, got {}", r.len());
+        assert_eq!(
+            2,
+            r.len(),
+            "expected 2 self-self-self triples, got {}",
+            r.len()
+        );
     }
 }

@@ -9,12 +9,6 @@ use triblespace::prelude::*;
 
 fn assert_send<T: Send>(_: T) {}
 
-
-
-
-
-
-
 /// The manual `Query::clone` bound must stay independent of `R: Clone` after
 /// the residual cursor has started.
 #[cfg(feature = "parallel")]
@@ -38,7 +32,6 @@ fn clone_after_iteration_does_not_require_clone_output() {
     let cloned = query.clone();
     assert_eq!(query.count(), cloned.count());
 }
-
 
 /// A started query has already published progress. Ordinary Rayon conversion
 /// drains its residual state as one exact leaf instead of restarting or
@@ -69,9 +62,6 @@ fn partially_consumed_query_into_par_iter_keeps_exact_remainder() {
     actual.sort_unstable();
     assert_eq!(actual, expected);
 }
-
-
-
 
 /// Ordinary parallel residual execution must descend through an initially
 /// deterministic chain, reach a late block-native branch, and preserve

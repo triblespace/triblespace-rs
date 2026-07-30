@@ -3167,7 +3167,6 @@ mod tests {
         }
     }
 
-
     pub mod knights {
         use crate::prelude::*;
 
