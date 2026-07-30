@@ -369,6 +369,31 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
+// Probe-only census hook. `option_env!` makes the disabled arm a compile-time
+// constant, so the wall-time binary contains no counter instruction. Keep this
+// instrumentation on benchmark branches only.
+#[cfg(test)]
+static LOCAL_LEAF_HASH_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+#[inline(always)]
+fn record_local_leaf_hash_call() {
+    if option_env!("PATCH_CARDINALITY_HASH_CENSUS").is_some() {
+        LOCAL_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn reset_local_leaf_hash_calls() {
+    LOCAL_LEAF_HASH_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn local_leaf_hash_calls() -> u64 {
+    LOCAL_LEAF_HASH_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
 /// branch arm. Below this, the per-key `modify_child` loop wins
@@ -1056,6 +1081,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => leaf.hash,
             BodyRef::LocalLeaf(bytes) => {
+                #[cfg(test)]
+                record_local_leaf_hash_call();
                 use siphasher::sip128::SipHasher24;
                 use std::ptr::addr_of;
                 // SAFETY: SIP_KEY is initialized at startup; we only read it.
@@ -3760,6 +3787,7 @@ mod tests {
     use std::convert::TryInto;
     use std::iter::FromIterator;
     use std::mem;
+    use std::time::Instant;
 
     #[repr(C, align(16))]
     struct AlignedArchivePair([[u8; 16]; 2]);
@@ -4903,5 +4931,485 @@ mod tests {
 
         assert_eq!(tree.len(), 3);
         assert_eq!(tree.get(&[2u8; KEY_SIZE]), Some(&3u32));
+    }
+
+    // ---------------------------------------------------------------------
+    // Probe-only LocalLeaf cardinality A/B harness.
+    // ---------------------------------------------------------------------
+
+    const CARDINALITY_PROBE_KEY_LEN: usize = 64;
+
+    #[repr(C, align(16))]
+    struct AlignedCardinalityKey([u8; CARDINALITY_PROBE_KEY_LEN]);
+
+    fn cardinality_variant() -> &'static str {
+        option_env!("PATCH_CARDINALITY_VARIANT").unwrap_or("unlabelled")
+    }
+
+    fn cardinality_key(domain: u8, value: u32) -> [u8; CARDINALITY_PROBE_KEY_LEN] {
+        let mut key = [0; CARDINALITY_PROBE_KEY_LEN];
+        let spread = value.wrapping_mul(0x9e37_79b9).to_be_bytes();
+        key[0] = domain;
+        key[1..5].copy_from_slice(&spread);
+        key[CARDINALITY_PROBE_KEY_LEN - 4..].copy_from_slice(&value.to_be_bytes());
+        key
+    }
+
+    fn cardinality_key_slice(
+        storage: &[AlignedCardinalityKey],
+    ) -> &[[u8; CARDINALITY_PROBE_KEY_LEN]] {
+        assert_eq!(
+            mem::size_of::<AlignedCardinalityKey>(),
+            CARDINALITY_PROBE_KEY_LEN
+        );
+        // SAFETY: `AlignedCardinalityKey` is repr(C), contains only the byte
+        // array at offset zero, and has no tail padding at this 64-byte width.
+        unsafe { std::slice::from_raw_parts(storage.as_ptr().cast(), storage.len()) }
+    }
+
+    fn cardinality_archive_patch(
+        storage: &[AlignedCardinalityKey],
+        owner: &Arc<dyn ArchiveOwner>,
+    ) -> PATCH<CARDINALITY_PROBE_KEY_LEN, IdentitySchema> {
+        let keys = cardinality_key_slice(storage);
+        let hashes = keys.iter().map(|key| hash_key(key)).collect::<Vec<_>>();
+        let mut rows = (0..keys.len())
+            .map(|row| u32::try_from(row).expect("probe row fits u32"))
+            .collect::<Vec<_>>();
+        // SAFETY: the rows are a permutation of this unique, aligned slice;
+        // hashes correspond one-to-one and `owner` retains the allocation.
+        unsafe { PATCH::from_archive_partition(keys, &hashes, &mut rows, owner) }
+    }
+
+    struct CardinalityDirectFixture {
+        // Drop Heads before the explicit allocation guards.
+        branch: PATCH<CARDINALITY_PROBE_KEY_LEN, IdentitySchema>,
+        local: Head<CARDINALITY_PROBE_KEY_LEN, IdentitySchema, ()>,
+        _owner: Arc<dyn ArchiveOwner>,
+        _storage: Arc<Vec<AlignedCardinalityKey>>,
+    }
+
+    impl CardinalityDirectFixture {
+        fn new(branch_len: usize) -> Self {
+            assert!(matches!(branch_len, 2 | 16 | 256));
+            let mut keys = Vec::with_capacity(branch_len + 1);
+            keys.push(AlignedCardinalityKey(cardinality_key(0xe0, 0)));
+            keys.extend(
+                (0..branch_len)
+                    .map(|value| AlignedCardinalityKey(cardinality_key(0x20, value as u32))),
+            );
+            let storage = Arc::new(keys);
+            let owner: Arc<dyn ArchiveOwner> = storage.clone();
+            let branch = cardinality_archive_patch(&storage[1..], &owner);
+            assert_eq!(branch.len(), branch_len as u64);
+            assert!(branch.get(&storage[0].0).is_none());
+            assert!(matches!(
+                branch.root.as_ref().map(Head::body_ref),
+                Some(BodyRef::Branch(_))
+            ));
+            let local = unsafe {
+                // SAFETY: the first aligned key is immutable and retained by
+                // both strong guards for the fixture's full lifetime.
+                Head::new_local_leaf(0, NonNull::from(&storage[0].0))
+            };
+            Self {
+                branch,
+                local,
+                _owner: owner,
+                _storage: storage,
+            }
+        }
+
+        fn branch_head(&self) -> &Head<CARDINALITY_PROBE_KEY_LEN, IdentitySchema, ()> {
+            self.branch.root.as_ref().expect("branch fixture is nonempty")
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    enum CardinalityOrder {
+        LocalBranch,
+        BranchLocal,
+    }
+
+    impl CardinalityOrder {
+        fn label(self) -> &'static str {
+            match self {
+                Self::LocalBranch => "local_branch",
+                Self::BranchLocal => "branch_local",
+            }
+        }
+    }
+
+    fn cardinality_operands(
+        fixture: &CardinalityDirectFixture,
+        order: CardinalityOrder,
+    ) -> (
+        &Head<CARDINALITY_PROBE_KEY_LEN, IdentitySchema, ()>,
+        &Head<CARDINALITY_PROBE_KEY_LEN, IdentitySchema, ()>,
+    ) {
+        match order {
+            CardinalityOrder::LocalBranch => (&fixture.local, fixture.branch_head()),
+            CardinalityOrder::BranchLocal => (fixture.branch_head(), &fixture.local),
+        }
+    }
+
+    fn assert_cardinality_direct_semantics(
+        fixture: &CardinalityDirectFixture,
+        branch_len: usize,
+        order: CardinalityOrder,
+    ) {
+        let (left, right) = cardinality_operands(fixture, order);
+        assert_eq!(
+            Head::union(left.clone(), right.clone(), 0).count(),
+            branch_len as u64 + 1
+        );
+        assert!(left.intersect(right, 0).is_none());
+        let expected_difference = match order {
+            CardinalityOrder::LocalBranch => 1,
+            CardinalityOrder::BranchLocal => branch_len as u64,
+        };
+        assert_eq!(
+            left.difference(right, 0).as_ref().map(Head::count),
+            Some(expected_difference)
+        );
+    }
+
+    fn print_cardinality_direct_census(
+        fixture: &CardinalityDirectFixture,
+        branch_len: usize,
+        order: CardinalityOrder,
+    ) {
+        let (left, right) = cardinality_operands(fixture, order);
+
+        reset_local_leaf_hash_calls();
+        let union = Head::union(left.clone(), right.clone(), 0);
+        assert_eq!(union.count(), branch_len as u64 + 1);
+        println!(
+            "PATCH_CARDINALITY_CENSUS,{},direct,{},{},union,{}",
+            cardinality_variant(),
+            branch_len,
+            order.label(),
+            local_leaf_hash_calls()
+        );
+
+        reset_local_leaf_hash_calls();
+        let intersection = left.intersect(right, 0);
+        assert!(intersection.is_none());
+        println!(
+            "PATCH_CARDINALITY_CENSUS,{},direct,{},{},intersect,{}",
+            cardinality_variant(),
+            branch_len,
+            order.label(),
+            local_leaf_hash_calls()
+        );
+
+        reset_local_leaf_hash_calls();
+        let difference = left.difference(right, 0);
+        let expected_difference = match order {
+            CardinalityOrder::LocalBranch => 1,
+            CardinalityOrder::BranchLocal => branch_len as u64,
+        };
+        assert_eq!(
+            difference.as_ref().map(Head::count),
+            Some(expected_difference)
+        );
+        println!(
+            "PATCH_CARDINALITY_CENSUS,{},direct,{},{},difference,{}",
+            cardinality_variant(),
+            branch_len,
+            order.label(),
+            local_leaf_hash_calls()
+        );
+    }
+
+    #[derive(Copy, Clone)]
+    enum CardinalityGeometry {
+        Disjoint,
+        HalfOverlap,
+    }
+
+    impl CardinalityGeometry {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Disjoint => "disjoint",
+                Self::HalfOverlap => "half_overlap",
+            }
+        }
+    }
+
+    struct CardinalityPatchFixture {
+        // Drop PATCHes before the explicit allocation guards.
+        left: PATCH<CARDINALITY_PROBE_KEY_LEN, IdentitySchema>,
+        right: PATCH<CARDINALITY_PROBE_KEY_LEN, IdentitySchema>,
+        union_len: u64,
+        intersect_len: u64,
+        difference_len: u64,
+        _owner: Arc<dyn ArchiveOwner>,
+        _storage: Arc<Vec<AlignedCardinalityKey>>,
+    }
+
+    impl CardinalityPatchFixture {
+        fn new(len: usize, geometry: CardinalityGeometry) -> Self {
+            assert!(matches!(len, 1024 | 4096));
+            let right_start = match geometry {
+                CardinalityGeometry::Disjoint => len,
+                CardinalityGeometry::HalfOverlap => len / 2,
+            };
+            let mut keys = Vec::with_capacity(len * 2);
+            keys.extend(
+                (0..len)
+                    .map(|value| AlignedCardinalityKey(cardinality_key(0x60, value as u32))),
+            );
+            keys.extend((right_start..right_start + len).map(|value| {
+                AlignedCardinalityKey(cardinality_key(0x60, value as u32))
+            }));
+            let storage = Arc::new(keys);
+            let owner: Arc<dyn ArchiveOwner> = storage.clone();
+            let left = cardinality_archive_patch(&storage[..len], &owner);
+            let right = cardinality_archive_patch(&storage[len..], &owner);
+            let overlap = match geometry {
+                CardinalityGeometry::Disjoint => 0,
+                CardinalityGeometry::HalfOverlap => len / 2,
+            };
+            Self {
+                left,
+                right,
+                union_len: (len * 2 - overlap) as u64,
+                intersect_len: overlap as u64,
+                difference_len: (len - overlap) as u64,
+                _owner: owner,
+                _storage: storage,
+            }
+        }
+
+        fn assert_semantics(&self) {
+            let mut union = self.left.clone();
+            union.union(self.right.clone());
+            assert_eq!(union.len(), self.union_len);
+            assert_eq!(self.left.intersect(&self.right).len(), self.intersect_len);
+            assert_eq!(
+                self.left.difference(&self.right).len(),
+                self.difference_len
+            );
+        }
+    }
+
+    fn print_cardinality_patch_census(
+        fixture: &CardinalityPatchFixture,
+        len: usize,
+        geometry: CardinalityGeometry,
+    ) {
+        let mut union = fixture.left.clone();
+        let right = fixture.right.clone();
+        reset_local_leaf_hash_calls();
+        union.union(right);
+        assert_eq!(union.len(), fixture.union_len);
+        println!(
+            "PATCH_CARDINALITY_CENSUS,{},patch,{},{},union,{}",
+            cardinality_variant(),
+            len,
+            geometry.label(),
+            local_leaf_hash_calls()
+        );
+
+        reset_local_leaf_hash_calls();
+        let intersection = fixture.left.intersect(&fixture.right);
+        assert_eq!(intersection.len(), fixture.intersect_len);
+        println!(
+            "PATCH_CARDINALITY_CENSUS,{},patch,{},{},intersect,{}",
+            cardinality_variant(),
+            len,
+            geometry.label(),
+            local_leaf_hash_calls()
+        );
+
+        reset_local_leaf_hash_calls();
+        let difference = fixture.left.difference(&fixture.right);
+        assert_eq!(difference.len(), fixture.difference_len);
+        println!(
+            "PATCH_CARDINALITY_CENSUS,{},patch,{},{},difference,{}",
+            cardinality_variant(),
+            len,
+            geometry.label(),
+            local_leaf_hash_calls()
+        );
+    }
+
+    fn cardinality_samples(
+        iterations: usize,
+        samples: usize,
+        mut operation: impl FnMut() -> u64,
+    ) -> [f64; 3] {
+        for _ in 0..iterations.min(32) {
+            std::hint::black_box(operation());
+        }
+        let mut nanos = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(operation());
+            }
+            nanos.push(start.elapsed().as_secs_f64() * 1e9 / iterations as f64);
+        }
+        nanos.sort_by(f64::total_cmp);
+        [nanos[0], nanos[nanos.len() / 2], nanos[nanos.len() - 1]]
+    }
+
+    fn print_cardinality_timing(
+        level: &str,
+        size: usize,
+        scenario: &str,
+        operation: &str,
+        iterations: usize,
+        samples: usize,
+        run: impl FnMut() -> u64,
+    ) {
+        let [min, median, max] = cardinality_samples(iterations, samples, run);
+        println!(
+            "PATCH_CARDINALITY_BENCH,{},{},{},{},{},iterations={},samples={},min_ns={:.3},median_ns={:.3},max_ns={:.3}",
+            cardinality_variant(),
+            level,
+            size,
+            scenario,
+            operation,
+            iterations,
+            samples,
+            min,
+            median,
+            max
+        );
+    }
+
+    fn print_cardinality_direct_timings(
+        fixture: &CardinalityDirectFixture,
+        branch_len: usize,
+        order: CardinalityOrder,
+    ) {
+        const ITERATIONS: usize = 100_000;
+        const SAMPLES: usize = 11;
+        let (left, right) = cardinality_operands(fixture, order);
+        print_cardinality_timing(
+            "direct",
+            branch_len,
+            order.label(),
+            "union",
+            ITERATIONS,
+            SAMPLES,
+            || Head::union(left.clone(), right.clone(), 0).count(),
+        );
+        print_cardinality_timing(
+            "direct",
+            branch_len,
+            order.label(),
+            "intersect",
+            ITERATIONS,
+            SAMPLES,
+            || left.intersect(right, 0).as_ref().map_or(0, Head::count),
+        );
+        print_cardinality_timing(
+            "direct",
+            branch_len,
+            order.label(),
+            "difference",
+            ITERATIONS,
+            SAMPLES,
+            || left.difference(right, 0).as_ref().map_or(0, Head::count),
+        );
+    }
+
+    fn print_cardinality_patch_timings(
+        fixture: &CardinalityPatchFixture,
+        len: usize,
+        geometry: CardinalityGeometry,
+    ) {
+        let iterations = if len == 4096 { 8 } else { 32 };
+        const SAMPLES: usize = 11;
+        print_cardinality_timing(
+            "patch",
+            len,
+            geometry.label(),
+            "union",
+            iterations,
+            SAMPLES,
+            || {
+                let mut union = fixture.left.clone();
+                union.union(fixture.right.clone());
+                union.len()
+            },
+        );
+        print_cardinality_timing(
+            "patch",
+            len,
+            geometry.label(),
+            "intersect",
+            iterations,
+            SAMPLES,
+            || fixture.left.intersect(&fixture.right).len(),
+        );
+        print_cardinality_timing(
+            "patch",
+            len,
+            geometry.label(),
+            "difference",
+            iterations,
+            SAMPLES,
+            || fixture.left.difference(&fixture.right).len(),
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release LocalLeaf cardinality hash census"]
+    fn cardinality_gate_hash_census() {
+        assert!(
+            option_env!("PATCH_CARDINALITY_HASH_CENSUS").is_some(),
+            "rebuild with PATCH_CARDINALITY_HASH_CENSUS=1"
+        );
+        for branch_len in [2, 16, 256] {
+            let fixture = CardinalityDirectFixture::new(branch_len);
+            for order in [
+                CardinalityOrder::LocalBranch,
+                CardinalityOrder::BranchLocal,
+            ] {
+                print_cardinality_direct_census(&fixture, branch_len, order);
+            }
+        }
+        for len in [1024, 4096] {
+            for geometry in [
+                CardinalityGeometry::Disjoint,
+                CardinalityGeometry::HalfOverlap,
+            ] {
+                let fixture = CardinalityPatchFixture::new(len, geometry);
+                print_cardinality_patch_census(&fixture, len, geometry);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release LocalLeaf cardinality wall-time benchmark"]
+    fn cardinality_gate_wall_time_benchmark() {
+        assert!(
+            option_env!("PATCH_CARDINALITY_HASH_CENSUS").is_none(),
+            "wall timing must be rebuilt without census instrumentation"
+        );
+        for branch_len in [2, 16, 256] {
+            let fixture = CardinalityDirectFixture::new(branch_len);
+            for order in [
+                CardinalityOrder::LocalBranch,
+                CardinalityOrder::BranchLocal,
+            ] {
+                assert_cardinality_direct_semantics(&fixture, branch_len, order);
+                print_cardinality_direct_timings(&fixture, branch_len, order);
+            }
+        }
+        for len in [1024, 4096] {
+            for geometry in [
+                CardinalityGeometry::Disjoint,
+                CardinalityGeometry::HalfOverlap,
+            ] {
+                let fixture = CardinalityPatchFixture::new(len, geometry);
+                fixture.assert_semantics();
+                print_cardinality_patch_timings(&fixture, len, geometry);
+            }
+        }
     }
 }
