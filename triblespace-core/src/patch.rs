@@ -1214,52 +1214,77 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // NOTE: mut_children removed — prefer matching on BodyRef returned by
     // `body_mut()` and operating directly on the `&mut Branch` reference.
 
+    /// Remove a matching leaf. A detached heap leaf is returned without being
+    /// dropped; archive-local leaves are dropped immediately while the enclosing
+    /// PATCH owner cover is still installed. Their backing owner is retired
+    /// separately at the public mutation boundary if the root empties.
+    #[must_use = "drop the retired heap leaf only after the replacement root is committed"]
     pub(crate) fn remove_leaf(
         slot: &mut Option<Self>,
         leaf_key: &[u8; KEY_LEN],
         start_depth: usize,
-    ) {
+    ) -> Option<Self> {
         if let Some(this) = slot {
             let end_depth = std::cmp::min(this.end_depth(), KEY_LEN);
             // Check reachable equality by asking the head to test the prefix
             // up to its end_depth. Using the head/leaf primitive centralises the
             // unsafe deref into Branch::childleaf()/Leaf::has_prefix.
             if !this.has_prefix::<KEY_LEN>(start_depth, leaf_key) {
-                return;
+                return None;
             }
-            if matches!(this.tag(), HeadTag::Leaf | HeadTag::LocalLeaf) {
-                slot.take();
-            } else {
-                let mut ed = crate::patch::branch::BranchMut::from_head(this);
-                let key = leaf_key[end_depth];
-                ed.modify_child(key, |mut opt| {
-                    Self::remove_leaf(&mut opt, leaf_key, end_depth);
-                    opt
-                });
+            match this.tag() {
+                HeadTag::Leaf => {
+                    // Keep the removed value alive until every ancestor has
+                    // repaired its aggregates and collapsed any unary branch.
+                    slot.take()
+                }
+                HeadTag::LocalLeaf => {
+                    // A LocalLeaf owns no allocation itself. Remove its Head
+                    // while the PATCH-level owner cover still guards the raw
+                    // bytes; never let a naked LocalLeaf escape as retirement.
+                    drop(slot.take());
+                    None
+                }
+                _ => {
+                    let mut retired_leaf = None;
+                    let mut ed = crate::patch::branch::BranchMut::from_head(this);
+                    let key = leaf_key[end_depth];
+                    ed.modify_child(key, |mut opt| {
+                        retired_leaf = Self::remove_leaf(&mut opt, leaf_key, end_depth);
+                        opt
+                    });
 
-                // If the branch now contains a single remaining child we
-                // collapse the branch upward into that child. We must pull
-                // the remaining child out while `ed` is still borrowed,
-                // then drop `ed` before writing back into `slot` to avoid
-                // double mutable borrows of the slot.
-                if ed.leaf_count == 1 {
-                    let mut remaining: Option<Head<KEY_LEN, O, V>> = None;
-                    for slot_child in &mut ed.child_table {
-                        if let Some(child) = slot_child.take() {
-                            remaining = Some(child.with_start(start_depth));
-                            break;
+                    // If the branch now contains a single remaining child we
+                    // collapse the branch upward into that child. We must pull
+                    // the remaining child out while `ed` is still borrowed,
+                    // then drop `ed` before writing back into `slot` to avoid
+                    // double mutable borrows of the slot.
+                    let occupied_children = ed.child_table.iter().flatten().take(2).count();
+                    if occupied_children == 0 {
+                        drop(ed);
+                        drop(slot.take());
+                    } else if occupied_children == 1 {
+                        let mut remaining: Option<Head<KEY_LEN, O, V>> = None;
+                        for slot_child in &mut ed.child_table {
+                            if let Some(child) = slot_child.take() {
+                                remaining = Some(child.with_start(start_depth));
+                                break;
+                            }
                         }
+                        drop(ed);
+                        if let Some(child) = remaining {
+                            slot.replace(child);
+                        }
+                    } else {
+                        // Ensure the editor commits the final pointer into the
+                        // head when the branch does not collapse.
+                        drop(ed);
                     }
-                    drop(ed);
-                    if let Some(child) = remaining {
-                        slot.replace(child);
-                    }
-                } else {
-                    // ensure we drop the editor when not collapsing so the
-                    // final pointer is committed back into the head.
-                    drop(ed);
+                    retired_leaf
                 }
             }
+        } else {
+            None
         }
     }
 
@@ -2625,12 +2650,22 @@ where
     /// Removes a key from the PATCH.
     ///
     /// If the key is not present, this is a no-op.
+    /// If a removed value or final archive owner's destructor panics, the
+    /// removal is already fully committed when the panic is raised.
     pub fn remove(&mut self, key: &[u8; KEY_LEN]) {
-        Head::remove_leaf(&mut self.root, key, 0);
-        if self.root.is_none() {
-            self.owners = None;
-        }
+        let retired_leaf = Head::remove_leaf(&mut self.root, key, 0);
+        let retired_owners = if self.root.is_none() {
+            self.owners.take()
+        } else {
+            None
+        };
         self.debug_check_owner_invariant();
+
+        // Deliberately last: owner and value reclamation may execute arbitrary
+        // user Drop implementations, so every observable PATCH field and
+        // structural invariant must already describe the committed result.
+        drop(retired_owners);
+        drop(retired_leaf);
     }
 
     /// Returns the number of keys in the PATCH.
@@ -3882,9 +3917,23 @@ mod tests {
     use std::convert::TryInto;
     use std::iter::FromIterator;
     use std::mem;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[repr(C, align(16))]
     struct AlignedArchivePair([[u8; 16]; 2]);
+
+    #[repr(C, align(16))]
+    struct AlignedArchiveKey<const KEY_LEN: usize>([u8; KEY_LEN]);
+
+    struct PanicOnDrop(bool);
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            if self.0 {
+                panic!("intentional value drop panic");
+            }
+        }
+    }
 
     /// Build the smallest all-LocalLeaf PATCH and return a weak witness for
     /// its backing allocation. The returned PATCH is the allocation's only
@@ -4609,6 +4658,188 @@ mod tests {
 
         let after = tree.root.as_ref().expect("root exists");
         assert_eq!(after.childleaf_key(), &new_key);
+    }
+
+    #[test]
+    fn remove_commits_nested_structure_before_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_LEN: usize = 4;
+        let removed = [0, 0, 0, 0];
+        let nested_sibling = [0, 0, 0, 1];
+        let root_sibling = [1, 0, 0, 0];
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema, PanicOnDrop>::new();
+
+        for (key, should_panic) in [
+            (removed, true),
+            (nested_sibling, false),
+            (root_sibling, false),
+        ] {
+            let entry = Entry::with_value(&key, PanicOnDrop(should_panic));
+            patch.insert(&entry);
+            drop(entry);
+        }
+        assert_eq!(patch.node_stats().0, 2, "fixture must contain two branches");
+        assert_eq!(
+            patch.root.as_ref().expect("root branch").childleaf_key(),
+            &removed,
+            "the removed leaf must back the ancestor representative pointer",
+        );
+        let old_hash = patch.root_hash().expect("fixture hash");
+
+        let result = catch_unwind(AssertUnwindSafe(|| patch.remove(&removed)));
+        assert!(result.is_err());
+
+        assert_eq!(patch.len(), 2);
+        assert!(patch.get(&removed).is_none());
+        assert!(patch.get(&nested_sibling).is_some());
+        assert!(patch.get(&root_sibling).is_some());
+        assert_eq!(
+            patch.iter_ordered().copied().collect::<Vec<_>>(),
+            vec![nested_sibling, root_sibling],
+        );
+        assert_eq!(patch.node_stats().0, 1, "the nested unary branch collapsed");
+        assert_ne!(
+            patch.root.as_ref().expect("surviving root").childleaf_key(),
+            &removed,
+            "the surviving branch must not retain a dangling representative",
+        );
+        assert_eq!(patch.root_hash(), Some(old_hash ^ hash_key(&removed)));
+        let fanout = patch.branch_fanout_histogram();
+        assert_eq!(fanout[0], 0);
+        assert_eq!(fanout[1], 0);
+    }
+
+    #[test]
+    fn remove_collapses_root_before_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_LEN: usize = 4;
+        let removed = [0; KEY_LEN];
+        let retained = [1; KEY_LEN];
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema, PanicOnDrop>::new();
+        for (key, should_panic) in [(removed, true), (retained, false)] {
+            let entry = Entry::with_value(&key, PanicOnDrop(should_panic));
+            patch.insert(&entry);
+            drop(entry);
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| patch.remove(&removed)));
+        assert!(result.is_err());
+        assert_eq!(patch.len(), 1);
+        assert!(patch.get(&removed).is_none());
+        assert!(patch.get(&retained).is_some());
+        assert_eq!(patch.root_hash(), Some(hash_key(&retained)));
+        assert!(matches!(
+            patch.root.as_ref().expect("retained root").body_ref(),
+            BodyRef::Leaf(_),
+        ));
+    }
+
+    #[test]
+    fn remove_commits_cow_snapshot_before_deferred_value_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_LEN: usize = 4;
+        let removed = [0; KEY_LEN];
+        let retained = [1; KEY_LEN];
+        let mut edited = PATCH::<KEY_LEN, IdentitySchema, PanicOnDrop>::new();
+        for (key, should_panic) in [(removed, true), (retained, false)] {
+            let entry = Entry::with_value(&key, PanicOnDrop(should_panic));
+            edited.insert(&entry);
+            drop(entry);
+        }
+        let snapshot = edited.clone();
+
+        // The untouched snapshot still owns the removed leaf, so this is not
+        // yet its final release and the edit itself cannot run `V::drop`.
+        edited.remove(&removed);
+        assert!(edited.get(&removed).is_none());
+        assert!(edited.get(&retained).is_some());
+        assert_eq!(edited.root_hash(), Some(hash_key(&retained)));
+        assert!(snapshot.get(&removed).is_some());
+
+        let result = catch_unwind(AssertUnwindSafe(|| drop(snapshot)));
+        assert!(result.is_err());
+        assert_eq!(edited.len(), 1);
+        assert!(edited.get(&retained).is_some());
+    }
+
+    #[test]
+    fn remove_retains_archive_owner_until_empty_then_commits_before_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const KEY_LEN: usize = 16;
+        #[repr(C, align(16))]
+        struct PanickingOwner {
+            keys: [AlignedArchiveKey<KEY_LEN>; 2],
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Drop for PanickingOwner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+                panic!("intentional archive owner drop panic");
+            }
+        }
+
+        let first = [7; KEY_LEN];
+        let second = [8; KEY_LEN];
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(PanickingOwner {
+            keys: [AlignedArchiveKey(first), AlignedArchiveKey(second)],
+            drops: drops.clone(),
+        });
+        let erased: Arc<dyn ArchiveOwner> = owner.clone();
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema>::new();
+        for index in 0..2 {
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&owner.keys[index].0), &erased) };
+            patch.insert_archive(&entry);
+        }
+        drop(erased);
+        drop(owner);
+
+        // Removing one LocalLeaf may collapse its parent, but must retain the
+        // owner cover for the promoted survivor.
+        patch.remove(&first);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(patch.owners.is_some());
+        assert_eq!(patch.iter().copied().collect::<Vec<_>>(), vec![second]);
+        assert!(matches!(
+            patch.root.as_ref().expect("archive root").body_ref(),
+            BodyRef::LocalLeaf(_),
+        ));
+
+        let result = catch_unwind(AssertUnwindSafe(|| patch.remove(&second)));
+        assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(patch.root.is_none(), "the empty root was committed first");
+        assert!(
+            patch.owners.is_none(),
+            "the owner cover was detached before reclamation"
+        );
+        assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn remove_promotes_a_multi_leaf_only_child_subtree() {
+        const KEY_LEN: usize = 4;
+        let removed = [0, 0, 0, 0];
+        let retained_a = [1, 0, 0, 0];
+        let retained_b = [1, 1, 0, 0];
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema>::new();
+        for key in [removed, retained_a, retained_b] {
+            patch.insert(&Entry::new(&key));
+        }
+        assert_eq!(patch.node_stats().0, 2, "fixture must contain two branches");
+
+        patch.remove(&removed);
+
+        assert_eq!(patch.len(), 2);
+        assert_eq!(patch.node_stats().0, 1, "unary root must be removed");
+        assert_eq!(patch.branch_fanout_histogram()[1], 0);
+        assert!(patch.get(&retained_a).is_some());
+        assert!(patch.get(&retained_b).is_some());
     }
 
     #[test]

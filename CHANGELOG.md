@@ -566,6 +566,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PATCH removal commits structure before reclaiming values or archive owners.**
+  Heap leaves are retired until every ancestor has repaired its aggregates and
+  collapsed unary branches; the final owner cover is detached only after an
+  empty root is published. A panic in user `Drop` code therefore cannot leave
+  the PATCH observing a half-applied removal or a dangling representative.
+
 - **Borrowing PATCH iteration now reaches the maximum trie depth.** The
   stack-allocated iterator seeds its traversal from the root branch's child
   table instead of spending one of its `KEY_LEN` frames on a synthetic root.
