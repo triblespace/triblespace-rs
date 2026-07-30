@@ -16,6 +16,8 @@ mod branch;
 pub mod bytetable;
 mod entry;
 mod leaf;
+#[cfg(feature = "patch-probe")]
+pub(crate) mod probe;
 
 use arrayvec::ArrayVec;
 
@@ -27,8 +29,13 @@ use leaf::*;
 
 /// Re-export of all byte table utilities.
 pub use bytetable::*;
+#[cfg(feature = "patch-probe")]
+use rand::rngs::StdRng;
+#[cfg(not(feature = "patch-probe"))]
 use rand::thread_rng;
 use rand::RngCore;
+#[cfg(feature = "patch-probe")]
+use rand::SeedableRng;
 use std::cmp::Reverse;
 use std::convert::TryInto;
 use std::fmt;
@@ -161,6 +168,9 @@ pub(crate) fn init_sip_key() {
     INIT.call_once(|| {
         bytetable::init();
 
+        #[cfg(feature = "patch-probe")]
+        let mut rng = StdRng::seed_from_u64(0x5041_5443_485f_5349);
+        #[cfg(not(feature = "patch-probe"))]
         let mut rng = thread_rng();
         unsafe {
             rng.fill_bytes(&mut SIP_KEY[..]);
@@ -658,6 +668,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::LocalLeaf(bytes) => {
                 use siphasher::sip128::SipHasher24;
                 use std::ptr::addr_of;
+                #[cfg(feature = "patch-probe")]
+                probe::record_local_leaf_hash();
                 // SAFETY: SIP_KEY is initialized at startup; we only read it.
                 let key = unsafe { *addr_of!(SIP_KEY) };
                 SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
@@ -924,6 +936,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             match (ed.owner.as_ref(), leaf_owner) {
                 (None, Some(lo)) => ed.owner = Some(lo.clone()),
                 (Some(bo), Some(lo)) if !std::sync::Arc::ptr_eq(bo, lo) => {
+                    #[cfg(feature = "patch-probe")]
+                    probe::record_owner_mismatch_reification();
                     leaf = Self::reify_local_leaf_unit(leaf);
                     leaf_owner = None;
                 }
@@ -988,6 +1002,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         match head.body_ref() {
             BodyRef::Leaf(_) | BodyRef::Branch(_) => head,
             BodyRef::LocalLeaf(bytes) => {
+                #[cfg(feature = "patch-probe")]
+                probe::record_local_leaf_reification();
                 let key_byte = head.key();
                 let key_copy = *bytes;
                 drop(head);
@@ -1019,6 +1035,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         match head.body_ref() {
             BodyRef::Leaf(_) | BodyRef::Branch(_) => head,
             BodyRef::LocalLeaf(bytes) => {
+                #[cfg(feature = "patch-probe")]
+                probe::record_local_leaf_reification();
                 assert_eq!(
                     std::mem::size_of::<V>(),
                     0,
@@ -1099,6 +1117,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     .expect("LocalLeaf must have a parent owner"),
             );
             if !same_owner {
+                #[cfg(feature = "patch-probe")]
+                probe::record_owner_mismatch_reification();
                 other = Self::reify_local_leaf(other);
                 other_owner = None;
                 other_is_local = false;
@@ -1286,6 +1306,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 if target_matches {
                     target_owner.clone()
                 } else {
+                    #[cfg(feature = "patch-probe")]
+                    probe::record_owner_mismatch_reification();
                     inserted = Self::reify_local_leaf(inserted);
                     None
                 }

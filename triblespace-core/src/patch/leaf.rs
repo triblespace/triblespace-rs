@@ -37,9 +37,13 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
             let Some(ptr) = NonNull::new(alloc(layout) as *mut Self) else {
                 handle_alloc_error(layout);
             };
+            #[cfg(feature = "patch-probe")]
+            crate::patch::probe::record_leaf_allocation();
             let hash = SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
                 .hash(&key[..])
                 .into();
+            #[cfg(feature = "patch-probe")]
+            crate::patch::probe::record_leaf_new_hash();
 
             ptr.write(Self {
                 key: *key,

@@ -305,6 +305,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             else {
                 handle_alloc_error(layout);
             };
+            #[cfg(feature = "patch-probe")]
+            crate::patch::probe::record_branch_new_allocation();
             addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
             addr_of_mut!((*ptr.as_ptr()).end_depth).write(end_depth as u32);
             addr_of_mut!((*ptr.as_ptr()).childleaf).write(lchild.childleaf_ptr());
@@ -383,6 +385,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     NonNull::new(std::ptr::slice_from_raw_parts(alloc_zeroed(layout), size)
                         as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
                 {
+                    #[cfg(feature = "patch-probe")]
+                    crate::patch::probe::record_branch_cow_allocation();
                     addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
                     addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
                     addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
@@ -427,6 +431,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             )
                 as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
             {
+                #[cfg(feature = "patch-probe")]
+                crate::patch::probe::record_branch_grow_allocation();
                 addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
                 addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
                 addr_of_mut!((*ptr.as_ptr()).leaf_count).write((*branch).leaf_count);

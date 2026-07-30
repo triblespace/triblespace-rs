@@ -118,6 +118,8 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
                 .hash(&ptr.as_ref()[..])
                 .into()
         };
+        #[cfg(feature = "patch-probe")]
+        crate::patch::probe::record_archive_entry_hash();
         Self { ptr, owner, hash }
     }
 

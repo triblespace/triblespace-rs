@@ -689,6 +689,117 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "patch-probe")]
+    mod intrinsic_512x3_attr {
+        use crate::prelude::inlineencodings::ShortString;
+        use crate::prelude::*;
+
+        attributes! {
+            pub field_01: ShortString;
+            pub field_02: ShortString;
+            pub field_03: ShortString;
+        }
+    }
+
+    #[cfg(feature = "patch-probe")]
+    fn intrinsic_512x3_inputs() -> Vec<[String; 3]> {
+        (0..512)
+            .map(|entity| {
+                [
+                    format!("a{entity:06}"),
+                    format!("b{entity:06}"),
+                    format!("c{entity:06}"),
+                ]
+            })
+            .collect()
+    }
+
+    /// Construction and composition receipt for the intrinsic-entity 512x3
+    /// workload. Run this test by itself so no other probe-enabled test can
+    /// contribute to the process-global counters:
+    ///
+    /// `cargo test --release -p triblespace-core --features patch-probe --lib intrinsic_512x3_patch_probe -- --ignored --nocapture`
+    #[cfg(feature = "patch-probe")]
+    #[test]
+    #[ignore = "explicit release-mode PATCH counter diagnostic"]
+    fn intrinsic_512x3_patch_probe() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the PATCH counter diagnostic with --release; debug invariant checks intentionally hash children again",
+        );
+
+        // Match `benches/entity_intrinsic.rs` exactly. Attribute initialization
+        // is deliberately outside the counted construction phase, just as the
+        // benchmark's `derived_attribute_warmup` is outside Criterion's loop.
+        let _ = intrinsic_512x3_attr::field_01.id();
+        let _ = intrinsic_512x3_attr::field_02.id();
+        let _ = intrinsic_512x3_attr::field_03.id();
+        let inputs = intrinsic_512x3_inputs();
+
+        crate::patch::probe::reset();
+        let entities: Vec<_> = inputs
+            .iter()
+            .map(|values| {
+                entity! {
+                    intrinsic_512x3_attr::field_01: values[0].as_str(),
+                    intrinsic_512x3_attr::field_02: values[1].as_str(),
+                    intrinsic_512x3_attr::field_03: values[2].as_str(),
+                }
+            })
+            .collect();
+        let construction = crate::patch::probe::snapshot();
+
+        let entities: Vec<_> = entities
+            .into_iter()
+            .map(crate::trible::Fragment::into_facts)
+            .collect();
+        crate::patch::probe::reset();
+        let mut aggregate = TribleSet::new();
+        for entity in entities {
+            aggregate += entity;
+        }
+        let union = crate::patch::probe::snapshot();
+        let final_nodes = [
+            ("eav", aggregate.eav.node_stats()),
+            ("eva", aggregate.eva.node_stats()),
+            ("aev", aggregate.aev.node_stats()),
+            ("ave", aggregate.ave.node_stats()),
+            ("vea", aggregate.vea.node_stats()),
+            ("vae", aggregate.vae.node_stats()),
+        ];
+
+        assert_eq!(aggregate.len(), 512 * 3);
+        eprintln!(
+            "patch_probe phase=construction entities=512 rows_per_entity=3 {}",
+            format_probe_snapshot(construction),
+        );
+        eprintln!(
+            "patch_probe phase=union entities=512 rows_per_entity=3 {}",
+            format_probe_snapshot(union),
+        );
+        for (index, (branches, branch_slots, heap_leaves, local_leaves)) in final_nodes {
+            eprintln!(
+                "patch_probe phase=union_final index={index} branches={branches} branch_slots={branch_slots} heap_leaves={heap_leaves} local_leaves={local_leaves}",
+            );
+        }
+    }
+
+    #[cfg(feature = "patch-probe")]
+    fn format_probe_snapshot(snapshot: crate::patch::probe::Snapshot) -> String {
+        format!(
+            "archive_entry_hashes={} local_leaf_hashes={} leaf_new_hashes={} local_leaf_reifications={} owner_mismatch_reifications={} leaf_allocations={} branch_new_allocations={} branch_cow_allocations={} branch_grow_allocations={}",
+            snapshot.archive_entry_hashes,
+            snapshot.local_leaf_hashes,
+            snapshot.leaf_new_hashes,
+            snapshot.local_leaf_reifications,
+            snapshot.owner_mismatch_reifications,
+            snapshot.leaf_allocations,
+            snapshot.branch_new_allocations,
+            snapshot.branch_cow_allocations,
+            snapshot.branch_grow_allocations,
+        )
+    }
+
     #[test]
     fn intrinsic_entity_rows_are_canonical_hashed_and_indexed() {
         assert_eq!(std::mem::size_of::<IntrinsicEntityRow>(), TRIBLE_LEN);
