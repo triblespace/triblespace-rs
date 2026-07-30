@@ -2734,7 +2734,7 @@ where
         &self,
         old_count: u64,
         old_hash: Option<u128>,
-        removed_key: &[u8; KEY_LEN],
+        removed_tree_key: &[u8; KEY_LEN],
     ) {
         let delta = old_count.checked_sub(self.len());
         debug_assert!(
@@ -2746,7 +2746,10 @@ where
         };
         let derived = match delta {
             Some(0) => old_hash,
-            Some(1) => old_hash.map(|hash| hash ^ hash_key(removed_key)),
+            Some(1) => old_hash.map(|hash| {
+                let removed_key = O::key_ordered(removed_tree_key);
+                hash ^ hash_key(&removed_key)
+            }),
             _ => None,
         };
         if let Some(hash) = derived {
@@ -2860,6 +2863,8 @@ where
     }
 
     /// Removes a key from the PATCH.
+    ///
+    /// `key` is expressed in this PATCH's tree ordering.
     ///
     /// If the key is not present, this is a no-op.
     pub fn remove(&mut self, key: &[u8; KEY_LEN]) {
@@ -4550,6 +4555,40 @@ mod tests {
             HashSet::from([a, b, inserted, novel])
         );
         deep_hash_audit(&snapshot);
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
+    fn remove_boundary_hashes_the_canonical_key_under_a_nonidentity_order() {
+        use crate::trible::AEVOrder;
+
+        let mut first = [0u8; 64];
+        first[0] = 1;
+        first[16] = 10;
+        first[32] = 20;
+        let mut removed = first;
+        removed[0] = 2;
+        removed[16] = 11;
+        removed[32] = 21;
+        let mut third = first;
+        third[0] = 3;
+        third[16] = 12;
+        third[32] = 22;
+
+        let mut patch = PATCH::<64, AEVOrder>::new();
+        patch.insert(&Entry::new(&first));
+        patch.insert(&Entry::new(&removed));
+        patch.insert(&Entry::new(&third));
+        let old_hash = patch.root_hash().expect("three keys have a root hash");
+
+        let removed_tree_key = AEVOrder::tree_ordered(&removed);
+        assert_ne!(removed_tree_key, removed);
+        patch.remove(&removed_tree_key);
+
+        let expected = old_hash ^ hash_key(&removed);
+        assert_eq!(patch.len(), 2);
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert!(patch.get(&removed_tree_key).is_none());
         deep_hash_audit(&patch);
     }
 
