@@ -4274,7 +4274,7 @@ mod tests {
         deep_hash_audit(&intersection);
 
         reset_local_leaf_hash_calls();
-        let difference = difference_with_exhausted_parallel_budget(&left, &right);
+        let difference = left.difference(&right);
         assert_eq!(local_leaf_hash_calls(), 0);
         assert_eq!(difference.iter().copied().collect::<Vec<_>>(), vec![a]);
         deep_hash_audit(&difference);
@@ -4389,7 +4389,7 @@ mod tests {
         assert_eq!(direct_dirty_branch_children(&left), 128);
 
         reset_local_leaf_hash_calls();
-        let difference = left.difference(&right);
+        let difference = difference_with_exhausted_parallel_budget(&left, &right);
         assert_eq!(local_leaf_hash_calls(), 0);
         assert_eq!(difference.len(), 2_048);
         assert_eq!(branch_cached_hash(&difference), 0);
