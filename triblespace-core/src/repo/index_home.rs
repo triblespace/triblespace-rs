@@ -12,9 +12,6 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[cfg(test)]
-use std::cell::Cell;
-
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
@@ -1379,58 +1376,6 @@ impl<U> UnionArchive<U> {
 }
 
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct UnionCompleteWalkCounts {
-    located: usize,
-    consumed: usize,
-}
-
-#[cfg(test)]
-thread_local! {
-    static UNION_COMPLETE_WALK_COUNTS: Cell<Option<UnionCompleteWalkCounts>> = const {
-        Cell::new(None)
-    };
-}
-
-#[cfg(test)]
-fn arm_union_complete_walk_counts() {
-    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
-        assert!(counts
-            .replace(Some(UnionCompleteWalkCounts::default()))
-            .is_none());
-    });
-}
-
-#[cfg(test)]
-fn record_union_complete_walk_located() {
-    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
-        if let Some(mut count) = counts.get() {
-            count.located += 1;
-            counts.set(Some(count));
-        }
-    });
-}
-
-#[cfg(test)]
-fn record_union_complete_walk_consumed() {
-    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
-        if let Some(mut count) = counts.get() {
-            count.consumed += 1;
-            counts.set(Some(count));
-        }
-    });
-}
-
-#[cfg(test)]
-fn take_union_complete_walk_counts() -> UnionCompleteWalkCounts {
-    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
-        counts
-            .take()
-            .expect("Union complete walk counter was not armed")
-    })
-}
-
 /// Atomic normalized union over one finite set of Succinct archive shards.
 ///
 /// A thin wrapper over [`UnionConstraint`]: every shard constraint carries
@@ -1527,3 +1472,875 @@ where
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    //! Restored from `bd973d1e^` (the June-protocol transplant deleted this
+    //! module wholesale). Everything below that survived is a manifest,
+    //! coverage, or repository-hook property — none of it depended on the
+    //! residual/VM-era protocol, and on tip main it had no coverage at all
+    //! outside `trible/tests/pile.rs` (3 `manifest_tribles` references) and
+    //! `examples/index_home.rs` (2 asserts).
+    //!
+    //! The `UnionArchive` constraint tests are ports, not copies: the old
+    //! ones drove a multi-row `confirm(&RowsView, &mut CandidateSink)` and
+    //! the typed `Program` route/rank/dispatch surface. The June protocol
+    //! confirms one `Binding` at a time into a kill-only `Candidates`, so the
+    //! row-tagged variants are re-expressed as per-binding independence and
+    //! the program-shape assertions are gone with the protocol that carried
+    //! them.
+    use super::*;
+    use crate::blob::IntoBlob;
+    use crate::examples::literature;
+    use crate::id::fucid;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::{IntoInline, RawInline};
+    use crate::query::{BindingStore, Variable};
+    use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::{BlobStorePut, CommitHandle};
+    use crate::trible::Trible;
+    use ed25519_dalek::SigningKey;
+    use std::collections::HashSet;
+    use std::convert::Infallible;
+
+    fn commit(byte: u8) -> CommitHandle {
+        Inline::new([byte; 32])
+    }
+
+    fn source(name: &str) -> TribleSet {
+        let person = fucid();
+        entity! { &person @ literature::firstname: name }.into_facts()
+    }
+
+    fn raw_value(tag: u8) -> RawInline {
+        [tag; 32]
+    }
+
+    fn fixed_archive(
+        entity: &Id,
+        attribute: &Id,
+        values: impl IntoIterator<Item = u8>,
+    ) -> SuccinctArchive<OrderedUniverse> {
+        let mut facts = TribleSet::new();
+        for tag in values {
+            facts.insert(&Trible::force(
+                entity,
+                attribute,
+                &Inline::<UnknownInline>::new(raw_value(tag)),
+            ));
+        }
+        (&facts).into()
+    }
+
+    /// Confirms `input` against `constraint` for `variable` under `binding`
+    /// and returns the surviving bag in buffer order.
+    ///
+    /// `Candidates` is kill-only, so this preserves order and multiplicity by
+    /// construction — the property the old `CandidateSink::Values` test spelled
+    /// out with an explicit `filter` comparison.
+    fn confirm_bag<'a, C: Constraint<'a>>(
+        constraint: &C,
+        variable: VariableId,
+        binding: &Binding,
+        input: &[RawInline],
+    ) -> Vec<RawInline> {
+        let mut buffer = ProposalBuffer::new();
+        buffer.extend_from_slice(input);
+        let mut candidates = buffer.region(0);
+        constraint.confirm(variable, binding, &mut candidates);
+        let values = candidates.values().to_vec();
+        (0..values.len())
+            .filter(|index| candidates.is_live(*index))
+            .map(|index| values[index])
+            .collect()
+    }
+
+    fn propose_bag<'a, C: Constraint<'a>>(
+        constraint: &C,
+        variable: VariableId,
+        binding: &Binding,
+    ) -> Vec<RawInline> {
+        let mut buffer = ProposalBuffer::new();
+        constraint.propose(variable, binding, &mut buffer);
+        buffer.live_values(0).copied().collect()
+    }
+
+    fn stored_commit(
+        storage: &mut MemoryRepo,
+        key: &SigningKey,
+        parents: impl IntoIterator<Item = CommitHandle>,
+        source: Option<&TribleSet>,
+    ) -> CommitHandle {
+        let content = source.map(IntoBlob::to_blob);
+        let metadata = crate::repo::commit::commit_metadata(key, parents, None, content, None);
+        storage.put(metadata).unwrap()
+    }
+
+    fn stored_chain(storage: &mut MemoryRepo, count: usize) -> Vec<CommitHandle> {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut commits = Vec::new();
+        for index in 0..count {
+            let facts = source(&format!("person-{index}"));
+            let commit = stored_commit(storage, &key, commits.last().copied(), Some(&facts));
+            commits.push(commit);
+        }
+        commits
+    }
+
+    #[derive(Debug)]
+    struct InjectedPutFailure;
+
+    impl fmt::Display for InjectedPutFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "injected put failure")
+        }
+    }
+
+    impl Error for InjectedPutFailure {}
+
+    struct FailingPutStore {
+        inner: MemoryRepo,
+        successful_puts_left: usize,
+    }
+
+    impl BlobStorePut for FailingPutStore {
+        type PutError = InjectedPutFailure;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: crate::blob::BlobEncoding + 'static,
+            T: crate::blob::IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            if self.successful_puts_left == 0 {
+                return Err(InjectedPutFailure);
+            }
+            self.successful_puts_left -= 1;
+            Ok(self.inner.put(item).expect("MemoryRepo put is infallible"))
+        }
+    }
+
+    impl BlobStore for FailingPutStore {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = Infallible;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.inner.reader()
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Manifest encoding / parsing
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn empty_manifest_has_a_self_marked_recipe_header() {
+        let mut storage = MemoryRepo::default();
+        let reader = storage.reader().unwrap();
+        let manifest = Manifest::new(&SuccinctRollup).unwrap();
+        let encoded = manifest.to_tribles();
+        let parsed = Manifest::from_tribles(&encoded, &reader, &SuccinctRollup).unwrap();
+        assert_eq!(parsed.recipe(), manifest.recipe());
+        assert!(parsed.ranges.is_empty());
+        assert!(encoded.iter().any(|fact| {
+            *fact.e() == manifest.recipe()
+                && fact.a() == &crate::repo::index_range::index_recipe.id()
+        }));
+    }
+
+    #[test]
+    fn repeated_unordered_succinct_pairs_parse_by_embedded_source() {
+        let mut storage = MemoryRepo::default();
+        let kind = SuccinctRollup;
+        let mut prepared = kind.build(&source("Ada")).unwrap();
+        prepared.extend(kind.build(&source("Grace")).unwrap());
+        let first = store_artifact(&mut storage, &kind, prepared.remove(0)).unwrap();
+        let second = store_artifact(&mut storage, &kind, prepared.remove(0)).unwrap();
+        let range = CommitRange::leaf(commit(1));
+        let mut record = RangeRecord::new(Manifest::new(&kind).unwrap().recipe(), range);
+        let entity = record.entity();
+        *record.facts_mut() += entity! { ExclusiveId::force_ref(&entity) @
+            seg_level: 0u64,
+            seg_seq: 0u64,
+            seg_succinct*: [second.raw, first.raw],
+            seg_succinct_rank9*: [first.rank9, second.rank9],
+        };
+        let reader = storage.reader().unwrap();
+        let parsed = kind.parse(&reader, record.facts(), entity).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&first));
+        assert!(parsed.contains(&second));
+    }
+
+    #[test]
+    fn missing_and_foreign_rank9_pairs_are_rejected() {
+        let mut storage = MemoryRepo::default();
+        let kind = SuccinctRollup;
+        let a = store_artifact(
+            &mut storage,
+            &kind,
+            kind.build(&source("A")).unwrap().remove(0),
+        )
+        .unwrap();
+        let b = store_artifact(
+            &mut storage,
+            &kind,
+            kind.build(&source("B")).unwrap().remove(0),
+        )
+        .unwrap();
+        let entity = *fucid();
+        let missing =
+            entity! { ExclusiveId::force_ref(&entity) @ seg_succinct: a.raw }.into_facts();
+        let reader = storage.reader().unwrap();
+        assert!(kind.parse(&reader, &missing, entity).is_err());
+
+        let foreign = entity! { ExclusiveId::force_ref(&entity) @
+            seg_succinct: a.raw,
+            seg_succinct_rank9: b.rank9,
+        }
+        .into_facts();
+        assert!(kind.parse(&reader, &foreign, entity).is_err());
+    }
+
+    #[test]
+    fn duplicate_rank9_sources_are_rejected() {
+        let mut storage = MemoryRepo::default();
+        let kind = SuccinctRollup;
+        let prepared = kind.build(&source("A")).unwrap().remove(0);
+        let mut duplicate_bytes = prepared.rank9.bytes.as_ref().to_vec();
+        duplicate_bytes.push(0);
+        let duplicate = Blob::<SuccinctArchiveRank9IndexBlob>::new(anybytes::Bytes::from_source(
+            duplicate_bytes,
+        ));
+        let duplicate_handle = storage.put(duplicate).unwrap();
+        let stored = kind.put(&mut storage, prepared).unwrap();
+        let entity = *fucid();
+        let facts = entity! { ExclusiveId::force_ref(&entity) @
+            seg_succinct: stored.raw,
+            seg_succinct_rank9*: [stored.rank9, duplicate_handle],
+        }
+        .into_facts();
+        let reader = storage.reader().unwrap();
+        assert!(kind.parse(&reader, &facts, entity).is_err());
+    }
+
+    #[test]
+    fn one_logical_leaf_can_hold_multiple_physical_pairs() {
+        let mut storage = MemoryRepo::default();
+        let kind = SuccinctRollup;
+        let mut head = TribleSet::new();
+        let mut prepared = kind.build(&source("Ada")).unwrap();
+        prepared.extend(kind.build(&source("Grace")).unwrap());
+        append_prepared_range(
+            &mut storage,
+            &kind,
+            CommitRange::leaf(commit(1)),
+            prepared,
+            &mut head,
+        )
+        .unwrap();
+        let reader = storage.reader().unwrap();
+        let manifest = Manifest::from_tribles(&head, &reader, &kind).unwrap();
+        assert_eq!(manifest.ranges.len(), 1);
+        assert_eq!(manifest.ranges[0].artifacts.len(), 2);
+    }
+
+    #[test]
+    fn empty_source_still_creates_a_coverage_record() {
+        let mut storage = MemoryRepo::default();
+        let kind = SuccinctRollup;
+        let mut head = TribleSet::new();
+        append_range(
+            &mut storage,
+            &kind,
+            &TribleSet::new(),
+            CommitRange::leaf(commit(1)),
+            &mut head,
+        )
+        .unwrap();
+        let reader = storage.reader().unwrap();
+        let manifest = Manifest::from_tribles(&head, &reader, &kind).unwrap();
+        assert_eq!(manifest.ranges.len(), 1);
+        assert!(manifest.ranges[0].artifacts.is_empty());
+    }
+
+    #[test]
+    fn generic_manifest_carry_is_lossless_and_ignores_legacy_facts() {
+        let kind = SuccinctRollup;
+        let manifest = Manifest::new(&kind).unwrap();
+        let recipe = manifest.recipe();
+        let unknown = fucid();
+        let legacy_entity = fucid();
+        let mut set = manifest.to_tribles();
+        set += entity! { ExclusiveId::force_ref(&recipe) @ metadata::tag: &unknown };
+        set += entity! { &legacy_entity @ metadata::tag: &unknown };
+        let carried = manifest_tribles(&set);
+        assert!(carried
+            .iter()
+            .any(|fact| { *fact.e() == recipe && fact.a() == &metadata::tag.id() }));
+        assert!(!carried.iter().any(|fact| *fact.e() == *legacy_entity));
+    }
+
+    #[test]
+    fn strip_recipe_manifest_repairs_a_missing_self_marker() {
+        let kind = SuccinctRollup;
+        let manifest = Manifest::new(&kind).unwrap();
+        let recipe = manifest.recipe();
+        let marker = entity! { ExclusiveId::force_ref(&recipe) @
+            crate::repo::index_range::index_recipe: recipe,
+        }
+        .into_facts();
+        let unrelated = fucid();
+        let mut malformed = manifest.to_tribles().difference(&marker);
+        malformed += entity! { &unrelated @ metadata::tag: recipe };
+        assert!(malformed.iter().any(|fact| *fact.e() == recipe));
+        let mut storage = MemoryRepo::default();
+        let reader = storage.reader().unwrap();
+        assert!(Manifest::from_tribles(&malformed, &reader, &kind).is_err());
+
+        strip_recipe_manifest(&mut malformed, recipe);
+        assert!(!malformed.iter().any(|fact| *fact.e() == recipe));
+        assert!(malformed.iter().any(|fact| *fact.e() == *unrelated));
+    }
+
+    // ---------------------------------------------------------------------
+    // Coverage, compaction, and failure atomicity
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn diamond_compacts_exactly_and_audited_head_rejects_a_hole() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let kind = SuccinctRollup;
+        let mut storage = MemoryRepo::default();
+        let g_facts = source("g");
+        let a_facts = source("a");
+        let b_facts = source("b");
+        let g = stored_commit(&mut storage, &key, [], Some(&g_facts));
+        let a = stored_commit(&mut storage, &key, [g], Some(&a_facts));
+        let b = stored_commit(&mut storage, &key, [g], Some(&b_facts));
+        let m = stored_commit(&mut storage, &key, [a, b], None);
+
+        let mut complete = TribleSet::new();
+        for (commit, facts) in [(g, &g_facts), (a, &a_facts), (b, &b_facts)] {
+            append_range(
+                &mut storage,
+                &kind,
+                facts,
+                CommitRange::leaf(commit),
+                &mut complete,
+            )
+            .unwrap();
+        }
+        set_index_frontier_audited(&mut storage, &kind, &mut complete, vec![b, a]).unwrap();
+        let reader = storage.reader().unwrap();
+        let prefix = Manifest::from_tribles(&complete, &reader, &kind).unwrap();
+        let mut expected_frontier = vec![a, b];
+        expected_frontier.sort_unstable_by_key(|commit| commit.raw);
+        assert_eq!(prefix.frontier(), expected_frontier);
+
+        append_range(
+            &mut storage,
+            &kind,
+            &TribleSet::new(),
+            CommitRange::leaf(m),
+            &mut complete,
+        )
+        .unwrap();
+        set_index_head_audited(&mut storage, &kind, &mut complete, Some(m)).unwrap();
+        let reader = storage.reader().unwrap();
+        let manifest = Manifest::from_tribles(&complete, &reader, &kind).unwrap();
+        assert_eq!(manifest.ranges().len(), 1);
+        assert_eq!(manifest.ranges()[0].range().start(), &[g]);
+        assert_eq!(manifest.ranges()[0].range().end(), &[m]);
+
+        let mut hole = TribleSet::new();
+        for (commit, facts) in [(g, &g_facts), (a, &a_facts)] {
+            append_range(
+                &mut storage,
+                &kind,
+                facts,
+                CommitRange::leaf(commit),
+                &mut hole,
+            )
+            .unwrap();
+        }
+        append_range(
+            &mut storage,
+            &kind,
+            &TribleSet::new(),
+            CommitRange::leaf(m),
+            &mut hole,
+        )
+        .unwrap();
+        let before = hole.clone();
+        assert!(set_index_head_audited(&mut storage, &kind, &mut hole, Some(m)).is_err());
+        assert_eq!(hole, before);
+    }
+
+    #[derive(Clone)]
+    struct FailingEmptyKind {
+        tag: Id,
+    }
+
+    impl IndexKind for FailingEmptyKind {
+        type Segment = ();
+        type PreparedArtifact = ();
+        type StoredArtifact = ();
+
+        fn recipe_fragment(&self) -> Fragment {
+            entity! { _ @ metadata::tag: self.tag }
+        }
+
+        fn build(&self, _source: &TribleSet) -> Result<Vec<()>, ArtifactError> {
+            Ok(Vec::new())
+        }
+
+        fn put<S: BlobStorePut>(
+            &self,
+            _storage: &mut S,
+            _artifact: (),
+        ) -> Result<(), ArtifactError> {
+            Ok(())
+        }
+
+        fn emit(&self, _range_entity: Id, _artifact: &()) -> TribleSet {
+            TribleSet::new()
+        }
+
+        fn parse<R: BlobStoreGet>(
+            &self,
+            _reader: &R,
+            _facts: &TribleSet,
+            _range_entity: Id,
+        ) -> Result<Vec<()>, ArtifactError> {
+            Ok(Vec::new())
+        }
+
+        fn attach<R: BlobStoreGet>(
+            &self,
+            _reader: &R,
+            _artifact: &(),
+        ) -> Result<(), ArtifactError> {
+            Ok(())
+        }
+
+        fn merge(&self, _segments: &[()]) -> Result<Vec<()>, ArtifactError> {
+            Err("injected merge failure".into())
+        }
+    }
+
+    #[test]
+    fn merge_failure_leaves_manifest_bytes_untouched() {
+        let mut storage = MemoryRepo::default();
+        let commits = stored_chain(&mut storage, FANOUT);
+        let kind = FailingEmptyKind { tag: *fucid() };
+        let mut head = TribleSet::new();
+        for commit in &commits[..FANOUT - 1] {
+            append_range(
+                &mut storage,
+                &kind,
+                &TribleSet::new(),
+                CommitRange::leaf(*commit),
+                &mut head,
+            )
+            .unwrap();
+        }
+        let before = head.clone();
+        assert!(append_range(
+            &mut storage,
+            &kind,
+            &TribleSet::new(),
+            CommitRange::leaf(commits[FANOUT - 1]),
+            &mut head,
+        )
+        .is_err());
+        assert_eq!(head, before);
+    }
+
+    #[test]
+    fn non_monotone_batch_is_rejected_before_extension() {
+        let mut storage = MemoryRepo::default();
+        let commits = stored_chain(&mut storage, 3);
+        let reader = storage.reader().unwrap();
+        validate_monotone_batch(&reader, Some(commits[0]), commits[2]).unwrap();
+        assert!(validate_monotone_batch(&reader, Some(commits[2]), commits[1]).is_err());
+        let unrelated = stored_commit(
+            &mut storage,
+            &SigningKey::from_bytes(&[11; 32]),
+            [],
+            Some(&source("fork")),
+        );
+        let reader = storage.reader().unwrap();
+        assert!(validate_monotone_batch(&reader, Some(commits[2]), unrelated).is_err());
+    }
+
+    #[test]
+    fn partial_pair_put_failure_leaves_head_untouched() {
+        let mut storage = FailingPutStore {
+            inner: MemoryRepo::default(),
+            successful_puts_left: 1,
+        };
+        let mut head = TribleSet::new();
+        let before = head.clone();
+        let error = append_range(
+            &mut storage,
+            &SuccinctRollup,
+            &source("Ada"),
+            CommitRange::leaf(commit(1)),
+            &mut head,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("put failure"));
+        assert_eq!(head, before);
+        assert_eq!(
+            storage.inner.blobs.len(),
+            1,
+            "the raw half may remain as unreachable CAS garbage"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Repository maintenance hook
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn repository_hook_tracks_each_commit_and_bounds_logical_fanout() {
+        use crate::repo::Repository;
+
+        let storage = MemoryRepo::default();
+        let mut repo =
+            Repository::new(storage, SigningKey::from_bytes(&[17; 32]), TribleSet::new()).unwrap();
+        repo.register_index(SuccinctRollup);
+        let branch = repo.create_branch("main", None).unwrap();
+
+        let count = 2 * FANOUT - 1;
+        for index in 0..count {
+            let mut workspace = repo.pull(*branch).unwrap();
+            workspace.commit(source(&format!("p{index}")), "commit");
+            repo.push(&mut workspace).unwrap();
+        }
+        assert!(repo.take_hook_errors().is_empty());
+
+        let current_head = repo.pull(*branch).unwrap().head();
+        let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup);
+        let manifest = home.read_manifest().unwrap();
+        assert!(manifest.claims_head(current_head));
+        assert!(manifest.ranges().len() < count);
+        let mut per_level = HashMap::new();
+        for range in manifest.ranges() {
+            *per_level.entry(range.level()).or_insert(0usize) += 1;
+        }
+        assert!(per_level.values().all(|count| *count < FANOUT));
+
+        let segments = home.attach_manifest(&manifest).unwrap();
+        let union = SuccinctRollup::union(&segments);
+        assert_eq!(
+            find!(
+                name: Inline<crate::inline::encodings::shortstring::ShortString>,
+                pattern!(&union, [{ _?person @ literature::firstname: ?name }])
+            )
+            .count(),
+            count
+        );
+    }
+
+    #[test]
+    fn unhooked_gap_remains_stale_and_next_commit_still_lands() {
+        use crate::repo::Repository;
+
+        let key = SigningKey::from_bytes(&[19; 32]);
+        let mut indexed =
+            Repository::new(MemoryRepo::default(), key.clone(), TribleSet::new()).unwrap();
+        indexed.register_index(SuccinctRollup);
+        let branch = indexed.create_branch("main", None).unwrap();
+        let mut first = indexed.pull(*branch).unwrap();
+        first.commit(source("indexed"), "indexed");
+        indexed.push(&mut first).unwrap();
+        let indexed_head = first.head();
+
+        let mut unhooked =
+            Repository::new(indexed.into_storage(), key.clone(), TribleSet::new()).unwrap();
+        let mut missed = unhooked.pull(*branch).unwrap();
+        missed.commit(source("missed"), "missed");
+        unhooked.push(&mut missed).unwrap();
+
+        let mut resumed = Repository::new(unhooked.into_storage(), key, TribleSet::new()).unwrap();
+        resumed.register_index(SuccinctRollup);
+        let mut later = resumed.pull(*branch).unwrap();
+        later.commit(source("later"), "later");
+        let later_head = later.head();
+        resumed.push(&mut later).unwrap();
+
+        let errors = resumed.take_hook_errors();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].error.to_string().contains("stale"));
+        assert_eq!(resumed.pull(*branch).unwrap().head(), later_head);
+        let mut home = IndexHome::new(resumed.storage_mut(), *branch, SuccinctRollup);
+        let manifest = home.read_manifest().unwrap();
+        assert!(manifest.claims_head(indexed_head));
+        assert_eq!(manifest.ranges().len(), 1);
+    }
+
+    #[test]
+    fn conflict_retry_covers_the_contentless_merge_leaf() {
+        use crate::repo::Repository;
+
+        let mut repo = Repository::new(
+            MemoryRepo::default(),
+            SigningKey::from_bytes(&[23; 32]),
+            TribleSet::new(),
+        )
+        .unwrap();
+        repo.register_index(SuccinctRollup);
+        let branch = repo.create_branch("main", None).unwrap();
+        let mut left = repo.pull(*branch).unwrap();
+        let mut right = repo.pull(*branch).unwrap();
+        left.commit(source("left"), "left");
+        right.commit(source("right"), "right");
+        repo.push(&mut left).unwrap();
+        repo.push(&mut right).unwrap();
+        assert!(repo.take_hook_errors().is_empty());
+
+        let head = right.head();
+        let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup);
+        let manifest = home.read_manifest().unwrap();
+        assert!(manifest.claims_head(head));
+        assert_eq!(
+            manifest.ranges().len(),
+            3,
+            "two authored leaves + merge leaf"
+        );
+        assert_eq!(
+            manifest
+                .ranges()
+                .iter()
+                .filter(|range| range.artifacts().is_empty())
+                .count(),
+            1
+        );
+        drop(home);
+        let reader = repo.storage_mut().reader().unwrap();
+        manifest.audit_exact_cover(&reader).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // UnionArchive — the shard union as a TriblePattern source
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn union_archive_reports_its_physical_segment_count() {
+        let entity = Id::new([0x30; 16]).unwrap();
+        let attribute = Id::new([0x40; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1]),
+            fixed_archive(&entity, &attribute, [2]),
+        ];
+
+        assert_eq!(UnionArchive::new(archives.to_vec()).segment_count(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "UnionArchive requires at least one physical shard")]
+    fn union_archive_rejects_an_empty_physical_union_at_construction() {
+        let archives: [SuccinctArchive<OrderedUniverse>; 0] = [];
+        let _ = UnionArchive::new(archives.to_vec());
+    }
+
+    #[test]
+    fn one_shard_union_archive_confirm_matches_direct_unsorted_duplicate_bag() {
+        let entity = Id::new([0x11; 16]).unwrap();
+        let attribute = Id::new([0x21; 16]).unwrap();
+        let archives = [fixed_archive(&entity, &attribute, [2, 4])];
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let direct = archives[0].pattern(entity, attribute, value);
+        let union_archive = UnionArchive::new(archives.to_vec());
+        let union = union_archive.pattern(entity, attribute, value);
+        let input = vec![
+            raw_value(4),
+            raw_value(1),
+            raw_value(2),
+            raw_value(4),
+            raw_value(3),
+            raw_value(2),
+        ];
+        let binding = Binding::default();
+
+        let direct_candidates = confirm_bag(&direct, value.index, &binding, &input);
+        let union_candidates = confirm_bag(&union, value.index, &binding, &input);
+
+        assert_eq!(union_candidates, direct_candidates);
+        assert_eq!(
+            union_candidates,
+            vec![raw_value(4), raw_value(2), raw_value(4), raw_value(2)],
+            "confirm is a kill-only filter: order and multiplicity must survive"
+        );
+    }
+
+    #[test]
+    fn multi_shard_union_archive_confirm_filters_by_or_membership_without_normalizing() {
+        let entity = Id::new([0x12; 16]).unwrap();
+        let attribute = Id::new([0x22; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1, 3]),
+            fixed_archive(&entity, &attribute, [2, 3]),
+        ];
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let union_archive = UnionArchive::new(archives.to_vec());
+        let union = union_archive.pattern(entity, attribute, value);
+        let input = vec![
+            raw_value(3),
+            raw_value(1),
+            raw_value(3),
+            raw_value(4),
+            raw_value(2),
+            raw_value(1),
+        ];
+
+        assert_eq!(
+            confirm_bag(&union, value.index, &Binding::default(), &input),
+            vec![
+                raw_value(3),
+                raw_value(1),
+                raw_value(3),
+                raw_value(2),
+                raw_value(1),
+            ],
+            "membership is the OR of the shards, and the survivors are not renormalized"
+        );
+    }
+
+    /// Re-expression of the deleted `union_archive_confirm_gates_shards_per_
+    /// tagged_parent_row`. The June protocol confirms one `Binding` at a time
+    /// instead of a row-tagged block, so the leak the original caught —
+    /// keying witnesses by value alone, which lets a value valid for one
+    /// parent survive under another — is now a per-binding property.
+    #[test]
+    fn union_archive_confirm_is_row_local_per_binding() {
+        let entity_one = Id::new([0x13; 16]).unwrap();
+        let entity_two = Id::new([0x14; 16]).unwrap();
+        let entity_dead = Id::new([0x15; 16]).unwrap();
+        let attribute = Id::new([0x23; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity_one, &attribute, [1]),
+            fixed_archive(&entity_two, &attribute, [2]),
+        ];
+        let entity = Variable::<GenId>::new(0);
+        let attribute_variable = Variable::<GenId>::new(1);
+        let value = Variable::<UnknownInline>::new(2);
+        let union_archive = UnionArchive::new(archives.to_vec());
+        let union = union_archive.pattern(entity, attribute_variable, value);
+        let entity_one: Inline<GenId> = entity_one.to_inline();
+        let entity_two: Inline<GenId> = entity_two.to_inline();
+        let entity_dead: Inline<GenId> = entity_dead.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let input = vec![raw_value(1), raw_value(1), raw_value(2)];
+
+        for (parent, expected) in [
+            (entity_one, vec![raw_value(1), raw_value(1)]),
+            (entity_two, vec![raw_value(2)]),
+            (entity_dead, Vec::new()),
+        ] {
+            let mut store = BindingStore::new();
+            store.bind(entity.index, &parent.raw);
+            store.bind(attribute_variable.index, &attribute.raw);
+            assert_eq!(
+                confirm_bag(&union, value.index, &store.view(), &input),
+                expected,
+                "value witnesses must not leak across parent bindings"
+            );
+        }
+    }
+
+    /// `UnionConstraint` republishes its appended region after a sort-dedup,
+    /// so the shard union proposes each value once even when several shards
+    /// carry it. `union_propose_liveness.rs` pins the kill-only law for the
+    /// generic union; this pins the set law for the archive shard union.
+    #[test]
+    fn union_archive_propose_is_the_deduplicated_shard_union() {
+        let entity = Id::new([0x16; 16]).unwrap();
+        let attribute = Id::new([0x24; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity, &attribute, [1, 3]),
+            fixed_archive(&entity, &attribute, [2, 3]),
+        ];
+        let entity: Inline<GenId> = entity.to_inline();
+        let attribute: Inline<GenId> = attribute.to_inline();
+        let value = Variable::<UnknownInline>::new(0);
+        let union_archive = UnionArchive::new(archives.to_vec());
+        let union = union_archive.pattern(entity, attribute, value);
+
+        let mut proposed = propose_bag(&union, value.index, &Binding::default());
+        proposed.sort_unstable();
+        assert_eq!(
+            proposed,
+            vec![raw_value(1), raw_value(2), raw_value(3)],
+            "value 3 lives in both shards and must be proposed once"
+        );
+    }
+
+    #[test]
+    fn cross_segment_union_matches_materialized_union() {
+        let left = source("Ada");
+        let right = source("Grace");
+        let left_archive: SuccinctArchive<OrderedUniverse> = (&left).into();
+        let right_archive: SuccinctArchive<OrderedUniverse> = (&right).into();
+        let segments = [left_archive, right_archive];
+        let union = SuccinctRollup::union(&segments);
+        let mut expected = left;
+        expected += right;
+        let actual: HashSet<_> = find!(
+            name: Inline<crate::inline::encodings::shortstring::ShortString>,
+            pattern!(&union, [{ _?person @ literature::firstname: ?name }])
+        )
+        .collect();
+        let wanted: HashSet<_> = find!(
+            name: Inline<crate::inline::encodings::shortstring::ShortString>,
+            pattern!(&expected, [{ _?person @ literature::firstname: ?name }])
+        )
+        .collect();
+        assert_eq!(actual, wanted);
+    }
+
+    /// The scheduled (full-engine) path over a shard union must answer exactly
+    /// like the same relation materialized into one archive — the surviving
+    /// half of `scheduled_union_archive_preserves_candidate_bag_before_set_
+    /// projection`, whose SET-projection half is obsolete under the documented
+    /// bag semantics.
+    #[test]
+    fn scheduled_union_archive_matches_the_materialized_archive() {
+        let entity_id = Id::new([0x17; 16]).unwrap();
+        let attribute_id = Id::new([0x25; 16]).unwrap();
+        let archives = [
+            fixed_archive(&entity_id, &attribute_id, [1, 3]),
+            fixed_archive(&entity_id, &attribute_id, [2, 3]),
+        ];
+        let materialized = fixed_archive(&entity_id, &attribute_id, [1, 2, 3]);
+        let union_archive = UnionArchive::new(archives.to_vec());
+        let attribute: Inline<GenId> = attribute_id.to_inline();
+
+        let union_rows: HashSet<Inline<UnknownInline>> = find!(
+            value: Inline<UnknownInline>,
+            pattern!(&union_archive, [{ _?entity @ (attribute): ?value }])
+        )
+        .collect();
+        let materialized_rows: HashSet<Inline<UnknownInline>> = find!(
+            value: Inline<UnknownInline>,
+            pattern!(&materialized, [{ _?entity @ (attribute): ?value }])
+        )
+        .collect();
+
+        assert_eq!(union_rows, materialized_rows);
+        assert_eq!(
+            union_rows,
+            HashSet::from([
+                Inline::<UnknownInline>::new(raw_value(1)),
+                Inline::<UnknownInline>::new(raw_value(2)),
+                Inline::<UnknownInline>::new(raw_value(3)),
+            ])
+        );
+    }
+}
