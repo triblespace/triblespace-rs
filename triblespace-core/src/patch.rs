@@ -1106,9 +1106,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return this;
         }
 
-        if this.is_singleton() == other.is_singleton()
-            && this.hash() == other.hash()
-        {
+        if this.hash() == other.hash() {
             return this;
         }
 
@@ -1226,9 +1224,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Self::union(this, other, at_depth);
         }
 
-        if this.is_singleton() == other.is_singleton()
-            && this.hash() == other.hash()
-        {
+        if this.hash() == other.hash() {
             return this;
         }
 
@@ -1409,9 +1405,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if self.is_archive_singleton_pair(other) {
             return self.intersect(other, at_depth);
         }
-        if self.is_singleton() == other.is_singleton()
-            && self.hash() == other.hash()
-        {
+        if self.hash() == other.hash() {
             return Some(self.clone());
         }
         if self.first_divergence(other, at_depth).is_some() {
@@ -1533,9 +1527,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if self.is_archive_singleton_pair(other) {
             return self.difference(other, at_depth);
         }
-        if self.is_singleton() == other.is_singleton()
-            && self.hash() == other.hash()
-        {
+        if self.hash() == other.hash() {
             return None;
         }
         if self.first_divergence(other, at_depth).is_some() {
@@ -1912,9 +1904,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             };
         }
 
-        if self.is_singleton() == other.is_singleton()
-            && self.hash() == other.hash()
-        {
+        if self.hash() == other.hash() {
             return Some(self.clone());
         }
 
@@ -2007,9 +1997,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             };
         }
 
-        if self.is_singleton() == other.is_singleton()
-            && self.hash() == other.hash()
-        {
+        if self.hash() == other.hash() {
             return None;
         }
 
@@ -3978,6 +3966,36 @@ mod tests {
         // left only has d
         assert_eq!(res.len(), 1);
         assert!(res.get(&d).is_some());
+    }
+
+    #[test]
+    fn difference_equal_singleton_from_one_child_branch_is_canonical_empty() {
+        const KEY_SIZE: usize = 16;
+        let removed_key = [0x10; KEY_SIZE];
+        let survivor_key = [0x20; KEY_SIZE];
+
+        let mut pair = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        pair.insert(&Entry::with_value(&removed_key, 1));
+        pair.insert(&Entry::with_value(&survivor_key, 2));
+
+        let mut removed = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        removed.insert(&Entry::with_value(&removed_key, 1));
+        let one_child_branch = pair.difference(&removed);
+        assert_eq!(one_child_branch.len(), 1);
+        assert!(matches!(
+            one_child_branch.root.as_ref().map(Head::body_ref),
+            Some(BodyRef::Branch(_))
+        ));
+
+        let mut survivor = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        survivor.insert(&Entry::with_value(&survivor_key, 2));
+        assert_eq!(one_child_branch, survivor);
+
+        let empty = one_child_branch.difference(&survivor);
+        assert!(
+            empty.root.is_none(),
+            "equal sets must subtract to the canonical empty PATCH"
+        );
     }
 
     #[test]
