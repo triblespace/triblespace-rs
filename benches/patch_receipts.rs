@@ -108,22 +108,43 @@ fn archive_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
 /// Turn an exact archive template into a semantically identical dirty one
 /// using only public operations.
 ///
-/// The separately decoded singleton is a root LocalLeaf and therefore has no
-/// resident fingerprint. Unioning it into a set that already contains its key
-/// cannot change the rows, but the exact union formula cannot retain the
-/// parent's fingerprint without both input fingerprints. This is the fixture
-/// shape needed to exercise an undemanded parallel union rather than asking
-/// the implementation to recover overlap receipts for two resident roots.
+/// A fresh archive singleton is used only to subtract the duplicate from the
+/// exact fixture. Subtracting that remainder from the fixture derives the same
+/// singleton LocalLeaf under the fixture's existing owner cover. Unioning the
+/// derived leaf back cannot change the rows, but the exact union formula cannot
+/// retain the parent's fingerprint without both input fingerprints. This is
+/// the fixture shape needed to exercise an undemanded parallel union without
+/// adding another archive owner to the benchmark operand.
 fn demote_via_duplicate(
     mut exact: EavPatch,
     duplicate: [u8; TRIBLE_LEN],
 ) -> EavPatch {
     assert!(exact.iter().any(|row| row == &duplicate));
     let expected_len = exact.len();
-    let singleton = archive_patch(std::slice::from_ref(&duplicate));
-    assert_eq!(singleton.node_stats(), (0, 0, 0, 1));
+    let singleton_rows = std::slice::from_ref(&duplicate);
+    let fresh = archive_patch(singleton_rows);
+    assert_local_rows(
+        "PATCH duplicate-demotion fresh singleton",
+        &fresh,
+        singleton_rows,
+    );
 
-    exact.union(singleton);
+    // PATCH::difference retains only the left operand's owners. The second
+    // difference therefore isolates a pointer-equal LocalLeaf covered by
+    // `exact`, rather than carrying the fresh singleton's 33rd owner forward.
+    let without = exact.difference(&fresh);
+    assert_eq!(without.len(), expected_len - 1);
+    let derived = exact.difference(&without);
+    assert_local_rows(
+        "PATCH duplicate-demotion derived singleton",
+        &derived,
+        singleton_rows,
+    );
+    assert_eq!(derived.node_stats(), (0, 0, 0, 1));
+    drop(without);
+    drop(fresh);
+
+    exact.union(derived);
     assert_eq!(exact.len(), expected_len);
     let stats = exact.node_stats();
     assert_eq!(stats.2, 0);
@@ -337,17 +358,46 @@ fn demote_tribleset_via_duplicate(
         expected,
     );
     let singleton_rows = std::slice::from_ref(&duplicate);
-    let singleton = archive_tribleset(singleton_rows);
+    let fresh = archive_tribleset(singleton_rows);
     assert_tribleset_rows(
         FixtureStorage::Local,
-        "TribleSet duplicate-demotion singleton",
-        &singleton,
+        "TribleSet duplicate-demotion fresh singleton",
+        &fresh,
         singleton_rows,
     );
 
-    // All six singleton indexes have unknown LocalLeaf roots. The semantic
-    // no-op therefore demotes all six exact aggregate roots independently.
-    exact.union(singleton);
+    // Each index difference retains only the left operand's owners. The
+    // second difference isolates all six pointer-equal LocalLeaves under
+    // `exact`'s owner cover, so the semantic no-op does not add a 33rd owner.
+    let without = exact.difference(&fresh);
+    assert_eq!(without.len(), expected.len() - 1);
+    let derived = exact.difference(&without);
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        "TribleSet duplicate-demotion derived singleton",
+        &derived,
+        singleton_rows,
+    );
+    for (index, stats) in [
+        ("eav", derived.eav.node_stats()),
+        ("eva", derived.eva.node_stats()),
+        ("aev", derived.aev.node_stats()),
+        ("ave", derived.ave.node_stats()),
+        ("vea", derived.vea.node_stats()),
+        ("vae", derived.vae.node_stats()),
+    ] {
+        assert_eq!(
+            stats,
+            (0, 0, 0, 1),
+            "TribleSet duplicate-demotion derived singleton/{index}: wrong shape"
+        );
+    }
+    drop(without);
+    drop(fresh);
+
+    // All six derived singleton indexes have unknown LocalLeaf roots. The
+    // semantic no-op therefore demotes all six aggregate roots independently.
+    exact.union(derived);
     assert_tribleset_rows(
         FixtureStorage::Local,
         "TribleSet duplicate-demotion result",
@@ -448,8 +498,8 @@ fn union_cases() -> Vec<UnionCase> {
 
     // Balanced variant unions produce an exact root over dirty direct
     // children. Demote both operands independently so dirty_disjoint and
-    // dirty_overlap128 exercise the no-root-demand path. Each helper call
-    // decodes its own singleton archive owner.
+    // dirty_overlap128 exercise the no-root-demand path. Each helper derives
+    // its duplicate leaf under the corresponding fixture's existing owners.
     let dirty_disjoint_left = demote_via_duplicate(
         archive_variants_in(0, 128, 0, 32),
         raw_trible(0, 0),
@@ -701,10 +751,10 @@ fn bench_difference(c: &mut Criterion) {
     for case in &cases {
         for (workload, compare) in [("difference_only", false), ("difference_eq1", true)] {
             group.bench_function(BenchmarkId::new(case.name, workload), |b| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || (case.left.clone(), case.right.clone()),
                     |(left, right)| {
-                        let result = black_box(&left).difference(black_box(&right));
+                        let result = black_box(&*left).difference(black_box(&*right));
                         if compare {
                             black_box(black_box(&result) == black_box(&case.oracle));
                         }
@@ -926,10 +976,10 @@ fn bench_tribleset_difference(c: &mut Criterion) {
     for case in &cases {
         for (workload, compare) in [("difference_only", false), ("difference_eq1", true)] {
             group.bench_function(BenchmarkId::new(case.name, workload), |b| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || (case.left.clone(), case.right.clone()),
                     |(left, right)| {
-                        let result = black_box(&left).difference(black_box(&right));
+                        let result = black_box(&*left).difference(black_box(&*right));
                         if compare {
                             // TribleSet equality intentionally consumes only EAV,
                             // while the difference above computes all six indexes.
