@@ -254,10 +254,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         Self::new_with_child_hashes(end_depth, lchild, rchild, lchild_hash, rchild_hash)
     }
 
-    /// Variant used when both child hashes are already known. This is the
-    /// binary fast path for bottom-up archive construction: two `LocalLeaf`
-    /// children can become one eager-hash Branch without hashing either row a
-    /// second time.
+    /// Variant used when both child hashes are already known. Bottom-up
+    /// archive construction and exact singleton union can therefore create a
+    /// binary Branch without hashing either child a second time.
     pub(super) fn new_with_child_hashes(
         end_depth: usize,
         lchild: Head<KEY_LEN, O, V>,

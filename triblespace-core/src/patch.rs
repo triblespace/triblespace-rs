@@ -1325,11 +1325,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 let this_hash = this.hash();
                 let other_hash = other.hash();
                 let old_key = this.key();
-                let new_body = Branch::new_with_owner_and_child_hashes(
+                let new_body = Branch::new_with_child_hashes(
                     depth,
                     this.with_key(this_byte_key),
                     other.with_key(other_byte_key),
-                    None,
                     this_hash,
                     other_hash,
                 );
@@ -4295,11 +4294,8 @@ mod tests {
         let key_b = [0x20; KEY_SIZE];
         let key_c = [0x30; KEY_SIZE];
         let (left, right) = {
-            let storage = std::sync::Arc::new([
-                AlignedKey(key_a),
-                AlignedKey(key_b),
-                AlignedKey(key_c),
-            ]);
+            let storage =
+                std::sync::Arc::new([AlignedKey(key_a), AlignedKey(key_b), AlignedKey(key_c)]);
             let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
             let mut left = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
             let mut right = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
@@ -4769,7 +4765,7 @@ mod tests {
     }
 
     #[test]
-    fn difference_equal_singleton_from_one_child_branch_is_canonical_empty() {
+    fn difference_equal_singleton_after_survivor_collapse_is_empty() {
         const KEY_SIZE: usize = 16;
         let removed_key = [0x10; KEY_SIZE];
         let survivor_key = [0x20; KEY_SIZE];
@@ -4780,15 +4776,17 @@ mod tests {
 
         let mut removed = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
         removed.insert(&Entry::with_value(&removed_key, 1));
-        let one_child_branch = pair.difference(&removed);
-        assert_eq!(one_child_branch.len(), 1);
-        // The current asymmetric-difference path represents this as a
-        // one-child Branch; canonicalizing variants may collapse it.
+        let collapsed_survivor = pair.difference(&removed);
+        assert_eq!(collapsed_survivor.len(), 1);
+        assert_eq!(
+            collapsed_survivor.root.as_ref().map(Head::tag),
+            Some(HeadTag::Leaf),
+        );
 
         let mut survivor = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
         survivor.insert(&Entry::with_value(&survivor_key, 2));
-        assert_eq!(one_child_branch, survivor);
-        assert!(one_child_branch.difference(&survivor).root.is_none());
+        assert_eq!(collapsed_survivor, survivor);
+        assert!(collapsed_survivor.difference(&survivor).root.is_none());
     }
 
     #[test]
