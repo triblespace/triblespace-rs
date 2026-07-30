@@ -777,6 +777,10 @@ fn bench_difference(c: &mut Criterion) {
         BUCKETS as u64 * DIFFERENCE_VARIANTS as u64,
     ));
 
+    // `half` is the decisive lazy-finalization fixture: a genuine 4,096-row
+    // archive PATCH loses 2,048 rows across all 128 root buckets. Run each
+    // workload as an exact, process-isolated Criterion invocation so the
+    // first fingerprint consumer cannot warm a later workload's template.
     for case in &cases {
         for (workload, equality_repeats) in [
             ("difference_only", 0),
