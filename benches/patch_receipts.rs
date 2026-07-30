@@ -4,6 +4,12 @@
 //! `SimpleArchive`, and decoded back through `TribleSet::eav`. Clean controls
 //! use ordinary `Entry` insertion over equally deterministic trible bytes.
 //! Neither path reaches through PATCH internals.
+//!
+//! Run one exact benchmark ID per process when comparing memoizing policies.
+//! Cases are intentionally reused within a process, so a broad group filter
+//! lets an earlier fingerprint workload publish knowledge visible to a later
+//! workload. Exact process isolation keeps each workload's initial knowledge
+//! state independent while retaining cheap persistent clones inside samples.
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
