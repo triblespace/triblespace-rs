@@ -15,8 +15,9 @@ use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
-use crate::patch::PATCH;
+use crate::patch::LocalLeafHashMemo;
 use crate::patch::PATCHOwnerGuard;
+use crate::patch::PATCH;
 use crate::query::Variable;
 use crate::trible::AEVOrder;
 use crate::trible::AVEOrder;
@@ -278,14 +279,64 @@ impl TribleSet {
                 );
                 return;
             }
+
+            // Public indexes may have diverged independently. The aggregate
+            // threshold above follows EAV by design, but an otherwise-small
+            // set can still contain a large source PATCH in another index.
+            // Preserve that PATCH's internal Rayon capability instead of
+            // forcing it through the serial, mutable memo.
+            if [
+                other.eva.len(),
+                other.aev.len(),
+                other.ave.len(),
+                other.vea.len(),
+                other.vae.len(),
+            ]
+            .into_iter()
+            .any(|len| len >= PARALLEL_UNION_THRESHOLD as u64)
+            {
+                self.eav.union(other.eav);
+                self.eva.union(other.eva);
+                self.aev.union(other.aev);
+                self.ave.union(other.ave);
+                self.vea.union(other.vea);
+                self.vae.union(other.vae);
+                return;
+            }
         }
 
-        self.eav.union(other.eav);
-        self.eva.union(other.eva);
-        self.aev.union(other.aev);
-        self.ave.union(other.ave);
-        self.vea.union(other.vea);
-        self.vae.union(other.vae);
+        let mut hash_memo = LocalLeafHashMemo::new();
+        #[cfg(all(test, not(debug_assertions)))]
+        {
+            for key in other.eav.iter() {
+                hash_memo.mark_source(key);
+            }
+            for key in other.eva.iter() {
+                hash_memo.mark_source(key);
+            }
+            for key in other.aev.iter() {
+                hash_memo.mark_source(key);
+            }
+            for key in other.ave.iter() {
+                hash_memo.mark_source(key);
+            }
+            for key in other.vea.iter() {
+                hash_memo.mark_source(key);
+            }
+            for key in other.vae.iter() {
+                hash_memo.mark_source(key);
+            }
+        }
+
+        self.eav.union_with_hash_memo(other.eav, &mut hash_memo);
+        self.eva.union_with_hash_memo(other.eva, &mut hash_memo);
+        self.aev.union_with_hash_memo(other.aev, &mut hash_memo);
+        self.ave.union_with_hash_memo(other.ave, &mut hash_memo);
+        self.vea.union_with_hash_memo(other.vea, &mut hash_memo);
+        self.vae.union_with_hash_memo(other.vae, &mut hash_memo);
+
+        #[cfg(all(test, not(debug_assertions)))]
+        hash_memo.publish_probe();
     }
 
     /// Returns a new set containing only tribles present in both sets.
@@ -765,6 +816,87 @@ mod tests {
         drop(owner);
         drop(storage);
         set
+    }
+
+    #[cfg(not(debug_assertions))]
+    mod union_hash_memo_512x3_attr {
+        use crate::prelude::inlineencodings::ShortString;
+        use crate::prelude::*;
+
+        attributes! {
+            pub field_01: ShortString;
+            pub field_02: ShortString;
+            pub field_03: ShortString;
+        }
+    }
+
+    /// Exact pointer-reuse census for the transient six-index hash memo.
+    /// Run alone because the release-test counters are process-global:
+    ///
+    /// `cargo test --release -p triblespace-core --lib union_hash_memo_512x3_probe -- --ignored --nocapture --test-threads=1`
+    #[cfg(not(debug_assertions))]
+    #[test]
+    #[ignore = "explicit release-mode LocalLeaf hash-memo diagnostic"]
+    fn union_hash_memo_512x3_probe() {
+        let _ = union_hash_memo_512x3_attr::field_01.id();
+        let _ = union_hash_memo_512x3_attr::field_02.id();
+        let _ = union_hash_memo_512x3_attr::field_03.id();
+        let inputs: Vec<[String; 3]> = (0..512)
+            .map(|entity| {
+                [
+                    format!("a{entity:06}"),
+                    format!("b{entity:06}"),
+                    format!("c{entity:06}"),
+                ]
+            })
+            .collect();
+        let entities: Vec<_> = inputs
+            .iter()
+            .map(|values| {
+                entity! {
+                    union_hash_memo_512x3_attr::field_01: values[0].as_str(),
+                    union_hash_memo_512x3_attr::field_02: values[1].as_str(),
+                    union_hash_memo_512x3_attr::field_03: values[2].as_str(),
+                }
+            })
+            .map(crate::trible::Fragment::into_facts)
+            .collect();
+        let expected: BTreeSet<[u8; TRIBLE_LEN]> = entities
+            .iter()
+            .flat_map(|entity| entity.iter().map(|trible| trible.data))
+            .collect();
+        assert_eq!(expected.len(), 512 * 3);
+
+        crate::patch::reset_union_hash_memo_probe();
+        let mut aggregate = TribleSet::new();
+        for entity in entities {
+            aggregate += entity;
+        }
+        let probe = crate::patch::union_hash_memo_probe();
+
+        assert_eq!(aggregate.len(), 512 * 3);
+        assert_all_indexes(&aggregate, &expected);
+        assert_eq!(std::mem::size_of::<TribleSet>(), 96);
+        assert_eq!(probe.source_hits + probe.source_misses, 6_132);
+        // Base 6e0e1f26 hashes each of 936 existing-LocalLeaf collision
+        // events twice: once before recursion and once when the divergent
+        // child Branch is materialized. The memo should collapse both that
+        // immediate duplicate and any reuse across the other five indexes.
+        assert_eq!(probe.destination_hits + probe.destination_misses, 936 * 2);
+        assert_eq!(probe.source_misses, 511 * 3);
+        assert_eq!(
+            probe.siphash_calls,
+            probe.source_misses + probe.destination_misses,
+        );
+        assert!(
+            probe.destination_hits > 0,
+            "the experiment must establish whether destination pointers recur",
+        );
+        assert!(
+            probe.destination_reused_pointers > 0,
+            "at least one destination LocalLeaf must recur across indexes",
+        );
+        eprintln!("union_hash_memo_512x3 {probe:?}");
     }
 
     fn assert_shared_owner_guard(set: &TribleSet) {

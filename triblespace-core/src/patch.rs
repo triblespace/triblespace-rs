@@ -17,7 +17,12 @@ pub mod bytetable;
 mod entry;
 mod leaf;
 
+use ahash::AHashMap;
+#[cfg(all(test, not(debug_assertions)))]
+use ahash::AHashSet;
 use arrayvec::ArrayVec;
+#[cfg(all(test, not(debug_assertions)))]
+use core::sync::atomic::Ordering::Relaxed;
 
 /// Re-export of [`Entry`](entry::Entry).
 use branch::*;
@@ -29,6 +34,7 @@ pub use bytetable::*;
 use rand::thread_rng;
 use rand::RngCore;
 use std::cmp::Reverse;
+use std::collections::hash_map::Entry as HashMapEntry;
 use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
@@ -348,6 +354,202 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
+
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+struct LocalLeafHashKey {
+    address: usize,
+    len: usize,
+}
+
+struct LocalLeafHashMemoEntry {
+    hash: u128,
+    #[cfg(all(test, not(debug_assertions)))]
+    uses: u32,
+}
+
+/// Ephemeral hash receipts shared by the six serial PATCH unions of one
+/// `TribleSet` union. The cache is deliberately not part of PATCH, Head, or
+/// any archive representation: it lives only for the enclosing set union and
+/// is dropped immediately afterwards.
+///
+/// Keys are allocation identities, not borrowed pointers. The enclosing
+/// `TribleSet` installs one joined owner cover on both operands before this
+/// memo is created, so every immutable LocalLeaf allocation stays live until
+/// all six unions and the memo itself have been dropped. `KEY_LEN` remains in
+/// the identity to prevent a future cross-width caller from reusing a prefix's
+/// receipt as though it covered the complete key.
+pub(crate) struct LocalLeafHashMemo {
+    hashes: AHashMap<LocalLeafHashKey, LocalLeafHashMemoEntry>,
+    #[cfg(all(test, not(debug_assertions)))]
+    source_pointers: AHashSet<LocalLeafHashKey>,
+    #[cfg(all(test, not(debug_assertions)))]
+    source_hits: u64,
+    #[cfg(all(test, not(debug_assertions)))]
+    source_misses: u64,
+    #[cfg(all(test, not(debug_assertions)))]
+    destination_hits: u64,
+    #[cfg(all(test, not(debug_assertions)))]
+    destination_misses: u64,
+}
+
+impl LocalLeafHashMemo {
+    pub(crate) fn new() -> Self {
+        Self {
+            hashes: AHashMap::new(),
+            #[cfg(all(test, not(debug_assertions)))]
+            source_pointers: AHashSet::new(),
+            #[cfg(all(test, not(debug_assertions)))]
+            source_hits: 0,
+            #[cfg(all(test, not(debug_assertions)))]
+            source_misses: 0,
+            #[cfg(all(test, not(debug_assertions)))]
+            destination_hits: 0,
+            #[cfg(all(test, not(debug_assertions)))]
+            destination_misses: 0,
+        }
+    }
+
+    #[cfg(all(test, not(debug_assertions)))]
+    pub(crate) fn mark_source<const KEY_LEN: usize>(&mut self, key: &[u8; KEY_LEN]) {
+        self.source_pointers.insert(LocalLeafHashKey {
+            address: key.as_ptr() as usize,
+            len: KEY_LEN,
+        });
+    }
+
+    #[cfg(all(test, not(debug_assertions)))]
+    pub(crate) fn publish_probe(&self) {
+        let destination_reused_pointers = self
+            .hashes
+            .iter()
+            .filter(|(key, entry)| !self.source_pointers.contains(key) && entry.uses > 1)
+            .count() as u64;
+        UNION_HASH_MEMO_SOURCE_HITS.fetch_add(self.source_hits, Relaxed);
+        UNION_HASH_MEMO_SOURCE_MISSES.fetch_add(self.source_misses, Relaxed);
+        UNION_HASH_MEMO_DESTINATION_HITS.fetch_add(self.destination_hits, Relaxed);
+        UNION_HASH_MEMO_DESTINATION_MISSES.fetch_add(self.destination_misses, Relaxed);
+        UNION_HASH_MEMO_DESTINATION_REUSED_POINTERS.fetch_add(destination_reused_pointers, Relaxed);
+    }
+}
+
+trait LocalLeafHasher {
+    fn hash<const KEY_LEN: usize>(&mut self, bytes: &[u8; KEY_LEN]) -> u128;
+}
+
+struct DirectLocalLeafHasher;
+
+impl LocalLeafHasher for DirectLocalLeafHasher {
+    #[inline]
+    fn hash<const KEY_LEN: usize>(&mut self, bytes: &[u8; KEY_LEN]) -> u128 {
+        siphash_local_leaf(bytes)
+    }
+}
+
+impl LocalLeafHasher for LocalLeafHashMemo {
+    #[inline]
+    fn hash<const KEY_LEN: usize>(&mut self, bytes: &[u8; KEY_LEN]) -> u128 {
+        let key = LocalLeafHashKey {
+            address: bytes.as_ptr() as usize,
+            len: KEY_LEN,
+        };
+        #[cfg(all(test, not(debug_assertions)))]
+        let is_source = self.source_pointers.contains(&key);
+
+        match self.hashes.entry(key) {
+            HashMapEntry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                #[cfg(all(test, not(debug_assertions)))]
+                {
+                    entry.uses += 1;
+                    if is_source {
+                        self.source_hits += 1;
+                    } else {
+                        self.destination_hits += 1;
+                    }
+                }
+                entry.hash
+            }
+            HashMapEntry::Vacant(vacant) => {
+                let hash = siphash_local_leaf(bytes);
+                vacant.insert(LocalLeafHashMemoEntry {
+                    hash,
+                    #[cfg(all(test, not(debug_assertions)))]
+                    uses: 1,
+                });
+                #[cfg(all(test, not(debug_assertions)))]
+                if is_source {
+                    self.source_misses += 1;
+                } else {
+                    self.destination_misses += 1;
+                }
+                hash
+            }
+        }
+    }
+}
+
+#[inline]
+fn siphash_local_leaf<const KEY_LEN: usize>(bytes: &[u8; KEY_LEN]) -> u128 {
+    use siphasher::sip128::SipHasher24;
+    use std::ptr::addr_of;
+    #[cfg(all(test, not(debug_assertions)))]
+    UNION_HASH_MEMO_SIPHASH_CALLS.fetch_add(1, Relaxed);
+    // SAFETY: SIP_KEY is initialized at startup; we only read it.
+    let key = unsafe { *addr_of!(SIP_KEY) };
+    SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+static UNION_HASH_MEMO_SIPHASH_CALLS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static UNION_HASH_MEMO_SOURCE_HITS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static UNION_HASH_MEMO_SOURCE_MISSES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static UNION_HASH_MEMO_DESTINATION_HITS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static UNION_HASH_MEMO_DESTINATION_MISSES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static UNION_HASH_MEMO_DESTINATION_REUSED_POINTERS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(test, not(debug_assertions)))]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UnionHashMemoProbe {
+    pub(crate) siphash_calls: u64,
+    pub(crate) source_hits: u64,
+    pub(crate) source_misses: u64,
+    pub(crate) destination_hits: u64,
+    pub(crate) destination_misses: u64,
+    pub(crate) destination_reused_pointers: u64,
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) fn reset_union_hash_memo_probe() {
+    UNION_HASH_MEMO_SIPHASH_CALLS.store(0, Relaxed);
+    UNION_HASH_MEMO_SOURCE_HITS.store(0, Relaxed);
+    UNION_HASH_MEMO_SOURCE_MISSES.store(0, Relaxed);
+    UNION_HASH_MEMO_DESTINATION_HITS.store(0, Relaxed);
+    UNION_HASH_MEMO_DESTINATION_MISSES.store(0, Relaxed);
+    UNION_HASH_MEMO_DESTINATION_REUSED_POINTERS.store(0, Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) fn union_hash_memo_probe() -> UnionHashMemoProbe {
+    UnionHashMemoProbe {
+        siphash_calls: UNION_HASH_MEMO_SIPHASH_CALLS.load(Relaxed),
+        source_hits: UNION_HASH_MEMO_SOURCE_HITS.load(Relaxed),
+        source_misses: UNION_HASH_MEMO_SOURCE_MISSES.load(Relaxed),
+        destination_hits: UNION_HASH_MEMO_DESTINATION_HITS.load(Relaxed),
+        destination_misses: UNION_HASH_MEMO_DESTINATION_MISSES.load(Relaxed),
+        destination_reused_pointers: UNION_HASH_MEMO_DESTINATION_REUSED_POINTERS.load(Relaxed),
+    }
+}
 
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
@@ -957,15 +1159,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 
     pub(crate) fn hash(&self) -> u128 {
+        let mut hasher = DirectLocalLeafHasher;
+        self.hash_with(&mut hasher)
+    }
+
+    #[inline]
+    fn hash_with<H: LocalLeafHasher>(&self, hasher: &mut H) -> u128 {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => leaf.hash,
-            BodyRef::LocalLeaf(bytes) => {
-                use siphasher::sip128::SipHasher24;
-                use std::ptr::addr_of;
-                // SAFETY: SIP_KEY is initialized at startup; we only read it.
-                let key = unsafe { *addr_of!(SIP_KEY) };
-                SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
-            }
+            BodyRef::LocalLeaf(bytes) => hasher.hash(bytes),
             BodyRef::Branch(branch) => branch.hash,
         }
     }
@@ -1245,7 +1447,26 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// Sequential PATCH-trie union. Always serial; the parallel
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
-    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
+    pub(crate) fn union(this: Self, other: Self, at_depth: usize) -> Self {
+        let mut hasher = DirectLocalLeafHasher;
+        Self::union_with_hasher(this, other, at_depth, &mut hasher)
+    }
+
+    pub(crate) fn union_with_hash_memo(
+        this: Self,
+        other: Self,
+        at_depth: usize,
+        memo: &mut LocalLeafHashMemo,
+    ) -> Self {
+        Self::union_with_hasher(this, other, at_depth, memo)
+    }
+
+    fn union_with_hasher<H: LocalLeafHasher>(
+        mut this: Self,
+        mut other: Self,
+        at_depth: usize,
+        hasher: &mut H,
+    ) -> Self {
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
 
@@ -1258,10 +1479,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 this.first_divergence(&other, at_depth)
             {
                 let old_key = this.key();
-                let new_body = Branch::new(
+                let new_body = Branch::new_with_hasher(
                     depth,
                     this.with_key(this_byte_key),
                     other.with_key(other_byte_key),
+                    hasher,
                 );
                 return Head::new(old_key, new_body);
             }
@@ -1271,7 +1493,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // Equal sets necessarily have equal cardinality. This cheap exact
         // discriminator avoids computing LocalLeaf fingerprints in the much
         // more common unequal-size case.
-        if this.count() == other.count() && this.hash() == other.hash() {
+        if this.count() == other.count() && this.hash_with(hasher) == other.hash_with(hasher) {
             return this;
         }
 
@@ -1279,10 +1501,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             this.first_divergence(&other, at_depth)
         {
             let old_key = this.key();
-            let new_body = Branch::new(
+            let new_body = Branch::new_with_hasher(
                 depth,
                 this.with_key(this_byte_key),
                 other.with_key(other_byte_key),
+                hasher,
             );
 
             return Head::new(old_key, new_body);
@@ -1292,8 +1515,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = other.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
+            ed.modify_child_with_hasher(key, hasher, |opt, hasher| match opt {
+                Some(old) => Some(Head::union_with_hasher(old, inserted, this_depth, hasher)),
                 None => Some(inserted),
             });
             drop(ed);
@@ -1306,8 +1529,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
             let inserted = this_head.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, other_depth)),
+            ed.modify_child_with_hasher(key, hasher, |opt, hasher| match opt {
+                Some(old) => Some(Head::union_with_hasher(old, inserted, other_depth, hasher)),
                 None => Some(inserted),
             });
             drop(ed);
@@ -1339,8 +1562,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         {
             let inserted = other_child.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
+            ed.modify_child_with_hasher(key, hasher, |opt, hasher| match opt {
+                Some(old) => Some(Head::union_with_hasher(old, inserted, this_depth, hasher)),
                 None => Some(inserted),
             });
         }
@@ -2907,6 +3130,26 @@ where
         self.debug_check_owner_invariant();
     }
 
+    /// Serial union using an ephemeral LocalLeaf hash cache supplied by an
+    /// enclosing aggregate. This is intentionally crate-private: sharing the
+    /// cache across several independent PATCH indexes is what makes it useful.
+    pub(crate) fn union_with_hash_memo(&mut self, mut other: Self, memo: &mut LocalLeafHashMemo) {
+        if let Some(other_root) = other.root.take() {
+            if self.root.is_some() {
+                // Install the lifetime cover before either root can move, just
+                // like the public union path.
+                OwnerCover::merge_into(&mut self.owners, &other.owners);
+                let this = self.root.take().expect("root should not be empty");
+                self.root
+                    .replace(Head::union_with_hash_memo(this, other_root, 0, memo));
+            } else {
+                self.root.replace(other_root);
+                self.owners = other.owners.take();
+            }
+        }
+        self.debug_check_owner_invariant();
+    }
+
     /// Intersects this PATCH with another PATCH.
     ///
     /// Returns a new PATCH that contains only the keys that are present in both PATCHes.
@@ -4364,6 +4607,19 @@ mod tests {
     #[test]
     fn patch_root_owner_guard_is_one_thin_arc() {
         assert_eq!(mem::size_of::<Option<Arc<OwnerCover>>>(), 8);
+        assert_eq!(mem::size_of::<PATCH<64, IdentitySchema, ()>>(), 16);
+    }
+
+    #[test]
+    fn transient_local_leaf_hash_memo_preserves_the_exact_hash() {
+        init_sip_key();
+        let bytes = [0xabu8; 64];
+        let expected = siphash_local_leaf(&bytes);
+        let mut memo = LocalLeafHashMemo::new();
+
+        assert_eq!(LocalLeafHasher::hash(&mut memo, &bytes), expected);
+        assert_eq!(LocalLeafHasher::hash(&mut memo, &bytes), expected);
+        assert_eq!(memo.hashes.len(), 1);
         assert_eq!(mem::size_of::<PATCH<64, IdentitySchema, ()>>(), 16);
     }
 

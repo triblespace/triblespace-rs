@@ -67,6 +67,16 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
+    /// Union-only variant whose LocalLeaf hashes are resolved through one
+    /// ephemeral cache shared by all six TribleSet indexes.
+    pub(super) fn modify_child_with_hasher<H, F>(&mut self, key: u8, hasher: &mut H, f: F)
+    where
+        H: LocalLeafHasher,
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>, &mut H) -> Option<Head<KEY_LEN, O, V>>,
+    {
+        Branch::modify_child_with_hasher(&mut self.branch_nn, key, hasher, f);
+    }
+
     /// Like [`modify_child`] but uses the supplied `inserted_hash`
     /// for the empty-slot insertion case instead of calling
     /// `inserted.hash()`. Lets archive ingest avoid recomputing
@@ -217,6 +227,21 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // the caller has the hash already.
         let rchild_hash = rchild.hash();
         Self::new_with_rchild_hash(end_depth, lchild, rchild, rchild_hash)
+    }
+
+    /// Union-only constructor that resolves both child hashes through the
+    /// caller's transient LocalLeaf cache.
+    pub(super) fn new_with_hasher<H: LocalLeafHasher>(
+        end_depth: usize,
+        lchild: Head<KEY_LEN, O, V>,
+        rchild: Head<KEY_LEN, O, V>,
+        hasher: &mut H,
+    ) -> NonNull<Self> {
+        // Match `new`'s established evaluation order: its right-child hint is
+        // obtained before `new_with_rchild_hash` resolves the left child.
+        let rchild_hash = rchild.hash_with(hasher);
+        let lchild_hash = lchild.hash_with(hasher);
+        Self::new_with_child_hashes(end_depth, lchild, rchild, lchild_hash, rchild_hash)
     }
 
     /// Variant of [`Self::new`] that takes a precomputed
@@ -421,68 +446,70 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
+        let mut hasher = DirectLocalLeafHasher;
+        Self::modify_child_with_hasher(branch_nn, key, &mut hasher, |child, _| f(child));
+    }
+
+    /// `modify_child` with explicit LocalLeaf hash resolution. Counts,
+    /// representative-leaf maintenance, cuckoo growth, and ownership are
+    /// identical to the canonical primitive; only hash reads consult the
+    /// transient union cache.
+    pub(super) fn modify_child_with_hasher<H, F>(
+        branch_nn: &mut NonNull<Self>,
+        key: u8,
+        hasher: &mut H,
+        f: F,
+    ) where
+        H: LocalLeafHasher,
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>, &mut H) -> Option<Head<KEY_LEN, O, V>>,
+    {
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
 
-            // If a slot exists, operate on the existing child in-place.
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
-                let old_child_hash = child.hash();
+                let old_child_hash = child.hash_with(hasher);
                 let old_child_segment_count = child.count_segment(end_depth);
                 let old_child_leaf_count = child.count();
-
                 let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
 
-                if let Some(new_child) = f(Some(child)) {
-                    // Replace existing child
-                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
+                if let Some(new_child) = f(Some(child), hasher) {
+                    (*branch).hash =
+                        ((*branch).hash ^ old_child_hash) ^ new_child.hash_with(hasher);
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
                         ((*branch).leaf_count - old_child_leaf_count) + new_child.count();
-
                     if replaced_childleaf {
                         (*branch).childleaf = new_child.childleaf_ptr();
                     }
-
                     if slot.replace(new_child.with_key(key)).is_some() {
                         unreachable!();
                     }
                 } else {
-                    // Remove existing child
                     (*branch).hash ^= old_child_hash;
                     (*branch).segment_count -= old_child_segment_count;
                     (*branch).leaf_count -= old_child_leaf_count;
-
                     if replaced_childleaf {
                         if let Some(other) = (*branch).child_table.iter().find_map(|s| s.as_ref()) {
                             (*branch).childleaf = other.childleaf_ptr();
                         }
                     }
                 }
-            } else {
-                // No current slot — the closure can choose to insert a child.
-                if let Some(mut inserted) = f(None) {
-                    // The caller is expected to pass an inserted Head that is
-                    // already prepared (with_start set to the appropriate depth).
-                    // Update aggregates before attempting insertion.
-                    (*branch).leaf_count += inserted.count();
-                    (*branch).segment_count += inserted.count_segment(end_depth);
-                    (*branch).hash ^= inserted.hash();
+            } else if let Some(mut inserted) = f(None, hasher) {
+                (*branch).leaf_count += inserted.count();
+                (*branch).segment_count += inserted.count_segment(end_depth);
+                (*branch).hash ^= inserted.hash_with(hasher);
 
-                    // Cuckoo insert loop, growing the table when necessary.
-                    let mut branch_ptr = branch_nn.as_ptr();
-                    while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
-                    {
-                        inserted = new_displaced;
-                        Self::grow(branch_nn);
-                        // Refresh local pointer after potential reallocation.
-                        branch_ptr = branch_nn.as_ptr();
-                    }
+                let mut branch_ptr = branch_nn.as_ptr();
+                while let Some(displaced) = (*branch_ptr).child_table.table_insert(inserted) {
+                    inserted = displaced;
+                    Self::grow(branch_nn);
+                    branch_ptr = branch_nn.as_ptr();
                 }
             }
-            // Debug invariant check (no-op in release builds).
+
             #[cfg(debug_assertions)]
             branch_nn.as_ref().debug_check_invariants();
         }
