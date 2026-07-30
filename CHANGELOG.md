@@ -47,12 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Known archive batches now start at their irreducible PATCH shape.** Empty
-  batches stay empty, singleton tribles use one shared heap Leaf across all six
-  indexes, and batches of two or more same-owner rows directly create ordinary
-  owner-bearing Branches over two LocalLeaves before continuing online
-  insertion. `SimpleArchive` keeps fused validation/construction in both its
-  serial and parallel chunk paths, while intrinsic entities avoid the former
-  heap seed and reuse both ArchiveEntry hashes across every index.
+  batches stay empty, singleton tribles remain root LocalLeaves, and batches of
+  two or more same-owner rows directly create ordinary Branches over two
+  LocalLeaves before continuing online insertion. Each PATCH now retains its
+  archive allocations once in a persistent root owner set, independently of
+  trie shape: collapse, cross-owner union, intersection, difference, cloning,
+  and consuming iteration can keep archive rows local without branch-boundary
+  reification. This removes the owner field from every Branch (64-byte to
+  48-byte header) for one thin owner-set Arc on PATCH. `SimpleArchive` keeps
+  fused validation/construction in both its serial and parallel chunk paths,
+  while intrinsic entities avoid the former heap seed and reuse both
+  ArchiveEntry hashes across every index.
 
 - **Experimental breaking intrinsic-entity epoch uses canonical full rows.**
   Content-derived `entity!` records now canonicalize aligned

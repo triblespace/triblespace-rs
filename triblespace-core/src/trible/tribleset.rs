@@ -76,7 +76,7 @@ pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleS
     }
 
     // Keep the final canonical allocation stable before taking any pointers
-    // into it. The erased Arc is what PATCH Branch owners retain.
+    // into it. The erased Arc is what each PATCH owner set retains.
     let rows = Arc::new(IntrinsicEntityRows(rows));
     let owner: Arc<dyn ArchiveOwner> = rows.clone();
     let mut iter = rows.0.iter();
@@ -88,7 +88,7 @@ pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleS
         unsafe { ArchiveEntry::new(NonNull::from(row.raw()), &owner) }
     };
 
-    // The known pair can directly form an ordinary owner-bearing Branch in
+    // The known pair can directly form an ordinary Branch in
     // every index. This is the minimum non-empty archive-backed trie and needs
     // no heap seed.
     let first = entry(iter.next().expect("at least two rows remain"));
@@ -386,12 +386,11 @@ impl TribleSet {
     /// the online empty-root path.
     ///
     /// An empty receiving set handles the three irreducible cardinalities
-    /// directly: zero stays empty; one row is copied into one shared heap
-    /// Entry because a standalone LocalLeaf cannot retain an owner; two or
+    /// directly: zero stays empty; one row becomes a root LocalLeaf; two or
     /// more distinct rows from the same owner bootstrap each index as one
-    /// owner-bearing Branch over two LocalLeaves. Remaining rows use ordinary
-    /// archive insertion. Duplicate or cross-owner leading pairs safely fall
-    /// back to the online path.
+    /// Branch over two LocalLeaves. Remaining rows use ordinary archive
+    /// insertion. Duplicate or cross-owner leading pairs safely fall back to
+    /// the online path.
     pub(crate) fn insert_archive_batch(&mut self, entries: &[ArchiveEntry<'_, TRIBLE_LEN>]) {
         if entries.is_empty() {
             return;
@@ -405,15 +404,12 @@ impl TribleSet {
 
         let first = &entries[0];
         let Some(second) = entries.get(1) else {
-            let shared = Entry::new(first.key());
-            self.insert_entry(&shared);
+            self.insert_archive(first);
             return;
         };
 
         if first.key() == second.key() || !Arc::ptr_eq(first.owner(), second.owner()) {
-            let shared = Entry::new(first.key());
-            self.insert_entry(&shared);
-            for entry in &entries[1..] {
+            for entry in entries {
                 self.insert_archive(entry);
             }
             return;
@@ -434,8 +430,8 @@ impl TribleSet {
     /// Inserts an archive-backed trible into all six covering indexes
     /// using [`PATCH::insert_archive`], so each index may land the new
     /// entry as a `LocalLeaf` instead of a freshly allocated heap
-    /// `Leaf`. The receiving Branches' `owner` fields keep the
-    /// underlying archive bytes alive.
+    /// `Leaf`. Each receiving PATCH's root owner set keeps the underlying
+    /// archive bytes alive.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, TRIBLE_LEN>) {
         self.eav.insert_archive(entry);
         self.eva.insert_archive(entry);
@@ -770,7 +766,7 @@ mod tests {
 
         // Each builder's input allocation is moved in and its local owner Arc
         // is gone before this union starts. Only the owners retained by PATCH
-        // Branches keep the archive rows alive here.
+        // owner sets keep the archive rows alive here.
         let (_, first) = build_intrinsic_entity(rows_a);
         let surviving_clone = first.clone();
         drop(first);
@@ -784,8 +780,8 @@ mod tests {
         assert_all_indexes(&union, &expected);
 
         // Independently built, byte-identical entities have distinct owner
-        // Arcs. Their overlapping LocalLeaves exercise PATCH's owner
-        // reconciliation while preserving exact set semantics.
+        // Arcs. Their overlapping LocalLeaves exercise persistent owner-set
+        // union while preserving exact set semantics.
         let same_rows = many_intrinsic_rows(3, 256);
         let (_, same_expected) = expected_intrinsic_entity(same_rows.clone());
         let (_, same_left) = build_intrinsic_entity(same_rows.clone());

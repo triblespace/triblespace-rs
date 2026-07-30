@@ -58,7 +58,7 @@ static A: CountingAllocator = CountingAllocator;
 /// exercising every LocalLeaf-vs-LocalLeaf collision in the trie. The
 /// sources are dropped before any
 /// reads so the result must keep all LocalLeaves' backing bytes
-/// alive transitively via the surviving Branches' owner Arcs.
+/// alive transitively via the surviving PATCH owner sets.
 #[test]
 fn union_two_overlapping_archives() {
     // Serialize with the decode-allocation test — they share the
@@ -75,8 +75,8 @@ fn union_two_overlapping_archives() {
     // independent so `try_from_blob_inner` wraps each in its own
     // `Arc<Bytes>`. After the union consumes both inputs, the
     // merged tree must keep all LocalLeaves' underlying bytes
-    // alive transitively (via the Arcs held on surviving
-    // Branches) — otherwise we get a use-after-free when we
+    // alive transitively (via the root owner sets on the surviving
+    // PATCHes) — otherwise we get a use-after-free when we
     // walk the merged data.
     let mut a_src = TribleSet::new();
     let mut b_src = TribleSet::new();
@@ -97,17 +97,64 @@ fn union_two_overlapping_archives() {
     let a: TribleSet = triblespace::core::blob::TryFromBlob::try_from_blob(a_blob).unwrap();
     let b: TribleSet = triblespace::core::blob::TryFromBlob::try_from_blob(b_blob).unwrap();
 
+    // These sizes cross the public TribleSet parallel gates for all three
+    // operations. The borrowed results must retain both (intersect) or the
+    // left-hand (difference) archive owners independently of their sources.
+    let intersection = a.intersect(&b);
+    let difference = a.difference(&b);
     let unioned = a + b;
     assert_eq!(
         unioned.len(),
         expected_len,
         "archive-vs-archive union should contain every distinct key"
     );
+    for stats in [
+        unioned.eav.node_stats(),
+        unioned.eva.node_stats(),
+        unioned.aev.node_stats(),
+        unioned.ave.node_stats(),
+        unioned.vea.node_stats(),
+        unioned.vae.node_stats(),
+    ] {
+        assert_eq!(stats.2, 0, "parallel cross-owner union reified heap Leafs");
+        assert_eq!(
+            stats.3, expected_len as u64,
+            "parallel cross-owner union lost LocalLeaf storage",
+        );
+    }
+    for (set, expected, operation) in [
+        (&intersection, N / 2, "parallel cross-owner intersection"),
+        (&difference, N / 2, "parallel cross-owner difference"),
+    ] {
+        assert_eq!(set.len(), expected);
+        for stats in [
+            set.eav.node_stats(),
+            set.eva.node_stats(),
+            set.aev.node_stats(),
+            set.ave.node_stats(),
+            set.vea.node_stats(),
+            set.vae.node_stats(),
+        ] {
+            assert_eq!(stats.2, 0, "{operation} reified heap Leafs");
+            assert_eq!(
+                stats.3, expected as u64,
+                "{operation} lost LocalLeaf storage",
+            );
+        }
+    }
 
     // Walk every key via the eav iterator — if any LocalLeaf points
     // into freed archive bytes, this will read garbage or fault.
     let count: usize = unioned.eav.iter_ordered().count();
     assert_eq!(count, expected_len);
+    drop(unioned);
+    let union_noise = vec![0xa5u8; N * 64];
+    std::hint::black_box(&union_noise);
+    assert_eq!(intersection.eav.iter_ordered().count(), N / 2);
+    drop(intersection);
+    let intersection_noise = vec![0x5au8; N * 64];
+    std::hint::black_box(&intersection_noise);
+    assert_eq!(difference.eav.iter_ordered().count(), N / 2);
 }
 
 fn make_trible(i: u64) -> Trible {
@@ -146,7 +193,7 @@ fn simplearchive_batch_layout_and_all_index_parity() {
         ];
         match n {
             0 => assert!(stats.iter().all(|stat| *stat == (0, 0, 0, 0))),
-            1 => assert!(stats.iter().all(|stat| *stat == (0, 0, 1, 0))),
+            1 => assert!(stats.iter().all(|stat| *stat == (0, 0, 0, 1))),
             2 => assert!(stats.iter().all(|stat| *stat == (1, 2, 0, 2))),
             _ => assert!(stats.iter().all(|stat| stat.2 == 0 && stat.3 == n as u64)),
         }
