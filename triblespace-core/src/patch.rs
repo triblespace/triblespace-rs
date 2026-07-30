@@ -2756,6 +2756,24 @@ where
         }
     }
 
+    /// Publish an operand hash when inclusion plus equal cardinality proves
+    /// that operand and result are the same finite key set. Every candidate
+    /// supplied by the caller must already be known to contain the result or
+    /// be contained by it; cardinality alone is not sufficient.
+    #[inline]
+    fn publish_inclusion_equal_hash<const N: usize>(&self, candidates: [(u64, Option<u128>); N]) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        let result_count = root.count();
+        let hash = candidates
+            .into_iter()
+            .find_map(|(count, hash)| (count == result_count).then_some(hash).flatten());
+        if let Some(hash) = hash {
+            root.publish_known_hash(hash);
+        }
+    }
+
     /// Inserts a shared key into the PATCH.
     ///
     /// Takes an [Entry] object that can be created from a key,
@@ -3277,19 +3295,11 @@ where
                 let merged = Head::par_union(this, other_root, 0);
                 #[cfg(not(feature = "parallel"))]
                 let merged = Head::union(this, other_root, 0);
-                let merged_count = merged.count();
-                let donated_hash = (merged_count == this_count)
-                    .then_some(this_hash)
-                    .flatten()
-                    .or_else(|| {
-                        (merged_count == other_count)
-                            .then_some(other_hash)
-                            .flatten()
-                    });
-                if let Some(hash) = donated_hash {
-                    merged.publish_known_hash(hash);
-                }
                 self.root.replace(merged);
+                self.publish_inclusion_equal_hash([
+                    (this_count, this_hash),
+                    (other_count, other_hash),
+                ]);
             } else {
                 self.root.replace(other_root);
                 self.owners = other.owners.take();
@@ -3311,6 +3321,10 @@ where
         }
         if let Some(root) = &self.root {
             if let Some(other_root) = &other.root {
+                let candidates = [
+                    (root.count(), root.known_hash()),
+                    (other_root.count(), other_root.known_hash()),
+                ];
                 #[cfg(feature = "parallel")]
                 let result = root.par_intersect(other_root, 0);
                 #[cfg(not(feature = "parallel"))]
@@ -3320,6 +3334,8 @@ where
                     .as_ref()
                     .and_then(|_| OwnerCover::union(self.owners.clone(), &other.owners));
                 let result = Self { root, owners };
+                // Intersection is a subset of both operands.
+                result.publish_inclusion_equal_hash(candidates);
                 result.debug_check_owner_invariant();
                 return result;
             }
@@ -3341,6 +3357,7 @@ where
         }
         if let Some(root) = &self.root {
             if let Some(other_root) = &other.root {
+                let candidate = [(root.count(), root.known_hash())];
                 #[cfg(feature = "parallel")]
                 let result = root.par_difference(other_root, 0);
                 #[cfg(not(feature = "parallel"))]
@@ -3350,6 +3367,8 @@ where
                     root: result,
                     owners,
                 };
+                // Difference is a subset of its left operand.
+                result.publish_inclusion_equal_hash(candidate);
                 result.debug_check_owner_invariant();
                 result
             } else {
@@ -4623,6 +4642,38 @@ mod tests {
         deep_hash_audit(&snapshot);
         deep_hash_audit(&target);
         deep_hash_audit(&subset);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn subset_operation_boundaries_donate_exact_operand_roots() {
+        let left = owned_archive_dirty_parent(0, 2, 0, 2);
+        let superset = owned_archive_dirty_parent(0, 2, 0, 4);
+        let disjoint = owned_archive_dirty_parent(0, 2, 2, 2);
+        let expected = branch_cached_hash(&left);
+        assert_ne!(expected, 0);
+        assert!(direct_dirty_branch_children(&left) > 0);
+
+        reset_local_leaf_hash_calls();
+        let intersection = left.intersect(&superset);
+        assert_eq!(intersection.len(), left.len());
+        assert_eq!(branch_cached_hash(&intersection), expected);
+        assert_eq!(intersection.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        reset_local_leaf_hash_calls();
+        let difference = left.difference(&disjoint);
+        assert_eq!(difference.len(), left.len());
+        assert_eq!(branch_cached_hash(&difference), expected);
+        assert_eq!(difference.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // Borrowed operands retain their own exact roots and dirty children.
+        assert_eq!(left.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&left);
+        deep_hash_audit(&intersection);
+        deep_hash_audit(&difference);
     }
 
     #[test]
