@@ -182,6 +182,11 @@ impl TribleSet {
             && self.eav.shares_owner_guard(&self.vae)
     }
 
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) fn owner_guards_are_shared_for_test(&self) -> bool {
+        self.owner_guards_are_shared()
+    }
+
     /// The zero-work archive-insert shortcut: one shared exact owner set whose
     /// latest allocation is the incoming owner.
     fn shared_owner_guard_latest_is(&self, owner: &Arc<dyn ArchiveOwner>) -> bool {
@@ -595,6 +600,91 @@ impl TribleSet {
             vae,
         };
         debug_assert!(result.owner_guards_are_shared());
+        (result, permutation_bytes)
+    }
+
+    /// Test-only fixed six-way parallel construction probe.
+    ///
+    /// Each index owns one identity `u32` row permutation while all six builds
+    /// share immutable archive rows, precomputed hashes, and one owner receipt.
+    /// The nested join tree mirrors the existing six-index set-operation path;
+    /// it introduces no recursive scheduling policy or production dispatch.
+    ///
+    /// # Safety
+    ///
+    /// Every row must be 16-byte aligned, immutable, duplicate-free, and kept
+    /// alive by `owner`. `hashes[row]` must be the PATCH key hash of `rows[row]`.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) unsafe fn from_archive_partition_parallel_for_test(
+        rows: &[[u8; TRIBLE_LEN]],
+        hashes: &[u128],
+        owner: &Arc<dyn ArchiveOwner>,
+    ) -> (Self, usize) {
+        assert_eq!(rows.len(), hashes.len());
+        assert!(
+            u32::try_from(rows.len()).is_ok(),
+            "the six-way probe uses u32 archive row indices",
+        );
+
+        let mut owners = PATCHOwnerGuard::default();
+        if !rows.is_empty() {
+            owners.retain_archive_owner(owner);
+        }
+        unsafe fn build<O: crate::patch::KeySchema<TRIBLE_LEN>>(
+            rows: &[[u8; TRIBLE_LEN]],
+            hashes: &[u128],
+            owners: &PATCHOwnerGuard,
+        ) -> PATCH<TRIBLE_LEN, O> {
+            let mut permutation: Vec<u32> = (0..rows.len()).map(|row| row as u32).collect();
+            // SAFETY: forwarded from the six-way constructor; this private
+            // permutation contains every archive row exactly once.
+            unsafe {
+                PATCH::<TRIBLE_LEN, O>::from_archive_partition_for_test(
+                    rows,
+                    hashes,
+                    &mut permutation,
+                    owners,
+                )
+            }
+        }
+
+        let ((eav, eva), ((aev, ave), (vea, vae))) = rayon::join(
+            || {
+                rayon::join(
+                    // SAFETY: validated archive invariants are shared read-only;
+                    // `build` creates one private identity permutation per call.
+                    || unsafe { build::<EAVOrder>(rows, hashes, &owners) },
+                    || unsafe { build::<EVAOrder>(rows, hashes, &owners) },
+                )
+            },
+            || {
+                rayon::join(
+                    || {
+                        rayon::join(
+                            || unsafe { build::<AEVOrder>(rows, hashes, &owners) },
+                            || unsafe { build::<AVEOrder>(rows, hashes, &owners) },
+                        )
+                    },
+                    || {
+                        rayon::join(
+                            || unsafe { build::<VEAOrder>(rows, hashes, &owners) },
+                            || unsafe { build::<VAEOrder>(rows, hashes, &owners) },
+                        )
+                    },
+                )
+            },
+        );
+
+        let result = Self {
+            eav,
+            eva,
+            aev,
+            ave,
+            vea,
+            vae,
+        };
+        debug_assert!(result.owner_guards_are_shared());
+        let permutation_bytes = rows.len() * 6 * std::mem::size_of::<u32>();
         (result, permutation_bytes)
     }
 

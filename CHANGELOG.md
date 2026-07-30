@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A test-only six-way SimpleArchive construction probe isolates index-level
+  parallelism.** Six fixed Rayon tasks share one validated row/hash view and
+  owner receipt while retaining private in-place MSD permutations. Its ignored
+  benchmark compares complete conversion against both sequential bottom-up
+  construction and the actual public parallel chunk-build-and-union decoder.
 - **A bounded oracle checks the regular-path closure kernel.** A Kani harness
   symbolically selects every subgraph of a five-edge, two-vertex labeled
   universe, while an ordinary deterministic test exhausts all 256 graphs whose

@@ -241,6 +241,37 @@ pub(crate) fn try_from_blob_serial_for_test(
 pub(crate) fn try_from_blob_bottom_up_for_test(
     blob: Blob<SimpleArchive>,
 ) -> Result<BottomUpArchiveProbe, UnarchiveError> {
+    try_from_blob_bottom_up_with_for_test(blob, |slice, hashes, owner| {
+        // SAFETY: the shared wrapper validates canonical distinct rows and
+        // alignment, while `owner` retains their immutable allocation.
+        unsafe { TribleSet::from_archive_partition_for_test(slice, hashes, owner) }
+    })
+}
+
+/// Fixed six-way Rayon variant of [`try_from_blob_bottom_up_for_test`].
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) fn try_from_blob_bottom_up_parallel_for_test(
+    blob: Blob<SimpleArchive>,
+) -> Result<BottomUpArchiveProbe, UnarchiveError> {
+    try_from_blob_bottom_up_with_for_test(blob, |slice, hashes, owner| {
+        // SAFETY: the shared wrapper establishes the archive invariants before
+        // the six tasks receive immutable rows/hashes and private permutations.
+        unsafe { TribleSet::from_archive_partition_parallel_for_test(slice, hashes, owner) }
+    })
+}
+
+#[cfg(test)]
+fn try_from_blob_bottom_up_with_for_test<F>(
+    blob: Blob<SimpleArchive>,
+    build: F,
+) -> Result<BottomUpArchiveProbe, UnarchiveError>
+where
+    F: FnOnce(
+        &[[u8; 64]],
+        &[u128],
+        &Arc<dyn ArchiveOwner>,
+    ) -> (TribleSet, usize),
+{
     let total_start = std::time::Instant::now();
     let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
         return Err(UnarchiveError::BadArchive);
@@ -276,8 +307,7 @@ pub(crate) fn try_from_blob_bottom_up_for_test(
     let hash_bytes = hashes.capacity() * std::mem::size_of::<u128>();
 
     let build_start = std::time::Instant::now();
-    let (set, permutation_bytes) =
-        unsafe { TribleSet::from_archive_partition_for_test(slice, &hashes, &owner) };
+    let (set, permutation_bytes) = build(slice, &hashes, &owner);
     let partition_and_build = build_start.elapsed();
 
     Ok(BottomUpArchiveProbe {
@@ -344,6 +374,7 @@ mod tests {
     use crate::patch::{KeySchema, PATCH};
     use crate::trible::{AEVOrder, AVEOrder, EAVOrder, EVAOrder, VAEOrder, VEAOrder};
     use std::hint::black_box;
+    #[cfg(feature = "parallel")]
     use std::time::{Duration, Instant};
 
     fn fixture_row(index: usize) -> [u8; 64] {
@@ -441,69 +472,209 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn all_six_bottom_up_parallel_matches_public_and_sequential() {
+        for len in [1usize, 2, 3, 257, 8_192] {
+            let blob = fixture_blob(len);
+            let production = TribleSet::try_from_blob(blob.clone()).unwrap();
+            let sequential = try_from_blob_bottom_up_for_test(blob.clone()).unwrap();
+            let parallel = try_from_blob_bottom_up_parallel_for_test(blob.clone()).unwrap();
+
+            assert_all_six_parity(&sequential.set, &production, len);
+            assert_all_six_parity(&parallel.set, &production, len);
+            assert_eq!(parallel.row_hashes, len);
+            assert_eq!(parallel.hash_bytes, len * std::mem::size_of::<u128>());
+            assert_eq!(
+                parallel.permutation_bytes,
+                len * 6 * std::mem::size_of::<u32>(),
+            );
+            assert!(production.owner_guards_are_shared_for_test());
+            assert!(sequential.set.owner_guards_are_shared_for_test());
+            assert!(parallel.set.owner_guards_are_shared_for_test());
+
+            let survivor = parallel.set.clone();
+            drop(parallel.set);
+            drop(sequential.set);
+            drop(production);
+            drop(blob);
+            black_box(vec![0xa5u8; len.saturating_mul(64).min(1 << 20)]);
+            assert_eq!(survivor.eav.iter_ordered().count(), len);
+            assert_eq!(survivor.eva.iter_ordered().count(), len);
+            assert_eq!(survivor.aev.iter_ordered().count(), len);
+            assert_eq!(survivor.ave.iter_ordered().count(), len);
+            assert_eq!(survivor.vea.iter_ordered().count(), len);
+            assert_eq!(survivor.vae.iter_ordered().count(), len);
+        }
+    }
+
     #[test]
     fn all_six_bottom_up_validates_canonical_eav_input() {
         let first = fixture_row(0);
         let second = fixture_row(1);
-        assert_eq!(
-            try_from_blob_bottom_up_for_test(blob_from_rows(vec![first, first]))
-                .err()
-                .expect("duplicate must fail"),
-            UnarchiveError::BadCanonicalizationRedundancy,
-        );
-        assert_eq!(
-            try_from_blob_bottom_up_for_test(blob_from_rows(vec![second, first]))
-                .err()
-                .expect("descending input must fail"),
-            UnarchiveError::BadCanonicalizationOrdering,
-        );
         let mut invalid = first;
         invalid[..16].fill(0);
+
+        for (rows, expected) in [
+            (
+                vec![first, first],
+                UnarchiveError::BadCanonicalizationRedundancy,
+            ),
+            (
+                vec![second, first],
+                UnarchiveError::BadCanonicalizationOrdering,
+            ),
+            (vec![invalid], UnarchiveError::BadTrible),
+        ] {
+            let blob = blob_from_rows(rows);
+            assert_eq!(
+                TribleSet::try_from_blob(blob.clone())
+                    .err()
+                    .expect("public decoder must reject invalid input"),
+                expected,
+            );
+            assert_eq!(
+                try_from_blob_bottom_up_for_test(blob.clone())
+                    .err()
+                    .expect("sequential bottom-up decoder must reject invalid input"),
+                expected,
+            );
+            #[cfg(feature = "parallel")]
+            assert_eq!(
+                try_from_blob_bottom_up_parallel_for_test(blob)
+                    .err()
+                    .expect("parallel bottom-up decoder must reject invalid input"),
+                expected,
+            );
+        }
+
+        let malformed_bytes: Bytes = vec![0u8; 63].into();
+        let malformed = Blob::new(malformed_bytes);
         assert_eq!(
-            try_from_blob_bottom_up_for_test(blob_from_rows(vec![invalid]))
+            TribleSet::try_from_blob(malformed.clone())
                 .err()
-                .expect("nil entity must fail"),
-            UnarchiveError::BadTrible,
+                .expect("public decoder must reject malformed bytes"),
+            UnarchiveError::BadArchive,
+        );
+        assert_eq!(
+            try_from_blob_bottom_up_for_test(malformed.clone())
+                .err()
+                .expect("sequential bottom-up decoder must reject malformed bytes"),
+            UnarchiveError::BadArchive,
+        );
+        #[cfg(feature = "parallel")]
+        assert_eq!(
+            try_from_blob_bottom_up_parallel_for_test(malformed)
+                .err()
+                .expect("parallel bottom-up decoder must reject malformed bytes"),
+            UnarchiveError::BadArchive,
         );
     }
 
-    /// End-to-end serial production vs fused all-six MSD construction timing.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn all_six_bottom_up_parallel_matches_public_errors_above_threshold() {
+        fn assert_error_parity(rows: Vec<[u8; 64]>, expected: UnarchiveError) {
+            let blob = blob_from_rows(rows);
+            assert_eq!(
+                TribleSet::try_from_blob(blob.clone())
+                    .err()
+                    .expect("public parallel decoder must reject invalid input"),
+                expected,
+            );
+            assert_eq!(
+                try_from_blob_bottom_up_for_test(blob.clone())
+                    .err()
+                    .expect("sequential bottom-up decoder must reject invalid input"),
+                expected,
+            );
+            assert_eq!(
+                try_from_blob_bottom_up_parallel_for_test(blob)
+                    .err()
+                    .expect("parallel bottom-up decoder must reject invalid input"),
+                expected,
+            );
+        }
+
+        let duplicate_rows = (0..4_096)
+            .flat_map(|index| [fixture_row(index), fixture_row(index)])
+            .collect();
+        assert_error_parity(
+            duplicate_rows,
+            UnarchiveError::BadCanonicalizationRedundancy,
+        );
+
+        let descending_rows = (0..8_192).rev().map(fixture_row).collect();
+        assert_error_parity(
+            descending_rows,
+            UnarchiveError::BadCanonicalizationOrdering,
+        );
+
+        let invalid_rows = (0..8_192)
+            .map(|index| {
+                let mut row = [0u8; 64];
+                row[31] = 1;
+                row[56..64].copy_from_slice(&((index + 1) as u64).to_be_bytes());
+                row
+            })
+            .collect();
+        assert_error_parity(invalid_rows, UnarchiveError::BadTrible);
+    }
+
+    /// End-to-end public parallel decoder vs sequential and fixed six-way
+    /// bottom-up construction. Result destruction is outside every timed span.
     /// Run with:
     ///
-    /// `cargo test -p triblespace-core --release all_six_bottom_up_archive_timing -- --ignored --nocapture`
+    /// `cargo test -p triblespace-core --release all_six_bottom_up_parallel_timing -- --ignored --nocapture`
+    #[cfg(feature = "parallel")]
     #[test]
-    #[ignore = "manual 100k/1m all-six construction benchmark"]
-    fn all_six_bottom_up_archive_timing() {
+    #[ignore = "manual public/sequential/six-way 100k/1m construction benchmark"]
+    fn all_six_bottom_up_parallel_timing() {
         fn median(samples: &mut [Duration]) -> Duration {
             samples.sort_unstable();
             samples[samples.len() / 2]
         }
 
-        for (len, rounds) in [(100_000usize, 5usize), (1_000_000, 3)] {
+        for (len, rounds) in [(100_000usize, 6usize), (1_000_000, 3)] {
             let blob = fixture_blob(len);
-            let baseline_oracle = try_from_blob_serial_for_test(blob.clone()).unwrap();
-            let candidate_oracle = try_from_blob_bottom_up_for_test(blob.clone()).unwrap();
-            assert_all_six_parity(&candidate_oracle.set, &baseline_oracle, len);
-            assert_eq!(candidate_oracle.row_hashes, len);
-            let hash_bytes = candidate_oracle.hash_bytes;
-            let permutation_bytes = candidate_oracle.permutation_bytes;
-            drop(candidate_oracle.set);
-            drop(baseline_oracle);
+            let production_oracle = TribleSet::try_from_blob(blob.clone()).unwrap();
+            let sequential_oracle = try_from_blob_bottom_up_for_test(blob.clone()).unwrap();
+            let parallel_oracle =
+                try_from_blob_bottom_up_parallel_for_test(blob.clone()).unwrap();
+            assert_all_six_parity(&sequential_oracle.set, &production_oracle, len);
+            assert_all_six_parity(&parallel_oracle.set, &production_oracle, len);
+            assert!(production_oracle.owner_guards_are_shared_for_test());
+            assert!(sequential_oracle.set.owner_guards_are_shared_for_test());
+            assert!(parallel_oracle.set.owner_guards_are_shared_for_test());
+            assert_eq!(sequential_oracle.row_hashes, len);
+            assert_eq!(parallel_oracle.row_hashes, len);
+            let sequential_transient =
+                sequential_oracle.hash_bytes + sequential_oracle.permutation_bytes;
+            let parallel_transient =
+                parallel_oracle.hash_bytes + parallel_oracle.permutation_bytes;
+            assert_eq!(sequential_transient, len * (16 + 4));
+            assert_eq!(parallel_transient, len * (16 + 6 * 4));
+            drop(parallel_oracle.set);
+            drop(sequential_oracle.set);
+            drop(production_oracle);
 
-            let mut baseline_samples = Vec::with_capacity(rounds);
-            let mut candidate_samples = Vec::with_capacity(rounds);
-            let mut validation_samples = Vec::with_capacity(rounds);
-            let mut build_samples = Vec::with_capacity(rounds);
+            let mut production_samples = Vec::with_capacity(rounds);
+            let mut sequential_samples = Vec::with_capacity(rounds);
+            let mut parallel_samples = Vec::with_capacity(rounds);
+            let mut sequential_validation_samples = Vec::with_capacity(rounds);
+            let mut sequential_build_samples = Vec::with_capacity(rounds);
+            let mut parallel_validation_samples = Vec::with_capacity(rounds);
+            let mut parallel_build_samples = Vec::with_capacity(rounds);
             for round in 0..rounds {
-                let baseline = || {
+                let production = || {
                     let start = Instant::now();
-                    let set = try_from_blob_serial_for_test(black_box(blob.clone())).unwrap();
+                    let set = TribleSet::try_from_blob(black_box(blob.clone())).unwrap();
                     let elapsed = start.elapsed();
                     black_box(set.len());
                     drop(set);
                     elapsed
                 };
-                let candidate = || {
+                let sequential = || {
                     let start = Instant::now();
                     let probe = try_from_blob_bottom_up_for_test(black_box(blob.clone())).unwrap();
                     let elapsed = start.elapsed();
@@ -513,34 +684,67 @@ mod tests {
                     drop(probe.set);
                     (elapsed, phases)
                 };
-                let (baseline_elapsed, candidate_result) = if round % 2 == 0 {
-                    let baseline_elapsed = baseline();
-                    let candidate_result = candidate();
-                    (baseline_elapsed, candidate_result)
-                } else {
-                    let candidate_result = candidate();
-                    let baseline_elapsed = baseline();
-                    (baseline_elapsed, candidate_result)
+                let parallel = || {
+                    let start = Instant::now();
+                    let probe = try_from_blob_bottom_up_parallel_for_test(black_box(blob.clone()))
+                        .unwrap();
+                    let elapsed = start.elapsed();
+                    black_box(probe.set.len());
+                    let phases = (probe.validation_and_hash, probe.partition_and_build);
+                    debug_assert!(probe.total <= elapsed);
+                    drop(probe.set);
+                    (elapsed, phases)
                 };
-                baseline_samples.push(baseline_elapsed);
-                candidate_samples.push(candidate_result.0);
-                validation_samples.push(candidate_result.1 .0);
-                build_samples.push(candidate_result.1 .1);
+
+                let (production_elapsed, sequential_result, parallel_result) = match round % 3 {
+                    0 => {
+                        let production_elapsed = production();
+                        let sequential_result = sequential();
+                        let parallel_result = parallel();
+                        (production_elapsed, sequential_result, parallel_result)
+                    }
+                    1 => {
+                        let sequential_result = sequential();
+                        let parallel_result = parallel();
+                        let production_elapsed = production();
+                        (production_elapsed, sequential_result, parallel_result)
+                    }
+                    _ => {
+                        let parallel_result = parallel();
+                        let production_elapsed = production();
+                        let sequential_result = sequential();
+                        (production_elapsed, sequential_result, parallel_result)
+                    }
+                };
+                production_samples.push(production_elapsed);
+                sequential_samples.push(sequential_result.0);
+                parallel_samples.push(parallel_result.0);
+                sequential_validation_samples.push(sequential_result.1 .0);
+                sequential_build_samples.push(sequential_result.1 .1);
+                parallel_validation_samples.push(parallel_result.1 .0);
+                parallel_build_samples.push(parallel_result.1 .1);
             }
 
-            let baseline = median(&mut baseline_samples);
-            let candidate = median(&mut candidate_samples);
-            let validation = median(&mut validation_samples);
-            let build = median(&mut build_samples);
+            let production = median(&mut production_samples);
+            let sequential = median(&mut sequential_samples);
+            let parallel = median(&mut parallel_samples);
+            let sequential_validation = median(&mut sequential_validation_samples);
+            let sequential_build = median(&mut sequential_build_samples);
+            let parallel_validation = median(&mut parallel_validation_samples);
+            let parallel_build = median(&mut parallel_build_samples);
             println!(
-                "all_six_bottom_up_archive len={len} baseline_ms={:.3} candidate_ms={:.3} speedup={:.3}x validation_hash_ms={:.3} partition_build_ms={:.3} hash_bytes={hash_bytes} permutation_bytes={permutation_bytes} transient_bytes={} transient_mib={:.3}",
-                baseline.as_secs_f64() * 1e3,
-                candidate.as_secs_f64() * 1e3,
-                baseline.as_secs_f64() / candidate.as_secs_f64(),
-                validation.as_secs_f64() * 1e3,
-                build.as_secs_f64() * 1e3,
-                hash_bytes + permutation_bytes,
-                (hash_bytes + permutation_bytes) as f64 / (1024.0 * 1024.0),
+                "all_six_bottom_up_parallel len={len} workers={} public_ms={:.3} sequential_ms={:.3} parallel_ms={:.3} sequential_speedup_vs_public={:.3}x parallel_speedup_vs_public={:.3}x parallel_speedup_vs_sequential={:.3}x sequential_validation_hash_ms={:.3} sequential_build_ms={:.3} parallel_validation_hash_ms={:.3} parallel_build_ms={:.3} sequential_transient_bytes={sequential_transient} parallel_transient_bytes={parallel_transient}",
+                rayon::current_num_threads(),
+                production.as_secs_f64() * 1e3,
+                sequential.as_secs_f64() * 1e3,
+                parallel.as_secs_f64() * 1e3,
+                production.as_secs_f64() / sequential.as_secs_f64(),
+                production.as_secs_f64() / parallel.as_secs_f64(),
+                sequential.as_secs_f64() / parallel.as_secs_f64(),
+                sequential_validation.as_secs_f64() * 1e3,
+                sequential_build.as_secs_f64() * 1e3,
+                parallel_validation.as_secs_f64() * 1e3,
+                parallel_build.as_secs_f64() * 1e3,
             );
         }
     }
