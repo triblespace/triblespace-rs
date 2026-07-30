@@ -167,15 +167,15 @@ impl OwnerCover {
     /// still covers its original PATCH root. The caller retains `other` and
     /// its root for the duration of the operation, so no LocalLeaf can dangle
     /// during unwind.
-    fn merge_into(current: &mut Option<Arc<Self>>, other: Option<Arc<Self>>) {
-        let Some(other) = other else {
+    fn merge_into(current: &mut Option<Arc<Self>>, other: &Option<Arc<Self>>) {
+        let Some(other) = other.as_ref() else {
             return;
         };
         let Some(left) = current.as_mut() else {
-            *current = Some(other);
+            *current = Some(other.clone());
             return;
         };
-        if Arc::ptr_eq(left, &other) {
+        if Arc::ptr_eq(left, other) {
             return;
         }
         let left_singleton = left.singleton_address();
@@ -193,7 +193,7 @@ impl OwnerCover {
         cover.latest_address = latest_address;
     }
 
-    fn union(left: Option<Arc<Self>>, right: Option<Arc<Self>>) -> Option<Arc<Self>> {
+    fn union(left: Option<Arc<Self>>, right: &Option<Arc<Self>>) -> Option<Arc<Self>> {
         let mut result = left;
         Self::merge_into(&mut result, right);
         result
@@ -2697,31 +2697,29 @@ where
     /// Unions this PATCH with another PATCH.
     ///
     /// The other PATCH is consumed, and this PATCH is updated in place.
-    pub fn union(&mut self, other: Self)
+    pub fn union(&mut self, mut other: Self)
     where
         O: Send + Sync,
         V: Send + Sync,
     {
-        let Self {
-            root: other_root,
-            owners: other_owners,
-        } = other;
-        if let Some(other) = other_root {
+        if let Some(other_root) = other.root.take() {
             if self.root.is_some() {
                 // Extend the installed lifetime guard before Head::union can
                 // detach or move either side's LocalLeaves. Owner-cover carry
                 // is monotone and transactional, so a caught allocation panic
-                // leaves this PATCH's existing root fully guarded.
-                OwnerCover::merge_into(&mut self.owners, other_owners);
+                // leaves this PATCH's existing root fully guarded. Keep
+                // `other.owners` in its PATCH until the Head merge completes,
+                // so unwind also drops the other Head before its guard.
+                OwnerCover::merge_into(&mut self.owners, &other.owners);
                 let this = self.root.take().expect("root should not be empty");
                 #[cfg(feature = "parallel")]
-                let merged = Head::par_union(this, other, 0);
+                let merged = Head::par_union(this, other_root, 0);
                 #[cfg(not(feature = "parallel"))]
-                let merged = Head::union(this, other, 0);
+                let merged = Head::union(this, other_root, 0);
                 self.root.replace(merged);
             } else {
-                self.root.replace(other);
-                self.owners = other_owners;
+                self.root.replace(other_root);
+                self.owners = other.owners.take();
             }
         }
         self.debug_check_owner_invariant();
@@ -2744,7 +2742,7 @@ where
                 let root = result.map(|root| root.with_start(0));
                 let owners = root
                     .as_ref()
-                    .and_then(|_| OwnerCover::union(self.owners.clone(), other.owners.clone()));
+                    .and_then(|_| OwnerCover::union(self.owners.clone(), &other.owners));
                 let result = Self { root, owners };
                 result.debug_check_owner_invariant();
                 return result;
@@ -3348,12 +3346,12 @@ mod tests {
         const UNIONS: usize = 512;
         let owners = [test_archive_owner(1), test_archive_owner(2)];
         let mut cover = None;
-        OwnerCover::merge_into(&mut cover, Some(OwnerCover::singleton(&owners[0])));
+        OwnerCover::merge_into(&mut cover, &Some(OwnerCover::singleton(&owners[0])));
         let allocation = Arc::as_ptr(cover.as_ref().unwrap());
         for i in 1..UNIONS {
             OwnerCover::merge_into(
                 &mut cover,
-                Some(OwnerCover::singleton(&owners[i & 1])),
+                &Some(OwnerCover::singleton(&owners[i & 1])),
             );
         }
 
@@ -3375,12 +3373,12 @@ mod tests {
         OwnerCover::retain(&mut right, &owner);
         let left_snapshot = left.as_ref().unwrap().clone();
 
-        let singleton_union = OwnerCover::union(left, right).unwrap();
+        let singleton_union = OwnerCover::union(left, &right).unwrap();
         assert!(Arc::ptr_eq(&singleton_union, &left_snapshot));
 
         let identical_union = OwnerCover::union(
             Some(singleton_union.clone()),
-            Some(singleton_union.clone()),
+            &Some(singleton_union.clone()),
         )
         .unwrap();
         assert!(Arc::ptr_eq(&identical_union, &singleton_union));
