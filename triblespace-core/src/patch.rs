@@ -1320,8 +1320,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         slot: &mut Option<Self>,
         leaf_key: &[u8; KEY_LEN],
         start_depth: usize,
+        need_delta: bool,
     ) -> HashDelta {
         if let Some(this) = slot {
+            // A resident branch can preserve its exact aggregate if the
+            // successful removal reports h(removed). An already-demanding
+            // ancestor keeps that obligation alive through dirty branches:
+            // cache knowledge is intentionally not downward-closed.
+            let need_delta = need_delta || this.known_hash().is_some();
             let end_depth = std::cmp::min(this.end_depth(), KEY_LEN);
             // Check reachable equality by asking the head to test the prefix
             // up to its end_depth. Using the head/leaf primitive centralises the
@@ -1330,17 +1336,21 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 return HashDelta::SAME_KEYS;
             }
             if matches!(this.tag(), HeadTag::Leaf | HeadTag::LocalLeaf) {
-                let delta = this
-                    .known_hash()
-                    .map(HashDelta::Known)
-                    .unwrap_or(HashDelta::Unknown);
+                let delta = match this.known_hash() {
+                    Some(hash) => HashDelta::Known(hash),
+                    // Hash the matched archive bytes, not `leaf_key`: callers
+                    // supply the tree-view ordering, while fingerprints cover
+                    // the canonical stored key for every KeySchema.
+                    None if need_delta => HashDelta::Known(this.hash()),
+                    None => HashDelta::Unknown,
+                };
                 slot.take();
                 return delta;
             } else {
                 let mut ed = crate::patch::branch::BranchMut::from_head(this);
                 let key = leaf_key[end_depth];
                 let delta = ed.modify_child_with_delta(key, |mut opt| {
-                    let delta = Self::remove_leaf(&mut opt, leaf_key, end_depth);
+                    let delta = Self::remove_leaf(&mut opt, leaf_key, end_depth, need_delta);
                     Mutation::with_delta(opt, delta)
                 });
 
@@ -2888,7 +2898,7 @@ where
     ///
     /// If the key is not present, this is a no-op.
     pub fn remove(&mut self, key: &[u8; KEY_LEN]) {
-        let _ = Head::remove_leaf(&mut self.root, key, 0);
+        let _ = Head::remove_leaf(&mut self.root, key, 0, false);
         if self.root.is_none() {
             self.owners = None;
         }
@@ -3915,6 +3925,9 @@ mod tests {
     #[repr(C, align(16))]
     struct AlignedArchiveKey<const KEY_LEN: usize>([u8; KEY_LEN]);
 
+    crate::key_segmentation!(RemovalSegments, 8, [4, 4]);
+    crate::key_schema!(SwappedRemovalSchema, RemovalSegments, 8, [1, 0]);
+
     /// Return a PATCH whose root owner cover is the only remaining owner of the
     /// two archive rows. This makes lifetime regressions deterministic: no
     /// fixture Arc can accidentally keep dangling LocalLeaves alive.
@@ -4352,7 +4365,7 @@ mod tests {
     }
 
     #[test]
-    fn local_leaf_remove_demotes_without_eager_hashing() {
+    fn local_leaf_remove_hashes_once_to_preserve_resident_root() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
         let mut b = a;
@@ -4376,9 +4389,74 @@ mod tests {
         patch.insert_archive(&entries[2]);
         assert_ne!(branch_cached_hash(&patch), 0);
 
-        // A LocalLeaf deliberately carries no resident per-leaf fingerprint.
-        // A successful removal therefore cannot derive a numeric delta without
-        // rehashing that archive row: demote the surviving Branch instead.
+        // The resident root asks the removal path for an exact delta. Hashing
+        // the one matched LocalLeaf is enough to preserve that aggregate; the
+        // surviving archive rows must not be traversed.
+        reset_local_leaf_hash_calls();
+        patch.remove(&c);
+        assert_ne!(branch_cached_hash(&patch), 0);
+        assert_eq!(local_leaf_hash_calls(), 1);
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b]),
+        );
+        deep_hash_audit(&patch);
+
+        let expected = heap_hash_oracle(&patch);
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 1);
+    }
+
+    #[test]
+    fn local_leaf_remove_root_collapse_spends_at_most_one_hash() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut patch = owned_archive_pair([a, b]);
+        assert_ne!(branch_cached_hash(&patch), 0);
+
+        // Demand is established before normalization. Removing one child from
+        // an exact two-child root therefore hashes that removed LocalLeaf even
+        // though the Branch subsequently collapses and has nowhere to retain
+        // its repaired aggregate. Avoiding this bounded one-hash edge would
+        // couple receipt demand to fanout/collapse preflight.
+        reset_local_leaf_hash_calls();
+        patch.remove(&b);
+        assert_eq!(local_leaf_hash_calls(), 1);
+        assert_eq!(patch.len(), 1);
+        assert!(matches!(
+            patch.root.as_ref().unwrap().body_ref(),
+            BodyRef::LocalLeaf(_)
+        ));
+        assert_eq!(patch.iter().copied().collect::<Vec<_>>(), vec![a]);
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
+    fn local_leaf_remove_stays_hash_free_on_a_dirty_path() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut c = a;
+        c[0] = 2;
+
+        let storage = Arc::new([
+            AlignedArchiveKey(a),
+            AlignedArchiveKey(b),
+            AlignedArchiveKey(c),
+        ]);
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let entries: [ArchiveEntry<'_, KEY_LEN>; 3] = std::array::from_fn(|i| unsafe {
+            ArchiveEntry::new(NonNull::from(&storage[i].0), &owner)
+        });
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema>::new();
+        for entry in &entries {
+            patch.insert_archive(entry);
+        }
+        assert_eq!(branch_cached_hash(&patch), 0);
+
         reset_local_leaf_hash_calls();
         patch.remove(&c);
         assert_eq!(branch_cached_hash(&patch), 0);
@@ -4388,10 +4466,76 @@ mod tests {
             HashSet::from([a, b]),
         );
         deep_hash_audit(&patch);
+    }
 
+    #[test]
+    fn local_leaf_remove_carries_one_delta_through_a_dirty_child() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+        let mut d = c;
+        d[1] = 1;
+
+        let mut patch = owned_archive_pair([a, c]);
+        patch.union(owned_archive_pair([b, d]));
+        let before = branch_cached_hash(&patch);
+        assert_ne!(before, 0);
+
+        reset_local_leaf_hash_calls();
+        patch.remove(&b);
+        assert_eq!(local_leaf_hash_calls(), 1);
+        assert_ne!(branch_cached_hash(&patch), 0);
+        assert_ne!(branch_cached_hash(&patch), before);
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, c, d]),
+        );
         let expected = heap_hash_oracle(&patch);
         assert_eq!(patch.root_hash(), Some(expected));
-        assert_eq!(local_leaf_hash_calls(), 2);
+        assert_eq!(local_leaf_hash_calls(), 1);
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
+    fn local_leaf_remove_hashes_canonical_bytes_for_reordered_schema() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut c = a;
+        c[4] = 1;
+
+        let storage = Arc::new([
+            AlignedArchiveKey(a),
+            AlignedArchiveKey(b),
+            AlignedArchiveKey(c),
+        ]);
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let entries: [ArchiveEntry<'_, KEY_LEN>; 3] = std::array::from_fn(|i| unsafe {
+            ArchiveEntry::new(NonNull::from(&storage[i].0), &owner)
+        });
+        let mut patch = PATCH::<KEY_LEN, SwappedRemovalSchema>::from_archive_pair(
+            &entries[0],
+            &entries[1],
+        );
+        patch.insert_archive(&entries[2]);
+        assert_ne!(branch_cached_hash(&patch), 0);
+
+        let tree_key = SwappedRemovalSchema::tree_ordered(&c);
+        reset_local_leaf_hash_calls();
+        patch.remove(&tree_key);
+        assert_eq!(local_leaf_hash_calls(), 1);
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b]),
+        );
+        let expected = heap_hash_oracle(&patch);
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls(), 1);
+        deep_hash_audit(&patch);
     }
 
     #[test]

@@ -126,9 +126,13 @@ is supplied or resident, even when the changed child itself is dirty.
 provenance; the returned child must still be installed. When the operation
 cannot supply a delta, the child editor falls back to already-resident old and
 replacement receipts. If neither source is available, the parent becomes
-dirty. Structural mutation never calls `child.hash()` merely to maintain a
-cache. Reading a resident root hash is O(1); reading a dirty root folds the
-subtree in O(n) and does not memoize through a shared reference.
+dirty. Structural mutation never folds a child subtree merely to maintain a
+cache. Successful LocalLeaf removal is the bounded exception: when some
+resident ancestor can consume the delta, it hashes the matched canonical leaf
+bytes exactly once and carries that receipt through any dirty intermediate
+branches. A wholly dirty removal path hashes nothing. Reading a resident root
+hash is O(1); reading a dirty root folds the subtree in O(n) and does not
+memoize through a shared reference.
 
 Serial union and the small parallel fallback repair more receipts without
 hashing disjoint LocalLeaves. For
