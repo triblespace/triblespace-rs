@@ -883,6 +883,15 @@ fn tribleset_union_cases() -> Vec<TribleSetBinaryCase> {
     let expected = union_rows(&left_rows, &right_rows);
     assert_eq!(expected.len(), 8_064);
 
+    // A strict 4,096-row subset of an exact 8,192-row target exercises the
+    // cardinality proof directly. The union is structurally nontrivial but
+    // semantically returns the target unchanged; a resident target fingerprint
+    // can therefore survive without consulting any raw LocalLeaf hash.
+    let superset_rows = ordered_archive_rows(0, 128, 0, 64);
+    let subset_rows = left_rows.clone();
+    let exact_superset = archive_tribleset_variants_in(0, 128, 0, 64);
+    let exact_subset = archive_tribleset_variants_in(0, 128, 0, 32);
+
     // The balanced templates have exact roots over dirty direct children.
     // Build a fresh second pair before demotion so the two benchmark cases
     // have the same rows and topology without cross-case refcount coupling;
@@ -902,6 +911,16 @@ fn tribleset_union_cases() -> Vec<TribleSetBinaryCase> {
     );
 
     vec![
+        checked_tribleset_case(
+            "exact_superset",
+            "union",
+            exact_superset,
+            &superset_rows,
+            exact_subset,
+            &subset_rows,
+            &superset_rows,
+            union_triblesets,
+        ),
         checked_tribleset_case(
             "exact_overlap128",
             "union",
