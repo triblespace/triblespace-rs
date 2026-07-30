@@ -76,7 +76,7 @@ pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleS
     }
 
     // Keep the final canonical allocation stable before taking any pointers
-    // into it. The erased Arc is what each PATCH owner set retains.
+    // into it. The erased Arc is what each PATCH owner cover retains.
     let rows = Arc::new(IntrinsicEntityRows(rows));
     let owner: Arc<dyn ArchiveOwner> = rows.clone();
     let mut iter = rows.0.iter();
@@ -430,7 +430,7 @@ impl TribleSet {
     /// Inserts an archive-backed trible into all six covering indexes
     /// using [`PATCH::insert_archive`], so each index may land the new
     /// entry as a `LocalLeaf` instead of a freshly allocated heap
-    /// `Leaf`. Each receiving PATCH's root owner set keeps the underlying
+    /// `Leaf`. Each receiving PATCH's root owner cover keeps the underlying
     /// archive bytes alive.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, TRIBLE_LEN>) {
         self.eav.insert_archive(entry);
@@ -766,7 +766,7 @@ mod tests {
 
         // Each builder's input allocation is moved in and its local owner Arc
         // is gone before this union starts. Only the owners retained by PATCH
-        // owner sets keep the archive rows alive here.
+        // owner covers keep the archive rows alive here.
         let (_, first) = build_intrinsic_entity(rows_a);
         let surviving_clone = first.clone();
         drop(first);
@@ -780,7 +780,7 @@ mod tests {
         assert_all_indexes(&union, &expected);
 
         // Independently built, byte-identical entities have distinct owner
-        // Arcs. Their overlapping LocalLeaves exercise persistent owner-set
+        // Arcs. Their overlapping LocalLeaves exercise persistent owner-cover
         // union while preserving exact set semantics.
         let same_rows = many_intrinsic_rows(3, 256);
         let (_, same_expected) = expected_intrinsic_entity(same_rows.clone());

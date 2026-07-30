@@ -58,7 +58,7 @@ static A: CountingAllocator = CountingAllocator;
 /// exercising every LocalLeaf-vs-LocalLeaf collision in the trie. The
 /// sources are dropped before any
 /// reads so the result must keep all LocalLeaves' backing bytes
-/// alive transitively via the surviving PATCH owner sets.
+/// alive transitively via the surviving PATCH owner covers.
 #[test]
 fn union_two_overlapping_archives() {
     // Serialize with the decode-allocation test — they share the
@@ -75,7 +75,7 @@ fn union_two_overlapping_archives() {
     // independent so `try_from_blob_inner` wraps each in its own
     // `Arc<Bytes>`. After the union consumes both inputs, the
     // merged tree must keep all LocalLeaves' underlying bytes
-    // alive transitively (via the root owner sets on the surviving
+    // alive transitively (via the root owner covers on the surviving
     // PATCHes) — otherwise we get a use-after-free when we
     // walk the merged data.
     let mut a_src = TribleSet::new();

@@ -197,7 +197,7 @@ fn serial_unarchive(
         }
     }
     if let Some(first) = first_archive_entry {
-        // A PATCH root can be a LocalLeaf because its owner set is independent
+        // A PATCH root can be a LocalLeaf because its owner cover is independent
         // of trie shape.
         tribles.insert_archive_batch(&[first]);
     }
@@ -236,7 +236,7 @@ fn parallel_unarchive(
     }
 
     // Phase 2: per-chunk serial unarchive in parallel. Every chunk
-    // shares the same archive owner, so persistent owner-set union later
+    // shares the same archive owner, so persistent owner-cover union later
     // deduplicates the guard while adopting LocalLeaves wholesale.
     let chunk_sets: Result<Vec<TribleSet>, UnarchiveError> = chunks
         .par_iter()

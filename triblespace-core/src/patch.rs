@@ -43,103 +43,204 @@ pub trait ArchiveOwner: Send + Sync + 'static {}
 
 impl<T: Send + Sync + 'static + ?Sized> ArchiveOwner for T {}
 
-/// Persistent set of archive allocations retained by one PATCH value.
+/// One complete binary tree in an archive-owner cover.
 ///
-/// Keys are the data pointers of the owning trait-object Arcs. Every key's Arc
-/// is stored in the map itself, so an address cannot be reused while present.
-/// `im::HashMap` makes snapshot clones and larger-side-first unions structural
-/// rather than copying the complete owner history.
+/// Rank-zero trees store the owner Arc directly. Joining two equal-rank trees
+/// allocates only their shared parent, so binary carrying shares every
+/// untouched subtree with older PATCH snapshots.
 #[derive(Clone)]
-struct ArchiveOwners {
-    /// Direct hot-path key. Archive ingestion overwhelmingly repeats the most
-    /// recently added owner, and `im::HashMap::iter()` allocates traversal
-    /// state even for a singleton map.
-    representative_address: usize,
-    by_address: im::HashMap<usize, Arc<dyn ArchiveOwner>>,
+// In production the tree is intentionally opaque: retaining and eventually
+// dropping its fields is the operation. Tests traverse it to verify shape.
+#[cfg_attr(not(test), allow(dead_code))]
+enum OwnerTree {
+    Owner(Arc<dyn ArchiveOwner>),
+    Pair(Arc<OwnerPair>),
 }
 
-impl core::fmt::Debug for ArchiveOwners {
+#[cfg_attr(not(test), allow(dead_code))]
+struct OwnerPair {
+    left: OwnerTree,
+    right: OwnerTree,
+}
+
+/// Persistent monotone cover of archive allocations retained by one PATCH.
+///
+/// `roots[rank]` is either empty or a complete owner tree with `2^rank`
+/// leaves. Retaining one owner or joining two covers uses ordinary binary
+/// carrying. The cover deliberately does not maintain an exact global set:
+/// only the latest owner and the two structurally trivial union cases are
+/// deduplicated. This keeps its shape balanced and its maintenance independent
+/// of the number of distinct archive allocations.
+#[derive(Clone)]
+struct OwnerCover {
+    /// Direct hot-path key. Archive ingestion overwhelmingly repeats the most
+    /// recently added owner.
+    latest_address: usize,
+    roots: Vec<Option<OwnerTree>>,
+}
+
+impl core::fmt::Debug for OwnerCover {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ArchiveOwners")
-            .field("len", &self.by_address.len())
+        f.debug_struct("OwnerCover")
+            .field("ranks", &self.roots.len())
             .finish()
     }
 }
 
-impl ArchiveOwners {
+impl OwnerCover {
     #[inline]
     fn address(owner: &Arc<dyn ArchiveOwner>) -> usize {
         Arc::as_ptr(owner) as *const () as usize
     }
 
     fn singleton(owner: &Arc<dyn ArchiveOwner>) -> Arc<Self> {
-        let mut by_address = im::HashMap::new();
-        let representative_address = Self::address(owner);
-        by_address.insert(representative_address, owner.clone());
         Arc::new(Self {
-            representative_address,
-            by_address,
+            latest_address: Self::address(owner),
+            roots: vec![Some(OwnerTree::Owner(owner.clone()))],
         })
+    }
+
+    /// Add one rank-`rank` tree, joining equal ranks by binary carry.
+    ///
+    /// Existing slots are cloned into the new pair spine before any slot is
+    /// changed. Capacity is likewise reserved first. Publishing the final
+    /// tree before clearing the carried slots means the installed cover never
+    /// stops retaining an owner, even if an allocation panic is caught.
+    fn carry(&mut self, rank: usize, mut tree: OwnerTree) {
+        let mut destination = rank;
+        while destination < self.roots.len() && self.roots[destination].is_some() {
+            destination += 1;
+        }
+        if destination >= self.roots.len() {
+            self.roots.reserve(destination + 1 - self.roots.len());
+        }
+
+        for occupied_rank in rank..destination {
+            let left = self.roots[occupied_rank]
+                .as_ref()
+                .expect("binary carry crossed an empty owner-cover rank")
+                .clone();
+            tree = OwnerTree::Pair(Arc::new(OwnerPair { left, right: tree }));
+        }
+
+        if destination < self.roots.len() {
+            self.roots[destination] = Some(tree);
+        } else {
+            self.roots.resize_with(destination, || None);
+            self.roots.push(Some(tree));
+        }
+        for occupied_rank in rank..destination {
+            self.roots[occupied_rank] = None;
+        }
+    }
+
+    #[inline]
+    fn singleton_address(&self) -> Option<usize> {
+        match self.roots.as_slice() {
+            [Some(OwnerTree::Owner(owner))] => Some(Self::address(owner)),
+            _ => None,
+        }
     }
 
     fn retain(current: &mut Option<Arc<Self>>, owner: &Arc<dyn ArchiveOwner>) {
         let address = Self::address(owner);
-        let Some(existing) = current.as_ref() else {
+        let Some(existing) = current.as_mut() else {
             *current = Some(Self::singleton(owner));
             return;
         };
-        if existing.representative_address == address || existing.by_address.contains_key(&address)
-        {
+        if existing.latest_address == address {
             return;
         }
-        // Build the new persistent snapshot while the old guard remains
-        // installed, then publish it in one assignment. Same-owner ingestion
-        // returns above without allocation or Arc traffic.
-        let mut by_address = existing.by_address.clone();
-        by_address.insert(address, owner.clone());
-        *current = Some(Arc::new(Self {
-            representative_address: address,
-            by_address,
-        }));
+
+        // Arc::make_mut clones the logarithmic root vector only when another
+        // PATCH snapshot shares it. The common unique case performs an
+        // amortized-constant binary carry in place.
+        let cover = Arc::make_mut(existing);
+        cover.carry(0, OwnerTree::Owner(owner.clone()));
+        cover.latest_address = address;
+    }
+
+    /// Monotonically extend an installed cover with every tree in `other`.
+    ///
+    /// Each individual carry is transactional. If a later carry panics, the
+    /// installed cover may contain a conservative prefix of `other`, but it
+    /// still covers its original PATCH root. The caller retains `other` and
+    /// its root for the duration of the operation, so no LocalLeaf can dangle
+    /// during unwind.
+    fn merge_into(current: &mut Option<Arc<Self>>, other: Option<Arc<Self>>) {
+        let Some(other) = other else {
+            return;
+        };
+        let Some(left) = current.as_mut() else {
+            *current = Some(other);
+            return;
+        };
+        if Arc::ptr_eq(left, &other) {
+            return;
+        }
+        let left_singleton = left.singleton_address();
+        if left_singleton.is_some() && left_singleton == other.singleton_address() {
+            return;
+        }
+
+        let latest_address = other.latest_address;
+        let cover = Arc::make_mut(left);
+        for (rank, tree) in other.roots.iter().enumerate() {
+            if let Some(tree) = tree {
+                cover.carry(rank, tree.clone());
+            }
+        }
+        cover.latest_address = latest_address;
     }
 
     fn union(left: Option<Arc<Self>>, right: Option<Arc<Self>>) -> Option<Arc<Self>> {
-        let (left, right) = match (left, right) {
-            (None, right) => return right,
-            (left, None) => return left,
-            (Some(left), Some(right)) => (left, right),
-        };
-        if Arc::ptr_eq(&left, &right) {
-            return Some(left);
-        }
-        if left.by_address.len() == 1
-            && right.by_address.len() == 1
-            && left.representative_address == right.representative_address
-        {
-            return Some(left);
-        }
+        let mut result = left;
+        Self::merge_into(&mut result, right);
+        result
+    }
+}
 
-        let (large, small) = if left.by_address.len() >= right.by_address.len() {
-            (left, right)
-        } else {
-            (right, left)
-        };
-        let mut by_address = large.by_address.clone();
-        let mut changed = false;
-        for (address, owner) in small.by_address.iter() {
-            if !by_address.contains_key(address) {
-                by_address.insert(*address, owner.clone());
-                changed = true;
+#[cfg(test)]
+#[derive(Default)]
+struct OwnerCoverStats {
+    owners: usize,
+    pairs: usize,
+    max_depth: usize,
+}
+
+#[cfg(test)]
+impl OwnerTree {
+    fn collect_stats(&self, depth: usize, stats: &mut OwnerCoverStats) {
+        match self {
+            Self::Owner(_) => {
+                stats.owners += 1;
+                stats.max_depth = stats.max_depth.max(depth);
+            }
+            Self::Pair(pair) => {
+                stats.pairs += 1;
+                pair.left.collect_stats(depth + 1, stats);
+                pair.right.collect_stats(depth + 1, stats);
             }
         }
-        if changed {
-            Some(Arc::new(Self {
-                representative_address: large.representative_address,
-                by_address,
-            }))
-        } else {
-            Some(large)
+    }
+}
+
+#[cfg(test)]
+impl OwnerCover {
+    fn stats(&self) -> OwnerCoverStats {
+        let mut stats = OwnerCoverStats::default();
+        for tree in self.roots.iter().flatten() {
+            tree.collect_stats(0, &mut stats);
         }
+        stats
+    }
+
+    fn owner_count(&self) -> usize {
+        self.stats().owners
+    }
+
+    fn root_count(&self) -> usize {
+        self.roots.iter().flatten().count()
     }
 }
 
@@ -579,7 +680,7 @@ pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     Leaf(NonNull<Leaf<KEY_LEN, V>>),
     /// Thin pointer to a `[u8; KEY_LEN]` trible living in an archive's
     /// mmap'd buffer. Lifetime is implicit — guaranteed by the enclosing
-    /// PATCH's owner set.
+    /// PATCH's owner cover.
     LocalLeaf(NonNull<[u8; KEY_LEN]>),
     Branch(branch::BranchNN<KEY_LEN, O, V>),
 }
@@ -944,7 +1045,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     /// # Safety
     /// - `trible_ptr` must remain valid for at least as long as this Head
     ///   exists, which the caller arranges by retaining its owner in the
-    ///   enclosing PATCH's root owner set.
+    ///   enclosing PATCH's root owner cover.
     /// - The pointer must be 16-byte aligned; this is debug-asserted.
     unsafe fn new_local_leaf(key: u8, trible_ptr: NonNull<[u8; KEY_LEN]>) -> Self {
         unsafe {
@@ -1933,7 +2034,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
             // A two-child Branch can lose its only matching child here.
             // Preserve the irreducible-tree invariant rather than returning
-            // a unary Branch. The PATCH-level owner set makes a LocalLeaf
+            // a unary Branch. The PATCH-level owner cover makes a LocalLeaf
             // survivor valid at any trie depth, including the root.
             let occupied_children = ed.child_table.iter().flatten().take(2).count();
             if occupied_children == 0 {
@@ -2068,7 +2169,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
             match self.body() {
                 BodyPtr::Leaf(leaf) => Leaf::rc_dec(leaf),
                 BodyPtr::LocalLeaf(_) => {
-                    // No-op: the enclosing PATCH owner set, not the leaf,
+                    // No-op: the enclosing PATCH owner cover, not the leaf,
                     // retains the archive bytes.
                 }
                 BodyPtr::Branch(branch) => Branch::rc_dec(branch),
@@ -2102,7 +2203,7 @@ where
     /// Conservative lifetime guard for every LocalLeaf anywhere below root.
     /// The concrete Arc is thin, so this adds eight bytes per PATCH while
     /// removing sixteen bytes from every Branch.
-    owners: Option<Arc<ArchiveOwners>>,
+    owners: Option<Arc<OwnerCover>>,
 }
 
 /// A prefix-located PATCH infix traversal whose exact cardinality has already
@@ -2607,12 +2708,11 @@ where
         } = other;
         if let Some(other) = other_root {
             if self.root.is_some() {
-                // Install the combined lifetime guard before Head::union can
-                // detach or move either side's LocalLeaves.
-                // Keep self's current guard installed while the persistent
-                // union is built, so a caught allocation panic cannot leave a
-                // live PATCH with unguarded LocalLeaves.
-                self.owners = ArchiveOwners::union(self.owners.clone(), other_owners);
+                // Extend the installed lifetime guard before Head::union can
+                // detach or move either side's LocalLeaves. Owner-cover carry
+                // is monotone and transactional, so a caught allocation panic
+                // leaves this PATCH's existing root fully guarded.
+                OwnerCover::merge_into(&mut self.owners, other_owners);
                 let this = self.root.take().expect("root should not be empty");
                 #[cfg(feature = "parallel")]
                 let merged = Head::par_union(this, other, 0);
@@ -2644,7 +2744,7 @@ where
                 let root = result.map(|root| root.with_start(0));
                 let owners = root
                     .as_ref()
-                    .and_then(|_| ArchiveOwners::union(self.owners.clone(), other.owners.clone()));
+                    .and_then(|_| OwnerCover::union(self.owners.clone(), other.owners.clone()));
                 let result = Self { root, owners };
                 result.debug_check_owner_invariant();
                 return result;
@@ -2724,7 +2824,7 @@ where
 
 /// Archive-backed insertion path, available only for `V = ()` because
 /// [`ArchiveEntry`] does not carry a value. Every inserted key remains a
-/// LocalLeaf while the PATCH's root owner set retains its allocation.
+/// LocalLeaf while the PATCH's root owner cover retains its allocation.
 impl<const KEY_LEN: usize, O> PATCH<KEY_LEN, O, ()>
 where
     O: KeySchema<KEY_LEN>,
@@ -2756,17 +2856,17 @@ where
         );
         let result = Self {
             root: Some(Head::new(root_key, branch)),
-            owners: Some(ArchiveOwners::singleton(first_owner)),
+            owners: Some(OwnerCover::singleton(first_owner)),
         };
         result.debug_check_owner_invariant();
         result
     }
 
     /// Inserts an archive-backed key and retains its allocation in the PATCH's
-    /// persistent root owner set.
+    /// persistent root owner cover.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, KEY_LEN>) {
         let (leaf_head, leaf_owner, leaf_hash) = entry.leaf::<O>();
-        ArchiveOwners::retain(&mut self.owners, leaf_owner);
+        OwnerCover::retain(&mut self.owners, leaf_owner);
         if let Some(this) = self.root.take() {
             let new_head = Head::insert_archive_leaf(this, leaf_head, leaf_hash, 0);
             self.root.replace(new_head);
@@ -2900,12 +3000,12 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHOrderedIterator<'a
 // --- Owned consuming iterators ---
 /// Iterator that owns a PATCH and yields keys in key-order. The iterator
 /// consumes the PATCH, drains owned Heads through a queue, and keeps the
-/// PATCH's archive-owner set alive until every LocalLeaf has been copied out.
+/// PATCH's archive-owner cover alive until every LocalLeaf has been copied out.
 pub struct PATCHIntoIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     // Field order is deliberate: queued Heads drop before the owner guard.
     queue: Vec<Head<KEY_LEN, O, V>>,
     remaining: usize,
-    _owners: Option<Arc<ArchiveOwners>>,
+    _owners: Option<Arc<OwnerCover>>,
 }
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIntoIterator<KEY_LEN, O, V> {}
@@ -2947,7 +3047,7 @@ pub struct PATCHIntoOrderedIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>,
     // Field order is deliberate: queued Heads drop before the owner guard.
     queue: Vec<Head<KEY_LEN, O, V>>,
     remaining: usize,
-    _owners: Option<Arc<ArchiveOwners>>,
+    _owners: Option<Arc<OwnerCover>>,
 }
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
@@ -3154,6 +3254,7 @@ mod tests {
     use std::convert::TryInto;
     use std::iter::FromIterator;
     use std::mem;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn patch_unowned_direct_local_leaves<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>(
         patch: &PATCH<KEY_LEN, O, V>,
@@ -3168,7 +3269,7 @@ mod tests {
     #[repr(C, align(16))]
     struct AlignedArchiveKey<const KEY_LEN: usize>([u8; KEY_LEN]);
 
-    /// Return a PATCH whose root owner set is the only remaining owner of the
+    /// Return a PATCH whose root owner cover is the only remaining owner of the
     /// two archive rows. This makes lifetime regressions deterministic: no
     /// fixture Arc can accidentally keep dangling LocalLeaves alive.
     fn owned_archive_pair<const KEY_LEN: usize>(
@@ -3198,6 +3299,121 @@ mod tests {
         patch
     }
 
+    fn test_archive_owner(byte: u8) -> Arc<dyn ArchiveOwner> {
+        Arc::new([byte])
+    }
+
+    #[test]
+    fn owner_cover_repeated_latest_owner_is_an_identity() {
+        let owner = test_archive_owner(1);
+        let mut cover = None;
+        OwnerCover::retain(&mut cover, &owner);
+        let first = cover.as_ref().unwrap().clone();
+
+        for _ in 0..4096 {
+            OwnerCover::retain(&mut cover, &owner);
+        }
+
+        let cover = cover.unwrap();
+        assert!(Arc::ptr_eq(&cover, &first));
+        let stats = cover.stats();
+        assert_eq!(stats.owners, 1);
+        assert_eq!(stats.pairs, 0);
+        assert_eq!(stats.max_depth, 0);
+        assert_eq!(cover.root_count(), 1);
+    }
+
+    #[test]
+    fn owner_cover_alternation_stays_balanced_and_linear() {
+        const RETAINS: usize = 4093;
+        let owners = [test_archive_owner(1), test_archive_owner(2)];
+        let mut cover = None;
+        for i in 0..RETAINS {
+            OwnerCover::retain(&mut cover, &owners[i & 1]);
+        }
+
+        let cover = cover.unwrap();
+        let stats = cover.stats();
+        let expected_roots = RETAINS.count_ones() as usize;
+        let expected_depth = usize::BITS as usize - 1 - RETAINS.leading_zeros() as usize;
+        assert_eq!(stats.owners, RETAINS);
+        assert_eq!(stats.pairs, RETAINS - expected_roots);
+        assert_eq!(stats.max_depth, expected_depth);
+        assert_eq!(cover.root_count(), expected_roots);
+        assert!(stats.owners + stats.pairs < 2 * RETAINS);
+    }
+
+    #[test]
+    fn owner_cover_singleton_union_fold_is_binary_carry() {
+        const UNIONS: usize = 512;
+        let owners = [test_archive_owner(1), test_archive_owner(2)];
+        let mut cover = None;
+        OwnerCover::merge_into(&mut cover, Some(OwnerCover::singleton(&owners[0])));
+        let allocation = Arc::as_ptr(cover.as_ref().unwrap());
+        for i in 1..UNIONS {
+            OwnerCover::merge_into(
+                &mut cover,
+                Some(OwnerCover::singleton(&owners[i & 1])),
+            );
+        }
+
+        let cover = cover.unwrap();
+        assert_eq!(Arc::as_ptr(&cover), allocation);
+        let stats = cover.stats();
+        assert_eq!(stats.owners, UNIONS);
+        assert_eq!(stats.pairs, UNIONS - 1);
+        assert_eq!(stats.max_depth, 9);
+        assert_eq!(cover.root_count(), 1);
+    }
+
+    #[test]
+    fn owner_cover_only_collapses_structural_identities() {
+        let owner = test_archive_owner(1);
+        let mut left = None;
+        let mut right = None;
+        OwnerCover::retain(&mut left, &owner);
+        OwnerCover::retain(&mut right, &owner);
+        let left_snapshot = left.as_ref().unwrap().clone();
+
+        let singleton_union = OwnerCover::union(left, right).unwrap();
+        assert!(Arc::ptr_eq(&singleton_union, &left_snapshot));
+
+        let identical_union = OwnerCover::union(
+            Some(singleton_union.clone()),
+            Some(singleton_union.clone()),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&identical_union, &singleton_union));
+    }
+
+    #[test]
+    fn owner_cover_snapshots_retain_owners_until_the_last_drop() {
+        struct CountedOwner(Arc<AtomicUsize>);
+
+        impl Drop for CountedOwner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first: Arc<dyn ArchiveOwner> = Arc::new(CountedOwner(drops.clone()));
+        let second: Arc<dyn ArchiveOwner> = Arc::new(CountedOwner(drops.clone()));
+        let mut cover = None;
+        for i in 0..65 {
+            let owner = if i & 1 == 0 { &first } else { &second };
+            OwnerCover::retain(&mut cover, owner);
+        }
+        let snapshot = cover.clone();
+
+        drop(first);
+        drop(second);
+        drop(cover);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(snapshot);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn archive_singleton_is_a_guarded_root_local_leaf() {
         const KEY_SIZE: usize = 8;
@@ -3205,7 +3421,7 @@ mod tests {
         let singleton = owned_archive_single(key);
 
         assert_eq!(singleton.node_stats(), (0, 0, 0, 1));
-        assert_eq!(singleton.owners.as_ref().unwrap().by_address.len(), 1);
+        assert_eq!(singleton.owners.as_ref().unwrap().owner_count(), 1);
         assert_eq!(singleton.root.as_ref().unwrap().tag(), HeadTag::LocalLeaf);
 
         // The fixture owner was dropped before `owned_archive_single`
@@ -3244,7 +3460,7 @@ mod tests {
 
         // Two entries are enough for each decoder to retain its own archive
         // allocation behind LocalLeaves. Keeping the attribute bytes equal
-        // makes AEV/AVE union below the attribute prefix, exercising owner-set
+        // makes AEV/AVE union below the attribute prefix, exercising owner-cover
         // propagation independently of the resulting trie shape.
         let left = decoded_archive(1);
         let right = decoded_archive(2);
@@ -3355,7 +3571,7 @@ mod tests {
         drop(owner);
         drop(storage);
 
-        // The clone's PATCH owner sets are now the only things retaining the
+        // The clone's PATCH owner covers are now the only things retaining the
         // archive rows. Force allocation churn, then dereference every index.
         let noise = vec![0xa5u8; 3 * 64 * 32];
         std::hint::black_box(&noise);
@@ -3504,8 +3720,8 @@ mod tests {
         archive.insert_archive(&duplicate);
         assert_eq!(archive.node_stats(), (1, 2, 0, 2));
         assert_eq!(archive.root_hash(), original_hash);
-        assert_eq!(archive.owners.as_ref().unwrap().by_address.len(), 2);
-        assert_eq!(snapshot.owners.as_ref().unwrap().by_address.len(), 1);
+        assert_eq!(archive.owners.as_ref().unwrap().owner_count(), 2);
+        assert_eq!(snapshot.owners.as_ref().unwrap().owner_count(), 1);
         assert!(!Arc::ptr_eq(
             archive.owners.as_ref().unwrap(),
             snapshot.owners.as_ref().unwrap(),
@@ -3924,7 +4140,7 @@ mod tests {
 
     #[test]
     fn patch_root_owner_guard_is_one_thin_arc() {
-        assert_eq!(mem::size_of::<Option<Arc<ArchiveOwners>>>(), 8);
+        assert_eq!(mem::size_of::<Option<Arc<OwnerCover>>>(), 8);
         assert_eq!(mem::size_of::<PATCH<64, IdentitySchema, ()>>(), 16);
     }
 

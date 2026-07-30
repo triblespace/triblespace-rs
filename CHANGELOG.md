@@ -49,12 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Known archive batches now start at their irreducible PATCH shape.** Empty
   batches stay empty, singleton tribles remain root LocalLeaves, and batches of
   two or more same-owner rows directly create ordinary Branches over two
-  LocalLeaves before continuing online insertion. Each PATCH now retains its
-  archive allocations once in a persistent root owner set, independently of
-  trie shape: collapse, cross-owner union, intersection, difference, cloning,
+  LocalLeaves before continuing online insertion. Each PATCH now
+  conservatively retains its archive allocations in a persistent root owner
+  cover, independently of trie shape: collapse, cross-owner union,
+  intersection, difference, cloning,
   and consuming iteration can keep archive rows local without branch-boundary
   reification. This removes the owner field from every Branch (64-byte to
-  48-byte header) for one thin owner-set Arc on PATCH. `SimpleArchive` keeps
+  48-byte header) for one thin owner-cover Arc on PATCH. The cover is a
+  balanced binary-carry forest: sequential adoption is amortized constant
+  time, snapshots share complete subtrees, and no exact global owner index is
+  maintained. `SimpleArchive` keeps
   fused validation/construction in both its serial and parallel chunk paths,
   while intrinsic entities avoid the former heap seed and reuse both
   ArchiveEntry hashes across every index.
@@ -506,11 +510,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proposals and confirmations therefore implement the same relation even when
   another constraint supplies the candidate.
 - **The residual query branch builds as an ordinary workspace again.** The
-  core crate now declares its `im` dependency directly instead of inheriting a
-  workspace dependency table that does not exist, and the formula reducer's
-  accumulated-length, continuation, and shared-input borrow paths once again
-  type-check under the workspace toolchain. A test-only panic is also fully
-  qualified so newer compilers do not report an ambiguous macro import.
+  formula reducer's accumulated-length, continuation, and shared-input borrow
+  paths once again type-check under the workspace toolchain. A test-only panic
+  is also fully qualified so newer compilers do not report an ambiguous macro
+  import.
 - **Variable grouping no longer changes a row's semantic proposal action.**
   The residual engine retains each row's exact adaptive next variable instead
   of reassigning estimate-compatible groups. Since the selected proposer owns
