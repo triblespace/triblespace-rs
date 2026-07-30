@@ -1789,11 +1789,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // taken before dispatch, so each task writes into a distinct empty
             // slot; if a task panics, rayon joins the remaining work and normal
             // array drops reclaim every result that was already written. Keep
-            // the tiny scalar receipts in a separate sidecar so the head array
-            // remains compact.
+            // demanded scalar receipts in a separate sidecar so the head array
+            // remains compact. With no consumer, avoid even initializing that
+            // 4 KiB transient array.
             let this_arr_ptr = parallel_union::ScatterPtr(this_arr.as_mut_ptr());
-            let mut overlap_receipts = [0u128; 256];
-            let overlap_ptr = parallel_union::ScatterPtr(overlap_receipts.as_mut_ptr());
+            let mut overlap_receipts = need_overlap.then(|| [0u128; 256]);
+            let overlap_ptr = overlap_receipts
+                .as_mut()
+                .map(|receipts| parallel_union::ScatterPtr(receipts.as_mut_ptr()));
 
             rayon::scope(|s| {
                 // Drain `both` pairs serially in the parent; per
@@ -1825,7 +1828,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                             // non-aliasing with every other task.
                             unsafe {
                                 this_arr_ptr.write_at(i, Some(head));
-                                if need_overlap {
+                                if let Some(overlap_ptr) = overlap_ptr {
                                     overlap_ptr.write_at(i, child_overlap);
                                 }
                             }
@@ -1845,7 +1848,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                         );
                         unsafe {
                             this_arr_ptr.write_at(i, Some(head));
-                            if need_overlap {
+                            if let Some(overlap_ptr) = overlap_ptr {
                                 overlap_ptr.write_at(i, child_overlap);
                             }
                         }
@@ -1863,13 +1866,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 }
             }
 
-            let overlap = if need_overlap {
-                overlap_receipts
-                    .into_iter()
-                    .fold(0, |hash, child| hash ^ child)
-            } else {
-                0
-            };
+            let overlap = overlap_receipts
+                .map(|receipts| receipts.into_iter().fold(0, |hash, child| hash ^ child))
+                .unwrap_or(0);
             let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
             ed.finish_union_aggregates(known_hash);
             drop(ed);
