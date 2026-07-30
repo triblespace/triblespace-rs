@@ -924,7 +924,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             match (ed.owner.as_ref(), leaf_owner) {
                 (None, Some(lo)) => ed.owner = Some(lo.clone()),
                 (Some(bo), Some(lo)) if !std::sync::Arc::ptr_eq(bo, lo) => {
-                    leaf = Self::reify_local_leaf_unit(leaf);
+                    leaf = Self::reify_local_leaf_unit_with_hash(leaf, leaf_hash);
                     leaf_owner = None;
                 }
                 _ => {}
@@ -984,14 +984,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     /// Reifies a LocalLeaf head into a heap `Leaf<KEY_LEN, ()>` head.
     /// Leaf and Branch heads pass through unchanged. Specialized to
     /// V = () so no `V: Default` bound leaks into generic call sites.
-    fn reify_local_leaf_unit(head: Self) -> Self {
+    fn reify_local_leaf_unit_with_hash(head: Self, hash: u128) -> Self {
         match head.body_ref() {
             BodyRef::Leaf(_) | BodyRef::Branch(_) => head,
             BodyRef::LocalLeaf(bytes) => {
                 let key_byte = head.key();
                 let key_copy = *bytes;
                 drop(head);
-                let new_leaf = unsafe { Leaf::<KEY_LEN, ()>::new(&key_copy, ()) };
+                let new_leaf = unsafe { Leaf::<KEY_LEN, ()>::new_with_hash(&key_copy, (), hash) };
                 Head::new(key_byte, new_leaf)
             }
         }
@@ -999,8 +999,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
 
     /// Public re-export for the root-reification path used by
     /// `PATCH::insert_archive` when the PATCH is empty.
-    pub(crate) fn reify_local_leaf_unit_for_root(head: Self) -> Self {
-        Self::reify_local_leaf_unit(head)
+    pub(crate) fn reify_local_leaf_unit_for_root(head: Self, hash: u128) -> Self {
+        Self::reify_local_leaf_unit_with_hash(head, hash)
     }
 }
 
@@ -1036,6 +1036,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 );
 
                 let key_byte = head.key();
+                // Hash while the LocalLeaf still points directly at its
+                // archive bytes. The resulting receipt is stored in the heap
+                // Leaf after copying, avoiding a second hash and another
+                // completed process-key initialization check.
+                let hash = head.hash();
                 let key_copy = *bytes;
                 drop(head);
 
@@ -1044,7 +1049,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 // type. Therefore observing this tag proves `V = ()`. The
                 // layout assertions catch accidental erosion of that internal
                 // invariant near this cast.
-                let unit_leaf = unsafe { Leaf::<KEY_LEN, ()>::new(&key_copy, ()) };
+                let unit_leaf = unsafe { Leaf::<KEY_LEN, ()>::new_with_hash(&key_copy, (), hash) };
                 let leaf = unit_leaf.cast::<Leaf<KEY_LEN, V>>();
                 Head::new(key_byte, leaf)
             }
@@ -2935,7 +2940,7 @@ where
             // into a heap Leaf. The next insertion creates a Branch
             // which can adopt the owner cleanly.
             self.root
-                .replace(Head::reify_local_leaf_unit_for_root(leaf_head));
+                .replace(Head::reify_local_leaf_unit_for_root(leaf_head, leaf_hash));
         }
     }
 }
@@ -3544,6 +3549,57 @@ mod tests {
         assert_eq!(archive_set.ave.root_hash(), heap_set.ave.root_hash());
         assert_eq!(archive_set.vea.root_hash(), heap_set.vea.root_hash());
         assert_eq!(archive_set.vae.root_hash(), heap_set.vae.root_hash());
+    }
+
+    #[test]
+    fn singleton_archive_reification_preserves_entry_hash_after_owner_drop() {
+        const KEY_SIZE: usize = 8;
+        let mut key = [0u8; KEY_SIZE];
+        key[0] = 1;
+        key[KEY_SIZE - 1] = 2;
+
+        let (patch, expected_hash) = {
+            let storage = std::sync::Arc::new(AlignedArchiveKey(key));
+            let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(&storage.0), &owner) };
+            let expected_hash = entry.hash;
+            let mut patch = PATCH::<KEY_SIZE, IdentitySchema>::new();
+            patch.insert_archive(&entry);
+            (patch, expected_hash)
+        };
+
+        assert_eq!(patch.node_stats(), (0, 0, 1, 0));
+        assert_eq!(patch.root_hash(), Some(expected_hash));
+
+        // The archive owner is gone. Allocation churn makes an accidental
+        // dangling LocalLeaf deterministic enough for this focused lifetime
+        // regression while the expected row remains a standalone heap leaf.
+        let noise = vec![0x5au8; 128 * KEY_SIZE];
+        std::hint::black_box(&noise);
+        assert_eq!(patch.iter_ordered().copied().collect_vec(), vec![key]);
+    }
+
+    #[test]
+    fn detached_archive_reification_preserves_hash_and_lifetime() {
+        const KEY_SIZE: usize = 8;
+        let a = [0u8; KEY_SIZE];
+        let mut b = [0u8; KEY_SIZE];
+        b[0] = 1;
+
+        let archive = owned_archive_pair([a, b]);
+        let mut selector = PATCH::<KEY_SIZE, IdentitySchema>::new();
+        selector.insert(&Entry::new(&a));
+        let expected_hash = selector.root_hash();
+
+        let selected = archive.intersect(&selector);
+        drop(archive);
+        drop(selector);
+
+        assert_eq!(selected.node_stats(), (0, 0, 1, 0));
+        assert_eq!(selected.root_hash(), expected_hash);
+        let noise = vec![0xa5u8; 128 * KEY_SIZE];
+        std::hint::black_box(&noise);
+        assert_eq!(selected.iter_ordered().copied().collect_vec(), vec![a]);
     }
 
     #[test]

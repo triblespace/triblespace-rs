@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Archive LocalLeaf materialization reuses its established PATCH hash.**
+  Reification hashes immutable archive bytes before releasing their owner and
+  writes that receipt into the allocated heap Leaf, while singleton and
+  owner-mismatch archive insertion reuse the `ArchiveEntry` hash they already
+  carry.
 - **Known archive batches now start at their irreducible PATCH shape.** Empty
   batches stay empty, singleton tribles use one shared heap Leaf across all six
   indexes, and batches of two or more same-owner rows directly create ordinary
