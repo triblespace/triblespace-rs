@@ -20,10 +20,24 @@ use itertools::Itertools;
 /// deduplicated, and confirmations are ORed per candidate region.
 ///
 /// Before proposing or confirming, the union checks each variant's
-/// [`satisfied`](Constraint::satisfied) status and skips variants that are
-/// provably dead. This prevents a value confirmed by a dead variant from
-/// leaking into the result set — the fix for spurious results in
-/// multi-entity [`pattern_changes!`](crate::macros::pattern_changes) joins.
+/// [`satisfied`](Constraint::satisfied) status for the row and skips
+/// variants that are provably dead. This is not a leftover of the old
+/// hidden-variable desugar — folding literals into constant `Term`s did
+/// not retire it, because deadness does not come from the constants. It
+/// comes from a variant being a *conjunction*: `pattern!` lowers to an
+/// [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint) with
+/// one clause per triple, and a propose/confirm pass consults only the
+/// clauses that return `Some` from `estimate` for the variable at hand.
+/// So in an arm like `{ ?p @ nickname: "Ali", city: ?out }` the `nickname`
+/// clause takes no part in the `?out` pass at all. Once `?p` is bound to
+/// an entity whose nickname is not `"Ali"` that arm is logically dead, yet
+/// its `city` clause would still propose the entity's city — and since the
+/// union ORs the per-variant survivors, the arm then confirms its own
+/// proposal and the row escapes. The liveness gate is what notices: the
+/// pinned clause's own `satisfied` is `false`, the intersection conjoins
+/// that to kill the arm, and the union drops the arm's contribution for
+/// that row. Both call sites are independently load-bearing; the
+/// `union_dead_variant_leak` integration test pins one leak per site.
 pub struct UnionConstraint<C> {
     constraints: Vec<C>,
 }
