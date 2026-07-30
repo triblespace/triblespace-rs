@@ -99,51 +99,71 @@ factors keep memory usage steady without ART’s specialised node types.
 
 Heap leaves store a SipHash-2-4 fingerprint of their key. Archive-backed
 LocalLeaves deliberately do not: their canonical representation is just the
-archive bytes. A branch's receipt obeys the one-way invariant
+archive bytes. For the finite canonical key set `S` below a node, define
 
 ```
-branch.hash == 0  OR  branch.hash == XOR(hash(key) for key below branch)
+F(S) = XOR(hash(key) for key in S).
 ```
 
-Zero is conservative cache bottom. It may also be the genuine XOR of a
-nonempty subtree; that rare case is simply treated as unknown and recomputed on
-demand. A nonzero cached parent may cover dirty children when its exact receipt
-was derived algebraically, so cache knowledge is not required to be
-downward-closed.
+A branch receipt is either `Unknown` or exactly `Known(F(S))`. The publication
+bit is separate from the 128-bit value, so `Known(0)` is not confused with
+`Unknown`. An immutable reader that encounters a dirty branch folds its
+children once and atomically publishes the result for every shared snapshot.
+Composition never hashes a LocalLeaf merely to keep a result warm.
 
-A child mutation keeps an exact parent only when the parent, old contribution,
-and replacement contribution are already known (or insertion supplies an exact
-hash hint). Otherwise the parent becomes dirty. Structural mutation never
-calls `child.hash()` merely to maintain a cache. Reading a resident root hash is
-O(1); reading a dirty root folds the subtree in O(n) and does not memoize through
-a shared reference.
+PATCH maintains receipts at two complementary proof boundaries.
 
-Union repairs more receipts without hashing disjoint LocalLeaves. For
+First, a Branch partitions its set into disjoint children. If the parent and
+every changed contribution are already resident, child mutation updates the
+parent by XOR:
 
 ```
-H(S) = XOR(hash(key) for key in S),
+absent -> N:      parent xor F(N)
+O      -> absent: parent xor F(O)
+O      -> N:      parent xor F(O) xor F(N)
 ```
 
-the recursive union can materialize the intersection receipt and applies
+If an earlier prerequisite is unknown, PATCH does not even load the later
+child receipt: it cannot complete the proof. The parent becomes dirty instead.
+The old child receipt is captured before mutation because a uniquely owned
+child Branch may change in place.
+
+Second, a public set operation knows exact cardinalities and inclusion facts
+that a generic child editor cannot see. It can publish an exact root above
+dirty descendants in these cases:
 
 ```
-H(A union B) = H(A) xor H(B) xor H(A intersection B).
+insert/remove one key: unchanged size donates the old root;
+insert/remove one key: size delta one XORs the canonical key hash;
+union:                result size equals an operand -> donate it;
+union:                result size equals the checked operand-size sum -> XOR;
+intersection:         result size equals an operand -> donate it;
+difference A-B:       unchanged size -> donate A;
+difference A-B:       result size + |B| = |A| -> F(A) xor F(B).
 ```
 
-Disjoint byte partitions contribute zero; equal singleton keys contribute one
-leaf hash; child intersections combine by XOR. When both input roots are
-resident, this is enough to make the result root resident even if newly formed
-internal branches remain dirty. Receipt demand follows information already in
-use: an ancestor demand crosses dirty descendants, while a structural frame
-with two resident input roots creates a local demand to repair itself. Equal
-dirty LocalLeaves are not hashed when no resident cache will consume their
-overlap.
+These rules are complete given only operand/result cardinalities and optional
+operand receipts. Write `X=A-B`, `Y=B-A`, and `Z=A intersect B`; cardinality
+can eliminate an unknown fingerprint atom only by proving `X`, `Y`, or `Z`
+empty, and those are exactly the cases above.
 
-Set operations such as `difference` use whole-subtree equality shortcuts only
-when both candidate receipts are resident. Dirty trees descend structurally
-instead of forcing hashes merely to ask whether they match. SipHash collisions
-remain the same probabilistic equality assumption as before and are
-astronomically unlikely for these 128-bit values.
+An exact root does not imply exact descendants. A root consumer returns
+immediately and leaves hidden dirty children untouched; their local receipts
+remain useful information for later recursive set operations. This is why the
+Branch-local and operation-boundary laws coexist.
+
+Archive construction computes each row hash once in `ArchiveEntry` and shares
+that ephemeral value across all six TribleSet indexes. After the initial
+two-row branch, archive and heap insertion use the same generic structural
+path; the PATCH boundary combines the row hash with its old root. LocalLeaf
+therefore remains one tagged pointer, with no persistent hash descriptor.
+
+Set operations use probabilistic whole-subtree equality only when both
+receipts are already resident. Exact persistent-body pointer identity is the
+collision-independent shortcut. Dirty trees otherwise descend structurally.
+The fingerprint always hashes canonical/shared key bytes; an operation such as
+`remove` that accepts a tree-ordered query converts it back through its
+`KeySchema` before applying a key-hash delta.
 
 Consumers can reorder or segment keys through the [`KeySchema`](../../src/patch.rs)
 and [`KeySegmentation`](../../src/patch.rs) traits. Prefix queries reuse the
