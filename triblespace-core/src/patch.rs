@@ -5318,14 +5318,14 @@ mod tests {
         len: usize,
         geometry: CardinalityGeometry,
     ) {
-        let iterations = if len == 4096 { 8 } else { 32 };
+        const ITERATIONS: usize = 32;
         const SAMPLES: usize = 11;
         print_cardinality_timing(
             "patch",
             len,
             geometry.label(),
             "union",
-            iterations,
+            ITERATIONS,
             SAMPLES,
             || {
                 let mut union = fixture.left.clone();
@@ -5338,7 +5338,7 @@ mod tests {
             len,
             geometry.label(),
             "intersect",
-            iterations,
+            ITERATIONS,
             SAMPLES,
             || fixture.left.intersect(&fixture.right).len(),
         );
@@ -5347,7 +5347,7 @@ mod tests {
             len,
             geometry.label(),
             "difference",
-            iterations,
+            ITERATIONS,
             SAMPLES,
             || fixture.left.difference(&fixture.right).len(),
         );
