@@ -3775,18 +3775,18 @@ mod tests {
     #[test]
     fn owner_cover_overlapping_diamond_stays_two_owners_and_one_branch() {
         let owners = [test_archive_owner(1), test_archive_owner(2)];
-        let mut a = Some(OwnerCover::singleton(&owners[0]));
-        let mut b = Some(OwnerCover::singleton(&owners[1]));
-
-        a = OwnerCover::union(a, &b);
-        b = OwnerCover::union(b, &a);
+        let mut a = Some(owner_cover_in_order(&owners, &[0, 1]));
+        let mut b = Some(owner_cover_in_order(&owners, &[1, 0]));
         let a_root = a.as_ref().unwrap().root.clone();
         let b_root = b.as_ref().unwrap().root.clone();
+        assert!(!Arc::ptr_eq(&a_root, &b_root));
+        assert!(a_root.same_shape(&b_root));
 
         // A_{k+1} = A_k ∪ B_k and B_{k+1} = B_k ∪ A_k used to grow
-        // the non-exact provenance forest despite the logical set staying
-        // fixed. Exact Patricia membership turns every later join into a node
-        // identity: only the directional latest-owner field may change.
+        // the non-exact provenance forest even when independently materialized
+        // inputs already represented the same logical set. Exact Patricia
+        // membership turns every later join into a node identity: only the
+        // directional latest-owner field may change.
         for _ in 0..4096 {
             let next_a = OwnerCover::union(a.clone(), &b);
             let next_b = OwnerCover::union(b.clone(), &a);
