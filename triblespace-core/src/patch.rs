@@ -3918,19 +3918,44 @@ mod tests {
         let mut patch = PATCH::<2>::new();
         patch.insert(&Entry::new(&[0, 0]));
         patch.insert(&Entry::new(&[1, 0]));
-        let BodyMut::Branch(branch) = patch.root.as_mut().unwrap().body_mut() else {
-            panic!("fixture root must be a Branch");
+        let original = match patch.root.as_ref().unwrap().body_ref() {
+            BodyRef::Branch(branch) => branch.cached_hash(),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                panic!("fixture root must be a Branch")
+            }
         };
-        let original = branch.cached_hash();
         assert!(original.is_some());
 
-        branch.replace_cached_hash(None);
-        assert_eq!(branch.cached_hash(), None);
-        branch.replace_cached_hash(Some(0));
-        assert_eq!(branch.cached_hash(), Some(0));
+        {
+            let BodyMut::Branch(branch) = patch.root.as_mut().unwrap().body_mut() else {
+                panic!("fixture root must be a Branch");
+            };
+            branch.replace_cached_hash(None);
+            assert_eq!(branch.cached_hash(), None);
+            branch.replace_cached_hash(Some(0));
+            assert_eq!(branch.cached_hash(), Some(0));
+        }
 
-        branch.replace_cached_hash(original);
+        // COW must preserve both the publication bit and the exact-zero words.
+        // The synthetic value is restored before any semantic consumer runs.
+        let mut snapshot = patch.clone();
+        {
+            let BodyMut::Branch(branch) = patch.root.as_mut().unwrap().body_mut() else {
+                panic!("fixture root must be a Branch");
+            };
+            assert_eq!(branch.cached_hash(), Some(0));
+            branch.replace_cached_hash(original);
+        }
+        {
+            let BodyMut::Branch(branch) = snapshot.root.as_mut().unwrap().body_mut() else {
+                panic!("fixture root must be a Branch");
+            };
+            assert_eq!(branch.cached_hash(), Some(0));
+            branch.replace_cached_hash(original);
+        }
+
         deep_hash_audit(&patch);
+        deep_hash_audit(&snapshot);
     }
 
     #[test]
