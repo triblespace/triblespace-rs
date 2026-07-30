@@ -405,7 +405,17 @@ mod tests {
             0,
             "benchmark archive allocation must support LocalLeaves",
         );
-        Blob::new(Bytes::from(rows))
+        let blob = Blob::new(Bytes::from(rows));
+        let Ok(view): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
+            panic!("benchmark Blob must remain a well-formed SimpleArchive view");
+        };
+        assert_eq!(view.len(), len);
+        assert_eq!(
+            view.as_ptr() as usize & 0x0f,
+            0,
+            "benchmark Blob view must exercise the LocalLeaf decoder",
+        );
+        blob
     }
 
     fn blob_from_rows(rows: Vec<[u8; 64]>) -> Blob<SimpleArchive> {
@@ -809,9 +819,10 @@ mod tests {
     /// Fixture generation, canonical sorting, warmup/parity oracles, input
     /// cloning, and result destruction are outside every timed interval. The
     /// four-position `ABBA` order cycle gives each decoder the same number of
-    /// first and second positions. The 4,095/4,096 cases expose the production
-    /// threshold discontinuity; the larger cases exercise scale and distinct
-    /// trie geometries.
+    /// first and second positions. Output includes each decoder's unscaled
+    /// median absolute deviation and the median paired per-round speedup. The
+    /// 4,095/4,096 cases expose the production threshold discontinuity; the
+    /// larger cases exercise scale and distinct trie geometries.
     ///
     /// Run from a clean worktree with no competing compiler or benchmark:
     ///
@@ -844,6 +855,7 @@ mod tests {
         }
 
         fn median_seconds(samples: &mut [Duration]) -> f64 {
+            assert!(!samples.is_empty());
             samples.sort_unstable();
             let middle = samples.len() / 2;
             if samples.len() % 2 == 0 {
@@ -851,6 +863,25 @@ mod tests {
             } else {
                 samples[middle].as_secs_f64()
             }
+        }
+
+        fn median_f64(samples: &mut [f64]) -> f64 {
+            assert!(!samples.is_empty());
+            samples.sort_unstable_by(f64::total_cmp);
+            let middle = samples.len() / 2;
+            if samples.len() % 2 == 0 {
+                (samples[middle - 1] + samples[middle]) / 2.0
+            } else {
+                samples[middle]
+            }
+        }
+
+        fn median_absolute_deviation_ms(samples: &[Duration], median_seconds: f64) -> f64 {
+            let mut deviations = samples
+                .iter()
+                .map(|sample| (sample.as_secs_f64() - median_seconds).abs() * 1e3)
+                .collect::<Vec<_>>();
+            median_f64(&mut deviations)
         }
 
         fn sample_milliseconds(samples: &[Duration]) -> String {
@@ -908,9 +939,9 @@ mod tests {
             (BenchmarkGeometry::EntityLike, 4_095usize, 8usize),
             (BenchmarkGeometry::EntityLike, 4_096, 8),
             (BenchmarkGeometry::EntityLike, 100_000, 8),
-            (BenchmarkGeometry::EntityLike, 1_000_000, 4),
-            (BenchmarkGeometry::HighEntropy, 1_000_000, 4),
-            (BenchmarkGeometry::LongPrefixLowCardinality, 1_000_000, 4),
+            (BenchmarkGeometry::EntityLike, 1_000_000, 8),
+            (BenchmarkGeometry::HighEntropy, 1_000_000, 8),
+            (BenchmarkGeometry::LongPrefixLowCardinality, 1_000_000, 8),
         ];
 
         for (geometry, len, sample_count) in cases {
@@ -928,6 +959,7 @@ mod tests {
 
             let mut legacy_samples = Vec::with_capacity(sample_count);
             let mut bottom_up_samples = Vec::with_capacity(sample_count);
+            let mut paired_speedups = Vec::with_capacity(sample_count);
             for round in 0..sample_count {
                 let order = ORDER_CYCLE[round % ORDER_CYCLE.len()];
                 let (legacy, bottom_up) = match order {
@@ -942,6 +974,7 @@ mod tests {
                         (legacy, bottom_up)
                     }
                 };
+                paired_speedups.push(legacy.as_secs_f64() / bottom_up.as_secs_f64());
                 legacy_samples.push(legacy);
                 bottom_up_samples.push(bottom_up);
             }
@@ -950,13 +983,17 @@ mod tests {
             let bottom_up_raw = sample_milliseconds(&bottom_up_samples);
             let legacy_seconds = median_seconds(&mut legacy_samples);
             let bottom_up_seconds = median_seconds(&mut bottom_up_samples);
+            let legacy_mad_ms = median_absolute_deviation_ms(&legacy_samples, legacy_seconds);
+            let bottom_up_mad_ms =
+                median_absolute_deviation_ms(&bottom_up_samples, bottom_up_seconds);
+            let paired_speedup_median = median_f64(&mut paired_speedups);
             let candidate_regime = if len < PARALLEL_UNARCHIVE_THRESHOLD {
                 "serial"
             } else {
                 "parallel_bottom_up"
             };
             println!(
-                "bottom_up_clean_case geometry={} len={len} samples={sample_count} order_cycle=ABBA candidate_regime={candidate_regime} legacy_median_ms={:.3} bottom_up_median_ms={:.3} speedup={:.3}x legacy_mtribles_per_s={:.3} bottom_up_mtribles_per_s={:.3} legacy_samples_ms=[{legacy_raw}] bottom_up_samples_ms=[{bottom_up_raw}]",
+                "bottom_up_clean_case geometry={} len={len} samples={sample_count} order_cycle=ABBA candidate_regime={candidate_regime} legacy_median_ms={:.3} legacy_mad_ms={legacy_mad_ms:.3} bottom_up_median_ms={:.3} bottom_up_mad_ms={bottom_up_mad_ms:.3} speedup={:.3}x paired_speedup_median={paired_speedup_median:.3}x legacy_mtribles_per_s={:.3} bottom_up_mtribles_per_s={:.3} legacy_samples_ms=[{legacy_raw}] bottom_up_samples_ms=[{bottom_up_raw}]",
                 geometry.name(),
                 legacy_seconds * 1e3,
                 bottom_up_seconds * 1e3,
