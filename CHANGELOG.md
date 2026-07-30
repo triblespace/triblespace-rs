@@ -65,16 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intersection, difference, cloning,
   and consuming iteration can keep archive rows local without branch-boundary
   reification. This removes the owner field from every Branch (64-byte to
-  48-byte header) for one thin owner-cover Arc on PATCH. The cover is a
-  balanced binary-carry forest: unshared sequential adoption is amortized
-  constant time, snapshots share complete subtrees, and no exact global owner
-  index is maintained. The six indexes in a `TribleSet` share one cover Arc:
-  archive adoption repairs divergent public indexes once, and set union joins
-  all twelve input covers once before the six PATCH unions move any heads.
-  `SimpleArchive` keeps
-  fused validation/construction in both its serial and parallel chunk paths,
-  while intrinsic entities avoid the former heap seed and reuse both
-  ArchiveEntry hashes across every index.
+  48-byte header) for one thin owner-cover Arc on PATCH. The cover is an exact
+  canonical binary Patricia trie keyed by live owner allocation addresses.
+  Its height is bounded by pointer width, insertion
+  order does not affect its shape, and union shares unchanged paths while
+  repeated and overlapping-diamond joins remain identities. A separate latest
+  owner fast path keeps contiguous rows from one archive at O(1). The six
+  indexes in a `TribleSet` share one cover Arc: archive adoption repairs
+  divergent public indexes once, and set union joins all twelve input covers
+  once before the six PATCH unions move any heads. `SimpleArchive` keeps fused
+  validation/construction in both its serial and parallel chunk paths, while
+  intrinsic entities avoid the former heap seed and reuse both ArchiveEntry
+  hashes across every index.
 
 - **Experimental breaking intrinsic-entity epoch uses canonical full rows.**
   Content-derived `entity!` records now canonicalize aligned
