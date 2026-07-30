@@ -892,6 +892,14 @@ fn tribleset_union_cases() -> Vec<TribleSetBinaryCase> {
     let exact_superset = archive_tribleset_variants_in(0, 128, 0, 64);
     let exact_subset = archive_tribleset_variants_in(0, 128, 0, 32);
 
+    // The same target with one independently archived duplicate isolates the
+    // cache-retention value from bulk subset traversal. Its exact root covers
+    // dirty direct children; losing that root over this tiny semantic no-op
+    // makes the next fingerprint consumer cross the whole dirty frontier.
+    let duplicate_rows = vec![superset_rows[0]];
+    let exact_duplicate_target = archive_tribleset_variants_in(0, 128, 0, 64);
+    let exact_duplicate = archive_tribleset(&duplicate_rows);
+
     // The balanced templates have exact roots over dirty direct children.
     // Build a fresh second pair before demotion so the two benchmark cases
     // have the same rows and topology without cross-case refcount coupling;
@@ -911,6 +919,16 @@ fn tribleset_union_cases() -> Vec<TribleSetBinaryCase> {
     );
 
     vec![
+        checked_tribleset_case(
+            "exact_duplicate",
+            "union",
+            exact_duplicate_target,
+            &superset_rows,
+            exact_duplicate,
+            &duplicate_rows,
+            &superset_rows,
+            union_triblesets,
+        ),
         checked_tribleset_case(
             "exact_superset",
             "union",
