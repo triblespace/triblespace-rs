@@ -45,13 +45,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::id::Id;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
-use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
@@ -333,7 +333,7 @@ where
                 } => {
                     if let Some(remote_id) = Id::new(branch) {
                         let mut store = self.store.lock().expect("store mutex");
-                        match read_remote_name(&mut *store, &head) {
+                        match read_remote_name(&mut *store, &head, remote_id) {
                             Some(name) => {
                                 let r = crate::tracking::ensure_tracking_pin(
                                     &mut *store,
@@ -390,8 +390,8 @@ where
                     // subject + latest_sig and mark the entry delivered
                     // so the daemon's next tick skips it from the
                     // re-dispatch set.
-                    use triblespace_core::inline::Inline;
                     use triblespace_core::inline::encodings::hash::Handle;
+                    use triblespace_core::inline::Inline;
                     let subject_key = match ed25519_dalek::VerifyingKey::from_bytes(&subject) {
                         Ok(k) => k,
                         Err(_) => continue,
@@ -494,8 +494,8 @@ where
     /// consumes; the partial-cap blob is recoverable from the entity's
     /// `request_partial_cap` handle.
     fn absorb_cap_request(&mut self, requester: PublisherKey, partial_cap_bytes: anybytes::Bytes) {
-        use triblespace_core::blob::Blob;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::blob::Blob;
         use triblespace_core::inline::TryToInline;
 
         // Reconstitute the requester pubkey from bytes. If the bytes
@@ -640,8 +640,8 @@ where
     ///
     /// Returns the count of entries dispatched this tick.
     fn redispatch_undelivered(&mut self) -> usize {
-        use triblespace_core::blob::Blob;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::blob::Blob;
         use triblespace_core::repo::BlobStoreGet;
 
         let mut store = self.store.lock().expect("store mutex");
@@ -1148,7 +1148,11 @@ where
 /// Read the branch name from a branch metadata blob. Tries `metadata::name`
 /// first (normal branches) and falls back to `remote_name` (tracking
 /// branches mirrored from a remote peer).
-fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<String> {
+fn read_remote_name<S: BlobStore>(
+    store: &mut S,
+    head_hash: &RawHash,
+    remote_id: Id,
+) -> Option<String> {
     use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::repo::BlobStoreGet;
@@ -1156,19 +1160,26 @@ fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<
     let reader = store.reader().ok()?;
     let meta_handle = Inline::<Handle<SimpleArchive>>::new(*head_hash);
     let meta: triblespace_core::trible::TribleSet = reader.get(meta_handle).ok()?;
+    let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, remote_id).ok()?;
 
-    let name_handle: Inline<Handle<LongString>> = find!(
+    let mut names = find!(
         h: Inline<Handle<LongString>>,
-        pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
-    )
-    .next()
-    .or_else(|| {
-        find!(
+        pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?h }])
+    );
+    let name_handle = match (names.next(), names.next()) {
+        (Some(name), None) => Some(name),
+        (None, None) => {
+            let mut remote_names = find!(
             h: Inline<Handle<LongString>>,
-            pattern!(&meta, [{ _?e @ crate::tracking::remote_name: ?h }])
-        )
-        .next()
-    })?;
+                pattern!(&meta, [{ branch_entity @ crate::tracking::remote_name: ?h }])
+            );
+            match (remote_names.next(), remote_names.next()) {
+                (Some(name), None) => Some(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }?;
 
     let name_view: anybytes::View<str> = reader.get(name_handle).ok()?;
     Some(name_view.as_ref().to_string())

@@ -388,6 +388,7 @@ proptest! {
 // outside core — a migration record, a downstream faculty's annotation.
 mod branch_head_carry {
     use super::*;
+    use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::repo::branch;
 
     mod ann {
@@ -402,11 +403,26 @@ mod branch_head_carry {
         let storage = MemoryRepo::default();
         let mut repo =
             Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-        let branch_id = *repo.create_branch("annotated", None).expect("create branch");
+        let branch_id = *repo
+            .create_branch("annotated", None)
+            .expect("create branch");
 
-        // Attach an annotation core knows nothing about, beside the head.
+        // Attach an annotation core knows nothing about, beside the head. It
+        // deliberately carries its own metadata::name AND a repo::branch
+        // relation for a different id: neither may be mistaken for fields of
+        // the pin identified by `branch_id`, and neither may be discarded.
         let marker = rngid();
-        let annotation: TribleSet = entity! { &marker @ ann::note: "kilroy" }.into();
+        let unrelated_branch_id = *genid();
+        let annotation_name: Inline<Handle<LongString>> = repo
+            .storage_mut()
+            .put::<LongString, _>("annotation".to_owned().to_blob())
+            .expect("store annotation name");
+        let annotation: TribleSet = entity! { &marker @
+            ann::note: "kilroy",
+            triblespace_core::metadata::name: annotation_name,
+            triblespace_core::repo::branch: unrelated_branch_id,
+        }
+        .into();
         let base = repo
             .storage_mut()
             .head(branch_id)
@@ -426,6 +442,12 @@ mod branch_head_carry {
         repo.storage_mut()
             .update(branch_id, Some(base), Some(handle))
             .expect("update head");
+
+        assert_eq!(
+            repo.lookup_branch("annotated").expect("lookup"),
+            Some(branch_id),
+            "an annotation entity's name must not make the branch ambiguous"
+        );
 
         // An ordinary commit — nothing to do with the annotation.
         let mut ws = repo.pull(branch_id).expect("pull");
@@ -453,6 +475,15 @@ mod branch_head_carry {
             1,
             "an annotation beside the branch head must survive a push that rebuilds it"
         );
+        let annotation_names: Vec<Inline<Handle<LongString>>> = find!(
+            name: Inline<Handle<LongString>>,
+            pattern!(&after, [{ marker @ triblespace_core::metadata::name: ?name }])
+        )
+        .collect();
+        assert_eq!(annotation_names, vec![annotation_name]);
+        assert!(exists!(pattern!(&after, [{
+            marker @ triblespace_core::repo::branch: unrelated_branch_id
+        }])));
 
         // And the head genuinely advanced — otherwise this proves nothing.
         assert_ne!(after_handle, base, "the push must have rebuilt the head");

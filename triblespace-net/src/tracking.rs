@@ -17,10 +17,10 @@
 
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::id::{Id, genid};
-use triblespace_core::inline::Inline;
+use triblespace_core::id::{genid, Id};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
+use triblespace_core::inline::Inline;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::prelude::attributes;
 use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
@@ -61,9 +61,12 @@ where
     let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else {
         return false;
     };
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, branch_id) else {
+        return false;
+    };
     find!(
         v: Id,
-        pattern!(&meta, [{ _?e @ tracking_remote_pin: ?v }])
+        pattern!(&meta, [{ branch_entity @ tracking_remote_pin: ?v }])
     )
     .next()
     .is_some()
@@ -86,9 +89,12 @@ where
     let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else {
         return false;
     };
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, branch_id) else {
+        return false;
+    };
     find!(
         v: Id,
-        pattern!(&meta, [{ _?e @ weak_tracking: ?v }])
+        pattern!(&meta, [{ branch_entity @ weak_tracking: ?v }])
     )
     .next()
     .is_some()
@@ -135,19 +141,23 @@ where
             continue;
         };
 
-        let Some(remote_branch_id) = find!(
-            v: Id,
-            pattern!(&meta, [{ _?e @ tracking_remote_pin: ?v }])
-        )
-        .next() else {
+        let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, bid) else {
             continue;
         };
 
-        let Some(name_handle) = find!(
+        let mut remote_ids = find!(
+            v: Id,
+            pattern!(&meta, [{ branch_entity @ tracking_remote_pin: ?v }])
+        );
+        let (Some(remote_branch_id), None) = (remote_ids.next(), remote_ids.next()) else {
+            continue;
+        };
+
+        let mut name_handles = find!(
             h: Inline<Handle<LongString>>,
-            pattern!(&meta, [{ _?e @ remote_name: ?h }])
-        )
-        .next() else {
+            pattern!(&meta, [{ branch_entity @ remote_name: ?h }])
+        );
+        let (Some(name_handle), None) = (name_handles.next(), name_handles.next()) else {
             continue;
         };
 
@@ -188,15 +198,19 @@ where
 fn resolve_commit_in_branch_meta<S: BlobStore>(
     store: &mut S,
     branch_meta_hash: &RawHash,
+    remote_branch_id: Id,
 ) -> Option<Inline<Handle<SimpleArchive>>> {
     let reader = store.reader().ok()?;
     let meta_handle = Inline::<Handle<SimpleArchive>>::new(*branch_meta_hash);
     let meta: TribleSet = reader.get(meta_handle).ok()?;
-    find!(
+    let branch_entity =
+        triblespace_core::repo::branch::branch_entity(&meta, remote_branch_id).ok()?;
+    let mut heads = find!(
         h: Inline<Handle<SimpleArchive>>,
-        pattern!(&meta, [{ _?e @ triblespace_core::repo::head: ?h }])
-    )
-    .next()
+        pattern!(&meta, [{ branch_entity @ triblespace_core::repo::head: ?h }])
+    );
+    let head = heads.next()?;
+    heads.next().is_none().then_some(head)
 }
 
 /// Read the `metadata::updated_at` attribute from a branch metadata blob,
@@ -205,15 +219,19 @@ fn resolve_commit_in_branch_meta<S: BlobStore>(
 fn read_updated_at<S: BlobStore>(
     store: &mut S,
     branch_meta_hash: &RawHash,
+    remote_branch_id: Id,
 ) -> Option<Inline<NsTAIInterval>> {
     let reader = store.reader().ok()?;
     let meta_handle = Inline::<Handle<SimpleArchive>>::new(*branch_meta_hash);
     let meta: TribleSet = reader.get(meta_handle).ok()?;
-    find!(
+    let branch_entity =
+        triblespace_core::repo::branch::branch_entity(&meta, remote_branch_id).ok()?;
+    let mut timestamps = find!(
         ts: Inline<NsTAIInterval>,
-        pattern!(&meta, [{ _?e @ triblespace_core::metadata::updated_at: ?ts }])
-    )
-    .next()
+        pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::updated_at: ?ts }])
+    );
+    let timestamp = timestamps.next()?;
+    timestamps.next().is_none().then_some(timestamp)
 }
 
 /// Create a new tracking pin. Returns the local pin id.
@@ -234,10 +252,10 @@ where
     S: BlobStore + BlobStorePut + PinStore,
 {
     // Resolve the gossiped branch metadata hash to the actual commit.
-    let commit_handle = resolve_commit_in_branch_meta(store, remote_head_hash)?;
+    let commit_handle = resolve_commit_in_branch_meta(store, remote_head_hash, remote_branch_id)?;
     // Mirror the remote's publication timestamp so future updates can
     // reject stale gossips without needing an ancestry walk.
-    let remote_updated_at = read_updated_at(store, remote_head_hash);
+    let remote_updated_at = read_updated_at(store, remote_head_hash, remote_branch_id);
 
     // tracking_id stays random (it's the pin's identity in the local
     // pile and must not collide across tracking setups). The metadata
@@ -293,9 +311,9 @@ where
     // downstream by `merge_commit`'s ancestry check (no-op if remote
     // is already in local's ancestry; fast-forward if local is in
     // remote's ancestry; merge commit otherwise).
-    let new_ts = read_updated_at(store, new_head_hash);
+    let new_ts = read_updated_at(store, new_head_hash, remote_branch_id);
 
-    let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash)?;
+    let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash, remote_branch_id)?;
 
     let name_string = remote_name_str.to_string();
     let name_handle: Inline<Handle<LongString>> =
@@ -426,12 +444,56 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::Blob;
     use triblespace_core::id::genid;
+    use triblespace_core::inline::TryToInline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
     fn test_repo() -> Repository<MemoryRepo> {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let store = MemoryRepo::default();
         Repository::new(store, signing_key, TribleSet::new()).unwrap()
+    }
+
+    #[test]
+    fn remote_head_and_freshness_ignore_carried_annotation_entities() {
+        let mut store = MemoryRepo::default();
+        let remote_branch_id = *genid();
+        let actual_commit: Inline<Handle<SimpleArchive>> = store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let mut decoy_set = TribleSet::new();
+        decoy_set += entity! { triblespace_core::metadata::tag: remote_branch_id };
+        let decoy_commit: Inline<Handle<SimpleArchive>> =
+            store.put::<SimpleArchive, _>(decoy_set.to_blob()).unwrap();
+        let actual_ts: Inline<NsTAIInterval> = {
+            let at = hifitime::Epoch::from_tai_seconds(1.0);
+            (at, at).try_to_inline().unwrap()
+        };
+        let decoy_ts: Inline<NsTAIInterval> = {
+            let at = hifitime::Epoch::from_tai_seconds(2.0);
+            (at, at).try_to_inline().unwrap()
+        };
+
+        let mut meta: TribleSet = entity! {
+            triblespace_core::repo::branch: remote_branch_id,
+            triblespace_core::repo::head: actual_commit,
+            triblespace_core::metadata::updated_at: actual_ts,
+        }
+        .into();
+        let annotation = genid();
+        meta += entity! { &annotation @
+            triblespace_core::repo::head: decoy_commit,
+            triblespace_core::metadata::updated_at: decoy_ts,
+        };
+        let meta_handle: Inline<Handle<SimpleArchive>> = store.put(meta).unwrap();
+
+        assert_eq!(
+            resolve_commit_in_branch_meta(&mut store, &meta_handle.raw, remote_branch_id),
+            Some(actual_commit)
+        );
+        assert_eq!(
+            read_updated_at(&mut store, &meta_handle.raw, remote_branch_id),
+            Some(actual_ts)
+        );
     }
 
     #[test]
@@ -556,8 +618,8 @@ mod tests {
 
         // Build a fake remote branch metadata blob first so we have something
         // to point to. Use branch_unsigned to avoid signing-key plumbing.
-        use triblespace_core::blob::IntoBlob;
         use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::blob::IntoBlob;
         use triblespace_core::repo::branch::branch_unsigned;
         let name_blob = "remote-branch".to_string().to_blob();
         let name_handle: Inline<Handle<LongString>> = store.put(name_blob).unwrap();

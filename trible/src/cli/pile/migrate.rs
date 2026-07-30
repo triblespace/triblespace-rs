@@ -99,10 +99,10 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
                     }
                 };
 
-            if !has_unique_name(&meta) {
+            if !has_unique_name(&meta, bid) {
                 // The legacy name is what the migration reads, so a branch is
                 // only *migratable* when it has one.
-                if legacy_branch_name(&meta)
+                if legacy_branch_name(&meta, bid)
                     .context("read legacy branch name")?
                     .is_some()
                 {
@@ -117,7 +117,9 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
                 }
             }
 
-            if let Some(name) = load_branch_name(&reader, &meta).context("decode branch name")? {
+            if let Some(name) =
+                load_branch_name(&reader, &meta, bid).context("decode branch name")?
+            {
                 *duplicate_names.entry(name).or_insert(0) += 1;
             }
         }
@@ -204,20 +206,22 @@ fn migrate_branch_metadata_name(
                     Err(_) => continue,
                 };
 
-            let Some(meta_entity) = meta
-                .iter()
-                .find(|t| t.a() == &triblespace_core::repo::branch.id())
-                .map(|t| *t.e())
-            else {
+            let Ok(meta_entity) = triblespace_core::repo::branch::branch_entity(&meta, bid) else {
                 // Not a branch metadata blob we recognize; skip.
                 continue;
             };
 
-            let has_head = meta
-                .iter()
-                .any(|t| t.a() == &triblespace_core::repo::head.id());
+            let head_count = find!(
+                head: BranchMetaHandle,
+                pattern!(&meta, [{ meta_entity @ triblespace_core::repo::head: ?head }])
+            )
+            .count();
+            // Name migration is orthogonal to head repair. Preserve every
+            // scoped head fact byte-for-byte; `has_head` is only a preference
+            // when choosing which duplicate name to keep.
+            let has_head = head_count >= 1;
 
-            let name = load_branch_name(&reader, &meta).context("decode branch name")?;
+            let name = load_branch_name(&reader, &meta, bid).context("decode branch name")?;
 
             branches.push(BranchInfo {
                 branch_id: bid,
@@ -231,12 +235,13 @@ fn migrate_branch_metadata_name(
 
         let mut migrated = 0usize;
         for info in branches.iter_mut() {
-            let needs_name = !has_unique_name(&info.meta);
+            let needs_name = !has_unique_name(&info.meta, info.branch_id);
             if !needs_name {
                 continue;
             }
 
-            let legacy_name = legacy_branch_name(&info.meta).context("read legacy branch name")?;
+            let legacy_name = legacy_branch_name(&info.meta, info.branch_id)
+                .context("read legacy branch name")?;
             let Some(legacy_name) = legacy_name else {
                 continue;
             };
@@ -303,22 +308,26 @@ fn migrate_branch_metadata_name(
     Ok(())
 }
 
-fn has_unique_name(meta: &TribleSet) -> bool {
+fn has_unique_name(meta: &TribleSet, branch_id: Id) -> bool {
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, branch_id) else {
+        return false;
+    };
     let mut names = find!(
-        (handle: NameHandle),
-        pattern!(meta, [{ triblespace_core::metadata::name: ?handle }])
-    )
-    .into_iter();
+        handle: NameHandle,
+        pattern!(meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
+    );
     names.next().is_some() && names.next().is_none()
 }
 
-fn legacy_branch_name(meta: &TribleSet) -> Result<Option<String>> {
+fn legacy_branch_name(meta: &TribleSet, branch_id: Id) -> Result<Option<String>> {
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, branch_id) else {
+        return Ok(None);
+    };
     let mut names = find!(
-        (name: String),
-        pattern!(meta, [{ legacy_branch_metadata::legacy_name: ?name }])
-    )
-    .into_iter();
-    let Some((name,)) = names.next() else {
+        name: String,
+        pattern!(meta, [{ branch_entity @ legacy_branch_metadata::legacy_name: ?name }])
+    );
+    let Some(name) = names.next() else {
         return Ok(None);
     };
     if names.next().is_some() {
@@ -327,15 +336,21 @@ fn legacy_branch_name(meta: &TribleSet) -> Result<Option<String>> {
     Ok(Some(name))
 }
 
-fn load_branch_name(reader: &impl BlobStoreGet, meta: &TribleSet) -> Result<Option<String>> {
+fn load_branch_name(
+    reader: &impl BlobStoreGet,
+    meta: &TribleSet,
+    branch_id: Id,
+) -> Result<Option<String>> {
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, branch_id) else {
+        return Ok(None);
+    };
     let mut names = find!(
-        (handle: NameHandle),
-        pattern!(meta, [{ triblespace_core::metadata::name: ?handle }])
-    )
-    .into_iter();
+        handle: NameHandle,
+        pattern!(meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
+    );
 
-    let Some((handle,)) = names.next() else {
-        return legacy_branch_name(meta);
+    let Some(handle) = names.next() else {
+        return legacy_branch_name(meta, branch_id);
     };
     if names.next().is_some() {
         return Ok(None);
@@ -352,7 +367,7 @@ fn rewrite_branch_meta(meta: &TribleSet, meta_entity: Id, name_handle: NameHandl
     let name_attr = triblespace_core::metadata::name.id();
     let legacy_attr = legacy_branch_metadata::legacy_name.id();
     for t in meta.iter() {
-        if t.a() == &name_attr || t.a() == &legacy_attr {
+        if t.e() == &meta_entity && (t.a() == &name_attr || t.a() == &legacy_attr) {
             continue;
         }
         out.insert(t);

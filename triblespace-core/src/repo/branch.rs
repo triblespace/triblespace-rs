@@ -20,6 +20,48 @@ use crate::metadata;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::trible::TribleSet;
 
+/// Why a branch metadata subject could not be identified uniquely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchEntityError {
+    /// No entity in the metadata identifies itself as the expected branch.
+    Missing,
+    /// More than one entity identifies itself as the expected branch.
+    Ambiguous,
+}
+
+/// Resolve the unique entity describing `branch_id` in one metadata blob.
+///
+/// Branch metadata may carry arbitrary facts on unrelated annotation entities.
+/// Consumers must first establish this subject and then read branch fields from
+/// that subject only; scanning the whole [`TribleSet`] lets an annotation's
+/// `metadata::name`, `repo::head`, or timestamp impersonate branch state.
+pub fn branch_entity(meta: &TribleSet, branch_id: Id) -> Result<Id, BranchEntityError> {
+    let mut entities = find!(
+        entity: Id,
+        pattern!(meta, [{ ?entity @ super::branch: branch_id }])
+    );
+    let Some(entity) = entities.next() else {
+        return Err(BranchEntityError::Missing);
+    };
+    if entities.next().is_some() {
+        return Err(BranchEntityError::Ambiguous);
+    }
+    Ok(entity)
+}
+
+/// Return every fact except the branch metadata entity being superseded.
+///
+/// Unrelated entities are carried byte-for-byte even when they themselves use
+/// `repo::branch` to describe another relationship.
+pub fn carried_facts(meta: &TribleSet, branch_id: Id) -> Result<TribleSet, BranchEntityError> {
+    let replaced = branch_entity(meta, branch_id)?;
+    let mut carried = TribleSet::new();
+    for fact in meta.iter().filter(|fact| fact.e() != &replaced) {
+        carried.insert(fact);
+    }
+    Ok(carried)
+}
+
 /// Current TAI time as a collapsed `NsTAIInterval`. Used as
 /// `metadata::updated_at` on every branch metadata blob so that peers can
 /// order concurrent HEAD gossips without walking ancestor chains.
@@ -100,6 +142,8 @@ pub fn branch_unsigned(
 
 /// Error returned when branch signature verification fails.
 pub enum ValidationError {
+    /// The metadata has no unique entity for the expected branch id.
+    InvalidBranchMetadata,
     /// The metadata contains multiple signature entities for the same commit.
     AmbiguousSignature,
     /// No signature information was found in the metadata.
@@ -122,15 +166,18 @@ impl From<SignatureError> for ValidationError {
 /// signature or contains multiple signature entities the appropriate
 /// `ValidationError` variant is returned.
 pub fn verify(
+    branch_id: Id,
     commit_head: Blob<SimpleArchive>,
     metadata: TribleSet,
 ) -> Result<(), ValidationError> {
     let handle = commit_head.get_handle();
+    let branch_entity =
+        branch_entity(&metadata, branch_id).map_err(|_| ValidationError::InvalidBranchMetadata)?;
     let (pubkey, r, s) = match find!(
     (pubkey: Inline<_>, r, s),
     pattern!(&metadata, [
     {
-        super::head: handle,
+        branch_entity @ super::head: handle,
         super::signed_by: ?pubkey,
         super::signature_r: ?r,
         super::signature_s: ?s,

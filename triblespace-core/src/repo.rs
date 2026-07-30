@@ -272,7 +272,7 @@ fn rebuild_branch_meta(
     base_meta: &TribleSet,
 ) -> TribleSet {
     let mut meta = branch_metadata(signing_key, branch_id, name, commit_head);
-    meta += carried_head_facts(base_meta);
+    meta += carried_head_facts(base_meta, branch_id);
     meta
 }
 
@@ -281,17 +281,9 @@ fn rebuild_branch_meta(
 /// The complement of [`index_home::manifest_tribles`]: rather than naming
 /// the kinds worth keeping, this names the one kind being replaced and keeps
 /// the rest.
-fn carried_head_facts(base_meta: &TribleSet) -> TribleSet {
-    let replaced: std::collections::HashSet<Id> = find!(
-        e: Id,
-        pattern!(base_meta, [{ ?e @ branch: _?b }])
-    )
-    .collect();
-    let mut out = TribleSet::new();
-    for fact in base_meta.iter().filter(|fact| !replaced.contains(fact.e())) {
-        out.insert(fact);
-    }
-    out
+fn carried_head_facts(base_meta: &TribleSet, branch_id: Id) -> TribleSet {
+    branch::carried_facts(base_meta, branch_id)
+        .expect("branch metadata was validated before rebuild")
 }
 
 /// The `ListBlobs` trait is used to list all blobs in a repository.
@@ -1294,6 +1286,23 @@ where
             .collect::<Result<Vec<_>, _>>()
             .map_err(LookupError::StorageBranches)?;
 
+        // Read every live pin head before taking the blob snapshot. Readers
+        // are point-in-time views: taking one first and then observing a pin
+        // that advanced concurrently can produce a handle absent from that
+        // older reader. Blob storage is append-only, so one reader created
+        // after this head census can resolve every collected handle while
+        // retaining the one-reader scan.
+        let mut branch_heads = Vec::with_capacity(branch_ids.len());
+        for branch_id in branch_ids {
+            if let Some(meta_handle) = self
+                .storage
+                .head(branch_id)
+                .map_err(LookupError::BranchHead)?
+            {
+                branch_heads.push((branch_id, meta_handle));
+            }
+        }
+
         let mut matches = Vec::new();
 
         // One reader for the whole scan. This used to be constructed inside
@@ -1311,25 +1320,24 @@ where
         // why this needs no on-disk name field to be fast.
         let target: Inline<Handle<LongString>> = name.to_owned().to_blob().get_handle();
 
-        for branch_id in branch_ids {
-            let Some(meta_handle) = self
-                .storage
-                .head(branch_id)
-                .map_err(LookupError::BranchHead)?
-            else {
+        for (branch_id, meta_handle) in branch_heads {
+            let meta_set: TribleSet = reader.get(meta_handle).map_err(LookupError::StorageGet)?;
+
+            let Ok(branch_entity) = branch::branch_entity(&meta_set, branch_id) else {
                 continue;
             };
-
-            let meta_set: TribleSet = reader.get(meta_handle).map_err(LookupError::StorageGet)?;
 
             // `exactly_one` skips a branch carrying two `metadata::name`
             // tribles: its name is not determinable, and guessing one would
             // let an ambiguous branch answer to a name it may not have.
-            let Ok((name_handle,)) = find!(
-                (n: Inline<Handle<LongString>>),
-                pattern!(&meta_set, [{ crate::metadata::name: ?n }])
+            let Ok(name_handle) = find!(
+                n: Inline<Handle<LongString>>,
+                pattern!(&meta_set, [{ branch_entity @ crate::metadata::name: ?n }])
             )
             .exactly_one() else {
+                // Pins without names are tracking/policy/anonymous pins, and
+                // a malformed branch entity with multiple names must not
+                // answer to either one.
                 continue;
             };
 
@@ -1413,9 +1421,12 @@ where
             Err(e) => return Err(PullError::BlobStorage(e)),
         };
 
+        let branch_entity = branch::branch_entity(&base_branch_meta, branch_id)
+            .map_err(|_| PullError::BadBranchMetadata())?;
+
         let head_ = match find!(
             (head_: Inline<_>),
-            pattern!(&base_branch_meta, [{ head: ?head_ }])
+            pattern!(&base_branch_meta, [{ branch_entity @ head: ?head_ }])
         )
         .at_most_one()
         {
@@ -1493,9 +1504,12 @@ where
             .get(workspace.base_branch_meta)
             .map_err(PushError::StorageGet)?;
 
+        let branch_entity = branch::branch_entity(&base_branch_meta, workspace.base_branch_id)
+            .map_err(|_| PushError::BadBranchMetadata())?;
+
         let Ok((branch_name,)) = find!(
             (name: Inline<Handle<LongString>>),
-            pattern!(&base_branch_meta, [{ crate::metadata::name: ?name }])
+            pattern!(&base_branch_meta, [{ branch_entity @ crate::metadata::name: ?name }])
         )
         .exactly_one() else {
             return Err(PushError::BadBranchMetadata());
@@ -1609,8 +1623,11 @@ where
                     .get(conflicting_meta)
                     .map_err(PushError::StorageGet)?;
 
+                let branch_entity = branch::branch_entity(&branch_meta, workspace.base_branch_id)
+                    .map_err(|_| PushError::BadBranchMetadata())?;
+
                 let head_ = match find!((head_: Inline<_>),
-                    pattern!(&branch_meta, [{ head: ?head_ }])
+                    pattern!(&branch_meta, [{ branch_entity @ head: ?head_ }])
                 )
                 .at_most_one()
                 {

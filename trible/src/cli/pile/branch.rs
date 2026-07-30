@@ -266,8 +266,8 @@ pub fn run(cmd: Command) -> Result<()> {
                         if let Some(mh) = meta_handle {
                             if reader.metadata(mh)?.is_some() {
                                 if let Ok(meta_set) = reader.get::<TribleSet, _>(mh) {
-                                    name = load_branch_name(&reader, &meta_set).tag();
-                                    if let Some(h) = extract_repo_head(&meta_set) {
+                                    name = load_branch_name(&reader, &meta_set, id).tag();
+                                    if let BranchHead::Head(h) = extract_repo_head(&meta_set, id) {
                                         head_str = format!("blake3:{}", hex::encode(h.raw));
                                     }
                                 }
@@ -289,7 +289,6 @@ pub fn run(cmd: Command) -> Result<()> {
                         .reader()
                         .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
                     let iter = pile.pins()?;
-                    let head_attr = triblespace_core::repo::head.id();
                     let mut rows: Vec<(String, Id, String)> = Vec::new();
                     for branch in iter {
                         let id = branch?;
@@ -303,24 +302,6 @@ pub fn run(cmd: Command) -> Result<()> {
 
                         let (name, head) = match reader.get::<TribleSet, _>(meta_handle) {
                             Ok(meta) => {
-                                let name_attr = triblespace_core::metadata::name.id();
-                                let mut name_handle: Option<BranchNameHandle> = None;
-                                let mut head_handle: Option<Inline<Handle<SimpleArchive>>> = None;
-                                for t in meta.iter() {
-                                    if t.a() == &name_attr {
-                                        let h: BranchNameHandle = *t.v();
-                                        if name_handle.replace(h).is_some() {
-                                            name_handle = None;
-                                            break;
-                                        }
-                                    } else if t.a() == &head_attr {
-                                        let h: Inline<Handle<SimpleArchive>> = *t.v();
-                                        if head_handle.replace(h).is_some() {
-                                            head_handle = None;
-                                        }
-                                    }
-                                }
-
                                 // Filter to content branches only:
                                 // a branch is, by the Pin/Branch
                                 // taxonomy, a pin that carries
@@ -330,20 +311,17 @@ pub fn run(cmd: Command) -> Result<()> {
                                 // none of which belong in
                                 // `branch list`. See `pile pin list`
                                 // for the generic all-pins view.
-                                let Some(name_h) = name_handle else {
+                                let resolved = load_branch_name(&reader, &meta, id);
+                                let Some(name) = resolved.named().map(str::to_string) else {
                                     continue;
                                 };
-                                let name = match reader.get::<View<str>, _>(name_h) {
-                                    Ok(view) => view.as_ref().to_string(),
-                                    Err(_) => format!(
-                                        "<name blob missing ({})>",
-                                        hex::encode_upper(&name_h.raw[..4])
-                                    ),
-                                };
 
-                                let head = match head_handle {
-                                    None => "-".to_string(),
-                                    Some(handle) => format!("blake3:{}", hex::encode(handle.raw)),
+                                let head = match extract_repo_head(&meta, id) {
+                                    BranchHead::Headless => "-".to_string(),
+                                    BranchHead::Head(handle) => {
+                                        format!("blake3:{}", hex::encode(handle.raw))
+                                    }
+                                    BranchHead::Malformed => continue,
                                 };
 
                                 (name, head)
@@ -427,24 +405,23 @@ pub fn run(cmd: Command) -> Result<()> {
                 ) = if meta_present {
                     match reader.get::<TribleSet, SimpleArchive>(meta_handle) {
                         Ok(meta) => {
-                            let mut head_val: Option<Inline<Handle<SimpleArchive>>> = None;
-                            let repo_head_attr = triblespace_core::repo::head.id();
-                            for t in meta.iter() {
-                                if t.a() == &repo_head_attr {
-                                    let h = *t.v::<Handle<SimpleArchive>>();
-                                    head_val = Some(h);
+                            let (head_val, head_note) = match extract_repo_head(&meta, branch_id) {
+                                BranchHead::Head(head) => (Some(head), None),
+                                BranchHead::Headless => (None, None),
+                                BranchHead::Malformed => {
+                                    (None, Some("malformed branch head metadata".to_string()))
                                 }
-                            }
+                            };
                             // An indeterminate name is reported as a note
                             // rather than dropped: `Unnamed` is legitimate
                             // and stays quiet, but ambiguous or unreadable
                             // metadata is a finding this listing exists to
                             // surface.
-                            let resolved = load_branch_name(&reader, &meta);
-                            let note = match &resolved {
+                            let resolved = load_branch_name(&reader, &meta, branch_id);
+                            let note = head_note.or_else(|| match &resolved {
                                 BranchName::Named(_) | BranchName::Unnamed => None,
                                 other => Some(other.reason()),
-                            };
+                            });
                             (resolved.named().map(str::to_string), head_val, note)
                         }
                         Err(e) => (None, None, Some(format!("decode failed: {e:?}"))),
@@ -598,8 +575,9 @@ pub fn run(cmd: Command) -> Result<()> {
                         meta_state = if present { "present" } else { "missing" };
                         if present {
                             if let Ok(meta_set) = reader.get::<TribleSet, _>(mh) {
-                                name = Some(load_branch_name(&reader, &meta_set).tag());
-                                if let Some(h) = extract_repo_head(&meta_set) {
+                                name = Some(load_branch_name(&reader, &meta_set, branch_id).tag());
+                                if let BranchHead::Head(h) = extract_repo_head(&meta_set, branch_id)
+                                {
                                     head_str = format!("blake3:{}", hex::encode(h.raw));
                                     head_state = if reader.metadata(h)?.is_some() {
                                         "present"
@@ -756,20 +734,18 @@ pub fn run(cmd: Command) -> Result<()> {
                     .head(branch_id)?
                     .ok_or_else(|| anyhow::anyhow!("branch not found"))?;
 
-                let mut head_opt: Option<Inline<Handle<SimpleArchive>>> = None;
+                let mut head_state = BranchHead::Malformed;
                 if reader.metadata(meta_handle)?.is_some() {
                     if let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(meta_handle) {
-                        let repo_head_attr = triblespace_core::repo::head.id();
-                        for t in meta.iter() {
-                            if t.a() == &repo_head_attr {
-                                head_opt = Some(*t.v::<Handle<SimpleArchive>>());
-                                break;
-                            }
-                        }
+                        head_state = extract_repo_head(&meta, branch_id);
                     }
                 }
 
-                let head = head_opt.ok_or_else(|| anyhow::anyhow!("branch has no head set"))?;
+                let head = match head_state {
+                    BranchHead::Head(head) => head,
+                    BranchHead::Headless => anyhow::bail!("branch has no head set"),
+                    BranchHead::Malformed => anyhow::bail!("branch metadata is malformed"),
+                };
 
                 // Traverse commit graph, union content tribles
                 let mut visited: BTreeSet<String> = BTreeSet::new();
@@ -1051,19 +1027,25 @@ pub fn run(cmd: Command) -> Result<()> {
                         let meta_set = match reader.get::<TribleSet, SimpleArchive>(mh) {
                             Ok(ms) => ms,
                             Err(err) => {
-                                ungroupable
-                                    .push((*bid, format!("metadata unreadable: {err:?}")));
+                                ungroupable.push((*bid, format!("metadata unreadable: {err:?}")));
                                 continue;
                             }
                         };
 
-                        let resolved = load_branch_name(&reader, &meta_set);
+                        let resolved = load_branch_name(&reader, &meta_set, *bid);
                         let Some(name) = resolved.named() else {
                             ungroupable.push((*bid, resolved.reason()));
                             continue;
                         };
 
-                        let head = extract_repo_head(&meta_set);
+                        let head = match extract_repo_head(&meta_set, *bid) {
+                            BranchHead::Head(head) => Some(head),
+                            BranchHead::Headless => None,
+                            BranchHead::Malformed => {
+                                ungroupable.push((*bid, "branch head metadata malformed".into()));
+                                continue;
+                            }
+                        };
                         groups
                             .entry(name.to_string())
                             .or_default()
@@ -1148,19 +1130,25 @@ pub fn run(cmd: Command) -> Result<()> {
                         let meta_set = match reader.get::<TribleSet, SimpleArchive>(mh) {
                             Ok(ms) => ms,
                             Err(err) => {
-                                ungroupable
-                                    .push((*bid, format!("metadata unreadable: {err:?}")));
+                                ungroupable.push((*bid, format!("metadata unreadable: {err:?}")));
                                 continue;
                             }
                         };
 
-                        let resolved = load_branch_name(&reader, &meta_set);
+                        let resolved = load_branch_name(&reader, &meta_set, *bid);
                         let Some(name) = resolved.named() else {
                             ungroupable.push((*bid, resolved.reason()));
                             continue;
                         };
 
-                        let head = extract_repo_head(&meta_set);
+                        let head = match extract_repo_head(&meta_set, *bid) {
+                            BranchHead::Head(head) => Some(head),
+                            BranchHead::Headless => None,
+                            BranchHead::Malformed => {
+                                ungroupable.push((*bid, "branch head metadata malformed".into()));
+                                continue;
+                            }
+                        };
                         groups
                             .entry(name.to_string())
                             .or_default()
@@ -1218,9 +1206,6 @@ pub fn run(cmd: Command) -> Result<()> {
                         .reader()
                         .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
 
-                    // Attribute ids used in branch metadata.
-                    let repo_head_attr = triblespace_core::repo::head.id();
-
                     // Collect all branch ids and their current heads.
                     let mut candidates: Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)> =
                         Vec::new();
@@ -1230,17 +1215,20 @@ pub fn run(cmd: Command) -> Result<()> {
                             .head(bid)?
                             .ok_or_else(|| anyhow::anyhow!("branch not found: {bid:X}"))?;
 
-                        let mut head_val: Option<Inline<Handle<SimpleArchive>>> = None;
+                        let mut head_state = BranchHead::Malformed;
                         if reader.metadata(meta_handle)?.is_some() {
                             if let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(meta_handle) {
-                                for t in meta.iter() {
-                                    if t.a() == &repo_head_attr {
-                                        head_val = Some(*t.v::<Handle<SimpleArchive>>());
-                                        break;
-                                    }
-                                }
+                                head_state = extract_repo_head(&meta, bid);
                             }
                         }
+
+                        let head_val = match head_state {
+                            BranchHead::Head(head) => Some(head),
+                            BranchHead::Headless => None,
+                            BranchHead::Malformed => {
+                                anyhow::bail!("branch {bid:X} metadata is malformed")
+                            }
+                        };
 
                         candidates.push((bid, head_val));
                     }
@@ -1346,8 +1334,11 @@ pub fn run(cmd: Command) -> Result<()> {
                 let branch_meta_set: TribleSet = reader
                     .get(branch_meta)
                     .map_err(|e| anyhow::anyhow!("read branch metadata: {e:?}"))?;
-                let commit_head = extract_repo_head(&branch_meta_set)
-                    .ok_or_else(|| anyhow::anyhow!("branch has no commit head"))?;
+                let commit_head = match extract_repo_head(&branch_meta_set, branch_id) {
+                    BranchHead::Head(head) => head,
+                    BranchHead::Headless => anyhow::bail!("branch has no commit head"),
+                    BranchHead::Malformed => anyhow::bail!("branch metadata is malformed"),
+                };
 
                 // BFS from commit head, newest first.
                 let mut queue: std::collections::VecDeque<Inline<Handle<SimpleArchive>>> =
@@ -1589,8 +1580,11 @@ pub fn run(cmd: Command) -> Result<()> {
                 let branch_meta_set: TribleSet = reader
                     .get(branch_meta)
                     .map_err(|e| anyhow::anyhow!("read branch metadata: {e:?}"))?;
-                let commit_head = extract_repo_head(&branch_meta_set)
-                    .ok_or_else(|| anyhow::anyhow!("branch has no commit head"))?;
+                let commit_head = match extract_repo_head(&branch_meta_set, branch_id) {
+                    BranchHead::Head(head) => head,
+                    BranchHead::Headless => anyhow::bail!("branch has no commit head"),
+                    BranchHead::Malformed => anyhow::bail!("branch metadata is malformed"),
+                };
 
                 // Walk full commit DAG, collect attribute tallies.
                 struct AttrTally {
@@ -1720,8 +1714,6 @@ pub fn run(cmd: Command) -> Result<()> {
             new_name,
             signing_key,
         } => {
-            use triblespace_core::macros::pattern;
-            use triblespace_core::query::find;
             use triblespace_core::repo::branch as branch_mod;
             use triblespace_core::repo::pile::Pile;
 
@@ -1746,10 +1738,13 @@ pub fn run(cmd: Command) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("read branch meta: {e:?}"))?;
 
                     // Extract current commit head from metadata.
-                    let head_handle: Option<Inline<Handle<SimpleArchive>>> =
-                        find!((h: Inline<_>), pattern!(&meta, [{ triblespace_core::repo::head: ?h }]))
-                            .next()
-                            .map(|(h,)| h);
+                    let head_handle = match extract_repo_head(&meta, branch_id) {
+                        BranchHead::Head(head) => Some(head),
+                        BranchHead::Headless => None,
+                        BranchHead::Malformed => {
+                            anyhow::bail!("branch metadata is malformed")
+                        }
+                    };
 
                     // Build the commit head blob for re-signing (branch_metadata needs it).
                     let commit_blob = if let Some(h) = head_handle {
@@ -1769,7 +1764,8 @@ pub fn run(cmd: Command) -> Result<()> {
                     // Build new branch metadata with the new name.
                     let mut new_meta =
                         branch_mod::branch_metadata(&key, branch_id, name_handle, commit_blob);
-                    new_meta += triblespace_core::repo::index_home::manifest_tribles(&meta);
+                    new_meta += branch_mod::carried_facts(&meta, branch_id)
+                        .map_err(|err| anyhow::anyhow!("malformed branch metadata: {err:?}"))?;
 
                     let new_meta_handle = pile
                         .put(new_meta)
@@ -1955,25 +1951,32 @@ fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
     info
 }
 
-fn extract_repo_head(meta: &TribleSet) -> Option<Inline<Handle<SimpleArchive>>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchHead {
+    Head(Inline<Handle<SimpleArchive>>),
+    Headless,
+    Malformed,
+}
+
+fn extract_repo_head(meta: &TribleSet, branch_id: Id) -> BranchHead {
     use triblespace::prelude::blobencodings::SimpleArchive;
     use triblespace::prelude::inlineencodings::Handle;
     use triblespace_core::repo;
 
     use triblespace_core::inline::Inline;
 
-    let head_attr = repo::head.id();
-    let mut head_handle: Option<Inline<Handle<SimpleArchive>>> = None;
-    for t in meta.iter() {
-        if t.a() == &head_attr {
-            let h: Inline<Handle<SimpleArchive>> = *t.v();
-            if head_handle.replace(h).is_some() {
-                // Multiple heads -> ambiguous.
-                return None;
-            }
-        }
+    let Ok(branch_entity) = repo::branch::branch_entity(meta, branch_id) else {
+        return BranchHead::Malformed;
+    };
+    let mut heads = find!(
+        head: Inline<Handle<SimpleArchive>>,
+        pattern!(meta, [{ branch_entity @ repo::head: ?head }])
+    );
+    match (heads.next(), heads.next()) {
+        (None, None) => BranchHead::Headless,
+        (Some(head), None) => BranchHead::Head(head),
+        _ => BranchHead::Malformed,
     }
-    head_handle
 }
 
 fn parse_branch_id_hex(s: &str) -> Result<Id> {
@@ -2084,58 +2087,19 @@ fn consolidate_groups(
                 .collect()
         };
 
-        // Set when any pair's relationship could not be determined, which
-        // disqualifies the whole group from an automatic merge: the merge
-        // reconciles the NON-SUBSUMED set, and an undetermined pair means we
-        // do not know what that set is.
-        let mut undetermined = false;
-
-        // Compute subsumption: a head is subsumed if another head
-        // has it as an ancestor.
-        let mut subsumed: HashSet<[u8; 32]> = HashSet::new();
-        if unique_heads.len() > 1 {
-            for i in 0..unique_heads.len() {
-                if subsumed.contains(&unique_heads[i].raw) {
-                    continue;
-                }
-                for j in 0..unique_heads.len() {
-                    if i == j {
-                        continue;
-                    }
-                    if subsumed.contains(&unique_heads[j].raw) {
-                        continue;
-                    }
-                    match is_ancestor_of(unique_heads[i], unique_heads[j], reader, &parent_attr) {
-                        Ok(Ancestry::Yes) => {
-                            subsumed.insert(unique_heads[i].raw);
-                            let hh: Inline<Hash<Blake3>> = Handle::to_hash(unique_heads[i]);
-                            let hex: String = hh.from_inline();
-                            println!("  ({}... subsumed)", &hex[..23]);
-                            break;
-                        }
-                        Ok(Ancestry::No) => {}
-                        Ok(Ancestry::Unknown) => {
-                            // Missing blobs mean this pair's relationship was
-                            // never determined. Treating it as "divergent"
-                            // is what produced merges of a branch with its
-                            // own ancestor, so the group is disqualified
-                            // rather than guessed at.
-                            let hh: Inline<Hash<Blake3>> = Handle::to_hash(unique_heads[i]);
-                            let hex: String = hh.from_inline();
-                            eprintln!(
-                                "  warning: ancestry of {}... is UNDETERMINED (missing commit \
-                                 blobs); not treating it as divergent",
-                                &hex[..23]
-                            );
-                            undetermined = true;
-                        }
-                        Err(e) => {
-                            eprintln!("  warning: ancestry check failed: {e:#}");
-                            undetermined = true;
-                        }
-                    }
-                }
-            }
+        // Evaluate each unordered pair as one relation. One direction can be
+        // Unknown while the reverse direction is definitively Yes (a readable
+        // child names an absent parent); that Yes settles the pair and must not
+        // be poisoned merely because iteration happened to try Unknown first.
+        let (subsumed, undetermined) =
+            classify_head_subsumption(&unique_heads, reader, &parent_attr);
+        for head in unique_heads
+            .iter()
+            .filter(|head| subsumed.contains(&head.raw))
+        {
+            let hh: Inline<Hash<Blake3>> = Handle::to_hash(*head);
+            let hex: String = hh.from_inline();
+            println!("  ({}... subsumed)", &hex[..23]);
         }
 
         let non_subsumed: Vec<Inline<Handle<SimpleArchive>>> = unique_heads
@@ -2305,6 +2269,42 @@ enum Ancestry {
     Unknown,
 }
 
+/// Compute which heads are ancestors of another head in the same group.
+///
+/// Every unordered pair is evaluated as a unit. Either-direction `Yes`
+/// settles it; only a pair with no proof in either direction and at least one
+/// `Unknown`/error makes the group unsafe to consolidate automatically.
+fn classify_head_subsumption(
+    heads: &[Inline<Handle<SimpleArchive>>],
+    reader: &impl BlobStoreGet,
+    parent_attr: &Id,
+) -> (HashSet<[u8; 32]>, bool) {
+    let mut subsumed = HashSet::new();
+    let mut undetermined = false;
+
+    for i in 0..heads.len() {
+        for j in (i + 1)..heads.len() {
+            let forward = is_ancestor_of(heads[i], heads[j], reader, parent_attr);
+            if matches!(forward, Ok(Ancestry::Yes)) {
+                subsumed.insert(heads[i].raw);
+                continue;
+            }
+
+            let reverse = is_ancestor_of(heads[j], heads[i], reader, parent_attr);
+            if matches!(reverse, Ok(Ancestry::Yes)) {
+                subsumed.insert(heads[j].raw);
+                continue;
+            }
+
+            if !matches!(forward, Ok(Ancestry::No)) || !matches!(reverse, Ok(Ancestry::No)) {
+                undetermined = true;
+            }
+        }
+    }
+
+    (subsumed, undetermined)
+}
+
 fn is_ancestor_of(
     ancestor: Inline<Handle<SimpleArchive>>,
     descendant: Inline<Handle<SimpleArchive>>,
@@ -2375,6 +2375,8 @@ enum BranchName {
     /// More than one `metadata::name`. The metadata is malformed; picking
     /// either name would invent a fact.
     Ambiguous { count: usize },
+    /// The metadata has no unique entity identifying the expected pin id.
+    MalformedEntity,
     /// Exactly one name trible, but its blob could not be read (missing,
     /// corrupt, or GC'd). The branch HAS a name; this pile cannot see it.
     Unreadable(String),
@@ -2399,6 +2401,7 @@ impl BranchName {
             BranchName::Named(n) => n.clone(),
             BranchName::Unnamed => "-".to_string(),
             BranchName::Ambiguous { count } => format!("<ambiguous:{count}>"),
+            BranchName::MalformedEntity => "<branch-entity-malformed>".to_string(),
             BranchName::Unreadable(_) => "<name-unreadable>".to_string(),
         }
     }
@@ -2410,6 +2413,9 @@ impl BranchName {
             BranchName::Unnamed => "no metadata::name trible".to_string(),
             BranchName::Ambiguous { count } => {
                 format!("{count} metadata::name tribles — metadata is malformed")
+            }
+            BranchName::MalformedEntity => {
+                "no unique metadata entity identifies the expected branch id".to_string()
             }
             BranchName::Unreadable(err) => format!("name blob unreadable: {err}"),
         }
@@ -2433,25 +2439,23 @@ fn report_ungroupable(ungroupable: &[(Id, String)]) {
     for (bid, reason) in ungroupable {
         eprintln!("  {bid:X}  {reason}");
     }
-    eprintln!(
-        "  (a name is a merge key; branches sharing only a failure are not the same branch)"
-    );
+    eprintln!("  (a name is a merge key; branches sharing only a failure are not the same branch)");
 }
 
 /// Resolve a branch's name from its metadata, distinguishing every outcome.
 ///
 /// Infallible by signature: an unreadable name blob is a *classification*,
 /// not an error to be swallowed by a caller's `.ok()`.
-fn load_branch_name(reader: &impl BlobStoreGet, meta: &TribleSet) -> BranchName {
-    let name_attr = triblespace_core::metadata::name.id();
-    let mut handle_opt: Option<BranchNameHandle> = None;
-    let mut count = 0usize;
-    for t in meta.iter() {
-        if t.a() == &name_attr {
-            count += 1;
-            handle_opt = Some(*t.v());
-        }
-    }
+fn load_branch_name(reader: &impl BlobStoreGet, meta: &TribleSet, branch_id: Id) -> BranchName {
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, branch_id) else {
+        return BranchName::MalformedEntity;
+    };
+    let mut handles = find!(
+        handle: BranchNameHandle,
+        pattern!(meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
+    );
+    let handle_opt = handles.next();
+    let count = usize::from(handle_opt.is_some()) + handles.count();
 
     if count > 1 {
         return BranchName::Ambiguous { count };
@@ -2497,17 +2501,20 @@ mod tests {
         // The root commit: content-addressed, so the same bytes in both stores
         // yield the same handle.
         let root_set = TribleSet::new();
-        let root: Inline<Handle<SimpleArchive>> =
-            full.put::<SimpleArchive, _>(root_set.clone().to_blob()).expect("put root");
+        let root: Inline<Handle<SimpleArchive>> = full
+            .put::<SimpleArchive, _>(root_set.clone().to_blob())
+            .expect("put root");
 
         // A child whose only fact is `parent -> root`.
         let child_entity = triblespace_core::id::fucid();
         let mut child_set = TribleSet::new();
         child_set.insert(&Trible::new(&child_entity, &parent_attr, &root));
-        let child: Inline<Handle<SimpleArchive>> =
-            full.put::<SimpleArchive, _>(child_set.clone().to_blob()).expect("put child");
-        let child_holed: Inline<Handle<SimpleArchive>> =
-            holed.put::<SimpleArchive, _>(child_set.to_blob()).expect("put child (holed)");
+        let child: Inline<Handle<SimpleArchive>> = full
+            .put::<SimpleArchive, _>(child_set.clone().to_blob())
+            .expect("put child");
+        let child_holed: Inline<Handle<SimpleArchive>> = holed
+            .put::<SimpleArchive, _>(child_set.to_blob())
+            .expect("put child (holed)");
         assert_eq!(
             child.raw, child_holed.raw,
             "content addressing: identical bytes must yield one handle"
@@ -2559,6 +2566,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn consolidate_subsumption_is_order_independent_when_reverse_proves_ancestry() {
+        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::trible::Trible;
+
+        let parent_attr = triblespace_core::repo::parent.id();
+        let mut store = MemoryBlobStore::new();
+
+        // `parent` is deliberately absent. The readable child still names it,
+        // so parent→child is Yes while child→parent is Unknown.
+        let parent: Inline<Handle<SimpleArchive>> = TribleSet::new().to_blob().get_handle();
+        let mut child_set = TribleSet::new();
+        child_set.insert(&Trible::new(
+            &triblespace_core::id::fucid(),
+            &parent_attr,
+            &parent,
+        ));
+        let child: Inline<Handle<SimpleArchive>> = store
+            .put::<SimpleArchive, _>(child_set.to_blob())
+            .expect("put child");
+        let reader = store.reader().expect("reader");
+
+        for heads in [[parent, child], [child, parent]] {
+            let (subsumed, undetermined) = classify_head_subsumption(&heads, &reader, &parent_attr);
+            assert_eq!(
+                subsumed,
+                HashSet::from([parent.raw]),
+                "the missing parent is still proven subsumed by its readable child"
+            );
+            assert!(
+                !undetermined,
+                "a reverse-direction Yes settles the unordered pair"
+            );
+        }
+    }
+
+    #[test]
+    fn by_name_delete_sources_leaves_a_two_head_branch_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("malformed-head.pile");
+        std::fs::File::create(&path).expect("create pile");
+
+        let pile = Pile::open(&path).expect("open pile");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[19; 32]);
+        let mut repo = Repository::new(pile, key, TribleSet::new()).expect("repo");
+        let branch_id = *repo.create_branch("main", None).expect("branch");
+        let old_meta = repo.storage_mut().head(branch_id).unwrap().unwrap();
+        let reader = repo.storage_mut().reader().unwrap();
+        let mut meta: TribleSet = reader.get(old_meta).unwrap();
+        let branch_entity =
+            triblespace_core::repo::branch::branch_entity(&meta, branch_id).unwrap();
+        let head_attr = triblespace_core::repo::head.id();
+
+        let first: Inline<Handle<SimpleArchive>> = repo
+            .storage_mut()
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let mut second_set = TribleSet::new();
+        second_set += entity! { triblespace_core::metadata::tag: branch_id };
+        let second: Inline<Handle<SimpleArchive>> = repo
+            .storage_mut()
+            .put::<SimpleArchive, _>(second_set.to_blob())
+            .unwrap();
+        meta.insert(&triblespace_core::trible::Trible::new(
+            &branch_entity,
+            &head_attr,
+            &first,
+        ));
+        meta.insert(&triblespace_core::trible::Trible::new(
+            &branch_entity,
+            &head_attr,
+            &second,
+        ));
+        let malformed_meta = repo.storage_mut().put(meta).unwrap();
+        assert!(matches!(
+            repo.storage_mut()
+                .update(branch_id, Some(old_meta), Some(malformed_meta)),
+            Ok(triblespace_core::repo::PushResult::Success())
+        ));
+        repo.into_storage().close().unwrap();
+
+        run(Command::Consolidate {
+            pile: path.clone(),
+            branches: Vec::new(),
+            out_name: None,
+            dry_run: false,
+            delete_sources: true,
+            by_name: true,
+            by_name_include_deleted: false,
+            signing_key: None,
+        })
+        .expect("consolidate must report and skip malformed branch");
+
+        let mut check = Pile::open(&path).unwrap();
+        assert_eq!(
+            check.head(branch_id).unwrap(),
+            Some(malformed_meta),
+            "malformed source pin must not be tombstoned or rewritten"
+        );
+        check.close().unwrap();
+    }
+
     /// The regression this file exists to prevent.
     ///
     /// `consolidate --by-name` groups branches by name and merges each group
@@ -2577,7 +2686,9 @@ mod tests {
         use triblespace_core::trible::Trible;
 
         let name_attr = triblespace_core::metadata::name.id();
+        let branch_attr = triblespace_core::repo::branch.id();
         let e = triblespace_core::id::fucid();
+        let branch_id = triblespace_core::id::fucid();
 
         let mut store = MemoryBlobStore::new();
         let h_a: BranchNameHandle = store
@@ -2594,20 +2705,24 @@ mod tests {
 
         // Exactly one name, resolvable.
         let mut named = TribleSet::new();
+        named.insert(&Trible::new(&e, &branch_attr, &branch_id));
         named.insert(&Trible::new(&e, &name_attr, &h_a));
-        let r = load_branch_name(&reader, &named);
+        let r = load_branch_name(&reader, &named, branch_id);
         assert_eq!(r.named(), Some("main"), "one resolvable name must resolve");
 
         // No name trible at all — legitimate, and NOT groupable.
-        let r = load_branch_name(&reader, &TribleSet::new());
+        let mut unnamed = TribleSet::new();
+        unnamed.insert(&Trible::new(&e, &branch_attr, &branch_id));
+        let r = load_branch_name(&reader, &unnamed, branch_id);
         assert!(matches!(r, BranchName::Unnamed));
         assert_eq!(r.named(), None, "an unnamed branch must not be groupable");
 
         // Two names — malformed metadata. Must not silently pick one.
         let mut ambiguous = TribleSet::new();
+        ambiguous.insert(&Trible::new(&e, &branch_attr, &branch_id));
         ambiguous.insert(&Trible::new(&e, &name_attr, &h_a));
         ambiguous.insert(&Trible::new(&e, &name_attr, &h_b));
-        let r = load_branch_name(&reader, &ambiguous);
+        let r = load_branch_name(&reader, &ambiguous, branch_id);
         assert!(
             matches!(r, BranchName::Ambiguous { count: 2 }),
             "two name tribles must classify as Ambiguous, got {r:?}"
@@ -2621,8 +2736,9 @@ mod tests {
 
         // One name, blob unreadable. The branch HAS a name; we cannot see it.
         let mut unreadable = TribleSet::new();
+        unreadable.insert(&Trible::new(&e, &branch_attr, &branch_id));
         unreadable.insert(&Trible::new(&e, &name_attr, &h_missing));
-        let r = load_branch_name(&reader, &unreadable);
+        let r = load_branch_name(&reader, &unreadable, branch_id);
         assert!(
             matches!(r, BranchName::Unreadable(_)),
             "a missing name blob must classify as Unreadable, got {r:?}"
@@ -2633,9 +2749,9 @@ mod tests {
         // distinguishable — collapsing any two of them is what caused the
         // bug, so equal renderings would let it come back.
         let tags = [
-            load_branch_name(&reader, &TribleSet::new()).tag(),
-            load_branch_name(&reader, &ambiguous).tag(),
-            load_branch_name(&reader, &unreadable).tag(),
+            load_branch_name(&reader, &unnamed, branch_id).tag(),
+            load_branch_name(&reader, &ambiguous, branch_id).tag(),
+            load_branch_name(&reader, &unreadable, branch_id).tag(),
         ];
         let unique: std::collections::HashSet<&String> = tags.iter().collect();
         assert_eq!(

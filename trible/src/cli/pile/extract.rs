@@ -85,8 +85,6 @@ pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummar
             .reader()
             .map_err(|e| anyhow!("source reader: {e:?}"))?;
 
-        let name_attr = triblespace_core::metadata::name.id();
-
         let mut branches: Vec<BranchInfo> = Vec::new();
         for &bid in &pin_ids {
             let meta_handle = match src_pile.head(bid) {
@@ -103,10 +101,13 @@ pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummar
             // invent the fact that this branch is called that. An
             // indeterminate name leaves the branch addressable only by its
             // hex id, which is never ambiguous.
-            let mut name_handles = meta
-                .iter()
-                .filter(|t| t.a() == &name_attr)
-                .map(|t| *t.v::<Handle<LongString>>());
+            let branch_entity = repo::branch::branch_entity(&meta, bid).ok();
+            let mut name_handles = branch_entity.into_iter().flat_map(|branch_entity| {
+                find!(
+                    handle: Inline<Handle<LongString>>,
+                    pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
+                )
+            });
             let name = match (name_handles.next(), name_handles.next()) {
                 (Some(h), None) => src_reader
                     .get::<View<str>, LongString>(h)

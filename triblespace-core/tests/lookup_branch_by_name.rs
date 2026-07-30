@@ -64,6 +64,53 @@ fn lookup_of_an_absent_name_is_none_not_an_error() {
     );
 }
 
+#[test]
+fn nameless_pins_are_not_branch_lookup_errors() {
+    let mut repo = repo();
+    let main = *repo.create_branch("main", None).expect("main");
+    let pin_id = *genid();
+    let pin_meta: TribleSet = entity! { triblespace_core::repo::branch: pin_id }.into();
+    let pin_head = repo
+        .storage_mut()
+        .put(pin_meta)
+        .expect("store pin metadata");
+    assert!(matches!(
+        repo.storage_mut().update(pin_id, None, Some(pin_head)),
+        Ok(triblespace_core::repo::PushResult::Success())
+    ));
+
+    assert_eq!(repo.lookup_branch("main").expect("lookup"), Some(main));
+    assert_eq!(repo.lookup_branch("absent").expect("lookup"), None);
+}
+
+#[test]
+fn multiple_names_on_the_actual_branch_entity_fail_closed() {
+    let mut repo = repo();
+    let branch_id = *repo.create_branch("main", None).expect("main");
+    let old = repo.storage_mut().head(branch_id).unwrap().unwrap();
+    let reader = repo.storage_mut().reader().unwrap();
+    let mut meta: TribleSet = reader.get(old).unwrap();
+    let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, branch_id).unwrap();
+    let other_name: Inline<Handle<LongString>> = repo
+        .storage_mut()
+        .put::<LongString, _>("other".to_owned().to_blob())
+        .unwrap();
+    meta += entity! { ExclusiveId::force_ref(&branch_entity) @
+        triblespace_core::metadata::name: other_name
+    };
+    let new = repo.storage_mut().put(meta).unwrap();
+    assert!(matches!(
+        repo.storage_mut().update(branch_id, Some(old), Some(new)),
+        Ok(triblespace_core::repo::PushResult::Success())
+    ));
+
+    assert_eq!(
+        repo.lookup_branch("main").expect("lookup"),
+        None,
+        "an ambiguous actual branch entity must not answer to either name"
+    );
+}
+
 /// The documented-but-untested path, and the one that actually occurs in
 /// merged piles.
 #[test]
