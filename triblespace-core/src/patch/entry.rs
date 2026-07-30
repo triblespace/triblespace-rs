@@ -67,14 +67,13 @@ impl<const KEY_LEN: usize, V> Drop for Entry<KEY_LEN, V> {
 /// Holds a thin pointer into an archive's bytes plus a *borrow* of
 /// the `Arc<dyn ArchiveOwner>` that keeps those bytes alive. When
 /// inserted via [`PATCH::insert_archive`], the entry's key becomes a
-/// `Head::new_local_leaf` under a Branch whose `owner` matches; on
-/// owner mismatch the leaf is automatically reified into a heap-
-/// allocated `Leaf<KEY_LEN, ()>` so the result is owner-consistent.
+/// `Head::new_local_leaf` and the owner joins the PATCH's persistent root
+/// guard, independently of trie shape.
 ///
 /// The owner is borrowed (not owned) so the ingest hot loop pays
-/// **zero** atomic ref-count traffic per trible — the only clones
-/// happen lazily inside the receiving PATCH when a Branch actually
-/// adopts the owner. The caller (typically a chunked-archive
+/// **zero** atomic ref-count traffic per trible — the receiving PATCH only
+/// clones an owner the first time that allocation joins its guard. The caller
+/// (typically a chunked-archive
 /// decoder) keeps one `Arc` alive on the stack for the whole batch.
 ///
 /// Only valid for `V = ()` because archive bytes don't carry a value

@@ -14,6 +14,7 @@ use crate::patch::ArchiveEntry;
 #[cfg(any(test, feature = "parallel"))]
 use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
+use crate::patch::PATCHOwnerGuard;
 use crate::patch::PATCH;
 use crate::query::Variable;
 use crate::trible::AEVOrder;
@@ -97,6 +98,29 @@ pub struct TribleSetIterator<'a> {
 pub const PARALLEL_UNION_THRESHOLD: usize = 4096;
 
 impl TribleSet {
+    /// Reconcile the six public indexes into one conservative lifetime guard.
+    /// Normally all six already share the same Arc, making this six pointer
+    /// comparisons; the joins also make independently edited public indexes
+    /// safe again at aggregate boundaries.
+    fn combined_owner_guard(&self) -> PATCHOwnerGuard {
+        self.eav
+            .owner_guard()
+            .union(&self.eva.owner_guard())
+            .union(&self.aev.owner_guard())
+            .union(&self.ave.owner_guard())
+            .union(&self.vea.owner_guard())
+            .union(&self.vae.owner_guard())
+    }
+
+    fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
+        self.eav.set_owner_guard(guard);
+        self.eva.set_owner_guard(guard);
+        self.aev.set_owner_guard(guard);
+        self.ave.set_owner_guard(guard);
+        self.vea.set_owner_guard(guard);
+        self.vae.set_owner_guard(guard);
+    }
+
     /// Union of two [`TribleSet`]s.
     ///
     /// The other [`TribleSet`] is consumed, and this [`TribleSet`] is updated
@@ -111,7 +135,13 @@ impl TribleSet {
     /// is inserted into `self`); when `other` is tiny (e.g. the per-
     /// `entity!{}` `+=` in a serial fold) the rayon overhead would
     /// dominate even at large `self`.
-    pub fn union(&mut self, other: Self) {
+    pub fn union(&mut self, mut other: Self) {
+        let owners = self
+            .combined_owner_guard()
+            .union(&other.combined_owner_guard());
+        self.set_owner_guard(&owners);
+        other.set_owner_guard(&owners);
+
         #[cfg(feature = "parallel")]
         {
             if other.len() >= PARALLEL_UNION_THRESHOLD {
@@ -162,28 +192,31 @@ impl TribleSet {
     /// property as `union`. Threshold gates on `min(self, other)`
     /// because intersect work is bounded by the smaller side.
     pub fn intersect(&self, other: &Self) -> Self {
+        let owners = self
+            .combined_owner_guard()
+            .union(&other.combined_owner_guard());
         #[cfg(feature = "parallel")]
         {
             if self.len().min(other.len()) >= PARALLEL_UNION_THRESHOLD {
                 let ((eav, eva), ((aev, ave), (vea, vae))) = rayon::join(
                     || {
                         rayon::join(
-                            || self.eav.intersect(&other.eav),
-                            || self.eva.intersect(&other.eva),
+                            || self.eav.intersect_with_guard(&other.eav, &owners),
+                            || self.eva.intersect_with_guard(&other.eva, &owners),
                         )
                     },
                     || {
                         rayon::join(
                             || {
                                 rayon::join(
-                                    || self.aev.intersect(&other.aev),
-                                    || self.ave.intersect(&other.ave),
+                                    || self.aev.intersect_with_guard(&other.aev, &owners),
+                                    || self.ave.intersect_with_guard(&other.ave, &owners),
                                 )
                             },
                             || {
                                 rayon::join(
-                                    || self.vea.intersect(&other.vea),
-                                    || self.vae.intersect(&other.vae),
+                                    || self.vea.intersect_with_guard(&other.vea, &owners),
+                                    || self.vae.intersect_with_guard(&other.vae, &owners),
                                 )
                             },
                         )
@@ -200,12 +233,12 @@ impl TribleSet {
             }
         }
         Self {
-            eav: self.eav.intersect(&other.eav),
-            eva: self.eva.intersect(&other.eva),
-            aev: self.aev.intersect(&other.aev),
-            ave: self.ave.intersect(&other.ave),
-            vea: self.vea.intersect(&other.vea),
-            vae: self.vae.intersect(&other.vae),
+            eav: self.eav.intersect_with_guard(&other.eav, &owners),
+            eva: self.eva.intersect_with_guard(&other.eva, &owners),
+            aev: self.aev.intersect_with_guard(&other.aev, &owners),
+            ave: self.ave.intersect_with_guard(&other.ave, &owners),
+            vea: self.vea.intersect_with_guard(&other.vea, &owners),
+            vae: self.vae.intersect_with_guard(&other.vae, &owners),
         }
     }
 
@@ -217,28 +250,29 @@ impl TribleSet {
     /// `self.len()` because difference work is bounded by the left
     /// side (each key from `self` is either kept or filtered).
     pub fn difference(&self, other: &Self) -> Self {
+        let owners = self.combined_owner_guard();
         #[cfg(feature = "parallel")]
         {
             if self.len() >= PARALLEL_UNION_THRESHOLD {
                 let ((eav, eva), ((aev, ave), (vea, vae))) = rayon::join(
                     || {
                         rayon::join(
-                            || self.eav.difference(&other.eav),
-                            || self.eva.difference(&other.eva),
+                            || self.eav.difference_with_guard(&other.eav, &owners),
+                            || self.eva.difference_with_guard(&other.eva, &owners),
                         )
                     },
                     || {
                         rayon::join(
                             || {
                                 rayon::join(
-                                    || self.aev.difference(&other.aev),
-                                    || self.ave.difference(&other.ave),
+                                    || self.aev.difference_with_guard(&other.aev, &owners),
+                                    || self.ave.difference_with_guard(&other.ave, &owners),
                                 )
                             },
                             || {
                                 rayon::join(
-                                    || self.vea.difference(&other.vea),
-                                    || self.vae.difference(&other.vae),
+                                    || self.vea.difference_with_guard(&other.vea, &owners),
+                                    || self.vae.difference_with_guard(&other.vae, &owners),
                                 )
                             },
                         )
@@ -255,12 +289,12 @@ impl TribleSet {
             }
         }
         Self {
-            eav: self.eav.difference(&other.eav),
-            eva: self.eva.difference(&other.eva),
-            aev: self.aev.difference(&other.aev),
-            ave: self.ave.difference(&other.ave),
-            vea: self.vea.difference(&other.vea),
-            vae: self.vae.difference(&other.vae),
+            eav: self.eav.difference_with_guard(&other.eav, &owners),
+            eva: self.eva.difference_with_guard(&other.eva, &owners),
+            aev: self.aev.difference_with_guard(&other.aev, &owners),
+            ave: self.ave.difference_with_guard(&other.ave, &owners),
+            vea: self.vea.difference_with_guard(&other.vea, &owners),
+            vae: self.vae.difference_with_guard(&other.vae, &owners),
         }
     }
 
@@ -331,16 +365,8 @@ impl TribleSet {
         if rows.is_empty() {
             return Self::new();
         }
-        if rows.len() == 1 {
-            // Main's PATCH root cannot retain an archive owner. Use the
-            // established heap singleton path, which also shares one Leaf
-            // allocation across all six indexes.
-            let trible = Trible::as_transmute_force_raw(&rows[0])
-                .expect("validated archive rows are well-formed tribles");
-            let mut set = Self::new();
-            set.insert(trible);
-            return set;
-        }
+        let mut owners = PATCHOwnerGuard::default();
+        owners.retain_archive_owner(owner);
 
         let mut permutation = vec![0u32; rows.len()];
         fn reset(permutation: &mut [u32]) {
@@ -353,11 +379,12 @@ impl TribleSet {
             ($order:ty) => {{
                 reset(&mut permutation);
                 unsafe {
-                    PATCH::<TRIBLE_LEN, $order>::from_archive_partition(
+                    PATCH::<TRIBLE_LEN, $order>::from_archive_partition_with_guard(
                         rows,
                         hashes,
                         &mut permutation,
                         owner,
+                        &owners,
                     )
                 }
             }};
@@ -381,17 +408,17 @@ impl TribleSet {
     }
 
     /// Inserts an archive-backed trible into all six covering indexes
-    /// using [`PATCH::insert_archive`], so each index may land the new
-    /// entry as a `LocalLeaf` instead of a freshly allocated heap
-    /// `Leaf`. The receiving Branches' `owner` fields keep the
-    /// underlying archive bytes alive.
+    /// using one owner guard shared by all six indexes.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, TRIBLE_LEN>) {
-        self.eav.insert_archive(entry);
-        self.eva.insert_archive(entry);
-        self.aev.insert_archive(entry);
-        self.ave.insert_archive(entry);
-        self.vea.insert_archive(entry);
-        self.vae.insert_archive(entry);
+        let mut owners = self.combined_owner_guard();
+        owners.retain_archive_owner(entry.owner());
+        self.set_owner_guard(&owners);
+        self.eav.insert_archive_with_guard(entry, &owners);
+        self.eva.insert_archive_with_guard(entry, &owners);
+        self.aev.insert_archive_with_guard(entry, &owners);
+        self.ave.insert_archive_with_guard(entry, &owners);
+        self.vea.insert_archive_with_guard(entry, &owners);
+        self.vae.insert_archive_with_guard(entry, &owners);
     }
 
     /// Returns `true` when the exact trible is present in the set.
@@ -572,6 +599,54 @@ mod tests {
 
     use rayon::iter::IntoParallelIterator;
     use rayon::iter::ParallelIterator;
+
+    #[repr(C, align(16))]
+    struct AlignedRows([[u8; TRIBLE_LEN]; 2]);
+
+    fn archive_set(seed: u8) -> TribleSet {
+        let mut rows = [[0u8; TRIBLE_LEN]; 2];
+        for (offset, row) in rows.iter_mut().enumerate() {
+            row[0] = 1;
+            row[16] = 2;
+            row[32] = 3;
+            row[63] = seed.wrapping_add(offset as u8);
+        }
+        let storage = std::sync::Arc::new(AlignedRows(rows));
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let hashes = [
+            crate::patch::hash_key(&storage.0[0]),
+            crate::patch::hash_key(&storage.0[1]),
+        ];
+        // SAFETY: the immutable rows are aligned, distinct and retained by
+        // `owner`; hashes correspond exactly to the source rows.
+        unsafe { TribleSet::from_archive_partition(&storage.0, &hashes, &owner) }
+    }
+
+    fn assert_shared_guard(set: &TribleSet, owners: usize) {
+        let guard = set.eav.owner_guard();
+        assert_eq!(guard.owner_count(), owners);
+        assert!(guard.ptr_eq(&set.eva.owner_guard()));
+        assert!(guard.ptr_eq(&set.aev.owner_guard()));
+        assert!(guard.ptr_eq(&set.ave.owner_guard()));
+        assert!(guard.ptr_eq(&set.vea.owner_guard()));
+        assert!(guard.ptr_eq(&set.vae.owner_guard()));
+    }
+
+    #[test]
+    fn archive_guard_is_shared_across_all_six_indexes_and_set_algebra() {
+        let mut left = archive_set(10);
+        let right = archive_set(20);
+        assert_shared_guard(&left, 1);
+        assert_shared_guard(&right, 1);
+
+        left.union(right);
+        assert_shared_guard(&left, 2);
+
+        let intersection = left.intersect(&left);
+        assert_shared_guard(&intersection, 2);
+        let difference = left.difference(&TribleSet::new());
+        assert_shared_guard(&difference, 2);
+    }
 
     #[test]
     fn union() {

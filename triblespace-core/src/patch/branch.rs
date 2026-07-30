@@ -11,23 +11,10 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ptr::addr_of;
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
 
 const BRANCH_ALIGN: usize = 16;
-const BRANCH_BASE_SIZE: usize = 64;
+const BRANCH_BASE_SIZE: usize = 48;
 const TABLE_ENTRY_SIZE: usize = 8;
-
-/// Marker trait for opaque owners of bytes referenced by archive-backed
-/// PATCH nodes. An `Option<Arc<dyn ArchiveOwner>>` lives on each
-/// `Branch`; when `Some(arc)`, the Arc keeps the underlying bytes
-/// (typically a memory-mapped archive blob) alive so that any
-/// `LocalLeaf` children — which are thin pointers into those bytes —
-/// remain valid for the Branch's lifetime. The trait is intentionally
-/// empty: the owner's only job is to drop the bytes when its refcount
-/// hits zero.
-pub trait ArchiveOwner: Send + Sync + 'static {}
-
-impl<T: Send + Sync + 'static + ?Sized> ArchiveOwner for T {}
 
 #[inline]
 pub(crate) fn dst_len<T>(ptr: *const [T]) -> usize {
@@ -177,16 +164,9 @@ pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Si
     pub leaf_count: u64,
     pub segment_count: u64,
     pub hash: u128,
-    /// Owner reference keeping `LocalLeaf` children's underlying bytes alive.
-    /// `None` for pure-memory branches; `Some(arc)` for archive-backed
-    /// branches. Niche-optimized to 16 bytes via the inner Arc's `NonNull`
-    /// data pointer — no discriminator byte. See [`ArchiveOwner`].
-    pub owner: Option<Arc<dyn ArchiveOwner>>,
     pub child_table: Table,
 }
 
-// Manual Debug since `Option<Arc<dyn ArchiveOwner>>` doesn't impl Debug
-// (the trait is intentionally minimal — no Debug bound).
 impl<
         const KEY_LEN: usize,
         O: KeySchema<KEY_LEN>,
@@ -202,7 +182,6 @@ impl<
             .field("leaf_count", &self.leaf_count)
             .field("segment_count", &self.segment_count)
             .field("hash", &self.hash)
-            .field("owner", &self.owner.as_ref().map(|_| "<archive owner>"))
             .field("child_table", &&self.child_table)
             .finish()
     }
@@ -247,27 +226,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
     ) -> NonNull<Self> {
-        Self::new_with_owner(end_depth, lchild, rchild, None)
-    }
-
-    /// Like [`Self::new`] but sets the branch's `owner` field — used by
-    /// the archive-leaf-elimination path so that a Branch created when
-    /// inserting a `LocalLeaf` adopts the entry's archive owner.
-    pub(super) fn new_with_owner(
-        end_depth: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
-        owner: Option<Arc<dyn ArchiveOwner>>,
-    ) -> NonNull<Self> {
         // Compute rchild's hash via the normal path. For LocalLeaf
         // this triggers siphash24; the
-        // [`new_with_owner_and_rchild_hash`] variant skips it when
+        // [`new_with_rchild_hash`] variant skips it when
         // the caller has the hash already.
         let rchild_hash = rchild.hash();
-        Self::new_with_owner_and_rchild_hash(end_depth, lchild, rchild, owner, rchild_hash)
+        Self::new_with_rchild_hash(end_depth, lchild, rchild, rchild_hash)
     }
 
-    /// Variant of [`Self::new_with_owner`] that takes a precomputed
+    /// Variant of [`Self::new`] that takes a precomputed
     /// `rchild_hash` and uses it instead of calling `rchild.hash()`.
     /// Lets archive-ingest divergence paths reuse the
     /// `ArchiveEntry::hash` they already have instead of recomputing
@@ -277,33 +244,24 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// still goes through the normal path — it's typically a Branch
     /// (cached) or heap Leaf (cached), so the only LocalLeaf hash
     /// recompute that matters is on the freshly inserted side.
-    pub(super) fn new_with_owner_and_rchild_hash(
+    pub(super) fn new_with_rchild_hash(
         end_depth: usize,
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
-        owner: Option<Arc<dyn ArchiveOwner>>,
         rchild_hash: u128,
     ) -> NonNull<Self> {
         let lchild_hash = lchild.hash();
-        Self::new_with_owner_and_child_hashes(
-            end_depth,
-            lchild,
-            rchild,
-            owner,
-            lchild_hash,
-            rchild_hash,
-        )
+        Self::new_with_child_hashes(end_depth, lchild, rchild, lchild_hash, rchild_hash)
     }
 
     /// Variant used when both child hashes are already known. This is the
     /// binary fast path for bottom-up archive construction: two `LocalLeaf`
     /// children can become one eager-hash Branch without hashing either row a
     /// second time.
-    pub(super) fn new_with_owner_and_child_hashes(
+    pub(super) fn new_with_child_hashes(
         end_depth: usize,
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
-        owner: Option<Arc<dyn ArchiveOwner>>,
         lchild_hash: u128,
         rchild_hash: u128,
     ) -> NonNull<Self> {
@@ -328,7 +286,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
             addr_of_mut!((*ptr.as_ptr()).hash).write(lchild_hash ^ rchild_hash);
-            addr_of_mut!((*ptr.as_ptr()).owner).write(owner);
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);
 
@@ -342,16 +299,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// hold their known fanout and grow only if cuckoo placement still needs
     /// it.
     ///
-    /// `owner` retains the archive for this complete subtree. Bottom-up archive
-    /// construction gives every Branch the same owner so a later union may
-    /// move a `LocalLeaf` into an empty child slot without losing its nearest
-    /// owning ancestor.
     #[cfg(any(test, feature = "parallel"))]
-    pub(super) fn new_with_owner_and_child_hashes_capacity(
+    pub(super) fn new_with_child_hashes_capacity(
         end_depth: usize,
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
-        owner: Option<Arc<dyn ArchiveOwner>>,
         lchild_hash: u128,
         rchild_hash: u128,
         size: usize,
@@ -381,7 +333,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
             addr_of_mut!((*ptr.as_ptr()).hash).write(lchild_hash ^ rchild_hash);
-            addr_of_mut!((*ptr.as_ptr()).owner).write(owner);
 
             if let Some(displaced) = (*ptr.as_ptr()).child_table.table_insert(lchild) {
                 Self::rc_dec(ptr);
@@ -468,7 +419,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     addr_of_mut!((*ptr.as_ptr()).leaf_count).write((*branch).leaf_count);
                     addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
                     addr_of_mut!((*ptr.as_ptr()).hash).write((*branch).hash);
-                    addr_of_mut!((*ptr.as_ptr()).owner).write((*branch).owner.clone());
                     (*ptr.as_ptr())
                         .child_table
                         .clone_from_slice(&(*branch).child_table);
@@ -512,7 +462,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
                 addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
                 addr_of_mut!((*ptr.as_ptr()).hash).write((*branch).hash);
-                addr_of_mut!((*ptr.as_ptr()).owner).write((*branch).owner.clone());
                 // Note that the child_table is already zeroed by the allocator and therefore None initialized.
 
                 (*branch)
@@ -1262,26 +1211,4 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     // required unsafe access (childleaf deref) locally and avoid forwarding
     // through more wrappers. This keeps the call graph minimal and makes the
     // logic easier to maintain.
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The whole archive-leaf-elimination design depends on
-    /// `Option<Arc<dyn ArchiveOwner>>` niche-optimizing to exactly 16
-    /// bytes (no discriminator byte added). The inner `Arc<dyn Trait>`
-    /// is a fat pointer (data + vtable) whose data pointer is `NonNull`,
-    /// so `None` is represented by a null data pointer — same width as
-    /// `Some`. If this size ever increases, the Branch struct grows
-    /// silently and the design's cost analysis no longer holds; surface
-    /// the regression here.
-    #[test]
-    fn option_arc_dyn_archive_owner_is_sixteen_bytes() {
-        assert_eq!(
-            std::mem::size_of::<Option<Arc<dyn ArchiveOwner>>>(),
-            16,
-            "Option<Arc<dyn ArchiveOwner>> must niche-optimize to 16 bytes"
-        );
-    }
 }

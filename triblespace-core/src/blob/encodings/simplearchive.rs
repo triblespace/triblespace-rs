@@ -423,7 +423,7 @@ mod tests {
             );
             assert_eq!(
                 stats.3, 0,
-                "an archive Branch has no owner for later LocalLeaf movement",
+                "an archive Branch is not covered by its PATCH root guard",
             );
         }
     }

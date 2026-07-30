@@ -59,7 +59,7 @@ static A: CountingAllocator = CountingAllocator;
 /// serial fallback, and exercises every LocalLeaf-vs-LocalLeaf
 /// collision in the trie. The sources are dropped before any
 /// reads so the result must keep all LocalLeaves' backing bytes
-/// alive transitively via the surviving Branches' owner Arcs.
+/// alive transitively via the surviving PATCH root guards.
 #[test]
 fn union_two_overlapping_archives() {
     // Serialize with the decode-allocation test — they share the
