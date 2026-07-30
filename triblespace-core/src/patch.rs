@@ -2704,6 +2704,15 @@ where
         }
     }
 
+    #[inline]
+    fn same_root_body(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.same_body(right),
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
     /// Inserts a shared key into the PATCH.
     ///
     /// Takes an [Entry] object that can be created from a key,
@@ -3181,6 +3190,12 @@ where
         O: Send + Sync,
         V: Send + Sync,
     {
+        // The installed owner guard already covers this exact root. Returning
+        // here also avoids joining two conservative owner covers for a set
+        // whose persistent structure is literally unchanged.
+        if self.same_root_body(&other) {
+            return;
+        }
         if let Some(other_root) = other.root.take() {
             if self.root.is_some() {
                 // Extend the installed lifetime guard before Head::union can
@@ -3212,6 +3227,9 @@ where
         O: Send + Sync,
         V: Send + Sync,
     {
+        if self.same_root_body(other) {
+            return self.clone();
+        }
         if let Some(root) = &self.root {
             if let Some(other_root) = &other.root {
                 #[cfg(feature = "parallel")]
@@ -3239,6 +3257,9 @@ where
         O: Send + Sync,
         V: Send + Sync,
     {
+        if self.same_root_body(other) {
+            return Self::new();
+        }
         if let Some(root) = &self.root {
             if let Some(other_root) = &other.root {
                 #[cfg(feature = "parallel")]
@@ -3377,11 +3398,10 @@ where
     O: KeySchema<KEY_LEN>,
 {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.root, &other.root) {
-            (Some(left), Some(right)) if left.same_body(right) => true,
-            (left, right) => left.as_ref().map(|root| root.hash())
-                == right.as_ref().map(|root| root.hash()),
+        if self.same_root_body(other) {
+            return true;
         }
+        self.root.as_ref().map(|root| root.hash()) == other.root.as_ref().map(|root| root.hash())
     }
 }
 
