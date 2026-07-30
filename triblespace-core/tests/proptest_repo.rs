@@ -417,10 +417,15 @@ mod branch_head_carry {
             .storage_mut()
             .put::<LongString, _>("annotation".to_owned().to_blob())
             .expect("store annotation name");
+        let decoy_head: Inline<Handle<SimpleArchive>> = repo
+            .storage_mut()
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .expect("store decoy head");
         let annotation: TribleSet = entity! { &marker @
             ann::note: "kilroy",
             triblespace_core::metadata::name: annotation_name,
             triblespace_core::repo::branch: unrelated_branch_id,
+            triblespace_core::repo::head: decoy_head,
         }
         .into();
         let base = repo
@@ -483,6 +488,9 @@ mod branch_head_carry {
         assert_eq!(annotation_names, vec![annotation_name]);
         assert!(exists!(pattern!(&after, [{
             marker @ triblespace_core::repo::branch: unrelated_branch_id
+        }])));
+        assert!(exists!(pattern!(&after, [{
+            marker @ triblespace_core::repo::head: decoy_head
         }])));
 
         // And the head genuinely advanced — otherwise this proves nothing.

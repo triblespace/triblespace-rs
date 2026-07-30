@@ -13,6 +13,7 @@ use triblespace_core::inline::encodings::hash::Blake3;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::hash::Hash;
 use triblespace_core::inline::Inline;
+use triblespace_core::macros::{find, pattern};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
@@ -46,10 +47,6 @@ fn parse_branch_id_hex(raw: &str) -> Result<Id> {
 fn read_branch_info(pile: &mut Pile, branch_id: Id) -> Result<BranchInfo> {
     use triblespace::prelude::blobencodings::SimpleArchive;
 
-    let reader = pile
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
-
     let Some(meta_handle) = pile
         .head(branch_id)
         .map_err(|e| anyhow::anyhow!("branch head: {e:?}"))?
@@ -57,33 +54,43 @@ fn read_branch_info(pile: &mut Pile, branch_id: Id) -> Result<BranchInfo> {
         bail!("branch not found: {branch_id:X}");
     };
 
+    // Readers are point-in-time snapshots, so take it after the live pin
+    // head; the collected metadata handle must be visible in this reader.
+    let reader = pile
+        .reader()
+        .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
+
     let meta: TribleSet = reader
         .get::<TribleSet, SimpleArchive>(meta_handle)
         .map_err(|e| anyhow::anyhow!("branch metadata: {e:?}"))?;
 
-    let name_attr = triblespace_core::metadata::name.id();
-    let head_attr = triblespace_core::repo::head.id();
+    let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, branch_id)
+        .map_err(|err| anyhow::anyhow!("branch {branch_id:X} metadata: {err:?}"))?;
 
-    let mut name: Option<String> = None;
-    let mut head: Option<CommitHandle> = None;
-
-    for t in meta.iter() {
-        if t.a() == &name_attr {
-            if name.is_some() {
-                bail!("branch {branch_id:X} has multiple name values");
-            }
-            let handle: Inline<Handle<LongString>> = *t.v();
+    let mut names = find!(
+        handle: Inline<Handle<LongString>>,
+        pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
+    );
+    let name = match (names.next(), names.next()) {
+        (None, None) => None,
+        (Some(handle), None) => {
             let view: View<str> = reader
                 .get(handle)
                 .map_err(|e| anyhow::anyhow!("branch name blob: {e:?}"))?;
-            name = Some(view.to_string());
-        } else if t.a() == &head_attr {
-            if head.is_some() {
-                bail!("branch {branch_id:X} has multiple heads");
-            }
-            head = Some(*t.v::<Handle<SimpleArchive>>());
+            Some(view.to_string())
         }
-    }
+        _ => bail!("branch {branch_id:X} has multiple name values"),
+    };
+
+    let mut heads = find!(
+        head: CommitHandle,
+        pattern!(&meta, [{ branch_entity @ triblespace_core::repo::head: ?head }])
+    );
+    let head = match (heads.next(), heads.next()) {
+        (None, None) => None,
+        (Some(head), None) => Some(head),
+        _ => bail!("branch {branch_id:X} has multiple heads"),
+    };
 
     Ok(BranchInfo { name, head })
 }

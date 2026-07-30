@@ -74,17 +74,16 @@ pub fn run(
             let meta_handle = src_repo.storage_mut().head(bid).ok()??;
             let reader = src_repo.storage_mut().reader().ok()?;
             let meta: TribleSet = reader.get(meta_handle).ok()?;
-            let name_attr = triblespace_core::metadata::name.id();
-            for t in meta.iter() {
-                if *t.a() == name_attr {
-                    let handle: Inline<
-                        Handle<triblespace_core::blob::encodings::longstring::LongString>,
-                    > = Inline::new(t.data[32..64].try_into().unwrap());
-                    let name_view: View<str> = reader.get(handle).ok()?;
-                    return Some(name_view.to_string());
-                }
-            }
-            None
+            let branch_entity = repo::branch::branch_entity(&meta, bid).ok()?;
+            let mut names = find!(
+                handle: Inline<Handle<triblespace_core::blob::encodings::longstring::LongString>>,
+                pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
+            );
+            let (Some(handle), None) = (names.next(), names.next()) else {
+                return None;
+            };
+            let name_view: View<str> = reader.get(handle).ok()?;
+            Some(name_view.to_string())
         })()
         .unwrap_or_else(|| format!("{bid:x}"));
 

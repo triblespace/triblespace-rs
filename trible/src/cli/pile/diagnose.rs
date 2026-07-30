@@ -40,8 +40,9 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     use triblespace_core::id::id_hex;
     use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
     use triblespace_core::inline::Inline;
+    use triblespace_core::macros::{find, pattern};
     use triblespace_core::repo::pile::{Pile, ReadError};
-    use triblespace_core::repo::BlobStoreMeta;
+    use triblespace_core::repo::{self, BlobStoreMeta};
     use triblespace_core::trible::TribleSet;
 
     match Pile::open(pile_path) {
@@ -88,8 +89,6 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                 println!("\nBranches:");
                 let _repo_branch_attr: triblespace_core::id::Id =
                     id_hex!("8694CC73AF96A5E1C7635C677D1B928A");
-                let repo_head_attr: triblespace_core::id::Id =
-                    id_hex!("272FBC56108F336C4D2E17289468C35F");
                 let repo_parent_attr: triblespace_core::id::Id =
                     id_hex!("317044B612C690000D798CA660ECFD2A");
                 let repo_content_attr: triblespace_core::id::Id =
@@ -184,23 +183,42 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                             let mut name_val: Option<String> = None;
                             let mut head_val: Option<Inline<Handle<SimpleArchive>>> = None;
                             let mut meta_err: Option<String> = None;
-                            let name_attr = triblespace_core::metadata::name.id();
                             if meta_present {
                                 match reader.get::<TribleSet, SimpleArchive>(meta_handle) {
-                                    Ok(meta) => {
-                                        for t in meta.iter() {
-                                            if t.a() == &name_attr {
-                                                let h: Inline<Handle<LongString>> = *t.v();
+                                    Ok(meta) => match repo::branch::branch_entity(&meta, bid) {
+                                        Ok(branch_entity) => {
+                                            let mut names = find!(
+                                                name: Inline<Handle<LongString>>,
+                                                pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?name }])
+                                            );
+                                            if let (Some(name), None) = (names.next(), names.next())
+                                            {
                                                 if let Ok(view) = reader
-                                                    .get::<triblespace::prelude::View<str>, _>(h)
+                                                    .get::<triblespace::prelude::View<str>, _>(name)
                                                 {
                                                     name_val = Some(view.as_ref().to_string());
                                                 }
-                                            } else if t.a() == &repo_head_attr {
-                                                head_val = Some(*t.v::<Handle<SimpleArchive>>());
+                                            }
+
+                                            let mut heads = find!(
+                                                head: Inline<Handle<SimpleArchive>>,
+                                                pattern!(&meta, [{ branch_entity @ repo::head: ?head }])
+                                            );
+                                            match (heads.next(), heads.next()) {
+                                                (Some(head), None) => head_val = Some(head),
+                                                (None, None) => {}
+                                                _ => {
+                                                    meta_err = Some(
+                                                        "multiple scoped branch heads".to_string(),
+                                                    )
+                                                }
                                             }
                                         }
-                                    }
+                                        Err(err) => {
+                                            meta_err =
+                                                Some(format!("branch entity malformed: {err:?}"));
+                                        }
+                                    },
                                     Err(e) => {
                                         meta_err = Some(format!("decode failed: {e:?}"));
                                     }

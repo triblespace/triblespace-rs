@@ -48,9 +48,6 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
     std::fs::File::create(&dest)?;
     let mut dst_pile: Pile = Pile::open(&dest)?;
 
-    let name_attr = triblespace_core::metadata::name.id();
-    let head_attr = repo::head.id();
-
     let mut total_branches = 0usize;
     let mut total_blobs = 0usize;
 
@@ -81,20 +78,39 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
             }
         };
 
-        let mut name_handle: Option<Inline<Handle<LongString>>> = None;
-        let mut head_handle: Option<Inline<Handle<SimpleArchive>>> = None;
-        for t in meta.iter() {
-            if t.a() == &name_attr {
-                name_handle = Some(*t.v::<Handle<LongString>>());
-            } else if t.a() == &head_attr {
-                head_handle = Some(*t.v::<Handle<SimpleArchive>>());
+        let branch_entity = match repo::branch::branch_entity(&meta, bid) {
+            Ok(entity) => entity,
+            Err(err) => {
+                eprintln!("skip {bid:X}: malformed branch entity: {err:?}");
+                continue;
             }
-        }
+        };
 
-        let name_handle = match name_handle {
-            Some(h) => h,
-            None => {
+        let mut names = find!(
+            name: Inline<Handle<LongString>>,
+            pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?name }])
+        );
+        let name_handle = match (names.next(), names.next()) {
+            (Some(name), None) => name,
+            (None, None) => {
                 eprintln!("skip {bid:X}: no name in metadata");
+                continue;
+            }
+            _ => {
+                eprintln!("skip {bid:X}: multiple names in branch metadata");
+                continue;
+            }
+        };
+
+        let mut heads = find!(
+            head: Inline<Handle<SimpleArchive>>,
+            pattern!(&meta, [{ branch_entity @ repo::head: ?head }])
+        );
+        let head_handle = match (heads.next(), heads.next()) {
+            (None, None) => None,
+            (Some(head), None) => Some(head),
+            _ => {
+                eprintln!("skip {bid:X}: multiple heads in branch metadata");
                 continue;
             }
         };
@@ -137,7 +153,8 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
         // Mint a fresh branch id, keep the same name and head.
         let branch_id = triblespace_core::id::genid();
         let mut new_meta = repo::branch::branch_metadata(&key, *branch_id, name_handle, head_blob);
-        new_meta += repo::index_home::manifest_tribles(&meta);
+        new_meta += repo::branch::carried_facts(&meta, bid)
+            .map_err(|err| anyhow!("carry branch annotations for {bid:X}: {err:?}"))?;
 
         let new_meta_handle = dst_pile
             .put(new_meta)

@@ -102,27 +102,30 @@ impl Role {
     }
 }
 
-fn classify(meta: &TribleSet) -> Role {
-    // Branch: has metadata::name.
-    let mut name_iter = find!(
-        h: Inline<Handle<triblespace_core::blob::encodings::longstring::LongString>>,
-        pattern!(meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
-    );
-    if name_iter.next().is_some() {
-        // We don't dereference the LongString here (would require an
-        // extra blob fetch); the branch row shows the *id* with a
-        // hint that it's named — `pile branch list` is the place to
-        // get the resolved name.
-        return Role::Branch(String::from("(named — see `pile branch list`)"));
-    }
+fn classify(meta: &TribleSet, pin_id: Id) -> Role {
+    // Branch and tracking markers belong to the unique metadata entity for
+    // this pin. Carried annotations may use the same attributes and must not
+    // change the pin's role.
+    if let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, pin_id) {
+        let mut name_iter = find!(
+            h: Inline<Handle<triblespace_core::blob::encodings::longstring::LongString>>,
+            pattern!(meta, [{ branch_entity @ triblespace_core::metadata::name: ?h }])
+        );
+        if name_iter.next().is_some() {
+            // We don't dereference the LongString here (would require an
+            // extra blob fetch); the branch row shows the *id* with a
+            // hint that it's named — `pile branch list` is the place to
+            // get the resolved name.
+            return Role::Branch(String::from("(named — see `pile branch list`)"));
+        }
 
-    // Tracking pin: has tracking_remote_pin.
-    let mut tracking_iter = find!(
-        v: Id,
-        pattern!(meta, [{ _?e @ triblespace_net::tracking::tracking_remote_pin: ?v }])
-    );
-    if tracking_iter.next().is_some() {
-        return Role::Tracking;
+        let mut tracking_iter = find!(
+            v: Id,
+            pattern!(meta, [{ branch_entity @ triblespace_net::tracking::tracking_remote_pin: ?v }])
+        );
+        if tracking_iter.next().is_some() {
+            return Role::Tracking;
+        }
     }
 
     // Local-only pin: has local_only_pin marker.
@@ -167,7 +170,7 @@ fn run_inspect(path: PathBuf, pin_hex: String) -> Result<()> {
         println!("head:  {}", hex::encode(head.raw));
         let (role, trible_count) = match reader.get::<TribleSet, SimpleArchive>(head) {
             Ok(meta) => {
-                let role = classify(&meta);
+                let role = classify(&meta, pin_id);
                 let count = meta.iter().count();
                 (role, count)
             }
@@ -265,7 +268,7 @@ fn run_list(path: PathBuf) -> Result<()> {
             };
 
             let role = match reader.get::<TribleSet, SimpleArchive>(head) {
-                Ok(meta) => classify(&meta),
+                Ok(meta) => classify(&meta, pin_id),
                 Err(_) => Role::Unnamed,
             };
 
