@@ -3666,6 +3666,10 @@ where
         );
         let mut root = Head::new(0, body);
         let mut hash = first_hash ^ second_hash;
+        if group_start == keys.len() {
+            return (root, hash);
+        }
+        let mut editor = BranchMut::from_head(&mut root);
 
         while group_start < keys.len() {
             let byte = keys[group_start][key_index];
@@ -3681,20 +3685,17 @@ where
                     end_depth + 1,
                 )
             };
-            let mut editor = BranchMut::from_head(&mut root);
-            editor.modify_child(byte, |old| {
-                debug_assert!(old.is_none());
-                Some(child.with_key(byte))
-            });
-            drop(editor);
             hash ^= child_hash;
+            editor.install_child_growing(child.with_key(byte));
             group_start = group_end;
         }
 
-        // The child editor may have dirtied this Branch when it encountered a
-        // LocalLeaf with no resident descriptor. The recursion independently
-        // proved the exact aggregate, so publish it without descending again.
-        root.publish_known_hash(hash);
+        // Bulk installation deliberately defers aggregate maintenance until
+        // every remaining child is present. Rebuild counts, choose any valid
+        // representative, and publish the independently accumulated exact XOR
+        // in one physical table scan.
+        editor.finish_bulk_aggregates(Some(hash));
+        drop(editor);
         (root, hash)
     }
 
