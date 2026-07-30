@@ -3983,6 +3983,27 @@ mod tests {
         left
     }
 
+    /// Drive the large difference scatter while resolving every matched child
+    /// on the caller thread, so the thread-local LocalLeaf hash census is exact.
+    #[cfg(feature = "parallel")]
+    fn difference_with_exhausted_parallel_budget(
+        left: &PATCH<16>,
+        right: &PATCH<16>,
+    ) -> PATCH<16> {
+        let ctx = parallel_union::ParUnionCtx {
+            budget: AtomicUsize::new(0),
+        };
+        let root = left
+            .root
+            .as_ref()
+            .expect("left root")
+            .par_difference_with_ctx(right.root.as_ref().expect("right root"), 0, &ctx);
+        let owners = root.as_ref().and(left.owners.clone());
+        let result = PATCH { root, owners };
+        result.debug_check_owner_invariant();
+        result
+    }
+
     fn test_archive_owner(byte: u8) -> Arc<dyn ArchiveOwner> {
         Arc::new([byte])
     }
@@ -4253,7 +4274,7 @@ mod tests {
         deep_hash_audit(&intersection);
 
         reset_local_leaf_hash_calls();
-        let difference = left.difference(&right);
+        let difference = difference_with_exhausted_parallel_budget(&left, &right);
         assert_eq!(local_leaf_hash_calls(), 0);
         assert_eq!(difference.iter().copied().collect::<Vec<_>>(), vec![a]);
         deep_hash_audit(&difference);
@@ -4394,14 +4415,18 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(local_leaf_hash_calls(), 0);
 
-        // With no difference receipt, the first explicit fingerprint request
-        // pays exactly for the surviving LocalLeaves, not for removed rows or
-        // during the set operation itself.
+        // With no difference receipt, every explicit fingerprint request pays
+        // exactly for the surviving LocalLeaves, not for removed rows or
+        // during the set operation itself. `hash(&self)` deliberately does not
+        // mutate shared cache state.
         let expected_hash = heap_hash_oracle(&difference);
         let before = local_leaf_hash_calls();
         assert_eq!(difference.root_hash(), Some(expected_hash));
         assert_eq!(local_leaf_hash_calls() - before, 2_048);
         assert_eq!(branch_cached_hash(&difference), 0);
+        let before = local_leaf_hash_calls();
+        assert_eq!(difference.root_hash(), Some(expected_hash));
+        assert_eq!(local_leaf_hash_calls() - before, 2_048);
         deep_hash_audit(&difference);
     }
 
