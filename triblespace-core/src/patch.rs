@@ -4504,9 +4504,9 @@ mod tests {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
         let mut b = a;
-        b[0] = 1;
+        b[4] = 1;
         let mut c = a;
-        c[4] = 1;
+        c[4] = 2;
 
         let storage = Arc::new([
             AlignedArchiveKey(a),
