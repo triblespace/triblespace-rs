@@ -53,8 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   therefore move LocalLeaves without hashing them. The large parallel scatter
   carries the same receipts in a transient scalar sidecar and rebuilds only
   structural aggregates, rather than recursively hashing dirty children during
-  bulk finalization. On-demand root hashes and deep debug audits retain the
-  same key-set semantics.
+  bulk finalization. Large partial parallel differences use the same non-hashing
+  finalizer and stay dirty until fingerprint demand, while unchanged, empty,
+  and unary results retain their existing fast paths. On-demand root hashes and
+  deep debug audits retain the same key-set semantics.
 
 - **Known archive batches now start at their irreducible PATCH shape.** Empty
   batches stay empty, singleton tribles remain root LocalLeaves, and batches of

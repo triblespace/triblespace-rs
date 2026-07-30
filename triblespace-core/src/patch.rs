@@ -1846,7 +1846,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 hash: overlap_receipts.into_iter().fold(0, |hash, child| hash ^ child),
             };
             let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
-            ed.finish_union_aggregates(known_hash);
+            ed.finish_bulk_aggregates(known_hash);
             drop(ed);
             return UnionResult {
                 head: this,
@@ -1964,8 +1964,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // per-key `modify_child` here — intersect's collection
         // phase typically has FEW children (heavy filtering kept
         // only the matching subset), so the per-call aggregate
-        // updates beat the fixed `recompute_aggregates` cost. Bench
-        // sanity-checked: install+recompute regressed intersect
+        // updates beat the fixed bulk-finalization cost. Bench
+        // sanity-checked: bulk install+finalize regressed intersect
         // +18% on the 4M/50%-overlap dataset.
         let mut iter = resolved.into_iter().flatten();
         let first = iter.next()?;
@@ -2100,11 +2100,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // Collect non-None results into a fresh Branch. Difference's
         // collection phase typically has MANY children (most keys
         // in `self` survive — only matching+empty subtrees get
-        // filtered), so `install_child_growing` + one
-        // `recompute_aggregates` pass wins handily over per-call
-        // `modify_child`. Mirror of the union pattern; intersect
-        // uses `modify_child` because its collection phase has
-        // far fewer children (heavy filtering).
+        // filtered), so `install_child_growing` plus one structural
+        // finalization pass wins handily over per-call `modify_child`.
+        // Difference has no overlap receipt yet, so the rebuilt multi-child
+        // result deliberately remains hash-dirty rather than traversing all
+        // survivors. Mirror of the union pattern; intersect uses
+        // `modify_child` because its collection phase has far fewer children
+        // (heavy filtering).
         let mut iter = resolved.into_iter().flatten();
         let first = iter.next()?;
         let Some(second) = iter.next() else {
@@ -2121,7 +2123,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             for child in iter {
                 ed.install_child_growing(child.with_start(self_depth));
             }
-            ed.recompute_aggregates();
+            ed.finish_bulk_aggregates(None);
         }
         Some(head_for_branch)
     }
@@ -4335,6 +4337,83 @@ mod tests {
         assert_eq!(parallel.root_hash(), Some(parallel_oracle));
         assert_eq!(local_leaf_hash_calls(), before_verify);
         deep_hash_audit(&parallel);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_difference_defers_hashing_a_large_partial_archive_result() {
+        // `left` is exactly at the parallel threshold: 128 root buckets with
+        // 32 archive-backed variants each. `right` removes the upper half of
+        // every bucket, so collection must rebuild a genuine multi-child root
+        // rather than taking the unchanged, empty, or unary fast path.
+        let left = owned_archive_dirty_parent(0, 128, 0, 32);
+        let right = owned_archive_dirty_parent(0, 128, 16, 16);
+        assert_eq!(left.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(right.len(), 2_048);
+        assert_ne!(branch_cached_hash(&left), 0);
+        assert_eq!(direct_dirty_branch_children(&left), 128);
+
+        reset_local_leaf_hash_calls();
+        let difference = left.difference(&right);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(difference.len(), 2_048);
+        assert_eq!(branch_cached_hash(&difference), 0);
+        assert!(difference.shares_owner_guard(&left));
+        assert_eq!(difference.owners.as_ref().unwrap().owner_count(), 32);
+
+        // The result's own guard must suffice after both source PATCH values
+        // disappear. Exact iteration also proves which half survived without
+        // touching any fingerprint.
+        drop(left);
+        drop(right);
+        let actual = difference.iter().copied().collect::<HashSet<_>>();
+        let expected = (0u8..128)
+            .flat_map(|bucket| {
+                (0u8..16).map(move |variant| {
+                    let mut key = [0u8; 16];
+                    key[0] = bucket;
+                    key[1] = variant;
+                    key
+                })
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // With no difference receipt, the first explicit fingerprint request
+        // pays exactly for the surviving LocalLeaves, not for removed rows or
+        // during the set operation itself.
+        let expected_hash = heap_hash_oracle(&difference);
+        let before = local_leaf_hash_calls();
+        assert_eq!(difference.root_hash(), Some(expected_hash));
+        assert_eq!(local_leaf_hash_calls() - before, 2_048);
+        assert_eq!(branch_cached_hash(&difference), 0);
+        deep_hash_audit(&difference);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_difference_fast_paths_do_no_archive_hash_work() {
+        let left = owned_archive_dirty_parent(0, 128, 0, 32);
+        let disjoint = owned_archive_dirty_parent(128, 128, 0, 32);
+        let expected_hash = left.root_hash().unwrap();
+        assert_ne!(expected_hash, 0);
+
+        // Disjoint roots preserve the whole left tree and its resident receipt.
+        reset_local_leaf_hash_calls();
+        let unchanged = left.difference(&disjoint);
+        assert_eq!(unchanged.len(), left.len());
+        assert_eq!(branch_cached_hash(&unchanged), expected_hash);
+        assert_eq!(unchanged.root_hash(), Some(expected_hash));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert!(unchanged.shares_owner_guard(&left));
+
+        // A - A is decided from equal resident roots and stays empty without
+        // visiting a LocalLeaf.
+        reset_local_leaf_hash_calls();
+        let empty = left.difference(&left);
+        assert!(empty.is_empty());
+        assert_eq!(local_leaf_hash_calls(), 0);
     }
 
     #[test]

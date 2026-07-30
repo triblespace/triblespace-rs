@@ -85,7 +85,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
 
     /// Insert `head` into the child table, growing the allocation if cuckoo
     /// placement fails. Does *not* update the branch's aggregates —
-    /// pair with [`Self::recompute_aggregates`] for bulk rewrites.
+    /// pair with [`Self::finish_bulk_aggregates`] for bulk rewrites.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub fn install_child_growing(&mut self, head: Head<KEY_LEN, O, V>) {
         unsafe {
@@ -93,28 +93,18 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         }
     }
 
-    /// Rebuild aggregates (hash/leaf_count/segment_count/childleaf) in one
-    /// linear pass over `child_table`. Call once after a batch of
-    /// [`Self::install_child_growing`] mutations.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    pub fn recompute_aggregates(&mut self) {
-        unsafe {
-            Branch::recompute_aggregates(&mut self.branch_nn);
-        }
-    }
-
-    /// Finish a bulk union rewrite from its algebraic root-hash receipt.
+    /// Finish a bulk set-operation rewrite from an optional root-hash receipt.
     ///
     /// Counts and the representative child pointer are structural and can be
     /// rebuilt in one table scan. The hash is different: asking every child
     /// for it would cross dirty archive-backed subtrees and defeat lazy hash
-    /// maintenance. `known_hash` is therefore the union-wide receipt derived
-    /// from the two input roots and their exact overlap; `None` (and exact
-    /// zero) installs the conservative zero sentinel.
-    #[cfg(feature = "parallel")]
-    pub fn finish_union_aggregates(&mut self, known_hash: Option<u128>) {
+    /// maintenance. `known_hash` is therefore supplied by the operation when
+    /// its algebra proves an exact receipt; `None` (and exact zero) installs
+    /// the conservative zero sentinel.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub fn finish_bulk_aggregates(&mut self, known_hash: Option<u128>) {
         unsafe {
-            Branch::finish_union_aggregates(&mut self.branch_nn, known_hash);
+            Branch::finish_bulk_aggregates(&mut self.branch_nn, known_hash);
         }
     }
 }
@@ -585,8 +575,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
     /// Insert `head` into the child table, growing if cuckoo placement
     /// fails. Does NOT touch aggregates — used by bulk-rewrite paths
-    /// that recompute aggregates in one pass at the end via
-    /// [`recompute_aggregates`](Self::recompute_aggregates).
+    /// that rebuild structural aggregates in one pass at the end via
+    /// [`finish_bulk_aggregates`](Self::finish_bulk_aggregates).
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) unsafe fn install_child_growing(
         branch_nn: &mut NonNull<Self>,
@@ -601,47 +591,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
-    /// Rebuild aggregate fields (`hash`, `leaf_count`, `segment_count`,
-    /// `childleaf`) from the current child table in one linear pass.
-    /// Cheaper than paying `modify_child`'s per-call accounting when
-    /// many children are being installed in bulk.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    pub(crate) unsafe fn recompute_aggregates(branch_nn: &mut NonNull<Self>) {
-        let branch = branch_nn.as_ptr();
-        let end_depth = (*branch).end_depth as usize;
-        let mut agg_leaf_count: u64 = 0;
-        let mut agg_segment_count: u64 = 0;
-        let mut agg_hash: u128 = 0;
-        let mut first_childleaf: *const [u8; KEY_LEN] = std::ptr::null();
-
-        for child in (*branch).child_table.iter().flatten() {
-            agg_leaf_count += child.count();
-            agg_segment_count += child.count_segment(end_depth);
-            agg_hash ^= child.hash();
-            if first_childleaf.is_null() {
-                first_childleaf = child.childleaf_ptr();
-            }
-        }
-
-        (*branch).leaf_count = agg_leaf_count;
-        (*branch).segment_count = agg_segment_count;
-        (*branch).hash = agg_hash;
-        if !first_childleaf.is_null() {
-            (*branch).childleaf = first_childleaf;
-        }
-
-        #[cfg(debug_assertions)]
-        branch_nn.as_ref().debug_check_invariants();
-    }
-
-    /// Rebuild the non-hash aggregates after a bulk union rewrite and install
-    /// the union-wide hash receipt without traversing a child for its hash.
+    /// Rebuild the non-hash aggregates after a bulk set-operation rewrite and
+    /// install an optional operation-wide hash receipt without traversing a
+    /// child for its hash.
     ///
     /// `known_hash` is exact when present. Zero remains the shared encoding
     /// for both an exact-zero XOR and an unknown cache, so either case is
     /// conservatively verified on demand by [`Head::hash`].
-    #[cfg(feature = "parallel")]
-    pub(crate) unsafe fn finish_union_aggregates(
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) unsafe fn finish_bulk_aggregates(
         branch_nn: &mut NonNull<Self>,
         known_hash: Option<u128>,
     ) {
