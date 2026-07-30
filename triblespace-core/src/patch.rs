@@ -43,6 +43,31 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
+// Manual probe hook. `option_env!` makes the disabled branch a compile-time
+// constant, so ordinary test and release-test binaries retain no census load
+// on the LocalLeaf hash path. Build the ignored census with
+// `PATCH_HASH_CENSUS=1` to count the actual archive-byte SipHash calls.
+#[cfg(test)]
+static LOCAL_LEAF_HASH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+#[inline(always)]
+fn record_local_leaf_hash_call() {
+    if option_env!("PATCH_HASH_CENSUS").is_some() {
+        LOCAL_LEAF_HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn reset_local_leaf_hash_calls() {
+    LOCAL_LEAF_HASH_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn local_leaf_hash_calls() -> u64 {
+    LOCAL_LEAF_HASH_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
 /// branch arm. Below this, the per-key `modify_child` loop wins
@@ -709,6 +734,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => leaf.hash,
             BodyRef::LocalLeaf(bytes) => {
+                #[cfg(test)]
+                record_local_leaf_hash_call();
                 use siphasher::sip128::SipHasher24;
                 use std::ptr::addr_of;
                 // SAFETY: SIP_KEY is initialized at startup; we only read it.
@@ -3305,6 +3332,8 @@ mod tests {
     use std::convert::TryInto;
     use std::iter::FromIterator;
     use std::mem;
+    use std::sync::Arc;
+    use std::time::Instant;
 
     #[test]
     fn head_tag() {
@@ -3931,5 +3960,397 @@ mod tests {
 
         assert_eq!(tree.len(), 3);
         assert_eq!(tree.get(&[2u8; KEY_SIZE]), Some(&3u32));
+    }
+
+    // ---------------------------------------------------------------------
+    // Exact-singleton hash probe
+    // ---------------------------------------------------------------------
+
+    const SINGLETON_PROBE_KEY_LEN: usize = 16;
+
+    #[derive(Clone)]
+    #[repr(C, align(16))]
+    struct AlignedProbeKey([u8; SINGLETON_PROBE_KEY_LEN]);
+
+    /// Owns one archive allocation shared by every LocalLeaf in a probe.
+    /// Keeping both the typed Arc and the erased owner Arc here deliberately
+    /// excludes owner-lifetime changes from the hash experiment.
+    struct LocalLeafProbeFixture {
+        storage: Arc<Vec<AlignedProbeKey>>,
+        owner: Arc<dyn ArchiveOwner>,
+    }
+
+    impl LocalLeafProbeFixture {
+        fn new(keys: Vec<[u8; SINGLETON_PROBE_KEY_LEN]>) -> Self {
+            init_sip_key();
+            let storage = Arc::new(keys.into_iter().map(AlignedProbeKey).collect::<Vec<_>>());
+            let owner: Arc<dyn ArchiveOwner> = storage.clone();
+            Self { storage, owner }
+        }
+
+        fn local_head(
+            &self,
+            index: usize,
+            at_depth: usize,
+        ) -> Head<SINGLETON_PROBE_KEY_LEN, IdentitySchema, ()> {
+            let key = if at_depth == 0 {
+                0
+            } else {
+                self.storage[index].0[at_depth - 1]
+            };
+            let ptr = NonNull::from(&self.storage[index].0);
+            // SAFETY: `AlignedProbeKey` gives 16-byte alignment and this
+            // fixture retains the shared backing allocation for the full
+            // lifetime of every temporary Head and result.
+            unsafe { Head::new_local_leaf(key, ptr) }
+        }
+
+        fn patch(
+            &self,
+            indices: impl IntoIterator<Item = usize>,
+        ) -> PATCH<SINGLETON_PROBE_KEY_LEN, IdentitySchema, ()> {
+            let mut patch = PATCH::new();
+            for index in indices {
+                let ptr = NonNull::from(&self.storage[index].0);
+                // SAFETY: same alignment/lifetime argument as `local_head`;
+                // both PATCHes receive this exact owner Arc identity.
+                let entry = unsafe { ArchiveEntry::new(ptr, &self.owner) };
+                patch.insert_archive(&entry);
+            }
+            patch
+        }
+    }
+
+    struct ArchivePatchPair {
+        // The PATCH branches also retain `owner`; these explicit fields make
+        // the fixture's same-owner premise visible and keep direct pointers
+        // valid even if an operation temporarily returns an ownerless root.
+        _storage: Arc<Vec<AlignedProbeKey>>,
+        _owner: Arc<dyn ArchiveOwner>,
+        left: PATCH<SINGLETON_PROBE_KEY_LEN, IdentitySchema, ()>,
+        right: PATCH<SINGLETON_PROBE_KEY_LEN, IdentitySchema, ()>,
+        union_len: u64,
+        intersect_len: u64,
+        difference_len: u64,
+    }
+
+    fn archived_patch_pair(
+        left_keys: Vec<[u8; SINGLETON_PROBE_KEY_LEN]>,
+        right_keys: Vec<[u8; SINGLETON_PROBE_KEY_LEN]>,
+    ) -> ArchivePatchPair {
+        let mut unique_keys = left_keys.clone();
+        unique_keys.extend(right_keys.iter().copied());
+        unique_keys.sort_unstable();
+        unique_keys.dedup();
+
+        let fixture = LocalLeafProbeFixture::new(unique_keys.clone());
+        let locate = |key: &[u8; SINGLETON_PROBE_KEY_LEN]| {
+            unique_keys
+                .binary_search(key)
+                .expect("probe key must occur in the shared archive")
+        };
+        let left = fixture.patch(left_keys.iter().map(locate));
+        let right = fixture.patch(right_keys.iter().map(locate));
+
+        let left_set: std::collections::BTreeSet<_> = left_keys.into_iter().collect();
+        let right_set: std::collections::BTreeSet<_> = right_keys.into_iter().collect();
+        let union_len = left_set.union(&right_set).count() as u64;
+        let intersect_len = left_set.intersection(&right_set).count() as u64;
+        let difference_len = left_set.difference(&right_set).count() as u64;
+
+        assert!(
+            left.node_stats().3 > 0,
+            "left probe must retain LocalLeaves"
+        );
+        assert!(
+            right.node_stats().3 > 0,
+            "right probe must retain LocalLeaves"
+        );
+
+        ArchivePatchPair {
+            _storage: fixture.storage,
+            _owner: fixture.owner,
+            left,
+            right,
+            union_len,
+            intersect_len,
+            difference_len,
+        }
+    }
+
+    fn encoded_probe_key(domain: u8, value: u32) -> [u8; SINGLETON_PROBE_KEY_LEN] {
+        let mut key = [0u8; SINGLETON_PROBE_KEY_LEN];
+        key[0] = domain;
+        let spread = value.wrapping_mul(0x9e37_79b9).to_be_bytes();
+        key[1..5].copy_from_slice(&spread);
+        key[12..16].copy_from_slice(&value.to_be_bytes());
+        key
+    }
+
+    fn overlap_probe_geometries() -> Vec<(&'static str, ArchivePatchPair)> {
+        const N: u32 = 1024;
+        let disjoint_roots_left = (0..N).map(|value| encoded_probe_key(0x10, value)).collect();
+        let disjoint_roots_right = (0..N).map(|value| encoded_probe_key(0x90, value)).collect();
+
+        let interleaved_left = (0..N)
+            .map(|value| encoded_probe_key(0x40, value * 2))
+            .collect();
+        let interleaved_right = (0..N)
+            .map(|value| encoded_probe_key(0x40, value * 2 + 1))
+            .collect();
+
+        let half_left = (0..N)
+            .map(|value| encoded_probe_key(0x50, value))
+            .collect::<Vec<_>>();
+        let half_right = (N / 2..N + N / 2)
+            .map(|value| encoded_probe_key(0x50, value))
+            .collect::<Vec<_>>();
+
+        let identical = (0..N)
+            .map(|value| encoded_probe_key(0x60, value))
+            .collect::<Vec<_>>();
+
+        vec![
+            (
+                "disjoint_roots",
+                archived_patch_pair(disjoint_roots_left, disjoint_roots_right),
+            ),
+            (
+                "interleaved_disjoint",
+                archived_patch_pair(interleaved_left, interleaved_right),
+            ),
+            ("half_overlap", archived_patch_pair(half_left, half_right)),
+            (
+                "identical",
+                archived_patch_pair(identical.clone(), identical),
+            ),
+        ]
+    }
+
+    fn print_direct_hash_census(
+        scenario: &str,
+        fixture: &LocalLeafProbeFixture,
+        left_index: usize,
+        right_index: usize,
+        at_depth: usize,
+        equal: bool,
+    ) {
+        reset_local_leaf_hash_calls();
+        let union = Head::union(
+            fixture.local_head(left_index, at_depth),
+            fixture.local_head(right_index, at_depth),
+            at_depth,
+        );
+        assert_eq!(union.count(), if equal { 1 } else { 2 });
+        println!(
+            "PATCH_EXACT_SINGLETON_CENSUS,direct,{scenario},union,{}",
+            local_leaf_hash_calls()
+        );
+        drop(union);
+
+        let left = fixture.local_head(left_index, at_depth);
+        let right = fixture.local_head(right_index, at_depth);
+        reset_local_leaf_hash_calls();
+        let intersect = left.intersect(&right, at_depth);
+        assert_eq!(intersect.is_some(), equal);
+        println!(
+            "PATCH_EXACT_SINGLETON_CENSUS,direct,{scenario},intersect,{}",
+            local_leaf_hash_calls()
+        );
+        drop(intersect);
+
+        reset_local_leaf_hash_calls();
+        let difference = left.difference(&right, at_depth);
+        assert_eq!(difference.is_none(), equal);
+        println!(
+            "PATCH_EXACT_SINGLETON_CENSUS,direct,{scenario},difference,{}",
+            local_leaf_hash_calls()
+        );
+    }
+
+    fn print_patch_hash_census(scenario: &str, pair: &ArchivePatchPair) {
+        let mut union_left = pair.left.clone();
+        let union_right = pair.right.clone();
+        reset_local_leaf_hash_calls();
+        union_left.union(union_right);
+        assert_eq!(union_left.len(), pair.union_len);
+        println!(
+            "PATCH_EXACT_SINGLETON_CENSUS,patch,{scenario},union,{}",
+            local_leaf_hash_calls()
+        );
+
+        reset_local_leaf_hash_calls();
+        let intersect = pair.left.intersect(&pair.right);
+        assert_eq!(intersect.len(), pair.intersect_len);
+        println!(
+            "PATCH_EXACT_SINGLETON_CENSUS,patch,{scenario},intersect,{}",
+            local_leaf_hash_calls()
+        );
+
+        reset_local_leaf_hash_calls();
+        let difference = pair.left.difference(&pair.right);
+        assert_eq!(difference.len(), pair.difference_len);
+        println!(
+            "PATCH_EXACT_SINGLETON_CENSUS,patch,{scenario},difference,{}",
+            local_leaf_hash_calls()
+        );
+    }
+
+    /// Exact operation-level census. This stays ignored because it is a
+    /// release probe, not a correctness test. Compile it with
+    /// `PATCH_HASH_CENSUS=1`; without that compile-time switch ordinary test
+    /// binaries have no counter instructions in `Head::hash`.
+    #[test]
+    #[ignore = "manual release LocalLeaf hash-call census"]
+    fn exact_singleton_localleaf_hash_census() {
+        assert!(
+            option_env!("PATCH_HASH_CENSUS").is_some(),
+            "rebuild this ignored probe with PATCH_HASH_CENSUS=1"
+        );
+
+        let mut disjoint_a = [0u8; SINGLETON_PROBE_KEY_LEN];
+        disjoint_a[0] = 0x10;
+        let mut disjoint_b = [0u8; SINGLETON_PROBE_KEY_LEN];
+        disjoint_b[0] = 0x90;
+        let disjoint = LocalLeafProbeFixture::new(vec![disjoint_a, disjoint_b]);
+        print_direct_hash_census("disjoint_roots", &disjoint, 0, 1, 0, false);
+
+        let mut sibling_a = [0x44u8; SINGLETON_PROBE_KEY_LEN];
+        sibling_a[SINGLETON_PROBE_KEY_LEN - 1] = 0x10;
+        let mut sibling_b = sibling_a;
+        sibling_b[SINGLETON_PROBE_KEY_LEN - 1] = 0x20;
+        let siblings = LocalLeafProbeFixture::new(vec![sibling_a, sibling_b]);
+        print_direct_hash_census("same_parent_distinct", &siblings, 0, 1, 1, false);
+
+        let equal = LocalLeafProbeFixture::new(vec![sibling_a]);
+        print_direct_hash_census("same_parent_equal", &equal, 0, 0, 1, true);
+
+        for (scenario, pair) in overlap_probe_geometries() {
+            print_patch_hash_census(scenario, &pair);
+        }
+    }
+
+    fn benchmark_samples(
+        iterations: usize,
+        samples: usize,
+        mut operation: impl FnMut(),
+    ) -> [f64; 3] {
+        for _ in 0..iterations.min(16) {
+            operation();
+        }
+
+        let mut nanos_per_operation = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                operation();
+            }
+            nanos_per_operation.push(start.elapsed().as_secs_f64() * 1e9 / iterations as f64);
+        }
+        nanos_per_operation.sort_by(f64::total_cmp);
+        [
+            nanos_per_operation[0],
+            nanos_per_operation[nanos_per_operation.len() / 2],
+            *nanos_per_operation.last().expect("at least one sample"),
+        ]
+    }
+
+    fn print_benchmark(
+        level: &str,
+        scenario: &str,
+        operation: &str,
+        iterations: usize,
+        samples: usize,
+        run: impl FnMut(),
+    ) {
+        let [min, median, max] = benchmark_samples(iterations, samples, run);
+        println!(
+            "PATCH_EXACT_SINGLETON_BENCH,{level},{scenario},{operation},\
+             iterations={iterations},samples={samples},min_ns={min:.3},\
+             median_ns={median:.3},max_ns={max:.3}"
+        );
+    }
+
+    fn print_direct_benchmarks(
+        scenario: &str,
+        fixture: &LocalLeafProbeFixture,
+        left_index: usize,
+        right_index: usize,
+        at_depth: usize,
+    ) {
+        const ITERATIONS: usize = 40_000;
+        const SAMPLES: usize = 15;
+        let left = fixture.local_head(left_index, at_depth);
+        let right = fixture.local_head(right_index, at_depth);
+
+        print_benchmark("direct", scenario, "union", ITERATIONS, SAMPLES, || {
+            let result = Head::union(left.clone(), right.clone(), at_depth);
+            std::hint::black_box(result.count());
+        });
+        print_benchmark("direct", scenario, "intersect", ITERATIONS, SAMPLES, || {
+            let result = left.intersect(&right, at_depth);
+            std::hint::black_box(result.as_ref().map(Head::count));
+        });
+        print_benchmark(
+            "direct",
+            scenario,
+            "difference",
+            ITERATIONS,
+            SAMPLES,
+            || {
+                let result = left.difference(&right, at_depth);
+                std::hint::black_box(result.as_ref().map(Head::count));
+            },
+        );
+    }
+
+    fn print_patch_benchmarks(scenario: &str, pair: &ArchivePatchPair) {
+        const ITERATIONS: usize = 64;
+        const SAMPLES: usize = 15;
+        print_benchmark("patch", scenario, "union", ITERATIONS, SAMPLES, || {
+            let mut left = pair.left.clone();
+            left.union(pair.right.clone());
+            std::hint::black_box(left.len());
+        });
+        print_benchmark("patch", scenario, "intersect", ITERATIONS, SAMPLES, || {
+            let result = pair.left.intersect(&pair.right);
+            std::hint::black_box(result.len());
+        });
+        print_benchmark("patch", scenario, "difference", ITERATIONS, SAMPLES, || {
+            let result = pair.left.difference(&pair.right);
+            std::hint::black_box(result.len());
+        });
+    }
+
+    /// Same fixtures as the census, timed without the compile-time census
+    /// switch so the release binary contains no instrumentation branch.
+    #[test]
+    #[ignore = "manual release wall-time benchmark"]
+    fn exact_singleton_wall_time_benchmark() {
+        assert!(
+            option_env!("PATCH_HASH_CENSUS").is_none(),
+            "wall timing must be rebuilt without PATCH_HASH_CENSUS"
+        );
+
+        let mut disjoint_a = [0u8; SINGLETON_PROBE_KEY_LEN];
+        disjoint_a[0] = 0x10;
+        let mut disjoint_b = [0u8; SINGLETON_PROBE_KEY_LEN];
+        disjoint_b[0] = 0x90;
+        let disjoint = LocalLeafProbeFixture::new(vec![disjoint_a, disjoint_b]);
+        print_direct_benchmarks("disjoint_roots", &disjoint, 0, 1, 0);
+
+        let mut sibling_a = [0x44u8; SINGLETON_PROBE_KEY_LEN];
+        sibling_a[SINGLETON_PROBE_KEY_LEN - 1] = 0x10;
+        let mut sibling_b = sibling_a;
+        sibling_b[SINGLETON_PROBE_KEY_LEN - 1] = 0x20;
+        let siblings = LocalLeafProbeFixture::new(vec![sibling_a, sibling_b]);
+        print_direct_benchmarks("same_parent_distinct", &siblings, 0, 1, 1);
+
+        let equal = LocalLeafProbeFixture::new(vec![sibling_a]);
+        print_direct_benchmarks("same_parent_equal", &equal, 0, 0, 1);
+
+        for (scenario, pair) in overlap_probe_geometries() {
+            print_patch_benchmarks(scenario, &pair);
+        }
     }
 }
