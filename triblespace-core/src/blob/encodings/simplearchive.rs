@@ -445,6 +445,104 @@ mod tests {
         Blob::new(bytes)
     }
 
+    #[cfg(feature = "parallel")]
+    #[derive(Clone, Copy)]
+    enum VariedArchiveGeometry {
+        EntityLike,
+        HighEntropy,
+        LongPrefixSkew,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl VariedArchiveGeometry {
+        fn name(self) -> &'static str {
+            match self {
+                Self::EntityLike => "entity_like_control",
+                Self::HighEntropy => "high_entropy_uniform_eav",
+                Self::LongPrefixSkew => "long_prefix_low_cardinality",
+            }
+        }
+
+        fn row(self, index: usize) -> [u8; 64] {
+            match self {
+                Self::EntityLike => fixture_row(index),
+                Self::HighEntropy => high_entropy_row(index),
+                Self::LongPrefixSkew => long_prefix_skew_row(index),
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn avalanche_word(mut word: u64) -> u64 {
+        // Every operation is bijective on u64, so each fixed-salt output word
+        // remains an injective function of the row ordinal.
+        word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        word ^ (word >> 31)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn high_entropy_row(index: usize) -> [u8; 64] {
+        let ordinal = u64::try_from(index).expect("fixture ordinal must fit u64");
+        let mut row = [0u8; 64];
+        for (word_index, chunk) in row.chunks_exact_mut(8).enumerate() {
+            let salt = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(word_index as u64 + 1);
+            chunk.copy_from_slice(&avalanche_word(ordinal ^ salt).to_be_bytes());
+        }
+        // Distinct salts mean neither 16-byte identifier can have both words
+        // zero. The first word alone is also injective, proving row uniqueness.
+        debug_assert!(row[..16].iter().any(|byte| *byte != 0));
+        debug_assert!(row[16..32].iter().any(|byte| *byte != 0));
+        row
+    }
+
+    #[cfg(feature = "parallel")]
+    fn long_prefix_skew_row(index: usize) -> [u8; 64] {
+        const ENTITY_CARDINALITY: usize = 256;
+        const ATTRIBUTE_CARDINALITY: usize = 16;
+
+        let mut row = [0u8; 64];
+        let entity = index % ENTITY_CARDINALITY + 1;
+        let attribute = (index / ENTITY_CARDINALITY) % ATTRIBUTE_CARDINALITY + 1;
+        let value = index + 1;
+        row[12..16].copy_from_slice(
+            &u32::try_from(entity)
+                .expect("fixture entity must fit u32")
+                .to_be_bytes(),
+        );
+        row[28..32].copy_from_slice(
+            &u32::try_from(attribute)
+                .expect("fixture attribute must fit u32")
+                .to_be_bytes(),
+        );
+        row[56..64].copy_from_slice(
+            &u64::try_from(value)
+                .expect("fixture value must fit u64")
+                .to_be_bytes(),
+        );
+        row
+    }
+
+    #[cfg(feature = "parallel")]
+    fn varied_fixture_blob(geometry: VariedArchiveGeometry, len: usize) -> Blob<SimpleArchive> {
+        let mut rows = (0..len)
+            .map(|index| geometry.row(index))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows.len(), len);
+        assert!(rows
+            .iter()
+            .all(|row| Trible::as_transmute_force_raw(row).is_some()));
+        assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            rows.as_ptr() as usize & 0x0f,
+            0,
+            "archive fixture allocation must support LocalLeaves",
+        );
+        let bytes: Bytes = rows.into();
+        Blob::new(bytes)
+    }
+
     fn blob_from_rows(rows: Vec<[u8; 64]>) -> Blob<SimpleArchive> {
         let bytes: Bytes = rows.into();
         Blob::new(bytes)
@@ -756,6 +854,99 @@ mod tests {
                 baseline.as_secs_f64() / candidate.as_secs_f64(),
                 transient_bytes as f64 / (1024.0 * 1024.0),
             );
+        }
+    }
+
+    /// Public parallel chunk+online+union versus the matching chunk DAG with
+    /// direct-capacity bottom-up workers, across materially different trie
+    /// shapes. Dataset generation, sorting, canonical validation, and parity
+    /// oracles are outside the timed samples; result destruction is after each
+    /// sample.
+    ///
+    /// The reported logical payload accounting is exact for the candidate's
+    /// explicit arrays: one `u128` hash and one `u32` permutation slot per row.
+    /// `full_overlap_payload_bytes` is their worst-case sum if every chunk is
+    /// building concurrently; instantaneous overlap may be lower. This excludes
+    /// allocator metadata, Rayon task/result vectors, input archive bytes, and
+    /// the output PATCH nodes shared by both paths.
+    /// Run with:
+    ///
+    /// `cargo test -p triblespace-core --release --features parallel chunked_bottom_up_archive_varied_data_timing -- --ignored --nocapture --test-threads=1`
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[ignore = "manual varied-data 100k/1m construction benchmark"]
+    fn chunked_bottom_up_archive_varied_data_timing() {
+        fn median(samples: &mut [Duration]) -> Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        let geometries = [
+            VariedArchiveGeometry::HighEntropy,
+            VariedArchiveGeometry::LongPrefixSkew,
+            VariedArchiveGeometry::EntityLike,
+        ];
+        for geometry in geometries {
+            for (len, rounds) in [(100_000usize, 6usize), (1_000_000, 4)] {
+                let blob = varied_fixture_blob(geometry, len);
+
+                let baseline_oracle = TribleSet::try_from_blob(blob.clone()).unwrap();
+                let candidate_oracle =
+                    try_from_blob_chunked_bottom_up_for_test(blob.clone()).unwrap();
+                assert_all_six_parity(&candidate_oracle, &baseline_oracle, len);
+                drop(candidate_oracle);
+                drop(baseline_oracle);
+
+                let mut baseline_samples = Vec::with_capacity(rounds);
+                let mut candidate_samples = Vec::with_capacity(rounds);
+                for round in 0..rounds {
+                    let baseline = || {
+                        let start = Instant::now();
+                        let set = TribleSet::try_from_blob(black_box(blob.clone())).unwrap();
+                        let elapsed = start.elapsed();
+                        black_box(set.len());
+                        drop(set);
+                        elapsed
+                    };
+                    let candidate = || {
+                        let start = Instant::now();
+                        let set = try_from_blob_chunked_bottom_up_for_test(black_box(blob.clone()))
+                            .unwrap();
+                        let elapsed = start.elapsed();
+                        black_box(set.len());
+                        drop(set);
+                        elapsed
+                    };
+                    let (baseline_elapsed, candidate_elapsed) = if round % 2 == 0 {
+                        (baseline(), candidate())
+                    } else {
+                        let candidate_elapsed = candidate();
+                        (baseline(), candidate_elapsed)
+                    };
+                    baseline_samples.push(baseline_elapsed);
+                    candidate_samples.push(candidate_elapsed);
+                }
+
+                let baseline = median(&mut baseline_samples);
+                let candidate = median(&mut candidate_samples);
+                let threads = rayon::current_num_threads().max(1);
+                let chunk_size = len.div_ceil(threads).max(1);
+                let chunk_count = len.div_ceil(chunk_size);
+                let hash_payload_bytes = len * std::mem::size_of::<u128>();
+                let permutation_payload_bytes = len * std::mem::size_of::<u32>();
+                let full_overlap_payload_bytes = hash_payload_bytes + permutation_payload_bytes;
+                let max_chunk_rows = len.min(chunk_size);
+                let max_chunk_payload_bytes =
+                    max_chunk_rows * (std::mem::size_of::<u128>() + std::mem::size_of::<u32>());
+                println!(
+                    "chunked_bottom_up_archive_varied geometry={} len={len} threads={threads} chunks={chunk_count} baseline_ms={:.3} candidate_ms={:.3} speedup={:.3}x hash_payload_bytes={hash_payload_bytes} permutation_payload_bytes={permutation_payload_bytes} full_overlap_payload_bytes={full_overlap_payload_bytes} full_overlap_payload_mib={:.3} max_chunk_payload_bytes={max_chunk_payload_bytes}",
+                    geometry.name(),
+                    baseline.as_secs_f64() * 1e3,
+                    candidate.as_secs_f64() * 1e3,
+                    baseline.as_secs_f64() / candidate.as_secs_f64(),
+                    full_overlap_payload_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
         }
     }
 }
