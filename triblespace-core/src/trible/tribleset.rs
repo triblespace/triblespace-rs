@@ -1142,8 +1142,15 @@ mod tests {
         assert!(coherent.coherent_resident_identity().is_some());
 
         let mut diverged = coherent;
+        let removed = *diverged.eva.iter().next().expect("non-empty fixture");
+        diverged.eva.remove(&removed);
         let extra = [0xabu8; TRIBLE_LEN];
         diverged.eva.insert(&Entry::new(&extra));
+        assert_eq!(diverged.eva.len(), diverged.eav.len());
+        assert_ne!(
+            diverged.eva.resident_identity(),
+            diverged.eav.resident_identity(),
+        );
         assert!(diverged.coherent_resident_identity().is_none());
     }
 
