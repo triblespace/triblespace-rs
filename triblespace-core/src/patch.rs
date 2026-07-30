@@ -986,6 +986,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         (self.tptr.as_ptr() as u64 >> 56) as u8
     }
 
+    /// Exact structural identity, independent of the contextual routing byte
+    /// stored in the Head. Branch and heap-leaf bodies are immutable while
+    /// shared, and LocalLeaf bytes are immutable for their retained-owner
+    /// lifetime, so one body pointer denotes one key set without consulting a
+    /// probabilistic fingerprint.
+    #[inline]
+    fn same_body(&self, other: &Self) -> bool {
+        let body_and_tag = Self::BODY_MASK | Self::TAG_MASK;
+        (self.tptr.as_ptr() as u64 & body_and_tag)
+            == (other.tptr.as_ptr() as u64 & body_and_tag)
+    }
+
     #[inline]
     pub(crate) fn with_key(mut self, key: u8) -> Self {
         self.tptr =
@@ -1442,6 +1454,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// hashes a `LocalLeaf` merely to keep the result cache warm. The first
     /// actual fingerprint consumer pays for whatever dirty region remains.
     pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
+        if this.same_body(&other) {
+            return this;
+        }
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
         let this_hash = this.known_hash();
@@ -1587,6 +1602,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
+        if this.same_body(&other) {
+            return this;
+        }
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
 
@@ -1786,6 +1804,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
+        if self.same_body(other) {
+            return Some(self.clone());
+        }
         let self_depth = self.end_depth();
         let other_depth = other.end_depth();
         if self_depth == KEY_LEN && other_depth == KEY_LEN {
@@ -1915,6 +1936,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
+        if self.same_body(other) {
+            return None;
+        }
         let self_depth = self.end_depth();
         let other_depth = other.end_depth();
         if self_depth == KEY_LEN && other_depth == KEY_LEN {
@@ -2291,6 +2315,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // call the owned helper `union` directly.
 
     pub(crate) fn intersect(&self, other: &Self, at_depth: usize) -> Option<Self> {
+        if self.same_body(other) {
+            return Some(self.clone());
+        }
         let self_depth = self.end_depth();
         let other_depth = other.end_depth();
         if self_depth == KEY_LEN && other_depth == KEY_LEN {
@@ -2387,6 +2414,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// This is the set of elements that are in self but not in other.
     /// If the difference is empty, None is returned.
     pub(crate) fn difference(&self, other: &Self, at_depth: usize) -> Option<Self> {
+        if self.same_body(other) {
+            return None;
+        }
         let self_depth = self.end_depth();
         let other_depth = other.end_depth();
         if self_depth == KEY_LEN && other_depth == KEY_LEN {
@@ -3351,7 +3381,11 @@ where
     O: KeySchema<KEY_LEN>,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.root.as_ref().map(|root| root.hash()) == other.root.as_ref().map(|root| root.hash())
+        match (&self.root, &other.root) {
+            (Some(left), Some(right)) if left.same_body(right) => true,
+            (left, right) => left.as_ref().map(|root| root.hash())
+                == right.as_ref().map(|root| root.hash()),
+        }
     }
 }
 
@@ -3909,6 +3943,49 @@ mod tests {
         patch.debug_check_deep_hash_invariant();
         #[cfg(not(debug_assertions))]
         let _ = patch;
+    }
+
+    #[test]
+    fn shared_body_shortcuts_need_neither_fingerprints_nor_matching_route_bytes() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+
+        let mut original = owned_archive_single(a);
+        original.union(owned_archive_single(b));
+        assert_eq!(branch_cached_hash(&original), 0);
+        let snapshot = original.clone();
+
+        let root = snapshot.root.as_ref().expect("fixture must be non-empty");
+        let rerouted = root.clone().with_key(root.key().wrapping_add(1));
+        assert!(root.same_body(&rerouted));
+        drop(rerouted);
+
+        reset_local_leaf_hash_calls();
+        original.union(snapshot.clone());
+        assert!(
+            original
+                .root
+                .as_ref()
+                .unwrap()
+                .same_body(snapshot.root.as_ref().unwrap()),
+            "union should retain the exact shared body",
+        );
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        let intersection = original.intersect(&snapshot);
+        assert!(
+            intersection
+                .root
+                .as_ref()
+                .unwrap()
+                .same_body(snapshot.root.as_ref().unwrap()),
+        );
+        assert!(original.difference(&snapshot).is_empty());
+        assert_eq!(original, snapshot);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&original);
     }
 
     #[test]
