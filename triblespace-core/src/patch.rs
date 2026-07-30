@@ -3866,6 +3866,7 @@ mod tests {
         variant: usize,
     ) -> PATCH<16> {
         assert!(bucket_start + bucket_count <= 256);
+        assert!(bucket_count >= 2);
         assert!(variant < 256);
         let storage = Arc::new(
             (bucket_start..bucket_start + bucket_count)
@@ -3878,8 +3879,10 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let owner: Arc<dyn ArchiveOwner> = storage.clone();
-        let mut patch = PATCH::new();
-        for key in storage.iter() {
+        let first = unsafe { ArchiveEntry::new(NonNull::from(&storage[0].0), &owner) };
+        let second = unsafe { ArchiveEntry::new(NonNull::from(&storage[1].0), &owner) };
+        let mut patch = PATCH::from_archive_pair(&first, &second);
+        for key in storage.iter().skip(2) {
             let entry = unsafe { ArchiveEntry::new(NonNull::from(&key.0), &owner) };
             patch.insert_archive(&entry);
         }
@@ -4249,6 +4252,8 @@ mod tests {
         let right = owned_archive_dirty_parent(128, 128, 0, 32);
         assert_eq!(left.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
         assert_eq!(right.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_ne!(branch_cached_hash(&left), 0);
+        assert_ne!(branch_cached_hash(&right), 0);
         assert_eq!(direct_dirty_branch_children(&left), 128);
         assert_eq!(direct_dirty_branch_children(&right), 128);
 
@@ -4282,6 +4287,8 @@ mod tests {
         // dirty, so structural descent must identify those 128 equal keys.
         let left = owned_archive_dirty_parent(0, 128, 0, 32);
         let right = owned_archive_dirty_parent(0, 128, 31, 32);
+        assert_ne!(branch_cached_hash(&left), 0);
+        assert_ne!(branch_cached_hash(&right), 0);
         assert_eq!(direct_dirty_branch_children(&left), 128);
         assert_eq!(direct_dirty_branch_children(&right), 128);
 
