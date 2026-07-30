@@ -86,16 +86,23 @@ fn ordered_rows(variant_count: u8) -> Vec<[u8; TRIBLE_LEN]> {
     ordered_archive_rows(0, BUCKETS as u16, 0, variant_count)
 }
 
-fn archive_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
+fn heap_tribleset(rows: &[[u8; TRIBLE_LEN]]) -> TribleSet {
     let mut source = TribleSet::new();
     for row in rows {
         let trible = Trible::force_raw(*row).expect("fixture trible must be valid");
         source.insert(&trible);
     }
+    source
+}
 
+fn archive_tribleset(rows: &[[u8; TRIBLE_LEN]]) -> TribleSet {
+    let source = heap_tribleset(rows);
     let archive: Blob<SimpleArchive> = SimpleArchive::encode(&source);
-    let decoded: TribleSet = archive.try_from_blob().expect("fixture archive must decode");
-    decoded.eav
+    archive.try_from_blob().expect("fixture archive must decode")
+}
+
+fn archive_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
+    archive_tribleset(rows).eav
 }
 
 /// Turn an exact archive template into a semantically identical dirty one
@@ -129,20 +136,20 @@ fn archive_variant(bucket_start: u16, bucket_count: u16, variant: u8) -> EavPatc
     archive_patch(&rows)
 }
 
-fn balanced_union(mut patches: Vec<EavPatch>) -> EavPatch {
-    assert!(!patches.is_empty(), "balanced union needs at least one tree");
-    while patches.len() > 1 {
-        let mut next = Vec::with_capacity(patches.len().div_ceil(2));
-        let mut iter = patches.into_iter();
+fn balanced_merge<T>(mut values: Vec<T>, mut merge: impl FnMut(&mut T, T)) -> T {
+    assert!(!values.is_empty(), "balanced merge needs at least one value");
+    while values.len() > 1 {
+        let mut next = Vec::with_capacity(values.len().div_ceil(2));
+        let mut iter = values.into_iter();
         while let Some(mut left) = iter.next() {
             if let Some(right) = iter.next() {
-                left.union(right);
+                merge(&mut left, right);
             }
             next.push(left);
         }
-        patches = next;
+        values = next;
     }
-    patches.pop().expect("non-empty union round")
+    values.pop().expect("non-empty merge round")
 }
 
 fn archive_variants_in(
@@ -151,15 +158,45 @@ fn archive_variants_in(
     variant_start: u8,
     variant_count: u8,
 ) -> EavPatch {
-    balanced_union(
+    balanced_merge(
         (variant_start as u16..variant_start as u16 + variant_count as u16)
             .map(|variant| archive_variant(bucket_start, bucket_count, variant as u8))
             .collect(),
+        |left, right| left.union(right),
     )
 }
 
 fn archive_variants(variant_count: u8) -> EavPatch {
     archive_variants_in(0, BUCKETS as u16, 0, variant_count)
+}
+
+fn archive_tribleset_variant(
+    bucket_start: u16,
+    bucket_count: u16,
+    variant: u8,
+) -> TribleSet {
+    let rows = ordered_archive_rows(bucket_start, bucket_count, variant, 1);
+    archive_tribleset(&rows)
+}
+
+fn archive_tribleset_variants_in(
+    bucket_start: u16,
+    bucket_count: u16,
+    variant_start: u8,
+    variant_count: u8,
+) -> TribleSet {
+    balanced_merge(
+        (variant_start as u16..variant_start as u16 + variant_count as u16)
+            .map(|variant| {
+                archive_tribleset_variant(bucket_start, bucket_count, variant as u8)
+            })
+            .collect(),
+        |left, right| left.union(right),
+    )
+}
+
+fn archive_tribleset_variants(variant_count: u8) -> TribleSet {
+    archive_tribleset_variants_in(0, BUCKETS as u16, 0, variant_count)
 }
 
 fn heap_oracle(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
@@ -234,6 +271,90 @@ fn assert_fixture_rows(
         FixtureStorage::Heap => assert_heap_rows(label, patch, expected),
         FixtureStorage::Local => assert_local_rows(label, patch, expected),
     }
+}
+
+fn assert_tribleset_rows(
+    storage: FixtureStorage,
+    label: &str,
+    set: &TribleSet,
+    expected: &[[u8; TRIBLE_LEN]],
+) {
+    assert_eq!(set.len(), expected.len(), "{label}: wrong length");
+    for (index, stats) in [
+        ("eav", set.eav.node_stats()),
+        ("eva", set.eva.node_stats()),
+        ("aev", set.aev.node_stats()),
+        ("ave", set.ave.node_stats()),
+        ("vea", set.vea.node_stats()),
+        ("vae", set.vae.node_stats()),
+    ] {
+        match storage {
+            FixtureStorage::Heap => {
+                assert_eq!(stats.2, expected.len() as u64, "{label}/{index}: heap leaves");
+                assert_eq!(stats.3, 0, "{label}/{index}: unexpected LocalLeaves");
+            }
+            FixtureStorage::Local => {
+                assert_eq!(stats.2, 0, "{label}/{index}: unexpected heap leaves");
+                assert_eq!(
+                    stats.3,
+                    expected.len() as u64,
+                    "{label}/{index}: LocalLeaves"
+                );
+            }
+        }
+    }
+
+    macro_rules! assert_index_rows {
+        ($index:ident) => {{
+            let mut actual: Vec<_> = set.$index.iter().copied().collect();
+            actual.sort_unstable();
+            assert_eq!(
+                actual,
+                expected,
+                "{label}/{}: wrong rows",
+                stringify!($index)
+            );
+        }};
+    }
+    assert_index_rows!(eav);
+    assert_index_rows!(eva);
+    assert_index_rows!(aev);
+    assert_index_rows!(ave);
+    assert_index_rows!(vea);
+    assert_index_rows!(vae);
+}
+
+fn demote_tribleset_via_duplicate(
+    mut exact: TribleSet,
+    expected: &[[u8; TRIBLE_LEN]],
+    duplicate: [u8; TRIBLE_LEN],
+) -> TribleSet {
+    assert!(expected.binary_search(&duplicate).is_ok());
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        "TribleSet duplicate-demotion source",
+        &exact,
+        expected,
+    );
+    let singleton_rows = std::slice::from_ref(&duplicate);
+    let singleton = archive_tribleset(singleton_rows);
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        "TribleSet duplicate-demotion singleton",
+        &singleton,
+        singleton_rows,
+    );
+
+    // All six singleton indexes have unknown LocalLeaf roots. The semantic
+    // no-op therefore demotes all six exact aggregate roots independently.
+    exact.union(singleton);
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        "TribleSet duplicate-demotion result",
+        &exact,
+        expected,
+    );
+    exact
 }
 
 struct UnionCase {
@@ -597,10 +718,239 @@ fn bench_difference(c: &mut Criterion) {
     group.finish();
 }
 
+struct TribleSetBinaryCase {
+    name: &'static str,
+    left: TribleSet,
+    right: TribleSet,
+    oracle: TribleSet,
+}
+
+fn union_triblesets(left: &TribleSet, right: &TribleSet) -> TribleSet {
+    let mut result = left.clone();
+    result.union(right.clone());
+    result
+}
+
+fn checked_tribleset_case(
+    name: &'static str,
+    operation: &str,
+    left: TribleSet,
+    left_rows: &[[u8; TRIBLE_LEN]],
+    right: TribleSet,
+    right_rows: &[[u8; TRIBLE_LEN]],
+    expected: &[[u8; TRIBLE_LEN]],
+    evaluate: impl FnOnce(&TribleSet, &TribleSet) -> TribleSet,
+) -> TribleSetBinaryCase {
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        &format!("{name} TribleSet {operation} left source"),
+        &left,
+        left_rows,
+    );
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        &format!("{name} TribleSet {operation} right source"),
+        &right,
+        right_rows,
+    );
+
+    let oracle = heap_tribleset(expected);
+    assert_tribleset_rows(
+        FixtureStorage::Heap,
+        &format!("{name} TribleSet {operation} heap oracle"),
+        &oracle,
+        expected,
+    );
+    let result = evaluate(&left, &right);
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        &format!("{name} TribleSet {operation} result"),
+        &result,
+        expected,
+    );
+    assert_eq!(
+        result, oracle,
+        "{name}: TribleSet {operation} disagrees with heap oracle"
+    );
+
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        &format!("{name} TribleSet {operation} left source after operation"),
+        &left,
+        left_rows,
+    );
+    assert_tribleset_rows(
+        FixtureStorage::Local,
+        &format!("{name} TribleSet {operation} right source after operation"),
+        &right,
+        right_rows,
+    );
+
+    TribleSetBinaryCase {
+        name,
+        left,
+        right,
+        oracle,
+    }
+}
+
+fn tribleset_union_cases() -> Vec<TribleSetBinaryCase> {
+    let left_rows = ordered_archive_rows(0, 128, 0, 32);
+    let right_rows = ordered_archive_rows(0, 128, 31, 32);
+    let expected = union_rows(&left_rows, &right_rows);
+    assert_eq!(expected.len(), 8_064);
+
+    // The balanced templates have exact roots over dirty direct children.
+    // Build a fresh second pair before demotion so the two benchmark cases
+    // have the same rows and topology without cross-case refcount coupling;
+    // only the singleton no-op changes root knowledge in the demoted pair.
+    let exact_left = archive_tribleset_variants_in(0, 128, 0, 32);
+    let exact_right = archive_tribleset_variants_in(0, 128, 31, 32);
+    let demoted_left = demote_tribleset_via_duplicate(
+        archive_tribleset_variants_in(0, 128, 0, 32),
+        &left_rows,
+        raw_trible(0, 0),
+    );
+    let demoted_right = demote_tribleset_via_duplicate(
+        archive_tribleset_variants_in(0, 128, 31, 32),
+        &right_rows,
+        raw_trible(0, 31),
+    );
+
+    vec![
+        checked_tribleset_case(
+            "exact_overlap128",
+            "union",
+            exact_left,
+            &left_rows,
+            exact_right,
+            &right_rows,
+            &expected,
+            union_triblesets,
+        ),
+        checked_tribleset_case(
+            "demoted_overlap128",
+            "union",
+            demoted_left,
+            &left_rows,
+            demoted_right,
+            &right_rows,
+            &expected,
+            union_triblesets,
+        ),
+    ]
+}
+
+fn bench_tribleset_union(c: &mut Criterion) {
+    let cases = tribleset_union_cases();
+    let mut group = c.benchmark_group("patch_receipts/tribleset_union");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(8_192));
+
+    for case in &cases {
+        for (workload, compare) in [("union_only", false), ("union_eq1", true)] {
+            group.bench_function(BenchmarkId::new(case.name, workload), |b| {
+                b.iter_batched(
+                    || (case.left.clone(), case.right.clone()),
+                    |(mut left, right)| {
+                        left.union(black_box(right));
+                        if compare {
+                            // The union runs all six indexes; public equality
+                            // consumes only the EAV result fingerprint.
+                            black_box(black_box(&left) == black_box(&case.oracle));
+                        }
+                        black_box(left)
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+fn tribleset_difference_cases() -> Vec<TribleSetBinaryCase> {
+    let left_rows = ordered_rows(DIFFERENCE_VARIANTS);
+    let sparse_rows = vec![
+        raw_trible(0, 0),
+        raw_trible(BUCKETS - 1, DIFFERENCE_VARIANTS - 1),
+    ];
+    let half_rows = ordered_rows(DIFFERENCE_VARIANTS / 2);
+    let heavy_rows = ordered_rows(DIFFERENCE_VARIANTS - 1);
+    let sparse_expected = without_rows(&left_rows, |row| sparse_rows.binary_search(row).is_ok());
+    let half_expected = without_rows(&left_rows, |row| half_rows.binary_search(row).is_ok());
+    let heavy_expected = without_rows(&left_rows, |row| heavy_rows.binary_search(row).is_ok());
+
+    vec![
+        checked_tribleset_case(
+            "sparse2",
+            "difference",
+            archive_tribleset_variants(DIFFERENCE_VARIANTS),
+            &left_rows,
+            archive_tribleset(&sparse_rows),
+            &sparse_rows,
+            &sparse_expected,
+            TribleSet::difference,
+        ),
+        checked_tribleset_case(
+            "half",
+            "difference",
+            archive_tribleset_variants(DIFFERENCE_VARIANTS),
+            &left_rows,
+            archive_tribleset_variants(DIFFERENCE_VARIANTS / 2),
+            &half_rows,
+            &half_expected,
+            TribleSet::difference,
+        ),
+        checked_tribleset_case(
+            "heavy",
+            "difference",
+            archive_tribleset_variants(DIFFERENCE_VARIANTS),
+            &left_rows,
+            archive_tribleset_variants(DIFFERENCE_VARIANTS - 1),
+            &heavy_rows,
+            &heavy_expected,
+            TribleSet::difference,
+        ),
+    ]
+}
+
+fn bench_tribleset_difference(c: &mut Criterion) {
+    let cases = tribleset_difference_cases();
+    let mut group = c.benchmark_group("patch_receipts/tribleset_difference");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(
+        BUCKETS as u64 * DIFFERENCE_VARIANTS as u64,
+    ));
+
+    for case in &cases {
+        for (workload, compare) in [("difference_only", false), ("difference_eq1", true)] {
+            group.bench_function(BenchmarkId::new(case.name, workload), |b| {
+                b.iter_batched(
+                    || (case.left.clone(), case.right.clone()),
+                    |(left, right)| {
+                        let result = black_box(&left).difference(black_box(&right));
+                        if compare {
+                            // TribleSet equality intentionally consumes only EAV,
+                            // while the difference above computes all six indexes.
+                            black_box(black_box(&result) == black_box(&case.oracle));
+                        }
+                        black_box(result)
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 fn benches(c: &mut Criterion) {
     bench_union(c);
     bench_removal(c);
     bench_difference(c);
+    bench_tribleset_union(c);
+    bench_tribleset_difference(c);
 }
 
 criterion_group!(patch_receipt_benches, benches);
