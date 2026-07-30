@@ -728,6 +728,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         matches!(self.tag(), HeadTag::Leaf | HeadTag::LocalLeaf)
     }
 
+    #[inline]
+    fn is_archive_singleton_pair(&self, other: &Self) -> bool {
+        matches!(
+            (self.tag(), other.tag()),
+            (HeadTag::LocalLeaf, HeadTag::Leaf | HeadTag::LocalLeaf)
+                | (HeadTag::Leaf, HeadTag::LocalLeaf)
+        )
+    }
+
     pub(crate) fn count_segment(&self, at_depth: usize) -> u64 {
         match self.body_ref() {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
@@ -1074,13 +1083,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
     pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
-        let this_singleton = this.is_singleton();
-        let other_singleton = other.is_singleton();
-
         // Singleton identity is exact key equality. Decide it before asking
         // for a fingerprint: LocalLeaf has no cached hash, and a distinct
         // pair needs each hash only once to initialize its first Branch.
-        if this_singleton && other_singleton {
+        if this.is_archive_singleton_pair(&other) {
             if let Some((depth, this_byte_key, other_byte_key)) =
                 this.first_divergence(&other, at_depth)
             {
@@ -1212,12 +1218,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        let this_singleton = this.is_singleton();
-        let other_singleton = other.is_singleton();
-
         // Singleton pairs have no fan-out work for Rayon; the serial arm
         // decides them exactly and constructs a distinct pair prehashed.
-        if this_singleton && other_singleton {
+        if this.is_archive_singleton_pair(&other) {
             return Self::union(this, other, at_depth);
         }
 
@@ -1399,9 +1402,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        let self_singleton = self.is_singleton();
-        let other_singleton = other.is_singleton();
-        if self_singleton && other_singleton {
+        if self.is_archive_singleton_pair(other) {
             return self.intersect(other, at_depth);
         }
         if self.hash() == other.hash() {
@@ -1523,9 +1524,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        let self_singleton = self.is_singleton();
-        let other_singleton = other.is_singleton();
-        if self_singleton && other_singleton {
+        if self.is_archive_singleton_pair(other) {
             return self.difference(other, at_depth);
         }
         if self.hash() == other.hash() {
@@ -1897,9 +1896,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // call the owned helper `union` directly.
 
     pub(crate) fn intersect(&self, other: &Self, at_depth: usize) -> Option<Self> {
-        let self_singleton = self.is_singleton();
-        let other_singleton = other.is_singleton();
-        if self_singleton && other_singleton {
+        if self.is_archive_singleton_pair(other) {
             return if self.first_divergence(other, at_depth).is_none() {
                 Some(self.clone())
             } else {
@@ -1992,9 +1989,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// This is the set of elements that are in self but not in other.
     /// If the difference is empty, None is returned.
     pub(crate) fn difference(&self, other: &Self, at_depth: usize) -> Option<Self> {
-        let self_singleton = self.is_singleton();
-        let other_singleton = other.is_singleton();
-        if self_singleton && other_singleton {
+        if self.is_archive_singleton_pair(other) {
             return if self.first_divergence(other, at_depth).is_none() {
                 None
             } else {

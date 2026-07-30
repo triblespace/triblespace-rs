@@ -47,8 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **PATCH set operations decide leaf pairs by exact keys before fingerprints.**
-  `union`, `intersect`, and `difference` compare heap and archive-backed
-  singleton keys directly. Distinct singleton union carries each child's one
+  When either singleton is archive-backed, `union`, `intersect`, and
+  `difference` compare keys directly while heap/heap pairs retain their cached
+  fingerprint fast path. Distinct singleton union carries each child's one
   required hash into the new Branch instead of hashing both children twice;
   equal singleton intersection/difference need no hash at all.
 - **Parallel SimpleArchive decoding builds each worker chunk bottom-up.** For
