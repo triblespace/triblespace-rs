@@ -812,6 +812,21 @@ impl HeadTag {
     }
 }
 
+/// Selects the cheapest sound way to decide whether two PATCH heads denote
+/// the same set before structural descent.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum EqualityMode {
+    /// At least one side is archive-backed and both sides are leaves, so key
+    /// bytes decide identity without computing an uncached fingerprint.
+    ExactKey,
+    /// An archive-backed leaf is being compared with a non-unary subtree, so
+    /// equal fingerprints are impossible by cardinality.
+    FingerprintImpossible,
+    /// Preserve the ordinary fingerprint path, including heap/heap pairs and
+    /// archive-backed leaves compared with unary Branches.
+    Fingerprint,
+}
+
 pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     Leaf(NonNull<Leaf<KEY_LEN, V>>),
     /// Thin pointer to a `[u8; KEY_LEN]` trible living in an archive's
@@ -966,25 +981,38 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // `self.has_prefix::<KEY_LEN>(at_depth, key)` or for partial checks
     // `self.childleaf().has_prefix::<O>(at_depth, &key[..limit])` instead.
 
-    pub(crate) fn body(&self) -> BodyPtr<KEY_LEN, O, V> {
-        unsafe {
-            let ptr = NonNull::new_unchecked(self.tptr.as_ptr().map_addr(|addr| {
+    /// Decodes the body using an already-read tag.
+    ///
+    /// # Safety
+    ///
+    /// `tag` must be the tag encoded in `self.tptr`.
+    #[inline]
+    unsafe fn body_with_tag(&self, tag: HeadTag) -> BodyPtr<KEY_LEN, O, V> {
+        let ptr = unsafe {
+            NonNull::new_unchecked(self.tptr.as_ptr().map_addr(|addr| {
                 let masked = (addr as u64) & Self::BODY_MASK;
                 masked as usize
-            }));
-            match self.tag() {
-                HeadTag::Leaf => BodyPtr::Leaf(ptr.cast()),
-                HeadTag::LocalLeaf => BodyPtr::LocalLeaf(ptr.cast()),
-                branch_tag => {
-                    let count = 1 << (branch_tag as usize);
-                    BodyPtr::Branch(NonNull::new_unchecked(std::ptr::slice_from_raw_parts(
-                        ptr.as_ptr(),
-                        count,
+            }))
+        };
+        match tag {
+            HeadTag::Leaf => BodyPtr::Leaf(ptr.cast()),
+            HeadTag::LocalLeaf => BodyPtr::LocalLeaf(ptr.cast()),
+            branch_tag => {
+                let count = 1 << (branch_tag as usize);
+                BodyPtr::Branch(unsafe {
+                    NonNull::new_unchecked(
+                        std::ptr::slice_from_raw_parts(ptr.as_ptr(), count)
+                            as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>,
                     )
-                        as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>))
-                }
+                })
             }
         }
+    }
+
+    pub(crate) fn body(&self) -> BodyPtr<KEY_LEN, O, V> {
+        let tag = self.tag();
+        // SAFETY: `tag` was read from this Head immediately above.
+        unsafe { self.body_with_tag(tag) }
     }
 
     pub(crate) fn body_mut(&mut self) -> BodyMut<'_, KEY_LEN, O, V> {
@@ -1016,32 +1044,52 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
-    pub(crate) fn count(&self) -> u64 {
-        match self.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
-            BodyRef::Branch(branch) => branch.leaf_count,
+    /// Returns the count using an already-read tag.
+    ///
+    /// # Safety
+    ///
+    /// `tag` must be the tag encoded in `self.tptr`.
+    #[inline]
+    unsafe fn count_with_tag(&self, tag: HeadTag) -> u64 {
+        match tag {
+            HeadTag::Leaf | HeadTag::LocalLeaf => 1,
+            branch_tag => match unsafe { self.body_with_tag(branch_tag) } {
+                BodyPtr::Branch(branch) => unsafe { branch.as_ref().leaf_count },
+                BodyPtr::Leaf(_) | BodyPtr::LocalLeaf(_) => unreachable!(),
+            },
         }
     }
 
-    #[inline]
-    fn is_archive_singleton_pair(&self, other: &Self) -> bool {
-        matches!(
-            (self.tag(), other.tag()),
-            (HeadTag::LocalLeaf, HeadTag::Leaf | HeadTag::LocalLeaf)
-                | (HeadTag::Leaf, HeadTag::LocalLeaf)
-        )
+    pub(crate) fn count(&self) -> u64 {
+        let tag = self.tag();
+        // SAFETY: `tag` was read from this Head immediately above.
+        unsafe { self.count_with_tag(tag) }
     }
 
-    /// Returns whether cardinality still permits equal fingerprints when an
-    /// archive-backed leaf is involved. A `LocalLeaf` represents exactly one
-    /// key, while a Branch's count is cached; all pairs without a `LocalLeaf`
-    /// retain the existing fingerprint path unchanged.
     #[inline]
-    fn local_leaf_cardinality_allows_equality(&self, other: &Self) -> bool {
-        match (self.tag(), other.tag()) {
-            (HeadTag::LocalLeaf, _) => other.count() == 1,
-            (_, HeadTag::LocalLeaf) => self.count() == 1,
-            _ => true,
+    fn equality_mode(&self, other: &Self) -> EqualityMode {
+        let self_tag = self.tag();
+        let other_tag = other.tag();
+
+        match (self_tag, other_tag) {
+            (HeadTag::LocalLeaf, HeadTag::Leaf | HeadTag::LocalLeaf)
+            | (HeadTag::Leaf, HeadTag::LocalLeaf) => EqualityMode::ExactKey,
+            // SAFETY: both tags were read from their respective Heads above.
+            (HeadTag::LocalLeaf, _) => {
+                if unsafe { other.count_with_tag(other_tag) } == 1 {
+                    EqualityMode::Fingerprint
+                } else {
+                    EqualityMode::FingerprintImpossible
+                }
+            }
+            (_, HeadTag::LocalLeaf) => {
+                if unsafe { self.count_with_tag(self_tag) } == 1 {
+                    EqualityMode::Fingerprint
+                } else {
+                    EqualityMode::FingerprintImpossible
+                }
+            }
+            _ => EqualityMode::Fingerprint,
         }
     }
 
@@ -1297,33 +1345,41 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         this
     }
 
+    /// Unions a pair already classified as [`EqualityMode::ExactKey`].
+    #[inline]
+    fn union_exact_key_pair(this: Self, other: Self, at_depth: usize) -> Self {
+        if let Some((depth, this_byte_key, other_byte_key)) =
+            this.first_divergence(&other, at_depth)
+        {
+            let this_hash = this.hash();
+            let other_hash = other.hash();
+            let old_key = this.key();
+            let new_body = Branch::new_with_child_hashes(
+                depth,
+                this.with_key(this_byte_key),
+                other.with_key(other_byte_key),
+                this_hash,
+                other_hash,
+            );
+            return Head::new(old_key, new_body);
+        }
+        this
+    }
+
+    #[inline]
+    fn exact_keys_equal(&self, other: &Self, at_depth: usize) -> bool {
+        self.first_divergence(other, at_depth).is_none()
+    }
+
     /// Sequential PATCH-trie union. Always serial; the parallel
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
     pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
-        // An archive-backed singleton has no cached fingerprint. Decide its
-        // exact identity first; a distinct union then hashes each child once
-        // and carries those hashes into the new Branch.
-        if this.is_archive_singleton_pair(&other) {
-            if let Some((depth, this_byte_key, other_byte_key)) =
-                this.first_divergence(&other, at_depth)
-            {
-                let this_hash = this.hash();
-                let other_hash = other.hash();
-                let old_key = this.key();
-                let new_body = Branch::new_with_child_hashes(
-                    depth,
-                    this.with_key(this_byte_key),
-                    other.with_key(other_byte_key),
-                    this_hash,
-                    other_hash,
-                );
-                return Head::new(old_key, new_body);
-            }
-            return this;
+        let equality_mode = this.equality_mode(&other);
+        if equality_mode == EqualityMode::ExactKey {
+            return Self::union_exact_key_pair(this, other, at_depth);
         }
-
-        if this.local_leaf_cardinality_allows_equality(&other) && this.hash() == other.hash() {
+        if equality_mode == EqualityMode::Fingerprint && this.hash() == other.hash() {
             return this;
         }
 
@@ -1435,12 +1491,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        // Singleton pairs have no fan-out work for Rayon.
-        if this.is_archive_singleton_pair(&other) {
-            return Self::union(this, other, at_depth);
+        let equality_mode = this.equality_mode(&other);
+        if equality_mode == EqualityMode::ExactKey {
+            // Exact singleton pairs have no fan-out work for Rayon.
+            return Self::union_exact_key_pair(this, other, at_depth);
         }
-
-        if this.local_leaf_cardinality_allows_equality(&other) && this.hash() == other.hash() {
+        if equality_mode == EqualityMode::Fingerprint && this.hash() == other.hash() {
             return this;
         }
 
@@ -1618,10 +1674,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        if self.is_archive_singleton_pair(other) {
-            return self.intersect(other, at_depth);
+        let equality_mode = self.equality_mode(other);
+        if equality_mode == EqualityMode::ExactKey {
+            return self
+                .exact_keys_equal(other, at_depth)
+                .then(|| self.clone());
         }
-        if self.local_leaf_cardinality_allows_equality(other) && self.hash() == other.hash() {
+        if equality_mode == EqualityMode::Fingerprint && self.hash() == other.hash() {
             return Some(self.clone());
         }
         if self.first_divergence(other, at_depth).is_some() {
@@ -1740,10 +1799,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        if self.is_archive_singleton_pair(other) {
-            return self.difference(other, at_depth);
+        let equality_mode = self.equality_mode(other);
+        if equality_mode == EqualityMode::ExactKey {
+            return (!self.exact_keys_equal(other, at_depth)).then(|| self.clone());
         }
-        if self.local_leaf_cardinality_allows_equality(other) && self.hash() == other.hash() {
+        if equality_mode == EqualityMode::Fingerprint && self.hash() == other.hash() {
             return None;
         }
         if self.first_divergence(other, at_depth).is_some() {
@@ -2112,15 +2172,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // call the owned helper `union` directly.
 
     pub(crate) fn intersect(&self, other: &Self, at_depth: usize) -> Option<Self> {
-        if self.is_archive_singleton_pair(other) {
-            return if self.first_divergence(other, at_depth).is_none() {
-                Some(self.clone())
-            } else {
-                None
-            };
+        let equality_mode = self.equality_mode(other);
+        if equality_mode == EqualityMode::ExactKey {
+            return self
+                .exact_keys_equal(other, at_depth)
+                .then(|| self.clone());
         }
-
-        if self.local_leaf_cardinality_allows_equality(other) && self.hash() == other.hash() {
+        if equality_mode == EqualityMode::Fingerprint && self.hash() == other.hash() {
             return Some(self.clone());
         }
 
@@ -2205,15 +2263,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// This is the set of elements that are in self but not in other.
     /// If the difference is empty, None is returned.
     pub(crate) fn difference(&self, other: &Self, at_depth: usize) -> Option<Self> {
-        if self.is_archive_singleton_pair(other) {
-            return if self.first_divergence(other, at_depth).is_none() {
-                None
-            } else {
-                Some(self.clone())
-            };
+        let equality_mode = self.equality_mode(other);
+        if equality_mode == EqualityMode::ExactKey {
+            return (!self.exact_keys_equal(other, at_depth)).then(|| self.clone());
         }
-
-        if self.local_leaf_cardinality_allows_equality(other) && self.hash() == other.hash() {
+        if equality_mode == EqualityMode::Fingerprint && self.hash() == other.hash() {
             return None;
         }
 
@@ -4242,6 +4296,11 @@ mod tests {
         let heap_a = heap_a_entry.leaf::<IdentitySchema>();
         let heap_b = heap_b_entry.leaf::<IdentitySchema>();
 
+        assert_eq!(local_a.equality_mode(&local_b), EqualityMode::ExactKey);
+        assert_eq!(local_a.equality_mode(&heap_a), EqualityMode::ExactKey);
+        assert_eq!(heap_a.equality_mode(&local_a), EqualityMode::ExactKey);
+        assert_eq!(heap_a.equality_mode(&heap_b), EqualityMode::Fingerprint);
+
         fn assert_pair(
             left: &Head<64, IdentitySchema, ()>,
             right: &Head<64, IdentitySchema, ()>,
@@ -4287,6 +4346,24 @@ mod tests {
         // Deliberately retain a unary Branch representation. Cardinality one
         // is not enough to infer its tag or reject equality with a LocalLeaf.
         let mut unary = pair.root.as_ref().expect("pair has a root").clone();
+        let branch_local = match unary.body_ref() {
+            BodyRef::Branch(branch) => branch
+                .child_table
+                .iter()
+                .flatten()
+                .next()
+                .expect("pair Branch has a child")
+                .clone(),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => panic!("pair root must be a Branch"),
+        };
+        assert_eq!(
+            branch_local.equality_mode(&unary),
+            EqualityMode::FingerprintImpossible,
+        );
+        assert_eq!(
+            unary.equality_mode(&branch_local),
+            EqualityMode::FingerprintImpossible,
+        );
         let removed_slot = match unary.body_ref() {
             BodyRef::Branch(branch) => branch
                 .child_table
@@ -4317,6 +4394,8 @@ mod tests {
         assert_eq!(local.tag(), HeadTag::LocalLeaf);
         assert_eq!(local.count(), 1);
         assert_eq!(local.hash(), unary.hash());
+        assert_eq!(local.equality_mode(&unary), EqualityMode::Fingerprint);
+        assert_eq!(unary.equality_mode(&local), EqualityMode::Fingerprint);
 
         // The equal-fingerprint shortcut returns its left operand unchanged.
         // These shape checks therefore prove that the count-one case reaches
