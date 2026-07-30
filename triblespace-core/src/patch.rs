@@ -7,7 +7,11 @@
 //! Values stored in leaves are not part of hashing or equality comparisons.
 //! Two [`PATCH`](crate::patch::PATCH)es are considered equal if they contain the same set of keys,
 //! even if the associated values differ. This allows using the structure as an
-//! idempotent blobstore where a value's hash determines its key.
+//! idempotent blobstore where a value's hash determines its key. Consequently,
+//! union does not promise which value survives a duplicate key: cached-equal
+//! subtrees may keep the left tree wholesale, while structurally traversed
+//! (including dirty-hash) trees retain values according to the ordinary
+//! in-place/swap path. Key-set semantics are invariant across both cases.
 //!
 #![allow(unstable_name_collisions)]
 
@@ -348,6 +352,24 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
+
+#[cfg(test)]
+std::thread_local! {
+    // The focused counter probes stay on the serial/small-union lane. Keeping
+    // their accounting thread-local prevents unrelated parallel unit tests
+    // from racing a reset or contributing incidental verification hashes.
+    static LOCAL_LEAF_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_local_leaf_hash_calls() {
+    LOCAL_LEAF_HASH_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn local_leaf_hash_calls() -> usize {
+    LOCAL_LEAF_HASH_CALLS.get()
+}
 
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
@@ -818,6 +840,25 @@ pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     value: PhantomData<V>,
 }
 
+/// What a recursive union learned about the input intersection.
+///
+/// The scalar representation is intentionally private to this experiment. It
+/// can later grow symbolic `Empty` / whole-subtree cases without changing the
+/// surrounding mutation API.
+#[derive(Clone, Copy, Debug, Default)]
+struct UnionOverlap {
+    hash: u128,
+}
+
+impl UnionOverlap {
+    const EMPTY: Self = Self { hash: 0 };
+}
+
+struct UnionResult<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+    head: Head<KEY_LEN, O, V>,
+    overlap: UnionOverlap,
+}
+
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Send for Head<KEY_LEN, O, V> {}
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Sync for Head<KEY_LEN, O, V> {}
 
@@ -956,17 +997,78 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Return a hash already resident in this node without traversing it.
+    /// LocalLeaves have no hash field, and a zero Branch hash is the
+    /// conservative uncached sentinel.
+    #[inline]
+    fn known_hash(&self) -> Option<u128> {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => Some(leaf.hash),
+            BodyRef::LocalLeaf(_) => None,
+            BodyRef::Branch(branch) => (branch.hash != 0).then_some(branch.hash),
+        }
+    }
+
     pub(crate) fn hash(&self) -> u128 {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => leaf.hash,
             BodyRef::LocalLeaf(bytes) => {
+                #[cfg(test)]
+                LOCAL_LEAF_HASH_CALLS.set(LOCAL_LEAF_HASH_CALLS.get() + 1);
                 use siphasher::sip128::SipHasher24;
                 use std::ptr::addr_of;
                 // SAFETY: SIP_KEY is initialized at startup; we only read it.
                 let key = unsafe { *addr_of!(SIP_KEY) };
                 SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
             }
-            BodyRef::Branch(branch) => branch.hash,
+            BodyRef::Branch(branch) => {
+                if branch.hash != 0 {
+                    branch.hash
+                } else {
+                    branch
+                        .child_table
+                        .iter()
+                        .flatten()
+                        .fold(0, |hash, child| hash ^ child.hash())
+                }
+            }
+        }
+    }
+
+    /// Recompute a subtree hash from leaf keys while ignoring every Branch
+    /// cache, asserting each nonzero cache against the resulting semantics.
+    /// This is deliberately separate from `hash()` so deep debug audits do not
+    /// make dirty descendants appear clean merely because an ancestor cache is
+    /// populated.
+    #[cfg(debug_assertions)]
+    pub(super) fn debug_semantic_hash(&self) -> u128 {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => {
+                use siphasher::sip128::SipHasher24;
+                use std::ptr::addr_of;
+                let key = unsafe { *addr_of!(SIP_KEY) };
+                let semantic: u128 = SipHasher24::new_with_key(&key).hash(&leaf.key[..]).into();
+                debug_assert_eq!(leaf.hash, semantic, "heap Leaf hash mismatch");
+                semantic
+            }
+            BodyRef::LocalLeaf(bytes) => {
+                use siphasher::sip128::SipHasher24;
+                use std::ptr::addr_of;
+                let key = unsafe { *addr_of!(SIP_KEY) };
+                SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
+            }
+            BodyRef::Branch(branch) => {
+                let semantic = branch
+                    .child_table
+                    .iter()
+                    .flatten()
+                    .fold(0, |hash, child| hash ^ child.debug_semantic_hash());
+                debug_assert!(
+                    branch.hash == 0 || branch.hash == semantic,
+                    "nonzero Branch hash disagrees with leaf-derived semantics",
+                );
+                semantic
+            }
         }
     }
 
@@ -1245,9 +1347,33 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// Sequential PATCH-trie union. Always serial; the parallel
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
-    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
+    pub(crate) fn union(this: Self, other: Self, at_depth: usize) -> Self {
+        Self::union_with_overlap(this, other, at_depth).head
+    }
+
+    #[inline]
+    fn known_union_hash(
+        left: Option<u128>,
+        right: Option<u128>,
+        overlap: UnionOverlap,
+    ) -> Option<u128> {
+        Some(left? ^ right? ^ overlap.hash)
+    }
+
+    /// Recursive serial union that reports `H(left ∩ right)` alongside the
+    /// merged head. The receipt is enough to derive `H(left ∪ right)` from
+    /// cached input aggregates without hashing disjoint LocalLeaves:
+    ///
+    /// `H(left ∪ right) = H(left) xor H(right) xor H(left ∩ right)`.
+    fn union_with_overlap(
+        mut this: Self,
+        mut other: Self,
+        at_depth: usize,
+    ) -> UnionResult<KEY_LEN, O, V> {
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
+        let this_hash = this.known_hash();
+        let other_hash = other.known_hash();
 
         // Singleton equality is exact byte equality. Decide it before asking
         // for a fingerprint: LocalLeaf intentionally has no cached hash, and
@@ -1258,46 +1384,80 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 this.first_divergence(&other, at_depth)
             {
                 let old_key = this.key();
-                let new_body = Branch::new(
+                let new_body = Branch::new_with_optional_child_hashes(
                     depth,
                     this.with_key(this_byte_key),
                     other.with_key(other_byte_key),
+                    this_hash,
+                    other_hash,
                 );
-                return Head::new(old_key, new_body);
+                return UnionResult {
+                    head: Head::new(old_key, new_body),
+                    overlap: UnionOverlap::EMPTY,
+                };
             }
-            return this;
+
+            // The intersection is the singleton itself. Prefer either cached
+            // heap-leaf hash; only two LocalLeaves require one on-demand hash.
+            let hash = this_hash.or(other_hash).unwrap_or_else(|| this.hash());
+            return UnionResult {
+                head: this,
+                overlap: UnionOverlap { hash },
+            };
         }
 
-        // Equal sets necessarily have equal cardinality. This cheap exact
-        // discriminator avoids computing LocalLeaf fingerprints in the much
-        // more common unequal-size case.
-        if this.count() == other.count() && this.hash() == other.hash() {
-            return this;
+        // Only use the probabilistic whole-subtree equality shortcut when both
+        // aggregate hashes are already cached. Dirty trees descend instead of
+        // forcing every LocalLeaf hash merely to ask the question.
+        if this.count() == other.count() {
+            if let (Some(left), Some(right)) = (this_hash, other_hash) {
+                if left == right {
+                    return UnionResult {
+                        head: this,
+                        overlap: UnionOverlap { hash: left },
+                    };
+                }
+            }
         }
 
         if let Some((depth, this_byte_key, other_byte_key)) =
             this.first_divergence(&other, at_depth)
         {
             let old_key = this.key();
-            let new_body = Branch::new(
+            let new_body = Branch::new_with_optional_child_hashes(
                 depth,
                 this.with_key(this_byte_key),
                 other.with_key(other_byte_key),
+                this_hash,
+                other_hash,
             );
 
-            return Head::new(old_key, new_body);
+            return UnionResult {
+                head: Head::new(old_key, new_body),
+                overlap: UnionOverlap::EMPTY,
+            };
         }
 
         if this_depth < other_depth {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = other.with_start(ed.end_depth as usize);
             let key = inserted.key();
+            let mut overlap = UnionOverlap::EMPTY;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
+                Some(old) => {
+                    let result = Head::union_with_overlap(old, inserted, this_depth);
+                    overlap = result.overlap;
+                    Some(result.head)
+                }
                 None => Some(inserted),
             });
+            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
+            ed.hash = known_hash.unwrap_or(0);
             drop(ed);
-            return this;
+            return UnionResult {
+                head: this,
+                overlap,
+            };
         }
 
         if other_depth < this_depth {
@@ -1306,16 +1466,28 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
             let inserted = this_head.with_start(ed.end_depth as usize);
             let key = inserted.key();
+            let mut overlap = UnionOverlap::EMPTY;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, other_depth)),
+                Some(old) => {
+                    let result = Head::union_with_overlap(old, inserted, other_depth);
+                    overlap = result.overlap;
+                    Some(result.head)
+                }
                 None => Some(inserted),
             });
+            let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
+            ed.hash = known_hash.unwrap_or(0);
             drop(ed);
-            return other.with_key(old_key);
+            return UnionResult {
+                head: other.with_key(old_key),
+                overlap,
+            };
         }
 
         // Equal depth, hashes differ → walk `other`'s children and resolve
-        // collisions with `modify_child`'s per-call accounting.
+        // collisions through the canonical child mutation primitive. Each
+        // recursive call returns its overlap receipt through an outer local;
+        // once the batch is complete we install the union-wide cache formula.
         //
         // Union is commutative; mutating either side in place is
         // semantically equivalent. Swap when `other`'s child_table
@@ -1331,6 +1503,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             unreachable!();
         };
         let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+        let mut overlap = UnionOverlap::EMPTY;
 
         for other_child in other_branch_ref
             .child_table
@@ -1339,13 +1512,24 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         {
             let inserted = other_child.with_start(ed.end_depth as usize);
             let key = inserted.key();
+            let mut child_overlap = UnionOverlap::EMPTY;
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
+                Some(old) => {
+                    let result = Head::union_with_overlap(old, inserted, this_depth);
+                    child_overlap = result.overlap;
+                    Some(result.head)
+                }
                 None => Some(inserted),
             });
+            overlap.hash ^= child_overlap.hash;
         }
+        let known_hash = Self::known_union_hash(this_hash, other_hash, overlap);
+        ed.hash = known_hash.unwrap_or(0);
         drop(ed);
-        this
+        UnionResult {
+            head: this,
+            overlap,
+        }
     }
 
     /// Parallel-aware top-level union entry. Allocates a fresh
@@ -1370,6 +1554,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// back to serial `Self::union`. All other arms (hash-equal,
     /// divergence, asymmetric depth) delegate to `Self::union` —
     /// they don't generate fan-out work for the budget to spend.
+    ///
+    /// Prototype scope: the large scatter path still finishes with eager
+    /// `recompute_aggregates`, which recursively materializes any dirty child
+    /// hashes. Lazy overlap receipts currently optimize only serial union (and
+    /// the small parallel-dispatch fallback that delegates to it).
     #[cfg(feature = "parallel")]
     pub(crate) fn par_union_with_ctx(
         mut this: Self,
@@ -1390,18 +1579,26 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Self::union(this, other, at_depth);
         }
 
-        if this.count() == other.count() && this.hash() == other.hash() {
-            return this;
+        let this_hash = this.known_hash();
+        let other_hash = other.known_hash();
+        if this.count() == other.count() {
+            if let (Some(left), Some(right)) = (this_hash, other_hash) {
+                if left == right {
+                    return this;
+                }
+            }
         }
 
         if let Some((depth, this_byte_key, other_byte_key)) =
             this.first_divergence(&other, at_depth)
         {
             let old_key = this.key();
-            let new_body = Branch::new(
+            let new_body = Branch::new_with_optional_child_hashes(
                 depth,
                 this.with_key(this_byte_key),
                 other.with_key(other_byte_key),
+                this_hash,
+                other_hash,
             );
             return Head::new(old_key, new_body);
         }
@@ -1528,6 +1725,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 ed.install_child_growing(head);
             }
 
+            // Deliberately eager in this prototype. This preserves the
+            // existing parallel implementation while leaving a clear later
+            // seam for per-task overlap receipts and algebraic aggregation.
             ed.recompute_aggregates();
         }
         this
@@ -1566,14 +1766,24 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        if self.hash() == other.hash() {
-            return Some(self.clone());
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth == KEY_LEN && other_depth == KEY_LEN {
+            return self
+                .first_divergence(other, at_depth)
+                .is_none()
+                .then(|| self.clone());
+        }
+        if self.count() == other.count() {
+            if let (Some(left), Some(right)) = (self.known_hash(), other.known_hash()) {
+                if left == right {
+                    return Some(self.clone());
+                }
+            }
         }
         if self.first_divergence(other, at_depth).is_some() {
             return None;
         }
-        let self_depth = self.end_depth();
-        let other_depth = other.end_depth();
         if self_depth != other_depth {
             return self.intersect(other, at_depth);
         }
@@ -1685,14 +1895,24 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         O: Send + Sync,
         V: Send + Sync,
     {
-        if self.hash() == other.hash() {
-            return None;
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth == KEY_LEN && other_depth == KEY_LEN {
+            return self
+                .first_divergence(other, at_depth)
+                .is_some()
+                .then(|| self.clone());
+        }
+        if self.count() == other.count() {
+            if let (Some(left), Some(right)) = (self.known_hash(), other.known_hash()) {
+                if left == right {
+                    return None;
+                }
+            }
         }
         if self.first_divergence(other, at_depth).is_some() {
             return Some(self.clone());
         }
-        let self_depth = self.end_depth();
-        let other_depth = other.end_depth();
         if self_depth != other_depth {
             return self.difference(other, at_depth);
         }
@@ -2051,16 +2271,26 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // call the owned helper `union` directly.
 
     pub(crate) fn intersect(&self, other: &Self, at_depth: usize) -> Option<Self> {
-        if self.hash() == other.hash() {
-            return Some(self.clone());
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth == KEY_LEN && other_depth == KEY_LEN {
+            return self
+                .first_divergence(other, at_depth)
+                .is_none()
+                .then(|| self.clone());
+        }
+        if self.count() == other.count() {
+            if let (Some(left), Some(right)) = (self.known_hash(), other.known_hash()) {
+                if left == right {
+                    return Some(self.clone());
+                }
+            }
         }
 
         if self.first_divergence(other, at_depth).is_some() {
             return None;
         }
 
-        let self_depth = self.end_depth();
-        let other_depth = other.end_depth();
         if self_depth < other_depth {
             // This means that there can be at most one child in self
             // that might intersect with other.
@@ -2137,16 +2367,26 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// This is the set of elements that are in self but not in other.
     /// If the difference is empty, None is returned.
     pub(crate) fn difference(&self, other: &Self, at_depth: usize) -> Option<Self> {
-        if self.hash() == other.hash() {
-            return None;
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth == KEY_LEN && other_depth == KEY_LEN {
+            return self
+                .first_divergence(other, at_depth)
+                .is_some()
+                .then(|| self.clone());
+        }
+        if self.count() == other.count() {
+            if let (Some(left), Some(right)) = (self.known_hash(), other.known_hash()) {
+                if left == right {
+                    return None;
+                }
+            }
         }
 
         if self.first_divergence(other, at_depth).is_some() {
             return Some(self.clone());
         }
 
-        let self_depth = self.end_depth();
-        let other_depth = other.end_depth();
         if self_depth < other_depth {
             // This means that there can be at most one child in self
             // that might intersect with other. It's the only child that may not be in the difference.
@@ -2536,6 +2776,17 @@ where
         self.root.as_ref().map(|root| root.hash())
     }
 
+    /// Expensive debug oracle: derive the root hash from leaf bytes while
+    /// recursively checking every nonzero Branch cache. Kept explicit rather
+    /// than attached to each mutation so ordinary debug insertion does not
+    /// become quadratic in the number of leaves.
+    #[cfg(debug_assertions)]
+    fn debug_check_deep_hash_invariant(&self) {
+        if let Some(root) = &self.root {
+            let _ = root.debug_semantic_hash();
+        }
+    }
+
     /// Clone the opaque archive-owner receipt without exposing the root Head.
     pub(crate) fn owner_guard(&self) -> PATCHOwnerGuard {
         PATCHOwnerGuard(self.owners.clone())
@@ -2879,6 +3130,8 @@ where
     /// Unions this PATCH with another PATCH.
     ///
     /// The other PATCH is consumed, and this PATCH is updated in place.
+    /// Key-set semantics are preserved, but when duplicate keys carry
+    /// different values, which value survives is unspecified.
     pub fn union(&mut self, mut other: Self)
     where
         O: Send + Sync,
@@ -3499,6 +3752,344 @@ mod tests {
 
     fn test_archive_owner(byte: u8) -> Arc<dyn ArchiveOwner> {
         Arc::new([byte])
+    }
+
+    fn heap_hash_oracle<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(
+        patch: &PATCH<KEY_LEN, O>,
+    ) -> u128 {
+        let mut oracle = PATCH::<KEY_LEN, O>::new();
+        for key in patch.iter() {
+            oracle.insert(&Entry::new(key));
+        }
+        oracle
+            .root_hash()
+            .expect("a non-empty PATCH must have a root hash")
+    }
+
+    fn branch_cached_hash<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(
+        patch: &PATCH<KEY_LEN, O>,
+    ) -> u128 {
+        let Some(root) = patch.root.as_ref() else {
+            panic!("expected a non-empty PATCH");
+        };
+        let BodyRef::Branch(branch) = root.body_ref() else {
+            panic!("expected a Branch root");
+        };
+        branch.hash
+    }
+
+    fn deep_hash_audit<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(patch: &PATCH<KEY_LEN, O>) {
+        #[cfg(debug_assertions)]
+        patch.debug_check_deep_hash_invariant();
+        #[cfg(not(debug_assertions))]
+        let _ = patch;
+    }
+
+    #[test]
+    fn lazy_union_keeps_disjoint_local_leaves_unhashed_across_dirty_children() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+        let mut d = c;
+        d[1] = 1;
+        let mut e = a;
+        e[1] = 2;
+
+        reset_local_leaf_hash_calls();
+
+        let mut left = owned_archive_single(a);
+        left.union(owned_archive_single(b));
+        assert_eq!(branch_cached_hash(&left), 0);
+
+        let mut right = owned_archive_single(c);
+        right.union(owned_archive_single(d));
+        assert_eq!(branch_cached_hash(&right), 0);
+
+        // The new two-slot root has no way to know either dirty child's
+        // aggregate. It must stay dirty rather than crossing the information
+        // boundary by hashing all four LocalLeaves.
+        left.union(right);
+        assert_eq!(branch_cached_hash(&left), 0);
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // A later asymmetric union descends through both dirty levels. The
+        // dirty sentinel propagates, while all non-hash aggregates stay exact.
+        left.union(owned_archive_single(e));
+        assert_eq!(left.len(), 5);
+        assert_eq!(branch_cached_hash(&left), 0);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        deep_hash_audit(&left);
+
+        let expected = heap_hash_oracle(&left);
+        let before = local_leaf_hash_calls();
+        assert_eq!(left.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls() - before, 5);
+        assert_eq!(branch_cached_hash(&left), 0);
+
+        // Zero remains an uncached sentinel even after verification. A
+        // legitimate semantic zero follows the same conservative rule.
+        let before = local_leaf_hash_calls();
+        assert_eq!(left.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls() - before, 5);
+        assert_eq!(branch_cached_hash(&left), 0);
+    }
+
+    #[test]
+    fn lazy_union_dirty_root_survives_clone_and_cow_mutation() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[1] = 2;
+
+        let mut original = owned_archive_single(a);
+        reset_local_leaf_hash_calls();
+        original.union(owned_archive_single(b));
+        assert_eq!(branch_cached_hash(&original), 0);
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        let mut changed = original.clone();
+        changed.insert(&Entry::new(&c));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(branch_cached_hash(&original), 0);
+        assert_eq!(branch_cached_hash(&changed), 0);
+        assert_eq!(original.len(), 2);
+        assert_eq!(changed.len(), 3);
+        deep_hash_audit(&original);
+        deep_hash_audit(&changed);
+
+        let original_expected = heap_hash_oracle(&original);
+        let changed_expected = heap_hash_oracle(&changed);
+        assert_eq!(original.root_hash(), Some(original_expected));
+        assert_eq!(changed.root_hash(), Some(changed_expected));
+    }
+
+    #[test]
+    fn ordinary_insert_propagates_a_dirty_child_through_a_clean_ancestor() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+        let mut d = c;
+        d[1] = 1;
+        let mut inserted = a;
+        inserted[1] = 2;
+        let mut disjoint_insert = a;
+        disjoint_insert[0] = 2;
+
+        // Both input roots are exact because the archive-pair constructor has
+        // both leaf hashes. Their union repairs the root algebraically, while
+        // each same-prefix collision constructs a dirty two-LocalLeaf child.
+        let mut patch = owned_archive_pair([a, c]);
+        let other = owned_archive_pair([b, d]);
+        reset_local_leaf_hash_calls();
+        patch.union(other);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_ne!(branch_cached_hash(&patch), 0);
+        let dirty_children = match patch.root.as_ref().unwrap().body_ref() {
+            BodyRef::Branch(root) => root
+                .child_table
+                .iter()
+                .flatten()
+                .filter(
+                    |child| matches!(child.body_ref(), BodyRef::Branch(branch) if branch.hash == 0),
+                )
+                .count(),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 0,
+        };
+        assert_eq!(dirty_children, 2);
+        deep_hash_audit(&patch);
+
+        // An unrelated known heap child can extend the exact parent without
+        // consulting either dirty sibling. The ordinary local debug audit must
+        // likewise remain resident-only.
+        let mut extended = patch.clone();
+        reset_local_leaf_hash_calls();
+        extended.insert(&Entry::new(&disjoint_insert));
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_ne!(branch_cached_hash(&extended), 0);
+        let before = local_leaf_hash_calls();
+        assert!(extended.root_hash().is_some());
+        assert_eq!(local_leaf_hash_calls(), before);
+        deep_hash_audit(&extended);
+
+        reset_local_leaf_hash_calls();
+        patch.insert(&Entry::new(&inserted));
+        assert_eq!(
+            local_leaf_hash_calls(),
+            0,
+            "ordinary mutation must not recursively hash a dirty old child",
+        );
+        assert_eq!(
+            branch_cached_hash(&patch),
+            0,
+            "unknown replacement accounting must dirty the clean ancestor",
+        );
+        deep_hash_audit(&patch);
+
+        let expected = heap_hash_oracle(&patch);
+        let before = local_leaf_hash_calls();
+        assert_eq!(patch.root_hash(), Some(expected));
+        assert_eq!(local_leaf_hash_calls() - before, 4);
+    }
+
+    #[test]
+    fn promoted_dirty_results_remain_correct_through_later_unions() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+        let mut d = c;
+        d[1] = 1;
+        let mut e = a;
+        e[1] = 2;
+        let mut f = c;
+        f[1] = 2;
+        let mut g = a;
+        g[1] = 3;
+
+        let mut left = owned_archive_single(a);
+        left.union(owned_archive_single(b));
+        let mut right = owned_archive_single(c);
+        right.union(owned_archive_single(d));
+        let mut whole = left.clone();
+        whole.union(right.clone());
+
+        // Intersect and difference each collapse the two-slot outer root and
+        // promote one still-dirty Branch child to the PATCH root.
+        let intersection = whole.intersect(&left);
+        let difference = whole.difference(&left);
+        assert_eq!(branch_cached_hash(&intersection), 0);
+        assert_eq!(branch_cached_hash(&difference), 0);
+        deep_hash_audit(&whole);
+        deep_hash_audit(&intersection);
+        deep_hash_audit(&difference);
+
+        // Remove collapses a dirty Branch all the way to one LocalLeaf.
+        let mut removed = left;
+        removed.remove(&a);
+        assert_eq!(removed.root.as_ref().unwrap().tag(), HeadTag::LocalLeaf);
+
+        for (mut promoted, extra, expected) in [
+            (intersection, e, HashSet::from([a, b, e])),
+            (difference, f, HashSet::from([c, d, f])),
+            (removed, g, HashSet::from([b, g])),
+        ] {
+            reset_local_leaf_hash_calls();
+            promoted.union(owned_archive_single(extra));
+            assert_eq!(
+                local_leaf_hash_calls(),
+                0,
+                "a later disjoint union crossed a promoted dirty boundary",
+            );
+            assert_eq!(promoted.iter().copied().collect::<HashSet<_>>(), expected);
+            deep_hash_audit(&promoted);
+            let oracle = heap_hash_oracle(&promoted);
+            assert_eq!(promoted.root_hash(), Some(oracle));
+        }
+    }
+
+    #[test]
+    fn dirty_intersection_and_difference_use_exact_keys_without_hashing() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut c = a;
+        c[0] = 2;
+
+        let mut left = owned_archive_single(a);
+        left.union(owned_archive_single(b));
+        let mut right = owned_archive_single(b);
+        right.union(owned_archive_single(c));
+        assert_eq!(branch_cached_hash(&left), 0);
+        assert_eq!(branch_cached_hash(&right), 0);
+
+        reset_local_leaf_hash_calls();
+        let intersection = left.intersect(&right);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(intersection.iter().copied().collect::<Vec<_>>(), vec![b]);
+        deep_hash_audit(&intersection);
+
+        reset_local_leaf_hash_calls();
+        let difference = left.difference(&right);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(difference.iter().copied().collect::<Vec<_>>(), vec![a]);
+        deep_hash_audit(&difference);
+    }
+
+    #[test]
+    fn known_zero_and_unknown_hash_receipts_stay_distinct() {
+        type TestHead = Head<2, IdentitySchema, ()>;
+        assert_eq!(
+            TestHead::known_union_hash(Some(0x55), Some(0x55), UnionOverlap::EMPTY),
+            Some(0),
+        );
+        assert_eq!(
+            TestHead::known_union_hash(None, Some(0x55), UnionOverlap::EMPTY),
+            None,
+        );
+    }
+
+    #[test]
+    fn singleton_overlap_prefers_a_cached_heap_leaf_hash() {
+        const KEY_LEN: usize = 2;
+        let key = [7, 9];
+        let mut local = owned_archive_single(key);
+        let mut heap = PATCH::<KEY_LEN>::new();
+        heap.insert(&Entry::new(&key));
+
+        reset_local_leaf_hash_calls();
+        local.union(heap);
+
+        assert_eq!(local.len(), 1);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(local.root.as_ref().unwrap().tag(), HeadTag::LocalLeaf);
+    }
+
+    #[test]
+    fn overlapping_cached_roots_repair_without_deferring_duplicate_hashes() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut c = a;
+        c[0] = 2;
+
+        let mut left = owned_archive_pair([a, b]);
+        let right = owned_archive_pair([b, c]);
+        assert_ne!(branch_cached_hash(&left), 0);
+        assert_ne!(branch_cached_hash(&right), 0);
+
+        reset_local_leaf_hash_calls();
+        left.union(right);
+        assert_eq!(
+            local_leaf_hash_calls(),
+            1,
+            "only the equal LocalLeaf pair should materialize an overlap hash",
+        );
+        assert_eq!(
+            left.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c])
+        );
+        deep_hash_audit(&left);
+
+        let expected = heap_hash_oracle(&left);
+        let before = local_leaf_hash_calls();
+        assert_eq!(left.root_hash(), Some(expected));
+        assert_eq!(
+            local_leaf_hash_calls(),
+            before,
+            "known input roots plus the overlap receipt must repair the root cache",
+        );
     }
 
     #[test]

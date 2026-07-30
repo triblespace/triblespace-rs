@@ -25,6 +25,10 @@
     or changelog.
   - Capture any uncovered hotspots or tuning ideas back into this inventory for
     future releases.
+  - Generalize lazy union overlap receipts from a scalar hash to symbolic
+    empty/whole-subtree proofs so duplicate LocalLeaves need not be hashed.
+  - Carry overlap receipts through the large parallel scatter path instead of
+    ending it with eager recursive aggregate recomputation.
 
 ## Query engine documentation follow-ups
 - `triblespace-core/src/query/residual/` is still tracked (`delta.rs`,

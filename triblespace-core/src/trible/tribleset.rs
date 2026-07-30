@@ -133,10 +133,13 @@ pub struct TribleSet {
     pub aev: PATCH<TRIBLE_LEN, AEVOrder, ()>,
 }
 
-/// O(1) fingerprint for a [`TribleSet`], derived from the PATCH root hash.
+/// Process-local 128-bit fingerprint for a [`TribleSet`], derived from the
+/// PATCH root hash.
 ///
 /// This matches the equality semantics of [`TribleSet`], but it is not stable
-/// across process boundaries because [`PATCH`] uses a per-process hash key.
+/// across process boundaries because [`PATCH`] uses a per-process hash key. A
+/// cached root is read in O(1); for a dirty root, the full XOR is computed on
+/// demand and is not memoized through a shared reference.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TribleSetFingerprint(Option<u128>);
 
@@ -420,10 +423,11 @@ impl TribleSet {
         self.len() == 0
     }
 
-    /// Returns a fast fingerprint suitable for in-memory caching.
+    /// Returns a process-local fingerprint suitable for in-memory caching.
     ///
     /// The fingerprint matches [`TribleSet`] equality, but it is not stable
     /// across process boundaries because [`PATCH`] uses a per-process hash key.
+    /// It is O(1) for a cached root; a dirty root is recomputed on demand.
     pub fn fingerprint(&self) -> TribleSetFingerprint {
         TribleSetFingerprint(self.eav.root_hash())
     }
@@ -794,6 +798,76 @@ mod tests {
                 intrinsic_row(attribute, value)
             })
             .collect()
+    }
+
+    /// Mirrors the 512-entity / three-field intrinsic aggregation benchmark.
+    /// Run explicitly in release mode with one test thread so the test-only
+    /// LocalLeaf hash counter is an isolated operational witness.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    #[ignore = "release-only LocalLeaf hash accounting probe"]
+    fn aggregate_hash_union_512x3_probe() {
+        use crate::patch::{local_leaf_hash_calls, reset_local_leaf_hash_calls};
+
+        const ENTITY_COUNT: usize = 512;
+        let mut expected_hashes = [0u128; 6];
+        let mut entities = Vec::with_capacity(ENTITY_COUNT);
+
+        for entity in 0..ENTITY_COUNT {
+            let rows = (0..3)
+                .map(|field| {
+                    let mut attribute = [0u8; 16];
+                    attribute[15] = field + 1;
+                    let mut value = [0u8; 32];
+                    value[..8].copy_from_slice(&(entity as u64).to_be_bytes());
+                    value[31] = field;
+                    intrinsic_row(attribute, value)
+                })
+                .collect();
+            let (_, set) = build_intrinsic_entity(rows);
+            for (expected, actual) in expected_hashes.iter_mut().zip([
+                set.eav.root_hash().unwrap(),
+                set.eva.root_hash().unwrap(),
+                set.aev.root_hash().unwrap(),
+                set.ave.root_hash().unwrap(),
+                set.vea.root_hash().unwrap(),
+                set.vae.root_hash().unwrap(),
+            ]) {
+                *expected ^= actual;
+            }
+            entities.push(set);
+        }
+
+        reset_local_leaf_hash_calls();
+        let mut aggregate = TribleSet::new();
+        for entity in entities {
+            aggregate += entity;
+        }
+        assert_eq!(aggregate.len(), ENTITY_COUNT * 3);
+        let fold_hashes = local_leaf_hash_calls();
+        assert_eq!(
+            fold_hashes, 0,
+            "disjoint serial unions must not hash archive-backed leaves",
+        );
+
+        // The saving must survive public verification: every root should have
+        // been repaired from input aggregates plus overlap receipts, not left
+        // dirty with the hashing bill merely deferred to `root_hash()`.
+        let before_root_verification = local_leaf_hash_calls();
+        let actual_hashes = [
+            aggregate.eav.root_hash().unwrap(),
+            aggregate.eva.root_hash().unwrap(),
+            aggregate.aev.root_hash().unwrap(),
+            aggregate.ave.root_hash().unwrap(),
+            aggregate.vea.root_hash().unwrap(),
+            aggregate.vae.root_hash().unwrap(),
+        ];
+        assert_eq!(actual_hashes, expected_hashes);
+        let verification_hashes = local_leaf_hash_calls() - before_root_verification;
+        assert_eq!(verification_hashes, 0);
+        eprintln!(
+            "aggregate_hash_union_512x3: fold LocalLeaf hashes={fold_hashes}, root verification hashes={verification_hashes}",
+        );
     }
 
     #[test]

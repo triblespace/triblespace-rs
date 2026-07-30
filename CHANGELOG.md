@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Experimental PATCH union can leave internal hashes lazy.** A zero Branch
+  aggregate is treated as a conservative uncached sentinel, serial union
+  propagates exact intersection-hash receipts, and cached input aggregates
+  repair the result algebraically. Disjoint archive-backed aggregation can
+  therefore move LocalLeaves without hashing them, while on-demand root hashes
+  and deep debug audits retain the same key-set semantics.
+
 - **Known archive batches now start at their irreducible PATCH shape.** Empty
   batches stay empty, singleton tribles remain root LocalLeaves, and batches of
   two or more same-owner rows directly create ordinary Branches over two

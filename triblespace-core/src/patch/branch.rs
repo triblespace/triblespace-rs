@@ -67,16 +67,15 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
-    /// Like [`modify_child`] but uses the supplied `inserted_hash`
-    /// for the empty-slot insertion case instead of calling
-    /// `inserted.hash()`. Lets archive ingest avoid recomputing
-    /// the LocalLeaf siphash24 once per index — the caller already
-    /// has it from `ArchiveEntry::hash`.
+    /// Like [`modify_child`] but treats the supplied `inserted_hash` as a known
+    /// contribution for the empty-slot insertion case. This lets archive
+    /// ingest maintain a clean parent around a LocalLeaf without recomputing
+    /// siphash24 once per index — the caller already has it from
+    /// `ArchiveEntry::hash`.
     ///
     /// The hint MUST equal the hash of whatever `f(None)` returns.
-    /// When the slot is non-empty and `f(Some(_))` runs, the result
-    /// is hashed normally (recursion result, hash already cached on
-    /// the Branch).
+    /// When the slot is non-empty, both old and replacement contributions must
+    /// already be cached or the parent becomes dirty.
     pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: u128, f: F)
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
@@ -211,12 +210,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
     ) -> NonNull<Self> {
-        // Compute rchild's hash via the normal path. For LocalLeaf
-        // this triggers siphash24; the
-        // [`new_with_rchild_hash`] variant skips it when
-        // the caller has the hash already.
-        let rchild_hash = rchild.hash();
-        Self::new_with_rchild_hash(end_depth, lchild, rchild, rchild_hash)
+        let lchild_hash = lchild.known_hash();
+        let rchild_hash = rchild.known_hash();
+        Self::new_with_optional_child_hashes(end_depth, lchild, rchild, lchild_hash, rchild_hash)
     }
 
     /// Variant of [`Self::new`] that takes a precomputed
@@ -225,18 +221,23 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// `ArchiveEntry::hash` they already have instead of recomputing
     /// siphash24 over the LocalLeaf bytes.
     ///
-    /// `rchild_hash` MUST equal `rchild.hash()`. The lchild hash
-    /// still goes through the normal path — it's typically a Branch
-    /// (cached) or heap Leaf (cached), so the only LocalLeaf hash
-    /// recompute that matters is on the freshly inserted side.
+    /// `rchild_hash` MUST equal `rchild.hash()`. The left contribution is used
+    /// only when it is already cached; a dirty left subtree makes the new
+    /// parent dirty instead of forcing a recursive hash.
     pub(super) fn new_with_rchild_hash(
         end_depth: usize,
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
         rchild_hash: u128,
     ) -> NonNull<Self> {
-        let lchild_hash = lchild.hash();
-        Self::new_with_child_hashes(end_depth, lchild, rchild, lchild_hash, rchild_hash)
+        let lchild_hash = lchild.known_hash();
+        Self::new_with_optional_child_hashes(
+            end_depth,
+            lchild,
+            rchild,
+            lchild_hash,
+            Some(rchild_hash),
+        )
     }
 
     /// Variant used when a known archive batch bootstraps a Branch directly
@@ -248,6 +249,26 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         rchild: Head<KEY_LEN, O, V>,
         lchild_hash: u128,
         rchild_hash: u128,
+    ) -> NonNull<Self> {
+        Self::new_with_optional_child_hashes(
+            end_depth,
+            lchild,
+            rchild,
+            Some(lchild_hash),
+            Some(rchild_hash),
+        )
+    }
+
+    /// Construct a branch whose aggregate is cached only when both child
+    /// hashes are already known. Zero is a conservative uncached sentinel;
+    /// an exact semantic zero is intentionally represented by the same value
+    /// and will simply be recomputed by [`Head::hash`].
+    pub(super) fn new_with_optional_child_hashes(
+        end_depth: usize,
+        lchild: Head<KEY_LEN, O, V>,
+        rchild: Head<KEY_LEN, O, V>,
+        lchild_hash: Option<u128>,
+        rchild_hash: Option<u128>,
     ) -> NonNull<Self> {
         unsafe {
             let size = 2;
@@ -269,7 +290,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
-            addr_of_mut!((*ptr.as_ptr()).hash).write(lchild_hash ^ rchild_hash);
+            let hash = match (lchild_hash, rchild_hash) {
+                (Some(left), Some(right)) => left ^ right,
+                _ => 0,
+            };
+            addr_of_mut!((*ptr.as_ptr()).hash).write(hash);
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);
 
@@ -421,14 +446,35 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
+        Self::modify_child_impl(branch_nn, key, None, f);
+    }
+
+    /// Shared child mutation machinery. `empty_slot_hash_hint` is consulted
+    /// only when `f(None)` inserts a child; an occupied replacement always
+    /// derives both contributions from the resident heads. `Some(0)` is a
+    /// legitimate known-zero contribution and must remain distinct from no
+    /// hint.
+    fn modify_child_impl<F>(
+        branch_nn: &mut NonNull<Self>,
+        key: u8,
+        empty_slot_hash_hint: Option<u128>,
+        f: F,
+    ) where
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    {
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
+            // A zero aggregate is deliberately ambiguous: it may be a dirty
+            // cache or a legitimate semantic zero. Incremental maintenance is
+            // valid only when the parent and every replaced contribution are
+            // already known; otherwise dirtiness propagates upward.
+            let cached_parent_hash = ((*branch).hash != 0).then_some((*branch).hash);
 
             // If a slot exists, operate on the existing child in-place.
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
-                let old_child_hash = child.hash();
+                let old_child_hash = cached_parent_hash.and_then(|_| child.known_hash());
                 let old_child_segment_count = child.count_segment(end_depth);
                 let old_child_leaf_count = child.count();
 
@@ -436,7 +482,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
                 if let Some(new_child) = f(Some(child)) {
                     // Replace existing child
-                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
+                    let new_child_hash = new_child.known_hash();
+                    (*branch).hash = match (cached_parent_hash, old_child_hash, new_child_hash) {
+                        (Some(parent), Some(old), Some(new)) => parent ^ old ^ new,
+                        _ => 0,
+                    };
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
@@ -451,7 +501,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     }
                 } else {
                     // Remove existing child
-                    (*branch).hash ^= old_child_hash;
+                    (*branch).hash = match (cached_parent_hash, old_child_hash) {
+                        (Some(parent), Some(old)) => parent ^ old,
+                        _ => 0,
+                    };
                     (*branch).segment_count -= old_child_segment_count;
                     (*branch).leaf_count -= old_child_leaf_count;
 
@@ -469,7 +522,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    (*branch).hash ^= inserted.hash();
+                    let inserted_hash =
+                        empty_slot_hash_hint.or_else(|| inserted.known_hash());
+                    (*branch).hash = match (cached_parent_hash, inserted_hash) {
+                        (Some(parent), Some(inserted)) => parent ^ inserted,
+                        _ => 0,
+                    };
 
                     // Cuckoo insert loop, growing the table when necessary.
                     let mut branch_ptr = branch_nn.as_ptr();
@@ -489,11 +547,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     }
 
     /// Variant of [`Self::modify_child`] that takes a precomputed
-    /// `inserted_hash` and uses it for the empty-slot insertion path
-    /// instead of calling `inserted.hash()`. The hint MUST equal the
-    /// hash of whatever `f(None)` returns. The non-empty path uses
-    /// `new_child.hash()` as normal (the recursive result is a Branch
-    /// whose hash is already cached, so the call is O(1)).
+    /// `inserted_hash` as a known empty-slot contribution. The hint MUST equal
+    /// the hash of whatever `f(None)` returns. A non-empty replacement keeps
+    /// the parent clean only when both child hashes are already cached.
     pub(super) fn modify_child_with_inserted_hint<F>(
         branch_nn: &mut NonNull<Self>,
         key: u8,
@@ -502,66 +558,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     ) where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
-        unsafe {
-            let branch = branch_nn.as_ptr();
-            let end_depth = (*branch).end_depth as usize;
-
-            if let Some(slot) = (*branch).child_table.table_get_slot(key) {
-                let child = slot.take().unwrap();
-                let old_child_hash = child.hash();
-                let old_child_segment_count = child.count_segment(end_depth);
-                let old_child_leaf_count = child.count();
-
-                let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
-
-                if let Some(new_child) = f(Some(child)) {
-                    // Recursion result — its hash is cached on the
-                    // returned Head (Branch.hash field), so calling
-                    // .hash() is cheap.
-                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
-                    (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
-                        + new_child.count_segment(end_depth);
-                    (*branch).leaf_count =
-                        ((*branch).leaf_count - old_child_leaf_count) + new_child.count();
-
-                    if replaced_childleaf {
-                        (*branch).childleaf = new_child.childleaf_ptr();
-                    }
-
-                    if slot.replace(new_child.with_key(key)).is_some() {
-                        unreachable!();
-                    }
-                } else {
-                    (*branch).hash ^= old_child_hash;
-                    (*branch).segment_count -= old_child_segment_count;
-                    (*branch).leaf_count -= old_child_leaf_count;
-
-                    if replaced_childleaf {
-                        if let Some(other) = (*branch).child_table.iter().find_map(|s| s.as_ref()) {
-                            (*branch).childleaf = other.childleaf_ptr();
-                        }
-                    }
-                }
-            } else {
-                if let Some(mut inserted) = f(None) {
-                    // Use the caller-supplied hint instead of
-                    // recomputing siphash24 over the LocalLeaf bytes.
-                    (*branch).leaf_count += inserted.count();
-                    (*branch).segment_count += inserted.count_segment(end_depth);
-                    (*branch).hash ^= inserted_hash;
-
-                    let mut branch_ptr = branch_nn.as_ptr();
-                    while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
-                    {
-                        inserted = new_displaced;
-                        Self::grow(branch_nn);
-                        branch_ptr = branch_nn.as_ptr();
-                    }
-                }
-            }
-            #[cfg(debug_assertions)]
-            branch_nn.as_ref().debug_check_invariants();
-        }
+        Self::modify_child_impl(branch_nn, key, Some(inserted_hash), f);
     }
 
     // Note: upsert_child removed in favor of explicit insert_child / update_child
@@ -642,11 +639,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let mut agg_segment_count: u64 = 0;
         let mut agg_hash: u128 = 0;
         let mut match_found = false;
+        let has_cached_hash = self.hash != 0;
+        let mut all_child_hashes_known = true;
 
         for child in self.child_table.iter().flatten() {
             agg_leaf_count = agg_leaf_count.saturating_add(child.count());
             agg_segment_count = agg_segment_count.saturating_add(child.count_segment(end_depth));
-            agg_hash ^= child.hash();
+            if has_cached_hash {
+                if let Some(hash) = child.known_hash() {
+                    agg_hash ^= hash;
+                } else {
+                    all_child_hashes_known = false;
+                }
+            }
             if child.childleaf_ptr() == self.childleaf {
                 match_found = true;
             }
@@ -660,7 +665,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             agg_segment_count, self.segment_count,
             "branch.segment_count mismatch"
         );
-        debug_assert_eq!(agg_hash, self.hash, "branch.hash mismatch");
+        // Zero is the conservative uncached sentinel. It is also a valid
+        // semantic XOR, so zero branches are always verified on demand by
+        // `Head::hash` rather than distinguished with extra state. A nonzero
+        // parent may legally cover dirty descendants after algebraic repair;
+        // keep this local audit resident-only and leave that case to the
+        // explicit deep boundary oracle.
+        if has_cached_hash && all_child_hashes_known {
+            debug_assert_eq!(agg_hash, self.hash, "branch.hash mismatch");
+        }
 
         // If there are any leaves aggregated in this branch then the
         // `childleaf` pointer must match one of the children. When the
