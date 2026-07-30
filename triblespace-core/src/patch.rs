@@ -1036,11 +1036,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 );
 
                 let key_byte = head.key();
-                // Hash while the LocalLeaf still points directly at its
-                // archive bytes. The resulting receipt is stored in the heap
-                // Leaf after copying, avoiding a second hash and another
-                // completed process-key initialization check.
-                let hash = head.hash();
                 let key_copy = *bytes;
                 drop(head);
 
@@ -1049,7 +1044,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 // type. Therefore observing this tag proves `V = ()`. The
                 // layout assertions catch accidental erosion of that internal
                 // invariant near this cast.
-                let unit_leaf = unsafe { Leaf::<KEY_LEN, ()>::new_with_hash(&key_copy, (), hash) };
+                let unit_leaf =
+                    unsafe { Leaf::<KEY_LEN, ()>::new_with_initialized_hash_key(&key_copy, ()) };
                 let leaf = unit_leaf.cast::<Leaf<KEY_LEN, V>>();
                 Head::new(key_byte, leaf)
             }

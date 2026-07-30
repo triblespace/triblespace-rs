@@ -32,12 +32,24 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
         // the shared process-local key at the hash-construction boundary so a
         // later PATCH never observes a stale zero-key leaf hash.
         init_sip_key();
-        let hash = unsafe {
-            SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let Some(ptr) = NonNull::new(alloc(layout) as *mut Self) else {
+                handle_alloc_error(layout);
+            };
+            let hash = SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
                 .hash(&key[..])
-                .into()
-        };
-        unsafe { Self::new_with_hash(key, value, hash) }
+                .into();
+
+            ptr.write(Self {
+                key: *key,
+                hash,
+                rc: atomic::AtomicU32::new(1),
+                value,
+            });
+
+            ptr
+        }
     }
 
     /// Allocates a leaf whose PATCH-compatible key hash is already known.
@@ -51,6 +63,35 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
             let Some(ptr) = NonNull::new(alloc(layout) as *mut Self) else {
                 handle_alloc_error(layout);
             };
+
+            ptr.write(Self {
+                key: *key,
+                hash,
+                rc: atomic::AtomicU32::new(1),
+                value,
+            });
+
+            ptr
+        }
+    }
+
+    /// Allocates a leaf after the shared PATCH hash key has been initialized.
+    ///
+    /// This preserves `Leaf::new`'s allocation-before-hashing order while
+    /// avoiding its completed process-key initialization check when a
+    /// `LocalLeaf` is materialized from an existing PATCH.
+    pub(super) unsafe fn new_with_initialized_hash_key(
+        key: &[u8; KEY_LEN],
+        value: V,
+    ) -> NonNull<Self> {
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let Some(ptr) = NonNull::new(alloc(layout) as *mut Self) else {
+                handle_alloc_error(layout);
+            };
+            let hash = SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
+                .hash(&key[..])
+                .into();
 
             ptr.write(Self {
                 key: *key,
