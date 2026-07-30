@@ -3674,8 +3674,15 @@ where
         result
     }
 
-    /// In-place MSD-radix worker for
+    /// Representative-LCP plus in-place MSD-radix worker for
     /// [`Self::from_archive_partition_for_test`].
+    ///
+    /// After examining `k` rows, `end_depth` is the minimum LCP length between
+    /// the representative and those rows, bounded below by the incoming
+    /// `depth`. Consequently every row shares `[depth, end_depth)`, and for a
+    /// unique multi-row input at least two byte buckets exist at `end_depth`.
+    /// Finding that compressed boundary row-major avoids one whole-slice pass
+    /// for every shared byte of a long prefix.
     #[cfg(test)]
     unsafe fn build_archive_partition_head_for_test(
         keys: &[[u8; KEY_LEN]],
@@ -3692,12 +3699,29 @@ where
             let head = unsafe { Head::new_local_leaf(0, ptr) };
             return (head, hashes[row]);
         }
+        let representative = &keys[rows[0] as usize];
+        let mut end_depth = KEY_LEN;
+        for &row in &rows[1..] {
+            let key = &keys[row as usize];
+            let mut candidate_depth = depth;
+            while candidate_depth < end_depth {
+                let key_index = O::TREE_TO_KEY[candidate_depth];
+                if representative[key_index] != key[key_index] {
+                    end_depth = candidate_depth;
+                    break;
+                }
+                candidate_depth += 1;
+            }
+            if end_depth == depth {
+                break;
+            }
+        }
         assert!(
-            depth < KEY_LEN,
+            end_depth < KEY_LEN,
             "duplicate archive keys cannot form a finite trie",
         );
 
-        let key_index = O::TREE_TO_KEY[depth];
+        let key_index = O::TREE_TO_KEY[end_depth];
         let mut counts = [0usize; 256];
         for &row in rows.iter() {
             counts[keys[row as usize][key_index] as usize] += 1;
@@ -3718,11 +3742,7 @@ where
         }
 
         let first_bucket = first_bucket.expect("a non-empty partition has one bucket");
-        if second_bucket.is_none() {
-            return unsafe {
-                Self::build_archive_partition_head_for_test(keys, hashes, rows, depth + 1)
-            };
-        }
+        let second_bucket = second_bucket.expect("a unique multi-row node has two buckets");
 
         // American-flag partition: `starts` defines each final bucket range,
         // while `next` advances the first unfilled position in that range.
@@ -3751,14 +3771,13 @@ where
             }
         }
 
-        let second_bucket = second_bucket.expect("a Branch needs two child buckets");
         let first_range = starts[first_bucket]..starts[first_bucket] + counts[first_bucket];
         let (first_head, first_hash) = unsafe {
             Self::build_archive_partition_head_for_test(
                 keys,
                 hashes,
                 &mut rows[first_range],
-                depth + 1,
+                end_depth + 1,
             )
         };
         let second_range = starts[second_bucket]..starts[second_bucket] + counts[second_bucket];
@@ -3767,12 +3786,12 @@ where
                 keys,
                 hashes,
                 &mut rows[second_range],
-                depth + 1,
+                end_depth + 1,
             )
         };
 
         let body = Branch::new_with_child_hashes(
-            depth,
+            end_depth,
             first_head.with_key(first_bucket as u8),
             second_head.with_key(second_bucket as u8),
             first_hash,
@@ -3791,7 +3810,7 @@ where
                     keys,
                     hashes,
                     &mut rows[range],
-                    depth + 1,
+                    end_depth + 1,
                 )
             };
             let mut editor = BranchMut::from_head(&mut root);
