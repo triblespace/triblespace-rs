@@ -758,4 +758,101 @@ mod tests {
             );
         }
     }
+
+    /// Crossover sweep for the production-shaped direct-capacity chunk
+    /// candidate. Fixture construction, input cloning, parity checks, result
+    /// observation, and result destruction are deliberately outside each
+    /// measured conversion interval.
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[ignore = "manual direct-capacity threshold/crossover benchmark"]
+    fn chunked_direct_capacity_threshold_timing() {
+        fn median(samples: &mut [Duration]) -> Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        fn time_public(blob: Blob<SimpleArchive>) -> (Duration, TribleSet) {
+            let start = Instant::now();
+            let set = TribleSet::try_from_blob(blob).unwrap();
+            (start.elapsed(), set)
+        }
+
+        fn time_candidate(blob: Blob<SimpleArchive>) -> (Duration, TribleSet) {
+            let start = Instant::now();
+            let set = try_from_blob_chunked_bottom_up_for_test(blob).unwrap();
+            (start.elapsed(), set)
+        }
+
+        fn observe_and_drop(set: TribleSet) {
+            black_box(set.len());
+            drop(set);
+        }
+
+        for (len, sample_count) in [
+            (4_095usize, 48usize),
+            (4_096, 48),
+            (8_192, 40),
+            (16_384, 32),
+            (32_768, 24),
+            (65_536, 16),
+            (100_000, 12),
+        ] {
+            let blob = fixture_blob(len);
+
+            let public_oracle = TribleSet::try_from_blob(blob.clone()).unwrap();
+            let candidate_oracle = try_from_blob_chunked_bottom_up_for_test(blob.clone()).unwrap();
+            assert_all_six_parity(&candidate_oracle, &public_oracle, len);
+            drop(candidate_oracle);
+            drop(public_oracle);
+
+            let threads = rayon::current_num_threads().max(1);
+            let uses_parallel_chunks = len >= PARALLEL_UNARCHIVE_THRESHOLD;
+            let chunk_size = if uses_parallel_chunks {
+                len.div_ceil(threads).max(1)
+            } else {
+                len
+            };
+            let chunk_count = if uses_parallel_chunks {
+                len.div_ceil(chunk_size)
+            } else {
+                1
+            };
+
+            let mut public_samples = Vec::with_capacity(sample_count);
+            let mut candidate_samples = Vec::with_capacity(sample_count);
+            for sample in 0..sample_count {
+                if sample % 2 == 0 {
+                    let public_input = black_box(blob.clone());
+                    let (elapsed, set) = time_public(public_input);
+                    public_samples.push(elapsed);
+                    observe_and_drop(set);
+
+                    let candidate_input = black_box(blob.clone());
+                    let (elapsed, set) = time_candidate(candidate_input);
+                    candidate_samples.push(elapsed);
+                    observe_and_drop(set);
+                } else {
+                    let candidate_input = black_box(blob.clone());
+                    let (elapsed, set) = time_candidate(candidate_input);
+                    candidate_samples.push(elapsed);
+                    observe_and_drop(set);
+
+                    let public_input = black_box(blob.clone());
+                    let (elapsed, set) = time_public(public_input);
+                    public_samples.push(elapsed);
+                    observe_and_drop(set);
+                }
+            }
+
+            let public = median(&mut public_samples);
+            let candidate = median(&mut candidate_samples);
+            println!(
+                "chunked_direct_capacity_threshold len={len} samples={sample_count} threads={threads} parallel_chunks={uses_parallel_chunks} chunk_count={chunk_count} chunk_size={chunk_size} public_ms={:.3} candidate_ms={:.3} public_over_candidate={:.3}x",
+                public.as_secs_f64() * 1e3,
+                candidate.as_secs_f64() * 1e3,
+                public.as_secs_f64() / candidate.as_secs_f64(),
+            );
+        }
+    }
 }
