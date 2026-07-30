@@ -942,9 +942,10 @@ pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
 
 /// What a recursive union learned about the input intersection.
 ///
-/// The scalar representation is intentionally private to this experiment. It
-/// can later grow symbolic `Empty` / whole-subtree cases without changing the
-/// surrounding mutation API.
+/// The scalar representation is intentionally private. A richer deferred
+/// containment proof is not a drop-in enum extension: partial intersections
+/// need a retained source or a second traversal before their numeric hash can
+/// be recovered.
 #[derive(Clone, Copy, Debug, Default)]
 struct UnionOverlap {
     hash: u128,
