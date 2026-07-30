@@ -283,6 +283,8 @@ mod tests {
     use crate::patch::{KeySchema, PATCH};
     use crate::trible::{AEVOrder, AVEOrder, EAVOrder, EVAOrder, VAEOrder, VEAOrder};
     use std::hint::black_box;
+    #[cfg(feature = "parallel")]
+    use std::time::{Duration, Instant};
 
     fn fixture_row(index: usize) -> [u8; 64] {
         const FACTS_PER_ENTITY: usize = 8;
@@ -309,6 +311,101 @@ mod tests {
         assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
         let bytes: Bytes = rows.into();
         Blob::new(bytes)
+    }
+
+    #[cfg(feature = "parallel")]
+    #[derive(Clone, Copy)]
+    enum BenchmarkGeometry {
+        EntityLike,
+        HighEntropy,
+        LongPrefixLowCardinality,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl BenchmarkGeometry {
+        fn name(self) -> &'static str {
+            match self {
+                Self::EntityLike => "entity_like",
+                Self::HighEntropy => "high_entropy",
+                Self::LongPrefixLowCardinality => "long_prefix_low_cardinality",
+            }
+        }
+
+        fn row(self, index: usize) -> [u8; 64] {
+            match self {
+                Self::EntityLike => fixture_row(index),
+                Self::HighEntropy => high_entropy_row(index),
+                Self::LongPrefixLowCardinality => long_prefix_low_cardinality_row(index),
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn avalanche_word(mut word: u64) -> u64 {
+        // This is a bijection on u64. Distinct ordinals therefore remain
+        // distinct in each fixed-salt word.
+        word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        word ^ (word >> 31)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn high_entropy_row(index: usize) -> [u8; 64] {
+        let ordinal = u64::try_from(index).expect("fixture ordinal must fit u64");
+        let mut row = [0u8; 64];
+        for (word_index, chunk) in row.chunks_exact_mut(8).enumerate() {
+            let salt = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(word_index as u64 + 1);
+            chunk.copy_from_slice(&avalanche_word(ordinal ^ salt).to_be_bytes());
+        }
+        debug_assert!(row[..16].iter().any(|byte| *byte != 0));
+        debug_assert!(row[16..32].iter().any(|byte| *byte != 0));
+        row
+    }
+
+    #[cfg(feature = "parallel")]
+    fn long_prefix_low_cardinality_row(index: usize) -> [u8; 64] {
+        const ENTITY_CARDINALITY: usize = 256;
+        const ATTRIBUTE_CARDINALITY: usize = 16;
+
+        let mut row = [0u8; 64];
+        let entity = index % ENTITY_CARDINALITY + 1;
+        let attribute = (index / ENTITY_CARDINALITY) % ATTRIBUTE_CARDINALITY + 1;
+        let value = index + 1;
+        row[12..16].copy_from_slice(
+            &u32::try_from(entity)
+                .expect("fixture entity must fit u32")
+                .to_be_bytes(),
+        );
+        row[28..32].copy_from_slice(
+            &u32::try_from(attribute)
+                .expect("fixture attribute must fit u32")
+                .to_be_bytes(),
+        );
+        row[56..64].copy_from_slice(
+            &u64::try_from(value)
+                .expect("fixture value must fit u64")
+                .to_be_bytes(),
+        );
+        row
+    }
+
+    #[cfg(feature = "parallel")]
+    fn benchmark_blob(geometry: BenchmarkGeometry, len: usize) -> Blob<SimpleArchive> {
+        let mut rows = (0..len)
+            .map(|index| geometry.row(index))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows.len(), len);
+        assert!(rows
+            .iter()
+            .all(|row| Trible::as_transmute_force_raw(row).is_some()));
+        assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            rows.as_ptr() as usize & 0x0f,
+            0,
+            "benchmark archive allocation must support LocalLeaves",
+        );
+        Blob::new(Bytes::from(rows))
     }
 
     fn blob_from_rows(rows: Vec<[u8; 64]>) -> Blob<SimpleArchive> {
@@ -341,6 +438,65 @@ mod tests {
         Ok(unsafe { TribleSet::from_archive_partition(slice, &hashes, &owner) })
     }
 
+    /// The production decoder immediately before the bottom-up change, copied
+    /// from parent `677401ee`. Keeping this oracle in the same optimized test
+    /// binary removes cross-binary and cross-revision noise from the causal
+    /// benchmark below.
+    #[cfg(feature = "parallel")]
+    fn legacy_try_from_blob_for_benchmark(
+        blob: Blob<SimpleArchive>,
+    ) -> Result<TribleSet, UnarchiveError> {
+        let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
+            return Err(UnarchiveError::BadArchive);
+        };
+        let slice: &[[u8; 64]] = &packed_tribles;
+        let owner: Option<Arc<dyn ArchiveOwner>> = if (slice.as_ptr() as usize) & 0x0f == 0 {
+            Some(Arc::new(blob.bytes.clone()))
+        } else {
+            None
+        };
+
+        if slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
+            legacy_parallel_unarchive_for_benchmark(slice, owner)
+        } else {
+            serial_unarchive(slice, owner.as_ref())
+        }
+    }
+
+    /// Exact former production worker DAG: chunk, validate and insert rows
+    /// online inside each worker, then reduce the chunk sets through union.
+    #[cfg(feature = "parallel")]
+    fn legacy_parallel_unarchive_for_benchmark(
+        slice: &[[u8; 64]],
+        owner: Option<Arc<dyn ArchiveOwner>>,
+    ) -> Result<TribleSet, UnarchiveError> {
+        use rayon::prelude::*;
+
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = slice.len().div_ceil(n_threads).max(1);
+        let chunks: Vec<&[[u8; 64]]> = slice.chunks(chunk_size).collect();
+
+        for window in chunks.windows(2) {
+            let last_left = window[0].last().expect("non-empty chunk");
+            let first_right = window[1].first().expect("non-empty chunk");
+            if last_left == first_right {
+                return Err(UnarchiveError::BadCanonicalizationRedundancy);
+            }
+            if last_left > first_right {
+                return Err(UnarchiveError::BadCanonicalizationOrdering);
+            }
+        }
+
+        let chunk_sets: Result<Vec<TribleSet>, UnarchiveError> = chunks
+            .par_iter()
+            .map(|chunk| serial_unarchive(chunk, owner.as_ref()))
+            .collect();
+
+        Ok(chunk_sets?
+            .into_par_iter()
+            .reduce(TribleSet::new, |left, right| left + right))
+    }
+
     fn assert_index_parity<O: KeySchema<64>>(
         candidate: &PATCH<64, O>,
         baseline: &PATCH<64, O>,
@@ -366,6 +522,19 @@ mod tests {
         assert_index_parity::<AVEOrder>(&candidate.ave, &baseline.ave, len);
         assert_index_parity::<VEAOrder>(&candidate.vea, &baseline.vea, len);
         assert_index_parity::<VAEOrder>(&candidate.vae, &baseline.vae, len);
+    }
+
+    #[cfg(feature = "parallel")]
+    fn assert_benchmark_semantic_parity(candidate: &TribleSet, baseline: &TribleSet, len: usize) {
+        assert_eq!(candidate.len(), len);
+        assert_eq!(baseline.len(), len);
+        assert!(candidate.eav.iter_ordered().eq(baseline.eav.iter_ordered()));
+        assert_eq!(candidate.eav.root_hash(), baseline.eav.root_hash());
+        assert_eq!(candidate.eva.root_hash(), baseline.eva.root_hash());
+        assert_eq!(candidate.aev.root_hash(), baseline.aev.root_hash());
+        assert_eq!(candidate.ave.root_hash(), baseline.ave.root_hash());
+        assert_eq!(candidate.vea.root_hash(), baseline.vea.root_hash());
+        assert_eq!(candidate.vae.root_hash(), baseline.vae.root_hash());
     }
 
     #[test]
@@ -631,6 +800,170 @@ mod tests {
         ] {
             assert_eq!(stats.2, len as u64, "heap fallback lost heap Leaves");
             assert_eq!(stats.3, 0, "heap fallback created LocalLeaves");
+        }
+    }
+
+    /// Causal comparison of the former production chunk-online+union decoder
+    /// and its bottom-up replacement in one release test binary.
+    ///
+    /// Fixture generation, canonical sorting, warmup/parity oracles, input
+    /// cloning, and result destruction are outside every timed interval. The
+    /// four-position `ABBA` order cycle gives each decoder the same number of
+    /// first and second positions. The 4,095/4,096 cases expose the production
+    /// threshold discontinuity; the larger cases exercise scale and distinct
+    /// trie geometries.
+    ///
+    /// Run from a clean worktree with no competing compiler or benchmark:
+    ///
+    /// `cargo test -p triblespace-core --release --features parallel bottom_up_clean_causal_benchmark -- --ignored --nocapture --test-threads=1`
+    ///
+    /// The harness prints its exact executable path. Record `shasum -a 256` of
+    /// that file externally alongside the output rather than putting file I/O
+    /// in the benchmark process.
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[ignore = "manual clean-lineage bottom-up causal benchmark"]
+    fn bottom_up_clean_causal_benchmark() {
+        #[derive(Clone, Copy)]
+        enum SampleOrder {
+            LegacyFirst,
+            BottomUpFirst,
+        }
+
+        fn timed_decode(
+            input: Blob<SimpleArchive>,
+            decode: impl FnOnce(Blob<SimpleArchive>) -> Result<TribleSet, UnarchiveError>,
+        ) -> Duration {
+            let start = Instant::now();
+            let set = decode(black_box(input)).expect("canonical benchmark fixture must decode");
+            let len = black_box(set.len());
+            let elapsed = start.elapsed();
+            black_box(len);
+            drop(set);
+            elapsed
+        }
+
+        fn median_seconds(samples: &mut [Duration]) -> f64 {
+            samples.sort_unstable();
+            let middle = samples.len() / 2;
+            if samples.len() % 2 == 0 {
+                (samples[middle - 1].as_secs_f64() + samples[middle].as_secs_f64()) / 2.0
+            } else {
+                samples[middle].as_secs_f64()
+            }
+        }
+
+        fn sample_milliseconds(samples: &[Duration]) -> String {
+            samples
+                .iter()
+                .map(|sample| format!("{:.3}", sample.as_secs_f64() * 1e3))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn git_output(worktree: &std::path::Path, args: &[&str]) -> String {
+            let Ok(output) = std::process::Command::new("git")
+                .current_dir(worktree)
+                .args(args)
+                .output()
+            else {
+                return "unavailable".to_owned();
+            };
+            if !output.status.success() {
+                return format!("error:{}", output.status);
+            }
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        const BOTTOM_UP_INTRODUCTION: &str = "649d3d9b98ec2b8dd3ba1d5e5f369fe6f6b0f782";
+        const CANDIDATE_PARENT: &str = "ab330e0fee695ae786ce2aa4c562ee8a5cad4b1a";
+        const ORDER_CYCLE: [SampleOrder; 4] = [
+            SampleOrder::LegacyFirst,
+            SampleOrder::BottomUpFirst,
+            SampleOrder::BottomUpFirst,
+            SampleOrder::LegacyFirst,
+        ];
+        let worktree = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("core crate must have a repository parent");
+        let head = git_output(worktree, &["rev-parse", "HEAD"]);
+        let dirty =
+            !git_output(worktree, &["status", "--porcelain", "--untracked-files=no"]).is_empty();
+        let executable = std::env::current_exe().expect("test executable path must be available");
+        println!(
+            "bottom_up_clean_context head={head} candidate_parent={CANDIDATE_PARENT} bottom_up_introduction={BOTTOM_UP_INTRODUCTION} worktree={} dirty={dirty} executable={} rayon_threads={} rayon_num_threads_env={} debug_assertions={} command={}",
+            worktree.display(),
+            executable.display(),
+            rayon::current_num_threads(),
+            std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset".to_owned()),
+            cfg!(debug_assertions),
+            "cargo test -p triblespace-core --release --features parallel bottom_up_clean_causal_benchmark -- --ignored --nocapture --test-threads=1",
+        );
+        println!(
+            "bottom_up_clean_executable_hash_plan command=shasum_-a_256 path={}",
+            executable.display(),
+        );
+
+        let cases = [
+            (BenchmarkGeometry::EntityLike, 4_095usize, 8usize),
+            (BenchmarkGeometry::EntityLike, 4_096, 8),
+            (BenchmarkGeometry::EntityLike, 100_000, 8),
+            (BenchmarkGeometry::EntityLike, 1_000_000, 4),
+            (BenchmarkGeometry::HighEntropy, 1_000_000, 4),
+            (BenchmarkGeometry::LongPrefixLowCardinality, 1_000_000, 4),
+        ];
+
+        for (geometry, len, sample_count) in cases {
+            assert_eq!(sample_count % ORDER_CYCLE.len(), 0);
+            let blob = benchmark_blob(geometry, len);
+
+            // These calls also warm both implementations and initialize Rayon
+            // before measurement. Parity traversal and root hashes are never
+            // part of a timed sample.
+            let legacy_oracle = legacy_try_from_blob_for_benchmark(blob.clone()).unwrap();
+            let bottom_up_oracle = TribleSet::try_from_blob(blob.clone()).unwrap();
+            assert_benchmark_semantic_parity(&bottom_up_oracle, &legacy_oracle, len);
+            drop(bottom_up_oracle);
+            drop(legacy_oracle);
+
+            let mut legacy_samples = Vec::with_capacity(sample_count);
+            let mut bottom_up_samples = Vec::with_capacity(sample_count);
+            for round in 0..sample_count {
+                let order = ORDER_CYCLE[round % ORDER_CYCLE.len()];
+                let (legacy, bottom_up) = match order {
+                    SampleOrder::LegacyFirst => {
+                        let legacy = timed_decode(blob.clone(), legacy_try_from_blob_for_benchmark);
+                        let bottom_up = timed_decode(blob.clone(), TribleSet::try_from_blob);
+                        (legacy, bottom_up)
+                    }
+                    SampleOrder::BottomUpFirst => {
+                        let bottom_up = timed_decode(blob.clone(), TribleSet::try_from_blob);
+                        let legacy = timed_decode(blob.clone(), legacy_try_from_blob_for_benchmark);
+                        (legacy, bottom_up)
+                    }
+                };
+                legacy_samples.push(legacy);
+                bottom_up_samples.push(bottom_up);
+            }
+
+            let legacy_raw = sample_milliseconds(&legacy_samples);
+            let bottom_up_raw = sample_milliseconds(&bottom_up_samples);
+            let legacy_seconds = median_seconds(&mut legacy_samples);
+            let bottom_up_seconds = median_seconds(&mut bottom_up_samples);
+            let candidate_regime = if len < PARALLEL_UNARCHIVE_THRESHOLD {
+                "serial"
+            } else {
+                "parallel_bottom_up"
+            };
+            println!(
+                "bottom_up_clean_case geometry={} len={len} samples={sample_count} order_cycle=ABBA candidate_regime={candidate_regime} legacy_median_ms={:.3} bottom_up_median_ms={:.3} speedup={:.3}x legacy_mtribles_per_s={:.3} bottom_up_mtribles_per_s={:.3} legacy_samples_ms=[{legacy_raw}] bottom_up_samples_ms=[{bottom_up_raw}]",
+                geometry.name(),
+                legacy_seconds * 1e3,
+                bottom_up_seconds * 1e3,
+                legacy_seconds / bottom_up_seconds,
+                len as f64 / legacy_seconds / 1e6,
+                len as f64 / bottom_up_seconds / 1e6,
+            );
         }
     }
 }
