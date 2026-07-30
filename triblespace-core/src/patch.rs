@@ -4048,6 +4048,24 @@ mod tests {
         left
     }
 
+    /// Drive the large difference scatter on this thread so the thread-local
+    /// LocalLeaf hash census covers every surviving child.
+    #[cfg(feature = "parallel")]
+    fn difference_with_exhausted_parallel_budget(left: &PATCH<16>, right: &PATCH<16>) -> PATCH<16> {
+        let ctx = parallel_union::ParUnionCtx {
+            budget: AtomicUsize::new(0),
+        };
+        let root = left
+            .root
+            .as_ref()
+            .expect("left root")
+            .par_difference_with_ctx(right.root.as_ref().expect("right root"), 0, &ctx);
+        let owners = root.as_ref().and(left.owners.clone());
+        let result = PATCH { root, owners };
+        result.debug_check_owner_invariant();
+        result
+    }
+
     fn test_archive_owner(byte: u8) -> Arc<dyn ArchiveOwner> {
         Arc::new([byte])
     }
@@ -4757,6 +4775,32 @@ mod tests {
         assert_eq!(left.root_hash(), Some(expected_hash));
         assert_eq!(local_leaf_hash_calls(), before);
         deep_hash_audit(&left);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_difference_eager_control_hash_census() {
+        let left = owned_archive_dirty_parent(0, 128, 0, 32);
+        let right = owned_archive_dirty_parent(0, 128, 16, 16);
+        assert_eq!(left.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(right.len(), 2_048);
+        assert_eq!(direct_dirty_branch_children(&left), 128);
+
+        reset_local_leaf_hash_calls();
+        let difference = difference_with_exhausted_parallel_budget(&left, &right);
+        let composition_hashes = local_leaf_hash_calls();
+        assert_eq!(composition_hashes, 2_048);
+        assert_eq!(difference.len(), 2_048);
+
+        let expected_hash = heap_hash_oracle(&difference);
+        let before = local_leaf_hash_calls();
+        assert_eq!(difference.root_hash(), Some(expected_hash));
+        let first_fingerprint_hashes = local_leaf_hash_calls() - before;
+        assert_eq!(first_fingerprint_hashes, 0);
+
+        eprintln!(
+            "parallel difference eager control: composition={composition_hashes}, first_fingerprint={first_fingerprint_hashes}"
+        );
     }
 
     #[cfg(feature = "parallel")]
