@@ -795,6 +795,128 @@ mod tests {
             .collect()
     }
 
+    /// Deterministic hash-call census for the Criterion `exact_duplicate`
+    /// fixture. This is deliberately ignored: it is an operational probe, not
+    /// a semantic regression test.
+    #[test]
+    #[ignore = "release-only exact-duplicate LocalLeaf hash census"]
+    fn exact_duplicate_hash_census_probe() {
+        use crate::blob::encodings::simplearchive::SimpleArchive;
+        use crate::blob::Blob;
+        use crate::inline::Encodes;
+        use crate::patch::{local_leaf_hash_calls, reset_local_leaf_hash_calls};
+
+        fn raw_trible(bucket: u8, variant: u8) -> [u8; TRIBLE_LEN] {
+            let mut data = [0u8; TRIBLE_LEN];
+            data[0] = bucket;
+            data[1] = variant;
+            data[15] = 0xe1;
+            data[16] = bucket;
+            data[17] = variant;
+            data[31] = 0xa1;
+            data[32] = bucket;
+            data[33] = variant;
+            data[63] = 0x51;
+            data
+        }
+
+        fn rows(variant_count: u8) -> Vec<[u8; TRIBLE_LEN]> {
+            let mut result = Vec::with_capacity(128 * variant_count as usize);
+            for variant in 0..variant_count {
+                for bucket in 0..128u16 {
+                    result.push(raw_trible(bucket as u8, variant));
+                }
+            }
+            result.sort_unstable();
+            result
+        }
+
+        fn heap_set(rows: &[[u8; TRIBLE_LEN]]) -> TribleSet {
+            let mut result = TribleSet::new();
+            for raw in rows {
+                let trible = Trible::force_raw(*raw).expect("valid probe trible");
+                result.insert(&trible);
+            }
+            result
+        }
+
+        fn archive_set(rows: &[[u8; TRIBLE_LEN]]) -> TribleSet {
+            let source = heap_set(rows);
+            let archive: Blob<SimpleArchive> = SimpleArchive::encode(&source);
+            archive.try_from_blob().expect("valid probe archive")
+        }
+
+        fn variant(variant: u8) -> TribleSet {
+            archive_set(
+                &rows(1)
+                    .into_iter()
+                    .map(|mut raw| {
+                        raw[1] = variant;
+                        raw[17] = variant;
+                        raw[33] = variant;
+                        raw
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        fn merged_variants(variant_count: u8) -> TribleSet {
+            assert!(variant_count.is_power_of_two());
+            let mut groups: Vec<_> = (0..variant_count).map(variant).collect();
+            while groups.len() > 1 {
+                let mut next = Vec::with_capacity(groups.len().div_ceil(2));
+                let mut iter = groups.into_iter();
+                while let Some(mut left) = iter.next() {
+                    if let Some(right) = iter.next() {
+                        left.union(right);
+                    }
+                    next.push(left);
+                }
+                groups = next;
+            }
+            groups.pop().expect("at least one variant")
+        }
+
+        for workers in [1usize, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("probe pool");
+            let (stages, union_calls, first_eq_calls, second_eq_calls) = pool.install(|| {
+                let mut stages = Vec::new();
+                for variant_count in [1u8, 2, 4, 8, 16, 32, 64] {
+                    let target = merged_variants(variant_count);
+                    reset_local_leaf_hash_calls();
+                    let _ = target.fingerprint();
+                    stages.push((variant_count, local_leaf_hash_calls()));
+                }
+
+                let expected_rows = rows(64);
+                let mut left = merged_variants(64);
+                let duplicate = archive_set(&[raw_trible(0, 0)]);
+                let oracle = heap_set(&expected_rows);
+
+                reset_local_leaf_hash_calls();
+                left.union(duplicate);
+                let union_calls = local_leaf_hash_calls();
+
+                let before = local_leaf_hash_calls();
+                assert_eq!(left, oracle);
+                let first_eq_calls = local_leaf_hash_calls() - before;
+
+                let before = local_leaf_hash_calls();
+                assert_eq!(left, oracle);
+                let second_eq_calls = local_leaf_hash_calls() - before;
+
+                (stages, union_calls, first_eq_calls, second_eq_calls)
+            });
+
+            eprintln!(
+                "exact_duplicate workers={workers}: stages={stages:?}, union={union_calls}, first_eq={first_eq_calls}, second_eq={second_eq_calls}"
+            );
+        }
+    }
+
     /// Mirrors the 512-entity / three-field intrinsic aggregation benchmark.
     /// Run explicitly in release mode with one test thread so the test-only
     /// LocalLeaf hash counter is an isolated operational witness.
