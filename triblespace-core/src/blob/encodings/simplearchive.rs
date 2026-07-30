@@ -308,6 +308,35 @@ pub(crate) fn try_from_blob_bottom_up_for_test(
 fn try_from_blob_chunked_bottom_up_for_test(
     blob: Blob<SimpleArchive>,
 ) -> Result<TribleSet, UnarchiveError> {
+    try_from_blob_chunked_bottom_up_with_for_test(blob, |rows, hashes, owner| {
+        // SAFETY: the shared chunk shell validates canonical distinct rows,
+        // alignment, u32 ordinals, hashes, and archive ownership.
+        unsafe { TribleSet::from_archive_partition_for_test(rows, hashes, owner).0 }
+    })
+}
+
+/// EAV-specialized variant of [`try_from_blob_chunked_bottom_up_for_test`].
+/// The archive's native EAV order bypasses one radix partition pass, while the
+/// other five schemas retain the same one-buffer bottom-up construction.
+#[cfg(all(test, feature = "parallel"))]
+fn try_from_blob_chunked_eav_specialized_for_test(
+    blob: Blob<SimpleArchive>,
+) -> Result<TribleSet, UnarchiveError> {
+    try_from_blob_chunked_bottom_up_with_for_test(blob, |rows, hashes, owner| {
+        // SAFETY: the shared chunk shell establishes the general invariants
+        // above and proves that each chunk is strictly increasing in EAV order.
+        unsafe { TribleSet::from_archive_partition_eav_specialized_for_test(rows, hashes, owner).0 }
+    })
+}
+
+#[cfg(all(test, feature = "parallel"))]
+fn try_from_blob_chunked_bottom_up_with_for_test<F>(
+    blob: Blob<SimpleArchive>,
+    build: F,
+) -> Result<TribleSet, UnarchiveError>
+where
+    F: Fn(&[[u8; 64]], &[u128], &Arc<dyn ArchiveOwner>) -> TribleSet + Sync,
+{
     use rayon::prelude::*;
 
     let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
@@ -346,10 +375,7 @@ fn try_from_blob_chunked_bottom_up_for_test(
         .par_iter()
         .map(|chunk| {
             let hashes = validate_and_hash_archive_slice_for_test(chunk)?;
-            let (set, _) = unsafe {
-                TribleSet::from_archive_partition_for_test(chunk, &hashes, &owner)
-            };
-            Ok(set)
+            Ok(build(chunk, &hashes, &owner))
         })
         .collect();
 
@@ -536,15 +562,18 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn chunked_bottom_up_archive_matches_public_parallel_path() {
+    fn chunked_bottom_up_candidates_match_public_parallel_path() {
         for len in [4_095usize, 4_096, 8_192] {
             let blob = fixture_blob(len);
             let baseline = TribleSet::try_from_blob(blob.clone()).unwrap();
-            let candidate = try_from_blob_chunked_bottom_up_for_test(blob.clone()).unwrap();
-            assert_all_six_parity(&candidate, &baseline, len);
+            let bottom_up = try_from_blob_chunked_bottom_up_for_test(blob.clone()).unwrap();
+            let specialized = try_from_blob_chunked_eav_specialized_for_test(blob.clone()).unwrap();
+            assert_all_six_parity(&bottom_up, &baseline, len);
+            assert_all_six_parity(&specialized, &baseline, len);
 
-            let survivor = candidate.clone();
-            drop(candidate);
+            let survivor = specialized.clone();
+            drop(specialized);
+            drop(bottom_up);
             drop(baseline);
             drop(blob);
             black_box(vec![0x5au8; len.saturating_mul(64).min(1 << 20)]);
@@ -573,8 +602,13 @@ mod tests {
                         expected,
                     );
                     assert_eq!(
-                        try_from_blob_chunked_bottom_up_for_test(blob)
+                        try_from_blob_chunked_bottom_up_for_test(blob.clone())
                             .expect_err("chunked bottom-up decoder must reject invalid input"),
+                        expected,
+                    );
+                    assert_eq!(
+                        try_from_blob_chunked_eav_specialized_for_test(blob)
+                            .expect_err("EAV-specialized decoder must reject invalid input"),
                         expected,
                     );
                 }
@@ -610,8 +644,13 @@ mod tests {
                     UnarchiveError::BadArchive,
                 );
                 assert_eq!(
-                    try_from_blob_chunked_bottom_up_for_test(malformed)
+                    try_from_blob_chunked_bottom_up_for_test(malformed.clone())
                         .expect_err("chunked bottom-up decoder must reject malformed bytes"),
+                    UnarchiveError::BadArchive,
+                );
+                assert_eq!(
+                    try_from_blob_chunked_eav_specialized_for_test(malformed)
+                        .expect_err("EAV-specialized decoder must reject malformed bytes"),
                     UnarchiveError::BadArchive,
                 );
             });
@@ -695,30 +734,34 @@ mod tests {
         }
     }
 
-    /// Actual public parallel chunk+online+union path versus the same chunk
-    /// DAG with the sparse bottom-up builder inside every worker.
+    /// Actual public parallel path versus the general and EAV-specialized
+    /// bottom-up builders inside the same chunk DAG.
     #[cfg(feature = "parallel")]
     #[test]
-    #[ignore = "manual 100k/1m production-shaped construction benchmark"]
-    fn chunked_bottom_up_archive_timing() {
+    #[ignore = "manual 100k/1m EAV-specialized construction benchmark"]
+    fn chunked_eav_specialized_archive_timing() {
         fn median(samples: &mut [Duration]) -> Duration {
             samples.sort_unstable();
             samples[samples.len() / 2]
         }
 
-        for (len, rounds) in [(100_000usize, 6usize), (1_000_000, 4)] {
+        for (len, rounds) in [(100_000usize, 6usize), (1_000_000, 3)] {
             let blob = fixture_blob(len);
-            let baseline_oracle = TribleSet::try_from_blob(blob.clone()).unwrap();
-            let candidate_oracle =
-                try_from_blob_chunked_bottom_up_for_test(blob.clone()).unwrap();
-            assert_all_six_parity(&candidate_oracle, &baseline_oracle, len);
-            drop(candidate_oracle);
-            drop(baseline_oracle);
+            let public_oracle = TribleSet::try_from_blob(blob.clone()).unwrap();
+            let bottom_up_oracle = try_from_blob_chunked_bottom_up_for_test(blob.clone()).unwrap();
+            let specialized_oracle =
+                try_from_blob_chunked_eav_specialized_for_test(blob.clone()).unwrap();
+            assert_all_six_parity(&bottom_up_oracle, &public_oracle, len);
+            assert_all_six_parity(&specialized_oracle, &public_oracle, len);
+            drop(specialized_oracle);
+            drop(bottom_up_oracle);
+            drop(public_oracle);
 
-            let mut baseline_samples = Vec::with_capacity(rounds);
-            let mut candidate_samples = Vec::with_capacity(rounds);
+            let mut public_samples = Vec::with_capacity(rounds);
+            let mut bottom_up_samples = Vec::with_capacity(rounds);
+            let mut specialized_samples = Vec::with_capacity(rounds);
             for round in 0..rounds {
-                let baseline = || {
+                let public = || {
                     let start = Instant::now();
                     let set = TribleSet::try_from_blob(black_box(blob.clone())).unwrap();
                     let elapsed = start.elapsed();
@@ -726,35 +769,68 @@ mod tests {
                     drop(set);
                     elapsed
                 };
-                let candidate = || {
+                let bottom_up = || {
                     let start = Instant::now();
-                    let set = try_from_blob_chunked_bottom_up_for_test(black_box(blob.clone()))
-                        .unwrap();
+                    let set =
+                        try_from_blob_chunked_bottom_up_for_test(black_box(blob.clone())).unwrap();
                     let elapsed = start.elapsed();
                     black_box(set.len());
                     drop(set);
                     elapsed
                 };
-                let (baseline_elapsed, candidate_elapsed) = if round % 2 == 0 {
-                    (baseline(), candidate())
-                } else {
-                    let candidate_elapsed = candidate();
-                    (baseline(), candidate_elapsed)
+                let specialized = || {
+                    let start = Instant::now();
+                    let set =
+                        try_from_blob_chunked_eav_specialized_for_test(black_box(blob.clone()))
+                            .unwrap();
+                    let elapsed = start.elapsed();
+                    black_box(set.len());
+                    drop(set);
+                    elapsed
                 };
-                baseline_samples.push(baseline_elapsed);
-                candidate_samples.push(candidate_elapsed);
+                let (public_elapsed, bottom_up_elapsed, specialized_elapsed) = match round % 3 {
+                    0 => {
+                        let public_elapsed = public();
+                        let bottom_up_elapsed = bottom_up();
+                        let specialized_elapsed = specialized();
+                        (public_elapsed, bottom_up_elapsed, specialized_elapsed)
+                    }
+                    1 => {
+                        let bottom_up_elapsed = bottom_up();
+                        let specialized_elapsed = specialized();
+                        let public_elapsed = public();
+                        (public_elapsed, bottom_up_elapsed, specialized_elapsed)
+                    }
+                    _ => {
+                        let specialized_elapsed = specialized();
+                        let public_elapsed = public();
+                        let bottom_up_elapsed = bottom_up();
+                        (public_elapsed, bottom_up_elapsed, specialized_elapsed)
+                    }
+                };
+                public_samples.push(public_elapsed);
+                bottom_up_samples.push(bottom_up_elapsed);
+                specialized_samples.push(specialized_elapsed);
             }
 
-            let baseline = median(&mut baseline_samples);
-            let candidate = median(&mut candidate_samples);
-            let transient_bytes = len * (std::mem::size_of::<u128>() + std::mem::size_of::<u32>());
+            let public = median(&mut public_samples);
+            let bottom_up = median(&mut bottom_up_samples);
+            let specialized = median(&mut specialized_samples);
+            let bottom_up_transient =
+                len * (std::mem::size_of::<u128>() + std::mem::size_of::<u32>());
+            // EAV no longer touches the permutation, but the other five
+            // schemas still allocate the same one reusable u32 row buffer.
+            let specialized_transient = bottom_up_transient;
             println!(
-                "chunked_bottom_up_archive len={len} threads={} baseline_ms={:.3} candidate_ms={:.3} speedup={:.3}x transient_bytes={transient_bytes} transient_mib={:.3}",
+                "chunked_eav_specialized_archive len={len} threads={} public_ms={:.3} bottom_up_ms={:.3} specialized_ms={:.3} bottom_up_speedup_vs_public={:.3}x specialized_speedup_vs_public={:.3}x specialized_speedup_vs_bottom_up={:.3}x bottom_up_logical_transient_bytes={bottom_up_transient} specialized_logical_transient_bytes={specialized_transient} logical_transient_reduction_bytes={}",
                 rayon::current_num_threads(),
-                baseline.as_secs_f64() * 1e3,
-                candidate.as_secs_f64() * 1e3,
-                baseline.as_secs_f64() / candidate.as_secs_f64(),
-                transient_bytes as f64 / (1024.0 * 1024.0),
+                public.as_secs_f64() * 1e3,
+                bottom_up.as_secs_f64() * 1e3,
+                specialized.as_secs_f64() * 1e3,
+                public.as_secs_f64() / bottom_up.as_secs_f64(),
+                public.as_secs_f64() / specialized.as_secs_f64(),
+                bottom_up.as_secs_f64() / specialized.as_secs_f64(),
+                bottom_up_transient - specialized_transient,
             );
         }
     }

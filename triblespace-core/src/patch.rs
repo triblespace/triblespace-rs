@@ -3510,7 +3510,8 @@ where
             );
         }
 
-        let (root, _) = unsafe { Self::build_sorted_archive_head_for_test(keys, owner, 0) };
+        let (root, _) =
+            unsafe { Self::build_sorted_archive_head_for_test(keys, None, Some(owner), 0) };
         let mut guard = PATCHOwnerGuard::default();
         guard.retain_archive_owner(owner);
         let result = Self {
@@ -3524,7 +3525,56 @@ where
         result
     }
 
-    /// Recursive worker for [`Self::from_sorted_archive_keys_for_test`].
+    /// Builds one prehashed PATCH index from keys already sorted in this
+    /// schema's tree order, adopting an owner receipt prepared by the caller.
+    ///
+    /// This companion to [`Self::from_archive_partition_for_test`] lets a
+    /// canonical archive's native ordering skip the row permutation while
+    /// reusing the hashes required by its other index orders.
+    ///
+    /// # Safety
+    ///
+    /// - Every key pointer must be 16-byte aligned, immutable, and covered by
+    ///   an archive owner already retained in `guard`.
+    /// - `hashes[index]` must be the PATCH key hash of `keys[index]`.
+    /// - `keys` must be strictly increasing in `O`'s tree order.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_sorted_archive_keys_with_hashes_for_test(
+        keys: &[[u8; KEY_LEN]],
+        hashes: &[u128],
+        guard: &PATCHOwnerGuard,
+    ) -> Self {
+        init_sip_key();
+        assert_eq!(keys.len(), hashes.len());
+        if keys.is_empty() {
+            return Self::new();
+        }
+
+        #[cfg(debug_assertions)]
+        for pair in keys.windows(2) {
+            let ordering = (0..KEY_LEN)
+                .map(|depth| pair[0][O::TREE_TO_KEY[depth]].cmp(&pair[1][O::TREE_TO_KEY[depth]]))
+                .find(|ordering| !ordering.is_eq())
+                .unwrap_or(std::cmp::Ordering::Equal);
+            debug_assert_eq!(
+                ordering,
+                std::cmp::Ordering::Less,
+                "bottom-up archive input must be strictly tree-ordered",
+            );
+        }
+
+        let (root, _) =
+            unsafe { Self::build_sorted_archive_head_for_test(keys, Some(hashes), None, 0) };
+        let result = Self {
+            root: Some(root.with_start(0)),
+            owners: guard.0.clone(),
+        };
+        result.debug_check_owner_invariant();
+        result
+    }
+
+    /// Recursive worker for [`Self::from_sorted_archive_keys_for_test`] and
+    /// [`Self::from_sorted_archive_keys_with_hashes_for_test`].
     ///
     /// The returned Head has a placeholder routing byte. Its caller installs
     /// the byte at that caller's divergence depth. `hash` is the exact XOR of
@@ -3533,14 +3583,27 @@ where
     #[cfg(test)]
     unsafe fn build_sorted_archive_head_for_test(
         keys: &[[u8; KEY_LEN]],
-        owner: &Arc<dyn ArchiveOwner>,
+        hashes: Option<&[u128]>,
+        owner: Option<&Arc<dyn ArchiveOwner>>,
         start_depth: usize,
     ) -> (Head<KEY_LEN, O, ()>, u128) {
         debug_assert!(!keys.is_empty());
+        debug_assert_eq!(hashes.map_or(keys.len(), |hashes| hashes.len()), keys.len());
         if keys.len() == 1 {
             let ptr = NonNull::from(&keys[0]);
+            if let Some(hashes) = hashes {
+                // SAFETY: the prehashed caller guarantees that `guard` keeps
+                // this aligned archive allocation alive.
+                let head = unsafe { Head::new_local_leaf(0, ptr) };
+                return (head, hashes[0]);
+            }
             // SAFETY: forwarded from the caller of the test-only bulk builder.
-            let entry = unsafe { ArchiveEntry::new(ptr, owner) };
+            let entry = unsafe {
+                ArchiveEntry::new(
+                    ptr,
+                    owner.expect("the hashing path requires an archive owner"),
+                )
+            };
             let (head, _, hash) = entry.leaf::<O>();
             return (head, hash);
         }
@@ -3578,6 +3641,7 @@ where
         let (first_head, first_hash) = unsafe {
             Self::build_sorted_archive_head_for_test(
                 &keys[group_start..first_end],
+                hashes.map(|hashes| &hashes[group_start..first_end]),
                 owner,
                 end_depth + 1,
             )
@@ -3586,6 +3650,7 @@ where
         let (second_head, second_hash) = unsafe {
             Self::build_sorted_archive_head_for_test(
                 &keys[group_start..second_end],
+                hashes.map(|hashes| &hashes[group_start..second_end]),
                 owner,
                 end_depth + 1,
             )
@@ -3611,6 +3676,7 @@ where
             let (child, child_hash) = unsafe {
                 Self::build_sorted_archive_head_for_test(
                     &keys[group_start..group_end],
+                    hashes.map(|hashes| &hashes[group_start..group_end]),
                     owner,
                     end_depth + 1,
                 )

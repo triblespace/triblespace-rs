@@ -598,6 +598,107 @@ impl TribleSet {
         (result, permutation_bytes)
     }
 
+    /// Test-only all-six construction probe specialized for canonical EAV
+    /// archive order.
+    ///
+    /// EAV consumes the already sorted archive slice directly. The other five
+    /// schemas reset and reuse one `u32` row permutation exactly as the general
+    /// bottom-up probe does. All indexes adopt the same owner receipt and the
+    /// same precomputed row hashes.
+    ///
+    /// # Safety
+    ///
+    /// Every row must be 16-byte aligned, immutable, strictly increasing in
+    /// EAV order, and kept alive by `owner`. `hashes[row]` must be the PATCH key
+    /// hash of `rows[row]`.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) unsafe fn from_archive_partition_eav_specialized_for_test(
+        rows: &[[u8; TRIBLE_LEN]],
+        hashes: &[u128],
+        owner: &Arc<dyn ArchiveOwner>,
+    ) -> (Self, usize) {
+        assert_eq!(rows.len(), hashes.len());
+        assert!(
+            u32::try_from(rows.len()).is_ok(),
+            "the one-buffer probe uses u32 archive row indices",
+        );
+
+        let mut owners = PATCHOwnerGuard::default();
+        if !rows.is_empty() {
+            owners.retain_archive_owner(owner);
+        }
+        let eav = unsafe {
+            PATCH::<TRIBLE_LEN, EAVOrder>::from_sorted_archive_keys_with_hashes_for_test(
+                rows, hashes, &owners,
+            )
+        };
+
+        let mut permutation = vec![0u32; rows.len()];
+        let permutation_bytes = permutation.len() * std::mem::size_of::<u32>();
+        fn reset(permutation: &mut [u32]) {
+            for (row, slot) in permutation.iter_mut().enumerate() {
+                *slot = row as u32;
+            }
+        }
+
+        reset(&mut permutation);
+        let aev = unsafe {
+            PATCH::<TRIBLE_LEN, AEVOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let vae = unsafe {
+            PATCH::<TRIBLE_LEN, VAEOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let eva = unsafe {
+            PATCH::<TRIBLE_LEN, EVAOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let vea = unsafe {
+            PATCH::<TRIBLE_LEN, VEAOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+        reset(&mut permutation);
+        let ave = unsafe {
+            PATCH::<TRIBLE_LEN, AVEOrder>::from_archive_partition_for_test(
+                rows,
+                hashes,
+                &mut permutation,
+                &owners,
+            )
+        };
+
+        let result = Self {
+            eav,
+            eva,
+            aev,
+            ave,
+            vea,
+            vae,
+        };
+        debug_assert!(result.owner_guards_are_shared());
+        (result, permutation_bytes)
+    }
+
     /// Inserts an archive-backed trible into all six covering indexes
     /// using [`PATCH::insert_archive`], so each index may land the new
     /// entry as a `LocalLeaf` instead of a freshly allocated heap
