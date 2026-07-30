@@ -584,6 +584,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LocalLeaf fallback hashing, and public blinding all initialize through that
   accessor, so constructing an `Entry` before the first `PATCH` produces the
   same cached hash as every later construction.
+- **Consuming one cloned PATCH snapshot no longer creates a mutable reference
+  to a leaf shared by another snapshot.** The internal mutation view now keeps
+  reference-counted leaves read-only while retaining copy-on-write mutable
+  access to branches. This removes a safe-code aliasing violation in both
+  consuming iterators.
 
 - **Typed `UnionArchive` proposals no longer re-scan every attached shard for
   every emitted value.** Bounded shard paging and dense complete drains share
