@@ -99,6 +99,10 @@ name = "patch"
 harness = false
 
 [[bench]]
+name = "patch_receipts"
+harness = false
+
+[[bench]]
 name = "json_import"
 harness = false
 
