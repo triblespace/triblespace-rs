@@ -114,20 +114,19 @@ fn archive_patch(rows: &[[u8; TRIBLE_LEN]]) -> EavPatch {
 /// Turn an exact archive template into a semantically identical dirty one
 /// using only public operations.
 ///
-/// A fresh archive singleton is used only to subtract the duplicate from the
-/// exact fixture. Subtracting that remainder from the fixture derives the same
-/// singleton LocalLeaf under the fixture's existing owner cover. Unioning the
-/// derived leaf back cannot change the rows, but the exact union formula cannot
-/// retain the parent's fingerprint without both input fingerprints. This is
-/// the fixture shape needed to exercise an undemanded parallel union without
-/// adding another archive owner to the benchmark operand.
-fn demote_via_duplicate(mut exact: EavPatch, duplicate: [u8; TRIBLE_LEN]) -> EavPatch {
+/// A fresh archive singleton is used only to subtract the selected row from the
+/// exact fixture. Subtracting that remainder from the original derives the same
+/// singleton LocalLeaf under the fixture's existing owner cover. Re-inserting
+/// it into the actually-shrunk remainder restores the rows but not the resident
+/// root fingerprint. This keeps the dirty fixture valid even when duplicate or
+/// subset unions can prove semantic no-ops without hashing.
+fn demote_via_remove_reinsert(exact: EavPatch, duplicate: [u8; TRIBLE_LEN]) -> EavPatch {
     assert!(exact.iter().any(|row| row == &duplicate));
     let expected_len = exact.len();
     let singleton_rows = std::slice::from_ref(&duplicate);
     let fresh = archive_patch(singleton_rows);
     assert_local_rows(
-        "PATCH duplicate-demotion fresh singleton",
+        "PATCH dirty-fixture fresh singleton",
         &fresh,
         singleton_rows,
     );
@@ -135,24 +134,23 @@ fn demote_via_duplicate(mut exact: EavPatch, duplicate: [u8; TRIBLE_LEN]) -> Eav
     // PATCH::difference retains only the left operand's owners. The second
     // difference therefore isolates a pointer-equal LocalLeaf covered by
     // `exact`, rather than carrying the fresh singleton's 33rd owner forward.
-    let without = exact.difference(&fresh);
+    let mut without = exact.difference(&fresh);
     assert_eq!(without.len(), expected_len - 1);
     let derived = exact.difference(&without);
     assert_local_rows(
-        "PATCH duplicate-demotion derived singleton",
+        "PATCH dirty-fixture derived singleton",
         &derived,
         singleton_rows,
     );
     assert_eq!(derived.node_stats(), (0, 0, 0, 1));
-    drop(without);
     drop(fresh);
 
-    exact.union(derived);
-    assert_eq!(exact.len(), expected_len);
-    let stats = exact.node_stats();
+    without.union(derived);
+    assert_eq!(without.len(), expected_len);
+    let stats = without.node_stats();
     assert_eq!(stats.2, 0);
     assert_eq!(stats.3, expected_len);
-    exact
+    without
 }
 
 fn archive_variant(bucket_start: u16, bucket_count: u16, variant: u8) -> EavPatch {
@@ -343,15 +341,15 @@ fn assert_tribleset_rows(
     assert_index_rows!(vae);
 }
 
-fn demote_tribleset_via_duplicate(
-    mut exact: TribleSet,
+fn demote_tribleset_via_remove_reinsert(
+    exact: TribleSet,
     expected: &[[u8; TRIBLE_LEN]],
     duplicate: [u8; TRIBLE_LEN],
 ) -> TribleSet {
     assert!(expected.binary_search(&duplicate).is_ok());
     assert_tribleset_rows(
         FixtureStorage::Local,
-        "TribleSet duplicate-demotion source",
+        "TribleSet dirty-fixture source",
         &exact,
         expected,
     );
@@ -359,7 +357,7 @@ fn demote_tribleset_via_duplicate(
     let fresh = archive_tribleset(singleton_rows);
     assert_tribleset_rows(
         FixtureStorage::Local,
-        "TribleSet duplicate-demotion fresh singleton",
+        "TribleSet dirty-fixture fresh singleton",
         &fresh,
         singleton_rows,
     );
@@ -367,12 +365,12 @@ fn demote_tribleset_via_duplicate(
     // Each index difference retains only the left operand's owners. The
     // second difference isolates all six pointer-equal LocalLeaves under
     // `exact`'s owner cover, so the semantic no-op does not add a 33rd owner.
-    let without = exact.difference(&fresh);
+    let mut without = exact.difference(&fresh);
     assert_eq!(without.len(), expected.len() - 1);
     let derived = exact.difference(&without);
     assert_tribleset_rows(
         FixtureStorage::Local,
-        "TribleSet duplicate-demotion derived singleton",
+        "TribleSet dirty-fixture derived singleton",
         &derived,
         singleton_rows,
     );
@@ -387,22 +385,24 @@ fn demote_tribleset_via_duplicate(
         assert_eq!(
             stats,
             (0, 0, 0, 1),
-            "TribleSet duplicate-demotion derived singleton/{index}: wrong shape"
+            "TribleSet dirty-fixture derived singleton/{index}: wrong shape"
         );
     }
-    drop(without);
     drop(fresh);
 
-    // All six derived singleton indexes have unknown LocalLeaf roots. The
-    // semantic no-op therefore demotes all six aggregate roots independently.
-    exact.union(derived);
+    // `without` has crossed a real shrinking edit, so its aggregate roots are
+    // dirty without relying on duplicate-union behaviour. Grow the missing
+    // row back from the same original owner cover. This restores the exact row
+    // set while remaining a genuine dirty fixture even for implementations
+    // that prove duplicate/subset union is a semantic no-op by cardinality.
+    without.union(derived);
     assert_tribleset_rows(
         FixtureStorage::Local,
-        "TribleSet duplicate-demotion result",
-        &exact,
+        "TribleSet dirty-fixture result",
+        &without,
         expected,
     );
-    exact
+    without
 }
 
 struct UnionCase {
@@ -500,16 +500,16 @@ fn union_cases() -> Vec<UnionCase> {
 
     // Balanced variant unions produce an exact root over dirty direct
     // children. Demote both operands independently so dirty_disjoint and
-    // dirty_overlap128 exercise the no-root-demand path. Each helper derives
-    // its duplicate leaf under the corresponding fixture's existing owners.
+    // dirty_overlap128 exercise the no-root-demand path. Each helper removes
+    // and restores one leaf under the corresponding fixture's existing owners.
     let dirty_disjoint_left =
-        demote_via_duplicate(archive_variants_in(0, 128, 0, 32), raw_trible(0, 0));
+        demote_via_remove_reinsert(archive_variants_in(0, 128, 0, 32), raw_trible(0, 0));
     let dirty_disjoint_right =
-        demote_via_duplicate(archive_variants_in(128, 128, 0, 32), raw_trible(128, 0));
+        demote_via_remove_reinsert(archive_variants_in(128, 128, 0, 32), raw_trible(128, 0));
     let dirty_overlap_left =
-        demote_via_duplicate(archive_variants_in(0, 128, 0, 32), raw_trible(0, 0));
+        demote_via_remove_reinsert(archive_variants_in(0, 128, 0, 32), raw_trible(0, 0));
     let dirty_overlap_right =
-        demote_via_duplicate(archive_variants_in(0, 128, 31, 32), raw_trible(0, 31));
+        demote_via_remove_reinsert(archive_variants_in(0, 128, 31, 32), raw_trible(0, 31));
 
     vec![
         clean_union_case(4_095),
@@ -886,15 +886,16 @@ fn tribleset_union_cases() -> Vec<TribleSetBinaryCase> {
     // The balanced templates have exact roots over dirty direct children.
     // Build a fresh second pair before demotion so the two benchmark cases
     // have the same rows and topology without cross-case refcount coupling;
-    // only the singleton no-op changes root knowledge in the demoted pair.
+    // only the remove/reinsert cycle changes root knowledge in the demoted
+    // pair.
     let exact_left = archive_tribleset_variants_in(0, 128, 0, 32);
     let exact_right = archive_tribleset_variants_in(0, 128, 31, 32);
-    let demoted_left = demote_tribleset_via_duplicate(
+    let demoted_left = demote_tribleset_via_remove_reinsert(
         archive_tribleset_variants_in(0, 128, 0, 32),
         &left_rows,
         raw_trible(0, 0),
     );
-    let demoted_right = demote_tribleset_via_duplicate(
+    let demoted_right = demote_tribleset_via_remove_reinsert(
         archive_tribleset_variants_in(0, 128, 31, 32),
         &right_rows,
         raw_trible(0, 31),
