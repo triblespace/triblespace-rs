@@ -87,21 +87,11 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
 
     /// Insert `head` into the child table, growing the allocation if cuckoo
     /// placement fails. Does *not* update the branch's aggregates —
-    /// pair with [`Self::recompute_aggregates`] for bulk rewrites.
+    /// pair with [`Self::finish_bulk_aggregates`] for bulk rewrites.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub fn install_child_growing(&mut self, head: Head<KEY_LEN, O, V>) {
         unsafe {
             Branch::install_child_growing(&mut self.branch_nn, head);
-        }
-    }
-
-    /// Rebuild aggregates (hash/leaf_count/segment_count/childleaf) in one
-    /// linear pass over `child_table`. Call once after a batch of
-    /// [`Self::install_child_growing`] mutations.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    pub fn recompute_aggregates(&mut self) {
-        unsafe {
-            Branch::recompute_aggregates(&mut self.branch_nn);
         }
     }
 
@@ -652,8 +642,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
     /// Insert `head` into the child table, growing if cuckoo placement
     /// fails. Does NOT touch aggregates — used by bulk-rewrite paths
-    /// that recompute aggregates in one pass at the end via
-    /// [`recompute_aggregates`](Self::recompute_aggregates).
+    /// that finish aggregates in one pass at the end via
+    /// [`finish_bulk_aggregates`](Self::finish_bulk_aggregates).
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) unsafe fn install_child_growing(
         branch_nn: &mut NonNull<Self>,
@@ -666,39 +656,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             Self::grow(branch_nn);
             branch_ptr = branch_nn.as_ptr();
         }
-    }
-
-    /// Rebuild aggregate fields (`hash`, `leaf_count`, `segment_count`,
-    /// `childleaf`) from the current child table in one linear pass.
-    /// Cheaper than paying `modify_child`'s per-call accounting when
-    /// many children are being installed in bulk.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    pub(crate) unsafe fn recompute_aggregates(branch_nn: &mut NonNull<Self>) {
-        let branch = branch_nn.as_ptr();
-        let end_depth = (*branch).end_depth as usize;
-        let mut agg_leaf_count: u64 = 0;
-        let mut agg_segment_count: u64 = 0;
-        let mut agg_hash: u128 = 0;
-        let mut first_childleaf: *const [u8; KEY_LEN] = std::ptr::null();
-
-        for child in (*branch).child_table.iter().flatten() {
-            agg_leaf_count += child.count();
-            agg_segment_count += child.count_segment(end_depth);
-            agg_hash ^= child.hash();
-            if first_childleaf.is_null() {
-                first_childleaf = child.childleaf_ptr();
-            }
-        }
-
-        (*branch).leaf_count = agg_leaf_count;
-        (*branch).segment_count = agg_segment_count;
-        (&mut *branch).replace_cached_hash(Some(agg_hash));
-        if !first_childleaf.is_null() {
-            (*branch).childleaf = first_childleaf;
-        }
-
-        #[cfg(debug_assertions)]
-        branch_nn.as_ref().debug_check_invariants();
     }
 
     /// Rebuild non-hash aggregates after a bulk rewrite and optionally install

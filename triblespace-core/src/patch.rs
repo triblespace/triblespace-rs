@@ -2033,10 +2033,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // collection phase typically has MANY children (most keys
         // in `self` survive — only matching+empty subtrees get
         // filtered), so `install_child_growing` + one
-        // `recompute_aggregates` pass wins handily over per-call
-        // `modify_child`. Mirror of the union pattern; intersect
-        // uses `modify_child` because its collection phase has
-        // far fewer children (heavy filtering).
+        // structural-finalization pass wins handily over per-call
+        // `modify_child`. Hashing the surviving children here would turn
+        // difference into an eager fingerprint consumer, so the rebuilt root
+        // remains dirty unless the PATCH boundary later proves it unchanged.
+        // Intersect uses `modify_child` because its collection phase has far
+        // fewer children (heavy filtering).
         let mut iter = resolved.into_iter().flatten();
         let first = iter.next()?;
         let Some(second) = iter.next() else {
@@ -2053,7 +2055,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             for child in iter {
                 ed.install_child_growing(child.with_start(self_depth));
             }
-            ed.recompute_aggregates();
+            ed.finish_bulk_aggregates(None);
         }
         Some(head_for_branch)
     }
@@ -4048,6 +4050,24 @@ mod tests {
         left
     }
 
+    /// Drive the large difference scatter on this thread so the thread-local
+    /// LocalLeaf hash census covers every surviving child.
+    #[cfg(feature = "parallel")]
+    fn difference_with_exhausted_parallel_budget(left: &PATCH<16>, right: &PATCH<16>) -> PATCH<16> {
+        let ctx = parallel_union::ParUnionCtx {
+            budget: AtomicUsize::new(0),
+        };
+        let root = left
+            .root
+            .as_ref()
+            .expect("left root")
+            .par_difference_with_ctx(right.root.as_ref().expect("right root"), 0, &ctx);
+        let owners = root.as_ref().and(left.owners.clone());
+        let result = PATCH { root, owners };
+        result.debug_check_owner_invariant();
+        result
+    }
+
     fn test_archive_owner(byte: u8) -> Arc<dyn ArchiveOwner> {
         Arc::new([byte])
     }
@@ -4798,6 +4818,56 @@ mod tests {
         assert_eq!(parallel.root_hash(), Some(parallel_oracle));
         assert_eq!(branch_cached_hash(&parallel), parallel_oracle);
         deep_hash_audit(&parallel);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_difference_defers_hashing_a_large_partial_archive_result() {
+        // Rebuild a genuine 128-child result: every bucket loses its upper 16
+        // variants, so no unchanged/empty/unary shortcut can decide the root.
+        let left = owned_archive_dirty_parent(0, 128, 0, 32);
+        let right = owned_archive_dirty_parent(0, 128, 16, 16);
+        assert_eq!(left.len(), PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert_eq!(right.len(), 2_048);
+        assert_ne!(branch_cached_hash(&left), 0);
+        assert_eq!(direct_dirty_branch_children(&left), 128);
+
+        reset_local_leaf_hash_calls();
+        let difference = difference_with_exhausted_parallel_budget(&left, &right);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(difference.len(), 2_048);
+        assert_eq!(branch_cached_hash(&difference), 0);
+        assert!(difference.shares_owner_guard(&left));
+
+        // The result guard remains sufficient after both source values drop;
+        // exact iteration is structural and consumes no fingerprint.
+        drop(left);
+        drop(right);
+        let actual = difference.iter().copied().collect::<HashSet<_>>();
+        let expected = (0u8..128)
+            .flat_map(|bucket| {
+                (0u8..16).map(move |variant| {
+                    let mut key = [0u8; 16];
+                    key[0] = bucket;
+                    key[1] = variant;
+                    key
+                })
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(local_leaf_hash_calls(), 0);
+
+        // The first actual consumer pays exactly for the surviving frontier
+        // and memoizes it; neither removed rows nor later consumers are hashed.
+        let expected_hash = heap_hash_oracle(&difference);
+        let before = local_leaf_hash_calls();
+        assert_eq!(difference.root_hash(), Some(expected_hash));
+        assert_eq!(local_leaf_hash_calls() - before, 2_048);
+        assert_eq!(branch_cached_hash(&difference), expected_hash);
+        let before = local_leaf_hash_calls();
+        assert_eq!(difference.root_hash(), Some(expected_hash));
+        assert_eq!(local_leaf_hash_calls() - before, 0);
+        deep_hash_audit(&difference);
     }
 
     #[cfg(feature = "parallel")]
