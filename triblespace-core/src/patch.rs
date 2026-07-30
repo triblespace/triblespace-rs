@@ -349,6 +349,39 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
+// Release-test-only counters for the 512x3 union receipt experiment. They do
+// not exist in library builds and therefore cannot perturb production code.
+#[cfg(all(test, not(debug_assertions)))]
+static LOCAL_LEAF_HASHES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, not(debug_assertions)))]
+static UNION_RECEIPT_REUSES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(test, not(debug_assertions)))]
+fn record_local_leaf_hash() {
+    LOCAL_LEAF_HASHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+fn record_union_receipt_reuse() {
+    UNION_RECEIPT_REUSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) fn reset_union_receipt_probe() {
+    LOCAL_LEAF_HASHES.store(0, core::sync::atomic::Ordering::Relaxed);
+    UNION_RECEIPT_REUSES.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) fn union_receipt_probe_snapshot() -> (u64, u64) {
+    (
+        LOCAL_LEAF_HASHES.load(core::sync::atomic::Ordering::Relaxed),
+        UNION_RECEIPT_REUSES.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
 /// branch arm. Below this, the per-key `modify_child` loop wins
@@ -962,6 +995,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             BodyRef::LocalLeaf(bytes) => {
                 use siphasher::sip128::SipHasher24;
                 use std::ptr::addr_of;
+                #[cfg(all(test, not(debug_assertions)))]
+                record_local_leaf_hash();
                 // SAFETY: SIP_KEY is initialized at startup; we only read it.
                 let key = unsafe { *addr_of!(SIP_KEY) };
                 SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
@@ -1242,6 +1277,47 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         this
     }
 
+    /// Union an occupied child with an incoming child while preserving the
+    /// editor's already-computed hash through a real singleton collision.
+    ///
+    /// Non-singleton shapes fall back to ordinary union. Their returned Head
+    /// is a Branch with a cached hash, so reconstructing the receipt is cheap.
+    fn union_with_existing_receipt(
+        existing: ChildHashReceipt<KEY_LEN, O, V>,
+        incoming: Self,
+        at_depth: usize,
+    ) -> ChildHashReceipt<KEY_LEN, O, V> {
+        if existing.head.end_depth() == KEY_LEN && incoming.end_depth() == KEY_LEN {
+            if let Some((depth, existing_byte_key, incoming_byte_key)) =
+                existing.head.first_divergence(&incoming, at_depth)
+            {
+                #[cfg(all(test, not(debug_assertions)))]
+                let existing_is_local = existing.head.tag() == HeadTag::LocalLeaf;
+                let old_key = existing.head.key();
+                let incoming_hash = incoming.hash();
+                let merged_hash = existing.hash ^ incoming_hash;
+                let new_body = Branch::new_with_child_hashes(
+                    depth,
+                    existing.head.with_key(existing_byte_key),
+                    incoming.with_key(incoming_byte_key),
+                    existing.hash,
+                    incoming_hash,
+                );
+                #[cfg(all(test, not(debug_assertions)))]
+                if existing_is_local {
+                    record_union_receipt_reuse();
+                }
+                return ChildHashReceipt {
+                    head: Head::new(old_key, new_body),
+                    hash: merged_hash,
+                };
+            }
+            return existing;
+        }
+
+        ChildHashReceipt::from_head(Self::union(existing.head, incoming, at_depth))
+    }
+
     /// Sequential PATCH-trie union. Always serial; the parallel
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
@@ -1292,9 +1368,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = other.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
-                None => Some(inserted),
+            ed.modify_child_with_receipt(key, |current| match current {
+                Some(existing) => Some(Head::union_with_existing_receipt(
+                    existing, inserted, this_depth,
+                )),
+                None => Some(ChildHashReceipt::from_head(inserted)),
             });
             drop(ed);
             return this;
@@ -1306,9 +1384,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
             let inserted = this_head.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, other_depth)),
-                None => Some(inserted),
+            ed.modify_child_with_receipt(key, |current| match current {
+                Some(existing) => Some(Head::union_with_existing_receipt(
+                    existing,
+                    inserted,
+                    other_depth,
+                )),
+                None => Some(ChildHashReceipt::from_head(inserted)),
             });
             drop(ed);
             return other.with_key(old_key);
@@ -1339,9 +1421,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         {
             let inserted = other_child.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
-                None => Some(inserted),
+            ed.modify_child_with_receipt(key, |current| match current {
+                Some(existing) => Some(Head::union_with_existing_receipt(
+                    existing, inserted, this_depth,
+                )),
+                None => Some(ChildHashReceipt::from_head(inserted)),
             });
         }
         drop(ed);

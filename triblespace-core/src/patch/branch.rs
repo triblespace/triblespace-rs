@@ -31,6 +31,21 @@ pub(crate) fn dst_len<T>(ptr: *const [T]) -> usize {
 pub(crate) type BranchNN<const KEY_LEN: usize, O, V> =
     NonNull<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>>;
 
+/// Stack-only receipt pairing an owned child Head with its semantic PATCH
+/// hash. Receipts exist only while a child slot is being edited; they are
+/// never stored in the trie or alongside archive rows.
+pub(super) struct ChildHashReceipt<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+    pub(super) head: Head<KEY_LEN, O, V>,
+    pub(super) hash: u128,
+}
+
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> ChildHashReceipt<KEY_LEN, O, V> {
+    pub(super) fn from_head(head: Head<KEY_LEN, O, V>) -> Self {
+        let hash = head.hash();
+        Self { head, hash }
+    }
+}
+
 pub(crate) struct BranchMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     head: &'a mut Head<KEY_LEN, O, V>,
     branch_nn: BranchNN<KEY_LEN, O, V>,
@@ -65,6 +80,19 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         // Delegate to the low-level NonNull based primitive which may grow and
         // update the pointer in-place.
         Branch::modify_child(&mut self.branch_nn, key, f);
+    }
+
+    /// Edit one slot while threading its already-computed hash through the
+    /// closure. This narrow union primitive prevents a singleton collision
+    /// from hashing the existing LocalLeaf once for its parent and again for
+    /// the newly constructed child Branch.
+    pub(super) fn modify_child_with_receipt<F>(&mut self, key: u8, f: F)
+    where
+        F: FnOnce(
+            Option<ChildHashReceipt<KEY_LEN, O, V>>,
+        ) -> Option<ChildHashReceipt<KEY_LEN, O, V>>,
+    {
+        Branch::modify_child_with_receipt(&mut self.branch_nn, key, f);
     }
 
     /// Like [`modify_child`] but uses the supplied `inserted_hash`
@@ -421,6 +449,26 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
+        Self::modify_child_with_receipt(branch_nn, key, |current| {
+            f(current.map(|receipt| receipt.head)).map(ChildHashReceipt::from_head)
+        });
+    }
+
+    /// Receipt-preserving form of [`Self::modify_child`].
+    ///
+    /// The existing child is hashed exactly once before ownership passes to
+    /// `f`. The returned receipt lets a union reuse that hash when it builds a
+    /// Branch from the old singleton. Hashes are ordinary copied values; the
+    /// receipt owns its Head and cannot outlive the slot edit.
+    pub(super) fn modify_child_with_receipt<F>(
+        branch_nn: &mut NonNull<Self>,
+        key: u8,
+        f: F,
+    ) where
+        F: FnOnce(
+            Option<ChildHashReceipt<KEY_LEN, O, V>>,
+        ) -> Option<ChildHashReceipt<KEY_LEN, O, V>>,
+    {
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
@@ -434,9 +482,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
                 let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
 
-                if let Some(new_child) = f(Some(child)) {
+                let current = ChildHashReceipt {
+                    head: child,
+                    hash: old_child_hash,
+                };
+                if let Some(replacement) = f(Some(current)) {
                     // Replace existing child
-                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
+                    let ChildHashReceipt {
+                        head: new_child,
+                        hash: new_child_hash,
+                    } = replacement;
+                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child_hash;
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
@@ -463,13 +519,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 }
             } else {
                 // No current slot — the closure can choose to insert a child.
-                if let Some(mut inserted) = f(None) {
+                if let Some(insertion) = f(None) {
+                    let ChildHashReceipt {
+                        head: mut inserted,
+                        hash: inserted_hash,
+                    } = insertion;
                     // The caller is expected to pass an inserted Head that is
                     // already prepared (with_start set to the appropriate depth).
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    (*branch).hash ^= inserted.hash();
+                    (*branch).hash ^= inserted_hash;
 
                     // Cuckoo insert loop, growing the table when necessary.
                     let mut branch_ptr = branch_nn.as_ptr();

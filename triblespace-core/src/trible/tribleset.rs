@@ -796,6 +796,87 @@ mod tests {
             .collect()
     }
 
+    #[cfg(not(debug_assertions))]
+    mod union_receipt_512x3_attr {
+        use crate::prelude::inlineencodings::ShortString;
+        use crate::prelude::*;
+
+        attributes! {
+            pub field_01: ShortString;
+            pub field_02: ShortString;
+            pub field_03: ShortString;
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn union_receipt_512x3_inputs() -> Vec<[String; 3]> {
+        (0..512)
+            .map(|entity| {
+                [
+                    format!("a{entity:06}"),
+                    format!("b{entity:06}"),
+                    format!("c{entity:06}"),
+                ]
+            })
+            .collect()
+    }
+
+    /// Exact receipt for the stack-only union hash experiment. Run alone so
+    /// no other release test contributes to its process-global counters:
+    ///
+    /// `cargo test --release -p triblespace-core --lib union_hash_receipt_512x3_probe -- --ignored --nocapture --test-threads=1`
+    #[cfg(not(debug_assertions))]
+    #[test]
+    #[ignore = "explicit release-mode LocalLeaf hash receipt diagnostic"]
+    fn union_hash_receipt_512x3_probe() {
+        let _ = union_receipt_512x3_attr::field_01.id();
+        let _ = union_receipt_512x3_attr::field_02.id();
+        let _ = union_receipt_512x3_attr::field_03.id();
+        let inputs = union_receipt_512x3_inputs();
+        let entities: Vec<_> = inputs
+            .iter()
+            .map(|values| {
+                entity! {
+                    union_receipt_512x3_attr::field_01: values[0].as_str(),
+                    union_receipt_512x3_attr::field_02: values[1].as_str(),
+                    union_receipt_512x3_attr::field_03: values[2].as_str(),
+                }
+            })
+            .map(crate::trible::Fragment::into_facts)
+            .collect();
+        let expected: BTreeSet<[u8; TRIBLE_LEN]> = entities
+            .iter()
+            .flat_map(|entity| entity.iter().map(|trible| trible.data))
+            .collect();
+        assert_eq!(expected.len(), 512 * 3);
+
+        crate::patch::reset_union_receipt_probe();
+        let mut aggregate = TribleSet::new();
+        for entity in entities {
+            aggregate += entity;
+        }
+        let (local_leaf_hashes, receipt_reuses) =
+            crate::patch::union_receipt_probe_snapshot();
+
+        assert_eq!(aggregate.len(), 512 * 3);
+        assert_all_indexes(&aggregate, &expected);
+        for index_len in [
+            aggregate.eav.len(),
+            aggregate.eva.len(),
+            aggregate.aev.len(),
+            aggregate.ave.len(),
+            aggregate.vea.len(),
+            aggregate.vae.len(),
+        ] {
+            assert_eq!(index_len, (512 * 3) as u64);
+        }
+        assert_eq!(receipt_reuses, 936);
+        assert_eq!(local_leaf_hashes, 7_068);
+        eprintln!(
+            "union_hash_receipt entities=512 rows_per_entity=3 baseline_local_leaf_hashes=8004 local_leaf_hashes={local_leaf_hashes} receipt_reuses={receipt_reuses}",
+        );
+    }
+
     #[test]
     fn intrinsic_entity_rows_are_canonical_hashed_and_indexed() {
         assert_eq!(std::mem::size_of::<IntrinsicEntityRow>(), TRIBLE_LEN);
