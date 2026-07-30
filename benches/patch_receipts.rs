@@ -547,13 +547,15 @@ fn bench_union(c: &mut Criterion) {
 
     for case in &cases {
         group.throughput(Throughput::Elements(case.left.len() + case.right.len()));
-        for (workload, compare) in [("union_only", false), ("union_eq1", true)] {
+        for (workload, equality_repeats) in
+            [("union_only", 0), ("union_eq1", 1), ("union_eq8", 8)]
+        {
             group.bench_function(BenchmarkId::new(case.name, workload), |b| {
                 b.iter_batched(
                     || (case.left.clone(), case.right.clone()),
                     |(mut left, right)| {
                         left.union(black_box(right));
-                        if compare {
+                        for _ in 0..equality_repeats {
                             black_box(black_box(&left) == black_box(&case.oracle));
                         }
                         black_box(left)
@@ -577,7 +579,8 @@ struct RemovalCase {
 fn removal_cases() -> Vec<RemovalCase> {
     const RESIDENT_WORK: &[(&str, usize)] =
         &[("delete_only", 0), ("delete_eq1", 1), ("delete_eq8", 8)];
-    const DIRTY_WORK: &[(&str, usize)] = &[("delete_only", 0), ("delete_eq1", 1)];
+    const DIRTY_WORK: &[(&str, usize)] =
+        &[("delete_only", 0), ("delete_eq1", 1), ("delete_eq8", 8)];
 
     let resident_rows = ordered_rows(REMOVAL_VARIANTS);
     let resident = archive_variants(REMOVAL_VARIANTS);
@@ -749,13 +752,17 @@ fn bench_difference(c: &mut Criterion) {
     ));
 
     for case in &cases {
-        for (workload, compare) in [("difference_only", false), ("difference_eq1", true)] {
+        for (workload, equality_repeats) in [
+            ("difference_only", 0),
+            ("difference_eq1", 1),
+            ("difference_eq8", 8),
+        ] {
             group.bench_function(BenchmarkId::new(case.name, workload), |b| {
                 b.iter_batched_ref(
                     || (case.left.clone(), case.right.clone()),
                     |(left, right)| {
                         let result = black_box(&*left).difference(black_box(&*right));
-                        if compare {
+                        for _ in 0..equality_repeats {
                             black_box(black_box(&result) == black_box(&case.oracle));
                         }
                         black_box(result)
@@ -898,13 +905,15 @@ fn bench_tribleset_union(c: &mut Criterion) {
     group.throughput(Throughput::Elements(8_192));
 
     for case in &cases {
-        for (workload, compare) in [("union_only", false), ("union_eq1", true)] {
+        for (workload, equality_repeats) in
+            [("union_only", 0), ("union_eq1", 1), ("union_eq8", 8)]
+        {
             group.bench_function(BenchmarkId::new(case.name, workload), |b| {
                 b.iter_batched(
                     || (case.left.clone(), case.right.clone()),
                     |(mut left, right)| {
                         left.union(black_box(right));
-                        if compare {
+                        for _ in 0..equality_repeats {
                             // The union runs all six indexes; public equality
                             // consumes only the EAV result fingerprint.
                             black_box(black_box(&left) == black_box(&case.oracle));
@@ -974,13 +983,17 @@ fn bench_tribleset_difference(c: &mut Criterion) {
     ));
 
     for case in &cases {
-        for (workload, compare) in [("difference_only", false), ("difference_eq1", true)] {
+        for (workload, equality_repeats) in [
+            ("difference_only", 0),
+            ("difference_eq1", 1),
+            ("difference_eq8", 8),
+        ] {
             group.bench_function(BenchmarkId::new(case.name, workload), |b| {
                 b.iter_batched_ref(
                     || (case.left.clone(), case.right.clone()),
                     |(left, right)| {
                         let result = black_box(&*left).difference(black_box(&*right));
-                        if compare {
+                        for _ in 0..equality_repeats {
                             // TribleSet equality intentionally consumes only EAV,
                             // while the difference above computes all six indexes.
                             black_box(black_box(&result) == black_box(&case.oracle));
