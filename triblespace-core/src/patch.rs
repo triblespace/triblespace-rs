@@ -4483,10 +4483,26 @@ mod tests {
         patch.union(owned_archive_pair([b, d]));
         let before = branch_cached_hash(&patch);
         assert_ne!(before, 0);
+        let dirty_child_hash = match patch.root.as_ref().unwrap().body_ref() {
+            BodyRef::Branch(root) => root
+                .child_table
+                .table_get(a[0])
+                .and_then(|child| match child.body_ref() {
+                    BodyRef::Branch(branch) => Some(branch.hash),
+                    BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => None,
+                })
+                .expect("expected a same-prefix child Branch"),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => panic!("expected a Branch root"),
+        };
+        assert_eq!(dirty_child_hash, 0);
+        let shared_root = patch.root.as_ref().unwrap().tptr;
+        let snapshot = patch.clone();
 
         reset_local_leaf_hash_calls();
         patch.remove(&b);
         assert_eq!(local_leaf_hash_calls(), 1);
+        assert_ne!(patch.root.as_ref().unwrap().tptr, shared_root);
+        assert_eq!(snapshot.root.as_ref().unwrap().tptr, shared_root);
         assert_ne!(branch_cached_hash(&patch), 0);
         assert_ne!(branch_cached_hash(&patch), before);
         assert_eq!(
@@ -4496,7 +4512,13 @@ mod tests {
         let expected = heap_hash_oracle(&patch);
         assert_eq!(patch.root_hash(), Some(expected));
         assert_eq!(local_leaf_hash_calls(), 1);
+        assert_eq!(branch_cached_hash(&snapshot), before);
+        assert_eq!(
+            snapshot.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c, d]),
+        );
         deep_hash_audit(&patch);
+        deep_hash_audit(&snapshot);
     }
 
     #[test]
