@@ -4364,8 +4364,7 @@ mod tests {
         let entries: [ArchiveEntry<'_, KEY_LEN>; 3] = std::array::from_fn(|i| unsafe {
             ArchiveEntry::new(NonNull::from(&storage[i].0), &owner)
         });
-        let mut patch: PATCH<KEY_LEN> =
-            PATCH::from_archive_pair(&entries[0], &entries[1]);
+        let mut patch: PATCH<KEY_LEN> = PATCH::from_archive_pair(&entries[0], &entries[1]);
         let before = branch_cached_hash(&patch);
         let expected = before ^ entries[2].hash;
 
