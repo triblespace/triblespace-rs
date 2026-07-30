@@ -67,20 +67,15 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
-    /// Like [`modify_child`] but treats the supplied `inserted_hash` as a known
-    /// contribution for the empty-slot insertion case. This lets archive
-    /// ingest maintain a clean parent around a LocalLeaf without recomputing
-    /// siphash24 once per index — the caller already has it from
-    /// `ArchiveEntry::hash`.
-    ///
-    /// The hint MUST equal the hash of whatever `f(None)` returns.
-    /// When the slot is non-empty, both old and replacement contributions must
-    /// already be cached or the parent becomes dirty.
-    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: u128, f: F)
+    /// Modify one child while carrying an exact XOR-fingerprint delta from the
+    /// semantic operation. A known delta updates an exact parent without
+    /// requiring either child hash to be resident and is returned unchanged for
+    /// propagation through the next ancestor.
+    pub(super) fn modify_child_with_delta<F>(&mut self, key: u8, f: F) -> HashDelta
     where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Mutation<Option<Head<KEY_LEN, O, V>>>,
     {
-        Branch::modify_child_with_inserted_hint(&mut self.branch_nn, key, inserted_hash, f);
+        Branch::modify_child_with_delta(&mut self.branch_nn, key, f)
     }
 
     /// Insert `head` into the child table, growing the allocation if cuckoo
@@ -446,47 +441,52 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
-        Self::modify_child_impl(branch_nn, key, None, f);
+        let _ = Self::modify_child_impl(branch_nn, key, |child| Mutation::unknown(f(child)));
     }
 
-    /// Shared child mutation machinery. `empty_slot_hash_hint` is consulted
-    /// only when `f(None)` inserts a child; an occupied replacement always
-    /// derives both contributions from the resident heads. `Some(0)` is a
-    /// legitimate known-zero contribution and must remain distinct from no
-    /// hint.
-    fn modify_child_impl<F>(
-        branch_nn: &mut NonNull<Self>,
-        key: u8,
-        empty_slot_hash_hint: Option<u128>,
-        f: F,
-    ) where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    /// Shared child mutation machinery. The returned receipt describes only
+    /// the key-fingerprint change; structural changes and value winners always
+    /// follow the returned Head. `Known(0)` and `Unknown` remain distinct.
+    fn modify_child_impl<F>(branch_nn: &mut NonNull<Self>, key: u8, f: F) -> HashDelta
+    where
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Mutation<Option<Head<KEY_LEN, O, V>>>,
     {
         unsafe {
             let branch = branch_nn.as_ptr();
             let end_depth = (*branch).end_depth as usize;
             // A zero aggregate is deliberately ambiguous: it may be a dirty
-            // cache or a legitimate semantic zero. Incremental maintenance is
-            // valid only when the parent and every replaced contribution are
-            // already known; otherwise dirtiness propagates upward.
+            // cache or a legitimate semantic zero. A known operation delta can
+            // update a nonzero parent directly; otherwise resident old/new
+            // child hashes are the conservative fallback.
             let cached_parent_hash = ((*branch).hash != 0).then_some((*branch).hash);
 
             // If a slot exists, operate on the existing child in-place.
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
-                let old_child_hash = cached_parent_hash.and_then(|_| child.known_hash());
+                let old_child_hash = child.known_hash();
                 let old_child_segment_count = child.count_segment(end_depth);
                 let old_child_leaf_count = child.count();
 
                 let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
+                let Mutation {
+                    result: new_child,
+                    delta,
+                } = f(Some(child));
+                let inferred_delta = match new_child.as_ref() {
+                    Some(new_child) => match (old_child_hash, new_child.known_hash()) {
+                        (Some(old), Some(new)) => Some(old ^ new),
+                        _ => None,
+                    },
+                    None => old_child_hash,
+                };
+                let delta = delta.resolve(inferred_delta);
+                (*branch).hash = match (cached_parent_hash, delta.known()) {
+                    (Some(parent), Some(delta)) => parent ^ delta,
+                    _ => 0,
+                };
 
-                if let Some(new_child) = f(Some(child)) {
+                if let Some(new_child) = new_child {
                     // Replace existing child
-                    let new_child_hash = new_child.known_hash();
-                    (*branch).hash = match (cached_parent_hash, old_child_hash, new_child_hash) {
-                        (Some(parent), Some(old), Some(new)) => parent ^ old ^ new,
-                        _ => 0,
-                    };
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
                         + new_child.count_segment(end_depth);
                     (*branch).leaf_count =
@@ -501,10 +501,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     }
                 } else {
                     // Remove existing child
-                    (*branch).hash = match (cached_parent_hash, old_child_hash) {
-                        (Some(parent), Some(old)) => parent ^ old,
-                        _ => 0,
-                    };
                     (*branch).segment_count -= old_child_segment_count;
                     (*branch).leaf_count -= old_child_leaf_count;
 
@@ -514,20 +510,31 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         }
                     }
                 }
+                #[cfg(debug_assertions)]
+                branch_nn.as_ref().debug_check_invariants();
+                return delta;
             } else {
                 // No current slot — the closure can choose to insert a child.
-                if let Some(mut inserted) = f(None) {
+                let Mutation {
+                    result: inserted,
+                    delta,
+                } = f(None);
+                let inferred_delta = match inserted.as_ref() {
+                    Some(inserted) => inserted.known_hash(),
+                    None => Some(0),
+                };
+                let delta = delta.resolve(inferred_delta);
+                (*branch).hash = match (cached_parent_hash, delta.known()) {
+                    (Some(parent), Some(delta)) => parent ^ delta,
+                    _ => 0,
+                };
+
+                if let Some(mut inserted) = inserted {
                     // The caller is expected to pass an inserted Head that is
                     // already prepared (with_start set to the appropriate depth).
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
                     (*branch).segment_count += inserted.count_segment(end_depth);
-                    let inserted_hash =
-                        empty_slot_hash_hint.or_else(|| inserted.known_hash());
-                    (*branch).hash = match (cached_parent_hash, inserted_hash) {
-                        (Some(parent), Some(inserted)) => parent ^ inserted,
-                        _ => 0,
-                    };
 
                     // Cuckoo insert loop, growing the table when necessary.
                     let mut branch_ptr = branch_nn.as_ptr();
@@ -539,26 +546,23 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         branch_ptr = branch_nn.as_ptr();
                     }
                 }
+                #[cfg(debug_assertions)]
+                branch_nn.as_ref().debug_check_invariants();
+                return delta;
             }
-            // Debug invariant check (no-op in release builds).
-            #[cfg(debug_assertions)]
-            branch_nn.as_ref().debug_check_invariants();
         }
     }
 
-    /// Variant of [`Self::modify_child`] that takes a precomputed
-    /// `inserted_hash` as a known empty-slot contribution. The hint MUST equal
-    /// the hash of whatever `f(None)` returns. A non-empty replacement keeps
-    /// the parent clean only when both child hashes are already cached.
-    pub(super) fn modify_child_with_inserted_hint<F>(
+    /// Receipt-aware variant of [`Self::modify_child`].
+    pub(super) fn modify_child_with_delta<F>(
         branch_nn: &mut NonNull<Self>,
         key: u8,
-        inserted_hash: u128,
         f: F,
-    ) where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    ) -> HashDelta
+    where
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Mutation<Option<Head<KEY_LEN, O, V>>>,
     {
-        Self::modify_child_impl(branch_nn, key, Some(inserted_hash), f);
+        Self::modify_child_impl(branch_nn, key, f)
     }
 
     // Note: upsert_child removed in favor of explicit insert_child / update_child

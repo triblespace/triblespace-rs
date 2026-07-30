@@ -940,6 +940,78 @@ pub(crate) struct Head<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     value: PhantomData<V>,
 }
 
+/// Exact change in the XOR fingerprint of one mutated key set.
+///
+/// This receipt says nothing about structural identity, archive ownership, or
+/// which value wins for an existing key. In particular, `Known(0)` still
+/// permits replacing the returned Head when its key set is unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "a known hash delta must be applied or propagated"]
+enum HashDelta {
+    Known(u128),
+    Unknown,
+}
+
+impl HashDelta {
+    const SAME_KEYS: Self = Self::Known(0);
+
+    #[inline]
+    fn known(self) -> Option<u128> {
+        match self {
+            Self::Known(delta) => Some(delta),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Prefer an operation's semantic receipt, falling back to hashes already
+    /// resident in the old and new Heads. The debug check catches disagreement
+    /// whenever both sources of evidence are available without traversal.
+    #[inline]
+    fn resolve(self, inferred: Option<u128>) -> Self {
+        match (self, inferred) {
+            (Self::Known(claimed), Some(inferred)) => {
+                debug_assert_eq!(claimed, inferred, "mutation hash-delta receipt mismatch");
+                Self::Known(claimed)
+            }
+            (known @ Self::Known(_), None) => known,
+            (Self::Unknown, Some(inferred)) => Self::Known(inferred),
+            (Self::Unknown, None) => Self::Unknown,
+        }
+    }
+}
+
+/// A structural mutation result coupled to its exact key-fingerprint delta.
+#[must_use = "mutation results and their hash deltas must be consumed together"]
+struct Mutation<T> {
+    result: T,
+    delta: HashDelta,
+}
+
+impl<T> Mutation<T> {
+    #[inline]
+    fn with_delta(result: T, delta: HashDelta) -> Self {
+        Self { result, delta }
+    }
+
+    #[inline]
+    fn same_keys(result: T) -> Self {
+        Self::with_delta(result, HashDelta::SAME_KEYS)
+    }
+
+    #[inline]
+    fn unknown(result: T) -> Self {
+        Self::with_delta(result, HashDelta::Unknown)
+    }
+
+    #[inline]
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Mutation<U> {
+        Mutation {
+            result: f(self.result),
+            delta: self.delta,
+        }
+    }
+}
+
 /// What a recursive union learned about the input intersection.
 ///
 /// The scalar representation is intentionally private to this experiment. It
@@ -1243,27 +1315,32 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // NOTE: mut_children removed — prefer matching on BodyRef returned by
     // `body_mut()` and operating directly on the `&mut Branch` reference.
 
-    pub(crate) fn remove_leaf(
+    fn remove_leaf(
         slot: &mut Option<Self>,
         leaf_key: &[u8; KEY_LEN],
         start_depth: usize,
-    ) {
+    ) -> HashDelta {
         if let Some(this) = slot {
             let end_depth = std::cmp::min(this.end_depth(), KEY_LEN);
             // Check reachable equality by asking the head to test the prefix
             // up to its end_depth. Using the head/leaf primitive centralises the
             // unsafe deref into Branch::childleaf()/Leaf::has_prefix.
             if !this.has_prefix::<KEY_LEN>(start_depth, leaf_key) {
-                return;
+                return HashDelta::SAME_KEYS;
             }
             if matches!(this.tag(), HeadTag::Leaf | HeadTag::LocalLeaf) {
+                let delta = this
+                    .known_hash()
+                    .map(HashDelta::Known)
+                    .unwrap_or(HashDelta::Unknown);
                 slot.take();
+                return delta;
             } else {
                 let mut ed = crate::patch::branch::BranchMut::from_head(this);
                 let key = leaf_key[end_depth];
-                ed.modify_child(key, |mut opt| {
-                    Self::remove_leaf(&mut opt, leaf_key, end_depth);
-                    opt
+                let delta = ed.modify_child_with_delta(key, |mut opt| {
+                    let delta = Self::remove_leaf(&mut opt, leaf_key, end_depth);
+                    Mutation::with_delta(opt, delta)
                 });
 
                 // If the branch now contains a single remaining child we
@@ -1292,8 +1369,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     // final pointer is committed back into the head.
                     drop(ed);
                 }
+                return delta;
             }
         }
+        HashDelta::SAME_KEYS
     }
 
     // NOTE: slot-level wrappers removed; callers should take the slot and call
@@ -1305,7 +1384,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // Head by value and return the new Head after performing the
     // modification. They are used with the split `insert_child` /
     // `update_child` APIs so we no longer need `Branch::upsert_child`.
-    pub(crate) fn insert_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Self {
+    fn insert_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Mutation<Self> {
+        let inserted_delta = leaf
+            .known_hash()
+            .map(HashDelta::Known)
+            .unwrap_or(HashDelta::Unknown);
         if let Some((depth, this_byte_key, leaf_byte_key)) =
             this.first_divergence(&leaf, start_depth)
         {
@@ -1315,20 +1398,23 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 this.with_key(this_byte_key),
                 leaf.with_key(leaf_byte_key),
             );
-            return Head::new(old_key, new_body);
+            return Mutation::with_delta(Head::new(old_key, new_body), inserted_delta);
         }
 
         let end_depth = this.end_depth();
-        if end_depth != KEY_LEN {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
-            let inserted = leaf.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::insert_leaf(old, inserted, end_depth)),
-                None => Some(inserted),
-            });
+        if end_depth == KEY_LEN {
+            return Mutation::same_keys(this);
         }
-        this
+
+        let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+        let inserted = leaf.with_start(ed.end_depth as usize);
+        let key = inserted.key();
+        let delta = ed.modify_child_with_delta(key, |opt| match opt {
+            Some(old) => Head::insert_leaf(old, inserted, end_depth).map(Some),
+            None => Mutation::with_delta(Some(inserted), inserted_delta),
+        });
+        drop(ed);
+        Mutation::with_delta(this, delta)
     }
 }
 
@@ -1377,12 +1463,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     /// Inserts a LocalLeaf whose hash was already computed by ArchiveEntry.
     /// The enclosing PATCH retains the leaf's archive owner independently of
     /// trie shape, so LocalLeaves can move through ordinary Branch operations.
-    pub(crate) fn insert_archive_leaf(
+    fn insert_archive_leaf(
         mut this: Self,
         leaf: Self,
         leaf_hash: u128,
         start_depth: usize,
-    ) -> Self {
+    ) -> Mutation<Self> {
+        let inserted_delta = HashDelta::Known(leaf_hash);
         if let Some((depth, this_byte_key, leaf_byte_key)) =
             this.first_divergence(&leaf, start_depth)
         {
@@ -1393,22 +1480,23 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                 leaf.with_key(leaf_byte_key),
                 leaf_hash,
             );
-            return Head::new(old_key, new_body);
+            return Mutation::with_delta(Head::new(old_key, new_body), inserted_delta);
         }
 
         let end_depth = this.end_depth();
-        if end_depth != KEY_LEN {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
-            let inserted = leaf.with_start(ed.end_depth as usize);
-            let key = inserted.key();
-            ed.modify_child_with_inserted_hint(key, leaf_hash, |opt| match opt {
-                None => Some(inserted),
-                Some(old) => Some(Head::insert_archive_leaf(
-                    old, inserted, leaf_hash, end_depth,
-                )),
-            });
+        if end_depth == KEY_LEN {
+            return Mutation::same_keys(this);
         }
-        this
+
+        let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+        let inserted = leaf.with_start(ed.end_depth as usize);
+        let key = inserted.key();
+        let delta = ed.modify_child_with_delta(key, |opt| match opt {
+            None => Mutation::with_delta(Some(inserted), inserted_delta),
+            Some(old) => Head::insert_archive_leaf(old, inserted, leaf_hash, end_depth).map(Some),
+        });
+        drop(ed);
+        Mutation::with_delta(this, delta)
     }
 }
 
@@ -1416,7 +1504,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
 // union, intersect, query operations, etc.) which don't care about V
 // shape and so remain in the V-generic impl block.
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
-    pub(crate) fn replace_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Self {
+    fn replace_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Mutation<Self> {
+        let inserted_delta = leaf
+            .known_hash()
+            .map(HashDelta::Known)
+            .unwrap_or(HashDelta::Unknown);
         if let Some((depth, this_byte_key, leaf_byte_key)) =
             this.first_divergence(&leaf, start_depth)
         {
@@ -1427,24 +1519,25 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 leaf.with_key(leaf_byte_key),
             );
 
-            return Head::new(old_key, new_body);
+            return Mutation::with_delta(Head::new(old_key, new_body), inserted_delta);
         }
 
         let end_depth = this.end_depth();
         if end_depth == KEY_LEN {
             let old_key = this.key();
-            return leaf.with_key(old_key);
+            return Mutation::same_keys(leaf.with_key(old_key));
         } else {
             // Use the editor view for branch mutation instead of raw pointer ops.
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::replace_leaf(old, inserted, end_depth)),
-                None => Some(inserted),
+            let delta = ed.modify_child_with_delta(key, |opt| match opt {
+                Some(old) => Head::replace_leaf(old, inserted, end_depth).map(Some),
+                None => Mutation::with_delta(Some(inserted), inserted_delta),
             });
+            drop(ed);
+            Mutation::with_delta(this, delta)
         }
-        this
     }
 
     /// Sequential PATCH-trie union. Always serial; the parallel
@@ -2770,7 +2863,7 @@ where
     pub fn insert(&mut self, entry: &Entry<KEY_LEN, V>) {
         if self.root.is_some() {
             let this = self.root.take().expect("root should not be empty");
-            let new_head = Head::insert_leaf(this, entry.leaf(), 0);
+            let new_head = Head::insert_leaf(this, entry.leaf(), 0).result;
             self.root.replace(new_head);
         } else {
             self.root.replace(entry.leaf());
@@ -2782,7 +2875,7 @@ where
     pub fn replace(&mut self, entry: &Entry<KEY_LEN, V>) {
         if self.root.is_some() {
             let this = self.root.take().expect("root should not be empty");
-            let new_head = Head::replace_leaf(this, entry.leaf(), 0);
+            let new_head = Head::replace_leaf(this, entry.leaf(), 0).result;
             self.root.replace(new_head);
         } else {
             self.root.replace(entry.leaf());
@@ -2794,7 +2887,7 @@ where
     ///
     /// If the key is not present, this is a no-op.
     pub fn remove(&mut self, key: &[u8; KEY_LEN]) {
-        Head::remove_leaf(&mut self.root, key, 0);
+        let _ = Head::remove_leaf(&mut self.root, key, 0);
         if self.root.is_none() {
             self.owners = None;
         }
@@ -3420,7 +3513,7 @@ where
         let (leaf_head, leaf_owner, leaf_hash) = entry.leaf::<O>();
         OwnerCover::retain(&mut self.owners, leaf_owner);
         if let Some(this) = self.root.take() {
-            let new_head = Head::insert_archive_leaf(this, leaf_head, leaf_hash, 0);
+            let new_head = Head::insert_archive_leaf(this, leaf_head, leaf_hash, 0).result;
             self.root.replace(new_head);
         } else {
             self.root.replace(leaf_head);
@@ -3867,8 +3960,8 @@ mod tests {
             .expect("a non-empty PATCH must have a root hash")
     }
 
-    fn branch_cached_hash<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(
-        patch: &PATCH<KEY_LEN, O>,
+    fn branch_cached_hash<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>(
+        patch: &PATCH<KEY_LEN, O, V>,
     ) -> u128 {
         let Some(root) = patch.root.as_ref() else {
             panic!("expected a non-empty PATCH");
@@ -3879,11 +3972,114 @@ mod tests {
         branch.hash
     }
 
-    fn deep_hash_audit<const KEY_LEN: usize, O: KeySchema<KEY_LEN>>(patch: &PATCH<KEY_LEN, O>) {
+    fn deep_hash_audit<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>(
+        patch: &PATCH<KEY_LEN, O, V>,
+    ) {
         #[cfg(debug_assertions)]
         patch.debug_check_deep_hash_invariant();
         #[cfg(not(debug_assertions))]
         let _ = patch;
+    }
+
+    #[test]
+    fn failed_remove_preserves_exact_hash_across_nested_cow() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[1] = 1;
+        let mut c = a;
+        c[0] = 1;
+        let mut missing = a;
+        missing[2] = 1;
+
+        let storage = Arc::new([
+            AlignedArchiveKey(a),
+            AlignedArchiveKey(b),
+            AlignedArchiveKey(c),
+        ]);
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let entries: [ArchiveEntry<'_, KEY_LEN>; 3] = std::array::from_fn(|i| unsafe {
+            ArchiveEntry::new(NonNull::from(&storage[i].0), &owner)
+        });
+        let mut patch: PATCH<KEY_LEN, IdentitySchema> =
+            PATCH::from_archive_pair(&entries[0], &entries[1]);
+        patch.insert_archive(&entries[2]);
+        let cached_hash = branch_cached_hash(&patch);
+        assert_ne!(cached_hash, 0);
+
+        let nested_branch_ptr = |patch: &PATCH<KEY_LEN, IdentitySchema>| {
+            let BodyRef::Branch(root) = patch.root.as_ref().unwrap().body_ref() else {
+                panic!("expected an outer Branch");
+            };
+            root.child_table
+                .iter()
+                .flatten()
+                .find(|child| child.key() == a[0])
+                .expect("expected the same-prefix child")
+                .tptr
+        };
+        let before_nested = nested_branch_ptr(&patch);
+        let snapshot = patch.clone();
+
+        reset_local_leaf_hash_calls();
+        patch.remove(&missing);
+
+        assert_ne!(nested_branch_ptr(&patch), before_nested);
+        assert_eq!(branch_cached_hash(&patch), cached_hash);
+        assert_eq!(branch_cached_hash(&snapshot), cached_hash);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(
+            patch.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([a, b, c]),
+        );
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
+    fn same_key_replace_preserves_hash_and_installs_heap_provenance() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut patch = owned_archive_pair([a, b]);
+        let cached_hash = branch_cached_hash(&patch);
+        assert_ne!(cached_hash, 0);
+        let before_childleaf = patch.root.as_ref().unwrap().childleaf_ptr();
+
+        reset_local_leaf_hash_calls();
+        patch.replace(&Entry::new(&a));
+
+        assert_eq!(branch_cached_hash(&patch), cached_hash);
+        assert_eq!(local_leaf_hash_calls(), 0);
+        assert_eq!(patch.node_stats(), (1, 2, 1, 1));
+        assert_ne!(
+            patch.root.as_ref().unwrap().childleaf_ptr(),
+            before_childleaf
+        );
+        assert_eq!(patch.root.as_ref().unwrap().childleaf_key(), &a);
+        deep_hash_audit(&patch);
+    }
+
+    #[test]
+    fn same_key_delta_preserves_insert_and_replace_value_winners() {
+        const KEY_LEN: usize = 8;
+        let a = [0u8; KEY_LEN];
+        let mut b = a;
+        b[0] = 1;
+        let mut patch = PATCH::<KEY_LEN, IdentitySchema, u32>::new();
+        patch.insert(&Entry::with_value(&a, 1));
+        patch.insert(&Entry::with_value(&b, 2));
+        let cached_hash = branch_cached_hash(&patch);
+        assert_ne!(cached_hash, 0);
+
+        patch.insert(&Entry::with_value(&a, 3));
+        assert_eq!(patch.get(&a), Some(&1));
+        assert_eq!(branch_cached_hash(&patch), cached_hash);
+
+        patch.replace(&Entry::with_value(&a, 4));
+        assert_eq!(patch.get(&a), Some(&4));
+        assert_eq!(branch_cached_hash(&patch), cached_hash);
+        deep_hash_audit(&patch);
     }
 
     #[test]
@@ -3970,7 +4166,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_insert_propagates_a_dirty_child_through_a_clean_ancestor() {
+    fn ordinary_insert_carries_known_delta_through_a_dirty_child() {
         const KEY_LEN: usize = 8;
         let a = [0u8; KEY_LEN];
         let mut b = a;
@@ -4006,6 +4202,7 @@ mod tests {
         };
         assert_eq!(dirty_children, 2);
         deep_hash_audit(&patch);
+        let before_insert_hash = branch_cached_hash(&patch);
 
         // An unrelated known heap child can extend the exact parent without
         // consulting either dirty sibling. The ordinary local debug audit must
@@ -4027,17 +4224,18 @@ mod tests {
             0,
             "ordinary mutation must not recursively hash a dirty old child",
         );
-        assert_eq!(
+        assert_ne!(
             branch_cached_hash(&patch),
-            0,
-            "unknown replacement accounting must dirty the clean ancestor",
+            before_insert_hash,
+            "the inserted key's known delta must update the clean ancestor",
         );
         deep_hash_audit(&patch);
 
         let expected = heap_hash_oracle(&patch);
         let before = local_leaf_hash_calls();
+        assert_eq!(branch_cached_hash(&patch), expected);
         assert_eq!(patch.root_hash(), Some(expected));
-        assert_eq!(local_leaf_hash_calls() - before, 4);
+        assert_eq!(local_leaf_hash_calls(), before);
     }
 
     #[test]
@@ -4863,7 +5061,8 @@ mod tests {
         });
         let mut archive: PATCH<KEY_SIZE, IdentitySchema> =
             PATCH::from_archive_pair(&entries[0], &entries[1]);
-        let original_hash = archive.root_hash();
+        let original_hash = branch_cached_hash(&archive);
+        assert_ne!(original_hash, 0);
         let snapshot = archive.clone();
         assert!(Arc::ptr_eq(
             archive.owners.as_ref().unwrap(),
@@ -4871,9 +5070,11 @@ mod tests {
         ));
 
         // Same-owner duplication stays entirely local.
+        reset_local_leaf_hash_calls();
         archive.insert_archive(&entries[0]);
         assert_eq!(archive.node_stats(), (1, 2, 0, 2));
-        assert_eq!(archive.root_hash(), original_hash);
+        assert_eq!(branch_cached_hash(&archive), original_hash);
+        assert_eq!(local_leaf_hash_calls(), 0);
         assert!(Arc::ptr_eq(
             archive.owners.as_ref().unwrap(),
             snapshot.owners.as_ref().unwrap(),
@@ -4887,7 +5088,8 @@ mod tests {
             unsafe { ArchiveEntry::new(NonNull::from(&duplicate_storage.0), &duplicate_owner) };
         archive.insert_archive(&duplicate);
         assert_eq!(archive.node_stats(), (1, 2, 0, 2));
-        assert_eq!(archive.root_hash(), original_hash);
+        assert_eq!(branch_cached_hash(&archive), original_hash);
+        assert_eq!(local_leaf_hash_calls(), 0);
         assert_eq!(archive.owners.as_ref().unwrap().owner_count(), 2);
         assert_eq!(snapshot.owners.as_ref().unwrap().owner_count(), 1);
         assert!(!Arc::ptr_eq(
@@ -5627,7 +5829,7 @@ mod tests {
             let key = inserted.key();
 
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::insert_leaf(old, inserted, start_depth)),
+                Some(old) => Some(Head::insert_leaf(old, inserted, start_depth).result),
                 None => Some(inserted),
             });
             // BranchMut is dropped here and commits the updated branch pointer back into the head.
