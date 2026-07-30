@@ -549,7 +549,7 @@ mod parallel_union {
     /// identifies a slot), so the writes are non-aliasing despite sharing a
     /// `*mut` across threads.
     ///
-    /// `write_at` exists as an inherent method (rather than callers
+    /// The accessors exist as inherent methods (rather than callers
     /// reading the `*mut` field directly) so that move closures
     /// capture the whole wrapper — Rust 2021 precise-capture would
     /// otherwise grab the raw pointer field, dropping the manual
@@ -575,6 +575,13 @@ mod parallel_union {
         /// to slot `i` concurrently.
         pub(crate) unsafe fn write_at(self, i: usize, v: T) {
             self.0.add(i).write(v);
+        }
+
+        /// SAFETY: `i` must be in-bounds of the initialized buffer, and the
+        /// caller must guarantee exclusive access to slot `i` for the
+        /// duration of the replacement.
+        pub(crate) unsafe fn replace_at(self, i: usize, v: T) -> T {
+            self.0.add(i).replace(v)
         }
     }
 }
@@ -1745,19 +1752,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let end_depth = ed.end_depth as usize;
 
-            // Scatter both child tables into key-indexed 256-slot
-            // arrays + present bitsets. The bitset partition tells us
-            // which keys need a recursive union ("both") vs which are
-            // simple pass-throughs ("only").
+            // Scatter both child tables into key-indexed 256-slot arrays.
+            // Other-only children land directly in `this_arr`; `other_arr`
+            // holds only colliding operands, and `both` names exactly those
+            // slots that need recursive union.
             let mut this_arr: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
             let mut other_arr: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-            let mut this_present = crate::patch::bytetable::ByteSet::new_empty();
-            let mut other_present = crate::patch::bytetable::ByteSet::new_empty();
+            let mut both = crate::patch::bytetable::ByteSet::new_empty();
 
             for slot in ed.child_table.iter_mut() {
                 if let Some(head) = slot.take() {
                     let key = head.key();
-                    this_present.insert(key);
                     this_arr[key as usize] = Some(head);
                 }
             }
@@ -1765,12 +1770,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 if let Some(head) = slot.take() {
                     let head = head.with_start(end_depth);
                     let key = head.key();
-                    other_present.insert(key);
-                    other_arr[key as usize] = Some(head);
+                    let i = key as usize;
+                    if this_arr[i].is_some() {
+                        both.insert(key);
+                        other_arr[i] = Some(head);
+                    } else {
+                        this_arr[i] = Some(head);
+                    }
                 }
             }
-
-            let mut both = this_present.intersect(&other_present);
 
             // Reuse `this_arr` as the resolved-head target. A both-side slot is
             // taken before dispatch, so each task writes into a distinct empty
@@ -1790,7 +1798,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 // with all nested `par_union_with_ctx` calls.
                 while let Some(k) = both.drain_next_ascending() {
                     let i = k as usize;
-                    let t = this_arr[i].take().expect("both ⇒ this");
+                    // SAFETY: after publishing `this_arr_ptr`, every access to
+                    // this array inside the scope uses the raw disjoint-slot
+                    // primitive. The parent empties `i` before spawning its
+                    // sole writer, and `both` yields each index exactly once.
+                    // Safe array access resumes only after rayon joins them.
+                    let t = unsafe { this_arr_ptr.replace_at(i, None) }.expect("both ⇒ this");
                     let o = other_arr[i].take().expect("both ⇒ other");
                     if ctx.try_claim() {
                         s.spawn(move |_| {
@@ -1821,7 +1834,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // scatter writes are all sequenced-before here by rayon's join
             // semantics.
 
-            for slot in this_arr.iter_mut().chain(other_arr.iter_mut()) {
+            debug_assert!(other_arr.iter().all(Option::is_none));
+            for slot in &mut this_arr {
                 if let Some(head) = slot.take() {
                     ed.install_child_growing(head);
                 }
