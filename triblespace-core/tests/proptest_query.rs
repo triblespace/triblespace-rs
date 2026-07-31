@@ -896,9 +896,10 @@ fn cross_product_rows(
 }
 
 proptest! {
-    /// The batch width is an execution choice, not a semantic one: a
-    /// frontier of one (the pre-batching shape) and a wide frontier must
-    /// produce the very same bag of rows.
+    /// The row-fiber law makes batch width an execution choice, not a
+    /// semantic one: partitioning every frontier into singleton source pages
+    /// (the pre-batching shape) and using wide geometric pages must produce
+    /// the very same bag of rows.
     #[test]
     fn frontier_width_preserves_the_bag(
         seed_values in vec(prop::array::uniform32(any::<u8>()), 1..24),
@@ -921,10 +922,10 @@ proptest! {
         // whole point: with a frontier of one, every deeper propose sees a
         // single parent binding.
         prop_assert!(narrow_widths.lock().unwrap().iter().all(|&w| w == 1));
-        // Two candidates is not enough to see the ramp leave 1: the level
-        // hands down chunks of 1 then 2, and the second chunk holds only
-        // the one candidate that is left.
-        if values.len() > 2 {
+        // Three candidates are not enough to show a multi-row *source page*:
+        // the candidate ramp hands down 1 then 2, and that two-row frontier
+        // is itself exposed as source pages of 1 and 1.
+        if values.len() > 3 {
             prop_assert!(wide_widths.lock().unwrap().iter().any(|&w| w > 1));
         }
     }
@@ -932,10 +933,9 @@ proptest! {
 
 #[test]
 fn deep_levels_see_a_wide_frontier() {
-    // Two levels of 40 values each: at width 1 the inner level is proposed
-    // over one binding 40 times; batched, the root hands down one narrow
-    // chunk (so a caller who stops at the first row pays nothing extra)
-    // and then everything that is left in one wide batch.
+    // Two levels of 40 values each. Both the candidate descent and the
+    // engine-owned parent selection ramp geometrically: no atomic propose is
+    // allowed to hide the full parent batch behind a narrow child chunk.
     let values: Vec<[u8; 32]> = (0..40u32)
         .map(|i| {
             let mut v = [0u8; 32];
@@ -951,20 +951,13 @@ fn deep_levels_see_a_wide_frontier() {
     let widths = widths.lock().unwrap();
     assert_eq!(
         widths.as_slice(),
-        &[1, 1, 8, 31],
-        "root, one narrow chunk, then the ramp climbing by FRONTIER_RAMP_BASE"
+        &[1, 1, 1, 7, 1, 8, 22],
+        "root, then a fresh parent-row ramp within each root chunk"
     );
-    // The schedule is a schedule, not a cap — every root candidate is still
-    // expanded exactly once.
+    // The schedule is a partition, not a cap: every root candidate is still
+    // expanded exactly once, but no child propose sees all 40 parents at once.
     assert_eq!(widths[1..].iter().sum::<usize>(), 40);
-    // And the ramp keeps most of the peak. A ramp's cost is the size of its
-    // LAST chunk: at base 2 the tail is half the level (which is why the
-    // geometric ramp was rejected), at base 8 it is the large majority. 31
-    // of 40 here; the 512-value fixture below shows the asymptote cleanly.
-    assert!(
-        *widths[1..].iter().max().unwrap() * 4 >= 40 * 3,
-        "the ramp must keep at least three quarters of the peak, got {widths:?}"
-    );
+    assert_eq!(*widths[1..].iter().max().unwrap(), 22);
 }
 
 #[test]
@@ -1225,10 +1218,10 @@ fn a_branching_descent_still_copies() {
 
 #[test]
 fn the_short_circuiting_query_still_sees_the_full_width_afterwards() {
-    // The narrow first chunk is a latency guard, not a width cap: once the
-    // caller keeps pulling, the level must hand down the ceiling. This is
-    // what a geometric ramp gets wrong — it would need log2(width) chunks
-    // to get here and would top out at half the width.
+    // The narrow first chunk is a latency guard, not a width cap. The source
+    // page inside each child frontier follows the same ramp, so sustained
+    // demand still reaches a large batch without hiding a whole frontier
+    // behind its first result.
     let values: Vec<[u8; 32]> = (0..512u32).map(Chain::node).collect();
     let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let outer = WidthObserver {
@@ -1251,19 +1244,18 @@ fn the_short_circuiting_query_still_sees_the_full_width_afterwards() {
     let stats = query.stats();
     assert_eq!(query.count(), 512 * 512);
 
-    // Root, the one-row latency chunk, then the ramp: 8, 64, and the rest.
-    assert_eq!(widths.lock().unwrap().as_slice(), &[1, 1, 8, 64, 439]);
-    // This is the number the whole ramp design turns on. A ramp by `b`
-    // spends `(b^k - 1)/(b - 1)` getting up to speed, so the final — and
-    // widest — chunk is `N` minus that. At b = 2 it is N/2, which halves
-    // the peak and is exactly why the geometric ramp lost. At b = 8 the
-    // run-up costs 1 + 8 + 64 = 73 of 512, leaving 439: eighty-six percent
-    // of what a flat full-width engine would have built, for a schedule
-    // that also serves the caller who wanted three rows.
+    // Root; pages within root chunks 1, 8, 64, and 439. Every root candidate
+    // is exposed once. The last 439-row chunk is recursively partitioned as
+    // 1 + 8 + 64 + 366, so the deepest atomic source call still reaches 71%
+    // of the whole frontier while intermediate pulls remain bounded.
+    assert_eq!(
+        widths.lock().unwrap().as_slice(),
+        &[1, 1, 1, 7, 1, 8, 55, 1, 8, 64, 366]
+    );
     assert_eq!(
         stats.widest(),
         439,
-        "the ramp must keep the large majority of the peak, not half of it"
+        "frontier width and atomic source-page width are distinct observations"
     );
 }
 

@@ -103,11 +103,13 @@ That single decision pays for most of the engine's structure:
   those iterators, and a borrowed enumeration would tie the constraint's
   lifetime to the engine's — the self-referential trap that a stateful protocol
   cannot avoid.
-- **A level is proposed once.** Because no source is ever asked to resume, a
-  level's buffer is written exactly once and never appended to while its
-  variable is bound. That makes "a bound variable's buffer is stable for the
-  lifetime of its binding" an unconditional invariant, which is what lets a
-  binding be an *index* into that buffer instead of a copy of the value.
+- **A physical source page is proposed once.** Because no source is ever asked
+  to resume, one page's level buffer is written exactly once and never appended
+  to while its variable is bound. When it is exhausted the engine unbinds the
+  variable and may refill the buffer for the next disjoint parent page. That
+  keeps "a bound variable's buffer is stable for the lifetime of its binding"
+  unconditional, which is what lets a binding be an *index* into that buffer
+  instead of a copy of the value.
 
 ## Depth-first search with dynamic variable ordering
 
@@ -121,11 +123,11 @@ whole frontier at a time:
 1. For each row of the frontier, pick its most specific unbound variable from
    *that row's own* estimates.
 2. Partition the frontier by that choice and take the next group.
-3. Ask the constraint tree to `propose` candidates for the group's variable,
-   over all of the group's rows in one call. An intersection internally lets
-   each row's tightest child propose and runs the remaining children as
-   confirmers over that output, so the buffer the engine sees has already
-   survived every clause.
+3. Expose the group's parent rows in geometrically growing pages. Ask the
+   constraint tree to `propose` candidates for one page in one call. An
+   intersection internally lets each row's tightest child propose and runs
+   the remaining children as confirmers over that output, so the buffer the
+   engine sees has already survived every clause.
 4. Turn the next chunk of surviving candidates into the child frontier and
    descend. Each child row inherits its parent's estimates and refreshes
    exactly the ones the new binding could have changed — the `influence` set
@@ -133,20 +135,41 @@ whole frontier at a time:
 5. When a level runs out of live candidates, retire it and continue with the
    next group, then with the next chunk one level up.
 
-### The width is a ceiling, and the frontier ramps from one row
+### The width is a ceiling, and both sides of a level ramp from one row
 
-`DEFAULT_FRONTIER_WIDTH` is how wide a chunk may *get*, not how wide the first
-one is. A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding. Later
-chunks multiply by `FRONTIER_RAMP_BASE` = 8 until they reach the ceiling. If
-the final remainder would be smaller than the chunk before it, the engine
-merges that tail early; the caller's ceiling remains a hard bound.
+`DEFAULT_FRONTIER_WIDTH` is how wide a batch may *get*, not how wide the first
+one is. The same geometric schedule applies on both sides of a level:
 
-That is what keeps time-to-first-result honest. A caller who stops after one
-row — `exists!`, `.next()` — must not pay to build a 16 384-wide frontier it
-will never look at, and with a first chunk of one it does exactly the work the
-single-binding engine did. Measured on a first-row-only join, a flat
-full-width engine is 8.8x slower than the pre-batching engine; one narrow
-chunk closes the entire gap.
+- a level hands confirmed candidates down as child-frontier chunks; and
+- a preferred-variable group hands parent rows into an atomic
+  `propose`/`confirm` pass as source pages.
+
+Both start at `INITIAL_FRONTIER_WIDTH` = 1 and later widths multiply by
+`FRONTIER_RAMP_BASE` = 8 until they reach the ceiling. If the final remainder
+would be smaller than the chunk before it, the engine merges that tail early;
+the ceiling remains hard.
+
+Both dimensions are necessary to keep pull latency honest. Candidate chunking
+alone prevents the engine from *descending* 16 384 rows, but the next depth
+could still synchronously propose and confirm every parent in that chunk
+before yielding its first result. Source paging bounds that hidden work too.
+Each page is a disjoint slice of the engine-owned row selection, so constraints
+remain stateless and every parent is still expanded exactly once.
+
+This rests on the constraint protocol's **row-fiber law**. For any selection of
+parent rows, running `propose` and `confirm` on that selection alone and lifting
+its local parent tags back into the original frontier must produce the same
+tagged bag, up to order, as processing those rows in the full frontier. Batch
+width is physical, never semantic. The built-in leaves work row by row;
+intersection chooses and confirms within each row; and union deduplicates by
+`(parent, value)`, so composition preserves the law. The width-1-versus-wide
+property tests pin its observable consequence.
+
+A caller who stops after one row — `exists!`, `.next()` — therefore does not
+pay to build or expand a 16 384-wide frontier it will never inspect. Measured
+on a first-row-only join, a flat full-width engine is 8.8x slower than the
+pre-batching engine; the recursive narrow first page closes that gap without a
+source cursor.
 
 The base is the latency/throughput trade, not an incidental tuning detail. A
 base-2 ramp was measured and rejected: its last chunk is only about half a
@@ -160,6 +183,15 @@ schedule), at 44.7% more expansions. It therefore keeps almost all useful
 batch width while avoiding the flat schedule's enormous overshoot for callers
 that want only a handful of rows. The first row is protected exactly; larger
 short demands pay at most the next base-8 rung.
+
+The irreducible granule is one parent row. If one row itself proposes a million
+values, the stateless protocol still enumerates that row atomically.
+Interrupting it would require the source-level cursor described under “What
+the engine refuses” below. There is also an honest online batching boundary:
+after any prefix has been processed narrowly, an exact-threshold remainder is
+smaller than the original accelerator batch. Recovering that exact batch
+requires an operation-specific lower threshold, replay, or asynchronous
+overlap; source paging does not pretend otherwise.
 
 ### A 1:1 descent copies nothing
 
@@ -302,11 +334,11 @@ surviving candidates happen to sort early.
 What did survive is the *geometric* part. The deleted cursor carried an
 `INITIAL_CHUNK`/`WIDEN_FACTOR` pair, and the residual engine before it grew its
 search width geometrically after negative work; both are the same idea, and
-both were attached to the wrong object. Attached to a *level*, growth asks a
-source to resume. Attached to the *frontier*, it asks nothing of anyone — the
-engine already owns how many parent rows it expands at a time, so
-`INITIAL_FRONTIER_WIDTH` and `FRONTIER_RAMP_BASE` buy the time-to-first-result
-property the cursor was reaching for with none of its protocol cost.
+both were attached to the wrong object. Attached to a source's candidate
+sequence, growth asks that source to resume. Attached to engine-owned frontier
+rows, it asks nothing of anyone. `INITIAL_FRONTIER_WIDTH` and
+`FRONTIER_RAMP_BASE` therefore govern both child chunks and disjoint parent
+pages, buying bounded pull work recursively with none of the cursor protocol.
 
 Narrowing a wide level is still a real problem; galloping intersection is the
 standing candidate for it. What the engine will not do is require a *seek* from

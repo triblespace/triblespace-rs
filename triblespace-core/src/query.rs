@@ -819,6 +819,15 @@ impl BindingStore {
 /// which is what keeps hash maps, PATCHes, succinct archives and
 /// device-resident structures all admissible.
 ///
+/// A batch is only a physical execution unit. Constraints obey the
+/// **row-fiber law**: selecting any subset of a frontier, processing it
+/// independently, and lifting its local parent tags back to the original
+/// rows produces the same tagged bag of candidates (up to order) as
+/// processing those rows inside the full frontier. In particular, another
+/// row and the batch width may not change either the candidates proposed for
+/// one row or a confirmer's verdict on them. This is what lets the engine
+/// partition parent rows for latency and Rayon without changing semantics.
+///
 /// # Statelessness
 ///
 /// Constraints are stateless: every method receives the current [`Binding`]
@@ -1132,6 +1141,22 @@ pub const INITIAL_FRONTIER_WIDTH: usize = 1;
 /// engine instead. Both are useful arms; they are not the same arm.
 pub const FRONTIER_RAMP_BASE: usize = 8;
 
+/// Advances one geometric width after `remaining` entries have been left.
+///
+/// The same schedule governs both dimensions of the search: how many
+/// confirmed candidates a level hands down, and how many parent rows a
+/// preferred-variable group hands to one atomic `propose`/`confirm` pass.
+/// Keeping the policy in one place is load-bearing: otherwise a narrow
+/// candidate chunk can still hide a full-width proposal at the next depth.
+fn widened_width(current: usize, remaining: usize, ceiling: usize) -> usize {
+    let next = current.saturating_mul(FRONTIER_RAMP_BASE).min(ceiling);
+    if remaining < next.saturating_mul(2) {
+        remaining.max(next).min(ceiling)
+    } else {
+        next
+    }
+}
+
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
@@ -1188,6 +1213,12 @@ struct Level {
     variable: VariableId,
     width: usize,
     proposed: usize,
+    /// Half-open slice of the parent depth's `order` expanded by this
+    /// source. A preferred-variable group may be exposed in several
+    /// geometrically growing pages; the level owns exactly one of them.
+    source_start: usize,
+    source_end: usize,
+    source_group: usize,
 }
 
 /// Empties one of a [`Depth`]'s `Arc`-shared buffers for rewriting, without
@@ -1228,8 +1259,14 @@ struct Depth {
     order: Arc<Vec<u32>>,
     /// `(variable, end offset into order)`, one per group.
     groups: Arc<Vec<(VariableId, usize)>>,
-    /// Next group to expand.
+    /// Current group to expand (or the next unstarted group when
+    /// `group_row == 0`).
     group: usize,
+    /// Rows already exposed from `group` and the width of its next source
+    /// page. Unlike candidate chunking, this bounds the work paid *inside*
+    /// one atomic `Constraint::propose` call.
+    group_row: usize,
+    group_width: usize,
     /// Emission cursor, used only when every variable is bound.
     emit: usize,
 }
@@ -1401,11 +1438,17 @@ where
         right.depth = 0;
 
         debug_assert_eq!(right.stack[0].variable, variable);
+        let source_group = right.stack[0].source_group;
         let root = &mut right.depths[0];
-        let group = root.group;
-        debug_assert!(group > 0 && group <= root.groups.len());
-        debug_assert_eq!(root.groups[group - 1].0, variable);
-        Arc::make_mut(&mut root.groups).truncate(group);
+        debug_assert!(source_group < root.groups.len());
+        debug_assert_eq!(root.groups[source_group].0, variable);
+        Arc::make_mut(&mut root.groups).truncate(source_group + 1);
+        // The right half owns only this already-materialised source page.
+        // Once its candidate suffix is spent it must not resume later pages
+        // of the same semantic group or any following group.
+        root.group = root.groups.len();
+        root.group_row = 0;
+        root.group_width = INITIAL_FRONTIER_WIDTH.min(right.width);
         right
     }
 }
@@ -1462,6 +1505,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             order: Arc::new(vec![0u32]),
             groups: Arc::new(Vec::new()),
             group: 0,
+            group_row: 0,
+            group_width: INITIAL_FRONTIER_WIDTH,
             emit: 0,
         };
 
@@ -1599,6 +1644,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             }
         }
         depth.group = 0;
+        depth.group_row = 0;
+        depth.group_width = INITIAL_FRONTIER_WIDTH.min(self.width);
 
         self.stats.expansions.fetch_add(1, Ordering::Relaxed);
         self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
@@ -1610,47 +1657,83 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         self.mode = Search::NextGroup;
     }
 
-    /// Expands the next group of the top frontier: pushes its variable and
-    /// proposes candidates for every row of the group in one call. When the
-    /// groups are exhausted the frontier itself is retired.
+    /// Expands the next page of the next group of the top frontier: pushes
+    /// its variable and proposes candidates for a geometrically growing
+    /// prefix of that group's still-unseen rows. When every page of every
+    /// group is exhausted the frontier itself is retired.
+    ///
+    /// Candidate chunking alone cannot bound pull latency: before the first
+    /// candidate can be drawn, `propose` has already enumerated and confirmed
+    /// every row it was handed. Paging the engine-owned parent selection is
+    /// the stateless counterpart. Constraints still see an ordinary
+    /// [`Frontier`] and every parent row is expanded exactly once.
     fn next_group(&mut self) {
-        let depth = &self.depths[self.depth];
-        if depth.group >= depth.groups.len() {
-            if self.depth == 0 {
-                self.mode = Search::Done;
-            } else {
-                self.depth -= 1;
-                self.mode = Search::NextChunk;
+        loop {
+            let depth = &self.depths[self.depth];
+            if depth.group >= depth.groups.len() {
+                if self.depth == 0 {
+                    self.mode = Search::Done;
+                } else {
+                    self.depth -= 1;
+                    self.mode = Search::NextChunk;
+                }
+                return;
             }
+
+            let group = depth.group;
+            let whole = depth.group_range(group);
+            let offset = depth.group_row;
+            let remaining = whole.len() - offset;
+            if remaining == 0 {
+                let depth = &mut self.depths[self.depth];
+                depth.group += 1;
+                depth.group_row = 0;
+                depth.group_width = INITIAL_FRONTIER_WIDTH.min(self.width);
+                continue;
+            }
+
+            let page = depth.group_width.min(remaining);
+            let range = whole.start + offset..whole.start + offset + page;
+            let variable = depth.groups[group].0;
+
+            let depth = &mut self.depths[self.depth];
+            depth.group_row += page;
+            let remaining = remaining - page;
+            if remaining == 0 {
+                depth.group += 1;
+                depth.group_row = 0;
+                depth.group_width = INITIAL_FRONTIER_WIDTH.min(self.width);
+            } else {
+                depth.group_width = widened_width(depth.group_width, remaining, self.width);
+            }
+
+            self.unbound.unset(variable);
+
+            let constraint = &self.constraint;
+            let depth = &self.depths[self.depth];
+            let block = Arc::clone(&depth.block);
+            let order = Arc::clone(&depth.order);
+            let proposed = self.bindings.refill(
+                variable,
+                &block,
+                &order[range.clone()],
+                self.slots,
+                |frontier, proposals| constraint.propose(variable, frontier, proposals),
+            );
+            self.stack.push(Level {
+                variable,
+                width: INITIAL_FRONTIER_WIDTH.min(self.width),
+                proposed,
+                source_start: range.start,
+                source_end: range.end,
+                source_group: group,
+            });
+            self.stats
+                .proposals
+                .fetch_add(proposed as u64, Ordering::Relaxed);
+            self.mode = Search::NextChunk;
             return;
         }
-        let group = depth.group;
-        let range = depth.group_range(group);
-        let variable = depth.groups[group].0;
-        self.depths[self.depth].group += 1;
-
-        self.unbound.unset(variable);
-
-        let constraint = &self.constraint;
-        let depth = &self.depths[self.depth];
-        let block = Arc::clone(&depth.block);
-        let order = Arc::clone(&depth.order);
-        let proposed = self.bindings.refill(
-            variable,
-            &block,
-            &order[range],
-            self.slots,
-            |frontier, proposals| constraint.propose(variable, frontier, proposals),
-        );
-        self.stack.push(Level {
-            variable,
-            width: INITIAL_FRONTIER_WIDTH.min(self.width),
-            proposed,
-        });
-        self.stats
-            .proposals
-            .fetch_add(proposed as u64, Ordering::Relaxed);
-        self.mode = Search::NextChunk;
     }
 
     /// Consumes the next chunk of the top level's candidates into the child
@@ -1699,8 +1782,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         let level = *self.stack.last().expect("a level to chunk");
         let variable = level.variable;
         let parent = self.depth;
-        let group = self.depths[parent].group - 1;
-        let range = self.depths[parent].group_range(group);
+        let range = level.source_start..level.source_end;
         let slots = self.slots;
 
         if self.depths.len() <= parent + 1 {
@@ -1745,7 +1827,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         // `FRONTIER_RAMP_BASE` for why the base is what decides that).
         let consumed = self.bindings.consumed(variable);
         if let Some(top) = self.stack.last_mut() {
-            let next = top.width.saturating_mul(FRONTIER_RAMP_BASE).min(self.width);
             // Never leave a tail smaller than the chunk that would precede
             // it. `proposed - consumed` over-counts (it cannot see which
             // entries confirm already killed), so this merges conservatively
@@ -1753,20 +1834,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             // it should not. Both branches are O(1): the level already knows
             // how many candidates it proposed and how far the cursor ran.
             let remaining = top.proposed.saturating_sub(consumed);
-            top.width = if remaining < next.saturating_mul(2) {
-                // `.min(self.width)` is load-bearing, not belt-and-braces:
-                // `remaining` is bounded by the region, not by the ceiling,
-                // so merging a tail without it hands down a chunk up to
-                // twice the width the caller asked for. Measured before the
-                // cap: 134 of 300 registry spans exceeded a 16384 ceiling,
-                // worst at 1.93x — and `width` is a ceiling that the
-                // `O(width · variables · depth)` frontier-memory bound is
-                // stated against. At the ceiling the merge is a no-op, which
-                // is right: a level already running flat has no ramp tail.
-                remaining.max(next).min(self.width)
-            } else {
-                next
-            };
+            top.width = widened_width(top.width, remaining, self.width);
         }
 
         if rows == 0 {
@@ -1841,6 +1909,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         }
         child.rows = rows;
         child.group = 0;
+        child.group_row = 0;
+        child.group_width = INITIAL_FRONTIER_WIDTH.min(self.width);
         child.emit = 0;
 
         let order = Arc::make_mut(&mut child.order);
@@ -1879,8 +1949,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 /// candidate list.
 ///
 /// - `Plan` — partition the top frontier by each row's preferred variable.
-/// - `NextGroup` — expand the next group: push its variable and propose for
-///   all its rows in one call.
+/// - `NextGroup` — expand the next geometric page of a preferred-variable
+///   group: push its variable and propose for that disjoint row slice.
 /// - `NextChunk` — turn the next `width` surviving candidates into the
 ///   child frontier, or retire the group when they run out.
 /// - `Emit` — every variable is bound; stream the frontier's rows out.
