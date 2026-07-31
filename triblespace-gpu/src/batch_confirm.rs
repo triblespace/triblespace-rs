@@ -19,9 +19,10 @@
 //! the value universe (as big-endian `u32` words for lexicographic binary
 //! search), the three axis occupancy boundaries, and the six Ring wavelet
 //! matrices. Its [`WgpuSuccinctArchiveConstraint`] mirrors the canonical
-//! constraint exactly, except that `confirm` calls whose region holds at
-//! least [`min_confirm_batch`](WgpuSuccinctArchive::min_confirm_batch) live
-//! candidates are evaluated on the device:
+//! constraint exactly, except that sufficiently large `confirm` regions are
+//! evaluated on the device. The floor is selected from the operation already
+//! identified by [`ConfirmPlan`]: range probes amortise at 8,192 live
+//! candidates, while the lighter membership probes need 24,576.
 //!
 //! * **Unbound membership** (no other position bound; the confirmed variable
 //!   is E, A, or V): one fused kernel per region — binary search of each
@@ -147,9 +148,8 @@ pub type WgpuWaveletMatrix = GpuWaveletMatrix<WgpuRuntime>;
 /// Jerky's shared compatibility domain on the default CubeCL WGPU device.
 pub type WgpuContext = GpuContext<WgpuRuntime>;
 
-/// Default minimum number of live candidates in a confirm region before the
-/// verdicts are computed on WGPU; smaller regions run the canonical CPU
-/// probes.
+/// Default minimum number of live candidates in a one- or two-bound **range**
+/// confirm before the verdicts are computed on WGPU.
 ///
 /// Measured on an Apple M4 Max (Metal via wgpu, cubecl 0.10), release
 /// profile, with the two ignored sweep benchmarks. `cpu/gpu` is total CPU
@@ -185,25 +185,25 @@ pub type WgpuContext = GpuContext<WgpuRuntime>;
 ///
 /// The device round trip is nearly flat (~1.2–2.6 ms) while CPU probe cost
 /// scales linearly, putting both range shapes' crossover at ~6–8k
-/// candidates. The lighter membership arm — one universe search and one
-/// boundary compare per candidate, no wavelet rank at all — is still at
-/// 0.72x at 16 384 and only wins from ~24k up, so it is membership, not the
-/// range shapes, that sets the knob.
+/// candidates. 8,192 is the conservative power-of-two floor supported by
+/// both the frontier-of-one and mixed-parent measurements.
 ///
-/// 16384 is the single-knob compromise: the range shapes are a 1.6–2.7x win
-/// there and membership costs 1.4x, and it equals
-/// [`DEFAULT_FRONTIER_WIDTH`](triblespace_core::query::DEFAULT_FRONTIER_WIDTH),
-/// so a level whose rows each contribute one candidate already reaches the
-/// batched tier. Lowering it to the range shapes' own crossover would trade
-/// their gain for a deeper membership loss.
-///
-/// The number is unchanged from the pre-frontier measurement, but what it
-/// buys is not: resolving parent bands on the device rather than on the host
-/// took the mixed-parent range shapes from 1.6–5.4x to 2.7–11.1x at width
-/// 16384 (device time for a 262k-candidate 2-bound region: 13.4 ms → 7.3 ms),
+/// Resolving parent bands on the device rather than on the host took the
+/// mixed-parent range shapes from 1.6–5.4x to 2.7–11.1x at width 16384
+/// (device time for a 262k-candidate 2-bound region: 13.4 ms → 7.3 ms),
 /// because the host no longer ranks a wavelet once per frontier row before
 /// it can dispatch.
-pub const DEFAULT_MIN_CONFIRM_BATCH: usize = 16384;
+pub const DEFAULT_MIN_CONFIRM_BATCH_RANGE: usize = 8192;
+
+/// Default minimum number of live candidates in an unbound **membership**
+/// confirm before the verdicts are computed on WGPU.
+///
+/// Membership replaces a much lighter CPU operation than a range confirm:
+/// one universe search and one boundary comparison per candidate, with no
+/// wavelet rank and no parent table. The measured device ratio is only 0.72x
+/// at 16,384 candidates and crosses over around 24k, so sharing the range
+/// floor would turn its gain into a membership loss.
+pub const DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP: usize = 24576;
 
 /// Observational dispatch counters for one [`WgpuSuccinctArchive`].
 ///
@@ -798,9 +798,8 @@ fn parent_table(
 /// occurs on that axis, and `bounds[d]..bounds[d+1]` *is* that code's base
 /// range), and the six Ring wavelet matrices. Planning, estimates, and
 /// proposals always use the wrapped CPU archive; only
-/// [`Constraint::confirm`] regions at or above
-/// [`min_confirm_batch`](Self::min_confirm_batch) live candidates dispatch to
-/// the device.
+/// [`Constraint::confirm`] regions at or above the operation-shaped range or
+/// membership floor dispatch to the device.
 pub struct WgpuSuccinctArchive<U>
 where
     U: Universe,
@@ -816,7 +815,8 @@ where
     v_bounds: DeviceU32Buffer<WgpuRuntime>,
     /// Resident Ring columns in canonical [`SuccinctRotation`] order.
     ring: [WgpuWaveletMatrix; SuccinctRotation::ALL.len()],
-    min_confirm_batch: usize,
+    min_confirm_batch_range: usize,
+    min_confirm_batch_membership: usize,
     stats: ConfirmStats,
 }
 
@@ -905,28 +905,38 @@ where
             a_bounds,
             v_bounds,
             ring,
-            min_confirm_batch: DEFAULT_MIN_CONFIRM_BATCH,
+            min_confirm_batch_range: DEFAULT_MIN_CONFIRM_BATCH_RANGE,
+            min_confirm_batch_membership: DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP,
             stats: ConfirmStats::default(),
         })
     }
 
-    /// Sets the minimum live-candidate region size dispatched to the device.
+    /// Sets one uniform live-candidate floor for every confirm operation.
     ///
-    /// Zero forces every routed confirm through WGPU (parity testing);
+    /// This is an explicit diagnostic ablation, not the production placement
+    /// policy. Zero forces every confirm through WGPU for parity testing;
     /// `usize::MAX` disables the device path without dropping residency.
-    pub fn with_min_confirm_batch(mut self, min_confirm_batch: usize) -> Self {
-        self.min_confirm_batch = min_confirm_batch;
+    pub fn with_min_confirm_batch_uniform(mut self, min_confirm_batch: usize) -> Self {
+        self.min_confirm_batch_range = min_confirm_batch;
+        self.min_confirm_batch_membership = min_confirm_batch;
         self
     }
 
-    /// Changes the minimum live-candidate region size dispatched to the device.
-    pub fn set_min_confirm_batch(&mut self, min_confirm_batch: usize) {
-        self.min_confirm_batch = min_confirm_batch;
+    /// In-place diagnostic twin of
+    /// [`with_min_confirm_batch_uniform`](Self::with_min_confirm_batch_uniform).
+    pub fn set_min_confirm_batch_uniform(&mut self, min_confirm_batch: usize) {
+        self.min_confirm_batch_range = min_confirm_batch;
+        self.min_confirm_batch_membership = min_confirm_batch;
     }
 
-    /// Returns the minimum live-candidate region size dispatched to the device.
-    pub fn min_confirm_batch(&self) -> usize {
-        self.min_confirm_batch
+    /// Returns the range-confirm placement floor.
+    pub fn min_confirm_batch_range(&self) -> usize {
+        self.min_confirm_batch_range
+    }
+
+    /// Returns the membership-confirm placement floor.
+    pub fn min_confirm_batch_membership(&self) -> usize {
+        self.min_confirm_batch_membership
     }
 
     /// Returns the canonical CPU archive wrapped by this adapter.
@@ -1260,9 +1270,8 @@ where
 ///
 /// Every protocol method except [`confirm`](Constraint::confirm) delegates to
 /// the wrapped CPU constraint verbatim. `confirm` mirrors the CPU arm
-/// dispatch; regions with at least
-/// [`min_confirm_batch`](WgpuSuccinctArchive::min_confirm_batch) live
-/// candidates run their probes on the device, everything else (including any
+/// dispatch; regions that reach their operation-shaped live-candidate floor
+/// run their probes on the device, while everything else (including any
 /// device error) falls back to the CPU arm. Both paths satisfy the kill-only
 /// contract — the device path merges verdicts by word-wise AND, so it can
 /// never revive a dead entry.
@@ -1406,11 +1415,11 @@ where
     /// rows the dispatch resolved.
     fn confirm_gpu(
         &self,
-        variable: VariableId,
+        plan: ConfirmPlan,
         frontier: &Frontier<'_>,
         cands: &mut Candidates<'_>,
     ) -> jerky::Result<usize> {
-        match self.plan(variable, &frontier.row(0)) {
+        match plan {
             ConfirmPlan::Membership { axis } => {
                 self.gpu.confirm_membership_gpu(axis, cands)?;
                 Ok(0)
@@ -1479,12 +1488,34 @@ where
             return;
         }
         let live = count_live(cands);
-        if live < self.gpu.min_confirm_batch {
+        // Most regions are small. If neither operation shape could route,
+        // avoid classifying it solely to discover that fact.
+        if live
+            < self
+                .gpu
+                .min_confirm_batch_range
+                .min(self.gpu.min_confirm_batch_membership)
+        {
             self.gpu.stats.record_cpu(cands.len());
             self.inner.confirm(variable, frontier, cands);
             return;
         }
-        match self.confirm_gpu(variable, frontier, cands) {
+
+        // Resolve the operation once. The placement decision and the device
+        // dispatch must act on the same plan.
+        let plan = self.plan(variable, &frontier.row(0));
+        let floor = match plan {
+            ConfirmPlan::Membership { .. } => self.gpu.min_confirm_batch_membership,
+            ConfirmPlan::Base { .. } | ConfirmPlan::Restrict { .. } => {
+                self.gpu.min_confirm_batch_range
+            }
+        };
+        if live < floor {
+            self.gpu.stats.record_cpu(cands.len());
+            self.inner.confirm(variable, frontier, cands);
+            return;
+        }
+        match self.confirm_gpu(plan, frontier, cands) {
             Ok(parents) => self.gpu.stats.record_gpu(cands.len(), parents),
             Err(_) => {
                 // The helpers only write liveness after a complete verdict

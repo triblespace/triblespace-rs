@@ -48,10 +48,10 @@ axis, and the six Ring wavelet matrices in one Jerky compatibility domain. It
 implements the same `TriblePattern` interface as the wrapped archive;
 estimates, proposals, prefix walks, and satisfaction checks stay on the CPU.
 
-A `confirm` region with at least `min_confirm_batch` live candidates
-(default `DEFAULT_MIN_CONFIRM_BATCH = 16_384`, measured — see below) uploads
-its candidate values and liveness words and computes one verdict word per
-candidate on the device:
+A `confirm` region uploads its candidate values and liveness words and
+computes one verdict word per candidate on the device once it reaches the
+measured floor for its operation: 8,192 live candidates for range confirms,
+or 24,576 for the lighter membership confirms.
 
 * **Unbound membership** (no other pattern position bound; the confirmed
   variable is E, A, or V): one fused kernel binary-searches each candidate in
@@ -86,14 +86,17 @@ let gpu = WgpuSuccinctArchive::new(archive).expect("prepare succinct archive on 
 # }
 ```
 
-The threshold is measured, not guessed. The ignored `confirm_crossover_sweep`
+The floors are measured, not guessed. The ignored `confirm_crossover_sweep`
 benchmark sweeps fully-live regions of 1k/4k/16k/64k candidates over a
 262k-trible synthetic archive; on an Apple M4 Max (Metal, release profile,
 best of 5) the GPU round trip is nearly flat (~1.4–2.2 ms) while CPU confirm
 scales linearly, crossing at ~8k live candidates for the range shape and ~22k
-for the lighter membership shape. `16_384` is the single-knob compromise; use
-`with_min_confirm_batch(0)` to force every routed confirm through the device
-(parity measurements) and `set_min_confirm_batch` for local calibration.
+for the lighter membership shape. Production dispatch therefore uses
+`DEFAULT_MIN_CONFIRM_BATCH_RANGE = 8_192` and
+`DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP = 24_576`. The explicit
+`with_min_confirm_batch_uniform(0)` diagnostic ablation forces every confirm
+through the device for parity measurements; it is not the production
+placement policy.
 
 ```sh
 cargo test -p triblespace-gpu --release --test batch_confirm_parity -- --ignored --nocapture confirm_crossover_sweep

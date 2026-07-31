@@ -114,7 +114,7 @@ struct Fixture {
 /// A small archive with deliberate sharing: every entity carries several
 /// attributes, values are drawn from a shared pool (so V-side fanout exists),
 /// and one attribute/value pair is common to most entities.
-fn fixture() -> Fixture {
+fn fixture_with_uniform_floor(uniform_floor: Option<usize>) -> Fixture {
     let entity_ids: Vec<[u8; 16]> = (0..24).map(|k| make_id(0x01, k)).collect();
     let attribute_ids: Vec<[u8; 16]> = (0..6).map(|k| make_id(0x02, k)).collect();
     let value_pool: Vec<RawInline> = (0..40).map(|k| free_value(0x10, k)).collect();
@@ -141,9 +141,11 @@ fn fixture() -> Fixture {
     assert!(set.len() > 100, "fixture must be non-trivial");
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-    let gpu = WgpuSuccinctArchive::new(archive)
-        .expect("resident wrap succeeds")
-        .with_min_confirm_batch(0);
+    let gpu = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+    let gpu = match uniform_floor {
+        Some(floor) => gpu.with_min_confirm_batch_uniform(floor),
+        None => gpu,
+    };
     Fixture {
         gpu,
         entities: entity_ids.iter().map(id_value).collect(),
@@ -154,6 +156,10 @@ fn fixture() -> Fixture {
             .chain((0..8).map(|k| id_value(&make_id(0x03, k))))
             .collect(),
     }
+}
+
+fn fixture() -> Fixture {
+    fixture_with_uniform_floor(Some(0))
 }
 
 /// Mixed candidate pool: axis hits, universe values from the other axes
@@ -513,7 +519,7 @@ fn all_dead_region_stays_all_dead() {
 #[test]
 fn below_threshold_falls_back_to_cpu() {
     let mut fixture = fixture();
-    fixture.gpu.set_min_confirm_batch(usize::MAX);
+    fixture.gpu.set_min_confirm_batch_uniform(usize::MAX);
     let v = vars();
     let frontier = Frontier::default();
     let candidates = candidate_pool(&fixture, 17, 48);
@@ -566,8 +572,99 @@ fn below_threshold_falls_back_to_cpu() {
     }
 }
 
+#[test]
+fn default_floors_follow_the_confirm_operation() {
+    let fixture = fixture_with_uniform_floor(None);
+    assert_eq!(
+        fixture.gpu.min_confirm_batch_range(),
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE
+    );
+    assert_eq!(
+        fixture.gpu.min_confirm_batch_membership(),
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP
+    );
+
+    let variables = vars();
+    let constraint = triblespace_gpu::WgpuSuccinctArchiveConstraint::new(
+        variables.e,
+        variables.a,
+        variables.v,
+        &fixture.gpu,
+    );
+
+    macro_rules! route {
+        ($frontier:expr, $len:expr, $seed:expr) => {{
+            fixture.gpu.reset_stats();
+            let candidates = candidate_pool(&fixture, $seed, $len);
+            let _ = confirm_liveness(
+                &constraint,
+                variables.v.index,
+                $frontier,
+                0,
+                &candidates,
+                &[],
+            );
+            fixture.gpu.stats()
+        }};
+    }
+
+    let membership = Frontier::default();
+    let below = route!(
+        &membership,
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP - 1,
+        0x100
+    );
+    assert_eq!(below.gpu_confirms, 0, "{below:?}");
+    assert_eq!(below.cpu_fallback_confirms, 1, "{below:?}");
+    let at = route!(
+        &membership,
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP,
+        0x101
+    );
+    assert_eq!(at.gpu_confirms, 1, "{at:?}");
+    assert_eq!(at.cpu_fallback_confirms, 0, "{at:?}");
+
+    let mut base_binding = BindingStore::new();
+    base_binding.bind(variables.e.index, &fixture.entities[0]);
+    let base = base_binding.frontier();
+    let below = route!(
+        &base,
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE - 1,
+        0x200
+    );
+    assert_eq!(below.gpu_confirms, 0, "{below:?}");
+    assert_eq!(below.cpu_fallback_confirms, 1, "{below:?}");
+    let at = route!(
+        &base,
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE,
+        0x201
+    );
+    assert_eq!(at.gpu_confirms, 1, "{at:?}");
+    assert_eq!(at.cpu_fallback_confirms, 0, "{at:?}");
+
+    let mut restrict_binding = BindingStore::new();
+    restrict_binding.bind(variables.e.index, &fixture.entities[0]);
+    restrict_binding.bind(variables.a.index, &fixture.attributes[0]);
+    let restrict = restrict_binding.frontier();
+    let below = route!(
+        &restrict,
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE - 1,
+        0x300
+    );
+    assert_eq!(below.gpu_confirms, 0, "{below:?}");
+    assert_eq!(below.cpu_fallback_confirms, 1, "{below:?}");
+    let at = route!(
+        &restrict,
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE,
+        0x301
+    );
+    assert_eq!(at.gpu_confirms, 1, "{at:?}");
+    assert_eq!(at.cpu_fallback_confirms, 0, "{at:?}");
+}
+
 /// Region-size sweep printing the CPU/GPU crossover for both routed confirm
-/// shapes. `DEFAULT_MIN_CONFIRM_BATCH`'s doc comment records the measurement.
+/// shapes. The operation-shaped floor constants' doc comments record the
+/// measurement.
 ///
 /// Run with:
 /// `cargo test -p triblespace-gpu --test batch_confirm_parity -- --ignored --nocapture confirm_crossover_sweep`
@@ -604,7 +701,7 @@ fn confirm_crossover_sweep() {
     );
     let gpu = WgpuSuccinctArchive::new(archive)
         .expect("resident wrap succeeds")
-        .with_min_confirm_batch(0);
+        .with_min_confirm_batch_uniform(0);
 
     let absent: Vec<RawInline> = (0..65536).map(|k| free_value(0x20, k)).collect();
     let v = vars();
@@ -702,7 +799,8 @@ fn confirm_crossover_sweep() {
         }
     }
     println!(
-        "\ncurrent DEFAULT_MIN_CONFIRM_BATCH = {}",
-        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH
+        "\ncurrent floors: range={}, membership={}",
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE,
+        triblespace_gpu::DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP
     );
 }

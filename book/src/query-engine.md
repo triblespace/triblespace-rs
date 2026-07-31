@@ -61,9 +61,10 @@ The reason is measured. With a width-1 frontier only the root level ever
 proposes widely; every deeper level asks a source for the candidates of one
 parent, and over real data (a region-size census on dblp) that is a median of
 1–7 candidates at every scale, p95 around 200. Any batched tier — a GPU
-dispatch that pays off at 16 384 candidates, a SIMD probe — therefore engaged
-once at the root and never again. Batching the *parents* is what makes a
-level's region large at every depth.
+dispatch whose operation-shaped floors are measured in thousands of
+candidates, a SIMD probe — therefore engaged once at the root and never
+again. Batching the *parents* is what makes a level's region large at every
+depth.
 
 A frontier is cheap because bindings are indexes, not values (see below): it is
 an index matrix over the shared level buffers plus a `select` list of row
@@ -504,8 +505,9 @@ no variable through which the search could later discover failure.
 The optional `triblespace-gpu` crate accelerates one operation:
 `WgpuSuccinctArchive` keeps a succinct archive's value universe, per-axis
 occupancy boundaries, and six Jerky wavelet matrices resident on the device,
-and routes a `confirm` region to a kernel when it has at least
-`DEFAULT_MIN_CONFIRM_BATCH` live candidates.
+and routes a `confirm` region to a kernel when it reaches the measured floor
+for its operation: 8,192 live candidates for range confirms and 24,576 for
+the lighter membership confirms.
 
 It is not a second engine and not a planner. Estimates, proposals, prefix
 walks, and satisfaction checks stay on the CPU; a region below the threshold
@@ -526,15 +528,16 @@ back in. The kernel needs one device property for this — planes exactly 32
 lanes wide — which the host checks before dispatching, demoting to the CPU arm
 if it does not hold.
 
-The threshold is measured, not guessed. On an Apple M4 Max (Metal via wgpu),
+The floors are measured, not guessed. On an Apple M4 Max (Metal via wgpu),
 against a 262,135-trible archive with fully live regions, the GPU round trip is
 nearly flat at ~1.4–2.2 ms while CPU cost scales linearly — putting the
 crossover near 8k live candidates for the range shape (two wavelet ranks per
-candidate) and near 22k for the lighter membership shape. 16,384 is the
-single-knob compromise between them; the full crossover table lives in the
-constant's doc comment. `WgpuSuccinctArchive::stats` exposes dispatch and
-fallback counters, so the routing economics stay observable instead of being
-hidden inside a heuristic.
+candidate) and near 22k for the lighter membership shape. Dispatch already
+classifies which operation it will execute, so averaging those two curves
+into one threshold would lose at both ends. The full crossover table lives in
+the floor constants' doc comments. `WgpuSuccinctArchive::stats` exposes
+dispatch and fallback counters, so the routing economics stay observable
+instead of being hidden inside a heuristic.
 
 ## Where regular paths went
 

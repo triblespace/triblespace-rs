@@ -92,11 +92,11 @@ fn multi_parent_gpu_confirm_matches_cpu_and_width_one() {
     );
     assert_eq!(rows(&set, 1), cpu_base, "TribleSet and archive disagree");
 
-    // min_confirm_batch = 0 forces EVERY confirm onto the device, so even a
-    // small fixture exercises the multi-parent kernel path.
+    // A uniform floor of zero forces EVERY confirm onto the device, so even
+    // a small fixture exercises the multi-parent kernel path.
     let gpu = WgpuSuccinctArchive::new(archive)
         .expect("resident wrap succeeds")
-        .with_min_confirm_batch(0);
+        .with_min_confirm_batch_uniform(0);
 
     let narrow = rows(&gpu, 1);
     assert_eq!(narrow, cpu_base, "GPU width-1 diverges from CPU");

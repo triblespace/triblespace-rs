@@ -1070,12 +1070,12 @@ impl Default for LevelValues {
 /// data, a median region of 1–7 candidates at every scale, which is far
 /// below any batch-dispatch threshold.
 ///
-/// 16384 is chosen to equal
-/// `triblespace_gpu::batch_confirm::DEFAULT_MIN_CONFIRM_BATCH`, the measured
-/// crossover at which a device round trip beats the CPU probes. At that
-/// width a level's region carries at least as many candidates as there are
-/// rows, so the batched tier is reachable at *every* depth rather than only
-/// at a wide root.
+/// 16384 is a batching and memory ceiling, independent of accelerator
+/// placement. The WGPU succinct adapter selects its own measured floor from
+/// the operation it is asked to perform: range confirms amortise earlier
+/// than lighter membership probes. A wide frontier makes those tiers
+/// reachable below the root without coupling this engine constant to either
+/// device crossover.
 ///
 /// It is a *ceiling*, not the first batch: a level's first chunk is
 /// [`INITIAL_FRONTIER_WIDTH`], then chunk width grows by
