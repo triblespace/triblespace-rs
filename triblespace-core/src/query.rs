@@ -1105,13 +1105,15 @@ pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 /// execution policy, not a claim that the caller requested every child.
 ///
 /// Before the first caller-visible row, every new candidate level instead
-/// starts at one. Internal source pages may widen while searching, but their
-/// width cannot make the eventual first completion materialise an unused
-/// child suffix. This is a semantic phase boundary rather than a cardinality
-/// threshold: `.next()` and `exists!` retain depth-first granularity through
-/// arbitrary failing prefixes, then sustained demand can reuse paid work.
-/// Measured on a dense first-row join, a flat full-width engine is **8.8x**
-/// slower than the pre-batching engine; the pre-yield fence closes that gap.
+/// starts at one. Its own ordinary geometric ramp may still widen after
+/// unsuccessful chunks, but a widened *source page* cannot skip that initial
+/// step and make the eventual first completion materialise its unused child
+/// suffix. This is a semantic phase boundary rather than a cardinality
+/// threshold: `.next()` and `exists!` retain the double-geometric baseline
+/// through arbitrary failing prefixes, then sustained demand can reuse paid
+/// work. Measured on a dense first-row join, a flat full-width engine is
+/// **8.8x** slower than the pre-batching engine; the scalar initial drain
+/// closes that gap.
 ///
 /// This is the same insight as the `INITIAL_CHUNK`/`WIDEN_FACTOR` pair this
 /// branch deleted, and as the deleted residual engine's rule that search
@@ -1186,9 +1188,11 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
     mode: Search,
-    /// Whether this iterator has returned at least one caller-visible row.
-    /// Before that semantic boundary candidate drains stay scalar; afterward
-    /// they may reuse an already-materialised source page as work credit.
+    /// Whether this search branch has returned at least one caller-visible
+    /// row. Before that semantic boundary every new candidate drain starts at
+    /// one; its ordinary geometric widening is unchanged. Afterward a new
+    /// drain may reuse an already-materialised source page as work credit.
+    /// Rayon clones this bit, so the boundary is deliberately branch-local.
     has_emitted: bool,
     bindings: BindingStore,
     influences: [VariableSet; 128],
@@ -1744,9 +1748,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                 // Once the caller has observed a completion,
                 // `propose`/`confirm` work already paid for this source page
                 // becomes useful batching credit. Before that semantic
-                // boundary, keep every new candidate drain scalar: failed
-                // prefixes must not make the eventual first result prepay an
-                // unused child frontier.
+                // boundary, seed every new candidate drain at one: failed
+                // prefixes must not let an inherited source width make the
+                // eventual first result prepay an unused child frontier. The
+                // drain's ordinary geometric widening remains intact.
                 width: if self.has_emitted {
                     page.min(self.width)
                 } else {
@@ -2083,6 +2088,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // what one would have expanded together. That is the deliberate trade:
 // batch width buys per-level dispatch size, work-stealing buys core
 // utilisation, and rayon only asks for a split under stealing pressure.
+//
+// The pre-yield source-credit fence is branch-local under this split. Rayon
+// divides a fresh query before folding, so each leaf starts with
+// `has_emitted == false` and releases its own fence after its own first result;
+// an emitted query is already in `Search::Emit` and is not split again. This
+// avoids a synchronization edge in the search state. It can make each leaf
+// pay the scalar seed independently, but cannot change the result bag.
 //
 // `fold_with` is the terminal leaf: it just drives the existing sequential
 // `Iterator::next()` and feeds results into the folder. No duplicated
@@ -2753,6 +2765,52 @@ mod tests {
                 project_pair as fn(&Binding<'_>) -> Option<(RawInline, RawInline)>,
             )
             .with_frontier_width(4)
+        }
+
+        #[test]
+        fn only_a_visible_postprocessing_result_releases_source_credit() {
+            let mut rejected = Query::new(PagedFixture(2), |_binding: &Binding<'_>| None::<()>)
+                .with_frontier_width(4);
+            assert_eq!(rejected.next(), None);
+            assert!(
+                !rejected.has_emitted,
+                "complete bindings rejected by postprocessing are not visible results"
+            );
+
+            let expected = paged_query(2).nth(2).expect("at least three rows");
+            let seen = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&seen);
+            let mut filtered = Query::new(PagedFixture(2), move |binding: &Binding<'_>| {
+                let row = project_pair(binding)?;
+                let ordinal = observed.fetch_add(1, Ordering::Relaxed);
+                (ordinal >= 2).then_some(row)
+            })
+            .with_frontier_width(4);
+            assert!(!filtered.has_emitted);
+            assert_eq!(filtered.next(), Some(expected));
+            assert_eq!(seen.load(Ordering::Relaxed), 3);
+            assert!(filtered.has_emitted);
+        }
+
+        #[test]
+        fn parallel_search_branches_release_their_fences_independently() {
+            const FANOUT: u32 = 64;
+            let mut left = query(FANOUT);
+            advance_to_second_of_three_groups(&mut left);
+            let mut right = left.split_current_source(2);
+
+            assert!(!left.has_emitted);
+            assert!(!right.has_emitted);
+            assert!(right.next().is_some());
+            assert!(right.has_emitted);
+            assert!(
+                !left.has_emitted,
+                "one Rayon leaf must not mutate a sibling's scheduling phase"
+            );
+            assert!(
+                right.clone().has_emitted,
+                "a continuation clone keeps its branch-local scheduling phase"
+            );
         }
 
         fn advance_to_second_of_three_groups(query: &mut TestQuery) {
