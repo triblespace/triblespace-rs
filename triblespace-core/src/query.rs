@@ -1077,9 +1077,11 @@ impl Default for LevelValues {
 /// reachable below the root without coupling this engine constant to either
 /// device crossover.
 ///
-/// It is a *ceiling*, not the first batch: a level's first chunk is
-/// [`INITIAL_FRONTIER_WIDTH`], then chunk width grows by
-/// [`FRONTIER_RAMP_BASE`] until it reaches this ceiling. A conservative tail
+/// It is a *ceiling*, not the first batch: the first parent-source page is
+/// [`INITIAL_FRONTIER_WIDTH`], then page width grows by
+/// [`FRONTIER_RAMP_BASE`] until it reaches this ceiling. A candidate level
+/// reuses its source page's width as already-paid source work; subsequent
+/// candidate chunks keep widening by the same schedule. A conservative tail
 /// merge may consume the remainder early, but never exceeds the ceiling.
 ///
 /// The cost is frontier memory: one index row plus one estimate row per
@@ -1092,17 +1094,23 @@ impl Default for LevelValues {
 /// Tune per query with [`Query::with_frontier_width`].
 pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 
-/// Width of the *first* chunk a level draws. Later chunks grow by
+/// Width of the first parent-source page. Later pages grow by
 /// [`FRONTIER_RAMP_BASE`] up to [`DEFAULT_FRONTIER_WIDTH`] (or whatever
-/// [`Query::with_frontier_width`] set).
+/// [`Query::with_frontier_width`] set). A level opened for a wider page
+/// starts its candidate drain at that page's width: `propose`/`confirm` already
+/// paid for that many parent rows, so restarting a second ramp at one would
+/// discard useful amortisation credit. This is an execution policy, not a
+/// claim that the caller requested every child: beyond the first overall
+/// result it may materialise a wider child chunk before the next yield.
 ///
-/// Starting at one keeps time-to-first-result identical to plain
-/// depth-first search. A query the caller stops after one row — `exists!`,
-/// `.next()` — must not pay to materialise a full-width frontier it will
-/// throw away, and with a first chunk of one it does exactly the work the
-/// pre-batching engine did. Measured on a first-row-only join, a flat
-/// full-width engine is **8.8x** slower than the pre-batching engine;
-/// one narrow chunk closes the whole gap.
+/// Starting the source schedule at one keeps time-to-first-result identical
+/// to plain depth-first search. A query the caller stops after one row —
+/// `exists!`, `.next()` — opens only a one-row source page, so its candidate
+/// level inherits a width of one and does exactly the work the pre-batching
+/// engine did. Wider inherited credit is only reachable after sustained
+/// demand has already widened an earlier schedule. Measured on a
+/// first-row-only join, a flat full-width engine is **8.8x** slower than the
+/// pre-batching engine; the scalar first page closes the whole gap.
 ///
 /// This is the same insight as the `INITIAL_CHUNK`/`WIDEN_FACTOR` pair this
 /// branch deleted, and as the deleted residual engine's rule that search
@@ -1200,10 +1208,14 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
 /// One pushed search level: the variable it binds, how wide its *next*
 /// chunk may be, and how many candidates its proposer produced.
 ///
-/// The width is per level rather than per query because the schedule is a
-/// statement about one level's drain: the first chunk a level hands down is
-/// a single row, so a caller who stops after one result never pays for a
-/// batch it will not look at. See [`INITIAL_FRONTIER_WIDTH`].
+/// The width is per level rather than per query because it starts with the
+/// parent source page that opened this level, then records how far this
+/// level's own drain has widened. The first source page is a single row, so
+/// a caller who stops after one result still never pays for a batch it will
+/// not look at; later pages deliberately reuse source work already paid by
+/// sustained demand. This is only an execution partition: the row-fiber law
+/// preserves the exact tagged bag, while result order is not part of the
+/// contract. See [`INITIAL_FRONTIER_WIDTH`].
 ///
 /// `proposed` is the `O(1)` gate on the in-place descent: a level with more
 /// candidates than parent rows cannot possibly yield one child per parent,
@@ -1722,7 +1734,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             );
             self.stack.push(Level {
                 variable,
-                width: INITIAL_FRONTIER_WIDTH.min(self.width),
+                // `propose`/`confirm` already paid for this source page.
+                // Reuse its width in the candidate drain instead of paying a
+                // second ramp; the first source page is still exactly one.
+                width: page.min(self.width),
                 proposed,
                 source_start: range.start,
                 source_end: range.end,
@@ -1819,12 +1834,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                 &mut self.parents,
             )
         };
-        // Widen the next chunk this level hands down. The first chunk is one
-        // binding, so a caller who stops after one row pays exactly what
-        // depth-first paid; after that the width climbs by
-        // `FRONTIER_RAMP_BASE` to the ceiling, which serves the caller who
-        // wants a handful of rows without surrendering the peak (see
-        // `FRONTIER_RAMP_BASE` for why the base is what decides that).
+        // Widen the next chunk this level hands down. Its initial width is
+        // the source-page width that opened it: the first page is one, while
+        // later pages reuse source work already paid by sustained
+        // demand. After the first draw the width keeps climbing by
+        // `FRONTIER_RAMP_BASE` to the ceiling (see `FRONTIER_RAMP_BASE` for
+        // why the base is what decides that).
         let consumed = self.bindings.consumed(variable);
         if let Some(top) = self.stack.last_mut() {
             // Never leave a tail smaller than the chunk that would precede

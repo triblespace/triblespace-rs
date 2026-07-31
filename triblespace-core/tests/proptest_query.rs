@@ -6,7 +6,7 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
     Binding, BindingStore, Candidates, Constraint, ContainsConstraint, Frontier, ProposalBuffer,
-    TriblePattern, Variable, VariableContext,
+    TriblePattern, Variable, VariableContext, FRONTIER_RAMP_BASE, INITIAL_FRONTIER_WIDTH,
 };
 use triblespace_core::trible::{Fragment, Trible};
 
@@ -1442,6 +1442,187 @@ fn parent_dependent_row_fibers_survive_source_paging() {
     assert!(
         widest > 1,
         "the wide run must build the multi-row frontier that source paging partitions"
+    );
+}
+
+/// A parent-dependent layer in a three-variable one-to-one map. Variable 0
+/// seeds `count` rows; each later variable proposes exactly one deterministic
+/// successor of the value in the preceding variable.
+struct OneToOneMapLayer {
+    variable: usize,
+    count: u32,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<usize>>>>,
+}
+
+impl OneToOneMapLayer {
+    fn index(value: &[u8; 32]) -> u32 {
+        u32::from_be_bytes(value[27..31].try_into().unwrap())
+    }
+
+    fn successor(variable: usize, count: u32, input: u32) -> u32 {
+        match variable {
+            1 => (input * 5 + 17) % count,
+            2 => (input * 9 + 23) % count,
+            _ => input,
+        }
+    }
+
+    fn output(&self, input: u32) -> [u8; 32] {
+        value(
+            0xD0 + self.variable as u8,
+            Self::successor(self.variable, self.count, input),
+        )
+    }
+}
+
+impl<'a> Constraint<'a> for OneToOneMapLayer {
+    fn variables(&self) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        set.set(self.variable);
+        set
+    }
+
+    fn estimate(&self, variable: usize, binding: &Binding) -> Option<usize> {
+        if variable != self.variable {
+            return None;
+        }
+        Some(if variable == 0 {
+            self.count as usize
+        } else if binding.get(variable - 1).is_some() {
+            1
+        } else {
+            1 << 20
+        })
+    }
+
+    fn influence(&self, variable: usize) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        if variable + 1 == self.variable {
+            set.set(self.variable);
+        }
+        set
+    }
+
+    fn propose(
+        &self,
+        variable: usize,
+        frontier: &triblespace_core::query::Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        if variable != self.variable {
+            return;
+        }
+        self.calls.lock().unwrap()[variable].push(frontier.len());
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            if variable == 0 {
+                proposals.extend((0..self.count).map(|i| self.output(i)));
+            } else {
+                let input = Self::index(
+                    frontier
+                        .row(row)
+                        .get(variable - 1)
+                        .expect("predecessor bound"),
+                );
+                proposals.push(self.output(input));
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        _variable: usize,
+        _frontier: &triblespace_core::query::Frontier<'_>,
+        _cands: &mut Candidates<'_>,
+    ) {
+    }
+}
+
+/// The engine's geometric partition, expressed independently for the test.
+/// A source page of this size is source work `propose` already paid for.
+fn ramp_partition(mut remaining: usize, ceiling: usize) -> Vec<usize> {
+    let mut width = INITIAL_FRONTIER_WIDTH.min(ceiling);
+    let mut pages = Vec::new();
+    while remaining != 0 {
+        let page = width.min(remaining);
+        pages.push(page);
+        remaining -= page;
+        if remaining == 0 {
+            break;
+        }
+        let next = width.saturating_mul(FRONTIER_RAMP_BASE).min(ceiling);
+        width = if remaining < next.saturating_mul(2) {
+            remaining.max(next).min(ceiling)
+        } else {
+            next
+        };
+    }
+    pages
+}
+
+#[test]
+fn source_pages_credit_one_to_one_candidate_chunks() {
+    const N: u32 = 512;
+    const WIDTH: usize = 4096;
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(vec![Vec::new(); 3]));
+    let layers: Vec<Box<dyn Constraint + Send + Sync>> = (0..3)
+        .map(|variable| {
+            Box::new(OneToOneMapLayer {
+                variable,
+                count: N,
+                calls: std::sync::Arc::clone(&calls),
+            }) as Box<dyn Constraint + Send + Sync>
+        })
+        .collect();
+    let query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(layers),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?, *binding.get(2)?)),
+    )
+    .with_frontier_width(WIDTH);
+    let stats = query.stats();
+    let mut actual: Vec<_> = query.collect();
+    actual.sort_unstable();
+
+    let mut expected: Vec<_> = (0..N)
+        .map(|i| {
+            let a = value(0xD0, i);
+            let b = value(0xD1, OneToOneMapLayer::successor(1, N, i));
+            let c = value(
+                0xD2,
+                OneToOneMapLayer::successor(2, N, OneToOneMapLayer::index(&b)),
+            );
+            (a, b, c)
+        })
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(actual, expected, "the exact parent-dependent bag changed");
+    assert_eq!(
+        stats.proposals(),
+        3 * N as u64,
+        "each layer must propose exactly one value per represented row"
+    );
+
+    let calls = calls.lock().unwrap();
+    let root_chunks = ramp_partition(N as usize, WIDTH);
+    let second_calls: Vec<_> = root_chunks
+        .iter()
+        .flat_map(|&rows| ramp_partition(rows, WIDTH))
+        .collect();
+    let third_calls: Vec<_> = second_calls
+        .iter()
+        .flat_map(|&rows| ramp_partition(rows, WIDTH))
+        .collect();
+
+    assert_eq!(calls[0], [1], "the first source page remains scalar");
+    assert_eq!(calls[1], second_calls);
+    assert_eq!(calls[2], third_calls);
+    assert_eq!(calls[1].iter().sum::<usize>(), N as usize);
+    assert_eq!(calls[2].iter().sum::<usize>(), N as usize);
+    assert_eq!(
+        (calls[2].len(), calls[2].iter().copied().max()),
+        (20, Some(293)),
+        "already-paid source work should not restart a second geometric ramp"
     );
 }
 
