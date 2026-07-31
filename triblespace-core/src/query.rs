@@ -2648,16 +2648,79 @@ mod tests {
             }
         }
 
+        #[derive(Clone)]
+        struct PagedFixture(u32);
+
+        impl<'a> Constraint<'a> for PagedFixture {
+            fn variables(&self) -> VariableSet {
+                variable_set(0..2)
+            }
+
+            fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+                match variable {
+                    0 => Some(4),
+                    1 => Some(if binding.get(0).is_some() { 1 } else { 8 }),
+                    _ => None,
+                }
+            }
+
+            fn propose(
+                &self,
+                variable: VariableId,
+                frontier: &Frontier<'_>,
+                proposals: &mut ProposalBuffer,
+            ) {
+                for row in 0..frontier.len() {
+                    proposals.open(row as u32);
+                    match variable {
+                        0 => proposals.extend((0..4).map(|i| Fixture::value(0, i))),
+                        1 => {
+                            let anchor = frontier.row(row).get(0).expect("anchor bound")[31];
+                            if anchor != 0 {
+                                proposals.extend((0..self.0).map(|i| Fixture::value(anchor, i)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            fn confirm(
+                &self,
+                _variable: VariableId,
+                _frontier: &Frontier<'_>,
+                _candidates: &mut Candidates<'_>,
+            ) {
+            }
+        }
+
         type TestQuery = Query<Fixture, fn(&Binding<'_>) -> Option<RawInline>, RawInline>;
+        type PagedQuery = Query<
+            PagedFixture,
+            fn(&Binding<'_>) -> Option<(RawInline, RawInline)>,
+            (RawInline, RawInline),
+        >;
 
         fn project(binding: &Binding<'_>) -> Option<RawInline> {
             binding.get(0).copied()
+        }
+
+        fn project_pair(binding: &Binding<'_>) -> Option<(RawInline, RawInline)> {
+            Some((*binding.get(0)?, *binding.get(1)?))
         }
 
         fn query(fanout: u32) -> TestQuery {
             Query::new(
                 Fixture(fanout),
                 project as fn(&Binding<'_>) -> Option<RawInline>,
+            )
+            .with_frontier_width(4)
+        }
+
+        fn paged_query(fanout: u32) -> PagedQuery {
+            Query::new(
+                PagedFixture(fanout),
+                project_pair as fn(&Binding<'_>) -> Option<(RawInline, RawInline)>,
             )
             .with_frontier_width(4)
         }
@@ -2721,6 +2784,62 @@ mod tests {
             actual.sort_unstable();
             assert_eq!(actual, expected, "splitting must preserve the exact bag");
             assert_eq!(actual.iter().filter(|row| row[31] == 2).count(), 1);
+        }
+
+        #[test]
+        fn split_does_not_own_later_pages_of_the_same_group() {
+            const FANOUT: u32 = 64;
+            let mut expected: Vec<_> = paged_query(FANOUT).collect();
+            expected.sort_unstable();
+            assert_eq!(expected.len(), 3 * FANOUT as usize);
+
+            let mut left = paged_query(FANOUT);
+            left.plan();
+            left.next_group();
+            left.next_chunk();
+
+            // Anchor 0 deliberately has no child. Retire that one-row
+            // latency chunk so the root's next chunk contains anchors 1..3.
+            left.plan();
+            left.next_group();
+            left.next_chunk();
+            left.next_group();
+            left.next_chunk();
+
+            left.plan();
+            assert_eq!(left.depths[left.depth].group_range(0).len(), 3);
+            left.next_group();
+            let source = *left.stack.last().expect("paged source");
+            assert_eq!(source.variable, 1);
+            assert_eq!(source.source_group, 0);
+            assert_eq!(
+                (
+                    left.depths[left.depth].group,
+                    left.depths[left.depth].group_row,
+                ),
+                (0, 1),
+                "the split point must be inside a non-final page sequence"
+            );
+
+            let right = left.split_current_source(1);
+            assert_eq!(
+                (right.depths[0].group, right.depths[0].groups.len()),
+                (1, 1),
+                "the sibling must be fenced before later pages of this group"
+            );
+
+            let mut left_rows: Vec<_> = left.collect();
+            let right_rows: Vec<_> = right.collect();
+            assert!(
+                right_rows.iter().all(|(anchor, _)| anchor[31] == 1),
+                "the sibling escaped its first source page"
+            );
+            left_rows.extend(right_rows);
+            left_rows.sort_unstable();
+            assert_eq!(
+                left_rows, expected,
+                "splitting a non-final source page must preserve the exact bag"
+            );
         }
     }
 }

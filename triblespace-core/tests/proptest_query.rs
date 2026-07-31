@@ -1395,6 +1395,56 @@ fn a_fragmented_frontier_keeps_every_row() {
     );
 }
 
+fn equality_fiber_rows(width: usize) -> (Vec<([u8; 32], [u8; 32])>, u64) {
+    use triblespace_core::query::equalityconstraint::EqualityConstraint;
+
+    // The root is deliberately narrower than the independent source for
+    // variable 1, so it binds first. Equality then proposes each parent row's
+    // own anchor value: wrong page-local tag lifting changes the result.
+    let anchors: Vec<[u8; 32]> = (0..8u32).map(|i| value(0xA1, i)).collect();
+    let allowed: Vec<[u8; 32]> = (0..16u32).map(|i| value(0xA1, i)).collect();
+    let root = WidthObserver {
+        variable: 0,
+        values: anchors,
+        widths: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let independent = WidthObserver {
+        variable: 1,
+        values: allowed,
+        widths: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(root) as Box<dyn Constraint + Send + Sync>,
+            Box::new(independent),
+            Box::new(EqualityConstraint::new(0, 1)),
+        ]),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
+    )
+    .with_frontier_width(width);
+    let stats = query.stats();
+    let mut rows: Vec<_> = query.collect();
+    rows.sort_unstable();
+    (rows, stats.widest())
+}
+
+#[test]
+fn parent_dependent_row_fibers_survive_source_paging() {
+    let (narrow, _) = equality_fiber_rows(1);
+    let (wide, widest) = equality_fiber_rows(4096);
+
+    assert_eq!(narrow.len(), 8);
+    assert_eq!(
+        wide, narrow,
+        "source pages must preserve the exact tagged bag"
+    );
+    assert!(wide.iter().all(|(a, b)| a == b));
+    assert!(
+        widest > 1,
+        "the wide run must build the multi-row frontier that source paging partitions"
+    );
+}
+
 /// `with_frontier_width` is a CEILING, and the ramp must not lift it.
 ///
 /// The tail merge — never leave a remainder smaller than the chunk before
