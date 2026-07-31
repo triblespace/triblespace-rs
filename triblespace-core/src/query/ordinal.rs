@@ -2,8 +2,8 @@
 //!
 //! The query engine needs only two forms: a consecutive range of row
 //! ordinals, and an arbitrary explicit selection owned elsewhere. Identity
-//! selections and their non-zero page slices stay allocation-free; a genuine
-//! permutation borrows its dense ordinals.
+//! selections and their non-zero page slices stay allocation-free; a
+//! nonconsecutive selection borrows its dense ordinals.
 
 use std::ops::Range;
 
@@ -59,6 +59,10 @@ impl<'a> RowSelection<'a> {
         );
         let len = range.end - range.start;
         match self {
+            // An empty selection has no first ordinal. Canonicalize it before
+            // converting or adding `range.start`: the valid tail of
+            // `0..=u32::MAX` starts one past the largest representable row.
+            Self::Consecutive { .. } if len == 0 => Self::consecutive(0, 0),
             Self::Consecutive { first, .. } => {
                 let offset = u32::try_from(range.start).expect("validated consecutive row index");
                 Self::consecutive(
@@ -113,6 +117,20 @@ mod tests {
         let explicit = RowSelection::explicit(&values).slice(2..6);
         assert_eq!(explicit, RowSelection::explicit(&values[2..6]));
         assert_eq!(dense(explicit), vec![17, 19, 23, 29]);
+    }
+
+    #[test]
+    fn empty_consecutive_tails_are_exact_at_the_u32_boundary() {
+        let singleton = RowSelection::consecutive(u32::MAX, 1);
+        assert_eq!(singleton.slice(1..1), RowSelection::identity(0));
+
+        // This domain contains every `u32` row ordinal. It exists only when
+        // `usize` is wider than `u32`; the conversion cleanly skips 32-bit
+        // targets rather than overflowing the test itself.
+        if let Ok(len) = usize::try_from(u64::from(u32::MAX) + 1) {
+            let all_rows = RowSelection::identity(len);
+            assert_eq!(all_rows.slice(len..len), RowSelection::identity(0));
+        }
     }
 
     proptest! {
