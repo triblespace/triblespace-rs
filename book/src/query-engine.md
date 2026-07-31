@@ -67,9 +67,11 @@ again. Batching the *parents* is what makes a level's region large at every
 depth.
 
 A frontier is cheap because bindings are indexes, not values (see below): it is
-an index matrix over the shared level buffers plus a `select` list of row
-numbers, so restricting one to a subset costs four bytes per row and never
-copies a row. Correspondingly, the
+an index matrix over the shared level buffers plus an exact row-selection view.
+Identity selection and contiguous offset slices are affine and allocate
+nothing; only a grouping that genuinely permutes rows stores a borrowed
+four-byte override per row. Restricting either form never copies an index row.
+Correspondingly, the
 [`ProposalBuffer`](triblespace::core::query::ProposalBuffer) is *segmented*: a
 proposer calls `open(row)` before appending a row's candidates, and every entry
 carries that **parent tag**. `Candidates` exposes the tags, so one region can
@@ -367,8 +369,9 @@ sibling:
   frontier and current level; later preferred-variable groups and every
   ancestor continuation remain owned by the left half. When the sibling's
   suffix is exhausted it is done, rather than unwinding into work another
-  clone also owns. Applying the same rule to a sibling of a sibling is
-  idempotent: discarded continuation cannot reappear.
+  clone also owns. The fence is an exclusive branch-local group limit, so it
+  never truncates or clones the `Arc`-shared plan. Applying the same rule to a
+  sibling of a sibling is idempotent: discarded continuation cannot reappear.
 - Splitting narrows the frontier: the two halves each expand a slice of what
   one would have expanded together. That is the deliberate trade — batch width
   buys per-level dispatch size, work-stealing buys core utilisation — and rayon

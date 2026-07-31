@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Frontier planning stores distinctions only after rows disagree.** A
+  depth now carries an allocation-free universal variable choice until the
+  first counterexample, then promotes to stable split groups with an explicit
+  row-order override only for a real permutation. Identity and offset
+  selections remain affine, while Rayon fences shared plans with a
+  branch-local group limit instead of truncating plan metadata.
 - **Query row-ordinal maps have an exact implicit view.** The internal
   `RowOrdinalView` represents unanimous maps and offset identity ranges without
   allocating a dense vector, borrows explicit storage for arbitrary maps, and
