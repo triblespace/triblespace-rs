@@ -30,12 +30,8 @@ pub mod intersectionconstraint;
 /// [`ProposalBuffer`] and [`Candidates`] — candidate storage and bit-packed
 /// liveness for one search level.
 mod liveness;
-/// Exact implicit views over row-ordinal maps.
-///
-/// Frontier selection uses the affine and explicit forms now; later staged
-/// consumers exercise the remaining exact algebra.
-#[allow(dead_code)]
-pub(crate) mod ordinal;
+/// Exact consecutive or explicit row selections.
+mod ordinal;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
 #[doc(hidden)]
@@ -55,7 +51,7 @@ use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use constantconstraint::*;
-use ordinal::RowOrdinalView;
+use ordinal::RowSelection;
 
 use crate::inline::encodings::genid::GenId;
 use crate::inline::Inline;
@@ -394,9 +390,9 @@ impl Default for Binding<'_> {
 /// Because bindings are indexes rather than values, a frontier is an
 /// *index matrix*, not a pile of copied assignments: one row of `stride`
 /// `u32`s per parent binding, over the level buffers those indexes point
-/// into. Row selection is an exact ordinal view: the identity and an offset
-/// slice remain affine and allocation-free, while a genuine permutation
-/// borrows explicit row numbers. Narrowing never copies an index row.
+/// into. Identity selections and their offset page slices remain consecutive
+/// and allocation-free, while a genuine permutation borrows explicit row
+/// numbers. Narrowing never copies an index row.
 ///
 /// Every row of a frontier has the *same* [`bound`](Frontier::bound) set —
 /// they are all at the same point in the search, differing only in which
@@ -407,7 +403,7 @@ pub struct Frontier<'a> {
     bound: VariableSet,
     block: &'a [u32],
     stride: usize,
-    select: RowOrdinalView<'a>,
+    select: RowSelection<'a>,
     levels: &'a [LevelValues],
 }
 
@@ -425,7 +421,7 @@ impl Default for Frontier<'_> {
             bound: VariableSet::new_empty(),
             block: &NO_INDEXES,
             stride: NO_INDEXES.len(),
-            select: RowOrdinalView::affine(0, 1),
+            select: RowSelection::identity(1),
             levels: &NO_LEVELS,
         }
     }
@@ -490,7 +486,7 @@ impl<'a> Frontier<'a> {
             bound: self.bound,
             block: self.block,
             stride: self.stride,
-            select: RowOrdinalView::explicit(select),
+            select: RowSelection::explicit(select),
             levels: self.levels,
         }
     }
@@ -556,7 +552,7 @@ impl BindingStore {
             bound: self.bound,
             block: &self.indexes,
             stride: self.indexes.len(),
-            select: RowOrdinalView::affine(0, 1),
+            select: RowSelection::identity(1),
             levels: &self.levels,
         }
     }
@@ -614,7 +610,7 @@ impl BindingStore {
         &mut self,
         variable: VariableId,
         block: &[u32],
-        select: RowOrdinalView<'_>,
+        select: RowSelection<'_>,
         stride: usize,
         propose: impl FnOnce(&Frontier<'_>, &mut ProposalBuffer),
     ) -> usize {
@@ -645,7 +641,7 @@ impl BindingStore {
     pub(crate) fn batch<'s>(
         &'s self,
         block: &'s [u32],
-        select: RowOrdinalView<'s>,
+        select: RowSelection<'s>,
         stride: usize,
     ) -> Frontier<'s> {
         Frontier {
@@ -681,7 +677,7 @@ impl BindingStore {
         variable: VariableId,
         width: usize,
         parent_block: &[u32],
-        parent_select: RowOrdinalView<'_>,
+        parent_select: RowSelection<'_>,
         stride: usize,
         out: &mut Vec<u32>,
         parents_out: &mut Vec<u32>,
@@ -722,7 +718,7 @@ impl BindingStore {
         &mut self,
         variable: VariableId,
         width: usize,
-        parent_select: RowOrdinalView<'_>,
+        parent_select: RowSelection<'_>,
         drawn_out: &mut Vec<u32>,
         parents_out: &mut Vec<u32>,
     ) {
@@ -1297,8 +1293,8 @@ enum DepthPlan {
 /// Explicit metadata for a frontier whose rows choose different variables.
 #[derive(Debug, Default)]
 struct SplitPlan {
-    /// Stable grouped row order. Empty exactly when that order is the affine
-    /// identity `0..rows`.
+    /// Stable grouped row order. Empty exactly when that order is the
+    /// consecutive identity `0..rows`.
     order_override: Vec<u32>,
     /// `(variable, end offset into the grouped order)`, in variable order.
     groups: Vec<(VariableId, usize)>,
@@ -1306,15 +1302,13 @@ struct SplitPlan {
 
 impl DepthPlan {
     /// Row visitation order denoted by this plan.
-    fn selection(&self, rows: usize) -> RowOrdinalView<'_> {
+    fn selection(&self, rows: usize) -> RowSelection<'_> {
         match self {
             Self::Split(plan) if !plan.order_override.is_empty() => {
                 debug_assert_eq!(plan.order_override.len(), rows);
-                RowOrdinalView::explicit(&plan.order_override)
+                RowSelection::explicit(&plan.order_override)
             }
-            Self::Unplanned | Self::Universal(_) | Self::Split(_) => {
-                RowOrdinalView::affine(0, rows)
-            }
+            Self::Unplanned | Self::Universal(_) | Self::Split(_) => RowSelection::identity(rows),
         }
     }
 
@@ -1372,7 +1366,7 @@ struct Depth {
 }
 
 impl Depth {
-    fn selection(&self) -> RowOrdinalView<'_> {
+    fn selection(&self) -> RowSelection<'_> {
         self.plan.selection(self.rows)
     }
 
@@ -2057,7 +2051,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             let estimates = Arc::make_mut(&mut child.estimates);
             let batch = self
                 .bindings
-                .batch(&block, RowOrdinalView::affine(0, rows), slots);
+                .batch(&block, RowSelection::identity(rows), slots);
             for row in 0..rows {
                 let binding = batch.row(row);
                 for v in stale {
@@ -2729,7 +2723,7 @@ mod tests {
                     fanout,
                     // Anchor 3 is consumed by the scalar latency page. The
                     // remaining choices are 1, 2, 3, so stable grouping is
-                    // already affine identity.
+                    // already consecutive identity.
                     anchors: [3, 0, 1, 2],
                 }
             }
@@ -2985,7 +2979,7 @@ mod tests {
             ));
             assert_eq!(
                 representation.depths[0].selection(),
-                RowOrdinalView::affine(0, 1)
+                RowSelection::identity(1)
             );
             assert_eq!(
                 representation.choice.capacity(),
@@ -3011,7 +3005,7 @@ mod tests {
             assert!(plan.order_override.is_empty());
             assert_eq!(
                 representation.depths[representation.depth].selection(),
-                RowOrdinalView::affine(0, 3)
+                RowSelection::identity(3)
             );
 
             let narrow = bag(query(16).with_frontier_width(1).collect());
@@ -3032,7 +3026,7 @@ mod tests {
             assert_eq!(plan.order_override, [1, 0, 2]);
             assert_eq!(
                 representation.depths[representation.depth].selection(),
-                RowOrdinalView::explicit(&[1, 0, 2])
+                RowSelection::explicit(&[1, 0, 2])
             );
 
             let narrow = bag(nonidentity_query(16).with_frontier_width(1).collect());
@@ -3067,11 +3061,11 @@ mod tests {
             let plan = split_plan(&left);
             assert!(
                 plan.order_override.is_empty(),
-                "the stable grouped order is already affine identity"
+                "the stable grouped order is already consecutive identity"
             );
             assert_eq!(
                 left.depths[left.depth].selection(),
-                RowOrdinalView::affine(0, 3)
+                RowSelection::identity(3)
             );
             let mut right = left.split_current_source(2);
 
@@ -3124,7 +3118,7 @@ mod tests {
             assert_eq!(plan.order_override, [1, 0, 2]);
             assert_eq!(
                 left.depths[left.depth].selection(),
-                RowOrdinalView::explicit(&[1, 0, 2])
+                RowSelection::explicit(&[1, 0, 2])
             );
 
             let mut right = left.split_current_source(2);

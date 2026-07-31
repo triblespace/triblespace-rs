@@ -67,12 +67,12 @@ again. Batching the *parents* is what makes a level's region large at every
 depth.
 
 A frontier is cheap because bindings are indexes, not values (see below): it is
-an index matrix over the shared level buffers plus an exact row-selection view.
-The depth planner keeps identity order affine and allocation-free; only when
-its stable grouping genuinely permutes rows does its plan store a four-byte
-override per row. Constraint-created subviews may instead borrow arbitrary
-explicit selections through `Frontier::with_select`. Restricting either form
-never copies an index row. Correspondingly, the
+an index matrix over the shared level buffers plus an exact row selection.
+The depth planner keeps identity order and its non-zero page slices consecutive
+and allocation-free; only when stable grouping genuinely permutes rows does
+the plan store a four-byte override per row. Constraint-created subviews may
+instead borrow arbitrary explicit selections through `Frontier::with_select`.
+Restricting either form never copies an index row. Correspondingly, the
 [`ProposalBuffer`](triblespace::core::query::ProposalBuffer) is *segmented*: a
 proposer calls `open(row)` before appending a row's candidates, and every entry
 carries that **parent tag**. `Candidates` exposes the tags, so one region can

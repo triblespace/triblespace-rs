@@ -12,15 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Frontier planning stores distinctions only after rows disagree.** A
   depth now carries an allocation-free universal variable choice until the
   first counterexample, then promotes to stable split groups with an explicit
-  row-order override only for a real permutation. Identity and offset
-  selections remain affine, while Rayon fences shared plans with a
+  row-order override only for a real permutation. Identity and offset page
+  selections remain consecutive, while Rayon fences shared plans with a
   branch-local group limit instead of truncating plan metadata.
-- **Query row-ordinal maps have an exact implicit view.** The internal
-  `RowOrdinalView` represents unanimous maps and offset identity ranges without
-  allocating a dense vector, borrows explicit storage for arbitrary maps, and
-  supports indexing, slicing, splitting, iteration, and composition under one
-  dense-equivalent law. Property tests include the non-zero affine tails
-  produced by parallel source splits.
+- **Query planner row selections stay implicit until rows genuinely
+  permute.** The internal `RowSelection` represents identity order and its
+  non-zero consecutive page slices without allocating a dense vector, and
+  borrows explicit storage for arbitrary selections. Indexing and slicing
+  preserve those two exact forms.
 - **A bounded oracle checks the regular-path closure kernel.** A Kani harness
   symbolically selects every subgraph of a five-edge, two-vertex labeled
   universe, while an ordinary deterministic test exhausts all 256 graphs whose
