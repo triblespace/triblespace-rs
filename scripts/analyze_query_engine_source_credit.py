@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate and reduce a query-engine source-credit benchmark artifact.
 
-The runner executes the double-geometric and inherited-credit engines in
+The runner executes the manifest's old and current engine variants in
 sequential A/B/B/A order for each scenario. Timings are reduced in two stages:
 take the median inside each process invocation, then take the geometric mean of
 each arm's two invocations. This preserves the runner's drift control.
@@ -52,16 +52,9 @@ LATE_PROCESSED_ROOTS = {
 }
 LATE_SOURCE_PAGES = {2: 3, 18: 6, 146: 10, 1170: 15, 9362: 21}
 LATE_LAST_WIDTH = {2: 7, 18: 55, 146: 439, 1170: 3511, 9362: 7022}
-POSITION_ARM = {
-    "A1": "double-geometric",
-    "A2": "double-geometric",
-    "B1": "inherited-credit",
-    "B2": "inherited-credit",
-}
-ARM_POSITIONS = {
-    "double-geometric": ("A1", "A2"),
-    "inherited-credit": ("B1", "B2"),
-}
+OLD_POSITIONS = ("A1", "A2")
+CURRENT_POSITIONS = ("B1", "B2")
+CURRENT_VARIANTS = frozenset({"inherited-credit", "preyield-credit"})
 WORK_FIELDS = (
     "expansions",
     "frontier_rows",
@@ -151,6 +144,31 @@ def parse_int(value: str, description: str) -> int:
     except ValueError as error:
         raise ValueError(f"{description} is not an integer: {value!r}") from error
     return result
+
+
+def arm_specs(
+    manifest: Mapping[str, str],
+) -> tuple[tuple[str, tuple[str, str], str], ...]:
+    return (
+        (
+            manifest["old_variant"],
+            OLD_POSITIONS,
+            manifest["old_revision"],
+        ),
+        (
+            manifest["current_variant"],
+            CURRENT_POSITIONS,
+            manifest["current_revision"],
+        ),
+    )
+
+
+def position_arms(manifest: Mapping[str, str]) -> dict[str, str]:
+    return {
+        position: variant
+        for variant, positions, _revision in arm_specs(manifest)
+        for position in positions
+    }
 
 
 def read_manifest(path: Path) -> dict[str, str]:
@@ -323,8 +341,10 @@ def validate(
         raise ValueError("manifest repetitions must be positive")
     if manifest["old_variant"] != "double-geometric":
         raise ValueError("old arm is not labelled double-geometric")
-    if manifest["current_variant"] != "inherited-credit":
-        raise ValueError("current arm is not labelled inherited-credit")
+    if manifest["current_variant"] not in CURRENT_VARIANTS:
+        raise ValueError(
+            "current arm must be labelled inherited-credit or preyield-credit"
+        )
 
     observed_run = one((row["run_id"] for row in rows), "run id")
     observed_harness = one((row["harness"] for row in rows), "harness hash")
@@ -418,17 +438,22 @@ def validate(
                 "widest": 8,
                 "proposals": 16_396,
             }
-            if row["engine_variant"] == "double-geometric":
+            if row["engine_variant"] in {"double-geometric", "preyield-credit"}:
                 exact_work.update(
                     frontier_rows=13,
                     inplace_descents=2,
                     copied_descents=4,
                 )
-            else:
+            elif row["engine_variant"] == "inherited-credit":
                 exact_work.update(
                     frontier_rows=19,
                     inplace_descents=1,
                     copied_descents=5,
+                )
+            else:
+                raise ValueError(
+                    f"{context}: unsupported late-2 engine variant "
+                    f"{row['engine_variant']!r}"
                 )
             for field, expected in exact_work.items():
                 observed = parse_int(row[field], f"{context} {field}")
@@ -647,9 +672,9 @@ def reduce_timings(
                     f"{scenario}/V={variable_count}/{demand}: "
                     "row count differs across arms"
                 )
-            double_ns = geometric_mean(medians[position] for position in ("A1", "A2"))
-            inherited_ns = geometric_mean(
-                medians[position] for position in ("B1", "B2")
+            old_ns = geometric_mean(medians[position] for position in OLD_POSITIONS)
+            current_ns = geometric_mean(
+                medians[position] for position in CURRENT_POSITIONS
             )
             reduced.append(
                 {
@@ -657,15 +682,17 @@ def reduce_timings(
                     "variables": variable_count,
                     "demand": demand,
                     "rows": next(iter(row_counts)),
-                    "double_a1_median_ns": medians["A1"],
-                    "double_a2_median_ns": medians["A2"],
-                    "double_ns": double_ns,
-                    "double_ms": double_ns / 1_000_000,
-                    "inherited_b1_median_ns": medians["B1"],
-                    "inherited_b2_median_ns": medians["B2"],
-                    "inherited_ns": inherited_ns,
-                    "inherited_ms": inherited_ns / 1_000_000,
-                    "inherited_over_double": inherited_ns / double_ns,
+                    "old_variant": manifest["old_variant"],
+                    "current_variant": manifest["current_variant"],
+                    "old_a1_median_ns": medians["A1"],
+                    "old_a2_median_ns": medians["A2"],
+                    "old_ns": old_ns,
+                    "old_ms": old_ns / 1_000_000,
+                    "current_b1_median_ns": medians["B1"],
+                    "current_b2_median_ns": medians["B2"],
+                    "current_ns": current_ns,
+                    "current_ms": current_ns / 1_000_000,
+                    "current_over_old": current_ns / old_ns,
                 }
             )
     return reduced
@@ -709,8 +736,7 @@ def reduce_identity_work(
     output: list[dict[str, object]] = []
     for scenario, variable_count, demands in manifest_matrix(manifest):
         demand = next(value for value in demands if is_identity_cell(scenario, value))
-        for arm in ("double-geometric", "inherited-credit"):
-            positions = ARM_POSITIONS[arm]
+        for arm, positions, engine in arm_specs(manifest):
             summaries = [
                 grouped[(scenario, variable_count, demand, position, "identity")][0]
                 for position in positions
@@ -722,23 +748,13 @@ def reduce_identity_work(
                 )
                 for position in positions
             }
-            engine = (
-                manifest["old_revision"]
-                if arm == "double-geometric"
-                else manifest["current_revision"]
-            )
-            variant = (
-                manifest["old_variant"]
-                if arm == "double-geometric"
-                else manifest["current_variant"]
-            )
             item: dict[str, object] = {
                 "scenario": scenario,
                 "variables": variable_count,
                 "demand": demand,
                 "arm": arm,
                 "engine": engine,
-                "engine_variant": variant,
+                "engine_variant": arm,
                 "invocations": len(positions),
             }
             for field in WORK_FIELDS:
@@ -801,6 +817,7 @@ def reduce_identity_work(
 
 def repeat_spread(
     rows: Sequence[Mapping[str, str]],
+    manifest: Mapping[str, str],
 ) -> list[dict[str, object]]:
     samples: dict[tuple[str, int, str, str], list[int]] = defaultdict(list)
     for row in rows:
@@ -814,11 +831,12 @@ def repeat_spread(
                 )
             ].append(int(row["elapsed_ns"]))
 
+    arm_by_position = position_arms(manifest)
     spread_groups: dict[tuple[str, str], list[float]] = defaultdict(list)
     for (_scenario, _variables, _demand, position), values in samples.items():
         median = statistics.median(values)
         spread = statistics.median(abs(value - median) for value in values) / median
-        arm = POSITION_ARM[position]
+        arm = arm_by_position[position]
         spread_groups[(arm, "all")].append(spread)
         spread_groups[("all", "all")].append(spread)
         if median >= 1_000_000:
@@ -826,7 +844,11 @@ def repeat_spread(
             spread_groups[("all", ">=1 ms")].append(spread)
 
     output = []
-    arm_order = {"double-geometric": 0, "inherited-credit": 1, "all": 2}
+    arm_order = {
+        manifest["old_variant"]: 0,
+        manifest["current_variant"]: 1,
+        "all": 2,
+    }
     scope_order = {"all": 0, ">=1 ms": 1}
     for (arm, scope), values in sorted(
         spread_groups.items(),
@@ -903,11 +925,13 @@ def render_summary(
     spreads: Sequence[Mapping[str, object]],
 ) -> str:
     matrix_count = len(manifest_matrix(manifest))
+    old_variant = manifest["old_variant"]
+    current_variant = manifest["current_variant"]
     lines = [
-        "# Query-engine inherited source credit",
+        "# Query-engine source credit",
         "",
-        f"Run `{manifest['run_id']}` compares double geometric widening at "
-        f"`{manifest['old_revision'][:8]}` with inherited source-page credit at "
+        f"Run `{manifest['run_id']}` compares `{old_variant}` at "
+        f"`{manifest['old_revision'][:8]}` with `{current_variant}` at "
         f"`{manifest['current_revision'][:8]}`.",
         "",
         "## Integrity",
@@ -932,7 +956,7 @@ def render_summary(
         "",
         "Each invocation is reduced to its repetition median. The A1/A2 temporal "
         "bookends and B1/B2 middle repeats are then combined separately by geometric mean. "
-        "`inherited/double < 1` means inherited credit is faster.",
+        f"`{current_variant}/{old_variant} < 1` means `{current_variant}` is faster.",
         "Timed samples carry no identity digest: identity is established only by the "
         "untimed exact diagnostic in each scenario/variable fixture.",
         "",
@@ -945,9 +969,9 @@ def render_summary(
             "V",
             "demand",
             "rows",
-            "double ms",
-            "inherited ms",
-            "inherited/double",
+            f"{old_variant} ms",
+            f"{current_variant} ms",
+            f"{current_variant}/{old_variant}",
         ),
         (
             (
@@ -955,9 +979,9 @@ def render_summary(
                 row["variables"],
                 row["demand"],
                 row["rows"],
-                format_ms(row["double_ms"]),
-                format_ms(row["inherited_ms"]),
-                f"{float(row['inherited_over_double']):.3f}",
+                format_ms(row["old_ms"]),
+                format_ms(row["current_ms"]),
+                f"{float(row['current_over_old']):.3f}",
             )
             for row in cells
         ),
@@ -1060,7 +1084,7 @@ def main() -> None:
     record_counts = validate(rows, manifest)
     cells = reduce_timings(rows, manifest)
     work = reduce_identity_work(rows, manifest)
-    spreads = repeat_spread(rows)
+    spreads = repeat_spread(rows, manifest)
 
     analysis_dir = result_dir / "analysis"
     analysis_dir.mkdir(exist_ok=True)
@@ -1069,15 +1093,17 @@ def main() -> None:
         "variables",
         "demand",
         "rows",
-        "double_a1_median_ns",
-        "double_a2_median_ns",
-        "double_ns",
-        "double_ms",
-        "inherited_b1_median_ns",
-        "inherited_b2_median_ns",
-        "inherited_ns",
-        "inherited_ms",
-        "inherited_over_double",
+        "old_variant",
+        "current_variant",
+        "old_a1_median_ns",
+        "old_a2_median_ns",
+        "old_ns",
+        "old_ms",
+        "current_b1_median_ns",
+        "current_b2_median_ns",
+        "current_ns",
+        "current_ms",
+        "current_over_old",
     )
     work_fields = (
         "scenario",

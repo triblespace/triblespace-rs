@@ -22,15 +22,18 @@ fi
 OLD_REV=${OLD_REV:-28dee953}
 CURRENT_REV=${CURRENT_REV:-HEAD}
 OLD_VARIANT=${OLD_VARIANT:-double-geometric}
-CURRENT_VARIANT=${CURRENT_VARIANT:-inherited-credit}
+CURRENT_VARIANT=${CURRENT_VARIANT:-preyield-credit}
 [[ "$OLD_VARIANT" == "double-geometric" ]] || {
     echo "OLD_VARIANT must be double-geometric" >&2
     exit 2
 }
-[[ "$CURRENT_VARIANT" == "inherited-credit" ]] || {
-    echo "CURRENT_VARIANT must be inherited-credit" >&2
-    exit 2
-}
+case "$CURRENT_VARIANT" in
+    inherited-credit | preyield-credit) ;;
+    *)
+        echo "CURRENT_VARIANT must be inherited-credit or preyield-credit" >&2
+        exit 2
+        ;;
+esac
 
 VARIABLES=${VARIABLES:-"2 3 8 32"}
 read -r -a VARIABLE_LIST <<<"$VARIABLES"

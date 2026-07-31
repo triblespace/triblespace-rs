@@ -1,14 +1,15 @@
 #![allow(unexpected_cfgs)]
 
-//! Demand curve for inherited source-page credit.
+//! Demand curve for source-page credit policies.
 //!
 //! The fixture is deliberately independent of storage backends. It consists
 //! of `N = 16_384` roots and parent-dependent bijections. The dense scenario
 //! gives every root one completion. The V=3 late-first scenarios add a
 //! terminal unary gate which accepts one boundary-selected root, so the first
 //! visible row appears only after preceding source pages have failed. Together
-//! they expose cumulative widening boundaries and inherited candidate credit
-//! without mixing in archive or GPU placement.
+//! they expose cumulative widening boundaries and the difference between
+//! inherited candidate credit and a pre-yield credit fence without mixing in
+//! archive or GPU placement.
 //!
 //! Build this exact source against both revisions with
 //! `scripts/run_query_engine_source_credit.sh`. The runner freezes one
@@ -165,7 +166,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: query_engine_source_credit \
          --expect-engine <full-git-rev> \
-         --expect-variant <double-geometric|inherited-credit> \
+         --expect-variant <double-geometric|inherited-credit|preyield-credit> \
          --expect-harness <source-sha256> --expect-lock <Cargo.lock-sha256> \
          --run-id <id> --abba-position <position> --invocation-sequence <N> \
          --scenario <dense-bijective|late-2|late-18|late-146|late-1170|late-9362> \
@@ -250,6 +251,13 @@ fn parse_config() -> Config {
 }
 
 fn verify_provenance(cfg: &Config) {
+    if !matches!(
+        ENGINE_VARIANT,
+        "double-geometric" | "inherited-credit" | "preyield-credit"
+    ) {
+        eprintln!("fatal: unsupported baked engine variant {ENGINE_VARIANT}");
+        std::process::exit(2);
+    }
     for (kind, baked, expected) in [
         (
             "engine revision",
@@ -960,28 +968,23 @@ fn assert_late_first_diagnostic(
         assert_eq!(work.expansions, 6, "minimal exact expansions");
         assert_eq!(work.variable_groups, 6, "minimal exact variable groups");
         assert_eq!(work.widest, 8, "minimal exact widest frontier");
-        match ENGINE_VARIANT {
-            "double-geometric" => {
-                assert_eq!(work.frontier_rows, 13, "minimal old frontier rows");
-                assert_eq!(work.inplace_descents, 2, "minimal old in-place descents");
-                assert_eq!(
-                    work.copied_descents, 4,
-                    "minimal old copying descent events"
-                );
-            }
-            "inherited-credit" => {
-                assert_eq!(work.frontier_rows, 19, "minimal inherited frontier rows");
-                assert_eq!(
-                    work.inplace_descents, 1,
-                    "minimal inherited in-place descents"
-                );
-                assert_eq!(
-                    work.copied_descents, 5,
-                    "minimal inherited copying descent events"
-                );
-            }
+        let (frontier_rows, inplace_descents, copied_descents) = match ENGINE_VARIANT {
+            "double-geometric" | "preyield-credit" => (13, 2, 4),
+            "inherited-credit" => (19, 1, 5),
             other => panic!("unexpected baked engine variant {other}"),
-        }
+        };
+        assert_eq!(
+            work.frontier_rows, frontier_rows,
+            "minimal {ENGINE_VARIANT} frontier rows"
+        );
+        assert_eq!(
+            work.inplace_descents, inplace_descents,
+            "minimal {ENGINE_VARIANT} in-place descents"
+        );
+        assert_eq!(
+            work.copied_descents, copied_descents,
+            "minimal {ENGINE_VARIANT} copying descent events"
+        );
     }
 }
 
