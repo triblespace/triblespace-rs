@@ -64,12 +64,12 @@ const SORTED_PROBE_MIN: usize = 2;
 /// This is an internal execution crossover, not a query-planning knob. The
 /// logical frontier remains whole: proposal, probe grouping, and any device
 /// routing happen before this point. Only the CPU membership probes divide,
-/// at packed-word boundaries, into disjoint kill-only regions. With an 8192
-/// crossover the recursive leaves are about 4096 candidates wide — enough
-/// PATCH work to dominate a nested-join handoff while exposing useful work at
-/// the 16K frontier where accelerator routing begins.
+/// at packed-word boundaries, into disjoint kill-only regions. With a 1024
+/// crossover the recursive leaves are about 512 candidates wide, so medium
+/// common-plan CPU regions divide without touching GPU routing, which is
+/// decided before this leaf.
 #[cfg(feature = "parallel")]
-const PARALLEL_CONFIRM_MIN: usize = 8192;
+const PARALLEL_CONFIRM_MIN: usize = 1024;
 
 #[cfg(all(test, feature = "parallel"))]
 static PARALLEL_CONFIRM_SPLITS: std::sync::atomic::AtomicUsize =
