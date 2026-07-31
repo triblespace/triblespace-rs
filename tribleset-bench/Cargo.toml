@@ -23,16 +23,17 @@ protocol-v2 = []
 # instead of one `Binding`, and `propose_chunk`/`ProposeCursor` are gone
 # (engine/batched-frontier, 2026-07-28 onward). Refines `protocol-v2`:
 # the hand-written wrappers in F11 and the confirm-region census pick
-# their method signatures off this. Never enable it without
-# `protocol-v2` — bench.sh only ever probes for it alongside.
-frontier = []
+# their method signatures off this. A frontier subject is necessarily
+# protocol-v2, so encode that invariant in Cargo rather than relying on
+# every caller to remember the pair.
+frontier = ["protocol-v2"]
 # `FrontierStats` gained `widest`/`inplace_descents`/`copied_descents`
 # (engine/batched-frontier-harvest, 2026-07-28 onward). The batched
 # protocol shipped before those counters existed, so the census reports
 # expansions and mean width against a plain `frontier` subject and the
 # ceiling question only against one that can answer it. Refines
-# `frontier`; never enable it alone.
-frontier-widest = []
+# `frontier`, and carries that dependency explicitly.
+frontier-widest = ["frontier"]
 # The W=1 control arm: pins every translated query to
 # `with_frontier_width(1)`, reducing the SAME engine to expanding one
 # binding at a time. Not a capability probe — a deliberate ablation, so
