@@ -12,7 +12,7 @@
 //! DEMAND_CURVE_ENGINE_REVISION=$(git rev-parse 2cd60807) \
 //! DEMAND_CURVE_HARNESS_SHA256=$(shasum -a 256 examples/query_engine_demand_curve.rs | cut -d' ' -f1) \
 //! CARGO_TARGET_DIR=target/demand-2cd \
-//! cargo build --release --example query_engine_demand_curve
+//! cargo rustc --release --example query_engine_demand_curve --
 //!
 //! target/demand-2cd/release/examples/query_engine_demand_curve \
 //!   --expect-engine $(git rev-parse 2cd60807) \
@@ -31,7 +31,7 @@
 //!
 //! The revision comparison is intentionally labelled *literal scalar status
 //! quo versus current frontier stack*: those revisions differ by more than
-//! batching alone. Build current a second time with
+//! batching alone. Build current a second time with `cargo rustc` flags
 //! `--cfg demand_frontier_stats --cfg demand_frontier_w1`; its
 //! `with_frontier_width(1)` arm isolates width on the same current sources,
 //! while old versus current-width-one estimates the rest of the rewrite toll.
