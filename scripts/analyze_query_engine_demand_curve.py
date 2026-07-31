@@ -502,6 +502,14 @@ def render_summary(
     work: Sequence[Mapping[str, object]],
     affine: Sequence[Mapping[str, object]],
 ) -> str:
+    def work_arm(row: Mapping[str, object]) -> str:
+        if row["engine"] == manifest["old_revision"]:
+            return "old/default"
+        if row["engine_variant"] == "frontier-w1":
+            return "current/W1"
+        return "current/default"
+
+    arm_order = {"old/default": 0, "current/default": 1, "current/W1": 2}
     scale_count = len(set(row["scale"] for row in rows))
     scale_noun = "scale" if scale_count == 1 else "scales"
     lines = [
@@ -624,13 +632,16 @@ def render_summary(
             and row["shape"] == "parent_batch_confirm"
             and row["demand"] == "full"
         ),
-        key=lambda row: (int(str(row["batch_parents"])), str(row["engine_variant"])),
+        key=lambda row: (
+            int(str(row["batch_parents"])),
+            arm_order[work_arm(row)],
+        ),
     )
     lines += ["", "## Sequential WGPU route receipts", ""]
     lines += markdown_table(
         (
             "scale",
-            "variant",
+            "arm",
             "widest",
             "GPU confirms/candidates",
             "CPU confirms/candidates",
@@ -638,7 +649,7 @@ def render_summary(
         (
             (
                 row["scale"],
-                row["engine_variant"],
+                work_arm(row),
                 int(row["widest_frontier_median"]),
                 f"{int(row['gpu_confirms_median'])}/{int(row['gpu_candidates_median'])}",
                 f"{int(row['cpu_fallback_confirms_median'])}/{int(row['cpu_fallback_candidates_median'])}",
@@ -657,15 +668,18 @@ def render_summary(
             and row["shape"] == "parent_batch_confirm"
             and row["demand"] == "full"
         ),
-        key=lambda row: (int(str(row["batch_parents"])), str(row["engine_variant"])),
+        key=lambda row: (
+            int(str(row["batch_parents"])),
+            arm_order[work_arm(row)],
+        ),
     )
     lines += ["", "## Rayon batching retained at full drain", ""]
     lines += markdown_table(
-        ("scale", "variant", "widest median [range]", "expansions median [range]"),
+        ("scale", "arm", "widest median [range]", "expansions median [range]"),
         (
             (
                 row["scale"],
-                row["engine_variant"],
+                work_arm(row),
                 f"{int(row['widest_frontier_median'])} "
                 f"[{int(row['widest_frontier_min'])}, {int(row['widest_frontier_max'])}]",
                 f"{int(row['frontier_expansions_median'])} "
