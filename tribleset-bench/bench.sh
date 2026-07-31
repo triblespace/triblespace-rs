@@ -87,6 +87,13 @@ if grep -q 'pub struct Frontier' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev
   if grep -q 'pub fn widest' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
     FEATURES="$FEATURES frontier-widest"
   fi
+  # frontier-optin-stats: counters stopped being an unconditional Query
+  # field. New subjects need explicit activation; historical frontier
+  # subjects expose the already-live handle through Query::stats directly.
+  if grep -q 'pub fn with_frontier_stats' \
+      "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
+    FEATURES="$FEATURES frontier-optin-stats"
+  fi
 fi
 # rpq: only when the subject still has a regular-path constraint.
 if [ -f "$SUBJECT/triblespace-core/src/query/regularpathconstraint.rs" ]; then

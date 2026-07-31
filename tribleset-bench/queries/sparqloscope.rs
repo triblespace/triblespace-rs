@@ -216,19 +216,15 @@ pub fn current_engine() -> Engine {
 /// The uniform row stream every translation consumes: a fresh
 /// [`Query`] driven to completion by the selected [`Engine`] (today,
 /// the sole surviving residual-state engine — see [`Engine`]).
-pub struct Rows<C, P: Fn(&Binding) -> Option<R>, R, S: subject::core::query::FrontierStatsSink>(
-    Query<C, P, R, S>,
-);
+pub struct Rows<I>(I);
 
-impl<'a, C, P, R, S> Iterator for Rows<C, P, R, S>
+impl<I> Iterator for Rows<I>
 where
-    C: Constraint<'a> + 'a,
-    P: Fn(&Binding) -> Option<R>,
-    S: subject::core::query::FrontierStatsSink,
+    I: Iterator,
 {
-    type Item = R;
+    type Item = I::Item;
 
-    fn next(&mut self) -> Option<R> {
+    fn next(&mut self) -> Option<Self::Item> {
         let row = self.0.next();
         if row.is_some() {
             phase_row();
@@ -351,7 +347,7 @@ where
     // together — and NOT a measurement of width as a tunable.
     #[cfg(feature = "frontier-w1")]
     let q = q.with_frontier_width(1);
-    #[cfg(feature = "frontier")]
+    #[cfg(feature = "frontier-optin-stats")]
     let q = q.with_frontier_stats();
     #[cfg(feature = "frontier")]
     crate::archq::note_frontier_stats(q.stats());

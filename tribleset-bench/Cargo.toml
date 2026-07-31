@@ -34,6 +34,10 @@ frontier = ["protocol-v2"]
 # ceiling question only against one that can answer it. Refines
 # `frontier`, and carries that dependency explicitly.
 frontier-widest = ["frontier"]
+# `Query::with_frontier_stats` made frontier counters opt-in. Historical
+# frontier subjects expose `Query::stats` directly and must not be asked for
+# the activation method, so bench.sh probes this as its own capability.
+frontier-optin-stats = ["frontier"]
 # The W=1 control arm: pins every translated query to
 # `with_frontier_width(1)`, reducing the SAME engine to expanding one
 # binding at a time. Not a capability probe — a deliberate ablation, so
