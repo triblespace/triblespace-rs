@@ -63,7 +63,7 @@ echo "bench.sh : subject -> $target" >&2
 SUBJECT="$(cd subjects/current && pwd -P)"
 FEATURES=""
 # gpu: the subject must actually ship the triblespace-gpu crate (F10 reads
-# DEFAULT_MIN_CONFIRM_BATCH out of it rather than copying the number).
+# DEFAULT_MIN_CONFIRM_BATCH_RANGE out of it rather than copying the number).
 if [ -d "$SUBJECT/triblespace-gpu" ] && grep -q '^gpu = ' "$SUBJECT/Cargo.toml" 2>/dev/null; then
   FEATURES="$FEATURES gpu"
 fi

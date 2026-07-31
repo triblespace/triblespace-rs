@@ -13,8 +13,9 @@
 //!   commits of the `--data` pile's branch at the `--rung` target.
 //! - `arch/build_ram/total` — `SuccinctArchive<OrderedUniverse>` build
 //!   over the checked-out set.
-//! - `arch_regions/<query>/{confirms,max,p95,median,ge_threshold,
-//!   live_total}` — the confirm-region census (see [`archq`]): the
+//! - `arch_regions/<query>/{confirms,max,p95,median,ge_range_floor,
+//!   ge_membership_floor,live_total}` — the confirm-region census (see
+//!   [`archq`]): the
 //!   distribution of LIVE candidate counts real queries hand the
 //!   archive's `confirm`, which is the quantity `triblespace-gpu`
 //!   routes on. Counting, never timing, so it reads the same on a
@@ -30,7 +31,7 @@
 //!   (oasis) and F5 (diamond) run everywhere, F1/F2/F4 are rpq-gated.
 //! - `harkonnen/F{6..15}/…` — the R2 white-box fixtures, one engine
 //!   decision each. All run everywhere except F10, which is gpu-gated
-//!   because it reads the routing threshold out of `triblespace-gpu`.
+//!   because it reads the range-confirm floor out of `triblespace-gpu`.
 //! - `sparqloscope/<query>/total` — the vendored TRANSLATED registry;
 //!   without a wd Dataset every query records SKIP "dataset absent"
 //!   (the census still lands in the pile).
@@ -393,12 +394,13 @@ fn run_r2(
 const MAX_RAM: usize = 20_000_000;
 
 /// The per-query suffixes of the phase-1 confirm-region census.
-const ARCH_REGION_SUFFIXES: [&str; 6] = [
+const ARCH_REGION_SUFFIXES: [&str; 7] = [
     "confirms",
     "max",
     "p95",
     "median",
-    "ge_threshold",
+    "ge_range_floor",
+    "ge_membership_floor",
     "live_total",
 ];
 
@@ -460,10 +462,12 @@ fn run_arch_queries(
     let built = Instant::now();
     let archive = fixtures::build_archive(set);
     println!(
-        "arch     : query arm over a {}-trible archive (built in {:.2}s), routing threshold {}",
+        "arch     : query arm over a {}-trible archive (built in {:.2}s), \
+         confirm floors range {} / membership {}",
         set.len(),
         built.elapsed().as_secs_f64(),
-        archq::CONFIRM_THRESHOLD
+        archq::CONFIRM_RANGE_FLOOR,
+        archq::CONFIRM_MEMBERSHIP_FLOOR
     );
 
     // -- phase 1: the confirm-region census (counting, not timing) ------
@@ -471,8 +475,15 @@ fn run_arch_queries(
     let archive = {
         let ds = archq::shell(archq::CountingArchive::new(archive));
         println!(
-            "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}{:>10}",
-            "regions/live-count", "confirms", "max", "p95", "median", ">=thresh", "width"
+            "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}{:>10}{:>10}",
+            "regions/live-count",
+            "confirms",
+            "max",
+            "p95",
+            "median",
+            ">=range",
+            ">=member",
+            "width"
         );
         for q in archq::arch_queries() {
             ds.facts.reset();
@@ -494,7 +505,8 @@ fn run_arch_queries(
                         ("max", s.max),
                         ("p95", s.p95),
                         ("median", s.median),
-                        ("ge_threshold", s.ge_threshold),
+                        ("ge_range_floor", s.ge_range_floor),
+                        ("ge_membership_floor", s.ge_membership_floor),
                         ("live_total", s.live_total),
                     ] {
                         led.outcome(
@@ -504,8 +516,15 @@ fn run_arch_queries(
                         );
                     }
                     println!(
-                        "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}",
-                        q.name, s.confirms, s.max, s.p95, s.median, s.ge_threshold
+                        "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}{:>10}{:>10}",
+                        q.name,
+                        s.confirms,
+                        s.max,
+                        s.p95,
+                        s.median,
+                        s.ge_range_floor,
+                        s.ge_membership_floor,
+                        "n/a"
                     );
                     println!(
                         "      {} | answer {} | widest regions (size x count) {:?}",
@@ -529,8 +548,13 @@ fn run_arch_queries(
                         #[cfg(not(feature = "frontier"))]
                         let width = format!("{:>10}", "n/a");
                         println!(
-                            "      depth {depth:<2}{:>26}{:>12}{:>11}{:>10}{:>10}{width}",
-                            d.confirms, d.max, d.p95, d.median, d.ge_threshold
+                            "      depth {depth:<2}{:>26}{:>12}{:>11}{:>10}{:>10}{:>10}{width}",
+                            d.confirms,
+                            d.max,
+                            d.p95,
+                            d.median,
+                            d.ge_range_floor,
+                            d.ge_membership_floor
                         );
                         // The depth resolution is the whole claim ("wide
                         // regions at EVERY level", not one big root), so
@@ -541,7 +565,8 @@ fn run_arch_queries(
                             ("max", d.max),
                             ("p95", d.p95),
                             ("median", d.median),
-                            ("ge_threshold", d.ge_threshold),
+                            ("ge_range_floor", d.ge_range_floor),
+                            ("ge_membership_floor", d.ge_membership_floor),
                             ("live_total", d.live_total),
                         ] {
                             led.outcome(
@@ -647,10 +672,11 @@ fn run_arch_queries(
                 led.span("arch_gpu/attach/total", attach_begin, attach_ns);
                 led.outcome("arch_gpu/attach/total", "signal", None);
                 println!(
-                    "  {:<32} signal (1 span, {:.0} ms, min_confirm_batch {})",
+                    "  {:<32} signal (1 span, {:.0} ms, confirm floors range {} / membership {})",
                     "arch_gpu/attach/total",
                     attach_ns as f64 / 1e6,
-                    gpu.min_confirm_batch()
+                    gpu.min_confirm_batch_range(),
+                    gpu.min_confirm_batch_membership()
                 );
                 Some(gpu)
             }

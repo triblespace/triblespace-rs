@@ -62,7 +62,7 @@
 //! sequential measures the first k DFS/frontier rows, while Rayon measures any
 //! k parallel rows and may speculatively overshoot inside in-flight searches.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 #[cfg(demand_frontier_stats)]
@@ -198,19 +198,24 @@ impl Scale {
             }),
             "below" => Some(Self {
                 name: "below",
-                // Frontier widths 1 + 8 + 64 + 512 leave 3,511 parents;
-                // at F=4 the largest confirm is 14,044 candidates.
+                // The legacy unpaged final frontier held 3,511 parents.
+                // Paging it again leaves 2,926 parents in the final range
+                // confirm: 11,704 candidates at F=4.
                 batch_parents: 4_096,
             }),
             "threshold" => Some(Self {
                 name: "threshold",
-                // The final 4,096-parent region confirms exactly 16,384
-                // candidates, the default WGPU threshold.
+                // The legacy unpaged geometry confirmed exactly 16,384
+                // candidates here. Parent paging turns its final range
+                // confirm into 3,511 * 4 = 14,044 candidates, still above
+                // the operation-shaped 8,192 range floor.
                 batch_parents: 4_681,
             }),
             "above" => Some(Self {
                 name: "above",
-                // The final 4,215-parent region confirms 16,860 candidates.
+                // The legacy unpaged final frontier held 4,215 parents.
+                // Paging it again leaves 3,630 parents in the final range
+                // confirm: 14,520 candidates at F=4.
                 batch_parents: 4_800,
             }),
             "wide" => Some(Self {
@@ -453,6 +458,13 @@ impl Fixture {
                     .collect()
             })
             .collect();
+        let distinct_batch_children: HashSet<Id> =
+            batch_children.iter().flatten().copied().collect();
+        assert_eq!(
+            distinct_batch_children.len(),
+            scale.batch_parents * FANOUT,
+            "batch fixture requires every child to be globally unique"
+        );
         let star_center = components[0][0];
         let mut graph = TribleSet::new();
 
@@ -863,24 +875,6 @@ fn validate_routing(cfg: &Config, cell: &Cell<'_>, demand: Demand, routing: Rout
                     routing.gpu_confirms > 0,
                     "parent_batch_confirm/full did not execute the expected GPU confirmation"
                 );
-                if cell.scale == "threshold" {
-                    assert_eq!(
-                        routing.gpu_confirms, 1,
-                        "threshold geometry must produce exactly one GPU confirmation"
-                    );
-                    assert_eq!(
-                        routing.gpu_candidates, 16_384,
-                        "threshold geometry must route exactly 16,384 GPU candidates"
-                    );
-                    assert_eq!(
-                        routing.cpu_fallback_confirms, 4,
-                        "threshold geometry must leave four sub-threshold confirmations"
-                    );
-                    assert_eq!(
-                        routing.cpu_fallback_candidates, 2_340,
-                        "threshold geometry must leave 2,340 CPU candidates"
-                    );
-                }
             }
             CausalRouteExpectation::No => {
                 assert_eq!(
@@ -1441,11 +1435,7 @@ fn main() {
     if cfg.gpu {
         let attach_start = Instant::now();
         let gpu = WgpuSuccinctArchive::new(archive).expect("attach resident WGPU archive");
-        eprintln!(
-            "gpu_attach_ns={} min_confirm_batch={}",
-            attach_start.elapsed().as_nanos(),
-            gpu.min_confirm_batch(),
-        );
+        eprintln!("gpu_attach_ns={}", attach_start.elapsed().as_nanos(),);
         run_backend(
             &cfg,
             &fixture,

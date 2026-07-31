@@ -4,10 +4,11 @@
 //!
 //! Until now the suite BUILT an archive (`arch/build_ram/total`) and
 //! never queried it, so the only evidence about `triblespace-gpu`'s
-//! batched confirm came from F10 — a synthetic fixture *constructed*
-//! to straddle `DEFAULT_MIN_CONFIRM_BATCH`. That says the routing
-//! works; it says nothing about whether real queries produce regions
-//! that big. This module closes that gap in two independent halves:
+//! batched confirm came from F10 — a synthetic Restrict fixture
+//! *constructed* to straddle `DEFAULT_MIN_CONFIRM_BATCH_RANGE`. That
+//! says range routing works; it says nothing about whether real queries
+//! produce regions large enough for either operation floor. This module
+//! closes that gap in two independent halves:
 //!
 //! **Phase 1 — the structural question (timing-free).** Region size is
 //! a COUNTING property, so it is trustworthy on a loaded machine.
@@ -15,10 +16,12 @@
 //! `WgpuSuccinctArchive` does — same `TriblePattern` seam, same
 //! per-leaf `Constraint::confirm` — and histograms the live-candidate
 //! count of every region it is handed, which is precisely the quantity
-//! the GPU wrapper routes on (`count_live(cands) >=
-//! min_confirm_batch`). The reported max/p95/median/`>= threshold`
-//! counts therefore answer "could the GPU have engaged?" without
-//! running a GPU or timing anything.
+//! the GPU wrapper routes on (`count_live(cands) >= operation_floor`).
+//! The census cannot identify the wrapper's eventual `ConfirmPlan`, so
+//! it reports both `>= range floor` and `>= membership floor` counts
+//! beside max/p95/median. Together they answer "could this region have
+//! engaged for either operation class?" without running a GPU or timing
+//! anything.
 //!
 //! **Phase 2 — the timed comparison.** The same queries run against
 //! the plain CPU archive and (under `--features gpu`) against a
@@ -62,22 +65,24 @@ use subject::core::query::TriblePattern;
 use crate::queries::{self, Answer};
 use crate::wd_schema::{AnyBlobReader, Dataset};
 
-/// The live-candidate count at or above which `triblespace-gpu` routes
-/// a confirm region to the device.
+/// The live-candidate floor for Restrict/range confirms.
 ///
-/// Read out of the subject whenever the gpu crate is present, exactly
-/// like F10 — the fixture must not be able to drift away from the
-/// engine's own knob. Without the gpu crate there is nothing to read,
-/// so the census falls back to the value the constant currently holds
-/// (16 384, measured on an M4 Max) purely as a REPORTING reference: no
-/// routing happens on that path, and the histogram itself is
-/// threshold-independent.
+/// Read out of the subject whenever the gpu crate is present. Without
+/// the gpu crate the census uses the current measured default purely as
+/// a REPORTING reference: no routing happens on that path, and the
+/// histogram itself is floor-independent.
 #[cfg(feature = "gpu")]
-pub const CONFIRM_THRESHOLD: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH;
-/// Reporting-only mirror of the routing threshold; see the gpu-gated
-/// sibling.
+pub const CONFIRM_RANGE_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE;
+/// Reporting-only mirror of the range floor; see the gpu-gated sibling.
 #[cfg(not(feature = "gpu"))]
-pub const CONFIRM_THRESHOLD: usize = 16_384;
+pub const CONFIRM_RANGE_FLOOR: usize = 8_192;
+
+/// The live-candidate floor for exact membership confirms.
+#[cfg(feature = "gpu")]
+pub const CONFIRM_MEMBERSHIP_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP;
+/// Reporting-only mirror of the membership floor; see the gpu-gated sibling.
+#[cfg(not(feature = "gpu"))]
+pub const CONFIRM_MEMBERSHIP_FLOOR: usize = 24_576;
 
 // ---------------------------------------------------------------------------
 // The query set
@@ -204,10 +209,10 @@ pub struct RegionStats {
     pub p95: u64,
     /// Median (nearest-rank) of the live-candidate counts.
     pub median: u64,
-    /// Confirms whose region held at least [`CONFIRM_THRESHOLD`] live
-    /// candidates — the ones `triblespace-gpu` would have routed to
-    /// the device.
-    pub ge_threshold: u64,
+    /// Confirms large enough for the Restrict/range placement floor.
+    pub ge_range_floor: u64,
+    /// Confirms large enough for the exact-membership placement floor.
+    pub ge_membership_floor: u64,
     /// Sum of live-candidate counts over all confirms (the total work
     /// the confirm path was asked to do).
     pub live_total: u64,
@@ -311,6 +316,11 @@ fn quantile(hist: &BTreeMap<u64, u64>, total: u64, q: f64) -> u64 {
     hist.keys().next_back().copied().unwrap_or(0)
 }
 
+#[cfg(feature = "protocol-v2")]
+fn at_or_above(hist: &BTreeMap<u64, u64>, floor: usize) -> u64 {
+    hist.range((floor as u64)..).map(|(_, &n)| n).sum()
+}
+
 /// A [`SuccinctArchive`] that histograms the size of every confirm
 /// region its constraints are handed.
 ///
@@ -320,7 +330,7 @@ fn quantile(hist: &BTreeMap<u64, u64>, total: u64, q: f64) -> u64 {
 /// method to the canonical `SuccinctArchiveConstraint` verbatim. The
 /// ONLY addition is one histogram bump per `confirm`, recording
 /// `count_live` at entry — byte-for-byte the quantity the GPU wrapper
-/// compares against `min_confirm_batch`. Nothing about the plan
+/// compares against the selected operation's floor. Nothing about the plan
 /// changes: `estimate` is forwarded, so the planner sees the same
 /// numbers it would without the wrapper.
 ///
@@ -391,10 +401,8 @@ where
             max: hist.keys().next_back().copied().unwrap_or(0),
             p95: quantile(&hist, confirms, 0.95),
             median: quantile(&hist, confirms, 0.5),
-            ge_threshold: hist
-                .range((CONFIRM_THRESHOLD as u64)..)
-                .map(|(_, &n)| n)
-                .sum(),
+            ge_range_floor: at_or_above(&hist, CONFIRM_RANGE_FLOOR),
+            ge_membership_floor: at_or_above(&hist, CONFIRM_MEMBERSHIP_FLOOR),
             live_total: hist.iter().map(|(&v, &n)| v * n).sum(),
         }
     }
@@ -416,8 +424,7 @@ where
         self.archive
     }
 
-    /// The per-depth census: for each depth, `(confirms, max, median,
-    /// ge_threshold, live_total)`.
+    /// The per-depth census, including counts at both operation floors.
     ///
     /// Answers the question the flat histogram cannot: whether wide
     /// regions occur at every level of the search or only at the root.
@@ -434,10 +441,8 @@ where
                         max: hist.keys().next_back().copied().unwrap_or(0),
                         p95: quantile(hist, confirms, 0.95),
                         median: quantile(hist, confirms, 0.5),
-                        ge_threshold: hist
-                            .range((CONFIRM_THRESHOLD as u64)..)
-                            .map(|(_, &n)| n)
-                            .sum(),
+                        ge_range_floor: at_or_above(hist, CONFIRM_RANGE_FLOOR),
+                        ge_membership_floor: at_or_above(hist, CONFIRM_MEMBERSHIP_FLOOR),
                         live_total: hist.iter().map(|(&v, &n)| v * n).sum(),
                     },
                 )

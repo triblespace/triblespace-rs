@@ -26,7 +26,7 @@
 //!   2026-07-27). Each one isolates ONE engine decision changed in the
 //!   Term-native / propose-confirm work of this week, so a regression
 //!   gets a name instead of a vibe. None is path-shaped, so none is
-//!   rpq-gated; only F10 (which reads the GPU routing threshold out of
+//!   rpq-gated; only F10 (which reads the GPU range-confirm floor out of
 //!   `triblespace-gpu`) is feature-gated.
 
 use std::time::Instant;
@@ -602,7 +602,7 @@ mod r2_schema {
         // F9 — mask density: proposer side and confirmer side.
         "8DC793B45ADE8B81ADE789E8313BF974" as ma: inlineencodings::GenId;
         "B0E12EFD7CF941497603F09DEDF89760" as mb: inlineencodings::GenId;
-        // F10 — GPU confirm-batch threshold: proposer side and confirmer side.
+        // F10 — GPU range-confirm floor: proposer side and confirmer side.
         "3573F33EBA6E94CBAFFD27FFBAA4A0F8" as ga: inlineencodings::GenId;
         "3E9767FEE8A1EE68C58F0419817D5140" as gb: inlineencodings::GenId;
         // F11 — lying estimates: the small source and the large source.
@@ -640,8 +640,8 @@ const ANCHOR_TAG: u32 = 0xD46B_0002;
 /// | 0..=7    | F6 arm hub value (the literal each arm matches) |
 /// | 8..=15   | F6 arm decoy value (same attribute, wrong literal) |
 /// | 16, 17   | F9 proposer root, confirmer probe |
-/// | 18, 19   | F10 below-threshold root, probe |
-/// | 20, 21   | F10 above-threshold root, probe |
+/// | 18, 19   | F10 below-range-floor root, probe |
+/// | 20, 21   | F10 above-range-floor root, probe |
 /// | 22, 23   | F11 small source root, large source root |
 /// | 24, 25   | F14 wide root, selective probe |
 /// | 26       | F15 shared hub value |
@@ -1001,19 +1001,19 @@ pub fn f9_total(set: &TribleSet) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// F10 — GPU confirm-batch threshold boundary.
+// F10 — GPU range-confirm batch-floor boundary.
 //
-// INTERROGATES: routing hysteresis around `DEFAULT_MIN_CONFIRM_BATCH`,
-// and threshold rot.
+// INTERROGATES: routing hysteresis around
+// `DEFAULT_MIN_CONFIRM_BATCH_RANGE`, and floor rot.
 //
 // `triblespace-gpu` routes a confirm region to the device only when it
-// holds at least `DEFAULT_MIN_CONFIRM_BATCH` live candidates; smaller
-// regions run the canonical CPU probes. The threshold is a MEASURED
-// crossover (an M4 Max sweep recorded in its doc comment), which means
-// it is exactly the kind of constant that silently rots. This fixture
-// straddles it: two runs whose only difference is one candidate on
-// either side of the boundary. The constant is READ from the engine
-// (never copied here), so moving it moves the fixture.
+// reaches the measured floor for the operation it is performing. F10's
+// confirmer has entity and attribute fully bound and checks candidate
+// values, so `WgpuSuccinctArchiveConstraint` lowers it to the
+// Restrict/range arm. This fixture therefore straddles
+// `DEFAULT_MIN_CONFIRM_BATCH_RANGE`: two runs whose only difference is
+// one candidate on either side of that boundary. The constant is READ
+// from the engine (never copied here), so moving it moves the fixture.
 //
 // Gate on ROWS only — the answer must be the region size on both sides,
 // which is the property routing may never change. Timings across the
@@ -1021,30 +1021,30 @@ pub fn f9_total(set: &TribleSet) -> usize {
 //
 // !!! SIZING CAVEAT. The confirm region `IntersectionConstraint` hands
 // its siblings is the whole level, so a level of `F10_BELOW` /
-// `F10_ABOVE` candidates straddles the threshold exactly. This holds on
+// `F10_ABOVE` candidates straddles the range floor exactly. This holds on
 // both protocol eras but for different reasons: before
 // engine/batched-frontier because a proposer shipped the level in one
 // call, and after it because the region spans the whole frontier — here
 // a frontier of one, since the fixture's root level has no parent. Any
 // future change that makes a level arrive in pieces (a chunk schedule, a
 // width cap below the level size) would leave both sides under the
-// routing boundary and the fixture would silently stop straddling
+// range-routing boundary and the fixture would silently stop straddling
 // anything: re-derive `F10_BELOW` / `F10_ABOVE` from whatever bounds the
 // region then, not from the level size.
 // ---------------------------------------------------------------------------
 
-/// F10: the routing threshold, read from the engine so this fixture
+/// F10: the Restrict/range routing floor, read from the engine so this fixture
 /// cannot drift away from it.
 #[cfg(feature = "gpu")]
-pub const F10_THRESHOLD: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH;
+pub const F10_RANGE_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE;
 
-/// F10: candidates just BELOW the routing threshold (CPU probes).
+/// F10: candidates just BELOW the range-routing floor (CPU probes).
 #[cfg(feature = "gpu")]
-pub const F10_BELOW: usize = F10_THRESHOLD - 1;
+pub const F10_BELOW: usize = F10_RANGE_FLOOR - 1;
 
-/// F10: candidates just ABOVE the routing threshold (device confirm).
+/// F10: candidates just ABOVE the range-routing floor (device confirm).
 #[cfg(feature = "gpu")]
-pub const F10_ABOVE: usize = F10_THRESHOLD + 1;
+pub const F10_ABOVE: usize = F10_RANGE_FLOOR + 1;
 
 /// F10 root of the region of size `n`.
 #[cfg(feature = "gpu")]
