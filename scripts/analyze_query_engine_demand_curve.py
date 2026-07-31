@@ -57,6 +57,8 @@ REQUIRED_FIELDS = {
     "record",
     "run_id",
     "abba_position",
+    "invocation_sequence",
+    "repetition",
     "engine",
     "engine_variant",
     "harness",
@@ -720,13 +722,14 @@ def render_summary(
             grouped[key].append(int(row["elapsed_ns"]))
     for key, values in grouped.items():
         parallelism = key[CELL_FIELDS.index("parallelism")]
-        spread = (max(values) - min(values)) / statistics.median(values)
+        median = statistics.median(values)
+        spread = statistics.median(abs(value - median) for value in values) / median
         spreads[(parallelism, "all")].append(spread)
-        if statistics.median(values) >= 1_000_000:
+        if median >= 1_000_000:
             spreads[(parallelism, ">=1 ms")].append(spread)
     lines += ["", "## Repeat spread", ""]
     lines += markdown_table(
-        ("parallelism", "cells", "median within-invocation range/median", "p90", "p99"),
+        ("parallelism", "cells", "median within-invocation MAD/median", "p90", "p99"),
         (
             (
                 parallelism,
