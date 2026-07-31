@@ -1100,27 +1100,31 @@ pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 /// starts its candidate drain at that page's width: `propose`/`confirm` already
 /// paid for that many parent rows, so restarting a second ramp at one would
 /// discard useful amortisation credit. This is an execution policy, not a
-/// claim that the caller requested every child: beyond the first overall
-/// result it may materialise a wider child chunk before the next yield.
+/// claim that the caller requested every child: after internal search has
+/// widened the source schedule it may materialise a wider child chunk before
+/// the next yield — even if earlier pages produced no caller-visible row.
 ///
-/// Starting the source schedule at one keeps time-to-first-result identical
-/// to plain depth-first search. A query the caller stops after one row —
-/// `exists!`, `.next()` — opens only a one-row source page, so its candidate
-/// level inherits a width of one and does exactly the work the pre-batching
-/// engine did. Wider inherited credit is only reachable after sustained
-/// demand has already widened an earlier schedule. Measured on a
-/// first-row-only join, a flat full-width engine is **8.8x** slower than the
-/// pre-batching engine; the scalar first page closes the whole gap.
+/// Starting the source schedule at one keeps the first *successful search
+/// path* identical to plain depth-first search. Its candidate level inherits a
+/// width of one, so a query whose first path produces a row pays exactly the
+/// work the pre-batching engine did. This is deliberately not a universal
+/// `.next()` latency guarantee: if earlier source pages produce no completion,
+/// the engine can widen internally before yielding anything, and a later page
+/// then carries wider credit into its child drain. Sparse and failing prefixes
+/// are therefore part of the policy's benchmark surface. Measured on a dense
+/// first-row join, a flat full-width engine is **8.8x** slower than the
+/// pre-batching engine; the scalar first successful path closes that gap.
 ///
 /// This is the same insight as the `INITIAL_CHUNK`/`WIDEN_FACTOR` pair this
 /// branch deleted, and as the deleted residual engine's rule that search
 /// width grows geometrically after negative work — recovered at the right
 /// layer (the frontier) instead of the wrong one (per-parent chunking).
 ///
-/// Starting at one protects `.next()` and `exists!`; the ramp then trades
-/// low-demand granularity against full-drain batch width. The base controls
-/// that trade. Doubling was measured and rejected because its final chunk is
-/// only about half a drain, but base eight retains seven eighths
+/// Starting at one protects `.next()` and `exists!` when an early path
+/// succeeds; after failures the ramp trades low-demand granularity against
+/// full-drain batch width. The base controls that trade. Doubling was measured
+/// and rejected because its final chunk is only about half a drain, but base
+/// eight retains seven eighths
 /// asymptotically while reaching the ceiling in far fewer steps. See
 /// [`FRONTIER_RAMP_BASE`] for the measured rationale.
 pub const INITIAL_FRONTIER_WIDTH: usize = 1;
@@ -1210,12 +1214,13 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
 ///
 /// The width is per level rather than per query because it starts with the
 /// parent source page that opened this level, then records how far this
-/// level's own drain has widened. The first source page is a single row, so
-/// a caller who stops after one result still never pays for a batch it will
-/// not look at; later pages deliberately reuse source work already paid by
-/// sustained demand. This is only an execution partition: the row-fiber law
-/// preserves the exact tagged bag, while result order is not part of the
-/// contract. See [`INITIAL_FRONTIER_WIDTH`].
+/// level's own drain has widened. The first source page is a single row, so a
+/// successful first path remains scalar. Earlier failing paths can widen the
+/// source schedule before any row is visible to the caller; a later page then
+/// deliberately reuses that already-paid source work. This is only an
+/// execution partition: the row-fiber law preserves the exact tagged bag,
+/// while result order is not part of the contract. See
+/// [`INITIAL_FRONTIER_WIDTH`].
 ///
 /// `proposed` is the `O(1)` gate on the in-place descent: a level with more
 /// candidates than parent rows cannot possibly yield one child per parent,

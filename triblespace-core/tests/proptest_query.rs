@@ -1626,6 +1626,102 @@ fn source_pages_credit_one_to_one_candidate_chunks() {
     );
 }
 
+/// A terminal membership constraint that deliberately leaves the first two
+/// roots without a completion. Its deliberately loose estimate keeps the
+/// one-to-one map as proposer; this constraint only confirms.
+struct LateSuccessGate {
+    variable: usize,
+    accepted: [u8; 32],
+}
+
+impl<'a> Constraint<'a> for LateSuccessGate {
+    fn variables(&self) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        set.set(self.variable);
+        set
+    }
+
+    fn estimate(&self, variable: usize, _binding: &Binding) -> Option<usize> {
+        (variable == self.variable).then_some(1 << 30)
+    }
+
+    fn influence(&self, _variable: usize) -> triblespace_core::query::VariableSet {
+        triblespace_core::query::VariableSet::new_empty()
+    }
+
+    fn propose(
+        &self,
+        variable: usize,
+        _frontier: &triblespace_core::query::Frontier<'_>,
+        _proposals: &mut ProposalBuffer,
+    ) {
+        if variable == self.variable {
+            panic!("the loose terminal gate must not become the proposer");
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: usize,
+        _frontier: &triblespace_core::query::Frontier<'_>,
+        candidates: &mut Candidates<'_>,
+    ) {
+        if variable == self.variable {
+            candidates.retain(|candidate| candidate == &self.accepted);
+        }
+    }
+}
+
+#[test]
+fn source_schedule_can_widen_before_a_sparse_first_result() {
+    const N: u32 = 17;
+    const WIDTH: usize = 4096;
+    const FIRST_SUCCESSFUL_ROOT: u32 = 2;
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(vec![Vec::new(); 3]));
+    let second = OneToOneMapLayer::successor(1, N, FIRST_SUCCESSFUL_ROOT);
+    let accepted = value(0xD2, OneToOneMapLayer::successor(2, N, second));
+    let mut layers: Vec<Box<dyn Constraint + Send + Sync>> = (0..3)
+        .map(|variable| {
+            Box::new(OneToOneMapLayer {
+                variable,
+                count: N,
+                calls: std::sync::Arc::clone(&calls),
+            }) as Box<dyn Constraint + Send + Sync>
+        })
+        .collect();
+    layers.push(Box::new(LateSuccessGate {
+        variable: 2,
+        accepted,
+    }));
+
+    let mut query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(layers),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?, *binding.get(2)?)),
+    )
+    .with_frontier_width(WIDTH);
+    let stats = query.stats();
+    let first = query.next().expect("the third root has one completion");
+
+    assert_eq!(
+        first,
+        (
+            value(0xD0, FIRST_SUCCESSFUL_ROOT),
+            value(0xD1, second),
+            accepted,
+        )
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0], [1]);
+    assert_eq!(calls[1], [1, 1, 7]);
+    assert_eq!(calls[2], [1, 1, 1]);
+    assert_eq!(
+        stats.widest(),
+        8,
+        "two failures can widen an internal frontier before the first yield"
+    );
+}
+
 /// `with_frontier_width` is a CEILING, and the ramp must not lift it.
 ///
 /// The tail merge — never leave a remainder smaller than the chunk before
