@@ -662,10 +662,13 @@ fn digest_sorted(rows: &[CanonicalRow]) -> String {
 fn corpus_digest(set: &TribleSet) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(set.len() as u64).to_le_bytes());
-    // TribleSet::iter is the canonical EAV traversal. Hashing the raw tribles
-    // identifies the corpus rather than merely its cardinality.
-    for trible in set.iter() {
-        hasher.update(&trible.data);
+    // Internal trie traversal order is deliberately not a semantic invariant
+    // (and keyed fingerprints can vary it between processes). Sort raw EAV
+    // tribles so this identifies the set, not one internal traversal.
+    let mut tribles: Vec<_> = set.iter().map(|trible| trible.data).collect();
+    tribles.sort_unstable();
+    for trible in &tribles {
+        hasher.update(trible);
     }
     hasher.finalize().to_hex().to_string()
 }
