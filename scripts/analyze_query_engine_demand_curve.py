@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import math
 import statistics
 from collections import defaultdict
@@ -108,18 +109,90 @@ def one(values: Iterable[str], description: str) -> str:
     return next(iter(distinct))
 
 
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_artifact(result_dir: Path, manifest: Mapping[str, str]) -> None:
+    expected = {
+        "harness.rs": manifest["harness_sha256"],
+        "runner.sh": manifest["runner_sha256"],
+        "locks/Cargo.lock": manifest["dependency_lock_sha256"],
+        "bin/query_engine_demand_curve-old": manifest["old_binary_sha256"],
+        "bin/query_engine_demand_curve-current": manifest["current_binary_sha256"],
+        "bin/query_engine_demand_curve-current-w1": manifest[
+            "current_w1_binary_sha256"
+        ],
+    }
+    for relative, expected_hash in expected.items():
+        path = result_dir / relative
+        if not path.is_file():
+            raise ValueError(f"artifact is missing {relative}")
+        observed_hash = sha256(path)
+        if observed_hash != expected_hash:
+            raise ValueError(
+                f"artifact hash mismatch for {relative}: "
+                f"observed={observed_hash} expected={expected_hash}"
+            )
+
+
 def validate(
     rows: Sequence[Mapping[str, str]], manifest: Mapping[str, str]
 ) -> dict[str, int]:
     if not rows:
         raise ValueError("observations are empty")
-    one((row["run_id"] for row in rows), "run id")
-    one((row["harness"] for row in rows), "harness hash")
+    observed_run = one((row["run_id"] for row in rows), "run id")
+    if observed_run != manifest["run_id"]:
+        raise ValueError("manifest/observation run-id mismatch")
+    observed_harness = one((row["harness"] for row in rows), "harness hash")
+    if observed_harness != manifest["harness_sha256"]:
+        raise ValueError("manifest/observation harness mismatch")
     observed_lock = one((row["dependency_lock"] for row in rows), "dependency lock")
     if observed_lock != manifest["dependency_lock_sha256"]:
         raise ValueError("manifest/observation dependency-lock mismatch")
     if any(int(row["gpu_errors"]) != 0 for row in rows):
         raise ValueError("at least one observation reports a GPU error")
+
+    expected_arms = {
+        "primary-A1": (manifest["old_revision"], "default"),
+        "primary-B1": (manifest["current_revision"], "default"),
+        "primary-B2": (manifest["current_revision"], "default"),
+        "primary-A2": (manifest["old_revision"], "default"),
+        "ablation-C1": (manifest["current_revision"], "frontier-w1"),
+        "ablation-B1": (manifest["current_revision"], "default"),
+        "ablation-B2": (manifest["current_revision"], "default"),
+        "ablation-C2": (manifest["current_revision"], "frontier-w1"),
+    }
+    scales = manifest["scales"].split()
+    scale_ordinals = {scale: ordinal for ordinal, scale in enumerate(scales)}
+    position_ordinals = {
+        position: ordinal for ordinal, position in enumerate(POSITIONS)
+    }
+    for row in rows:
+        position = row["abba_position"]
+        if position not in expected_arms:
+            raise ValueError(f"unexpected ABBA position {position!r}")
+        observed_arm = (row["engine"], row["engine_variant"])
+        if observed_arm != expected_arms[position]:
+            raise ValueError(
+                f"ABBA arm mismatch at {position}: "
+                f"observed={observed_arm} expected={expected_arms[position]}"
+            )
+        scale = row["scale"]
+        if scale not in scale_ordinals:
+            raise ValueError(f"observation has unmanifested scale {scale!r}")
+        expected_invocation = (
+            scale_ordinals[scale] * len(POSITIONS) + position_ordinals[position]
+        )
+        if int(row["invocation_sequence"]) != expected_invocation:
+            raise ValueError(
+                f"invocation mismatch for {scale}/{position}: "
+                f"observed={row['invocation_sequence']} expected={expected_invocation}"
+            )
 
     corpora: dict[str, set[str]] = defaultdict(set)
     for row in rows:
@@ -365,11 +438,13 @@ def work_summary(rows: Sequence[Mapping[str, str]]) -> list[dict[str, object]]:
             for field in (
                 "scale",
                 "batch_parents",
+                "fanout",
                 "backend",
                 "substrate",
                 "parallelism",
                 "shape",
                 "demand",
+                "engine",
                 "engine_variant",
             )
         )
@@ -379,11 +454,13 @@ def work_summary(rows: Sequence[Mapping[str, str]]) -> list[dict[str, object]]:
     key_fields = (
         "scale",
         "batch_parents",
+        "fanout",
         "backend",
         "substrate",
         "parallelism",
         "shape",
         "demand",
+        "engine",
         "engine_variant",
     )
     for key, group in sorted(groups.items(), key=lambda item: item[0]):
@@ -679,6 +756,7 @@ def main() -> None:
     manifest_path = result_dir / "manifest.tsv"
     rows = read_tsv(observations)
     manifest = read_manifest(manifest_path)
+    validate_artifact(result_dir, manifest)
     record_counts = validate(rows, manifest)
     reduced = reduce_samples(rows)
     work = work_summary(rows)
