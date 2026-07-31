@@ -216,12 +216,15 @@ pub fn current_engine() -> Engine {
 /// The uniform row stream every translation consumes: a fresh
 /// [`Query`] driven to completion by the selected [`Engine`] (today,
 /// the sole surviving residual-state engine — see [`Engine`]).
-pub struct Rows<C, P: Fn(&Binding) -> Option<R>, R>(Query<C, P, R>);
+pub struct Rows<C, P: Fn(&Binding) -> Option<R>, R, S: subject::core::query::FrontierStatsSink>(
+    Query<C, P, R, S>,
+);
 
-impl<'a, C, P, R> Iterator for Rows<C, P, R>
+impl<'a, C, P, R, S> Iterator for Rows<C, P, R, S>
 where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
+    S: subject::core::query::FrontierStatsSink,
 {
     type Item = R;
 
@@ -331,7 +334,7 @@ fn phase_row() {
 /// clone, so stashing it here — before the iterator is consumed —
 /// makes `FrontierStats::widest` readable afterwards for every query
 /// in this module, with no per-call-site instrumentation.
-pub fn run<'a, C, P, R>(q: Query<C, P, R>) -> Rows<C, P, R>
+pub fn run<'a, C, P, R>(q: Query<C, P, R>) -> impl Iterator<Item = R>
 where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
@@ -348,6 +351,8 @@ where
     // together — and NOT a measurement of width as a tunable.
     #[cfg(feature = "frontier-w1")]
     let q = q.with_frontier_width(1);
+    #[cfg(feature = "frontier")]
+    let q = q.with_frontier_stats();
     #[cfg(feature = "frontier")]
     crate::archq::note_frontier_stats(q.stats());
     match current_engine() {

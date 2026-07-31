@@ -1184,7 +1184,7 @@ fn widened_width(current: usize, remaining: usize, ceiling: usize) -> usize {
 /// which provides a convenient way to declare variables and concrete types for them.
 /// And which sets up the nessecairy context for higher-level query languages
 /// like the one provided by the [`crate::macros`] module.
-pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
+pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R, S: FrontierStatsSink = NoFrontierStats> {
     constraint: C,
     postprocessing: P,
     mode: Search,
@@ -1212,7 +1212,11 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     drawn: Vec<u32>,
     /// Scratch: each freshly-drawn child row's parent row number.
     parents: Vec<u32>,
-    stats: Arc<FrontierStats>,
+    /// Statically-dispatched observational sink. The default
+    /// [`NoFrontierStats`] is zero-sized and its event methods inline away;
+    /// [`Query::with_frontier_stats`] replaces it with the shared atomic
+    /// recorder used by diagnostics.
+    stats: S,
 }
 
 /// One pushed search level: the variable it binds, how wide its *next*
@@ -1311,9 +1315,10 @@ impl Depth {
 /// rather than assumed because a row is never moved onto a variable it did
 /// not choose — see [`Query::plan`].
 ///
-/// Counters use relaxed atomics and are shared with every rayon clone of
-/// the query, so a snapshot taken after the iterator is exhausted covers
-/// the whole (possibly parallel) run.
+/// Instrumented queries use relaxed atomics shared with every rayon clone, so
+/// a snapshot taken after the iterator is exhausted covers the whole
+/// (possibly parallel) run. Ordinary queries do not allocate or update these
+/// counters; opt in with [`Query::with_frontier_stats`].
 #[derive(Debug, Default)]
 pub struct FrontierStats {
     expansions: AtomicU64,
@@ -1395,13 +1400,85 @@ impl FrontierStats {
     }
 }
 
+mod frontier_stats_sink {
+    pub trait Sealed {}
+}
+
+/// The zero-sized instrumentation mode used by ordinary queries.
+///
+/// This type is public only because it is the default type parameter of
+/// [`Query`]. Its event methods are statically dispatched and inline to
+/// nothing, so an unobserved query carries no stats pointer, allocation,
+/// branch, or atomic update.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoFrontierStats;
+
+impl frontier_stats_sink::Sealed for NoFrontierStats {}
+impl frontier_stats_sink::Sealed for Arc<FrontierStats> {}
+
+/// Internal static-dispatch seam for optional frontier instrumentation.
+///
+/// The trait is sealed because these events describe engine internals rather
+/// than a stable extension API. It is public only because it appears in
+/// [`Query`]'s generic bounds.
+#[doc(hidden)]
+pub trait FrontierStatsSink: frontier_stats_sink::Sealed {
+    fn expansion(&self, rows: usize, variable_groups: usize);
+    fn proposals(&self, proposals: usize);
+    fn inplace_descent(&self);
+    fn copied_descent(&self);
+}
+
+impl FrontierStatsSink for NoFrontierStats {
+    #[inline(always)]
+    fn expansion(&self, _rows: usize, _variable_groups: usize) {}
+
+    #[inline(always)]
+    fn proposals(&self, _proposals: usize) {}
+
+    #[inline(always)]
+    fn inplace_descent(&self) {}
+
+    #[inline(always)]
+    fn copied_descent(&self) {}
+}
+
+impl FrontierStatsSink for Arc<FrontierStats> {
+    #[inline]
+    fn expansion(&self, rows: usize, variable_groups: usize) {
+        self.expansions.fetch_add(1, Ordering::Relaxed);
+        self.rows.fetch_add(rows as u64, Ordering::Relaxed);
+        self.widest.fetch_max(rows as u64, Ordering::Relaxed);
+        self.variable_groups
+            .fetch_add(variable_groups as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn proposals(&self, proposals: usize) {
+        self.proposals
+            .fetch_add(proposals as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn inplace_descent(&self) {
+        self.inplace_descents.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn copied_descent(&self) {
+        self.copied_descents.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
 // which isn't actually needed — `R` only appears in `P`'s return type.
 #[cfg(feature = "parallel")]
-impl<C, P, R> Clone for Query<C, P, R>
+impl<C, P, R, S> Clone for Query<C, P, R, S>
 where
     C: Clone,
     P: Fn(&Binding<'_>) -> Option<R> + Clone,
+    S: FrontierStatsSink + Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -1425,16 +1502,17 @@ where
             choice: Vec::new(),
             drawn: Vec::new(),
             parents: Vec::new(),
-            stats: Arc::clone(&self.stats),
+            stats: self.stats.clone(),
         }
     }
 }
 
 #[cfg(feature = "parallel")]
-impl<C, P, R> Query<C, P, R>
+impl<C, P, R, S> Query<C, P, R, S>
 where
     C: Clone,
     P: Fn(&Binding<'_>) -> Option<R> + Clone,
+    S: FrontierStatsSink + Clone,
 {
     /// Bisects the pending candidates of the current source, leaving the
     /// prefix in `self` and returning the suffix as a fenced sibling query.
@@ -1548,7 +1626,52 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             choice: Vec::new(),
             drawn: Vec::new(),
             parents: Vec::new(),
-            stats: Arc::new(FrontierStats::default()),
+            stats: NoFrontierStats,
+        }
+    }
+}
+
+impl<C, P, R, S> Query<C, P, R, S>
+where
+    P: Fn(&Binding<'_>) -> Option<R>,
+    S: FrontierStatsSink,
+{
+    fn replace_stats<T: FrontierStatsSink>(self, stats: T) -> Query<C, P, R, T> {
+        let Query {
+            constraint,
+            postprocessing,
+            mode,
+            has_emitted,
+            bindings,
+            influences,
+            unbound,
+            slots,
+            width,
+            stack,
+            depths,
+            depth,
+            choice,
+            drawn,
+            parents,
+            stats: _,
+        } = self;
+        Query {
+            constraint,
+            postprocessing,
+            mode,
+            has_emitted,
+            bindings,
+            influences,
+            unbound,
+            slots,
+            width,
+            stack,
+            depths,
+            depth,
+            choice,
+            drawn,
+            parents,
+            stats,
         }
     }
 
@@ -1569,14 +1692,42 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         self.width = width;
         self
     }
+}
 
-    /// Observational counters for this query's frontiers. The handle is
-    /// shared with every rayon clone, so it stays meaningful under parallel
-    /// execution.
+impl<C, P, R> Query<C, P, R>
+where
+    P: Fn(&Binding<'_>) -> Option<R>,
+{
+    /// Enables observational frontier counters for this query.
+    ///
+    /// Instrumentation is opt-in so an ordinary query pays no allocation,
+    /// branch, or atomic-update cost. Call this before consuming the query,
+    /// then retain [`stats`](Query::stats) across iteration to inspect the
+    /// result. The handle is shared with every rayon clone.
+    pub fn with_frontier_stats(self) -> Query<C, P, R, Arc<FrontierStats>> {
+        self.replace_stats(Arc::new(FrontierStats::default()))
+    }
+}
+
+impl<C, P, R> Query<C, P, R, Arc<FrontierStats>>
+where
+    P: Fn(&Binding<'_>) -> Option<R>,
+{
+    /// Observational counters for an instrumented query.
+    ///
+    /// The handle is shared with every rayon clone, so it stays meaningful
+    /// after either sequential or parallel execution consumes the query.
     pub fn stats(&self) -> Arc<FrontierStats> {
         Arc::clone(&self.stats)
     }
+}
 
+impl<'a, C, P, R, S> Query<C, P, R, S>
+where
+    C: Constraint<'a>,
+    P: Fn(&Binding<'_>) -> Option<R>,
+    S: FrontierStatsSink,
+{
     /// The frontier currently at the top of the stack, unrestricted.
     fn frontier(&self) -> Frontier<'_> {
         let depth = &self.depths[self.depth];
@@ -1670,13 +1821,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         depth.group_row = 0;
         depth.group_width = INITIAL_FRONTIER_WIDTH.min(self.width);
 
-        self.stats.expansions.fetch_add(1, Ordering::Relaxed);
-        self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
-        self.stats.widest.fetch_max(rows as u64, Ordering::Relaxed);
-        self.stats.variable_groups.fetch_add(
-            self.depths[self.depth].groups.len() as u64,
-            Ordering::Relaxed,
-        );
+        self.stats
+            .expansion(rows, self.depths[self.depth].groups.len());
         self.mode = Search::NextGroup;
     }
 
@@ -1762,9 +1908,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                 source_end: range.end,
                 source_group: group,
             });
-            self.stats
-                .proposals
-                .fetch_add(proposed as u64, Ordering::Relaxed);
+            self.stats.proposals(proposed);
             self.mode = Search::NextChunk;
             return;
         }
@@ -1910,7 +2054,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             for (row, &entry) in self.drawn.iter().enumerate() {
                 block[row * slots + variable] = entry;
             }
-            self.stats.inplace_descents.fetch_add(1, Ordering::Relaxed);
+            self.stats.inplace_descent();
         } else {
             if speculate {
                 // Speculated and lost: the rows still have to be written,
@@ -1939,7 +2083,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                     &source.estimates[parent_row * slots..(parent_row + 1) * slots],
                 );
             }
-            self.stats.copied_descents.fetch_add(1, Ordering::Relaxed);
+            self.stats.copied_descent();
         }
         child.rows = rows;
         child.group = 0;
@@ -1998,7 +2142,12 @@ enum Search {
     Done,
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Query<C, P, R> {
+impl<'a, C, P, R, S> Iterator for Query<C, P, R, S>
+where
+    C: Constraint<'a>,
+    P: Fn(&Binding<'_>) -> Option<R>,
+    S: FrontierStatsSink,
+{
     type Item = R;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2043,7 +2192,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Qu
     }
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for Query<C, P, R> {
+impl<'a, C, P, R, S> fmt::Debug for Query<C, P, R, S>
+where
+    C: Constraint<'a>,
+    P: Fn(&Binding<'_>) -> Option<R>,
+    S: FrontierStatsSink,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Query")
             .field("constraint", &std::any::type_name::<C>())
@@ -2130,19 +2284,25 @@ mod parallel {
     /// A bounded per-producer budget (`num_threads²`) caps the split tree
     /// at ~N² leaves — enough for each worker to have roughly N chunks to
     /// rebalance via stealing — regardless of stealing pressure.
-    pub struct QueryParIter<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
-        inner: Box<Query<C, P, R>>,
+    pub struct QueryParIter<
+        C,
+        P: Fn(&Binding<'_>) -> Option<R>,
+        R,
+        S: FrontierStatsSink = NoFrontierStats,
+    > {
+        inner: Box<Query<C, P, R, S>>,
         split_budget: usize,
     }
 
-    impl<'a, C, P, R> IntoParallelIterator for Query<C, P, R>
+    impl<'a, C, P, R, S> IntoParallelIterator for Query<C, P, R, S>
     where
         C: Constraint<'a> + Clone + Send + 'a,
         P: Fn(&Binding<'_>) -> Option<R> + Clone + Send,
         R: Send,
+        S: FrontierStatsSink + Clone + Send,
     {
         type Item = R;
-        type Iter = QueryParIter<C, P, R>;
+        type Iter = QueryParIter<C, P, R, S>;
 
         fn into_par_iter(self) -> Self::Iter {
             // num_threads² chunks: intuition is "every worker has one spare
@@ -2159,11 +2319,12 @@ mod parallel {
         }
     }
 
-    impl<'a, C, P, R> UnindexedProducer for QueryParIter<C, P, R>
+    impl<'a, C, P, R, S> UnindexedProducer for QueryParIter<C, P, R, S>
     where
         C: Constraint<'a> + Clone + Send + 'a,
         P: Fn(&Binding<'_>) -> Option<R> + Clone + Send,
         R: Send,
+        S: FrontierStatsSink + Clone + Send,
     {
         type Item = R;
 
@@ -2223,11 +2384,12 @@ mod parallel {
         }
     }
 
-    impl<'a, C, P, R> ParallelIterator for QueryParIter<C, P, R>
+    impl<'a, C, P, R, S> ParallelIterator for QueryParIter<C, P, R, S>
     where
         C: Constraint<'a> + Clone + Send + 'a,
         P: Fn(&Binding<'_>) -> Option<R> + Clone + Send,
         R: Send,
+        S: FrontierStatsSink + Clone + Send,
     {
         type Item = R;
 

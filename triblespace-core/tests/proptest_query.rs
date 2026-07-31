@@ -991,7 +991,8 @@ fn the_ramp_keeps_a_short_circuiting_query_narrow() {
             Box::new(inner),
         ]),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
-    );
+    )
+    .with_frontier_stats();
     let stats = query.stats();
     assert!(query.next().is_some());
 
@@ -1035,7 +1036,8 @@ fn frontier_stats_report_an_unfragmented_batch() {
             Box::new(inner),
         ]),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
-    );
+    )
+    .with_frontier_stats();
     let stats = query.stats();
     let rows: Vec<_> = query.collect();
 
@@ -1163,7 +1165,8 @@ fn a_one_to_one_chain_descends_in_place() {
     let query = triblespace_core::query::Query::new(
         triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(links),
         |binding: &Binding| Some(*binding.get(HOPS - 1)?),
-    );
+    )
+    .with_frontier_stats();
     let stats = query.stats();
     let rows: Vec<_> = query.collect();
 
@@ -1200,7 +1203,8 @@ fn a_branching_descent_still_copies() {
             Box::new(inner),
         ]),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
-    );
+    )
+    .with_frontier_stats();
     let stats = query.stats();
     let rows: Vec<_> = query.collect();
 
@@ -1240,7 +1244,8 @@ fn the_short_circuiting_query_still_sees_the_full_width_afterwards() {
             Box::new(inner),
         ]),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
-    );
+    )
+    .with_frontier_stats();
     let stats = query.stats();
     assert_eq!(query.count(), 512 * 512);
 
@@ -1367,7 +1372,8 @@ fn skewed_rows(width: usize) -> (Vec<([u8; 32], [u8; 32], [u8; 32])>, (u64, u64)
         ]),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?, *binding.get(2)?)),
     )
-    .with_frontier_width(width);
+    .with_frontier_width(width)
+    .with_frontier_stats();
     let stats = query.stats();
     let mut rows: Vec<_> = query.collect();
     rows.sort_unstable();
@@ -1421,7 +1427,8 @@ fn equality_fiber_rows(width: usize) -> (Vec<([u8; 32], [u8; 32])>, u64) {
         ]),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
     )
-    .with_frontier_width(width);
+    .with_frontier_width(width)
+    .with_frontier_stats();
     let stats = query.stats();
     let mut rows: Vec<_> = query.collect();
     rows.sort_unstable();
@@ -1579,7 +1586,8 @@ fn source_pages_credit_one_to_one_candidate_chunks() {
         triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(layers),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?, *binding.get(2)?)),
     )
-    .with_frontier_width(WIDTH);
+    .with_frontier_width(WIDTH)
+    .with_frontier_stats();
     let stats = query.stats();
     let mut actual: Vec<_> = query.collect();
     actual.sort_unstable();
@@ -1699,7 +1707,8 @@ fn source_credit_is_fenced_before_a_sparse_first_result() {
         triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(layers),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?, *binding.get(2)?)),
     )
-    .with_frontier_width(WIDTH);
+    .with_frontier_width(WIDTH)
+    .with_frontier_stats();
     let stats = query.stats();
     let first = query.next().expect("the third root has one completion");
 

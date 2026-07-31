@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Frontier instrumentation is opt-in and zero-cost when unobserved.**
+  Ordinary `Query` values carry a zero-sized statically dispatched sink whose
+  event methods inline away: no stats allocation, pointer, branch, atomic
+  update, or rayon refcount traffic remains on the default search path.
+  `Query::with_frontier_stats` enables the existing shared `FrontierStats`
+  handle for sequential or parallel diagnostics. The demand-curve harness
+  records work in separate instrumented executions while timed samples use
+  the uninstrumented specialization.
 - **Breaking: candidate liveness is bit-packed.** The query engine's
   one-`u32`-per-candidate liveness becomes 32 candidates per `u32`, with
   `count_live`/`next_live` folding whole words through

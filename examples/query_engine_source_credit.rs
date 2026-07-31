@@ -632,8 +632,12 @@ impl Constraint<'static> for TerminalGate {
 
 type DynConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 type Row = (RawInline, RawInline);
-type SourceQuery =
-    Query<IntersectionConstraint<DynConstraint>, fn(&Binding<'_>) -> Option<Row>, Row>;
+type SourceQuery = Query<
+    IntersectionConstraint<DynConstraint>,
+    fn(&Binding<'_>) -> Option<Row>,
+    Row,
+    Arc<FrontierStats>,
+>;
 
 fn project(binding: &Binding<'_>) -> Option<Row> {
     Some((
@@ -711,7 +715,8 @@ fn prepare(variables: usize, scenario: Scenario, instrument_calls: bool) -> Prep
     let query = Query::new(
         IntersectionConstraint::new(constraints),
         project as fn(&Binding<'_>) -> Option<Row>,
-    );
+    )
+    .with_frontier_stats();
     let stats = query.stats();
     Prepared {
         query,

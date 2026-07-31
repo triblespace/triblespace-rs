@@ -215,7 +215,8 @@ first one.
 Ownership needs no separate flag. The matrices already sit behind `Arc` so a
 rayon split copies refcounts, and `Arc::get_mut` therefore succeeds exactly
 when no split or steal holds the other half; when it says no, the copying path
-runs. `FrontierStats` counts both paths.
+runs. An instrumented query (`query.with_frontier_stats()`) exposes
+`FrontierStats` that counts both paths; ordinary queries carry no recorder.
 
 The fast path is gated so that it costs nothing when it cannot fire.
 Recognising a 1:1 draw means deferring the child rows until the draw's shape
@@ -237,8 +238,9 @@ and the protocol supplies no cross-variable support-equivalence law, so an
 estimate-compatible variable is not an interchangeable action. All the leeway
 lives in the bucketing described next — which is exactly why agreement, and so
 an unsplit batch, is the common case.
-[`FrontierStats`](triblespace::core::query::FrontierStats) counts expansions,
-rows and groups, so fragmentation is observed rather than assumed.
+Opt-in [`FrontierStats`](triblespace::core::query::FrontierStats) counts
+expansions, rows and groups, so diagnostics can observe fragmentation without
+charging ordinary queries for atomic counters.
 
 Specificity is deliberately coarse. The sort key is the *bit length* of the
 estimate (`ilog2(n) + 1`), so counts inside the same power-of-two bucket are

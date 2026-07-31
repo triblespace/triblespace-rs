@@ -1288,6 +1288,8 @@ macro_rules! diagnostic_query {
     ($query:expr) => {{
         let query = configured_query!($query);
         #[cfg(demand_frontier_stats)]
+        let query = query.with_frontier_stats();
+        #[cfg(demand_frontier_stats)]
         let work = query.stats();
         #[cfg(not(demand_frontier_stats))]
         let work = NoWorkProbe;
