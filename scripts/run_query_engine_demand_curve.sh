@@ -11,6 +11,7 @@ set -euo pipefail
 #
 # Optional environment:
 #   RUN_ID, OLD_REV, CURRENT_REV, SCALES, REPETITIONS, WARMUP,
+#   OLD_CAUSAL_ROUTE_SCALES, CURRENT_CAUSAL_ROUTE_SCALES,
 #   RAYON_NUM_THREADS, DEMAND_CURVE_CACHE_ROOT
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,6 +32,8 @@ fi
 OLD_REV=${OLD_REV:-2cd60807}
 CURRENT_REV=${CURRENT_REV:-d75556ae}
 SCALES=${SCALES:-"tiny below threshold above wide"}
+OLD_CAUSAL_ROUTE_SCALES=${OLD_CAUSAL_ROUTE_SCALES:-""}
+CURRENT_CAUSAL_ROUTE_SCALES=${CURRENT_CAUSAL_ROUTE_SCALES:-"threshold above wide"}
 read -r -a SCALE_LIST <<<"$SCALES"
 [[ ${#SCALE_LIST[@]} -gt 0 ]] || {
     echo "SCALES must name at least one scale" >&2
@@ -176,6 +179,8 @@ build_subject current-w1 "$CURRENT_WORKTREE" "$CURRENT_REV" current \
     printf 'repetitions_per_invocation\t%s\n' "$REPETITIONS"
     printf 'warmups_per_invocation\t%s\n' "$WARMUP"
     printf 'scales\t%s\n' "$SCALES"
+    printf 'old_causal_route_scales\t%s\n' "$OLD_CAUSAL_ROUTE_SCALES"
+    printf 'current_causal_route_scales\t%s\n' "$CURRENT_CAUSAL_ROUTE_SCALES"
     printf 'rustc\t%s\n' "$(rustc --version)"
     printf 'cargo\t%s\n' "$(cargo --version)"
     printf 'uname\t%s\n' "$(uname -a)"
@@ -188,8 +193,12 @@ fi
 route_expectation() {
     local label=$1
     local scale=$2
-    if [[ "$label" == current ]] &&
-        [[ "$scale" == threshold || "$scale" == above || "$scale" == wide ]]; then
+    local routed_scales=""
+    case "$label" in
+        old) routed_scales=$OLD_CAUSAL_ROUTE_SCALES ;;
+        current) routed_scales=$CURRENT_CAUSAL_ROUTE_SCALES ;;
+    esac
+    if [[ " $routed_scales " == *" $scale "* ]]; then
         printf 'yes\n'
     else
         printf 'no\n'
