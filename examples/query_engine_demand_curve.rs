@@ -4,16 +4,18 @@
 //!
 //! This example intentionally uses only the public query surface shared by the
 //! literal pre-frontier revision (`2cd60807`) and current main. Cherry-pick the
-//! commit containing this file unchanged onto both subjects, build each in a
-//! distinct target directory, and bake the *engine-under-test* revision and
-//! this file's SHA-256 into the binary:
+//! commit containing this file unchanged onto both subjects and use
+//! `scripts/run_query_engine_demand_curve.sh`; that runner freezes one
+//! dependency lock across all arms. For a standalone single-subject diagnostic,
+//! build in a distinct target directory and bake the provenance into the binary:
 //!
 //! ```text
+//! cargo generate-lockfile
 //! DEMAND_CURVE_ENGINE_REVISION=$(git rev-parse 2cd60807) \
 //! DEMAND_CURVE_HARNESS_SHA256=$(shasum -a 256 examples/query_engine_demand_curve.rs | cut -d' ' -f1) \
 //! DEMAND_CURVE_LOCK_SHA256=$(shasum -a 256 Cargo.lock | cut -d' ' -f1) \
 //! CARGO_TARGET_DIR=target/demand-2cd \
-//! cargo rustc --release --example query_engine_demand_curve --
+//! cargo rustc --locked --release --example query_engine_demand_curve --
 //!
 //! target/demand-2cd/release/examples/query_engine_demand_curve \
 //!   --expect-engine $(git rev-parse 2cd60807) \
@@ -822,7 +824,7 @@ fn execution_path(cell: &Cell<'_>, routing: Routing) -> &'static str {
     }
 }
 
-fn expected_route(cell: &Cell<'_>, demand: &str) -> &'static str {
+fn expected_route<'a>(cell: &'a Cell<'_>, demand: &str) -> &'a str {
     if cell.substrate == "wgpu"
         && cell.parallelism == "sequential"
         && cell.shape == "parent_batch_confirm"
