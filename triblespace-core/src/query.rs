@@ -1272,6 +1272,13 @@ struct Depth {
     group_limit: usize,
     /// Emission cursor, used only when every variable is bound.
     emit: usize,
+    /// Exclusive end of the terminal row interval this query owns.
+    ///
+    /// Ordinary execution owns `0..rows`. A rayon split may fence two
+    /// producers to disjoint sub-ranges of the already-materialised terminal
+    /// frontier. The matrices and proposal buffers remain shared and no
+    /// earlier query operation is replayed.
+    emit_end: usize,
 }
 
 impl Depth {
@@ -1485,23 +1492,43 @@ where
         Some(right)
     }
 
-    /// Transfers the un-emitted remainder of a complete frontier page to a
-    /// fenced sibling, leaving `self` at the parent source continuation.
+    /// Splits the un-emitted interval of a complete frontier page between two
+    /// fenced producers.
     ///
-    /// Terminal pages have no `NextGroup` state — planning moves them
-    /// straight to [`Search::Emit`] — but they are still whole products of a
-    /// planned group. Treating the page as one indivisible unit is what lets
-    /// single-variable queries participate in rayon without slicing their
-    /// proposal buffers or their result frontiers. The sibling preserves the
-    /// current emission cursor, so the operation is correct even if a future
-    /// caller exposes splitting after partial consumption.
+    /// Terminal pages have no future proposal or confirmation work: planning
+    /// moves them straight to [`Search::Emit`] after the last complete
+    /// confirmation has materialised an immutable row matrix. That makes row
+    /// intervals a safe parallel unit. Both producers share the matrix and
+    /// every level buffer, but own disjoint half-open emission ranges. The
+    /// original retains the parent continuation; the sibling is re-rooted at
+    /// the terminal frontier and therefore stops when its interval is spent.
+    ///
+    /// A one-row interval is still transferable as a whole when the original
+    /// has an ancestor continuation. This preserves parallelism across small
+    /// terminal pages without ever bisecting a proposal buffer.
     fn split_terminal_frontier(&mut self) -> Option<Self> {
         debug_assert_eq!(self.mode, Search::Emit);
         let depth = self.depth;
-        if depth == 0
-            || self.depths[depth].emit >= self.depths[depth].rows
-            || !self.has_ancestor_continuation()
-        {
+        let start = self.depths[depth].emit;
+        let end = self.depths[depth].emit_end.min(self.depths[depth].rows);
+        if start >= end {
+            return None;
+        }
+
+        if end - start >= 2 {
+            let mid = start + (end - start) / 2;
+            let mut right = self.clone();
+            self.depths[depth].emit_end = mid;
+
+            drop(right.stack.drain(..depth));
+            drop(right.depths.drain(..depth));
+            right.depth = 0;
+            right.depths[0].emit = mid;
+            right.depths[0].emit_end = end;
+            return Some(right);
+        }
+
+        if depth == 0 || !self.has_ancestor_continuation() {
             return None;
         }
 
@@ -1570,6 +1597,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             group: 0,
             group_limit: 0,
             emit: 0,
+            emit_end: 0,
         };
 
         Query {
@@ -1643,6 +1671,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     fn plan(&mut self) {
         if self.unbound.is_empty() {
             self.depths[self.depth].emit = 0;
+            self.depths[self.depth].emit_end = self.depths[self.depth].rows;
             self.mode = Search::Emit;
             return;
         }
@@ -1957,6 +1986,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         child.group = 0;
         child.group_limit = 0;
         child.emit = 0;
+        child.emit_end = rows;
 
         let order = Arc::make_mut(&mut child.order);
         order.clear();
@@ -2023,7 +2053,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Qu
                     // dedup — bag semantics are a property of the rows, not
                     // of how many at a time the engine happened to build.
                     let frontier = self.frontier();
-                    let rows = frontier.len();
+                    let rows = self.depths[self.depth].emit_end.min(frontier.len());
                     let mut emit = self.depths[self.depth].emit;
                     let mut result = None;
                     while emit < rows {
@@ -2087,9 +2117,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // No proposal buffer is bisected. This is the load-bearing difference from
 // candidate sharding: every owned group reaches `propose`/`confirm` at its
 // natural width, preserving geometric widening and accelerator-sized batches.
-// A heavy sole root group is honestly serial until executing it produces a
-// child group with a source continuation; the parallel path does not invent a
-// destructive intra-group split merely to keep rayon busy.
+// A heavy sole root group stays whole through proposal and confirmation. Once
+// its final confirmation has materialised a terminal frontier, that immutable
+// row interval can be divided between producers without changing the route or
+// replaying work. Intermediate frontiers remain whole in this implementation.
 //
 // A built-in CPU constraint may nevertheless expose *work inside one logical
 // confirm call* to the same pool. `IntoParallelIterator` marks the query's
@@ -2099,10 +2130,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // word boundaries, where each worker owns disjoint killable words. That leaves
 // the frontier, proposal buffer, and any accelerator routing whole: it is data
 // parallelism inside a leaf, not another search-state split.
-// Every successful split advances the original owner's group/page cursor and
-// fences that unit out of the sibling's future, so ownership is a strict
-// progress measure. Rayon's pressure splitter needs no engine-specific split
-// budget.
+// Every successful split advances a group/page cursor or divides one terminal
+// half-open row interval, and fences that unit out of the sibling's future, so
+// ownership is a strict progress measure. Rayon's pressure splitter needs no
+// engine-specific split budget.
 //
 // `fold_with` is the terminal leaf: it just drives the existing sequential
 // `Iterator::next()` and feeds results into the folder. No duplicated
@@ -2678,7 +2709,8 @@ mod tests {
         use super::*;
         use rayon::iter::plumbing::UnindexedProducer;
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::collections::BTreeSet;
+        use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
         #[derive(Clone)]
         struct Fixture(u32);
@@ -2695,6 +2727,118 @@ mod tests {
         /// parallel.
         #[derive(Clone)]
         struct IntentRecorder(Arc<AtomicU8>);
+
+        /// Two homogeneous arms over one variable: the first proposes a wide
+        /// region, the second confirms it and records the route-sized facts a
+        /// real accelerator adapter observes. This pins that terminal row
+        /// splitting happens strictly after the completed level and cannot
+        /// replay or fragment its proposal/confirmation.
+        #[derive(Clone)]
+        struct RouteArm {
+            kind: RouteKind,
+            values: u32,
+            counts: Arc<RouteCounts>,
+        }
+
+        #[derive(Clone, Copy)]
+        enum RouteKind {
+            Proposer,
+            Confirmer,
+        }
+
+        #[derive(Debug, Default)]
+        struct RouteCounts {
+            proposal_calls: AtomicU64,
+            proposal_candidates: AtomicU64,
+            confirm_calls: AtomicU64,
+            confirm_candidates: AtomicU64,
+            confirm_parent_rows: AtomicU64,
+            device_routes: AtomicU64,
+            cpu_routes: AtomicU64,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct RouteSnapshot {
+            proposal_calls: u64,
+            proposal_candidates: u64,
+            confirm_calls: u64,
+            confirm_candidates: u64,
+            confirm_parent_rows: u64,
+            device_routes: u64,
+            cpu_routes: u64,
+        }
+
+        impl RouteCounts {
+            fn snapshot(&self) -> RouteSnapshot {
+                RouteSnapshot {
+                    proposal_calls: self.proposal_calls.load(Ordering::Relaxed),
+                    proposal_candidates: self.proposal_candidates.load(Ordering::Relaxed),
+                    confirm_calls: self.confirm_calls.load(Ordering::Relaxed),
+                    confirm_candidates: self.confirm_candidates.load(Ordering::Relaxed),
+                    confirm_parent_rows: self.confirm_parent_rows.load(Ordering::Relaxed),
+                    device_routes: self.device_routes.load(Ordering::Relaxed),
+                    cpu_routes: self.cpu_routes.load(Ordering::Relaxed),
+                }
+            }
+        }
+
+        impl<'a> Constraint<'a> for RouteArm {
+            fn variables(&self) -> VariableSet {
+                variable_set([0])
+            }
+
+            fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+                (variable == 0).then_some(match self.kind {
+                    RouteKind::Proposer => self.values as usize,
+                    RouteKind::Confirmer => self.values as usize + 1,
+                })
+            }
+
+            fn propose(
+                &self,
+                _variable: VariableId,
+                frontier: &Frontier<'_>,
+                proposals: &mut ProposalBuffer,
+            ) {
+                assert!(matches!(self.kind, RouteKind::Proposer));
+                self.counts.proposal_calls.fetch_add(1, Ordering::Relaxed);
+                self.counts.proposal_candidates.fetch_add(
+                    self.values as u64 * frontier.len() as u64,
+                    Ordering::Relaxed,
+                );
+                for row in 0..frontier.len() {
+                    proposals.open(row as u32);
+                    proposals.extend((0..self.values).map(|value| Fixture::value(0xa5, value)));
+                }
+            }
+
+            fn confirm(
+                &self,
+                _variable: VariableId,
+                frontier: &Frontier<'_>,
+                candidates: &mut Candidates<'_>,
+            ) {
+                if matches!(self.kind, RouteKind::Proposer) {
+                    return;
+                }
+                let entries = candidates.values().len() as u64;
+                self.counts.confirm_calls.fetch_add(1, Ordering::Relaxed);
+                self.counts
+                    .confirm_candidates
+                    .fetch_add(entries, Ordering::Relaxed);
+                self.counts
+                    .confirm_parent_rows
+                    .fetch_add(frontier.len() as u64, Ordering::Relaxed);
+                let route = if entries >= 1024 {
+                    &self.counts.device_routes
+                } else {
+                    &self.counts.cpu_routes
+                };
+                route.fetch_add(1, Ordering::Relaxed);
+                candidates
+                    .retain(|value| u32::from_be_bytes(value[28..].try_into().unwrap()) % 5 != 0);
+            }
+        }
 
         impl<'a> Constraint<'a> for IntentRecorder {
             fn variables(&self) -> VariableSet {
@@ -2848,6 +2992,35 @@ mod tests {
             .with_frontier_width(4)
         }
 
+        fn route_constraint(
+            values: u32,
+            counts: Arc<RouteCounts>,
+        ) -> Arc<intersectionconstraint::IntersectionConstraint<RouteArm>> {
+            Arc::new(intersectionconstraint::IntersectionConstraint::new(vec![
+                RouteArm {
+                    kind: RouteKind::Proposer,
+                    values,
+                    counts: Arc::clone(&counts),
+                },
+                RouteArm {
+                    kind: RouteKind::Confirmer,
+                    values,
+                    counts,
+                },
+            ]))
+        }
+
+        fn projected_index(binding: &Binding<'_>) -> Option<u32> {
+            let value = binding.get(0)?;
+            Some(u32::from_be_bytes(value[28..].try_into().unwrap()))
+        }
+
+        fn row_digest(rows: &[u32]) -> u64 {
+            rows.iter().fold(0x6a09_e667_f3bc_c909, |digest, &row| {
+                digest.rotate_left(13).wrapping_mul(0x9e37_79b1_85eb_ca87) ^ row as u64
+            })
+        }
+
         #[test]
         fn only_into_par_iter_sets_parallel_frontier_intent() {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -2963,27 +3136,182 @@ mod tests {
         }
 
         #[test]
-        fn terminal_page_is_transferred_without_slicing_rows() {
+        fn terminal_page_splits_into_disjoint_shared_row_intervals() {
             let mut left = query(32);
             advance_to_emit(&mut left);
+            while left.depths[left.depth].rows < 2 {
+                // Retire the one-row latency page without projecting it; the
+                // fixture's next geometric page is the range-split subject.
+                left.depth -= 1;
+                left.mode = Search::NextChunk;
+                advance_to_emit(&mut left);
+            }
             assert!(left.depth > 0);
             let terminal_rows = left.depths[left.depth].rows;
             let terminal_block = Arc::clone(&left.depths[left.depth].block);
+            let terminal_order = Arc::clone(&left.depths[left.depth].order);
             let mut expected = left.clone().collect::<Vec<_>>();
 
             let right = left
                 .split_terminal_frontier()
-                .expect("terminal page has a parent continuation");
+                .expect("terminal page has at least two stable rows");
+            let mid = terminal_rows / 2;
             assert_eq!(right.depth, 0);
             assert_eq!(right.stack.len(), 0);
             assert_eq!(right.mode, Search::Emit);
             assert_eq!(right.depths[0].rows, terminal_rows);
+            assert_eq!(
+                (
+                    left.depths[left.depth].emit,
+                    left.depths[left.depth].emit_end
+                ),
+                (0, mid)
+            );
+            assert_eq!(
+                (right.depths[0].emit, right.depths[0].emit_end),
+                (mid, terminal_rows)
+            );
             assert!(Arc::ptr_eq(&terminal_block, &right.depths[0].block));
+            assert!(Arc::ptr_eq(&terminal_order, &right.depths[0].order));
+            for variable in left.bindings.bound {
+                assert!(Arc::ptr_eq(
+                    left.bindings.levels[variable]
+                        .buffer
+                        .as_ref()
+                        .expect("bound level has a published buffer"),
+                    right.bindings.levels[variable]
+                        .buffer
+                        .as_ref()
+                        .expect("bound level has a published buffer"),
+                ));
+            }
 
             let mut actual: Vec<_> = left.chain(right).collect();
             expected.sort_unstable();
             actual.sort_unstable();
             assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn terminal_ranges_preserve_bag_set_digest_routes_and_thread_crossovers() {
+            const VALUES: u32 = 8 * 1024;
+            let expected: Vec<u32> = (0..VALUES).filter(|value| value % 5 != 0).collect();
+            let expected_set: BTreeSet<_> = expected.iter().copied().collect();
+            let expected_digest = row_digest(&expected);
+
+            let sequential_counts = Arc::new(RouteCounts::default());
+            let sequential: Vec<_> = Query::new(
+                route_constraint(VALUES, Arc::clone(&sequential_counts)),
+                projected_index as fn(&Binding<'_>) -> Option<u32>,
+            )
+            .collect();
+            assert_eq!(sequential, expected);
+            let expected_routes = sequential_counts.snapshot();
+            assert_eq!(
+                expected_routes,
+                RouteSnapshot {
+                    proposal_calls: 1,
+                    proposal_candidates: VALUES as u64,
+                    confirm_calls: 1,
+                    confirm_candidates: VALUES as u64,
+                    confirm_parent_rows: 1,
+                    device_routes: 1,
+                    cpu_routes: 0,
+                }
+            );
+
+            for threads in [1, 2, 4] {
+                let counts = Arc::new(RouteCounts::default());
+                let seen = Arc::new(AtomicU64::new(0));
+                let seen_by_query = Arc::clone(&seen);
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let mut actual = pool.install(|| {
+                    Query::new(
+                        route_constraint(VALUES, Arc::clone(&counts)),
+                        move |binding: &Binding<'_>| {
+                            let row = projected_index(binding)?;
+                            let thread = rayon::current_thread_index().unwrap();
+                            seen_by_query.fetch_or(1 << thread, Ordering::Relaxed);
+                            // Keep terminal folds alive long enough for a
+                            // second worker to steal in debug test builds.
+                            let mut work = row as u64;
+                            for _ in 0..256 {
+                                work = work.rotate_left(7).wrapping_mul(0x9e37_79b1_85eb_ca87)
+                                    ^ 0xd1b5_4a32_d192_ed03;
+                            }
+                            std::hint::black_box(work);
+                            Some(row)
+                        },
+                    )
+                    .into_par_iter()
+                    .collect::<Vec<_>>()
+                });
+                actual.sort_unstable();
+
+                assert_eq!(actual, expected, "{threads}-thread bag changed");
+                assert_eq!(
+                    actual.iter().copied().collect::<BTreeSet<_>>(),
+                    expected_set,
+                    "{threads}-thread set changed"
+                );
+                assert_eq!(
+                    row_digest(&actual),
+                    expected_digest,
+                    "{threads}-thread digest changed"
+                );
+                assert_eq!(
+                    counts.snapshot(),
+                    expected_routes,
+                    "terminal row splitting replayed or fragmented the completed route"
+                );
+
+                let workers = seen.load(Ordering::Relaxed).count_ones() as usize;
+                if threads == 1 {
+                    assert_eq!(workers, 1);
+                } else {
+                    assert!(
+                        workers >= 2,
+                        "{threads}-thread pool never crossed a terminal range"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn terminal_range_cancellation_is_a_unique_valid_subbag() {
+            const VALUES: u32 = 8 * 1024;
+            const TAKE: usize = 257;
+            let expected: BTreeSet<u32> = (0..VALUES).filter(|value| value % 5 != 0).collect();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+            for _ in 0..8 {
+                let counts = Arc::new(RouteCounts::default());
+                let taken = pool.install(|| {
+                    Query::new(
+                        route_constraint(VALUES, counts),
+                        projected_index as fn(&Binding<'_>) -> Option<u32>,
+                    )
+                    .into_par_iter()
+                    .take_any(TAKE)
+                    .collect::<Vec<_>>()
+                });
+                assert_eq!(taken.len(), TAKE);
+                let taken_set: BTreeSet<_> = taken.iter().copied().collect();
+                assert_eq!(
+                    taken_set.len(),
+                    TAKE,
+                    "a cancelled parallel fold duplicated a terminal row"
+                );
+                assert!(
+                    taken_set.is_subset(&expected),
+                    "a cancelled parallel fold emitted a row outside the exact bag"
+                );
+            }
         }
 
         #[test]
