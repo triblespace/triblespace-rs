@@ -31,18 +31,22 @@
 //! `live_words`, so nothing in this file spells a word layout and the suite
 //! would keep its meaning against a different one.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveConstraint,
 };
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
-use triblespace_core::inline::RawInline;
+use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    BindingStore, Constraint, Frontier, ProposalBuffer, Variable, VariableContext, VariableId,
+    BindingStore, Constraint, Frontier, ProposalBuffer, TriblePattern, Variable, VariableContext,
+    VariableId,
 };
 use triblespace_core::trible::{Trible, TribleSet};
+use triblespace_core::{and, find};
 use triblespace_gpu::WgpuSuccinctArchive;
 
 /// Buffer indices the confirmed region is made to start at.
@@ -562,6 +566,126 @@ fn below_threshold_falls_back_to_cpu() {
             &gpu.prefix,
             "CPU-fallback",
             &format!("threshold/base{base}"),
+        );
+    }
+}
+
+/// Explicit query parallelism must not fragment a candidate region before
+/// WGPU makes its route decision. One logical 8,192-candidate confirm is run
+/// through one-, two-, and four-worker pools twice: forced to the device, then
+/// forced through the canonical CPU fallback. In both cases the router must
+/// observe exactly one intact region and the normalized result bag/set must be
+/// identical.
+#[test]
+fn parallel_query_preserves_wgpu_route_region_and_counters() {
+    const PROPOSALS: u32 = 8192;
+    let entity = make_id(0x21, 1);
+    let attribute = make_id(0x22, 1);
+    let entity_inline: Inline<GenId> = Inline::new(id_value(&entity));
+    let attribute_inline: Inline<GenId> = Inline::new(id_value(&attribute));
+    let value = |i| Inline::<UnknownInline>::new(free_value(0x40, i));
+    let trible = |value: &Inline<UnknownInline>| {
+        let mut data = [0u8; 64];
+        data[..16].copy_from_slice(&entity);
+        data[16..32].copy_from_slice(&attribute);
+        data[32..].copy_from_slice(&value.raw);
+        Trible { data }
+    };
+
+    let mut proposer = TribleSet::new();
+    for i in 0..PROPOSALS {
+        proposer.insert(&trible(&value(i)));
+    }
+
+    let mut confirmer = TribleSet::new();
+    for i in (0..PROPOSALS).step_by(2) {
+        confirmer.insert(&trible(&value(i)));
+    }
+    // Raise the archive estimate above the proposer's without adding any
+    // further intersection results, ensuring Succinct is the confirmer.
+    for i in PROPOSALS * 2..PROPOSALS * 3 {
+        confirmer.insert(&trible(&value(i)));
+    }
+
+    let archive: SuccinctArchive<OrderedUniverse> = (&confirmer).into();
+    let mut gpu = WgpuSuccinctArchive::new(archive).expect("resident wrap succeeds");
+    let mut expected: Vec<_> = (0..PROPOSALS).step_by(2).map(|i| (value(i),)).collect();
+    expected.sort_unstable();
+    let expected_set: BTreeSet<_> = expected.iter().copied().collect();
+
+    macro_rules! collect_parallel {
+        ($pool:expr) => {
+            $pool.install(|| {
+                find! {
+                    (candidate: Inline<UnknownInline>),
+                    and!(
+                        proposer.pattern(entity_inline, attribute_inline, candidate),
+                        gpu.pattern(entity_inline, attribute_inline, candidate)
+                    )
+                }
+                .into_par_iter()
+                .collect::<Vec<_>>()
+            })
+        };
+    }
+
+    for threads in [1, 2, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+
+        gpu.set_min_confirm_batch(0);
+        gpu.reset_stats();
+        let mut routed = collect_parallel!(&pool);
+        let routed_stats = gpu.stats();
+        assert_eq!(routed_stats.gpu_confirms, 1, "{threads}: {routed_stats:?}");
+        assert_eq!(
+            routed_stats.gpu_candidates, PROPOSALS as u64,
+            "{threads}: GPU did not receive the intact region: {routed_stats:?}"
+        );
+        assert_eq!(
+            routed_stats.cpu_fallback_confirms, 0,
+            "{threads}: {routed_stats:?}"
+        );
+        assert_eq!(routed_stats.gpu_errors, 0, "{threads}: {routed_stats:?}");
+        routed.sort_unstable();
+        assert_eq!(routed, expected, "{threads}: device route changed the bag");
+        assert_eq!(
+            routed.iter().copied().collect::<BTreeSet<_>>(),
+            expected_set,
+            "{threads}: device route changed the set"
+        );
+
+        gpu.set_min_confirm_batch(usize::MAX);
+        gpu.reset_stats();
+        let mut fallback = collect_parallel!(&pool);
+        let fallback_stats = gpu.stats();
+        assert_eq!(
+            fallback_stats.gpu_confirms, 0,
+            "{threads}: {fallback_stats:?}"
+        );
+        assert_eq!(
+            fallback_stats.cpu_fallback_confirms, 1,
+            "{threads}: fallback route was fragmented: {fallback_stats:?}"
+        );
+        assert_eq!(
+            fallback_stats.cpu_fallback_candidates, PROPOSALS as u64,
+            "{threads}: router did not see the intact fallback region: {fallback_stats:?}"
+        );
+        assert_eq!(
+            fallback_stats.gpu_errors, 0,
+            "{threads}: {fallback_stats:?}"
+        );
+        fallback.sort_unstable();
+        assert_eq!(
+            fallback, expected,
+            "{threads}: CPU fallback changed the bag"
+        );
+        assert_eq!(
+            fallback.iter().copied().collect::<BTreeSet<_>>(),
+            expected_set,
+            "{threads}: CPU fallback changed the set"
         );
     }
 }

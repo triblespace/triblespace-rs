@@ -242,7 +242,7 @@ where
 
 impl<'a, U> Constraint<'a> for Probe<'a, U>
 where
-    U: Universe,
+    U: Universe + Sync,
 {
     fn variables(&self) -> VariableSet {
         self.cpu.variables()

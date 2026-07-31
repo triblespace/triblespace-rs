@@ -96,6 +96,19 @@ pub const LIVENESS_WORD_BITS: usize = 32;
 /// [`LIVENESS_WORD_BITS`].
 const BITS: usize = LIVENESS_WORD_BITS;
 
+/// Measured candidate-region crossover for TribleSet's scalar CPU membership
+/// probes.
+///
+/// This is a private execution crossover, not a query-planning knob. The
+/// logical proposal region has already been formed (and any accelerator has
+/// already decided whether to claim it) before this policy is consulted.
+/// The number lives beside the shared packed-split geometry so experimental
+/// mirrors can name the exact borrowed baseline without copying a magic
+/// literal. It is not evidence that another source has the same crossover;
+/// each caller still chooses its own admission threshold explicitly.
+#[cfg(feature = "parallel")]
+pub(crate) const TRIBLESET_PARALLEL_CONFIRM_MIN: usize = 1024;
+
 /// Number of words needed to hold `bits` liveness bits.
 fn words_for(bits: usize) -> usize {
     bits.div_ceil(BITS)
@@ -735,6 +748,39 @@ impl<'a> Candidates<'a> {
                 bit_offset: 0,
             },
         )
+    }
+
+    /// Applies a caller-supplied CPU-confirm crossover and, when it fires,
+    /// divides this region at the packed-word boundary nearest its midpoint.
+    ///
+    /// `Err(self)` is the serial leaf: the region is below the crossover, the
+    /// current pool has one worker, or no interior word boundary exists.
+    /// `Ok((left, right))` gives disjoint mutable liveness-word ownership, so
+    /// callers may recurse with [`rayon::join`] without atomics or a verdict
+    /// merge. Values and parent tags remain read-only slices in proposer
+    /// order.
+    ///
+    /// This deliberately knows nothing about query intent or accelerator
+    /// routing. Built-in constraints call it only after an explicitly
+    /// parallel [`Frontier`](crate::query::Frontier) reaches their canonical
+    /// CPU fallback.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn split_for_parallel_confirm(
+        self,
+        min_candidates: usize,
+    ) -> Result<(Candidates<'a>, Candidates<'a>), Candidates<'a>> {
+        if self.len() < min_candidates || rayon::current_num_threads() == 1 {
+            return Err(self);
+        }
+
+        let midpoint = self.bit_offset + self.len() / 2;
+        let boundary = midpoint / BITS * BITS;
+        let mid = boundary.saturating_sub(self.bit_offset);
+        if mid == 0 || mid >= self.len() {
+            return Err(self);
+        }
+
+        Ok(self.split_at_word_boundary(mid))
     }
 
     /// Copies the liveness words out (scratch for OR-composition).

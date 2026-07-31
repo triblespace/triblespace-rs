@@ -58,19 +58,6 @@ use crate::trible::TribleSet;
 /// loses on are the ones a wider frontier makes rarer, not commoner.
 const SORTED_PROBE_MIN: usize = 2;
 
-/// Candidate-region size at which a CPU confirmation becomes worth dividing
-/// across the current Rayon pool.
-///
-/// This is an internal execution crossover, not a query-planning knob. The
-/// logical frontier remains whole: proposal, probe grouping, and any device
-/// routing happen before this point. Only the CPU membership probes divide,
-/// at packed-word boundaries, into disjoint kill-only regions. With a 1024
-/// crossover the recursive leaves are about 512 candidates wide, so medium
-/// common-plan CPU regions divide without touching GPU routing, which is
-/// decided before this leaf.
-#[cfg(feature = "parallel")]
-const PARALLEL_CONFIRM_MIN: usize = 1024;
-
 #[cfg(all(test, feature = "parallel"))]
 static PARALLEL_CONFIRM_SPLITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -418,28 +405,14 @@ impl TribleSetConstraint {
         group: &[u32],
         cands: Candidates<'_>,
     ) {
-        if cands.len() < PARALLEL_CONFIRM_MIN || rayon::current_num_threads() == 1 {
-            let mut cands = cands;
-            self.confirm_grouped(variable, frontier, group, &mut cands);
-            return;
-        }
-
-        // Choose the packed-word boundary nearest the region midpoint. At
-        // this crossover the rounded division is necessarily interior; keep
-        // the check explicit so the ownership law remains local if the
-        // crossover or liveness geometry ever changes.
-        let bit_offset = cands.bit_offset();
-        let midpoint = bit_offset + cands.len() / 2;
-        let boundary =
-            midpoint / crate::query::LIVENESS_WORD_BITS * crate::query::LIVENESS_WORD_BITS;
-        let mid = boundary.saturating_sub(bit_offset);
-        if mid == 0 || mid >= cands.len() {
-            let mut cands = cands;
-            self.confirm_grouped(variable, frontier, group, &mut cands);
-            return;
-        }
-
-        let (left, right) = cands.split_at_word_boundary(mid);
+        let (left, right) =
+            match cands.split_for_parallel_confirm(crate::query::TRIBLESET_PARALLEL_CONFIRM_MIN) {
+                Ok(parts) => parts,
+                Err(mut cands) => {
+                    self.confirm_grouped(variable, frontier, group, &mut cands);
+                    return;
+                }
+            };
         #[cfg(test)]
         PARALLEL_CONFIRM_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         rayon::join(

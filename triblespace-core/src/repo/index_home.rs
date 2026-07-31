@@ -1391,7 +1391,7 @@ where
 
 impl<'a, U> UnionArchiveConstraint<'a, U>
 where
-    U: Universe,
+    U: Universe + Sync,
 {
     fn new(constraints: Vec<SuccinctArchiveConstraint<'a, U>>) -> Self {
         Self {
@@ -1402,7 +1402,7 @@ where
 
 impl<'a, U> Constraint<'a> for UnionArchiveConstraint<'a, U>
 where
-    U: Universe,
+    U: Universe + Sync,
 {
     fn variables(&self) -> VariableSet {
         self.union.variables()

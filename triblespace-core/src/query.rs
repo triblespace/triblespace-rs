@@ -58,6 +58,9 @@ use crate::inline::RawInline;
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
 
+#[cfg(feature = "parallel")]
+pub(crate) use liveness::TRIBLESET_PARALLEL_CONFIRM_MIN;
+
 /// Re-exports of the candidate/liveness pair. The module they come from is
 /// private on purpose: the bit-packed representation and the region-boundary
 /// invariants that keep it honest are enforced at the boundary of these two
@@ -2095,10 +2098,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // confirm call* to the same pool. `IntoParallelIterator` marks the query's
 // frontier views with crate-private execution intent; ordinary `Iterator`
 // queries do not acquire that intent merely because they happen to run on a
-// Rayon worker. TribleSet confirmation uses it to divide packed liveness at
-// word boundaries, where each worker owns disjoint killable words. That leaves
-// the frontier, proposal buffer, and any accelerator routing whole: it is data
-// parallelism inside a leaf, not another search-state split.
+// Rayon worker. TribleSet membership and SuccinctArchive's scalar CPU fallback
+// use it to divide packed liveness at word boundaries, where each worker owns
+// disjoint killable words. That leaves the frontier, proposal buffer, and any
+// accelerator routing whole: it is data parallelism inside a leaf, not another
+// search-state split.
 // Every successful split advances the original owner's group/page cursor and
 // fences that unit out of the sibling's future, so ownership is a strict
 // progress measure. Rayon's pressure splitter needs no engine-specific split

@@ -1449,7 +1449,7 @@ where
 
 impl<'a, U> Constraint<'a> for WgpuSuccinctArchiveConstraint<'a, U>
 where
-    U: Universe,
+    U: Universe + Sync,
 {
     fn variables(&self) -> VariableSet {
         self.inner.variables()

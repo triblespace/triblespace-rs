@@ -30,22 +30,17 @@ use jerky::bit_vector::Select;
 ///   This is the half that pays, and it pays a lot.
 /// * **Locality.** The domain is sorted on exactly the bytes being
 ///   searched for, so consecutive searches share their upper levels.
-///   Measured, this half is worth little — see [`SORTED_REGION_MIN`],
-///   which is the same idea applied where there is far more of it to do,
-///   and which is off.
+///   Measured, this half is worth little; the former candidate-region
+///   permutation tried to amplify it and was removed after losing on every
+///   measured shape that crossed it.
 ///
-/// The two halves have different economics, so they have their own
-/// thresholds. Ordering the *rows* costs `O(rows log rows)` — bounded by
-/// the frontier width — and buys the collapses above, which are savings
-/// in work rather than in cache misses. Ordering a *region* costs
-/// `O(candidates log candidates)`, which is unbounded by the frontier
-/// and buys only locality: it is worth it exactly when a probe is
-/// expensive enough to amortise a comparison.
-///
-/// This pair is the whole boundary between the two strategies: both
-/// paths run the same code over a permutation of the batch and differ
-/// solely in whether that permutation is sorted. Set either to
-/// `usize::MAX` to measure that half as the plain frontier-order loop.
+/// Ordering the *rows* costs `O(rows log rows)` — bounded by the frontier
+/// width — and buys the collapses above, which are savings in work rather
+/// than only cache misses. The candidate-region sort was different: it cost
+/// `O(candidates log candidates)`, was unbounded by the frontier, and bought
+/// locality alone. It is removed rather than retained as disabled machinery.
+/// Set this threshold to `usize::MAX` to measure the row ordering as the plain
+/// frontier-order loop.
 ///
 /// On for this source, and the larger of the two effects by far: over a
 /// 2M-trible DBLP archive the collapses are worth 2.6x on the arm's
@@ -55,46 +50,36 @@ use jerky::bit_vector::Select;
 /// for an answer it had already computed.
 const SORTED_PROBE_MIN: usize = 2;
 
-/// Region size at which `confirm` orders its candidates by value rather
-/// than walking the region as it lies. See [`SORTED_PROBE_MIN`] for what
-/// the ordering buys.
+/// Experimental Succinct CPU-confirm crossover for this scalar-probe arm.
 ///
-/// **Off, and measured off in both sources.** The idea is sound — the
-/// archive's domain and the PATCH's leaves are both laid out in value
-/// order, so probing a region in value order should sweep them — but as
-/// written it does not pay anywhere: within 3% on every archive query at
-/// 4M and at 8M tribles, and 33-46% *worse* on the Harkonnen fixtures
-/// whose regions are large enough to sort (F9, F11, F14).
-///
-/// The reason looks structural rather than incidental, which is why the
-/// switch is off rather than tuned: sorting a region means sorting an
-/// index permutation, and the comparator then gathers from `parents`
-/// and the values through those indices. Both arrays are region-sized,
-/// so at exactly the width where the ordering was supposed to earn its
-/// keep, the sort itself misses cache once or twice per comparison —
-/// and it does that `n log n` times to save `n` probes. A version worth
-/// re-measuring would sort *packed keys* (a `(group, value-prefix,
-/// index)` record) so the sort streams instead of gathering, or would
-/// leave the ordering to a tier that wants the region sorted anyway.
-///
-/// The row ordering above is a different trade and is on: it sorts at
-/// most `frontier width` entries and saves whole index walks rather
-/// than cache misses.
-const SORTED_REGION_MIN: usize = usize::MAX;
+/// The value deliberately aliases the measured TribleSet baseline so this
+/// branch tests a clean mirror without introducing a second magic literal.
+/// It is not claimed as a measured Succinct law: scalar universe/rank probes
+/// have different economics, and the separate batched-rank lineage already
+/// works in 1,024-probe chunks. The frozen demand matrix for this branch must
+/// decide whether the borrowed admission policy pays.
+#[cfg(feature = "parallel")]
+const PARALLEL_CONFIRM_MIN: usize = crate::query::TRIBLESET_PARALLEL_CONFIRM_MIN;
 
-/// Kills every entry named by `order` whose value fails `keep`, skipping
-/// entries that are already dead — [`Candidates::retain`] over a
-/// permutation instead of the region's own order.
+#[cfg(all(test, feature = "parallel"))]
+static PARALLEL_CONFIRM_SPLITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Kills every entry in `range` whose value fails `keep`, skipping entries
+/// that are already dead.
 ///
 /// The verdict is memoised across *adjacent equal values*, which costs
 /// one 32-byte compare and saves a domain binary search: a key-run
-/// fanned out over several frontier rows carries each candidate once per
-/// row, and sorted they arrive back to back.
+/// fanned out over several probe-ordered frontier rows carries each candidate
+/// once per row, and those copies arrive back to back.
 #[inline]
-fn retain_at(cands: &mut Candidates<'_>, order: &[u32], mut keep: impl FnMut(&RawInline) -> bool) {
+fn retain_range(
+    cands: &mut Candidates<'_>,
+    range: Range<usize>,
+    mut keep: impl FnMut(&RawInline) -> bool,
+) {
     let mut memo: Option<(RawInline, bool)> = None;
-    for &i in order {
-        let i = i as usize;
+    for i in range {
         if !cands.is_live(i) {
             continue;
         }
@@ -357,13 +342,10 @@ where
         }
     }
 
-    /// Kills the entries `order` names — indices into `cands` — whose
-    /// value is inconsistent with `binding`.
+    /// Kills the entries in `range` whose value is inconsistent with
+    /// `binding`.
     ///
-    /// `order` is a permutation of some part of the region rather than a
-    /// range, because the region spans a whole [`Frontier`] and the
-    /// caller decides in which order the archive is probed. Every entry
-    /// it names must belong to a row whose bound positions equal
+    /// Every entry in the range must belong to a row whose bound positions equal
     /// `binding`'s; the caller establishes that by grouping the region by
     /// probe key — which is also what makes the parent's `base_range`
     /// worth computing once here.
@@ -372,7 +354,7 @@ where
         variable: VariableId,
         binding: &Binding,
         cands: &mut Candidates<'_>,
-        order: &[u32],
+        range: Range<usize>,
     ) {
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
@@ -388,21 +370,21 @@ where
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
-                retain_at(cands, order, |e| {
+                retain_range(cands, range, |e| {
                     base_range(&self.archive.domain, &self.archive.e_a, e)
                         .is_empty()
                         .not()
                 });
             }
             (None, None, None, false, true, false) => {
-                retain_at(cands, order, |a| {
+                retain_range(cands, range, |a| {
                     base_range(&self.archive.domain, &self.archive.a_a, a)
                         .is_empty()
                         .not()
                 });
             }
             (None, None, None, false, false, true) => {
-                retain_at(cands, order, |v| {
+                retain_range(cands, range, |v| {
                     base_range(&self.archive.domain, &self.archive.v_a, v)
                         .is_empty()
                         .not()
@@ -410,7 +392,7 @@ where
             }
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                retain_at(cands, order, |a| {
+                retain_range(cands, range, |a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -424,7 +406,7 @@ where
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                retain_at(cands, order, |v| {
+                retain_range(cands, range, |v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -438,7 +420,7 @@ where
             }
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                retain_at(cands, order, |e| {
+                retain_range(cands, range, |e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -452,7 +434,7 @@ where
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                retain_at(cands, order, |v| {
+                retain_range(cands, range, |v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -466,7 +448,7 @@ where
             }
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                retain_at(cands, order, |e| {
+                retain_range(cands, range, |e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -480,7 +462,7 @@ where
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                retain_at(cands, order, |a| {
+                retain_range(cands, range, |a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -501,7 +483,7 @@ where
                     v,
                     &r,
                 );
-                retain_at(cands, order, |e| {
+                retain_range(cands, range, |e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -522,7 +504,7 @@ where
                     v,
                     &r,
                 );
-                retain_at(cands, order, |a| {
+                retain_range(cands, range, |a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -543,7 +525,7 @@ where
                     a,
                     &r,
                 );
-                retain_at(cands, order, |v| {
+                retain_range(cands, range, |v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -646,11 +628,78 @@ where
         }
         (group, order)
     }
+
+    /// Serial confirmation over one candidate region, given the probe-group
+    /// labels already computed for the region's logical frontier.
+    ///
+    /// The permanently disabled candidate permutation is intentionally gone:
+    /// candidates stay in proposer order, adjacent equal probe keys share one
+    /// base-range setup, and adjacent equal values retain the existing memo.
+    /// This range form is also the leaf of the parallel path, so a shard owns
+    /// local indices without copying or rebasing a global permutation.
+    fn confirm_grouped(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        group: &[u32],
+        cands: &mut Candidates<'_>,
+    ) {
+        let entries = cands.len();
+        let mut run_start = 0;
+        while run_start < entries {
+            let lead = cands.parent(run_start);
+            let label = group[lead as usize];
+            let mut run_end = run_start + 1;
+            while run_end < entries && group[cands.parent(run_end) as usize] == label {
+                run_end += 1;
+            }
+            let binding = frontier.row(lead as usize);
+            self.confirm_at(variable, &binding, cands, run_start..run_end);
+            run_start = run_end;
+        }
+    }
+
+    /// Divides only the canonical scalar CPU leaf. Each recursive branch owns
+    /// disjoint packed liveness words; the archive, universe, values, parent
+    /// tags, and frontier stay shared and read-only.
+    ///
+    /// A split can bisect one probe-group or adjacent-value memo run. That
+    /// repeats read-only range setup at the boundary but cannot change any
+    /// candidate verdict. `U: Sync` is the smallest honest additional bound:
+    /// nested Rayon closures share the archive's universe across workers.
+    #[cfg(feature = "parallel")]
+    fn confirm_parallel(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        group: &[u32],
+        cands: Candidates<'_>,
+    ) where
+        U: Sync,
+    {
+        let (left, right) = match cands.split_for_parallel_confirm(PARALLEL_CONFIRM_MIN) {
+            Ok(parts) => parts,
+            Err(mut cands) => {
+                self.confirm_grouped(variable, frontier, group, &mut cands);
+                return;
+            }
+        };
+        #[cfg(test)]
+        PARALLEL_CONFIRM_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rayon::join(
+            || self.confirm_parallel(variable, frontier, group, left),
+            || self.confirm_parallel(variable, frontier, group, right),
+        );
+    }
 }
 
+// Keep `Sync` here rather than widening `Universe` or the public constraint
+// type: only the `Constraint` execution path can share `U` between Rayon
+// workers. Direct users of this impl inherit the bound; `TriblePattern`
+// already required `U: Send + Sync`.
 impl<'a, U> Constraint<'a> for SuccinctArchiveConstraint<'a, U>
 where
-    U: Universe,
+    U: Universe + Sync,
 {
     fn variables(&self) -> VariableSet {
         let mut variables = VariableSet::new_empty();
@@ -792,45 +841,28 @@ where
 
     /// Confirms each candidate against its own row's bound positions.
     ///
-    /// The region spans the whole batch, so it is walked in **probe
-    /// order**: grouped by probe key — coarser than by parent tag, since
-    /// distinct rows that agree on this constraint's positions confirm
-    /// identically and can share one `base_range` — and, within a group,
-    /// in value order, which is the domain's own order. Below
-    /// [`SORTED_PROBE_MIN`] the region is walked in its own order
-    /// instead, which is the same grouping the tags already carry.
+    /// The region spans the whole batch and stays in proposer order. Adjacent
+    /// entries whose parent rows agree on this constraint's probe key share
+    /// one `base_range` setup. An explicitly parallel query may divide only
+    /// the scalar CPU probes at disjoint packed-word boundaries; ordinary
+    /// iteration remains on the serial grouped leaf even inside a Rayon pool.
     fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         let entries = cands.len();
         if entries == 0 || frontier.is_empty() || !self.touches(variable) {
             return;
         }
         let (group, _) = self.probe_groups(frontier);
-        // The tags are read after the region turns mutable, so take a
-        // copy of them rather than holding a borrow across the kills.
-        let parents: SmallVec<[u32; 64]> = SmallVec::from_slice(cands.parents());
-
-        let mut order: SmallVec<[u32; 64]> = (0..entries as u32).collect();
-        if entries >= SORTED_REGION_MIN {
-            let values = cands.values();
-            order.sort_unstable_by(|&a, &b| {
-                group[parents[a as usize] as usize]
-                    .cmp(&group[parents[b as usize] as usize])
-                    .then_with(|| values[a as usize].cmp(&values[b as usize]))
-                    .then(a.cmp(&b))
-            });
-        }
-
-        let mut run_start = 0;
-        while run_start < entries {
-            let lead = parents[order[run_start] as usize];
-            let label = group[lead as usize];
-            let mut run_end = run_start + 1;
-            while run_end < entries && group[parents[order[run_end] as usize] as usize] == label {
-                run_end += 1;
+        #[cfg(feature = "parallel")]
+        {
+            if frontier.parallel() {
+                self.confirm_parallel(variable, frontier, &group, cands.reborrow());
+            } else {
+                self.confirm_grouped(variable, frontier, &group, cands);
             }
-            let binding = frontier.row(lead as usize);
-            self.confirm_at(variable, &binding, cands, &order[run_start..run_end]);
-            run_start = run_end;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            self.confirm_grouped(variable, frontier, &group, cands);
         }
     }
 
@@ -866,6 +898,141 @@ where
                 .not()
             }
             _ => true,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    use super::*;
+    use crate::and;
+    use crate::find;
+    use crate::id::rngid;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
+    use crate::query::TriblePattern;
+    use crate::trible::{Trible, TribleSet};
+
+    fn raw_value(i: u64) -> Inline<UnknownInline> {
+        let mut raw = [0u8; 32];
+        raw[24..].copy_from_slice(&i.to_be_bytes());
+        Inline::new(raw)
+    }
+
+    fn id_inline(id: &[u8; 16]) -> Inline<GenId> {
+        let mut raw = [0u8; 32];
+        raw[16..].copy_from_slice(id);
+        Inline::new(raw)
+    }
+
+    fn row_digest(rows: &[(Inline<UnknownInline>,)]) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        for (value,) in rows {
+            hasher.update(&value.raw);
+        }
+        hasher.finalize()
+    }
+
+    /// Exercises the scalar Rank9 leaf through the public query path. The
+    /// TribleSet proposes 8,192 values; the larger Succinct archive confirms
+    /// them through its two-bound rank arm and retains exactly the even half.
+    ///
+    /// Ordinary iteration inside a four-worker pool and explicit parallel
+    /// iteration on one worker must stay serial. Two and four workers must
+    /// cross the packed-word split while preserving the exact normalized bag,
+    /// set, and digest.
+    #[test]
+    fn parallel_confirm_preserves_bag_set_digest_and_explicit_intent() {
+        const PROPOSALS: u64 = 8192;
+        let entity = rngid();
+        let attribute = rngid();
+        let entity_inline = id_inline(&entity);
+        let attribute_inline = id_inline(&attribute);
+
+        let mut proposer = TribleSet::new();
+        for i in 0..PROPOSALS {
+            proposer.insert(&Trible::new(&entity, &attribute, &raw_value(i)));
+        }
+
+        let mut confirmer = TribleSet::new();
+        for i in (0..PROPOSALS).step_by(2) {
+            confirmer.insert(&Trible::new(&entity, &attribute, &raw_value(i)));
+        }
+        // Keep the archive's estimate above the proposer's while adding no
+        // further intersection results.
+        for i in PROPOSALS * 2..PROPOSALS * 3 {
+            confirmer.insert(&Trible::new(&entity, &attribute, &raw_value(i)));
+        }
+        let archive: SuccinctArchive<OrderedUniverse> = (&confirmer).into();
+
+        let mut expected: Vec<_> = (0..PROPOSALS).step_by(2).map(|i| (raw_value(i),)).collect();
+        expected.sort_unstable();
+        let expected_set: BTreeSet<_> = expected.iter().copied().collect();
+        let expected_digest = row_digest(&expected);
+
+        macro_rules! query {
+            () => {
+                find! {
+                    (value: Inline<UnknownInline>),
+                    and!(
+                        proposer.pattern(entity_inline, attribute_inline, value),
+                        archive.pattern(entity_inline, attribute_inline, value)
+                    )
+                }
+            };
+        }
+
+        let four_threads = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let splits_before = PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut sequential = four_threads.install(|| query!().collect::<Vec<_>>());
+        assert_eq!(
+            PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed),
+            splits_before,
+            "ordinary iteration inside a Rayon pool must stay on the serial leaf"
+        );
+        sequential.sort_unstable();
+        assert_eq!(sequential, expected);
+        assert_eq!(row_digest(&sequential), expected_digest);
+
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let splits_before = PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed);
+            let mut parallel = pool.install(|| query!().into_par_iter().collect::<Vec<_>>());
+            let splits_after = PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed);
+            if threads == 1 {
+                assert_eq!(
+                    splits_after, splits_before,
+                    "a one-thread pool must stay on the serial leaf"
+                );
+            } else {
+                assert!(
+                    splits_after > splits_before,
+                    "fixture did not split on a {threads}-thread pool"
+                );
+            }
+
+            parallel.sort_unstable();
+            assert_eq!(parallel, expected, "{threads}-thread bag changed");
+            assert_eq!(
+                parallel.iter().copied().collect::<BTreeSet<_>>(),
+                expected_set,
+                "{threads}-thread set changed"
+            );
+            assert_eq!(
+                row_digest(&parallel),
+                expected_digest,
+                "{threads}-thread digest changed"
+            );
         }
     }
 }

@@ -70,6 +70,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   baseline it cut the dense common-plan full drain by 25% and the causal
   parent-batch full drain by 5%, without a repeatable regression at demands
   one through eight.
+- **SuccinctArchive scalar CPU confirmation mirrors the packed-liveness leaf
+  split experimentally.** An explicitly parallel query can divide independent
+  universe/Rank9 probes at the same disjoint word boundaries while ordinary
+  iteration remains serial inside a Rayon pool. WGPU still receives the whole
+  region and makes one route decision; only its threshold or device-error CPU
+  fallback may divide afterward. The split geometry is shared privately with
+  TribleSet, while Succinct explicitly borrows the measured 1,024-candidate
+  TribleSet crossover pending its own frozen demand matrix. The off-forever
+  candidate-region sort and its parent/order copies are removed so Rayon leaves
+  use local ranges rather than reallocating and rebasing a dormant permutation.
+  Sharing the immutable archive and universe across nested Rayon closures makes
+  `U: Sync` explicit on the affected `Constraint` implementations. Direct use
+  of those public constraint types therefore inherits the bound; the
+  `TriblePattern` routes already required `U: Send + Sync`. The `Universe`
+  trait itself is unchanged.
 - **TribleSet confirmation no longer builds a disabled candidate-sort
   permutation.** The value-order region sort was permanently set to
   `usize::MAX` after losing 33--46% on the fixtures that exercised it, yet its

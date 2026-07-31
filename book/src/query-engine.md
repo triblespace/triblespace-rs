@@ -345,6 +345,15 @@ walks the same state machine and transfers a *whole frontier unit* to a sibling:
 - A leaf just drives the ordinary sequential `Iterator::next` and folds the
   results. No engine logic is duplicated for the parallel path.
 
+Built-in scalar CPU confirmers can expose work inside that intact logical call
+to the same pool. TribleSet membership and SuccinctArchive's scalar fallback
+divide only at packed-liveness word boundaries, so each nested Rayon branch
+owns disjoint killable words while the frontier, candidate values, and parent
+tags remain shared and read-only. This path is gated by the explicit parallel
+query intent: ordinary iteration stays serial even when invoked from a Rayon
+worker. A Succinct WGPU adapter still sees and routes the complete region first;
+only a threshold or device-error fallback reaches the divisible CPU leaf.
+
 The ownership rule is itself the split bound: every successful split removes
 one group or page from the left producer and fences it into the right. Work
 cannot be handed back or rediscovered, so rayon's pressure splitter needs no
