@@ -1673,7 +1673,7 @@ impl<'a> Constraint<'a> for LateSuccessGate {
 }
 
 #[test]
-fn source_schedule_can_widen_before_a_sparse_first_result() {
+fn source_credit_is_fenced_before_a_sparse_first_result() {
     const N: u32 = 17;
     const WIDTH: usize = 4096;
     const FIRST_SUCCESSFUL_ROOT: u32 = 2;
@@ -1716,9 +1716,14 @@ fn source_schedule_can_widen_before_a_sparse_first_result() {
     assert_eq!(calls[1], [1, 1, 7]);
     assert_eq!(calls[2], [1, 1, 1]);
     assert_eq!(
+        stats.rows(),
+        13,
+        "a widened source page must not materialise its unused child suffix before the first yield"
+    );
+    assert_eq!(
         stats.widest(),
         8,
-        "two failures can widen an internal frontier before the first yield"
+        "source paging may still widen while candidate drains stay scalar"
     );
 }
 
