@@ -116,8 +116,9 @@ impl<'a> RowOrdinalView<'a> {
     /// Composes `self` after `inner`: result row `i` is
     /// `self[inner[i]]`.
     ///
-    /// Uniform and affine compositions stay implicit. A composition that
-    /// cannot be expressed by either law is written to `scratch`, and the
+    /// Uniform and affine compositions stay implicit, while selecting an
+    /// affine range from explicit storage stays borrowed. A composition that
+    /// cannot be expressed by those laws is written to `scratch`, and the
     /// returned explicit view borrows it. `scratch` is always cleared first.
     ///
     /// # Panics
@@ -128,7 +129,10 @@ impl<'a> RowOrdinalView<'a> {
         self,
         inner: RowOrdinalView<'_>,
         scratch: &'s mut Vec<u32>,
-    ) -> RowOrdinalView<'s> {
+    ) -> RowOrdinalView<'s>
+    where
+        'a: 's,
+    {
         scratch.clear();
         assert!(
             inner.iter().all(|index| (index as usize) < self.len()),
@@ -161,6 +165,16 @@ impl<'a> RowOrdinalView<'a> {
                     len: inner_len,
                 },
             ) => RowOrdinalView::uniform(values[value as usize], inner_len),
+            (
+                Repr::Explicit(values),
+                Repr::Affine {
+                    base,
+                    len: inner_len,
+                },
+            ) => {
+                let start = base as usize;
+                RowOrdinalView::explicit(&values[start..start + inner_len])
+            }
             _ => {
                 scratch.extend(inner.iter().map(|index| {
                     self.get(index as usize)
@@ -226,6 +240,19 @@ mod tests {
 
         let composed = outer.compose_into(inner, &mut scratch);
         assert_eq!(dense(composed), vec![3, 7, 3, 9]);
+    }
+
+    #[test]
+    fn explicit_after_offset_affine_borrows_contiguous_slice() {
+        let outer_values = [11, 13, 17, 19, 23, 29, 31];
+        let outer = RowOrdinalView::explicit(&outer_values);
+        let mut scratch = vec![999];
+
+        let composed = outer.compose_into(RowOrdinalView::affine(2, 4), &mut scratch);
+
+        assert_eq!(composed, RowOrdinalView::explicit(&outer_values[2..6]));
+        assert_eq!(dense(composed), vec![17, 19, 23, 29]);
+        assert!(scratch.is_empty());
     }
 
     proptest! {
