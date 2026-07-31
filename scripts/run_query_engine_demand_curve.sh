@@ -98,29 +98,29 @@ build_subject() {
     local label=$1
     local worktree=$2
     local revision=$3
-    local rustflags=$4
+    local target_label=$4
+    shift 4
     echo "building $label ($revision)" >&2
     env \
         DEMAND_CURVE_ENGINE_REVISION="$revision" \
         DEMAND_CURVE_HARNESS_SHA256="$HARNESS_SHA256" \
-        CARGO_TARGET_DIR="$OUT/targets/$label" \
-        RUSTFLAGS="$rustflags" \
-        cargo build \
+        CARGO_TARGET_DIR="$OUT/targets/$target_label" \
+        cargo rustc \
             --manifest-path "$worktree/Cargo.toml" \
             --locked \
             --release \
-            --example query_engine_demand_curve \
+            --example query_engine_demand_curve -- "$@" \
             >"$OUT/build-logs/$label.log" 2>&1
     cp \
-        "$OUT/targets/$label/release/examples/query_engine_demand_curve" \
+        "$OUT/targets/$target_label/release/examples/query_engine_demand_curve" \
         "$OUT/bin/query_engine_demand_curve-$label"
 }
 
-build_subject old "$OUT/subjects/old" "$OLD_REV" ""
-build_subject current "$OUT/subjects/current" "$CURRENT_REV" \
-    "--cfg demand_frontier_stats"
-build_subject current-w1 "$OUT/subjects/current" "$CURRENT_REV" \
-    "--cfg demand_frontier_stats --cfg demand_frontier_w1"
+build_subject old "$OUT/subjects/old" "$OLD_REV" old
+build_subject current "$OUT/subjects/current" "$CURRENT_REV" current \
+    --cfg demand_frontier_stats
+build_subject current-w1 "$OUT/subjects/current" "$CURRENT_REV" current \
+    --cfg demand_frontier_stats --cfg demand_frontier_w1
 
 {
     printf 'key\tvalue\n'
