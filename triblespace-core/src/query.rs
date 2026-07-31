@@ -30,6 +30,12 @@ pub mod intersectionconstraint;
 /// [`ProposalBuffer`] and [`Candidates`] — candidate storage and bit-packed
 /// liveness for one search level.
 mod liveness;
+/// Exact implicit views over row-ordinal maps.
+///
+/// Landed independently so its algebra is tested before query state begins
+/// depending on it; consumer integration removes the temporary lint allowance.
+#[allow(dead_code)]
+pub(crate) mod ordinal;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
 #[doc(hidden)]

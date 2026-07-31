@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Query row-ordinal maps have an exact implicit view.** The internal
+  `RowOrdinalView` represents unanimous maps and offset identity ranges without
+  allocating a dense vector, borrows explicit storage for arbitrary maps, and
+  supports indexing, slicing, splitting, iteration, and composition under one
+  dense-equivalent law. Property tests include the non-zero affine tails
+  produced by parallel source splits.
 - **A bounded oracle checks the regular-path closure kernel.** A Kani harness
   symbolically selects every subgraph of a five-edge, two-vertex labeled
   universe, while an ordinary deterministic test exhausts all 256 graphs whose
