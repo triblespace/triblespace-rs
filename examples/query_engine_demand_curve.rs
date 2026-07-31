@@ -11,6 +11,7 @@
 //! ```text
 //! DEMAND_CURVE_ENGINE_REVISION=$(git rev-parse 2cd60807) \
 //! DEMAND_CURVE_HARNESS_SHA256=$(shasum -a 256 examples/query_engine_demand_curve.rs | cut -d' ' -f1) \
+//! DEMAND_CURVE_LOCK_SHA256=$(shasum -a 256 Cargo.lock | cut -d' ' -f1) \
 //! CARGO_TARGET_DIR=target/demand-2cd \
 //! cargo rustc --release --example query_engine_demand_curve --
 //!
@@ -18,6 +19,7 @@
 //!   --expect-engine $(git rev-parse 2cd60807) \
 //!   --expect-variant default \
 //!   --expect-harness $(shasum -a 256 examples/query_engine_demand_curve.rs | cut -d' ' -f1) \
+//!   --expect-lock $(shasum -a 256 Cargo.lock | cut -d' ' -f1) \
 //!   --run-id 2026-07-31T120000Z --abba-position block-00-A1 \
 //!   --invocation-sequence 0 \
 //!   --scale threshold --repetitions 9 --warmup 2 --gpu \
@@ -90,6 +92,10 @@ const ENGINE_REVISION: &str = match option_env!("DEMAND_CURVE_ENGINE_REVISION") 
     None => "unbaked",
 };
 const HARNESS_SHA256: &str = match option_env!("DEMAND_CURVE_HARNESS_SHA256") {
+    Some(value) => value,
+    None => "unbaked",
+};
+const DEPENDENCY_LOCK_SHA256: &str = match option_env!("DEMAND_CURVE_LOCK_SHA256") {
     Some(value) => value,
     None => "unbaked",
 };
@@ -226,6 +232,7 @@ struct Config {
     expected_engine: String,
     expected_variant: String,
     expected_harness: String,
+    expected_lock: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -245,7 +252,7 @@ impl CausalRouteExpectation {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: query_engine_demand_curve \\\n         --expect-engine <full-git-rev> --expect-variant <default|frontier-w1> \\\n         --expect-harness <source-sha256> \\\n         --run-id <id> --abba-position <position> --invocation-sequence <N> \\\n         [--scale tiny|below|threshold|above|wide] \\\n         [--repetitions N] [--warmup N] [--gpu] \\\n         [--expect-causal-route yes|no]"
+        "usage: query_engine_demand_curve \\\n         --expect-engine <full-git-rev> --expect-variant <default|frontier-w1> \\\n         --expect-harness <source-sha256> --expect-lock <Cargo.lock-sha256> \\\n         --run-id <id> --abba-position <position> --invocation-sequence <N> \\\n         [--scale tiny|below|threshold|above|wide] \\\n         [--repetitions N] [--warmup N] [--gpu] \\\n         [--expect-causal-route yes|no]"
     );
     std::process::exit(2);
 }
@@ -262,6 +269,7 @@ fn parse_config() -> Config {
     let mut expected_engine = None;
     let mut expected_variant = None;
     let mut expected_harness = None;
+    let mut expected_lock = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     while i < args.len() {
@@ -289,6 +297,7 @@ fn parse_config() -> Config {
             "--expect-engine" => expected_engine = Some(value(&mut i).to_owned()),
             "--expect-variant" => expected_variant = Some(value(&mut i).to_owned()),
             "--expect-harness" => expected_harness = Some(value(&mut i).to_owned()),
+            "--expect-lock" => expected_lock = Some(value(&mut i).to_owned()),
             "-h" | "--help" => usage(),
             _ => usage(),
         }
@@ -314,6 +323,7 @@ fn parse_config() -> Config {
         expected_engine: expected_engine.unwrap_or_else(|| usage()),
         expected_variant: expected_variant.unwrap_or_else(|| usage()),
         expected_harness: expected_harness.unwrap_or_else(|| usage()),
+        expected_lock: expected_lock.unwrap_or_else(|| usage()),
     }
 }
 
@@ -333,6 +343,11 @@ fn verify_provenance(cfg: &Config) {
             "harness SHA-256",
             HARNESS_SHA256,
             cfg.expected_harness.as_str(),
+        ),
+        (
+            "dependency lock SHA-256",
+            DEPENDENCY_LOCK_SHA256,
+            cfg.expected_lock.as_str(),
         ),
     ] {
         if baked == "unbaked" {
@@ -891,7 +906,7 @@ fn emit(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_owned());
     println!(
-        "{record}\t{sequence}\t{}\t{}\t{}\t{ENGINE_REVISION}\t{ENGINE_VARIANT}\t{HARNESS_SHA256}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{demand}\t{repetition}\t{elapsed_ns}\t{rows}\t{digest}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{record}\t{sequence}\t{}\t{}\t{}\t{ENGINE_REVISION}\t{ENGINE_VARIANT}\t{HARNESS_SHA256}\t{DEPENDENCY_LOCK_SHA256}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{demand}\t{repetition}\t{elapsed_ns}\t{rows}\t{digest}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         cell.run_id,
         cell.abba_position,
         cell.invocation_sequence,
@@ -1376,6 +1391,7 @@ fn main() {
     eprintln!("engine={ENGINE_REVISION}");
     eprintln!("engine_variant={ENGINE_VARIANT}");
     eprintln!("harness={HARNESS_SHA256}");
+    eprintln!("dependency_lock={DEPENDENCY_LOCK_SHA256}");
     eprintln!(
         "run_id={} abba_position={} invocation_sequence={}",
         cfg.run_id, cfg.abba_position, cfg.invocation_sequence
@@ -1402,7 +1418,7 @@ fn main() {
     #[cfg(feature = "parallel")]
     eprintln!("rayon_threads={}", rayon::current_num_threads());
     println!(
-        "record\texecution_sequence\trun_id\tabba_position\tinvocation_sequence\tengine\tengine_variant\tharness\tcorpus\tscale\tbatch_parents\tfanout\texpected_sequential_parent_batch_full_route\tbackend\tsubstrate\tparallelism\texecution_path\tshape\tdemand\trepetition\telapsed_ns\trows\tresult_digest\twork_available\tfrontier_expansions\tfrontier_rows\tvariable_groups\tproposals\twidest_frontier\tinplace_descents\tcopied_descents\tgpu_confirms\tgpu_candidates\tcpu_fallback_confirms\tcpu_fallback_candidates\tgpu_errors"
+        "record\texecution_sequence\trun_id\tabba_position\tinvocation_sequence\tengine\tengine_variant\tharness\tdependency_lock\tcorpus\tscale\tbatch_parents\tfanout\texpected_sequential_parent_batch_full_route\tbackend\tsubstrate\tparallelism\texecution_path\tshape\tdemand\trepetition\telapsed_ns\trows\tresult_digest\twork_available\tfrontier_expansions\tfrontier_rows\tvariable_groups\tproposals\twidest_frontier\tinplace_descents\tcopied_descents\tgpu_confirms\tgpu_candidates\tcpu_fallback_confirms\tcpu_fallback_candidates\tgpu_errors"
     );
 
     run_backend(
