@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 if [[ $# -ne 1 ]]; then
-    echo "usage: OLD_REV=<rev> CURRENT_REV=<rev> $0 /absolute/output-directory" >&2
+    echo "usage: OLD_REV=<rev> CURRENT_REV=<rev> [OLD_PROTOCOL=scalar|frontier] $0 /absolute/output-directory" >&2
     exit 2
 fi
 OUT=$1
@@ -18,6 +18,23 @@ fi
 
 OLD_REV=$(git -C "$ROOT" rev-parse "${OLD_REV:-2cd60807}^{commit}")
 CURRENT_REV=$(git -C "$ROOT" rev-parse "${CURRENT_REV:-HEAD}^{commit}")
+OLD_PROTOCOL=${OLD_PROTOCOL:-scalar}
+case "$OLD_PROTOCOL" in
+    scalar)
+        OLD_RUSTFLAGS="--cfg allocation_census_old"
+        DEFAULT_OLD_VARIANT=scalar-dfs
+        ;;
+    frontier)
+        OLD_RUSTFLAGS=""
+        DEFAULT_OLD_VARIANT=frontier
+        ;;
+    *)
+        echo "OLD_PROTOCOL must be scalar or frontier, got: $OLD_PROTOCOL" >&2
+        exit 2
+        ;;
+esac
+OLD_VARIANT=${OLD_VARIANT:-$DEFAULT_OLD_VARIANT}
+CURRENT_VARIANT=${CURRENT_VARIANT:-frontier}
 HARNESS="$ROOT/examples/query_engine_allocation_census.rs"
 ANALYZER="$ROOT/scripts/analyze_query_engine_allocation_census.py"
 HARNESS_SHA256=$(shasum -a 256 "$HARNESS" | awk '{print $1}')
@@ -84,8 +101,8 @@ build() {
     chmod a-w "$OUT/bin/$label"
 }
 
-build old scalar-dfs "$OLD_SUBJECT" "$OLD_REV" "--cfg allocation_census_old"
-build current frontier "$CURRENT_SUBJECT" "$CURRENT_REV" ""
+build old "$OLD_VARIANT" "$OLD_SUBJECT" "$OLD_REV" "$OLD_RUSTFLAGS"
+build current "$CURRENT_VARIANT" "$CURRENT_SUBJECT" "$CURRENT_REV" ""
 
 # Invocation order is deliberately A/B/B/A even though the census contains no
 # timing: duplicate invocations expose nondeterministic/background allocations.
@@ -103,8 +120,9 @@ python3 "$ANALYZER" "$OUT/raw/00-A1-old.tsv" "$OUT/raw/01-B1-current.tsv" \
     printf 'protocol\tquery-engine-allocation-census-v1\n'
     printf 'old_revision\t%s\n' "$OLD_REV"
     printf 'current_revision\t%s\n' "$CURRENT_REV"
-    printf 'old_variant\tscalar-dfs\n'
-    printf 'current_variant\tfrontier\n'
+    printf 'old_protocol\t%s\n' "$OLD_PROTOCOL"
+    printf 'old_variant\t%s\n' "$OLD_VARIANT"
+    printf 'current_variant\t%s\n' "$CURRENT_VARIANT"
     printf 'harness_sha256\t%s\n' "$HARNESS_SHA256"
     printf 'runner_sha256\t%s\n' "$RUNNER_SHA256"
     printf 'analyzer_sha256\t%s\n' "$ANALYZER_SHA256"
