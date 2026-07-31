@@ -1001,19 +1001,17 @@ pub fn f9_total(set: &TribleSet) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// F10 — GPU range-confirm batch-floor boundary.
+// F10 — workload geometry around the GPU range-confirm floor.
 //
-// INTERROGATES: routing hysteresis around
-// `DEFAULT_MIN_CONFIRM_BATCH_RANGE`, and floor rot.
+// INTERROGATES: solver behaviour immediately around
+// `DEFAULT_MIN_CONFIRM_BATCH_RANGE`, and floor-relative fixture rot.
 //
-// `triblespace-gpu` routes a confirm region to the device only when it
-// reaches the measured floor for the operation it is performing. F10's
-// confirmer has entity and attribute fully bound and checks candidate
-// values, so `WgpuSuccinctArchiveConstraint` lowers it to the
-// Restrict/range arm. This fixture therefore straddles
-// `DEFAULT_MIN_CONFIRM_BATCH_RANGE`: two runs whose only difference is
-// one candidate on either side of that boundary. The constant is READ
-// from the engine (never copied here), so moving it moves the fixture.
+// F10's confirmer has entity and attribute fully bound and checks
+// candidate values, which is the Restrict/range shape. It sizes two
+// TribleSet runs one candidate either side of the WGPU range floor. The
+// constant is READ from the adapter (never copied here), so moving it moves
+// the fixture. This fixture does NOT construct `WgpuSuccinctArchive` or
+// prove device routing; the archive arm's route counters do that.
 //
 // Gate on ROWS only — the answer must be the region size on both sides,
 // which is the property routing may never change. Timings across the
@@ -1035,14 +1033,17 @@ pub fn f9_total(set: &TribleSet) -> usize {
 
 /// F10: the Restrict/range routing floor, read from the engine so this fixture
 /// cannot drift away from it.
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(feature = "gpu-single-floor")))]
 pub const F10_RANGE_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE;
+/// Historical subject mirror: the range arm used the one uniform floor.
+#[cfg(feature = "gpu-single-floor")]
+pub const F10_RANGE_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH;
 
-/// F10: candidates just BELOW the range-routing floor (CPU probes).
+/// F10: candidates just BELOW the range-confirm floor.
 #[cfg(feature = "gpu")]
 pub const F10_BELOW: usize = F10_RANGE_FLOOR - 1;
 
-/// F10: candidates just ABOVE the range-routing floor (device confirm).
+/// F10: candidates just ABOVE the range-confirm floor.
 #[cfg(feature = "gpu")]
 pub const F10_ABOVE: usize = F10_RANGE_FLOOR + 1;
 
@@ -1062,7 +1063,7 @@ fn f10_probe(above: bool) -> ExclusiveId {
 /// proposer and confirmer carry the same `n` values, so every candidate
 /// survives and the region handed to `confirm` is `n` entries wide.
 #[cfg(feature = "gpu")]
-pub fn build_gpu_boundary(above: bool, n: usize) -> TribleSet {
+pub fn build_range_floor_boundary(above: bool, n: usize) -> TribleSet {
     let mut ids = Ids::new();
     let mut set = TribleSet::new();
     let root = f10_root(above);

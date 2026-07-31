@@ -671,12 +671,20 @@ fn run_arch_queries(
             Ok(Ok(gpu)) => {
                 led.span("arch_gpu/attach/total", attach_begin, attach_ns);
                 led.outcome("arch_gpu/attach/total", "signal", None);
+                #[cfg(not(feature = "gpu-single-floor"))]
                 println!(
                     "  {:<32} signal (1 span, {:.0} ms, confirm floors range {} / membership {})",
                     "arch_gpu/attach/total",
                     attach_ns as f64 / 1e6,
                     gpu.min_confirm_batch_range(),
                     gpu.min_confirm_batch_membership()
+                );
+                #[cfg(feature = "gpu-single-floor")]
+                println!(
+                    "  {:<32} signal (1 span, {:.0} ms, uniform confirm floor {})",
+                    "arch_gpu/attach/total",
+                    attach_ns as f64 / 1e6,
+                    gpu.min_confirm_batch()
                 );
                 Some(gpu)
             }
@@ -1037,7 +1045,7 @@ fn main() {
             cfg.warmup,
             cfg.iters,
             &base,
-            || fixtures::build_gpu_boundary(false, fixtures::F10_BELOW),
+            || fixtures::build_range_floor_boundary(false, fixtures::F10_BELOW),
             &[R2Measure {
                 name: "harkonnen/F10/below",
                 rows_meaningful: true,
@@ -1050,7 +1058,7 @@ fn main() {
             cfg.warmup,
             cfg.iters,
             &base,
-            || fixtures::build_gpu_boundary(true, fixtures::F10_ABOVE),
+            || fixtures::build_range_floor_boundary(true, fixtures::F10_ABOVE),
             &[R2Measure {
                 name: "harkonnen/F10/above",
                 rows_meaningful: true,

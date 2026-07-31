@@ -3,12 +3,10 @@
 //! whether the batched-GPU confirm path can ever engage on them.
 //!
 //! Until now the suite BUILT an archive (`arch/build_ram/total`) and
-//! never queried it, so the only evidence about `triblespace-gpu`'s
-//! batched confirm came from F10 — a synthetic Restrict fixture
-//! *constructed* to straddle `DEFAULT_MIN_CONFIRM_BATCH_RANGE`. That
-//! says range routing works; it says nothing about whether real queries
-//! produce regions large enough for either operation floor. This module
-//! closes that gap in two independent halves:
+//! never queried it. F10 merely sizes a synthetic TribleSet join around
+//! `DEFAULT_MIN_CONFIRM_BATCH_RANGE`; it neither constructs the WGPU
+//! adapter nor observes routing. This module supplies the missing archive
+//! and accelerator evidence in two independent halves:
 //!
 //! **Phase 1 — the structural question (timing-free).** Region size is
 //! a COUNTING property, so it is trustworthy on a loaded machine.
@@ -71,15 +69,21 @@ use crate::wd_schema::{AnyBlobReader, Dataset};
 /// the gpu crate the census uses the current measured default purely as
 /// a REPORTING reference: no routing happens on that path, and the
 /// histogram itself is floor-independent.
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(feature = "gpu-single-floor")))]
 pub const CONFIRM_RANGE_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH_RANGE;
+/// Historical subject mirror: range and membership shared this floor.
+#[cfg(feature = "gpu-single-floor")]
+pub const CONFIRM_RANGE_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH;
 /// Reporting-only mirror of the range floor; see the gpu-gated sibling.
 #[cfg(not(feature = "gpu"))]
 pub const CONFIRM_RANGE_FLOOR: usize = 8_192;
 
 /// The live-candidate floor for exact membership confirms.
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(feature = "gpu-single-floor")))]
 pub const CONFIRM_MEMBERSHIP_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH_MEMBERSHIP;
+/// Historical subject mirror: range and membership shared this floor.
+#[cfg(feature = "gpu-single-floor")]
+pub const CONFIRM_MEMBERSHIP_FLOOR: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH;
 /// Reporting-only mirror of the membership floor; see the gpu-gated sibling.
 #[cfg(not(feature = "gpu"))]
 pub const CONFIRM_MEMBERSHIP_FLOOR: usize = 24_576;

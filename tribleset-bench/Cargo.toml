@@ -40,17 +40,18 @@ frontier-widest = ["frontier"]
 # bench.sh never enables it; build the control arm by hand. See the note
 # at `queries::run` for what the resulting gap does and does not measure.
 frontier-w1 = ["frontier"]
-# F10 straddles `triblespace-gpu`'s
-# `DEFAULT_MIN_CONFIRM_BATCH_RANGE` (its confirmer is a Restrict/range
-# operation) and READS the constant out of the subject rather than
-# copying it, so the fixture can only compile against a subject that
-# ships the gpu crate (the default since 3d9d8c72). On by default — a
-# subject old enough to lack it is benched with `--no-default-features`,
-# and F10 records SKIP.
+# F10 straddles the subject's GPU floor for Restrict/range confirms and
+# READS the constant rather than copying it, so the fixture can only
+# compile against a subject that ships the gpu crate (the default since
+# 3d9d8c72). An older subject records F10 as SKIP.
 # Forwards to the SUBJECT's own gpu feature: enabling it here without
 # enabling it there leaves `subject::gpu` gated out (revs where gpu is not
 # yet in the subject's default set).
 gpu = ["subject/gpu"]
+# Historical GPU subjects exposed one uniform confirm floor. `bench.sh`
+# enables this refinement only for those revisions, keeping the benchmark's
+# cross-era promise without restoring a compatibility alias in the product.
+gpu-single-floor = ["gpu"]
 
 [dependencies]
 # The engine under test. `subjects/current` is a symlink managed by

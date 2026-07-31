@@ -66,6 +66,10 @@ FEATURES=""
 # DEFAULT_MIN_CONFIRM_BATCH_RANGE out of it rather than copying the number).
 if [ -d "$SUBJECT/triblespace-gpu" ] && grep -q '^gpu = ' "$SUBJECT/Cargo.toml" 2>/dev/null; then
   FEATURES="$FEATURES gpu"
+  if ! grep -q 'DEFAULT_MIN_CONFIRM_BATCH_RANGE' \
+      "$SUBJECT/triblespace-gpu/src/batch_confirm.rs" 2>/dev/null; then
+    FEATURES="$FEATURES gpu-single-floor"
+  fi
 fi
 # protocol-v2: F11 implements Constraint by hand, so it needs the
 # post-Candidates protocol (engine/owned-mask onward).
