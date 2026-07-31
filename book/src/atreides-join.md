@@ -171,10 +171,11 @@ depth-first traversal from thrashing through unrelated values.
   refill that slot installs a fresh buffer rather than copying data it will
   immediately clear.
 - Under the `parallel` feature the same state machine is the rayon producer:
-  splitting transfers one whole preferred-variable group (or terminal page)
-  to a fenced sibling only when the left side retains another continuation.
-  Candidate regions and geometric frontier pages stay intact. Results are the
-  same bag of rows in an unspecified order.
+  splitting transfers one whole preferred-variable group to a fenced sibling
+  only when the left side retains another continuation. Once a terminal
+  frontier is complete, siblings may instead own disjoint emission intervals
+  over its immutable rows. Candidate regions and geometric frontier pages stay
+  intact. Results are the same bag of rows in an unspecified order.
 
 ## Why worst-case optimal?
 

@@ -328,14 +328,17 @@ walks the same state machine and transfers a *whole frontier unit* to a sibling:
   refills that variable, it installs a fresh empty buffer before proposing;
   the other sibling's indexes keep resolving through the old snapshot. A
   uniquely owned buffer keeps and reuses its allocation.
-- A complete terminal page may likewise be transferred as one unit. This is
-  how a one-variable query can expose parallel work without slicing its result
-  frontier.
-- A transfer is admitted only when the left producer has a distinct future:
-  another group at this frontier, or an ancestor level with an unconsumed
-  candidate suffix. A sole group or page with no such continuation stays in
-  place and the producer descends serially; that descent may expose genuinely
-  independent groups deeper in the search.
+- Once a terminal frontier is complete, its immutable row interval may be
+  bisected recursively. Each sibling owns a disjoint emission range over the
+  same `Arc`-backed rows, so result post-processing and draining can run in
+  parallel without changing the proposal/confirmation batch that produced
+  them. A singleton may still move whole when the left producer has an
+  ancestor continuation.
+- A group or singleton transfer is admitted only when the left producer has a
+  distinct future: another group at this frontier, or an ancestor level with
+  an unconsumed candidate suffix. An indivisible unit with no such continuation
+  stays in place and the producer descends or emits serially; a multi-row
+  terminal interval is its own divisible source of work.
 - The sibling owns no ancestor continuation. Once its fenced group or page is
   exhausted it ends instead of unwinding into work still owned by the left
   producer.
@@ -345,10 +348,11 @@ walks the same state machine and transfers a *whole frontier unit* to a sibling:
 - A leaf just drives the ordinary sequential `Iterator::next` and folds the
   results. No engine logic is duplicated for the parallel path.
 
-The ownership rule is itself the split bound: every successful split removes
-one group or page from the left producer and fences it into the right. Work
-cannot be handed back or rediscovered, so rayon's pressure splitter needs no
-engine-specific budget or thread-count tuning knob.
+The ownership rule is itself the split bound: every successful split either
+removes one group/singleton from the left producer and fences it into the
+right, or strictly halves a terminal emission interval. Work cannot be handed
+back or rediscovered, so rayon's pressure splitter needs no engine-specific
+budget or thread-count tuning knob.
 
 The guarantee is the same bag of rows, not the same order. Constraint trees are
 shared behind an `Arc`, so a split is a refcount bump rather than a tree clone;

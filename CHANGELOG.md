@@ -147,16 +147,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compressed-trie shape invariant. This adds one thin eight-byte Arc to PATCH
   while restoring the ownership-neutral 48-byte Branch header (sixteen bytes
   smaller than the per-Branch owner design).
-- **Parallel query splits transfer whole frontier units.** Rayon now steals one
-  complete preferred-variable group, or one complete terminal page, instead of
-  bisecting a proposal buffer. Geometric pages and accelerator-sized batches
-  stay intact. The sibling is re-rooted and fenced to its unit; a split is
-  admitted only when the left producer retains a later group or ancestor
-  candidate continuation. Every successful split therefore removes work from
-  the left and cannot rediscover it, so the old `num_threads²` split budget and
-  candidate-buffer `split_off` machinery are gone. An indivisible 1:1 chain
-  remains serial and keeps its zero-copy in-place descents rather than cloning
-  useless siblings at every depth.
+- **Parallel query splits preserve logical constraint batches.** Rayon now
+  steals one complete preferred-variable group instead of bisecting a proposal
+  buffer; once a terminal frontier is complete, it may additionally bisect the
+  immutable *emission interval* over those same rows. Proposal/confirmation
+  regions, geometric pages, and accelerator-sized batches stay intact while
+  result post-processing and draining can still use multiple cores. Group and
+  singleton transfers are admitted only when the left producer retains a
+  distinct continuation; terminal range splits strictly halve ownership.
+  Those progress measures remove the old `num_threads²` split budget and
+  candidate-buffer `split_off` machinery. An indivisible 1:1 chain remains
+  serial and keeps its zero-copy in-place descents rather than cloning useless
+  siblings at every depth.
 - **Rayon siblings share immutable proposal buffers.** `LevelValues` now holds
   `Option<Arc<ProposalBuffer>>` plus its branch-local consumption cursor, so a
   query split bumps refcounts instead of deep-cloning every live variable's

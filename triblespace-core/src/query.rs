@@ -1247,6 +1247,13 @@ struct Depth {
     group_limit: usize,
     /// Emission cursor, used only when every variable is bound.
     emit: usize,
+    /// Exclusive end of the terminal rows this query owns.
+    ///
+    /// Normally equal to `rows`. Rayon may split an immutable terminal
+    /// frontier into disjoint emission intervals without changing the batch
+    /// that produced it; the right sibling starts at the midpoint while this
+    /// query fences its prefix here.
+    emit_limit: usize,
 }
 
 impl Depth {
@@ -1459,29 +1466,50 @@ where
         Some(right)
     }
 
-    /// Transfers the un-emitted remainder of a complete frontier page to a
-    /// fenced sibling, leaving `self` at the parent source continuation.
+    /// Splits the un-emitted interval of a complete frontier page into two
+    /// disjoint owners, or transfers a singleton when `self` has an ancestor
+    /// continuation.
     ///
     /// Terminal pages have no `NextGroup` state — planning moves them
-    /// straight to [`Search::Emit`] — but they are still whole products of a
-    /// planned group. Treating the page as one indivisible unit is what lets
-    /// single-variable queries participate in rayon without slicing their
-    /// proposal buffers or their result frontiers. The sibling preserves the
-    /// current emission cursor, so the operation is correct even if a future
-    /// caller exposes splitting after partial consumption.
+    /// straight to [`Search::Emit`] — and every proposal and confirmation
+    /// that produced them is already complete. Their row matrix is immutable,
+    /// so bisecting only `[emit, emit_limit)` exposes CPU post-processing and
+    /// result-drain parallelism without fragmenting a logical constraint or
+    /// accelerator batch. The left prefix retains every ancestor continuation;
+    /// the re-rooted right suffix is fenced and ends after its interval.
+    ///
+    /// A one-row interval cannot be bisected. It may still be transferred as
+    /// a whole terminal unit when `self` can continue elsewhere; otherwise it
+    /// honestly remains serial. Every successful split either halves an
+    /// interval or removes the singleton from `self`, giving rayon a strict
+    /// progress measure without a separate split budget.
     fn split_terminal_frontier(&mut self) -> Option<Self> {
         debug_assert_eq!(self.mode, Search::Emit);
         let depth = self.depth;
-        if depth == 0
-            || self.depths[depth].emit >= self.depths[depth].rows
-            || !self.has_ancestor_continuation()
-        {
+        let start = self.depths[depth].emit;
+        let limit = self.depths[depth].emit_limit;
+        if start >= limit {
+            return None;
+        }
+
+        let remaining = limit - start;
+        let midpoint = start + remaining / 2;
+        if remaining == 1 && !self.has_ancestor_continuation() {
             return None;
         }
 
         let mut right = self.clone();
-        self.depth -= 1;
-        self.mode = Search::NextChunk;
+        right.depths[depth].emit = midpoint;
+
+        if midpoint == start {
+            // The singleton moved whole to `right`; no terminal rows remain
+            // on the left before its ancestor continuation.
+            debug_assert!(depth > 0);
+            self.depth -= 1;
+            self.mode = Search::NextChunk;
+        } else {
+            self.depths[depth].emit_limit = midpoint;
+        }
 
         drop(right.stack.drain(..depth));
         drop(right.depths.drain(..depth));
@@ -1544,6 +1572,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             group: 0,
             group_limit: 0,
             emit: 0,
+            emit_limit: 0,
         };
 
         Query {
@@ -1612,6 +1641,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     fn plan(&mut self) {
         if self.unbound.is_empty() {
             self.depths[self.depth].emit = 0;
+            self.depths[self.depth].emit_limit = self.depths[self.depth].rows;
             self.mode = Search::Emit;
             return;
         }
@@ -1925,6 +1955,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         child.group = 0;
         child.group_limit = 0;
         child.emit = 0;
+        child.emit_limit = 0;
 
         let order = Arc::make_mut(&mut child.order);
         order.clear();
@@ -1966,7 +1997,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 ///   all its rows in one call.
 /// - `NextChunk` — turn the next `width` surviving candidates into the
 ///   child frontier, or retire the group when they run out.
-/// - `Emit` — every variable is bound; stream the frontier's rows out.
+/// - `Emit` — every variable is bound; stream this query's owned interval of
+///   the terminal frontier out.
 /// - `Done` — the search is finished.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Search {
@@ -1991,7 +2023,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Qu
                     // dedup — bag semantics are a property of the rows, not
                     // of how many at a time the engine happened to build.
                     let frontier = self.frontier();
-                    let rows = frontier.len();
+                    let rows = self.depths[self.depth].emit_limit;
                     let mut emit = self.depths[self.depth].emit;
                     let mut result = None;
                     while emit < rows {
@@ -2058,10 +2090,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // A heavy sole root group is honestly serial until executing it produces a
 // child group with a source continuation; the parallel path does not invent a
 // destructive intra-group split merely to keep rayon busy.
+// Once a complete terminal frontier exists, its immutable emission interval
+// may be bisected recursively. This parallelises post-processing and result
+// drain while leaving every logical `propose`/`confirm` batch untouched.
 // Every successful split advances the original owner's group/page cursor and
-// fences that unit out of the sibling's future, so ownership is a strict
-// progress measure. Rayon's pressure splitter needs no engine-specific split
-// budget.
+// fences that unit out of the sibling's future, or strictly halves a terminal
+// interval, so ownership is a progress measure. Rayon's pressure splitter
+// needs no engine-specific split budget.
 //
 // `fold_with` is the terminal leaf: it just drives the existing sequential
 // `Iterator::next()` and feeds results into the folder. No duplicated
@@ -2851,12 +2886,33 @@ mod tests {
             }
         }
 
+        fn advance_to_emit_with_at_least(query: &mut TestQuery, minimum: usize) {
+            loop {
+                advance_to_emit(query);
+                let depth = query.depth;
+                let remaining = query.depths[depth].emit_limit - query.depths[depth].emit;
+                if remaining >= minimum {
+                    return;
+                }
+
+                // Retire this tiny terminal page exactly as `Iterator::next`
+                // would after emitting it. The helper deliberately discards
+                // those rows: each structural test compares the exact
+                // remainder from the state at which it actually splits.
+                query.depths[depth].emit = query.depths[depth].emit_limit;
+                assert!(depth > 0, "fixture ended before a wide terminal page");
+                query.depth -= 1;
+                query.mode = Search::NextChunk;
+            }
+        }
+
         #[test]
         fn terminal_page_is_transferred_without_slicing_rows() {
             let mut left = query(32);
             advance_to_emit(&mut left);
             assert!(left.depth > 0);
             let terminal_rows = left.depths[left.depth].rows;
+            assert_eq!(left.depths[left.depth].emit_limit, 1);
             let terminal_block = Arc::clone(&left.depths[left.depth].block);
             let mut expected = left.clone().collect::<Vec<_>>();
 
@@ -2867,6 +2923,39 @@ mod tests {
             assert_eq!(right.stack.len(), 0);
             assert_eq!(right.mode, Search::Emit);
             assert_eq!(right.depths[0].rows, terminal_rows);
+            assert_eq!((right.depths[0].emit, right.depths[0].emit_limit), (0, 1));
+            assert!(Arc::ptr_eq(&terminal_block, &right.depths[0].block));
+
+            let mut actual: Vec<_> = left.chain(right).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn terminal_interval_bisection_shares_rows_and_preserves_the_remainder() {
+            let mut left = query(32);
+            advance_to_emit_with_at_least(&mut left, 2);
+            let depth = left.depth;
+            let start = left.depths[depth].emit;
+            let limit = left.depths[depth].emit_limit;
+            let midpoint = start + (limit - start) / 2;
+            let terminal_block = Arc::clone(&left.depths[depth].block);
+            let mut expected = left.clone().collect::<Vec<_>>();
+
+            let right = left
+                .split_terminal_frontier()
+                .expect("a multi-row terminal interval is divisible");
+
+            assert_eq!(
+                (left.depths[depth].emit, left.depths[depth].emit_limit),
+                (start, midpoint)
+            );
+            assert_eq!(
+                (right.depths[0].emit, right.depths[0].emit_limit),
+                (midpoint, limit)
+            );
+            assert!(Arc::ptr_eq(&terminal_block, &left.depths[depth].block));
             assert!(Arc::ptr_eq(&terminal_block, &right.depths[0].block));
 
             let mut actual: Vec<_> = left.chain(right).collect();
@@ -2937,6 +3026,35 @@ mod tests {
                 let mut scheduled = pool.install(|| query(96).into_par_iter().collect::<Vec<_>>());
                 scheduled.sort_unstable();
                 assert_eq!(scheduled, expected);
+            }
+        }
+
+        #[test]
+        fn cancelled_parallel_drain_is_a_subbag_of_the_full_query() {
+            use std::collections::BTreeMap;
+
+            let expected = query(96).collect::<Vec<_>>();
+            let mut available = BTreeMap::<RawInline, usize>::new();
+            for row in expected {
+                *available.entry(row).or_default() += 1;
+            }
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+            for _ in 0..8 {
+                let rows =
+                    pool.install(|| query(96).into_par_iter().take_any(17).collect::<Vec<_>>());
+                assert_eq!(rows.len(), 17);
+                let mut remaining = available.clone();
+                for row in rows {
+                    let count = remaining
+                        .get_mut(&row)
+                        .expect("cancelled drain emitted a value outside the full bag");
+                    assert!(*count > 0, "cancelled drain duplicated a bag occurrence");
+                    *count -= 1;
+                }
             }
         }
     }
