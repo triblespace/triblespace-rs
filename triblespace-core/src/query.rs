@@ -1280,29 +1280,6 @@ fn reset_shared<T: Clone>(slot: &mut Arc<Vec<T>>, capacity: usize) -> &mut Vec<T
     buffer
 }
 
-/// Clears a split plan for rebuilding without cloning metadata that a Rayon
-/// sibling still owns.
-///
-/// A uniquely-owned plan keeps both vector capacities. Shared plans are
-/// replaced by a fresh empty allocation: their old contents are about to be
-/// discarded, so copy-on-write would pay for a clone with no semantic value.
-fn reset_split_plan(plan: &mut DepthPlan) -> &mut SplitPlan {
-    let reusable = match plan {
-        DepthPlan::Split(split) => Arc::get_mut(split).is_some(),
-        DepthPlan::Unplanned | DepthPlan::Universal(_) => false,
-    };
-    if !reusable {
-        *plan = DepthPlan::Split(Arc::new(SplitPlan::default()));
-    }
-    let DepthPlan::Split(split) = plan else {
-        unreachable!("the plan was replaced with a split")
-    };
-    let split = Arc::get_mut(split).expect("split plan is uniquely owned after replacement");
-    split.order_override.clear();
-    split.groups.clear();
-    split
-}
-
 /// The variable choice shared by every row, or the first exact partition
 /// observed when rows disagree.
 ///
@@ -1761,7 +1738,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                 counts[variable as usize] += 1;
             }
             let mut starts = [0usize; 128];
-            let split = reset_split_plan(&mut depth.plan);
+            let mut split = SplitPlan::default();
             let mut offset = 0;
             for variable in 0..slots {
                 starts[variable] = offset;
@@ -1784,6 +1761,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                     starts[variable as usize] += 1;
                 }
             }
+            depth.plan = DepthPlan::Split(Arc::new(split));
         } else {
             depth.plan = DepthPlan::Universal(first);
         }
@@ -3064,56 +3042,10 @@ mod tests {
             assert_eq!(wide, parallel);
         }
 
-        #[test]
-        fn split_replanning_reuses_unique_storage_and_replaces_shared_storage() {
-            let mut plan = DepthPlan::Split(Arc::new(SplitPlan {
-                order_override: vec![2, 0, 1],
-                groups: vec![(1, 1), (2, 3)],
-            }));
-            let (arc_ptr, order_ptr, group_ptr) = match &plan {
-                DepthPlan::Split(split) => (
-                    Arc::as_ptr(split),
-                    split.order_override.as_ptr(),
-                    split.groups.as_ptr(),
-                ),
-                _ => unreachable!(),
-            };
-
-            let split = reset_split_plan(&mut plan);
-            assert_eq!(split as *const SplitPlan, arc_ptr);
-            assert_eq!(split.order_override.as_ptr(), order_ptr);
-            assert_eq!(split.groups.as_ptr(), group_ptr);
-            assert!(split.order_override.is_empty());
-            assert!(split.groups.is_empty());
-
-            split.order_override.extend([1, 0]);
-            split.groups.push((1, 2));
-            let held = match &plan {
-                DepthPlan::Split(split) => Arc::clone(split),
-                _ => unreachable!(),
-            };
-            let held_ptr = Arc::as_ptr(&held);
-
-            let rebuilt = reset_split_plan(&mut plan);
-            assert_ne!(rebuilt as *const SplitPlan, held_ptr);
-            assert_eq!(held.order_override, [1, 0]);
-            assert_eq!(held.groups, [(1, 2)]);
-            assert!(rebuilt.order_override.is_empty());
-            assert!(rebuilt.groups.is_empty());
-        }
-
         fn advance_to_second_of_three_groups(query: &mut TestQuery) {
             advance_to_three_groups(query);
             let plan = split_plan(query);
             assert_eq!(plan.groups, [(1, 1), (2, 2), (3, 3)]);
-            assert!(
-                plan.order_override.is_empty(),
-                "the stable grouped order is already affine identity"
-            );
-            assert_eq!(
-                query.depths[query.depth].selection(),
-                RowOrdinalView::affine(0, 3)
-            );
 
             // Retire the empty first group and stop inside the second.
             query.next_group();
@@ -3132,6 +3064,15 @@ mod tests {
 
             let mut left = query(FANOUT);
             advance_to_second_of_three_groups(&mut left);
+            let plan = split_plan(&left);
+            assert!(
+                plan.order_override.is_empty(),
+                "the stable grouped order is already affine identity"
+            );
+            assert_eq!(
+                left.depths[left.depth].selection(),
+                RowOrdinalView::affine(0, 3)
+            );
             let mut right = left.split_current_source(2);
 
             assert_eq!(
@@ -3169,6 +3110,48 @@ mod tests {
             actual.sort_unstable();
             assert_eq!(actual, expected, "splitting must preserve the exact bag");
             assert_eq!(actual.iter().filter(|row| row[31] == 2).count(), 1);
+        }
+
+        #[test]
+        fn split_fence_preserves_nonidentity_plan_and_cannot_escape_its_group() {
+            const FANOUT: u32 = 64;
+            let mut expected: Vec<_> = nonidentity_query(FANOUT).collect();
+            expected.sort_unstable();
+
+            let mut left = nonidentity_query(FANOUT);
+            advance_to_second_of_three_groups(&mut left);
+            let plan = split_plan(&left);
+            assert_eq!(plan.order_override, [1, 0, 2]);
+            assert_eq!(
+                left.depths[left.depth].selection(),
+                RowOrdinalView::explicit(&[1, 0, 2])
+            );
+
+            let mut right = left.split_current_source(2);
+            let rightmost = right.split_current_source(2);
+            for branch in [&right, &rightmost] {
+                let plan = split_plan(branch);
+                assert_eq!(plan.order_override, [1, 0, 2]);
+                assert_eq!((branch.depth, branch.depths[0].group_limit), (0, 2));
+            }
+
+            let mut actual: Vec<_> = left.collect();
+            let right_rows: Vec<_> = right.collect();
+            let rightmost_rows: Vec<_> = rightmost.collect();
+            assert!(
+                right_rows
+                    .iter()
+                    .chain(&rightmost_rows)
+                    .all(|row| row[31] == 1),
+                "a fenced sibling escaped the nonidentity plan's current group"
+            );
+            actual.extend(right_rows);
+            actual.extend(rightmost_rows);
+            actual.sort_unstable();
+            assert_eq!(
+                actual, expected,
+                "repeated fencing must preserve the exact bag"
+            );
         }
 
         #[test]
