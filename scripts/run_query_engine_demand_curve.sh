@@ -11,7 +11,7 @@ set -euo pipefail
 #
 # Optional environment:
 #   RUN_ID, OLD_REV, CURRENT_REV, SCALES, REPETITIONS, WARMUP,
-#   RAYON_NUM_THREADS
+#   RAYON_NUM_THREADS, DEMAND_CURVE_CACHE_ROOT
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:?usage: run_query_engine_demand_curve.sh /absolute/output/directory}
@@ -39,6 +39,11 @@ read -r -a SCALE_LIST <<<"$SCALES"
 REPETITIONS=${REPETITIONS:-3}
 WARMUP=${WARMUP:-1}
 RUN_ID=${RUN_ID:-$(date -u +%Y-%m-%dT%H%M%SZ)}
+DEMAND_CURVE_CACHE_ROOT=${DEMAND_CURVE_CACHE_ROOT:-/private/tmp/triblespace-query-demand-cache}
+case "$DEMAND_CURVE_CACHE_ROOT" in
+    /*) ;;
+    *) echo "DEMAND_CURVE_CACHE_ROOT must be absolute" >&2; exit 2 ;;
+esac
 if [[ -z "${RAYON_NUM_THREADS:-}" ]]; then
     if command -v sysctl >/dev/null 2>&1; then
         RAYON_NUM_THREADS=$(sysctl -n hw.physicalcpu 2>/dev/null || true)
@@ -57,14 +62,15 @@ RUNNER="$ROOT/scripts/run_query_engine_demand_curve.sh"
 HARNESS_SHA256=$(shasum -a 256 "$HARNESS" | awk '{print $1}')
 RUNNER_SHA256=$(shasum -a 256 "$RUNNER" | awk '{print $1}')
 
-mkdir -p "$OUT"/{bin,build-logs,raw,subjects,targets}
+mkdir -p "$OUT"/{bin,build-logs,raw}
+mkdir -p "$DEMAND_CURVE_CACHE_ROOT"/{subjects,targets}
 cp "$HARNESS" "$OUT/harness.rs"
 cp "$RUNNER" "$OUT/runner.sh"
 
 prepare_subject() {
     local label=$1
     local revision=$2
-    local worktree="$OUT/subjects/$label"
+    local worktree="$DEMAND_CURVE_CACHE_ROOT/subjects/$label-${revision:0:12}"
     if [[ ! -e "$worktree/.git" ]]; then
         git -C "$ROOT" worktree add --detach "$worktree" "$revision"
     fi
@@ -93,6 +99,8 @@ prepare_subject() {
 
 prepare_subject old "$OLD_REV"
 prepare_subject current "$CURRENT_REV"
+OLD_WORKTREE="$DEMAND_CURVE_CACHE_ROOT/subjects/old-${OLD_REV:0:12}"
+CURRENT_WORKTREE="$DEMAND_CURVE_CACHE_ROOT/subjects/current-${CURRENT_REV:0:12}"
 
 build_subject() {
     local label=$1
@@ -104,7 +112,7 @@ build_subject() {
     env \
         DEMAND_CURVE_ENGINE_REVISION="$revision" \
         DEMAND_CURVE_HARNESS_SHA256="$HARNESS_SHA256" \
-        CARGO_TARGET_DIR="$OUT/targets/$target_label" \
+        CARGO_TARGET_DIR="$DEMAND_CURVE_CACHE_ROOT/targets/$target_label-${revision:0:12}" \
         cargo rustc \
             --manifest-path "$worktree/Cargo.toml" \
             --locked \
@@ -112,14 +120,14 @@ build_subject() {
             --example query_engine_demand_curve -- "$@" \
             >"$OUT/build-logs/$label.log" 2>&1
     cp \
-        "$OUT/targets/$target_label/release/examples/query_engine_demand_curve" \
+        "$DEMAND_CURVE_CACHE_ROOT/targets/$target_label-${revision:0:12}/release/examples/query_engine_demand_curve" \
         "$OUT/bin/query_engine_demand_curve-$label"
 }
 
-build_subject old "$OUT/subjects/old" "$OLD_REV" old
-build_subject current "$OUT/subjects/current" "$CURRENT_REV" current \
+build_subject old "$OLD_WORKTREE" "$OLD_REV" old
+build_subject current "$CURRENT_WORKTREE" "$CURRENT_REV" current \
     --cfg demand_frontier_stats
-build_subject current-w1 "$OUT/subjects/current" "$CURRENT_REV" current \
+build_subject current-w1 "$CURRENT_WORKTREE" "$CURRENT_REV" current \
     --cfg demand_frontier_stats --cfg demand_frontier_w1
 
 {
@@ -130,6 +138,7 @@ build_subject current-w1 "$OUT/subjects/current" "$CURRENT_REV" current \
     printf 'current_revision\t%s\n' "$CURRENT_REV"
     printf 'harness_sha256\t%s\n' "$HARNESS_SHA256"
     printf 'runner_sha256\t%s\n' "$RUNNER_SHA256"
+    printf 'build_cache_root\t%s\n' "$DEMAND_CURVE_CACHE_ROOT"
     printf 'old_binary_sha256\t%s\n' \
         "$(shasum -a 256 "$OUT/bin/query_engine_demand_curve-old" | awk '{print $1}')"
     printf 'current_binary_sha256\t%s\n' \
