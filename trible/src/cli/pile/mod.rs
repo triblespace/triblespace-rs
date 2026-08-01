@@ -198,7 +198,12 @@ pub(crate) fn open_legacy_rewrite_source(path: &Path, operation: &str) -> Result
             }
         });
     if let Err(err) = check {
-        let _ = pile.close();
+        if let Err(close_err) = pile.close() {
+            return Err(anyhow!(
+                "{err}; additionally failed to close source pile {}: {close_err}",
+                path.display()
+            ));
+        }
         return Err(err);
     }
     Ok(pile)
