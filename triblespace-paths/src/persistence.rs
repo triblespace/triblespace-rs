@@ -375,8 +375,8 @@ impl PathRollup {
     /// direct-product summaries, and close once.
     ///
     /// This hot path trusts the manifest's certified frontier, as maintained
-    /// by `Repository::register_index` or an audited setter. It does not repeat
-    /// the O(history) exact-cover audit on every attachment.
+    /// by an audited index publisher. It does not repeat the O(history)
+    /// exact-cover audit on every attachment.
     pub fn attach_exact<S>(
         &self,
         storage: &mut S,
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_hook_publishes_exact_paths_and_contentless_coverage() {
+    fn assertion_frontier_supports_exact_paths_and_contentless_coverage() {
         let rollup = PathRollup::new(plus_label(metadata::tag.id().into()));
         let mut repo = Repository::new(
             MemoryRepo::default(),
@@ -875,23 +875,55 @@ mod tests {
             TribleSet::new(),
         )
         .unwrap();
-        repo.register_index(rollup.clone());
-        let branch_id = *repo.create_branch("paths", None).unwrap();
-
-        let mut left = repo.pull(branch_id).unwrap();
-        let mut right = repo.pull(branch_id).unwrap();
-        left.commit(edge_facts(1, 2), "left edge");
-        right.commit(edge_facts(2, 3), "right edge");
+        let mut left = repo.create_workspace("paths").unwrap();
+        let mut right = repo.create_workspace("paths").unwrap();
+        let identity = *left.identity();
+        let branch_id = identity.id().entity();
+        let left_source = edge_facts(1, 2);
+        let right_source = edge_facts(2, 3);
+        left.commit(left_source.clone(), "left edge");
+        right.commit(right_source.clone(), "right edge");
+        let left_head = left.head().unwrap();
+        let right_head = right.head().unwrap();
         repo.push(&mut left).unwrap();
-
-        // The stale right push exercises Repository's conflict merge/retry.
-        // Its two edge commits share the empty branch as their base, so the
-        // retry creates a real two-parent commit whose metadata has no
-        // `repo::content` handle. The hook must still certify that commit as
-        // an artifact-free leaf in the exact range cover.
         repo.push(&mut right).unwrap();
-        let merge_head = right.head().unwrap();
-        assert!(repo.take_hook_errors().is_empty());
+
+        // Independent assertions from the same empty base resolve to one
+        // canonical, contentless merge. A no-change push caches that synthetic
+        // commit without adding a third branch assertion.
+        let mut merged = repo.pull(identity).unwrap();
+        let merge_head = merged.head().unwrap();
+        repo.push(&mut merged).unwrap();
+
+        // Derived index publication is deliberately explicit and separate
+        // from branch assertion publication.
+        let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
+        append_range(
+            repo.storage_mut(),
+            &rollup,
+            &left_source,
+            CommitRange::leaf(left_head),
+            &mut manifest,
+        )
+        .unwrap();
+        append_range(
+            repo.storage_mut(),
+            &rollup,
+            &right_source,
+            CommitRange::leaf(right_head),
+            &mut manifest,
+        )
+        .unwrap();
+        append_range(
+            repo.storage_mut(),
+            &rollup,
+            &TribleSet::new(),
+            CommitRange::leaf(merge_head),
+            &mut manifest,
+        )
+        .unwrap();
+        set_index_head(repo.storage_mut(), &rollup, &mut manifest, Some(merge_head)).unwrap();
+        publish_manifest(repo.storage_mut(), branch_id, manifest, Some(merge_head));
 
         let index = rollup.attach_exact(repo.storage_mut(), branch_id).unwrap();
         assert!(index.contains(

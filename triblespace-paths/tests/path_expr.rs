@@ -1,14 +1,18 @@
 use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
-use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::IntoBlob;
+use triblespace_core::id::{ufoid, ExclusiveId, Id};
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::macros::entity;
 use triblespace_core::metadata;
 use triblespace_core::query::{Binding, Query, Variable};
+use triblespace_core::repo::index_home::{append_range, set_index_head, CommitRange, Manifest};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::Repository;
+use triblespace_core::repo::{self, BlobStorePut, PinStore, PushResult, Repository};
 use triblespace_core::trible::TribleSet;
 use triblespace_paths::{automaton_fingerprint, GraphEdge, PathExpr, PathIndex, PathRollup, Step};
 
@@ -88,15 +92,45 @@ fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
         TribleSet::new(),
     )
     .unwrap();
-    repo.register_index(rollup.clone());
-    let branch_id = *repo.create_branch("path-expr", None).unwrap();
+    let mut workspace = repo.create_workspace("path-expr").unwrap();
+    let branch_id = workspace.identity().id().entity();
 
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);
-    let mut workspace = repo.pull(branch_id).unwrap();
-    workspace.commit(graph, "materialize compiled path expression");
+    workspace.commit(graph.clone(), "materialize compiled path expression");
+    let source_head = workspace.head().unwrap();
     repo.push(&mut workspace).unwrap();
-    assert!(repo.take_hook_errors().is_empty());
+
+    let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
+    append_range(
+        repo.storage_mut(),
+        &rollup,
+        &graph,
+        CommitRange::leaf(source_head),
+        &mut manifest,
+    )
+    .unwrap();
+    set_index_head(
+        repo.storage_mut(),
+        &rollup,
+        &mut manifest,
+        Some(source_head),
+    )
+    .unwrap();
+    let branch_entity = ufoid();
+    manifest += entity! { &branch_entity @
+        repo::branch: branch_id,
+        repo::head: source_head,
+    }
+    .into_facts();
+    let metadata_head: Inline<Handle<SimpleArchive>> =
+        repo.storage_mut().put(manifest.to_blob()).unwrap();
+    assert!(matches!(
+        repo.storage_mut()
+            .update(branch_id, None, Some(metadata_head))
+            .unwrap(),
+        PushResult::Success()
+    ));
 
     let index = rollup.attach_exact(repo.storage_mut(), branch_id).unwrap();
     let end = Variable::<UnknownInline>::new(0);
