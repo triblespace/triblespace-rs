@@ -909,6 +909,27 @@ impl BlobStoreGet for PileReader {
     }
 }
 
+impl super::branch_frontier::PartialCommitDag for PileReader {
+    type Error = super::commit::StoredCommitError<
+        GetBlobError<crate::blob::encodings::simplearchive::UnarchiveError>,
+    >;
+
+    fn parents(
+        &mut self,
+        commit: super::CommitHandle,
+    ) -> Result<super::branch_frontier::ParentLookup, Self::Error> {
+        use super::branch_frontier::ParentLookup;
+
+        match self.get::<crate::trible::TribleSet, SimpleArchive>(commit) {
+            Ok(metadata) => super::commit::direct_parents(&metadata)
+                .map(ParentLookup::Present)
+                .map_err(super::commit::StoredCommitError::Metadata),
+            Err(GetBlobError::BlobNotFound) => Ok(ParentLookup::Missing),
+            Err(err) => Err(super::commit::StoredCommitError::Read(err)),
+        }
+    }
+}
+
 impl super::BlobChildren for PileReader {}
 
 impl BlobStore for Pile {

@@ -311,6 +311,28 @@ impl BlobStoreGet for MemoryBlobStoreReader {
     }
 }
 
+impl crate::repo::branch_frontier::PartialCommitDag for MemoryBlobStoreReader {
+    type Error = crate::repo::commit::StoredCommitError<
+        MemoryStoreGetError<crate::blob::encodings::simplearchive::UnarchiveError>,
+    >;
+
+    fn parents(
+        &mut self,
+        commit: crate::repo::CommitHandle,
+    ) -> Result<crate::repo::branch_frontier::ParentLookup, Self::Error> {
+        use crate::blob::encodings::simplearchive::SimpleArchive;
+        use crate::repo::branch_frontier::ParentLookup;
+
+        match self.get::<crate::trible::TribleSet, SimpleArchive>(commit) {
+            Ok(metadata) => crate::repo::commit::direct_parents(&metadata)
+                .map(ParentLookup::Present)
+                .map_err(crate::repo::commit::StoredCommitError::Metadata),
+            Err(MemoryStoreGetError::NotFound()) => Ok(ParentLookup::Missing),
+            Err(err) => Err(crate::repo::commit::StoredCommitError::Read(err)),
+        }
+    }
+}
+
 impl crate::repo::BlobChildren for MemoryBlobStoreReader {}
 
 impl BlobStorePut for MemoryBlobStore {
