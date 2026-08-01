@@ -113,6 +113,10 @@
 pub mod async_store;
 
 pub mod branch;
+/// Immutable, signed branch assertions and their grow-only snapshots.
+pub mod branch_assertion;
+/// Partial-ancestry resolution of branch assertion frontiers.
+pub mod branch_frontier;
 /// Capability-based authorization for triblespace networks.
 pub mod capability;
 /// Commit metadata construction and signature verification.
@@ -188,7 +192,6 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::{self};
 
-use commit::commit_metadata;
 use hifitime::Epoch;
 use itertools::Itertools;
 
@@ -2723,7 +2726,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
 
         // Truly divergent — create a merge commit.
         let parents = self.head.iter().copied().chain(Some(other));
-        let merge_commit = commit_metadata(&self.signing_key, parents, None, None, None);
+        let merge_commit = crate::repo::commit::merge_metadata(parents);
         let commit_handle = self
             .staged
             .put(merge_commit)

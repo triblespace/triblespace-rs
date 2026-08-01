@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Branch assertions have a closed, signed, grow-only core model.** A branch
+  identity is now expressible as the intrinsic two-fact `(author key, name
+  handle)` descriptor, while one canonical 160-byte Ed25519 assertion carries
+  exactly that descriptor and a commit. Public assertion values are
+  verified-only; their opaque PATCH snapshot derives every 48-byte
+  `BranchId || AssertionId` key from the value and exposes no replacement,
+  deletion, CAS, or scalar-head operation. A partial-DAG resolver distinguishes
+  an unreadable target (`TipPending`) from readable candidates with unknown
+  ancestry (`Partial`) and the true maximal antichain (`Complete`). Partial
+  frontiers can build a conservative read view but cannot license an asserted
+  merge; complete divergence builds one deterministic flat authorless merge.
+  Generated acyclic-DAG tests pin delivery-order independence and
+  `Max(Max(A) ∪ B) = Max(A ∪ B)`.
 - **Demand-curve receipts render as explicit performance fingerprints.** The
   feature-gated `tribleset-bench` GORBIE notebook normalizes fragmented TSV
   axes in memory and gives every engine/storage/execution subject the same

@@ -18,6 +18,29 @@ use crate::prelude::inlineencodings::Handle;
 use crate::query::find;
 use crate::trible::TribleSet;
 
+/// Construct the canonical authorless commit for one complete divergent
+/// frontier.
+///
+/// The whole parent set is encoded flat in one intrinsic entity. There is no
+/// signer, timestamp, message, content, or metadata, so every replica given
+/// the same parent set produces byte-identical commit metadata. This is a
+/// derived view; constructing it does not assert or publish it.
+pub(crate) fn merge_metadata(
+    parents: impl IntoIterator<Item = Inline<Handle<SimpleArchive>>>,
+) -> TribleSet {
+    let mut parents: Vec<_> = parents.into_iter().collect();
+    parents.sort_unstable_by_key(|parent| parent.raw);
+    parents.dedup();
+    assert!(
+        parents.len() > 1,
+        "an authorless merge requires at least two distinct parents"
+    );
+    entity! {
+        super::parent*: parents,
+    }
+    .into()
+}
+
 /// Error returned when commit signature verification fails.
 pub enum ValidationError {
     /// The metadata contains multiple signature entities for the same commit.
