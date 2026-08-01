@@ -1,233 +1,268 @@
 # Repository Workflows
 
-Working with a Tribles repository feels familiar to Git users, but the types
-make data ownership and lifecycle explicit. Keep the following vocabulary in
-mind when exploring the API:
+TribleSpace repositories separate immutable, content-addressed blobs from the
+small amount of replicated state needed to name a line of work. That replicated
+state is a set of immutable, signed branch assertions. There is no mutable
+branch-head slot: publishing adds an assertion, and resolving a branch derives
+its current frontier from all assertions known for its exact identity.
 
-* **Repository** – top-level object that tracks history through `BlobStore`
-  and `BranchStore` implementations.
-* **Workspace** – mutable view of a branch, similar to Git's working directory
-  and index combined. Workspaces buffer commits and custom blobs until you push
-  them back to the repository.
-* **BlobStore** – storage backend for commits and payload blobs.
-* **BranchStore** – records branch metadata and head pointers.
+The main types are:
 
-Both stores can be in memory, on disk or backed by a remote service. The
-examples in `examples/repo.rs` and `examples/workspace.rs` showcase these APIs
-and are a great place to start if you are comfortable with Git but new to
-Tribles.
+- **`Repository`** — a local authoring boundary backed by a blob store and one
+  Ed25519 signing key.
+- **`Workspace`** — a mutable staging area containing a branch identity, a
+  current commit head, and blobs not yet uploaded to the repository.
+- **`BranchIdentity`** — the exact `(author key, name handle)` pair identifying
+  a branch. The name is a content-addressed `LongString` blob.
+- **`BranchAssertion`** — an immutable signature by the branch author over that
+  exact identity and one commit handle.
+- **`BranchAssertionStore`** — storage for a coherent, grow-only set of verified
+  assertions.
+
+This model deliberately allows concurrent publications. If two writers publish
+incomparable descendants, both assertions remain true; resolution computes the
+maximal commit frontier and derives a deterministic view over it.
 
 ## Opening a repository
 
-Repositories are constructed from any storage that implements the appropriate
-traits. The choice largely depends on your deployment scenario:
-
-1. Pick or compose a storage backend (see [Storage Backends and
-   Composition](#storage-backends-and-composition)).
-2. Create a signing key for the identity that will author commits.
-3. Call `Repository::new(storage, signing_key, commit_metadata)` to obtain a handle.
-   Pass `TribleSet::new()` for `commit_metadata` when you do not need custom
-   metadata on commits.
-
-Most applications perform the above steps once during start-up and then reuse
-the resulting `Repository`. If initialization may fail (for example when opening
-an on-disk pile), bubble the error to the caller so the process can retry or
-surface a helpful message to operators.
-
-## Storage Backends and Composition
-
-`Repository` accepts any storage that implements both the `BlobStore` and
-`BranchStore` traits, so you can combine backends to fit your deployment. The
-crate ships with a few ready-made options:
-
-- [`MemoryRepo`](../src/repo/memoryrepo.rs) stores everything in memory and is
-  ideal for tests or short-lived tooling where persistence is optional.
-- [`Pile`](../src/repo/pile.rs) persists blobs and branch metadata in a single
-  append-only file. It is the default choice for durable local repositories and
-  integrates with the pile tooling described in [Pile Format](pile-format.md).
-- [`ObjectStoreRemote`](../src/repo/objectstore.rs) connects to
-  [`object_store`](https://docs.rs/object_store/latest/object_store/) endpoints
-  (S3, local filesystems, etc.). It keeps all repository data in the remote
-  service and is useful when you want a shared blob store without running a
-  dedicated server.
-- [`HybridStore`](../src/repo/hybridstore.rs) lets you split responsibilities,
-  e.g. storing blobs on disk while keeping branch heads in memory or another
-  backend. Any combination that satisfies the trait bounds works.
-
-Backends that need explicit shutdown can implement `StorageClose`. When the
-repository type exposes that trait bound you can call `repo.close()?` to flush
-and release resources instead of relying on `Drop` to run at an unknown time.
-This is especially handy for automation where the process may terminate soon
-after completing a task.
-
-```rust,ignore
-use triblespace::core::repo::hybridstore::HybridStore;
-use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::objectstore::ObjectStoreRemote;
-use triblespace::core::repo::Repository;
-use triblespace::core::inline::encodings::hash::Blake3;
-use url::Url;
-
-let blob_remote: ObjectStoreRemote<Blake3> =
-    ObjectStoreRemote::with_url(&Url::parse("s3://bucket/prefix")?)?;
-let branch_store = MemoryRepo::default();
-let storage = HybridStore::new(blob_remote, branch_store);
-let mut repo = Repository::new(storage, signing_key, TribleSet::new())?;
-
-// Work with repo as usual …
-// repo.close()?; // if the underlying storage supports StorageClose
-```
-
-## Branching
-
-A branch records a line of history and carries the metadata that identifies who
-controls updates to that history. Creating one writes initial metadata to the
-underlying store and returns an [`ExclusiveId`](../src/id.rs) guarding the
-branch head. Dereference that ID when you need a plain [`Id`](../src/id.rs) for
-queries or workspace operations.
-
-Typical steps for working on a branch look like:
-
-1. Create a repository backed by blob and branch stores via `Repository::new`.
-2. Initialize or look up a branch ID with helpers like
-   `Repository::create_branch`. When interacting with an existing branch call
-   `Repository::pull` directly.
-3. Commit changes in the workspace using `Workspace::commit`.
-4. Push the workspace with `Repository::push` (or handle conflicts manually via
-   `Repository::try_push`) to publish those commits.
-
-The example below demonstrates bootstrapping a new branch and opening multiple
-workspaces on it. Each workspace holds its own staging area, so remember to push
-before sharing work or starting another task.
-
-
-```rust,ignore
-let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())?;
-let branch_id = repo.create_branch("main", None).expect("create branch");
-
-let mut ws = repo.pull(*branch_id).expect("pull branch");
-let mut ws2 = repo.pull(ws.branch_id()).expect("open branch");
-```
-
-After committing changes you can push the workspace back. `push` will retry on
-contention and attempt to merge, while `try_push` performs a single attempt and
-returns `Ok(Some(conflict_ws))` when the branch head moved. Choose the latter
-when you need explicit conflict handling:
-
-```rust,ignore
-ws.commit(change, "initial commit");
-repo.push(&mut ws)?;
-```
-
-### Managing signing identities
-
-The key passed to `Repository::new` becomes the default signing identity for
-branch metadata and commits. Collaborative projects often need to switch
-between multiple authors or assign a dedicated key to automation. You can
-adjust the active identity in three ways:
-
-* `Repository::set_signing_key` replaces the repository's default key. Subsequent
-  calls to helpers such as `Repository::create_branch` or `Repository::pull` use the new
-  key for any commits created from those workspaces.
-* `Repository::create_branch_with_key` signs a branch's metadata with an explicit
-  key, allowing each branch to advertise the author responsible for updating it.
-* `Repository::pull_with_key` opens a workspace that will sign its future commits
-  with the provided key, regardless of the repository default.
-
-The snippet below demonstrates giving an automation bot its own identity while
-letting a human collaborator keep theirs:
+Construct a repository from a storage backend, a signing key, and repository-wide
+commit metadata:
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::repo::Repository;
+use triblespace::prelude::*;
+use triblespace::core::repo::{memoryrepo::MemoryRepo, Repository};
 
-let alice = SigningKey::generate(&mut OsRng);
-let automation = SigningKey::generate(&mut OsRng);
-
-// Assume `pile` was opened earlier, e.g. via `Pile::open` as shown in previous sections.
-let mut repo = Repository::new(pile, alice.clone(), TribleSet::new())?;
-
-// Create a dedicated branch for the automation pipeline using its key.
-let automation_branch = repo
-    .create_branch_with_key("automation", None, automation.clone())?
-    .release();
-
-// Point automation jobs at their dedicated identity by default.
-repo.set_signing_key(automation.clone());
-let mut bot_ws = repo.pull(automation_branch)?;
-
-// Humans can opt into their own signing identity even while automation remains
-// the repository default.
-let mut human_ws = repo.pull_with_key(automation_branch, alice.clone())?;
+let storage = MemoryRepo::default();
+let key = SigningKey::generate(&mut OsRng);
+let mut repo = Repository::new(storage, key, TribleSet::new())?;
 ```
 
-`human_ws` and `bot_ws` now operate on the same branch but will sign their
-commits with different keys. This pattern is useful when rotating credentials or
-running scheduled jobs under a service identity while preserving authorship in
-the history. You can swap identities at any time; existing workspaces keep the
-key they were created with until you explicitly call
-`Repository::set_signing_key`.
+`Repository::new` accepts anything convertible into a `Fragment` as commit
+metadata. Embedded blobs in that fragment are stored along with the archived
+metadata, so an `entity!` or `attributes!::describe()` fragment can be used
+without separately managing its handles.
 
-## Inspecting History
+Repository operations are capability-gated by the backend:
 
-You can explore previous commits using `Workspace::checkout` which returns a
-`Checkout` (which derefs to `TribleSet` and also tracks the `CommitSet`) with the
-union of the specified commit contents. Passing a single
-commit returns just that commit. To include its history you can use the
-`ancestors` helper. Commit ranges are supported for convenience. The expression
-`a..b` yields every commit reachable from `b` that is not reachable from `a`,
-treating missing endpoints as empty (`..b`) or the current `HEAD` (`a..` and
-`..`). These selectors compose with filters, so you can slice history to only
-the entities you care about.
+- `BlobStore` is sufficient to construct a repository and create a detached
+  workspace.
+- `BranchAssertionStore` and a reader implementing `PartialCommitDag` add
+  branch resolution and pull.
+- `StorageFlush` adds publication, because blobs must cross a durability
+  boundary before an assertion may point at them.
+- `StorageClose` adds `Repository::close` for backends needing explicit
+  shutdown.
+
+`MemoryRepo` provides all of these capabilities for tests and ephemeral work.
+`Pile` provides the durable local implementation: blobs and fixed-size branch
+assertion records share one append-only file. Other storage compositions can
+implement the same capabilities without changing the repository semantics.
+
+## Branch identity and first publication
+
+A branch does not exist merely because a name was chosen. Its identity is the
+full pair of the repository's public key and the content handle of the name:
+
+```text
+BranchIdentity = (author verifying key, branch-name handle)
+```
+
+`BranchIdentity` is `Copy`, so callers can retain it as the stable descriptor
+used by `resolve` and `pull`. Its shorter `BranchId` is an intrinsic index
+prefix, not a substitute for comparing the full descriptor.
+
+Create a new line of work with `create_workspace`, commit into it, and publish
+the commit with `push`:
+
+```rust,ignore
+let mut ws = repo.create_workspace("main")?;
+let main = *ws.identity();
+
+ws.commit(TribleSet::new(), "initial commit");
+
+let outcome = repo.push(&mut ws)?;
+assert!(matches!(
+    outcome,
+    triblespace::core::repo::PublishOutcome::Published(_)
+));
+
+let mut reopened = repo.pull(main)?;
+```
+
+Creating the workspace only stages the branch-name blob locally. It does not
+write an assertion or create an empty branch. Pushing a workspace whose head
+has not changed returns `PublishOutcome::NoChange`; empty branches therefore
+remain unrepresentable. The first changed push makes the staged blobs durable
+and adds the first signed assertion.
+
+For an existing name owned by the repository key, callers can derive the same
+descriptor without opening a workspace:
+
+```rust,ignore
+let main = repo.branch_identity("main");
+let state = repo.resolve(&main)?;
+let ws = repo.pull(main)?;
+```
+
+`resolve_name("main")` is shorthand for deriving the repository's own identity
+and resolving it.
+
+## Working in a workspace
+
+A workspace keeps three things together: its immutable `BranchIdentity`, its
+current optional commit head, and a private staging store layered over the blob
+snapshot from which it was opened. A newly created workspace has no head;
+`commit` archives a content fragment, constructs canonical signed commit
+metadata, stages all resulting blobs, and advances the local head.
+
+These operations do not mutate repository branch state. Applications may keep
+several workspaces for one identity and let them advance independently. Their
+only replicated effect occurs when `push` appends an assertion for a changed
+head. `Workspace::identity`, `head`, `put`, `get`, `commit`, `checkout`, and the
+explicit merge helpers all operate within this local view.
+
+## Resolving assertions
+
+`Repository::resolve` takes a coherent assertion snapshot and classifies what
+can be established from the commit metadata currently available locally. It
+returns one of four states:
+
+| State | Meaning | Safe next step |
+| --- | --- | --- |
+| `Absent` | No assertion exists for the exact identity. | Create a workspace if this is a new local branch, or ingest/fetch the missing replicated state. |
+| `TipPending` | At least one surviving asserted tip's commit metadata is absent. | Fetch `missing_tips()` and resolve again. |
+| `Partial` | Every surviving tip is a well-formed commit, but missing ancestry prevents the resolver from deciding all dominance relations. | Use `conservative_head()` for a read-only derived view, fetch `missing_ancestry()`, and resolve again before authoring. |
+| `Complete` | The complete, sorted, nonempty maximal antichain is known. | Inspect `tips()` or open a writable workspace with `pull`. |
+
+Absence is distinct from incomplete replication. A signed assertion can arrive
+before the commit metadata it names, producing `TipPending`; readable tips can
+arrive before enough ancestry to compare them, producing `Partial`. Backend
+failures and malformed commit metadata remain errors rather than being
+misreported as missing data.
+
+Only `Complete` resolution licenses a writable pull. `Repository::pull`
+surfaces `Absent`, `TipPending`, and `Partial` as explicit errors instead of
+silently choosing a head from incomplete knowledge.
+
+### Divergent complete frontiers
+
+A complete frontier containing one maximal commit resolves directly to that
+commit. A complete divergent frontier resolves to a canonical, flat,
+authorless merge metadata blob whose parents are all maximal tips in raw-handle
+order. The shape depends only on the frontier, not on assertion arrival order
+or a history of pairwise merges.
+
+That synthetic merge is a derived view, not a branch assertion. Pull stages it
+as the workspace's base head. Merely pulling and pushing it unchanged returns
+`NoChange`; making a new commit creates an authored descendant of the derived
+merge, and pushing that descendant adds a normal signed assertion.
+
+`PartialFrontier::conservative_head` uses the same flat representation over
+the non-definitely-dominated candidates. It is safe for reading because it does
+not discard any candidate, but it must not be asserted: additional ancestry
+could later prove one candidate dominated.
+
+## Publishing and concurrency
+
+`Repository::push` has one publication point and no compare-and-swap loop. For
+a changed workspace it performs these steps in order:
+
+1. Upload every staged blob.
+2. Flush the storage so those blobs are durable.
+3. Read the proposed head metadata from the durable snapshot.
+4. Verify that the head has one of the canonical authored-commit or flat
+   authorless-merge shapes.
+5. Sign `(author key, name handle, commit handle)` and durably append the
+   assertion.
+6. Refresh the workspace base and clear its staging area.
+
+No fallible storage operation follows a successful assertion append. Thus a
+returned `Published` assertion cannot point at a commit that was only buffered
+locally. Repeating `push` without another commit returns `NoChange`, and exact
+duplicate assertions are idempotent in the assertion store.
+
+Concurrent writers do not overwrite or reject one another. Two workspaces
+pulled from the same base may both publish descendants; the grow-only store
+retains both assertions. A later resolution removes definitely dominated
+claims and, when the remaining commits are incomparable, exposes their
+canonical divergent frontier. Publication consequently chooses no losing
+writer and performs no mutable-head retry.
+
+Workspace-level `merge` and `merge_commit` remain useful when an application
+deliberately combines staged work or a known commit before publication. They
+operate on commit history; they are not a repair loop imposed by branch
+storage.
+
+## Local authoring boundary
+
+One `Repository` publishes only identities owned by the signing key passed to
+`Repository::new`. `branch_identity` and `create_workspace` always construct
+such identities. `resolve` and `pull` reject a foreign author key before
+consulting the assertion or blob stores, and `push` rejects it before uploading
+workspace data or appending an assertion.
+
+This hard boundary keeps local authoring separate from replication policy.
+Accepting assertions signed by other authors is a future, explicit remote
+ingest capability with its own authorization, quota, and overload rules; it is
+separate from the local authoring API.
+
+## Inspecting history
+
+`Workspace::checkout` returns a `Checkout`, which dereferences to `TribleSet`
+and also records the `CommitSet` that produced it. Passing one commit selects
+that commit. Wrap a selector with `ancestors` to include its history, or use a
+range to select commits reachable from the end but not the start. Missing range
+endpoints mean empty (`..b`) or the current workspace head (`a..` and `..`).
 
 ```rust,ignore
 let history = ws.checkout(commit_a..commit_b)?;
 let full = ws.checkout(ancestors(commit_b))?;
 ```
 
-The [`history_of`](../src/repo.rs) helper builds on the `filter` selector to
-retrieve only the commits affecting a specific entity. Commit selectors are
-covered in more detail in the next chapter:
+The `history_of` helper filters history to commits affecting a particular
+entity:
 
 ```rust,ignore
 let entity_changes = ws.checkout(history_of(my_entity))?;
 ```
 
-## Working with Custom Blobs
+Keeping the identity separately makes repeated incremental pulls explicit:
 
-Workspaces keep a private blob store that mirrors the repository's backing
-store. This makes it easy to stage large payloads alongside the trible sets you
-plan to commit. The [`Workspace::put`](../src/repo.rs) helper stores any type
-implementing [`ToBlob`](triblespace::core::blob::ToBlob) and returns a typed handle you can
-embed like any other value. Handles are `Copy`, so you can commit them and reuse
-them to fetch the blob later.
+```rust,ignore
+let identity = *ws.identity();
+let changed = repo.pull(identity)?.checkout(previous_commits..)?;
+```
 
-The example below stages a quote and an archived `TribleSet`, commits both, then
-retrieves them again with strongly typed and raw views. In practice you might
-use this pattern to attach schema migrations, binary artifacts, or other payloads
-that should travel with the commit:
+Commit selectors and incremental queries are covered in more detail in the
+next chapter.
+
+## Working with custom blobs
+
+A workspace has a private in-memory blob store layered over the repository
+reader. This lets structured facts and large payloads be staged together.
+`Workspace::put` accepts anything implementing `IntoBlob` and returns a typed,
+content-addressed handle suitable for embedding in an entity.
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::blob::Blob;
 use triblespace::core::examples::{self, literature};
-use triblespace::prelude::*;
 use triblespace::core::repo::{self, memoryrepo::MemoryRepo, Repository};
+use triblespace::prelude::*;
 use blobencodings::{LongString, SimpleArchive};
 
 let storage = MemoryRepo::default();
-let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
-let branch_id = repo.create_branch("main", None).expect("create branch");
-let mut ws = repo.pull(*branch_id).expect("pull branch");
+let mut repo = Repository::new(
+    storage,
+    SigningKey::generate(&mut OsRng),
+    TribleSet::new(),
+)?;
+let mut ws = repo.create_workspace("main")?;
+let main = *ws.identity();
 
-// `entity!{}` auto-puts blob payloads into the workspace's blob
-// store — the value side of a `Handle<S>`-typed field becomes the
-// content-addressed handle that lives in the trible.
-//
-// When you also need the handle in hand (to read back, log, share,
-// or reuse across multiple entities), call `ws.put` explicitly.
 let quote_handle: Inline<Handle<LongString>> =
     ws.put("Fear is the mind-killer".to_owned());
 let archive_handle: Inline<Handle<SimpleArchive>> =
@@ -239,302 +274,37 @@ let mut change = entity! {
 };
 change += entity! { repo::content: archive_handle.clone() };
 
-ws.commit(change, "Attach annotated dataset");
-// Single-attempt push. Use `push` to let the repository merge and retry automatically.
-repo.try_push(&mut ws).expect("try_push");
+ws.commit(change, "attach annotated dataset");
+repo.push(&mut ws)?;
 
-// Fetch the staged blobs back with the desired representation.
-let restored_quote: String = ws
-    .get(quote_handle)
-    .expect("load quote");
-let restored_set: TribleSet = ws
-    .get(archive_handle)
-    .expect("load dataset");
-let archive_bytes: Blob<SimpleArchive> = ws
-    .get(archive_handle)
-    .expect("load raw blob");
-std::fs::write("dataset.car", archive_bytes.bytes.as_ref()).expect("persist archive");
+let mut reopened = repo.pull(main)?;
+let restored_quote: String = reopened.get(quote_handle)?;
+let restored_set: TribleSet = reopened.get(archive_handle)?;
+let archive_bytes: Blob<SimpleArchive> = reopened.get(archive_handle)?;
+std::fs::write("dataset.car", archive_bytes.bytes.as_ref())?;
 ```
 
-Rust infers the blob encoding for both `put` and `get` from the handles and the
-assignment context, so the calls stay concise without explicit turbofish
-annotations.
+`entity!` can also absorb blob-valued fields directly through `Fragment`.
+Call `put` explicitly when the application needs to retain the handle for
+logging, reuse, or later reads.
 
-Blobs staged this way stay local to the workspace until you push the commit.
-`Workspace::get` searches the workspace-local store first and falls back to the
-repository if necessary, so the handles remain valid after you publish the
-commit. This round trip lets you persist logs, archives, or other auxiliary
-files next to your structured data without inventing a separate storage
-channel.
+`Workspace::get` checks staged blobs first and then its repository snapshot.
+Before publication, newly added payloads exist only in the workspace. A
+successful changed `push` uploads and flushes them before appending the branch
+assertion, so handles reachable from the published commit remain resolvable.
 
-## Merging and Conflict Handling
+## Closing durable storage
 
-When pushing a workspace another client might have already updated the branch.
-There are two ways to handle this:
-
-- `Repository::try_push` — a single-attempt push that uploads local blobs and
-  attempts a CAS update once. If the branch advanced concurrently it returns
-  `Ok(Some(conflict_ws))` so callers can merge and retry explicitly:
+When a backend implements `StorageClose`, consume the repository with
+`repo.close()?` to flush and release its resources explicitly. Alternatively,
+use `into_storage` when backend-specific finalization is needed:
 
 ```rust,ignore
-ws.commit(content, "codex-turn");
-let mut current_ws = ws;
-while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
-    // Merge the local staged changes into the incoming workspace and retry.
-    incoming.merge(&mut current_ws)?;
-    current_ws = incoming;
-}
+repo.close()?;
 ```
 
-- `Repository::push` — a convenience wrapper that performs the merge-and-retry
-  loop for you. Call this when you prefer the repository to handle conflicts
-  automatically; it either succeeds (returns `Ok(())`) or returns an error.
-
-```rust,ignore
-ws.commit(content, "codex-turn");
-repo.push(&mut ws)?; // will internally merge and retry until success
-```
-
-> **Troubleshooting:** `Workspace::merge` succeeds only when both workspaces
-> share a blob store. Merging a workspace pulled from a different pile or
-> remote returns `MergeError::DifferentRepos`. Decide which repository will own
-> the combined history, transfer the other branch's reachable blobs into it with
-> `repo::transfer(reachable(...))`, create a branch for that imported head, and
-> merge locally once both workspaces target the same store.
-
-After a successful push the branch may have advanced further than the head
-supplied, because the repository refreshes its view after releasing the lock.
-An error indicating a corrupted pile does not necessarily mean the push failed;
-the update might have been written before the corruption occurred.
-
-This snippet is taken from [`examples/workspace.rs`](../examples/workspace.rs).
-The [`examples/repo.rs`](../examples/repo.rs) example demonstrates the same
-pattern with two separate workspaces. The returned `Workspace` already contains
-the remote commits, so after merging your changes you push that new workspace to
-continue.
-
-## Typical CLI Usage
-
-There is a small command line front-end in the
-[`trible`](https://github.com/triblespace/trible) repository. It exposes push
-and merge operations over simple commands and follows the same API presented in
-the examples. The tool is currently experimental and may lag behind the library,
-but it demonstrates how repository operations map onto a CLI.
-
-## Diagram
-
-A simplified view of the push/merge cycle:
-
-```text
-
-        ┌───────────┐         pull          ┌───────────┐
-        | local ws  |◀───────────────────── |   repo    |
-        └─────┬─────┘                       └───────────┘
-              │
-              │ commit
-              │                                                                      
-              ▼                                   
-        ┌───────────┐         push          ┌───────────┐
-        │  local ws │ ─────────────────────▶│   repo    │
-        └─────┬─────┘                       └─────┬─────┘
-              │                                   │
-              │ merge                             │ conflict?
-              └──────▶┌─────────────┐◀────────────┘
-                      │ conflict ws │       
-                      └───────┬─────┘
-                              │             ┌───────────┐
-                              └────────────▶|   repo    │
-                                     push   └───────────┘
-   
-```
-
-Each push either succeeds or returns a workspace containing the other changes.
-Merging incorporates your commits and the process repeats until no conflicts
-remain.
-
-### Troubleshooting push, branch, and pull failures
-
-`Repository::push`, `Repository::create_branch`, and `Repository::pull` surface
-errors from the underlying blob and branch stores. These APIs intentionally do
-not hide storage issues, because diagnosing an I/O failure or a corrupt commit
-usually requires operator intervention. The table below lists the error variants
-along with common causes and remediation steps.
-
-| API | Error variant | Likely causes and guidance |
-| --- | --- | --- |
-| `Repository::push` | `PushError::StorageBranches` | Enumerating branch metadata in the backing store failed. Check connectivity and credentials for the branch store (for example, the object-store bucket, filesystem directory, or HTTP endpoint). |
-| `Repository::push` | `PushError::StorageReader` | Creating a blob reader failed before any transfer started. The blob store may be offline, misconfigured, or returning permission errors. |
-| `Repository::push` | `PushError::StorageGet` | Fetching existing commit metadata failed. The underlying store returned an error or the metadata blob could not be decoded, which often signals corruption or truncated uploads. Inspect the referenced blob in the store to confirm it exists and is readable. |
-| `Repository::push` | `PushError::StoragePut` | Uploading new content or metadata blobs failed. Look for transient network failures, insufficient space, or rejected writes in the blob store logs. On local `Pile` stores backed by `writev`, very large single records can fail with `EINVAL` (for example when total iovec bytes exceed platform syscall limits). Split oversized payloads into semantic chunks (with a manifest/root record) before retrying. |
-| `Repository::push` | `PushError::BranchUpdate` | Updating the branch head failed. Many backends implement optimistic compare-and-swap semantics; stale heads or concurrent writers therefore surface here as update errors. Refresh the workspace and retry after resolving any store-side errors. |
-| `Repository::push` | `PushError::BadBranchMetadata` | The branch metadata could not be parsed. Inspect the stored metadata blobs for corruption or manual edits and repair them before retrying the push. |
-| Branch creation APIs | `BranchError::StorageReader` | Creating a blob reader failed. Treat this like `PushError::StorageReader`: verify the blob store connectivity and credentials. |
-| Branch creation APIs | `BranchError::StorageGet` | Reading branch metadata during initialization failed. Check for corrupted metadata blobs or connectivity problems. |
-| Branch creation APIs | `BranchError::StoragePut` | Persisting branch metadata failed. Inspect store logs for rejected writes or quota issues. |
-| Branch creation APIs | `BranchError::BranchHead` | Retrieving the current head of the branch failed. This usually points to an unavailable branch store or inconsistent metadata. |
-| Branch creation APIs | `BranchError::BranchUpdate` | Updating the branch entry failed. Resolve branch-store errors and ensure no other writers are racing the update before retrying. |
-| Branch creation APIs | `BranchError::AlreadyExists` | A branch with the requested name already exists. Choose a different name or delete the existing branch before recreating it. |
-| Branch creation APIs | `BranchError::BranchNotFound` | The specified base branch does not exist. Verify the branch identifier and that the base branch has not been deleted. |
-| `Repository::pull` | `PullError::BranchNotFound` | The branch is missing from the repository. Check the branch name/ID and confirm that it has not been removed. |
-| `Repository::pull` | `PullError::BranchStorage` | Accessing the branch store failed. This mirrors `BranchError::BranchHead` and usually indicates an unavailable or misconfigured backend. |
-| `Repository::pull` | `PullError::BlobReader` | Creating a blob reader failed before commits could be fetched. Ensure the blob store is reachable and that the credentials grant read access. |
-| `Repository::pull` | `PullError::BlobStorage` | Reading commit or metadata blobs failed. Investigate missing objects, network failures, or permission problems in the blob store. |
-| `Repository::pull` | `PullError::BadBranchMetadata` | The branch metadata is malformed. Inspect and repair the stored metadata before retrying the pull. |
-
-## Remote Stores
-
-Remote deployments use the [`ObjectStoreRemote`](../src/repo/objectstore.rs)
-backend to speak to any service supported by the
-[`object_store`](https://docs.rs/object_store/latest/object_store/) crate (S3,
-Google Cloud Storage, Azure Blob Storage, HTTP-backed stores, the local
-filesystem, and the in-memory `memory:///` adapter). `ObjectStoreRemote`
-implements both `BlobStore` and `BranchStore`, so the rest of the repository API
-continues to work unchanged – the only difference is the URL you pass to
-`with_url`.
-
-```rust,ignore
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-use triblespace::prelude::*;
-use triblespace::core::repo::objectstore::ObjectStoreRemote;
-use triblespace::core::repo::Repository;
-use triblespace::core::inline::encodings::hash::Blake3;
-use url::Url;
-
-fn open_remote_repo(raw_url: &str) -> anyhow::Result<()> {
-    let url = Url::parse(raw_url)?;
-    let storage = ObjectStoreRemote::<Blake3>::with_url(&url)?;
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
-
-    let branch_id = repo.create_branch("main", None)?;
-    let mut ws = repo.pull(*branch_id)?;
-    ws.commit(TribleSet::new(), "initial commit");
-
-    while let Some(mut incoming) = repo.try_push(&mut ws)? {
-        incoming.merge(&mut ws)?;
-        ws = incoming;
-    }
-
-    Ok(())
-}
-```
-
-`ObjectStoreRemote` writes directly through to the backing service. It
-implements `StorageClose`, but the implementation is a no-op, so dropping the
-repository handle is usually sufficient. Call `repo.close()` if you prefer an
-explicit shutdown step.
-
-Credential configuration follows the `object_store` backend you select. For
-example, S3 endpoints consume AWS access keys or IAM roles, while
-`memory:///foo` provides a purely in-memory store for local testing. Once the
-URL resolves, repositories backed by piles and remote stores share the same
-workflow APIs.
-
-## Attaching a Foreign History (merge-import)
-
-Sometimes you want to graft an existing branch from another pile into your
-current repository without rewriting its commits. Tribles supports a
-conservative, schema‑agnostic import followed by a single merge commit:
-
-1. Copy all reachable blobs from the source branch head into the target pile
-   by streaming the `reachable` walker into `repo::transfer`. The traversal
-   scans every 32‑byte aligned chunk and enqueues any candidate that
-   dereferences in the source.
-2. Create a single merge commit that has two parents: your current branch head
-   and the imported head. No content is attached to the merge; it simply ties
-   the DAGs together.
-
-This yields a faithful attachment of the foreign history — commits and their
-content are copied verbatim, and a one‑off merge connects both histories.
-
-The `trible` CLI exposes this as:
-
-```sh
-trible branch merge-import \
-  --from-pile /path/to/src.pile --from-name source-branch \
-  --to-pile   /path/to/dst.pile --to-name   self
-```
-
-Internally this uses the `reachable` walker in combination with
-`repo::transfer` plus `Workspace::merge_commit`. Because the traversal scans
-aligned 32‑byte chunks, it is forward‑compatible with new formats as long as
-embedded handles remain 32‑aligned.
-
-> **Sidebar — Choosing a copy routine**
-> - `repo::transfer` pairs the reachability walker (or any other iterator you
->   provide) with targeted copies, returning `(old_handle, new_handle)` pairs
->   for the supplied handles. Feed it the `reachable` iterator when you only
->   want live blobs, the output of
->   [`potential_handles`](https://docs.rs/triblespace/latest/triblespace/repo/fn.potential_handles.html)
->   when scanning metadata, or a collected list from
->   `BlobStoreList::blobs()` when duplicating an entire store.
-> - `MemoryBlobStore::keep` (and other `BlobStoreKeep` implementations) retain
->   whichever handles you stream to them, making it easy to drop unreachable
->   blobs once you've walked your roots.
->
-> Reachable copy keeps imports minimal; the transfer helper lets you rewrite
-> specific handles while duplicating data into another store.
-
-### Programmatic example (Rust)
-
-The same flow can be used directly from Rust when you have two piles on disk and
-want to attach the history of one branch to another:
-
-```rust,ignore
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-use triblespace::prelude::*;
-use triblespace::core::repo::{self, pile::Pile, Repository};
-use triblespace::core::inline::encodings::hash::Blake3;
-use triblespace::core::inline::encodings::hash::Handle;
-
-fn merge_import_example(
-    src_path: &std::path::Path,
-    src_branch_id: triblespace::id::Id,
-    dst_path: &std::path::Path,
-    dst_branch_id: triblespace::id::Id,
-) -> anyhow::Result<()> {
-    // 1) Open source (read) and destination (write) piles. `refresh`
-    //    loads the existing records and fails loud on a corrupt tail
-    //    (repair is a separate, explicit step: `Pile::amputate` /
-    //    `trible pile amputate`).
-    let mut src = Pile::open(src_path)?;
-    src.refresh()?;
-    let mut dst = Pile::open(dst_path)?;
-    dst.refresh()?;
-
-    // 2) Resolve source head commit handle
-    let src_head: Inline<Handle<blobencodings::SimpleArchive>> =
-        src.head(src_branch_id)?.ok_or_else(|| anyhow::anyhow!("source head not found"))?;
-
-    // 3) Conservatively copy all reachable blobs from source → destination
-    let reader = src.reader()?;
-    let mapping: Vec<_> = repo::transfer(
-        &reader,
-        &mut dst,
-        repo::reachable(&reader, [src_head.transmute()]),
-    )
-    .collect::<Result<_, _>>()?;
-    eprintln!("copied {} reachable blobs", mapping.len());
-
-    // 4) Attach via a single merge commit in the destination branch
-    let mut repo = Repository::new(dst, SigningKey::generate(&mut OsRng), TribleSet::new())?;
-    let mut ws = repo.pull(dst_branch_id)?;
-    ws.merge_commit(src_head)?; // parents = { current HEAD, src_head }
-
-    // 5) Push with standard conflict resolution
-    while let Some(mut incoming) = repo.try_push(&mut ws)? {
-        incoming.merge(&mut ws)?;
-        ws = incoming;
-    }
-
-    drop(ws);
-    repo.close()?;
-    drop(reader);
-    src.close()?;
-    Ok(())
-}
-```
+Explicit close is useful for short-lived commands that should report a final
+I/O failure instead of relying on `Drop`.
 
 ## Optional telemetry sink
 

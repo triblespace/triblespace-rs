@@ -78,6 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `Repository` publishes own-key grow-only branch assertions.**
+  `create_workspace(name)` now begins an unpublished branch without writing an
+  empty state; its first changed `push` makes staged blobs durable, validates
+  the proposed canonical commit metadata, and appends one signed assertion.
+  `resolve` exposes `Absent`, `TipPending`, `Partial`, and `Complete` directly,
+  while `pull` creates a writable workspace only from a complete frontier and
+  stages the deterministic flat merge for complete divergence without
+  asserting that derived view. The CAS lifecycle (`create_branch`, scalar
+  lookup/ensure, key overrides, `try_push`, conflict workspaces, and branch-head
+  commit hooks) is removed rather than dual-authored. Local authoring rejects a
+  foreign `(author key, name handle)` descriptor before any store operation;
+  policy-bearing replicated ingest remains a separate capability.
+
 - **SuccinctArchive CPU range confirmation batches wavelet descents.** The
   frontier still forms and routes each complete candidate region before any
   fallback, while the canonical CPU path resolves adjacent distinct values in

@@ -1,7 +1,7 @@
 //! Repository over a `Lazy` store — the "lazy checkout" contract.
 //!
-//! `Repository`/`Workspace` need ZERO changes to run over a
-//! `Lazy<S>`: a checkout drives the reader's **sync probe**, so a
+//! A workspace can read over `Lazy<S>` independently of branch-assertion
+//! ingest policy: checkout drives the reader's **sync probe**, so a
 //! closure that is only partially present fails with
 //! `WantGetError::NotYet` (bubbled through
 //! `WorkspaceCheckoutError::Storage`) while the miss has already
@@ -29,16 +29,16 @@ mod test_ns {
 fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     let key = SigningKey::from_bytes(&[7u8; 32]);
 
-    // ── Source repo: one branch, one commit ──────────────────────────
+    // ── Source repo: one asserted branch, one commit ─────────────────
     let mut repo_a =
         Repository::new(MemoryRepo::default(), key.clone(), TribleSet::new()).expect("source repo");
-    let branch_id = *repo_a.create_branch("main", None).expect("create branch");
-    let mut ws = repo_a.pull(branch_id).expect("pull");
+    let mut ws = repo_a.create_workspace("main").expect("workspace");
 
     let e = triblespace_core::id::rngid();
     let data: TribleSet = entity! { &e @ test_ns::label: "payload" }.into();
     ws.commit(data.clone(), "the payload commit");
     repo_a.push(&mut ws).expect("push");
+    let head = ws.head().expect("published head");
 
     // The commit's content blob — the one we withhold from the replica.
     let content_blob: Blob<triblespace_core::blob::encodings::simplearchive::SimpleArchive> =
@@ -58,21 +58,14 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
             replica.put::<UnknownBlob, _>(blob).expect("replica put");
         }
     }
-    let head = repo_a
-        .storage_mut()
-        .head(branch_id)
-        .expect("head lookup")
-        .expect("branch has a head");
-    replica
-        .update(branch_id, None, Some(head))
-        .expect("replica branch pin");
-
     // ── Lazy checkout over the wrapped replica ─────────────────────
+    // Branch-assertion replication is deliberately outside this test: phase-3
+    // Repository is an own-key authoring boundary, while this contract concerns
+    // only a workspace reading a known commit through a lazy blob store.
     let lazy = Lazy::new(replica);
     let mut repo_b = Repository::new(lazy, key, TribleSet::new()).expect("replica repo");
-    let mut ws_b = repo_b
-        .pull(branch_id)
-        .expect("pull succeeds — branch meta + commit present");
+    let mut ws_b = repo_b.create_workspace("main").expect("workspace");
+    ws_b.set_head(head);
 
     let err = ws_b
         .checkout(..)

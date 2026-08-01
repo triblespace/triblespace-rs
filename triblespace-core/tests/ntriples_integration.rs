@@ -40,8 +40,7 @@ const NT_SAMPLE: &[u8] = br#"
 #[test]
 fn ingests_facts_and_roundtrips_via_query() {
     let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).expect("branch");
-    let mut ws = repo.pull(branch_id).expect("workspace");
+    let mut ws = repo.create_workspace("main").expect("workspace");
 
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
     assert_eq!(import.triples, 4, "four non-empty triples in the sample");

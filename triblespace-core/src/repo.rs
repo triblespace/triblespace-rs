@@ -1,25 +1,23 @@
 #![allow(clippy::type_complexity)]
-//! This module provides a high-level API for storing and retrieving data from repositories.
-//! The design is inspired by Git, but with a focus on object/content-addressed storage.
-//! It separates storage concerns from the data model, and reduces the mutable state of the repository,
-//! to an absolute minimum, making it easier to reason about and allowing for different storage backends.
+//! Content-addressed commit storage with grow-only signed branch assertions.
 //!
-//! Blob repositories are collections of blobs that can be content-addressed by their hash.
-//! This is typically local `.pile` file or a S3 bucket or a similar service.
-//! On their own they have no notion of branches or commits, or other stateful constructs.
-//! As such they also don't have a notion of time, order or history,
-//! massively relaxing the constraints on storage.
-//! This makes it possible to use a wide range of storage services, including those that don't support
-//! atomic transactions or have other limitations.
+//! Blobs are immutable and addressed by their hashes. A branch is not a mutable
+//! `(id -> head)` cell: its replicated state is the set of signed assertions
+//! that exact identity has made. [`branch_frontier::resolve_branch`] removes
+//! only definitely dominated tips under commit ancestry. A singleton frontier
+//! is its own head; a complete divergent frontier has one deterministic flat
+//! authorless merge as its derived read view.
 //!
-//! Branch repositories on the other hand are a stateful construct that can be used to represent a branch pointing to a specific commit.
-//! They are stored in a separate repository, typically a  local `.pile` file, a database or an S3 compatible service with a compare-and-swap operation,
-//! and can be used to represent the state of a repository at a specific point in time.
+//! This separation removes compare-and-swap from collaboration. Two writers
+//! may publish while partitioned; both assertions survive, and resolution
+//! reconciles them when their state is unioned. The signed assertion set—not a
+//! synthetic merge—is the authority-bearing replicated state.
 //!
-//! Technically, branches are just a mapping from a branch id to a blob hash,
-//! But because TribleSets are themselves easily stored in a blob, and because
-//! trible commit histories are an append-only chain of TribleSet metadata,
-//! the hash of the head is sufficient to represent the entire history of a branch.
+//! [`Repository`] is deliberately an own-key local-authoring boundary. Its
+//! [`BranchIdentity`] is the exact `(author key, name handle)` descriptor.
+//! Foreign assertion ingest needs authorization and overload policy and is a
+//! separate capability; local resolve, pull, and push reject foreign keys
+//! before touching storage.
 //!
 //! ## Basic usage
 //!
@@ -27,87 +25,25 @@
 //! use ed25519_dalek::SigningKey;
 //! use rand::rngs::OsRng;
 //! use triblespace::prelude::*;
-//! use triblespace::prelude::inlineencodings::{GenId, ShortString};
 //! use triblespace::repo::{memoryrepo::MemoryRepo, Repository};
 //!
 //! let storage = MemoryRepo::default();
 //! let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-//! let branch_id = repo.create_branch("main", None).expect("create branch");
-//! let mut ws = repo.pull(*branch_id).expect("pull branch");
+//! let mut workspace = repo.create_workspace("main").expect("open blob snapshot");
+//! let identity = *workspace.identity();
+//! workspace.commit(entity! { literature::title: "Dune" }, "initial commit");
+//! repo.push(&mut workspace).expect("publish assertion");
 //!
-//! attributes! {
-//!     "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
-//!     "0DBB530B37B966D137C50B943700EDB2" as pub firstname: ShortString;
-//!     "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: ShortString;
-//! }
-//! let author = fucid();
-//! ws.commit(
-//!     entity!{ &author @
-//!         literature::firstname: "Frank",
-//!         literature::lastname: "Herbert",
-//!      },
-//!     "initial commit",
-//! );
-//!
-//! // Single-attempt push: `try_push` uploads local blobs and attempts a
-//! // single CAS update. On conflict it returns a workspace containing the
-//! // new branch state which you should merge into before retrying.
-//! match repo.try_push(&mut ws).expect("try_push") {
-//!     None => {}
-//!     Some(_) => panic!("unexpected conflict"),
-//! }
+//! let mut current = repo.pull(identity).expect("complete branch frontier");
+//! let checkout = current.checkout(..).expect("read history");
 //! ```
 //!
-//! `create_branch` registers a new branch and returns an [`ExclusiveId`](crate::id::ExclusiveId) guard.
-//! `pull` creates a new workspace from an existing branch while
-//! `branch_from` can be used to start a new branch from a specific commit
-//! handle. See `examples/workspace.rs` for a more complete example.
-//!
-//! ## Handling conflicts
-//!
-//! The single-attempt primitive is [`Repository::try_push`](crate::repo::Repository::try_push). It returns
-//! `Ok(None)` on success or `Ok(Some(conflict_ws))` when the branch advanced
-//! concurrently. Callers that want explicit conflict handling may use this
-//! form:
-//!
-//! ```rust,ignore
-//! while let Some(mut other) = repo.try_push(&mut ws)? {
-//!     // Merge our staged changes into the incoming workspace and retry.
-//!     other.merge(&mut ws)?;
-//!     ws = other;
-//! }
-//! ```
-//!
-//! For convenience `Repository::push` is provided as a retrying wrapper that
-//! performs the merge-and-retry loop for you. Call `push` when you prefer the
-//! repository to handle conflicts automatically; call `try_push` when you need
-//! to inspect or control the intermediate conflict workspace yourself.
-//!
-//! `push` performs a compare‐and‐swap (CAS) update on the branch metadata.
-//! This optimistic concurrency control keeps branches consistent without
-//! locking and can be emulated by many storage systems (for example by
-//! using conditional writes on S3).
-//!
-//! ## Git parallels
-//!
-//! The API deliberately mirrors concepts from Git to make its usage familiar:
-//!
-//! - A [`Repository`](crate::repo::Repository) stores commits and branch metadata similar to a remote.
-//! - [`Workspace`](crate::repo::Workspace) is akin to a working directory combined with an index. It
-//!   tracks changes against a branch head until you `push` them.
-//! - `create_branch` and `branch_from` correspond to creating new branches from
-//!   scratch or from a specific commit, respectively.
-//! - `push` updates the repository atomically. If the branch advanced in the
-//!   meantime, you receive a conflict workspace which can be merged before
-//!   retrying the push.
-//! - `pull` is similar to cloning a branch into a new workspace.
-//!
-//! `pull` uses the repository's default signing key for new commits. If you
-//! need to work with a different identity, the `_with_key` variants allow providing
-//! an explicit key when creating branches or pulling workspaces.
-//!
-//! These parallels should help readers leverage their Git knowledge when
-//! working with trible repositories.
+//! [`Repository::create_workspace`] writes no branch state. An empty branch is
+//! unrepresentable; its first changed [`Repository::push`] uploads and flushes
+//! the staged blobs, validates the proposed canonical commit metadata, and
+//! durably appends exactly one signed assertion. [`Repository::pull`] yields a
+//! writable workspace only for [`BranchResolution::Complete`]; `Absent`,
+//! `TipPending`, and `Partial` remain explicit states.
 //!
 /// Branch metadata construction and signature verification.
 pub mod async_store;
@@ -172,7 +108,7 @@ pub trait StorageFlush {
 // Convenience impl for repositories whose storage supports explicit close.
 impl<Storage> Repository<Storage>
 where
-    Storage: BlobStore + PinStore + StorageClose,
+    Storage: BlobStore + StorageClose,
 {
     /// Close the repository's underlying storage if it supports explicit
     /// close operations.
@@ -203,7 +139,6 @@ use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::blob::TryFromBlob;
 use crate::find;
-use crate::id::genid;
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -213,9 +148,15 @@ use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::inlineencodings::GenId;
-use crate::repo::branch::branch_metadata;
 use crate::trible::TribleSet;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+
+use crate::repo::branch_assertion::{
+    AssertionId, BranchAssertion, BranchAssertionStore, BranchId, BranchIdentity,
+};
+use crate::repo::branch_frontier::{
+    BranchResolution, PartialCommitDag, PartialFrontier, ResolvedHead, TipPendingFrontier,
+};
 
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -244,49 +185,6 @@ attributes! {
     "9DF34F84959928F93A3C40AEB6E9E499" as pub signature_r: ed::ED25519RComponent;
     /// The `s` part of a ed25519 signature.
     "1ACE03BF70242B289FDF00E4327C3BC6" as pub signature_s: ed::ED25519SComponent;
-}
-
-/// Rebuild branch-head metadata against a new commit head, carrying every
-/// other fact on the head forward from `base_meta`.
-///
-/// [`branch_metadata`] mints a fresh branch-head entity — it is
-/// content-derived, so a new head or timestamp yields a new id — and a naive
-/// rebuild would therefore drop everything else stored beside it.
-///
-/// # Why the carry is total
-///
-/// This used to preserve exactly one thing: `index_home::manifest_tribles`.
-/// That made branch-head metadata durable only for the annotation kinds core
-/// knows by name — a closed-world assumption inside a store built on open
-/// extension. Anything else attached to a head (a migration record, a
-/// downstream faculty's annotation) survived until the next push and then
-/// vanished, with no error and no trace, because the loss happens in the
-/// rebuild rather than at the write.
-///
-/// So the rule is inverted: everything is carried EXCEPT the branch-head
-/// entities being replaced. Those are identified by carrying the `branch`
-/// attribute, which is exactly what `branch_metadata` mints and therefore
-/// exactly what this rebuild supersedes.
-fn rebuild_branch_meta(
-    signing_key: &SigningKey,
-    branch_id: Id,
-    name: Inline<Handle<LongString>>,
-    commit_head: Option<Blob<SimpleArchive>>,
-    base_meta: &TribleSet,
-) -> TribleSet {
-    let mut meta = branch_metadata(signing_key, branch_id, name, commit_head);
-    meta += carried_head_facts(base_meta, branch_id);
-    meta
-}
-
-/// Every fact on a branch head except the branch-head entities themselves.
-///
-/// The complement of [`index_home::manifest_tribles`]: rather than naming
-/// the kinds worth keeping, this names the one kind being replaced and keeps
-/// the rest.
-fn carried_head_facts(base_meta: &TribleSet, branch_id: Id) -> TribleSet {
-    branch::carried_facts(base_meta, branch_id)
-        .expect("branch metadata was validated before rebuild")
 }
 
 /// The `ListBlobs` trait is used to list all blobs in a repository.
@@ -829,222 +727,122 @@ pub enum MergeError {
     AncestryWalkFailed(String),
 }
 
-/// Error returned by [`Repository::push`] and [`Repository::try_push`].
-#[derive(Debug)]
-pub enum PushError<Storage: PinStore + BlobStore> {
-    /// An error occurred while enumerating the branch storage branches.
-    StorageBranches(Storage::PinsError),
-    /// An error occurred while creating a blob reader.
-    StorageReader(<Storage as BlobStore>::ReaderError),
-    /// An error occurred while reading metadata blobs.
-    StorageGet(<<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>),
-    /// An error occurred while transferring blobs to the repository.
-    StoragePut(<Storage as BlobStorePut>::PutError),
-    /// An error occurred while updating the branch storage.
-    BranchUpdate(Storage::UpdateError),
-    /// Malformed branch metadata.
-    BadBranchMetadata(),
-    /// Malformed commit metadata encountered while computing the push's
-    /// content delta for on-commit hooks.
-    BadCommitMetadata(),
-    /// Merge failed while retrying a push.
-    MergeError(MergeError),
-}
-
-// Allow using the `?` operator to convert MergeError into PushError in
-// contexts where PushError is the function error type. This keeps call sites
-// succinct by avoiding manual mapping closures like
-// `.map_err(|e| PushError::MergeError(e))?`.
-impl<Storage> From<MergeError> for PushError<Storage>
-where
-    Storage: PinStore + BlobStore,
-{
-    fn from(e: MergeError) -> Self {
-        PushError::MergeError(e)
-    }
-}
-
-// Note: we intentionally avoid generic `From` impls for storage-associated
-// error types because they can overlap with other blanket implementations
-// and lead to coherence conflicts. Call sites use explicit mapping via the
-// enum variant constructors (e.g. `map_err(PushError::StoragePut)`) where
-// needed which keeps conversions explicit and stable.
-
-/// Error returned by [`Repository::create_branch`] and related methods.
-#[derive(Debug)]
-pub enum BranchError<Storage>
-where
-    Storage: PinStore + BlobStore,
-{
-    /// An error occurred while creating a blob reader.
-    StorageReader(<Storage as BlobStore>::ReaderError),
-    /// An error occurred while reading metadata blobs.
-    StorageGet(<<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>),
-    /// An error occurred while storing blobs.
-    StoragePut(<Storage as BlobStorePut>::PutError),
-    /// An error occurred while retrieving branch heads.
-    BranchHead(Storage::HeadError),
-    /// An error occurred while updating the branch storage.
-    BranchUpdate(Storage::UpdateError),
-    /// The branch already exists.
-    AlreadyExists(),
-    /// The referenced base branch does not exist.
-    BranchNotFound(Id),
-}
-
-/// Error returned by [`Repository::lookup_branch`].
-#[derive(Debug)]
-pub enum LookupError<Storage>
-where
-    Storage: PinStore + BlobStore,
-{
-    /// Failed to enumerate branches.
-    StorageBranches(Storage::PinsError),
-    /// Failed to read a branch head.
-    BranchHead(Storage::HeadError),
-    /// Failed to create a blob reader.
-    StorageReader(<Storage as BlobStore>::ReaderError),
-    /// Failed to read a metadata blob.
-    StorageGet(<<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>),
-    /// Multiple branches were found with the given name.
-    NameConflict(Vec<Id>),
-    /// Branch metadata is malformed.
-    BadBranchMetadata(),
-}
-
-/// Error returned by [`Repository::ensure_branch`].
-#[derive(Debug)]
-pub enum EnsureBranchError<Storage>
-where
-    Storage: PinStore + BlobStore,
-{
-    /// Failed to look up the branch.
-    Lookup(LookupError<Storage>),
-    /// Failed to create the branch.
-    Create(BranchError<Storage>),
-}
-
-/// A topologically ordered batch of source commits introduced by one push
-/// attempt. The batch carries handles only; hooks that need payloads load one
-/// commit at a time from the storage passed alongside it.
-#[derive(Debug, Clone)]
-pub struct CommitBatch {
-    /// Source branch HEAD covered by the branch metadata this push replaces.
-    pub base_head: Option<CommitHandle>,
-    /// Source branch HEAD the push is about to publish.
-    pub new_head: CommitHandle,
-    /// Newly reachable commits, parents before children and deduplicated.
-    pub commits: Vec<CommitHandle>,
-}
-
-/// An on-commit hook, run by [`Repository::try_push`] once per push
-/// attempt, after the new branch-head tribleset has been assembled and
-/// before it is CAS'd in.
+/// An assertion-native repository that publishes branches owned by one key.
 ///
-/// Arguments, in order:
-///
-/// 1. `&mut Storage` — the repository's storage, for uploading derived
-///    blobs (index segments). Blobs uploaded by a losing attempt are
-///    unreferenced and content-addressed: a retry dedupes against them
-///    and GC reclaims them otherwise.
-/// 2. [`Id`] — the branch being pushed.
-/// 3. [`CommitBatch`] — every commit newly reachable from this attempt,
-///    ordered parents-first. Payloads are deliberately not unioned: hooks can
-///    build one logical leaf per source commit with bounded peak memory.
-/// 4. `&mut TribleSet` — the branch-head tribleset about to be CAS'd
-///    in. A hook folds its derived state (e.g. an index-home manifest)
-///    into this set, so commit and maintenance land in **one** atomic
-///    repoint; there is no second CAS to race.
-///
-/// Hooks run once per push *attempt*: after a CAS conflict the push
-/// merges and retries, and hooks re-run against the fresh base metadata
-/// and that attempt's delta (the mutated head tribleset of a losing
-/// attempt is discarded wholesale, so nothing a hook did leaks across
-/// attempts). Hooks must therefore be idempotent at the storage level —
-/// content-addressed blob uploads, as in
-/// [`Repository::register_index`], satisfy this for free.
-///
-/// A hook error never blocks or corrupts the commit: the hook's changes
-/// to the head tribleset are discarded, the error is recorded for
-/// [`Repository::take_hook_errors`], and the push proceeds.
-pub type CommitHook<Storage> = Box<
-    dyn FnMut(
-            &mut Storage,
-            Id,
-            &CommitBatch,
-            &mut TribleSet,
-        ) -> Result<(), Box<dyn Error + Send + Sync>>
-        + Send
-        + Sync,
->;
-
-/// A hook failure recorded (and skipped) during a push. Drained via
-/// [`Repository::take_hook_errors`].
-#[derive(Debug)]
-pub struct HookError {
-    /// The branch that was being pushed when the hook failed.
-    pub branch: Id,
-    /// The hook's error.
-    pub error: Box<dyn Error + Send + Sync>,
-}
-
-/// High-level wrapper combining a blob store and branch store into a usable
-/// repository API.
-///
-/// The [`Repository`] type exposes convenience methods for creating branches,
-/// committing data and pushing changes while delegating actual storage to the
-/// given [`BlobStore`] and [`PinStore`] implementations.
-pub struct Repository<Storage: BlobStore + PinStore> {
+/// Blob storage and grow-only branch assertions are separate capabilities.
+/// Merely constructing a repository therefore needs only [`BlobStore`]; branch
+/// resolution and publication are available when the backend additionally
+/// implements [`BranchAssertionStore`].
+pub struct Repository<Storage: BlobStore> {
     storage: Storage,
     signing_key: SigningKey,
     commit_metadata: MetadataHandle,
-    /// On-commit hooks (see [`CommitHook`]); empty by default, in which
-    /// case pushes take the plain path with zero added work.
-    hooks: Vec<CommitHook<Storage>>,
-    /// Hook failures skipped by pushes since the last
-    /// [`take_hook_errors`](Self::take_hook_errors).
-    hook_errors: Vec<HookError>,
 }
 
-/// Error returned by [`Repository::pull`].
-pub enum PullError<BranchStorageErr, BlobReaderErr, BlobStorageErr>
-where
-    BranchStorageErr: Error,
-    BlobReaderErr: Error,
-    BlobStorageErr: Error,
-{
-    /// The branch does not exist in the repository.
-    BranchNotFound(Id),
-    /// An error occurred while accessing the branch storage.
-    BranchStorage(BranchStorageErr),
-    /// An error occurred while creating a blob reader.
-    BlobReader(BlobReaderErr),
-    /// An error occurred while accessing the blob storage.
-    BlobStorage(BlobStorageErr),
-    /// The branch metadata is malformed or does not contain the expected fields.
-    BadBranchMetadata(),
+/// A caller presented a branch descriptor owned by a different key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForeignBranchIdentity {
+    expected: [u8; 32],
+    actual: [u8; 32],
 }
 
-impl<B, R, C> fmt::Debug for PullError<B, R, C>
-where
-    B: Error + fmt::Debug,
-    R: Error + fmt::Debug,
-    C: Error + fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PullError::BranchNotFound(id) => f.debug_tuple("BranchNotFound").field(id).finish(),
-            PullError::BranchStorage(e) => f.debug_tuple("BranchStorage").field(e).finish(),
-            PullError::BlobReader(e) => f.debug_tuple("BlobReader").field(e).finish(),
-            PullError::BlobStorage(e) => f.debug_tuple("BlobStorage").field(e).finish(),
-            PullError::BadBranchMetadata() => f.debug_tuple("BadBranchMetadata").finish(),
-        }
+impl ForeignBranchIdentity {
+    /// Repository key required at this local-authoring boundary.
+    pub const fn expected(&self) -> [u8; 32] {
+        self.expected
     }
+
+    /// Key carried by the rejected branch descriptor.
+    pub const fn actual(&self) -> [u8; 32] {
+        self.actual
+    }
+}
+
+impl fmt::Display for ForeignBranchIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "branch is owned by {}, but this repository publishes only as {}",
+            hex::encode(self.actual),
+            hex::encode(self.expected)
+        )
+    }
+}
+
+impl Error for ForeignBranchIdentity {}
+
+/// Failure while creating a detached, as-yet-unpublished workspace.
+#[derive(Debug)]
+pub enum CreateWorkspaceError<ReaderErr> {
+    /// Failed to snapshot the repository's blob store.
+    StorageReader(ReaderErr),
+}
+
+/// Failure while resolving an own-key branch identity.
+#[derive(Debug)]
+pub enum ResolveBranchError<AssertionErr, ReaderErr, DagErr> {
+    /// The requested descriptor is outside this repository's authoring key.
+    ForeignIdentity(ForeignBranchIdentity),
+    /// Failed to obtain a coherent assertion snapshot.
+    AssertionStore(AssertionErr),
+    /// Failed to snapshot the blob store.
+    StorageReader(ReaderErr),
+    /// Commit ancestry could not be read or decoded.
+    CommitDag(DagErr),
+}
+
+/// Failure while turning an assertion frontier into a writable workspace.
+#[derive(Debug)]
+pub enum AssertionPullError<AssertionErr, ReaderErr, DagErr> {
+    /// The requested descriptor is outside this repository's authoring key.
+    ForeignIdentity(ForeignBranchIdentity),
+    /// Failed to obtain a coherent assertion snapshot.
+    AssertionStore(AssertionErr),
+    /// Failed to snapshot the blob store.
+    StorageReader(ReaderErr),
+    /// Commit ancestry could not be read or decoded.
+    CommitDag(DagErr),
+    /// No assertion exists for this exact branch descriptor.
+    Absent,
+    /// At least one asserted tip has not arrived locally yet.
+    TipPending(TipPendingFrontier),
+    /// Tip metadata is readable, but missing ancestry keeps the frontier partial.
+    Partial(PartialFrontier),
+}
+
+/// Result of publishing a workspace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The workspace head already equals its base; no assertion was added.
+    NoChange,
+    /// A verified assertion was durably appended (or was already present).
+    Published(AssertionId),
+}
+
+/// Failure before a workspace assertion reaches its durable append point.
+#[derive(Debug)]
+pub enum PublishError<PutErr, FlushErr, ReaderErr, GetErr, AssertionErr> {
+    /// The workspace descriptor is outside this repository's authoring key.
+    ForeignIdentity(ForeignBranchIdentity),
+    /// Uploading a staged blob failed.
+    StoragePut(PutErr),
+    /// Making uploaded blobs durable failed.
+    StorageFlush(FlushErr),
+    /// Snapshotting the now-durable blob store failed.
+    StorageReader(ReaderErr),
+    /// The proposed commit metadata could not be loaded or decoded.
+    StorageGet(GetErr),
+    /// The proposed commit is not one of the canonical commit shapes.
+    BadCommitMetadata(commit::CommitMetadataError),
+    /// A changed workspace unexpectedly has no proposed head.
+    MissingHead,
+    /// Durably appending the signed branch assertion failed.
+    AssertionStore(AssertionErr),
 }
 
 impl<Storage> Repository<Storage>
 where
-    Storage: BlobStore + PinStore,
+    Storage: BlobStore,
 {
     /// Creates a new repository with the given storage, signing key, and
     /// repo-wide commit metadata.
@@ -1081,107 +879,7 @@ where
             storage,
             signing_key,
             commit_metadata,
-            hooks: Vec::new(),
-            hook_errors: Vec::new(),
         })
-    }
-
-    /// Register an on-commit hook (see [`CommitHook`] for the contract:
-    /// arguments, per-attempt re-runs, and the skip-on-error policy).
-    ///
-    /// Hooks run in registration order inside every subsequent
-    /// [`push`](Self::push)/[`try_push`](Self::try_push) that lands a new
-    /// commit. For the common "maintain a derived index" case, prefer the
-    /// [`register_index`](Self::register_index) convenience.
-    pub fn on_commit<F>(&mut self, hook: F)
-    where
-        F: FnMut(
-                &mut Storage,
-                Id,
-                &CommitBatch,
-                &mut TribleSet,
-            ) -> Result<(), Box<dyn Error + Send + Sync>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.hooks.push(Box::new(hook));
-    }
-
-    /// Register an [`IndexKind`](index_home::IndexKind) for automatic,
-    /// range-native on-commit maintenance. Every newly reachable commit gets
-    /// one inclusive `[commit, commit]` logical record, including contentless
-    /// merge commits and canonical empty recipe projections. A large commit
-    /// may still produce several repeated physical artifacts on that record.
-    pub fn register_index<K>(&mut self, kind: K)
-    where
-        K: index_home::IndexKind + Send + Sync + 'static,
-    {
-        self.on_commit(move |storage, _branch, batch, head_meta| {
-            let reader = storage
-                .reader()
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
-            index_home::validate_monotone_batch(&reader, batch.base_head, batch.new_head)?;
-            let manifest = index_home::Manifest::from_tribles(head_meta, &reader, &kind)
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
-            if !manifest.claims_head(batch.base_head) {
-                return Err(Box::new(index_home::CoverageMismatch {
-                    recipe: manifest.recipe(),
-                    expected: batch.base_head,
-                    actual: manifest.frontier().to_vec(),
-                }));
-            }
-
-            // All workspace blobs were uploaded before hooks run. Take one
-            // fresh snapshot and materialise exactly one commit payload at a
-            // time: strict commit-as-leaf semantics without a push-sized
-            // union in memory.
-            let reader = storage
-                .reader()
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-            for commit in &batch.commits {
-                let meta: TribleSet = reader
-                    .get(*commit)
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                let content_handle = find!(
-                    (content_handle: Inline<Handle<SimpleArchive>>),
-                    pattern!(&meta, [{ content: ?content_handle }])
-                )
-                .at_most_one()
-                .map_err(|_| {
-                    Box::new(std::io::Error::other("ambiguous commit content"))
-                        as Box<dyn Error + Send + Sync>
-                })?
-                .map(|(handle,)| handle);
-                let source = if let Some(content_handle) = content_handle {
-                    reader
-                        .get(content_handle)
-                        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?
-                } else {
-                    TribleSet::new()
-                };
-                index_home::append_range(
-                    storage,
-                    &kind,
-                    &source,
-                    index_home::CommitRange::leaf(*commit),
-                    head_meta,
-                )
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
-            }
-            index_home::set_index_head(storage, &kind, head_meta, Some(batch.new_head))
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
-            Ok(())
-        });
-    }
-
-    /// Drain the hook failures recorded (and skipped) by pushes since the
-    /// last call. An entry here means a commit landed *without* that
-    /// hook's contribution — for index hooks the index is soft state and
-    /// simply missing that delta; it can be repaired by an explicit range
-    /// rebuild, never by re-writing history.
-    pub fn take_hook_errors(&mut self) -> Vec<HookError> {
-        std::mem::take(&mut self.hook_errors)
     }
 
     /// Consume the repository and return the underlying storage backend.
@@ -1203,456 +901,234 @@ where
         &mut self.storage
     }
 
-    /// Replace the repository signing key.
-    pub fn set_signing_key(&mut self, signing_key: SigningKey) {
-        self.signing_key = signing_key;
-    }
-
     /// Returns the repository commit metadata handle.
     pub fn commit_metadata(&self) -> MetadataHandle {
         self.commit_metadata
     }
 
-    /// Initializes a new branch in the repository.
-    /// Branches are the only mutable state in the repository,
-    /// and are used to represent the state of a commit chain at a specific point in time.
-    /// A branch must always point to a commit, and this function can be used to create a new branch.
-    ///
-    /// Creates a new branch in the repository.
-    /// This branch is a pointer to a specific commit in the repository.
-    /// The branch is created with name and is initialized to point to the opionally given commit.
-    /// The branch is signed by the branch signing key.
-    ///
-    /// # Parameters
-    /// * `branch_name` - Name of the new branch.
-    /// * `commit` - Commit to initialize the branch from.
-    pub fn create_branch(
-        &mut self,
-        branch_name: &str,
-        commit: Option<CommitHandle>,
-    ) -> Result<ExclusiveId, BranchError<Storage>> {
-        self.create_branch_with_key(branch_name, commit, self.signing_key.clone())
+    /// Public key that owns every branch this repository may publish.
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.signing_key.verifying_key()
     }
 
-    /// Same as [`Self::create_branch`] but uses the provided signing key.
-    pub fn create_branch_with_key(
-        &mut self,
-        branch_name: &str,
-        commit: Option<CommitHandle>,
-        signing_key: SigningKey,
-    ) -> Result<ExclusiveId, BranchError<Storage>> {
-        let branch_id = genid();
-        let name_blob: Blob<LongString> = branch_name.to_owned().to_blob();
-        let name_handle = name_blob.get_handle();
-        self.storage
-            .put::<LongString, _>(name_blob)
-            .map_err(|e| BranchError::StoragePut(e))?;
-
-        let branch_set = if let Some(commit) = commit {
-            let reader = self
-                .storage
-                .reader()
-                .map_err(|e| BranchError::StorageReader(e))?;
-            let set: TribleSet = reader.get(commit).map_err(|e| BranchError::StorageGet(e))?;
-
-            branch::branch_metadata(&signing_key, *branch_id, name_handle, Some(set.to_blob()))
-        } else {
-            branch::branch_unsigned(*branch_id, name_handle, None)
-        };
-
-        let branch_blob = branch_set.to_blob();
-        let branch_handle = self
-            .storage
-            .put(branch_blob)
-            .map_err(|e| BranchError::StoragePut(e))?;
-        let push_result = self
-            .storage
-            .update(*branch_id, None, Some(branch_handle))
-            .map_err(|e| BranchError::BranchUpdate(e))?;
-
-        match push_result {
-            PushResult::Success() => Ok(branch_id),
-            PushResult::Conflict(_) => Err(BranchError::AlreadyExists()),
-        }
+    /// Derive this repository's exact branch descriptor for a human name.
+    pub fn branch_identity(&self, name: &str) -> BranchIdentity {
+        let name: Blob<LongString> = name.to_owned().to_blob();
+        BranchIdentity::new(self.verifying_key(), name.get_handle())
     }
 
-    /// Look up a branch by name.
+    /// Create an empty workspace without publishing an empty branch.
     ///
-    /// Iterates all branches, reads each one's metadata, and returns the ID
-    /// of the branch whose name matches. Returns `Ok(None)` if no branch has
-    /// that name, or `LookupError::NameConflict` if multiple branches share it.
-    pub fn lookup_branch(&mut self, name: &str) -> Result<Option<Id>, LookupError<Storage>> {
-        let branch_ids: Vec<Id> = self
-            .storage
-            .pins()
-            .map_err(LookupError::StorageBranches)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(LookupError::StorageBranches)?;
-
-        // Read every live pin head before taking the blob snapshot. Readers
-        // are point-in-time views: taking one first and then observing a pin
-        // that advanced concurrently can produce a handle absent from that
-        // older reader. Blob storage is append-only, so one reader created
-        // after this head census can resolve every collected handle while
-        // retaining the one-reader scan.
-        let mut branch_heads = Vec::with_capacity(branch_ids.len());
-        for branch_id in branch_ids {
-            if let Some(meta_handle) = self
-                .storage
-                .head(branch_id)
-                .map_err(LookupError::BranchHead)?
-            {
-                branch_heads.push((branch_id, meta_handle));
-            }
-        }
-
-        let mut matches = Vec::new();
-
-        // One reader for the whole scan. This used to be constructed inside
-        // the loop, costing a `refresh()` and a blobs-PATCH clone per branch
-        // to produce N equivalent readers.
-        let reader = self.storage.reader().map_err(LookupError::StorageReader)?;
-
-        // The name we are looking for hashes to exactly one handle, and
-        // handle equality IS content equality — so compare handles rather
-        // than fetching each branch's name blob and comparing strings. That
-        // removes the second blob read per branch: the scan is now one
-        // metadata read each, not a metadata read plus a name read.
-        //
-        // Exact by construction, with no length ceiling anywhere, which is
-        // why this needs no on-disk name field to be fast.
-        let target: Inline<Handle<LongString>> = name.to_owned().to_blob().get_handle();
-
-        for (branch_id, meta_handle) in branch_heads {
-            let meta_set: TribleSet = reader.get(meta_handle).map_err(LookupError::StorageGet)?;
-
-            let Ok(branch_entity) = branch::branch_entity(&meta_set, branch_id) else {
-                continue;
-            };
-
-            // `exactly_one` skips a branch carrying two `metadata::name`
-            // tribles: its name is not determinable, and guessing one would
-            // let an ambiguous branch answer to a name it may not have.
-            let Ok(name_handle) = find!(
-                n: Inline<Handle<LongString>>,
-                pattern!(&meta_set, [{ branch_entity @ crate::metadata::name: ?n }])
-            )
-            .exactly_one() else {
-                // Pins without names are tracking/policy/anonymous pins, and
-                // a malformed branch entity with multiple names must not
-                // answer to either one.
-                continue;
-            };
-
-            if name_handle == target {
-                matches.push(branch_id);
-            }
-        }
-
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(Some(matches[0])),
-            _ => Err(LookupError::NameConflict(matches)),
-        }
-    }
-
-    /// Ensure a branch with the given name exists, creating it if necessary.
-    ///
-    /// If a branch named `name` already exists, returns its ID.
-    /// If no such branch exists, creates a new one (optionally from the given
-    /// commit) and returns its ID.
-    ///
-    /// Errors if multiple branches share the same name (ambiguous).
-    pub fn ensure_branch(
+    /// The name blob is staged locally so a later publication makes the exact
+    /// branch descriptor self-describing. No assertion and no repository blob
+    /// is written by this operation; empty branches remain unrepresentable.
+    pub fn create_workspace(
         &mut self,
         name: &str,
-        commit: Option<CommitHandle>,
-    ) -> Result<Id, EnsureBranchError<Storage>> {
-        match self
-            .lookup_branch(name)
-            .map_err(EnsureBranchError::Lookup)?
-        {
-            Some(id) => Ok(id),
-            None => {
-                let id = self
-                    .create_branch(name, commit)
-                    .map_err(EnsureBranchError::Create)?;
-                Ok(*id)
-            }
-        }
-    }
+    ) -> Result<Workspace<Storage>, CreateWorkspaceError<Storage::ReaderError>> {
+        let name_blob: Blob<LongString> = name.to_owned().to_blob();
+        let identity = BranchIdentity::new(self.verifying_key(), name_blob.get_handle());
+        let mut staged = MemoryBlobStore::new();
+        staged
+            .put::<LongString, _>(name_blob)
+            .expect("MemoryBlobStore::put is infallible");
+        let base_blobs = self
+            .storage
+            .reader()
+            .map_err(CreateWorkspaceError::StorageReader)?;
 
-    /// Pulls an existing branch using the repository's signing key.
-    /// The workspace inherits the repository default metadata if configured.
-    pub fn pull(
-        &mut self,
-        branch_id: Id,
-    ) -> Result<
-        Workspace<Storage>,
-        PullError<
-            Storage::HeadError,
-            Storage::ReaderError,
-            <Storage::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-        >,
-    > {
-        self.pull_with_key(branch_id, self.signing_key.clone())
-    }
-
-    /// Same as [`Self::pull`] but overrides the signing key.
-    pub fn pull_with_key(
-        &mut self,
-        branch_id: Id,
-        signing_key: SigningKey,
-    ) -> Result<
-        Workspace<Storage>,
-        PullError<
-            Storage::HeadError,
-            Storage::ReaderError,
-            <Storage::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-        >,
-    > {
-        // 1. Get the branch metadata head from the branch store.
-        let base_branch_meta_handle = match self.storage.head(branch_id) {
-            Ok(Some(handle)) => handle,
-            Ok(None) => return Err(PullError::BranchNotFound(branch_id)),
-            Err(e) => return Err(PullError::BranchStorage(e)),
-        };
-        // 2. Get the current commit from the branch metadata.
-        let reader = self.storage.reader().map_err(PullError::BlobReader)?;
-        let base_branch_meta: TribleSet = match reader.get(base_branch_meta_handle) {
-            Ok(meta_set) => meta_set,
-            Err(e) => return Err(PullError::BlobStorage(e)),
-        };
-
-        let branch_entity = branch::branch_entity(&base_branch_meta, branch_id)
-            .map_err(|_| PullError::BadBranchMetadata())?;
-
-        let head_ = match find!(
-            (head_: Inline<_>),
-            pattern!(&base_branch_meta, [{ branch_entity @ head: ?head_ }])
-        )
-        .at_most_one()
-        {
-            Ok(Some((h,))) => Some(h),
-            Ok(None) => None,
-            Err(_) => return Err(PullError::BadBranchMetadata()),
-        };
-        // Create workspace with the current commit and base blobs.
-        let base_blobs = self.storage.reader().map_err(PullError::BlobReader)?;
         Ok(Workspace {
+            staged,
             base_blobs,
-            staged: MemoryBlobStore::new(),
-            head: head_,
-            base_head: head_,
-            base_branch_id: branch_id,
-            base_branch_meta: base_branch_meta_handle,
-            signing_key,
+            identity,
+            head: None,
+            base_head: None,
+            signing_key: self.signing_key.clone(),
             commit_metadata: self.commit_metadata,
         })
     }
 
-    /// Pushes the workspace's new blobs and commit to the persistent repository.
-    /// This syncs the local BlobSet with the repository's BlobStore and performs
-    /// an atomic branch update (using the stored base_branch_meta).
-    pub fn push(&mut self, workspace: &mut Workspace<Storage>) -> Result<(), PushError<Storage>> {
-        // Retrying push: attempt a single push and, on conflict, merge the
-        // local workspace into the returned conflict workspace and retry.
-        // This implements the common push-merge-retry loop as a convenience
-        // wrapper around `try_push`.
-        while let Some(mut conflict_ws) = self.try_push(workspace)? {
-            // Keep the previous merge order: merge the caller's staged
-            // changes into the incoming conflict workspace. This preserves
-            // the semantic ordering of parents used in the merge commit.
-            conflict_ws.merge(workspace)?;
-
-            // Move the merged incoming workspace into the caller's workspace
-            // so the next try_push operates against the fresh branch state.
-            // Using assignment here is equivalent to `swap` but avoids
-            // retaining the previous `workspace` contents in the temp var.
-            *workspace = conflict_ws;
+    fn require_own_identity(&self, identity: &BranchIdentity) -> Result<(), ForeignBranchIdentity> {
+        let expected = self.verifying_key().to_bytes();
+        let actual = identity.author().to_bytes();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(ForeignBranchIdentity { expected, actual })
         }
+    }
+}
 
-        Ok(())
+impl<Storage> Repository<Storage>
+where
+    Storage: BlobStore + BranchAssertionStore,
+    Storage::Reader: PartialCommitDag,
+{
+    /// Resolve the grow-only assertions for one exact own-key identity.
+    ///
+    /// Foreign identities are rejected before the assertion store or blob
+    /// reader is touched. Accepting replicated foreign assertions is a
+    /// separate, policy-bearing ingest operation rather than an authoring
+    /// convenience on this repository.
+    pub fn resolve(
+        &mut self,
+        identity: &BranchIdentity,
+    ) -> Result<
+        BranchResolution,
+        ResolveBranchError<
+            <Storage as BranchAssertionStore>::Error,
+            Storage::ReaderError,
+            <Storage::Reader as PartialCommitDag>::Error,
+        >,
+    > {
+        self.require_own_identity(identity)
+            .map_err(ResolveBranchError::ForeignIdentity)?;
+        let snapshot = self
+            .storage
+            .assertion_snapshot()
+            .map_err(ResolveBranchError::AssertionStore)?;
+        let mut reader = self
+            .storage
+            .reader()
+            .map_err(ResolveBranchError::StorageReader)?;
+        branch_frontier::resolve_branch(&snapshot, identity, &mut reader)
+            .map_err(ResolveBranchError::CommitDag)
     }
 
-    /// Single-attempt push: upload local blobs and try to update the branch
-    /// head once. Returns `Ok(None)` on success, or `Ok(Some(conflict_ws))`
-    /// when the branch was updated concurrently and the caller should merge.
-    pub fn try_push(
+    /// Resolve this repository's branch descriptor for a human name.
+    pub fn resolve_name(
         &mut self,
-        workspace: &mut Workspace<Storage>,
-    ) -> Result<Option<Workspace<Storage>>, PushError<Storage>> {
-        // 1. Sync `workspace.staged` to repository's BlobStore.
-        let workspace_reader = workspace.staged.reader().unwrap();
-        for handle in workspace_reader.blobs() {
-            let handle = handle.expect("infallible blob enumeration");
-            let blob: Blob<UnknownBlob> =
-                workspace_reader.get(handle).expect("infallible blob read");
-            self.storage
-                .put::<UnknownBlob, _>(blob)
-                .map_err(PushError::StoragePut)?;
-        }
+        name: &str,
+    ) -> Result<
+        BranchResolution,
+        ResolveBranchError<
+            <Storage as BranchAssertionStore>::Error,
+            Storage::ReaderError,
+            <Storage::Reader as PartialCommitDag>::Error,
+        >,
+    > {
+        let identity = self.branch_identity(name);
+        self.resolve(&identity)
+    }
 
-        // 1.5 If the workspace's head did not change since the workspace was
-        // created, there's no commit to reference and therefore no branch
-        // metadata update is required. This avoids touching the branch store
-        // in the common case where only blobs were staged or nothing changed.
-        if workspace.base_head == workspace.head {
-            return Ok(None);
-        }
-
-        // 2. Create a new branch meta blob referencing the new workspace head.
-        let repo_reader = self.storage.reader().map_err(PushError::StorageReader)?;
-        let base_branch_meta: TribleSet = repo_reader
-            .get(workspace.base_branch_meta)
-            .map_err(PushError::StorageGet)?;
-
-        let branch_entity = branch::branch_entity(&base_branch_meta, workspace.base_branch_id)
-            .map_err(|_| PushError::BadBranchMetadata())?;
-
-        let Ok((branch_name,)) = find!(
-            (name: Inline<Handle<LongString>>),
-            pattern!(&base_branch_meta, [{ branch_entity @ crate::metadata::name: ?name }])
-        )
-        .exactly_one() else {
-            return Err(PushError::BadBranchMetadata());
+    /// Open a complete assertion frontier as a writable workspace.
+    ///
+    /// A missing asserted tip or unresolved ancestry remains explicit. Partial
+    /// frontiers have a safe conservative read view, but cannot license a new
+    /// authored descendant until their maximal antichain is known completely.
+    pub fn pull(
+        &mut self,
+        identity: BranchIdentity,
+    ) -> Result<
+        Workspace<Storage>,
+        AssertionPullError<
+            <Storage as BranchAssertionStore>::Error,
+            Storage::ReaderError,
+            <Storage::Reader as PartialCommitDag>::Error,
+        >,
+    > {
+        self.require_own_identity(&identity)
+            .map_err(AssertionPullError::ForeignIdentity)?;
+        let snapshot = self
+            .storage
+            .assertion_snapshot()
+            .map_err(AssertionPullError::AssertionStore)?;
+        let mut base_blobs = self
+            .storage
+            .reader()
+            .map_err(AssertionPullError::StorageReader)?;
+        let resolution = branch_frontier::resolve_branch(&snapshot, &identity, &mut base_blobs)
+            .map_err(AssertionPullError::CommitDag)?;
+        let complete = match resolution {
+            BranchResolution::Absent => return Err(AssertionPullError::Absent),
+            BranchResolution::TipPending(frontier) => {
+                return Err(AssertionPullError::TipPending(frontier));
+            }
+            BranchResolution::Partial(frontier) => {
+                return Err(AssertionPullError::Partial(frontier));
+            }
+            BranchResolution::Complete(frontier) => frontier,
         };
 
-        let head_handle = workspace.head.ok_or(PushError::BadBranchMetadata())?;
-        let head_: TribleSet = repo_reader
-            .get(head_handle)
-            .map_err(PushError::StorageGet)?;
+        let mut staged = MemoryBlobStore::new();
+        let resolved = match complete.resolved_head() {
+            ResolvedHead::Existing(commit) => commit,
+            ResolvedHead::Synthetic(blob) => staged
+                .put::<SimpleArchive, _>(blob)
+                .expect("MemoryBlobStore::put is infallible"),
+        };
 
-        let mut branch_meta = rebuild_branch_meta(
-            &workspace.signing_key,
-            workspace.base_branch_id,
-            branch_name,
-            Some(head_.to_blob()),
-            &base_branch_meta,
-        );
+        Ok(Workspace {
+            staged,
+            base_blobs,
+            identity,
+            head: Some(resolved),
+            base_head: Some(resolved),
+            signing_key: self.signing_key.clone(),
+            commit_metadata: self.commit_metadata,
+        })
+    }
+}
 
-        // On-commit hooks: fold derived state (index-home segments) into
-        // the SAME branch-head tribleset this push is about to CAS in —
-        // one atomic repoint carries the commit and its index maintenance
-        // together, so hooks never race the branch pin with a second CAS.
-        // Runs once per push ATTEMPT (see [`CommitHook`] for the retry and
-        // failure contract); with no hooks registered this is a single
-        // `is_empty` check.
-        if !self.hooks.is_empty() {
-            let convert = |e: WorkspaceCheckoutError<
-                <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-            >| match e {
-                WorkspaceCheckoutError::Storage(e) => PushError::StorageGet(e),
-                WorkspaceCheckoutError::BadCommitMetadata() => PushError::BadCommitMetadata(),
-            };
+impl<Storage> Repository<Storage>
+where
+    Storage: BlobStore + StorageFlush + BranchAssertionStore,
+{
+    /// Publish the workspace head as one signed grow-only assertion.
+    ///
+    /// All staged blobs cross the storage durability boundary before the
+    /// assertion is appended. The reader used to validate the proposed tip is
+    /// acquired before that append and retained by the workspace afterwards,
+    /// leaving no fallible operation after the publication point.
+    pub fn push(
+        &mut self,
+        workspace: &mut Workspace<Storage>,
+    ) -> Result<
+        PublishOutcome,
+        PublishError<
+            <Storage as BlobStorePut>::PutError,
+            <Storage as StorageFlush>::Error,
+            Storage::ReaderError,
+            <Storage::Reader as BlobStoreGet>::GetError<UnarchiveError>,
+            <Storage as BranchAssertionStore>::Error,
+        >,
+    > {
+        self.require_own_identity(&workspace.identity)
+            .map_err(PublishError::ForeignIdentity)?;
 
-            // Select every commit reachable from the new head but not from
-            // the base head, then order that bounded set parents-first.
-            // Hooks receive handles rather than one materialised union, so
-            // they can process one source commit at a time. Stopping on the
-            // base head's full ancestor closure matters for merge commits: a
-            // conflict-retry merge reaches old history through the caller's
-            // side, and those commits are already covered by the winner.
-            let new_commits = match workspace.base_head {
-                None => collect_reachable(workspace, head_handle).map_err(convert)?,
-                Some(base) => {
-                    let stop = collect_reachable(workspace, base).map_err(convert)?;
-                    let mut seeds = CommitSet::new();
-                    seeds.insert(&Entry::new(&head_handle.raw));
-                    collect_reachable_from_patch_until(workspace, seeds, &stop).map_err(convert)?
-                }
-            };
-            let commits = topological_commits(workspace, &new_commits).map_err(convert)?;
-            let batch = CommitBatch {
-                base_head: workspace.base_head,
-                new_head: head_handle,
-                commits,
-            };
+        let staged = workspace
+            .staged
+            .reader()
+            .expect("MemoryBlobStore::reader is infallible");
+        for (_handle, blob) in staged {
+            self.storage
+                .put::<UnknownBlob, _>(blob)
+                .map_err(PublishError::StoragePut)?;
+        }
+        self.storage.flush().map_err(PublishError::StorageFlush)?;
 
-            let branch_id = workspace.base_branch_id;
-            for hook in self.hooks.iter_mut() {
-                // Per-hook atomicity: run against a scratch copy (cheap —
-                // TribleSet is persistent) so a failing hook contributes
-                // nothing instead of leaving the head half-mutated. The
-                // commit is the user's data; the hook's output is derived,
-                // re-buildable soft state — so on error we skip the hook,
-                // record it for `take_hook_errors`, and push anyway.
-                let mut scratch = branch_meta.clone();
-                match hook(&mut self.storage, branch_id, &batch, &mut scratch) {
-                    Ok(()) => branch_meta = scratch,
-                    Err(error) => self.hook_errors.push(HookError {
-                        branch: branch_id,
-                        error,
-                    }),
-                }
-            }
+        let reader = self.storage.reader().map_err(PublishError::StorageReader)?;
+        if workspace.head == workspace.base_head {
+            workspace.base_blobs = reader;
+            workspace.staged = MemoryBlobStore::new();
+            return Ok(PublishOutcome::NoChange);
         }
 
-        let branch_meta_handle = self
-            .storage
-            .put(branch_meta)
-            .map_err(PushError::StoragePut)?;
+        let proposed = workspace.head.ok_or(PublishError::MissingHead)?;
+        let commit_meta: TribleSet = reader.get(proposed).map_err(PublishError::StorageGet)?;
+        commit::direct_parents(&commit_meta).map_err(PublishError::BadCommitMetadata)?;
 
-        // 3. Use CAS (comparing against workspace.base_branch_meta) to update the branch pointer.
-        let result = self
-            .storage
-            .update(
-                workspace.base_branch_id,
-                Some(workspace.base_branch_meta),
-                Some(branch_meta_handle),
-            )
-            .map_err(PushError::BranchUpdate)?;
+        let assertion =
+            BranchAssertion::sign(&self.signing_key, workspace.identity.name(), proposed);
+        let assertion_id = assertion.id();
+        self.storage
+            .append_assertion(assertion)
+            .map_err(PublishError::AssertionStore)?;
 
-        match result {
-            PushResult::Success() => {
-                // Update workspace base pointers so subsequent pushes can detect
-                // that the workspace is already synchronized and avoid re-upload.
-                workspace.base_branch_meta = branch_meta_handle;
-                workspace.base_head = workspace.head;
-                // Refresh the workspace base blob reader to ensure newly
-                // uploaded blobs are visible to subsequent checkout operations.
-                workspace.base_blobs = self.storage.reader().map_err(PushError::StorageReader)?;
-                // Clear staged local blobs now that they have been uploaded and
-                // the branch metadata updated. This frees memory and prevents
-                // repeated uploads of the same staged blobs on subsequent pushes.
-                workspace.staged = MemoryBlobStore::new();
-                Ok(None)
-            }
-            PushResult::Conflict(conflicting_meta) => {
-                let conflicting_meta = conflicting_meta.ok_or(PushError::BadBranchMetadata())?;
-
-                let repo_reader = self.storage.reader().map_err(PushError::StorageReader)?;
-                let branch_meta: TribleSet = repo_reader
-                    .get(conflicting_meta)
-                    .map_err(PushError::StorageGet)?;
-
-                let branch_entity = branch::branch_entity(&branch_meta, workspace.base_branch_id)
-                    .map_err(|_| PushError::BadBranchMetadata())?;
-
-                let head_ = match find!((head_: Inline<_>),
-                    pattern!(&branch_meta, [{ branch_entity @ head: ?head_ }])
-                )
-                .at_most_one()
-                {
-                    Ok(Some((h,))) => Some(h),
-                    Ok(None) => None,
-                    Err(_) => return Err(PushError::BadBranchMetadata()),
-                };
-
-                let conflict_ws = Workspace {
-                    base_blobs: self.storage.reader().map_err(PushError::StorageReader)?,
-                    staged: MemoryBlobStore::new(),
-                    head: head_,
-                    base_head: head_,
-                    base_branch_id: workspace.base_branch_id,
-                    base_branch_meta: conflicting_meta,
-                    signing_key: workspace.signing_key.clone(),
-                    commit_metadata: workspace.commit_metadata,
-                };
-
-                Ok(Some(conflict_ws))
-            }
-        }
+        workspace.base_blobs = reader;
+        workspace.base_head = Some(proposed);
+        workspace.staged = MemoryBlobStore::new();
+        Ok(PublishOutcome::Published(assertion_id))
     }
 }
 
@@ -1661,7 +1137,6 @@ pub type CommitHandle = Inline<Handle<SimpleArchive>>;
 type MetadataHandle = Inline<Handle<SimpleArchive>>;
 /// A set of commit handles, used by [`CommitSelector`] and [`Checkout`].
 pub type CommitSet = PATCH<INLINE_LEN, IdentitySchema, ()>;
-type BranchMetaHandle = Inline<Handle<SimpleArchive>>;
 
 /// The result of a [`Workspace::checkout`] operation: a [`TribleSet`] paired
 /// with the set of commits that produced it. Pass the commit set as the start
@@ -1767,19 +1242,16 @@ pub struct Workspace<Blobs: BlobStore> {
     pub staged: MemoryBlobStore,
     /// The blob storage base for the workspace.
     base_blobs: Blobs::Reader,
-    /// The branch id this workspace is tracking; None for a detached workspace.
-    base_branch_id: Id,
-    /// The meta-handle corresponding to the base branch state used for CAS.
-    base_branch_meta: BranchMetaHandle,
+    /// Exact `(author key, name handle)` descriptor this workspace publishes.
+    identity: BranchIdentity,
     /// Handle to the current commit in the working branch. `None` for an empty branch.
     head: Option<CommitHandle>,
-    /// The branch head snapshot when this workspace was created (pull time).
+    /// Resolved head from which local work began.
     ///
-    /// This allows `try_push` to cheaply detect whether the commit head has
-    /// advanced since the workspace was created without querying the remote
-    /// branch store.
+    /// Equality with `head` means there is no new branch claim to publish. A
+    /// divergent complete frontier uses its canonical synthetic merge here.
     base_head: Option<CommitHandle>,
-    /// Signing key used for commit/branch signing.
+    /// Signing key used for authored commits.
     signing_key: SigningKey,
     /// Metadata handle for commits created in this workspace.
     commit_metadata: MetadataHandle,
@@ -1794,8 +1266,7 @@ where
         f.debug_struct("Workspace")
             .field("staged", &self.staged)
             .field("base_blobs", &self.base_blobs)
-            .field("base_branch_id", &self.base_branch_id)
-            .field("base_branch_meta", &self.base_branch_meta)
+            .field("identity", &self.identity)
             .field("base_head", &self.base_head)
             .field("head", &self.head)
             .field("commit_metadata", &self.commit_metadata)
@@ -2477,9 +1948,14 @@ where
 const PARALLEL_CHECKOUT_THRESHOLD: usize = 8;
 
 impl<Blobs: BlobStore> Workspace<Blobs> {
-    /// Returns the branch id associated with this workspace.
-    pub fn branch_id(&self) -> Id {
-        self.base_branch_id
+    /// Returns the exact branch identity associated with this workspace.
+    pub fn identity(&self) -> &BranchIdentity {
+        &self.identity
+    }
+
+    /// Returns the intrinsic branch index prefix associated with this workspace.
+    pub fn branch_id(&self) -> BranchId {
+        self.identity.id()
     }
 
     /// Returns the current commit handle if one exists.

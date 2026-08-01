@@ -29,8 +29,7 @@ proptest! {
             SigningKey::generate(&mut OsRng),
             TribleSet::new(),
         ).unwrap();
-        let branch_id = repo.create_branch("test", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut ws = repo.create_workspace("test").expect("workspace");
 
         // Commit data
         let mut data = TribleSet::new();
@@ -68,8 +67,7 @@ proptest! {
             SigningKey::generate(&mut OsRng),
             TribleSet::new(),
         ).unwrap();
-        let branch_id = repo.create_branch("test", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut ws = repo.create_workspace("test").expect("workspace");
 
         // First commit
         let mut data1 = TribleSet::new();
@@ -113,8 +111,8 @@ proptest! {
             SigningKey::generate(&mut OsRng),
             TribleSet::new(),
         ).unwrap();
-        let branch_id = repo.create_branch("test", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut ws = repo.create_workspace("test").expect("workspace");
+        let identity = *ws.identity();
 
         let mut data = TribleSet::new();
         for label in &labels {
@@ -125,7 +123,7 @@ proptest! {
         repo.push(&mut ws).expect("push");
 
         // Fresh pull should see the same data
-        let mut ws2 = repo.pull(*branch_id).expect("pull2");
+        let mut ws2 = repo.pull(identity).expect("pull2");
         let checkout = ws2.checkout(..).expect("checkout");
 
         let found: BTreeSet<Inline<ShortString>> = find!(
@@ -153,10 +151,9 @@ proptest! {
             SigningKey::generate(&mut OsRng),
             TribleSet::new(),
         ).unwrap();
-        let branch_id = repo.create_branch("test", None).expect("branch");
-
         // First commit + push
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut ws = repo.create_workspace("test").expect("workspace");
+        let identity = *ws.identity();
         let mut data1 = TribleSet::new();
         for label in &batch1 {
             let e = rngid();
@@ -166,10 +163,10 @@ proptest! {
         repo.push(&mut ws).expect("push");
 
         // First checkout — sees everything
-        let mut full = repo.pull(*branch_id).expect("pull").checkout(..).expect("checkout");
+        let mut full = repo.pull(identity).expect("pull").checkout(..).expect("checkout");
 
         // Second commit + push
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut ws = repo.pull(identity).expect("pull");
         let mut data2 = TribleSet::new();
         for label in &batch2 {
             let e = rngid();
@@ -179,7 +176,7 @@ proptest! {
         repo.push(&mut ws).expect("push");
 
         // Incremental checkout — should only see batch2
-        let mut ws2 = repo.pull(*branch_id).expect("pull");
+        let mut ws2 = repo.pull(identity).expect("pull");
         let delta = ws2.checkout(full.commits()..).expect("delta");
 
         let delta_labels: BTreeSet<Inline<ShortString>> = find!(
@@ -220,10 +217,9 @@ proptest! {
             SigningKey::generate(&mut OsRng),
             TribleSet::new(),
         ).unwrap();
-        let branch_id = repo.create_branch("test", None).expect("branch");
-
         // Workspace A commits
-        let mut ws_a = repo.pull(*branch_id).expect("pull");
+        let mut ws_a = repo.create_workspace("test").expect("workspace");
+        let identity = *ws_a.identity();
         let mut data_a = TribleSet::new();
         for label in &labels_a {
             let e = rngid();
@@ -233,7 +229,7 @@ proptest! {
         repo.push(&mut ws_a).expect("push A");
 
         // Workspace B commits (on top of A)
-        let mut ws_b = repo.pull(*branch_id).expect("pull");
+        let mut ws_b = repo.pull(identity).expect("pull");
         let mut data_b = TribleSet::new();
         for label in &labels_b {
             let e = rngid();
@@ -243,7 +239,7 @@ proptest! {
         repo.push(&mut ws_b).expect("push B");
 
         // Checkout should contain both
-        let mut ws_final = repo.pull(*branch_id).expect("pull");
+        let mut ws_final = repo.pull(identity).expect("pull");
         let checkout = ws_final.checkout(..).expect("checkout");
 
         let found: Vec<String> = find!(
@@ -270,10 +266,9 @@ proptest! {
             SigningKey::generate(&mut OsRng),
             TribleSet::new(),
         ).unwrap();
-        let branch_id = repo.create_branch("test", None).expect("branch");
-
         // Commit batch1
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut ws = repo.create_workspace("test").expect("workspace");
+        let identity = *ws.identity();
         let mut data1 = TribleSet::new();
         for label in &batch1 {
             let e = rngid();
@@ -283,11 +278,11 @@ proptest! {
         repo.push(&mut ws).expect("push");
 
         // First checkout
-        let mut ws1 = repo.pull(*branch_id).expect("pull");
+        let mut ws1 = repo.pull(identity).expect("pull");
         let checkout1 = ws1.checkout(..).expect("checkout1");
 
         // Commit batch2
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut ws = repo.pull(identity).expect("pull");
         let mut data2 = TribleSet::new();
         for label in &batch2 {
             let e = rngid();
@@ -297,7 +292,7 @@ proptest! {
         repo.push(&mut ws).expect("push");
 
         // Second checkout (only new commits)
-        let mut ws2 = repo.pull(*branch_id).expect("pull");
+        let mut ws2 = repo.pull(identity).expect("pull");
         let checkout2 = ws2.checkout(checkout1.commits()..).expect("checkout2");
 
         // Union the two checkouts
@@ -318,7 +313,7 @@ proptest! {
 
         // Combined commits should cover both checkouts
         // A third incremental checkout should yield nothing new
-        let mut ws3 = repo.pull(*branch_id).expect("pull");
+        let mut ws3 = repo.pull(identity).expect("pull");
         let checkout3 = ws3.checkout(combined.commits()..).expect("checkout3");
         prop_assert!(checkout3.facts().is_empty(),
             "combined commits should exclude all seen data, got {} tribles", checkout3.facts().len());
@@ -354,8 +349,7 @@ proptest! {
             SigningKey::generate(&mut OsRng),
             TribleSet::new(),
         ).unwrap();
-        let branch_id = repo.create_branch("test", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut ws = repo.create_workspace("test").expect("workspace");
 
         let mut data = TribleSet::new();
         for label in &labels {
@@ -368,134 +362,5 @@ proptest! {
         // commits() should be non-empty after a checkout with data
         prop_assert!(!checkout.commits().is_empty(),
             "checkout should track the commit");
-    }
-}
-
-// ── Branch-head annotations survive a rebuild ─────────────────────────
-//
-// Pushing a commit REBUILDS the branch-head metadata: `branch_metadata`
-// mints a fresh, content-derived branch entity, so anything else stored
-// beside it is dropped unless deliberately carried forward.
-//
-// That carry used to name exactly one kind (`index_home::manifest_tribles`),
-// which made head metadata durable only for annotations core knew about by
-// name — a closed-world assumption in a store built on open extension. The
-// loss was invisible: an annotation could be written, read back, and then
-// vanish at the next unrelated push, with no error at the write and no trace
-// afterwards.
-//
-// This asserts the property that makes head metadata usable by anything
-// outside core — a migration record, a downstream faculty's annotation.
-mod branch_head_carry {
-    use super::*;
-    use triblespace_core::blob::encodings::longstring::LongString;
-    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::inline::encodings::hash::Handle;
-
-    mod ann {
-        use triblespace_core::prelude::*;
-        attributes! {
-            "3420CB991983F9BF8D9CA88E5D622643" as pub note: inlineencodings::ShortString;
-        }
-    }
-
-    #[test]
-    fn an_unknown_fact_on_a_branch_head_survives_a_push() {
-        let storage = MemoryRepo::default();
-        let mut repo =
-            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-        let branch_id = *repo
-            .create_branch("annotated", None)
-            .expect("create branch");
-
-        // Attach an annotation core knows nothing about, beside the head. It
-        // deliberately carries its own metadata::name AND a repo::branch
-        // relation for a different id: neither may be mistaken for fields of
-        // the pin identified by `branch_id`, and neither may be discarded.
-        let marker = rngid();
-        let unrelated_branch_id = *genid();
-        let annotation_name: Inline<Handle<LongString>> = repo
-            .storage_mut()
-            .put::<LongString, _>("annotation".to_owned().to_blob())
-            .expect("store annotation name");
-        let decoy_head: Inline<Handle<SimpleArchive>> = repo
-            .storage_mut()
-            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
-            .expect("store decoy head");
-        let annotation: TribleSet = entity! { &marker @
-            ann::note: "kilroy",
-            triblespace_core::metadata::name: annotation_name,
-            triblespace_core::repo::branch: unrelated_branch_id,
-            triblespace_core::repo::head: decoy_head,
-        }
-        .into();
-        let base = repo
-            .storage_mut()
-            .head(branch_id)
-            .expect("head")
-            .expect("branch exists");
-        let mut head_set: TribleSet = repo
-            .storage_mut()
-            .reader()
-            .expect("reader")
-            .get(base)
-            .expect("read head meta");
-        head_set += annotation;
-        let handle = repo
-            .storage_mut()
-            .put(head_set.to_blob())
-            .expect("store annotated head");
-        repo.storage_mut()
-            .update(branch_id, Some(base), Some(handle))
-            .expect("update head");
-
-        assert_eq!(
-            repo.lookup_branch("annotated").expect("lookup"),
-            Some(branch_id),
-            "an annotation entity's name must not make the branch ambiguous"
-        );
-
-        // An ordinary commit — nothing to do with the annotation.
-        let mut ws = repo.pull(branch_id).expect("pull");
-        let e = rngid();
-        let work: TribleSet = entity! { &e @ test_ns::label: "work" }.into();
-        ws.commit(work, "a commit");
-        repo.push(&mut ws).expect("push");
-
-        // The annotation must still be there.
-        let after_handle = repo
-            .storage_mut()
-            .head(branch_id)
-            .expect("head")
-            .expect("branch exists");
-        let after: TribleSet = repo
-            .storage_mut()
-            .reader()
-            .expect("reader")
-            .get(after_handle)
-            .expect("read head meta");
-        let notes: Vec<Inline<triblespace_core::inline::encodings::shortstring::ShortString>> =
-            find!(n: Inline<ShortString>, pattern!(&after, [{ &marker @ ann::note: ?n }]))
-                .collect();
-        assert_eq!(
-            notes.len(),
-            1,
-            "an annotation beside the branch head must survive a push that rebuilds it"
-        );
-        let annotation_names: Vec<Inline<Handle<LongString>>> = find!(
-            name: Inline<Handle<LongString>>,
-            pattern!(&after, [{ &marker @ triblespace_core::metadata::name: ?name }])
-        )
-        .collect();
-        assert_eq!(annotation_names, vec![annotation_name]);
-        assert!(exists!(pattern!(&after, [{
-            &marker @ triblespace_core::repo::branch: unrelated_branch_id
-        }])));
-        assert!(exists!(pattern!(&after, [{
-            &marker @ triblespace_core::repo::head: decoy_head
-        }])));
-
-        // And the head genuinely advanced — otherwise this proves nothing.
-        assert_ne!(after_handle, base, "the push must have rebuilt the head");
     }
 }

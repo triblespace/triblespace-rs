@@ -30,8 +30,7 @@ fn commit_fragment_absorbs_blobs() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).expect("repo");
-    let branch_id = repo.create_branch("main", None).expect("branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("workspace");
 
     // Build a self-contained Fragment: the note handle bytes live
     // inside the Fragment's own MemoryBlobStore, not in the workspace
@@ -74,8 +73,7 @@ fn commit_tribleset_auto_promotes() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).expect("repo");
-    let branch_id = repo.create_branch("main", None).expect("branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("workspace");
 
     let mut data = TribleSet::new();
     let e = rngid();
