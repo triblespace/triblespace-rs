@@ -42,7 +42,8 @@ not interpret its old want marker as permission to erase published history.
 
 ## Conservative Reachability
 
-Every commit and branch metadata record is stored as a `SimpleArchive`. The
+Every commit and structured application-metadata record is stored as a
+`SimpleArchive`. The
 archive encodes a canonical `TribleSet` as 64-byte tribles, each containing a
 32-byte value column. The blob store does not track which handles correspond to
 archives, so the collector treats every blob identically: it scans the raw bytes

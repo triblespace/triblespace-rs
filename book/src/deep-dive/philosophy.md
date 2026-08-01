@@ -18,7 +18,7 @@ better evidence.
 ## Productive developer experience
 
 APIs should read like regular Rust. Where backends demand asynchronous
-capabilities—such as object-store repositories—we wrap them in blocking entry
+capabilities—such as remote object-blob access—we wrap them in blocking entry
 points so typical workflows stay synchronous while still supporting advanced
 integrations. Well-documented patterns and composable macros let readers
 experiment in a REPL or test harness without extra scaffolding, and examples in

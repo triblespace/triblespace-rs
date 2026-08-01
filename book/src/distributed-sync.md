@@ -1,252 +1,143 @@
 # Distributed Sync
 
 The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/triblespace-net)
-crate adds peer-to-peer synchronization over [iroh](https://www.iroh.computer/):
-gossip for HEAD announcements, a DHT for content discovery, direct QUIC
-for bulk transfer. The user-visible surface is a single wrapper type —
-`Peer<S>` — that makes any triblespace store also a node on a
-distributed graph, without changing how the storage traits look from
-outside.
+crate wraps a store in an [iroh](https://www.iroh.computer/) peer. It provides
+content discovery and transfer, capability-authenticated direct RPC, and an
+event loop that keeps network activity behind synchronous storage traits.
 
-Enable it through the facade crate's `net` feature:
+This chapter describes the current migration boundary precisely. Blob transport
+works. The older scalar-HEAD transport also still exists as local synchronization
+machinery. **There is not yet a dedicated protocol that replicates signed branch
+assertions. StrongPin branch replication is therefore incomplete and remains a
+migration blocker.**
 
-```toml
-[dependencies]
-triblespace = { version = "x.y.z", features = ["net"] }
-```
+## The StrongPin Boundary
 
-```rust,ignore
-use triblespace::net::peer::{Peer, PeerConfig};
-```
+Authoritative branch state is a grow-only set of verified assertions. Its
+identity is the exact pair `(author Ed25519 key, name blob handle)`; the
+truncated `BranchId` is only an index prefix. Each assertion adds a commit to
+that identity. Resolution derives the maximal ancestry frontier and reports
+`Absent`, `TipPending`, `Partial`, or `Complete`. A complete divergent frontier
+may produce a deterministic synthetic flat merge; a partial frontier exposes
+only a candidate-root descriptor. Neither derived blob substitutes for signed
+replicated assertions.
 
-## Mental Model
+The network layer currently forwards `BranchAssertionStore`, `StorageFlush`,
+and partial commit-DAG capabilities to its wrapped store. Consequently local
+repository publication and local frontier resolution continue to work through a
+`Peer<S>`. Forwarding a trait is not replication, however: assertions appended
+on one peer are not yet encoded, authenticated, announced, fetched, and
+admitted on another peer by an assertion-native wire protocol.
 
-`Peer<S>` takes any `S: BlobStore + BlobStorePut + BranchStore<Blake3>`
-and wraps it into a node that participates in the iroh network. Two
-layers of behavior are bolted onto the normal storage trait calls:
+Until that protocol exists, do not interpret legacy HEAD gossip or a tracking
+pin as authoritative StrongPin state, and do not claim network convergence for
+branch assertions.
 
-- **Reads auto-drain incoming gossip.** Every call through `reader()`,
-  `head(id)`, or `branches()` transparently pulls any pending
-  `NetEvent`s from the network thread into the wrapped store and
-  re-publishes any deltas from external writers (e.g. another process
-  appended to the same pile file). Mirrors `Pile::refresh` — the
-  explicit `Peer::refresh` method is available for tight loops, but
-  normal storage use Just Works.
-- **Writes auto-publish.** Calls through `put` / `update` delegate to
-  the inner store and then announce blobs to the DHT and gossip branch
-  HEADs to the topic mesh, all via the background network thread.
+## What Works Today
 
-The network thread is a private implementation detail: `Peer::new`
-spawns it; `Peer::drop` winds it down. Async stays jailed inside that
-thread — the storage traits stay sync.
+The network stack has three useful transport pieces:
 
-```rust,ignore
-use std::collections::HashSet;
+- **Blob discovery and transfer.** Content-addressed blobs are announced
+  through the DHT and transferred over authenticated QUIC. A receiver verifies
+  the hash, so provider identity does not change blob meaning.
+- **Lazy demand and retention.** A missing blob can be recorded as a durable
+  weak pin before fetching. The weak marker is local cache/retention state, not
+  branch authority.
+- **Legacy HEAD transport.** Gossip accepts the original 81-byte frame and
+  emits an 89-byte v2 frame: tag, 16-byte remote id, 32-byte metadata-head
+  hash, 32-byte publisher hint, and an 8-byte anti-deduplication nonce.
+  Reachable blobs can be fetched and the observation can be materialized as a
+  mutable local tracking pin.
 
-let pile = triblespace::core::repo::pile::Pile::open(path)?;
-let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
-    peers: vec![bootstrap_endpoint_id],
-    gossip: true,                            // false = pull/serve-only
-    // Auth is mandatory — see the Capability Auth chapter for the
-    // team-root + self_cap setup, or run `trible team create`.
-    // The team root pubkey doubles as the gossip mesh id when
-    // `gossip = true`.
-    team_root: signing_key.verifying_key(),  // single-user team-of-one
-    self_cap: [0u8; 32],
-});
-let mut repo = Repository::new(peer, signing_key, TribleSet::new())?;
-// From here it's just a Repository — commit, push, pull, query.
-```
+Publisher bytes in that frame are only a bounded routing hint. Fetches try the
+hint first, validate content, and then fall through to distinct DHT providers.
+`OP_CHILDREN` responses are likewise store-relative hints: every accepted hash
+must occur in the verified parent bytes and every fetched child must hash
+correctly, but a remote response cannot prove that a global closure is
+complete. If no provider answers a child-hint request the bounded walk retries;
+if one accepted hint is unavailable from every route, it remains
+non-authoritative and a later periodic walk may discover it. Verified fetched
+blobs are emitted immediately as monotone partial progress, while the legacy
+HEAD event waits for the bounded hint walk and generation check. Retry leases,
+active keys, attempts, concurrent walks, provider fan-out, time, count, and
+bytes are bounded independently. Persistence of the resulting event stream is
+fail-stop: if a blob write fails, `Peer::refresh` remembers and returns the
+error and will not apply a later HEAD event past it.
 
-## Tracking Branches
+One `GET_BLOB` response is currently limited to 256 MiB and one `CHILDREN`
+response to 65,536 hashes before allocation/growth. These are protocol resource
+limits, not blob-encoding rules: larger local blobs are valid but require a
+future chunked/streaming transport path to replicate.
 
-When a peer learns about a remote HEAD — via gossip arrival or an
-explicit `track` call — it materializes the data as a **tracking
-branch**: a local branch whose metadata carries `tracking_remote_branch`
-(the remote branch id), `tracking_peer` (the publisher's key), and
-`remote_name` (instead of the usual `metadata::name`). This keeps
-tracking branches invisible to normal discovery: `ensure_branch(name)`
-won't find them, `lookup_branch(name)` returns only your own branches,
-and the `is_tracking_branch` filter lets the Peer avoid re-gossiping
-its mirrors back to the network.
+Capability authentication still gates peer operations; see
+[Capability Auth](capability-auth.md). Async networking remains confined to the
+peer's background thread, while ordinary storage calls drain completed events.
 
-Tracking branches are your sandbox for remote state. Merging them into
-your own same-named branch is how you "accept" the remote changes (see
-the *Merge Flow* section below).
+## Tracking Pins Are Transport State
 
-## Transports
+A tracking pin is a local reification of the most recently accepted legacy
+remote HEAD observation. Its metadata records the remote id, publisher, and
+remote name. It deliberately uses the mutable `PinStore` capability and is kept
+separate from exact signed branch assertions.
 
-Three protocols ride on the same iroh endpoint:
+Tracking pins are useful staging state:
 
-- **Gossip mesh** (HyParView + PlumTree via `iroh-gossip`): all peers
-  on the same topic receive every branch HEAD announcement. 81-byte
-  messages: a 1-byte tag, 16-byte branch id, 32-byte HEAD hash,
-  32-byte publisher key. Eventual delivery; duplicates deduped on
-  the wire.
-- **DHT** (via `iroh-dht`): content discovery for blobs. On write,
-  `announce_provider(blob_hash)` tells the DHT "I have this blob." On
-  read, `find_providers(blob_hash)` returns peers to fetch from.
-  Content-addressed by design — any provider with the right bytes
-  passes blake3 verification.
-- **Direct QUIC RPC** (`PILE_SYNC_ALPN = "/triblespace/pile-sync/4"`):
-  point-to-point operations that don't fit the gossip model —
-  listing a peer's branches, asking for a specific branch's HEAD,
-  fetching a single blob by hash, enumerating a blob's child
-  references. One stream per operation, stream FIN signals end, nil
-  sentinels (zero branch ids / zero hashes) terminate sequences. The
-  protocol's first stream on every connection must be `OP_AUTH` —
-  see the [Capability Auth](capability-auth.md) chapter for the
-  full handshake and scope-gating semantics.
+1. legacy gossip announces a remote metadata-head hash;
+2. the network follows bounded, content-bound child hints and streams the
+   verified blobs it finds;
+3. local tracking-pin metadata records the resolved commit; and
+4. an explicit caller of `merge_tracking_into_local` can merge that commit into a workspace for the
+   local author's exact branch identity, then publish a new local assertion.
 
-## `track` vs `fetch`
+Step 4 is a new local authorship act. It does not preserve or replicate the
+remote author's assertion, because the legacy message did not contain that
+assertion's exact name handle and signature. Tracking pins may be overwritten,
+filtered, or removed as local operational state. They are neither an audit log
+nor a mirror of authoritative branch state.
 
-Two primitives cover the two levels of "go get this":
+`pile net sync` deliberately stops after step 3. A gossip frame's publisher
+field is useful for routing and separating tracking observations, but is not an
+authenticated StrongPin author signature; automatic adoption would launder a
+legacy observation into local authority.
 
-- `peer.track(endpoint_id, branch_id)` — fire-and-forget. Opens a
-  QUIC stream to the remote, asks for its HEAD, then walks the
-  reachable closure of blobs (BFS over the parent-to-children graph
-  via `op_children`, pulling each blob through DHT-first then
-  peer-fallback). When the whole closure has landed locally, emits a
-  `NetEvent::Head` that the Peer drains into a freshly-materialized
-  tracking branch. The tracking branch only advances **after** every
-  referenced blob is in the pile — external readers either see the
-  old HEAD (with its complete closure) or the new HEAD (with its
-  closure), never a half-torn state.
-- `peer.fetch::<T, Sch>(endpoint_id, handle)` — blocking single-blob
-  RPC. Pass a typed handle, pick what comes out: `Blob<Sch>` for
-  bytes-only with zero decode cost, or the decoded type (`TribleSet`,
-  `anybytes::View<str>`, etc.) for the deserialized value. The bytes
-  land in the wrapped store via `BlobStorePut::put` and the return
-  value is decoded from those same bytes.
+This bridge is useful while the migration is underway, but it is lossy at the
+branch protocol boundary. In particular, a scalar tracking pin cannot represent
+an unordered multi-tip frontier, `TipPending` versus `Partial`, or two distinct
+exact identities that happen to share an advisory 16-byte id.
 
-For the common "pull a branch by name" workflow, `peer.pull_branch(
-endpoint_id, name)` composes them: list the remote's branches, pull
-each metadata blob via `fetch`, query for `metadata::name`, find the
-match, hand off to `track`, block until the tracking branch
-materializes. Returns the local tracking branch id ready to merge.
+## Missing Assertion Protocol
 
-## Merge Flow
+An assertion-native replication protocol still needs to do all of the
+following:
 
-Once a tracking branch exists, merging it into its same-named local
-branch is the normal Repository workflow plus one helper:
+- transfer the canonical signed assertion bytes, not a synthesized HEAD;
+- identify a branch by the complete `(author key, name handle)` descriptor;
+- verify signatures strictly before assertions enter the semantic snapshot;
+- deduplicate semantic state by `(exact identity, commit)` while tolerating
+  multiple valid signatures over the same claim;
+- fetch the asserted tip metadata and missing ancestry independently, allowing
+  `TipPending` and `Partial` to remain observable rather than inventing a
+  complete scalar state;
+- apply an explicit admission policy for foreign authors; and
+- preserve set-union semantics under replay, duplication, and reordering.
 
-```rust,ignore
-use triblespace::net::tracking::{merge_tracking_into_local, MergeOutcome};
+Only after this exists can two peers exchange assertion sets and derive the same
+maximal frontier from the same available commit DAG. Blob convergence alone is
+necessary but not sufficient.
 
-match merge_tracking_into_local(&mut repo, tracking_id, "main")? {
-    MergeOutcome::Empty      => { /* tracking had no head yet */ }
-    MergeOutcome::UpToDate   => { /* local already at that state */ }
-    MergeOutcome::Merged { new_head } => {
-        // local "main" advanced — either fast-forward or a real
-        // merge commit, decided by Workspace::merge_commit.
-    }
-}
-```
+## Operational Guidance During Migration
 
-Under the hood that's `ensure_branch("main")` + `pull` tracking
-workspace + `pull` local workspace + `merge_commit(remote_head)` +
-conditional `push`. The `merge_commit` call picks no-op /
-fast-forward / merge commit based on ancestor-walking.
+- Use `Peer<S>` for blob movement, demand recording, and local networking.
+- Treat tracking pins and legacy HEAD events as temporary internal transport
+  inputs, not public branch identities.
+- Use exact StrongPin identities and signed assertions for local repository
+  state.
+- Do not advertise the current `pile net` behavior as StrongPin branch sync.
+- Do not add a shim that translates a signed assertion set back into one
+  last-writer-wins HEAD; that would discard concurrency and recreate the model
+  this migration removes.
 
-For long-running sync daemons, the same helper runs in a loop over
-every tracking branch on every refresh tick.
-
-**Convergence rounds.** When two peers diverge on the same branch:
-
-- *Sequential gossip* (one peer's merge lands before the other's starts)
-  converges in one round-pair. The first side produces a merge commit
-  `AM` containing both original commits as parents; the second side
-  sees `AM`, finds its own head in `ancestors(AM)`, and fast-forwards.
-- *Parallel gossip* (both peers merge before either sees the other's
-  merge) also converges in one round-pair — and without producing a
-  merge commit on the second side. Merge commits are **content-addressed**:
-  they carry no author-specific bits (no signature, no `created_at`,
-  entity id derived intrinsically from the parent set via `entity!`'s
-  content-hash form), so two peers merging the same parent set produce
-  bit-identical merge commits that dedup via blob hash alone.
-
-Either way the system converges in one round-pair. The tests in
-`triblespace-net/tests/two_peer_convergence.rs` exercise both cases
-and serve as regression coverage for the property. Content-addressed
-merges are also why `merge_tracking_into_local` is safe to run in a
-tight polling loop without worrying about merge-commit churn.
-
-## Ordering Under Pressure
-
-Gossip is eventually consistent, which means a flood of HEAD updates
-can arrive out of order: HEAD_1 → HEAD_2 → HEAD_3 where HEAD_1's
-closure happens to take longer over the DHT and completes *after*
-HEAD_3 has already advanced the tracking branch. Without protection,
-HEAD_1 would clobber HEAD_3 and the branch would regress.
-
-To prevent this, `branch_metadata` stamps every published branch
-metadata blob with `metadata::updated_at: NsTAIInterval` from
-`Epoch::now()`. TAI is strictly monotone (no leap-second jumps).
-`update_tracking_branch` reads the stamp from both the current and
-incoming metadata and rejects updates whose timestamp is not strictly
-newer — logged as `[tracking] skip stale update for branch <bid>`
-for observability. The synthesized tracking branch metadata mirrors
-the remote's timestamp so subsequent comparisons share a reference
-frame.
-
-Tradeoff: publishing the same HEAD twice at different moments produces
-different metadata blob hashes now (the timestamps differ). Gossip
-convergence degrades slightly — duplicate blobs for the same semantic
-state — but correctness is preserved and regressions are eliminated.
-
-## CLI Surface
-
-The `trible` CLI exposes sync via the `pile net` subcommand:
-
-```
-trible pile net identity [--key PATH]
-    Print this node's iroh identity (generates a key if needed).
-
-trible pile net sync <PILE> [--peers ...] [--key PATH]
-    Long-running bidirectional sync on the team's gossip mesh.
-    The mesh is identified by the team root pubkey directly (no
-    separate --topic flag): every team has exactly one mesh,
-    derived from its identity. Auto-merges incoming tracking
-    branches into same-named local ones every tick. Reads
-    `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` env vars for multi-
-    user team operation; falls back to single-user team-of-one
-    using the node's own pubkey when those aren't set.
-
-trible pile net pull <PILE> <REMOTE> --branch NAME [--key PATH]
-    One-shot pull of a named branch from a specific peer (REMOTE is
-    the peer's iroh node id, 64-char hex). Pull-only mode — no gossip
-    subscription, direct QUIC + DHT fetch, materialize a tracking
-    branch, merge into local. Useful for "give me a copy of that
-    project" workflows. Same env-var fallback as `sync`.
-
-trible team {create, invite, request-join, approve, retract, list,
-              list-pending, list-issued, show}
-    Team capability lifecycle — see the Capability Auth chapter.
-```
-
-## What's Deferred
-
-A few structural improvements the design discussion has surfaced but
-that aren't implemented yet:
-
-- **Incremental commit-chain advance.** Today the tracking branch only
-  moves when the whole reachable closure of a HEAD is local. Under
-  sustained gossip pressure on large histories, we could fall
-  arbitrarily behind. A git-like incremental walker (parallel-fetch
-  commit contents, advance the tracking branch commit-by-commit in
-  topological order) would give steady progress at the cost of
-  exposing intermediate states to readers.
-- **`CachingStore<P>` with on-miss fetch.** A middleware that wraps a
-  `Peer` and does DHT-backed on-miss fetching inside `BlobStoreGet::get`,
-  with a policy callback for gating by size / schema / context. Would
-  cover the "cache eviction + lazy fetch" workflows that current
-  eager-only semantics can't.
-- **Schema-aware traversal in `track`.** `op_children` today scans
-  parent blob bytes for 32-byte chunks that look like hashes. That's
-  cheap and peer-agnostic but pulls more than strictly necessary when
-  a blob contains handle-sized non-hash data. A schema-aware walker
-  that parses each blob as its declared schema and enumerates referenced
-  handles could be precise, but adds significant traversal complexity.
-
-All three are additive: the current model stays correct as a
-strict-closure / eager-only baseline that these improvements build on.
+The next networking milestone is therefore narrow and explicit: carry verified
+branch assertions end to end, then let the existing resolver compute branch
+state. The network should transport facts; ancestry and frontier semantics
+remain in the repository layer.

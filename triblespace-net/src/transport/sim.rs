@@ -2,7 +2,7 @@
 //!
 //! [`SimNet`] is a process-local network: nodes join it, get a
 //! [`Harness<SimTransport>`] back, and from there the *entire*
-//! production protocol stack — host loop, OP_AUTH, fetch_reachable,
+//! production protocol stack — host loop, OP_AUTH, legacy hint walking,
 //! cap delivery, gossip head tracking — runs unmodified over
 //! in-memory pipes instead of iroh QUIC.
 //!
@@ -51,9 +51,9 @@ use tokio::sync::mpsc;
 
 use super::{Alpn, Conn, GossipEvent, GossipSink, Harness, Incoming, PeerId, Transport};
 
-/// Capacity of each in-memory stream pipe. Generous enough that
-/// protocol frames never deadlock on backpressure (max blob size is
-/// enforced above the seam at 1 MiB; chain blobs are tiny).
+/// Capacity of each in-memory stream pipe. Protocol reads and writes are
+/// concurrent, so blobs larger than this capacity make progress through
+/// backpressure rather than requiring the whole frame to fit at once.
 const PIPE_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// Tunables for the simulated network.

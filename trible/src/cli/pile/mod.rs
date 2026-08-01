@@ -1,38 +1,26 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use triblespace_core::repo::branch_assertion::BranchAssertionStore;
 use triblespace_core::repo::pile::Pile;
 
 pub mod blob;
 pub mod branch;
 mod diagnose;
-mod extract;
-mod merge;
 mod migrate;
 pub mod net;
 pub mod pin;
-mod reid;
 mod signing;
-mod squash;
 
 #[derive(Parser)]
 pub enum PileCommand {
-    /// Operations on branches stored in a pile file. Branches are
-    /// the named-pin specialization that holds a commit-chain head;
-    /// `branch list` filters to those and shows commit-aware info.
-    /// For the generic pin view (all pins regardless of role), see
-    /// `pile pin`.
+    /// Observe and publish exact StrongPin branch assertions.
     Branch {
         #[command(subcommand)]
         cmd: branch::Command,
     },
-    /// Operations on the pin storage primitive (every named handle
-    /// in the pile, regardless of role). Branches, tracking mirrors,
-    /// and local-only policy pins all show up here. For the branch-
-    /// specific view, see `pile branch`.
+    /// Operations on the separate legacy/local pin storage primitive.
     Pin {
         #[command(subcommand)]
         cmd: pin::Command,
@@ -42,23 +30,7 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: blob::Command,
     },
-    /// Merge source branch heads into a target branch.
-    Merge {
-        /// Path to the pile file to modify
-        pile: PathBuf,
-        /// Target branch id (hex)
-        target: String,
-        /// Source branch id(s) (hex)
-        #[arg(num_args = 1..)]
-        sources: Vec<String>,
-        /// Optional signing key path. The file should contain a 64-char hex seed.
-        #[arg(long)]
-        signing_key: Option<PathBuf>,
-    },
     /// Create a new empty pile file.
-    ///
-    /// This is mainly a cross-platform convenience; a plain `touch` on
-    /// Unix-like systems achieves the same result.
     Create {
         /// Path to the pile file to create
         path: PathBuf,
@@ -96,62 +68,6 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: net::Command,
     },
-    /// Squash all branch histories into single commits in a new pile.
-    ///
-    /// For each branch, the full accumulated content and metadata are
-    /// checked out and written as a single commit. Only blobs reachable
-    /// from the squashed content are copied. The result is a minimal
-    /// pile with clean commit timestamps and no orphaned data.
-    Squash {
-        /// Source pile file
-        source: PathBuf,
-        /// Destination pile file (will be created)
-        dest: PathBuf,
-        /// Only include these branches (by name or hex ID). If omitted, all branches are included.
-        #[arg(long)]
-        include: Vec<String>,
-        /// Exclude these branches (by name or hex ID).
-        #[arg(long)]
-        exclude: Vec<String>,
-        /// Optional signing key path
-        #[arg(long)]
-        signing_key: Option<PathBuf>,
-    },
-    /// Stream one branch's commit chain into a fresh pile.
-    ///
-    /// The scalable single-branch alternative to `squash`: the branch's
-    /// content is never materialized. Commits are walked oldest → newest
-    /// and each content delta blob is copied as raw bytes into the
-    /// destination, where a fresh commit is minted per original commit
-    /// (preserving messages and per-commit deltas). Peak memory stays
-    /// proportional to one commit's blob references, so this works on
-    /// piles far larger than RAM. Prints a per-commit ladder table with
-    /// running cumulative trible counts.
-    Extract {
-        /// Source pile file
-        source: PathBuf,
-        /// Destination pile file (will be created)
-        dest: PathBuf,
-        /// Branch to extract (name or hex id)
-        #[arg(long)]
-        branch: String,
-    },
-    /// Re-id every branch into a new pile, preserving names + full history.
-    ///
-    /// Each branch keeps its name and head commit, but receives a freshly
-    /// minted branch id; the full reachable blob graph is copied unchanged
-    /// (unlike `squash`, which collapses history). Use this to de-alias two
-    /// piles that share branch ids before `cat` + `branch consolidate
-    /// --by-name`.
-    Reid {
-        /// Source pile file
-        source: PathBuf,
-        /// Destination pile file (will be created)
-        dest: PathBuf,
-        /// Optional signing key path
-        #[arg(long)]
-        signing_key: Option<PathBuf>,
-    },
 }
 
 /// Open a pile and load its records via `refresh`, failing loud on a
@@ -173,68 +89,29 @@ pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
     Ok(pile)
 }
 
-/// Refuse to feed assertion-bearing piles through a legacy rewrite.
-///
-/// `squash`, `extract`, and `reid` currently reconstruct only the legacy
-/// pin/commit representation. Letting one of them accept a mixed source would
-/// produce a plausible destination while silently omitting the grow-only
-/// assertion set. They must fail closed until the final assertion-native
-/// publication migration gives each operation an explicit meaning.
-pub(crate) fn open_legacy_rewrite_source(path: &Path, operation: &str) -> Result<Pile> {
-    let mut pile = open_refreshed(path)?;
-    let check = pile
-        .assertion_snapshot()
-        .map_err(|err| anyhow!("inspect assertions in {}: {err}", path.display()))
-        .and_then(|snapshot| {
-            let assertion_count = snapshot.len();
-            if assertion_count == 0 {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "refusing to {operation} {}: source contains {assertion_count} signed branch \
-                     assertion record(s), but this legacy rewrite cannot preserve them",
-                    path.display()
-                ))
-            }
-        });
-    if let Err(err) = check {
-        if let Err(close_err) = pile.close() {
-            return Err(anyhow!(
-                "{err}; additionally failed to close source pile {}: {close_err}",
-                path.display()
-            ));
-        }
-        return Err(err);
-    }
-    Ok(pile)
-}
-
 pub fn run(cmd: PileCommand) -> Result<()> {
     match cmd {
         PileCommand::Branch { cmd } => branch::run(cmd),
         PileCommand::Pin { cmd } => pin::run(cmd),
         PileCommand::Blob { cmd } => blob::run(cmd),
-        PileCommand::Merge {
-            pile,
-            target,
-            sources,
-            signing_key,
-        } => merge::run(pile, target, sources, signing_key),
         PileCommand::Create { path } => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if !parent.is_dir() {
+                bail!("pile directory {} does not exist", parent.display());
             }
 
-            // Pile::open no longer auto-creates files (v0.32.1), so we
-            // explicitly touch the path first. Fine if the file already
-            // exists — fs::File::create truncates empty-or-not, and
-            // piles are append-only so an empty file is the initial
-            // state.
-            fs::File::create(&path)?;
-
-            let pile: Pile = Pile::open(&path)?;
-            // Explicit close makes the empty pile durable and avoids Drop warnings.
-            pile.close().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            // Creation is deliberately no-clobber. A pile is append-only;
+            // silently turning an existing generation into an empty one is
+            // never a valid interpretation of "create".
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.sync_all()?;
+            sync_directory(parent)?;
             Ok(())
         }
         PileCommand::Net { cmd } => net::run(cmd),
@@ -263,22 +140,16 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             Ok(())
         }
         PileCommand::Migrate { pile, cmd } => migrate::run(pile, cmd),
-        PileCommand::Squash {
-            source,
-            dest,
-            include,
-            exclude,
-            signing_key,
-        } => squash::run(source, dest, signing_key, include, exclude),
-        PileCommand::Extract {
-            source,
-            dest,
-            branch,
-        } => extract::run(source, dest, branch),
-        PileCommand::Reid {
-            source,
-            dest,
-            signing_key,
-        } => reid::run(source, dest, signing_key),
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }

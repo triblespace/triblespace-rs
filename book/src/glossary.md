@@ -109,15 +109,16 @@ segments relevant to their bindings, further described in
 [the deep-dive chapter](deep-dive/patch.md).
 
 ### Pile
-An append-only collection of blobs and branch records stored in a single file.
-Piles act as durable backing storage for repositories, providing a
-write-ahead-log style format that can be memory mapped, repaired after crashes,
-and safely shared between threads.
+An append-only collection of blobs, signed branch assertions, and separate
+local pin records stored in a single file. Piles act as durable backing storage
+for repositories, providing a write-ahead-log style format that can be memory
+mapped, repaired after crashes, and safely shared between threads.
 
 ### Repository
-The durable record that ties blob storage, branch metadata, and namespaces
-together. A repository coordinates synchronization, replication, and history
-traversal across commits while enforcing signatures and branch ownership.
+The authoring and resolution layer over blob storage and grow-only branch
+assertions. A repository owns one signing key, publishes commits under exact
+`(author key, name handle)` identities, and derives their maximal commit
+frontiers while keeping replica-local pins outside branch authority.
 
 ### Encoding
 The byte-layout contract for a typed value. Encodings assign language-agnostic
@@ -136,7 +137,9 @@ triples (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`) optionally combined with
 branches. An empty branch-restriction set means "every branch within the
 permission set." Sub-capabilities issued via delegation must have a scope that
 is a subset of the parent's; the verifier enforces this via `scope_subsumes`
-during chain walk.
+during chain walk. The current `scope_branch` value belongs to the legacy HEAD
+transport; exact StrongPin assertion ingest still needs an
+`(author key, name handle)` scope representation.
 
 ### Team Root
 The single immutable keypair that anchors a triblespace network's

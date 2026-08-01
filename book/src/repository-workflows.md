@@ -133,7 +133,7 @@ returns one of four states:
 | --- | --- | --- |
 | `Absent` | No assertion exists for the exact identity. | Create a workspace if this is a new local branch, or ingest/fetch the missing replicated state. |
 | `TipPending` | At least one surviving asserted tip's commit metadata is absent. | Fetch `missing_tips()` and resolve again. |
-| `Partial` | Every surviving tip is a well-formed commit, but missing ancestry prevents the resolver from deciding all dominance relations. | Use `conservative_head()` for a read-only derived view, fetch `missing_ancestry()`, and resolve again before authoring. |
+| `Partial` | Every surviving tip is a well-formed commit, but missing ancestry prevents the resolver from deciding all dominance relations. | Inspect `candidate_root()` only as a deterministic descriptor, fetch `missing_ancestry()`, and resolve again before checkout or authoring. |
 | `Complete` | The complete, sorted, nonempty maximal antichain is known. | Inspect `tips()` or open a writable workspace with `pull`. |
 
 Absence is distinct from incomplete replication. A signed assertion can arrive
@@ -159,10 +159,12 @@ as the workspace's base head. Merely pulling and pushing it unchanged returns
 `NoChange`; making a new commit creates an authored descendant of the derived
 merge, and pushing that descendant adds a normal signed assertion.
 
-`PartialFrontier::conservative_head` uses the same flat representation over
-the non-definitely-dominated candidates. It is safe for reading because it does
-not discard any candidate, but it must not be asserted: additional ancestry
-could later prove one candidate dominated.
+`PartialFrontier::candidate_root` uses the same flat representation over the
+non-definitely-dominated candidates. It is a deterministic lower-bound
+descriptor that does not discard a candidate, not an available high-level
+checkout: `Repository::pull` correctly refuses a partial frontier, and walking
+those candidate histories would encounter the missing ancestry. It must not be
+asserted because additional ancestry could later prove a candidate dominated.
 
 ## Publishing and concurrency
 

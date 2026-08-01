@@ -236,10 +236,10 @@ fn invite_rejects_invalid_issuer_cap() {
 }
 
 #[test]
-fn invite_with_branch_restriction_renders_in_list() {
-    // Mint a team, mint a fresh branch id, invite a peer with
-    // `--branch <id>`. `team list` should surface the cap with a
-    // `branches=[<short-hex>]` suffix proving the scope_branch
+fn invite_with_legacy_pin_restriction_renders_in_list() {
+    // Mint a team, mint a fresh local pin id, invite a peer with
+    // `--legacy-pin <id>`. `team list` should surface the cap with a
+    // `legacy-pins=[<hex>]` suffix proving the legacy scope_branch
     // triple landed in the cap blob.
     let dir = tempdir().expect("tempdir");
     let pile_path = dir.path().join("team.pile");
@@ -283,18 +283,18 @@ fn invite_with_branch_restriction_renders_in_list() {
         })
         .expect("identity prints `node:`");
 
-    // Mint a fresh branch id via `trible genid` — same primitive
+    // Mint a fresh local pin id via `trible genid` — same primitive
     // the user would run interactively when scoping a cap.
     let genid = Command::cargo_bin("trible")
         .unwrap()
         .args(["genid"])
         .assert()
         .success();
-    let branch_id = String::from_utf8(genid.get_output().stdout.clone())
+    let pin_id = String::from_utf8(genid.get_output().stdout.clone())
         .unwrap()
         .trim()
         .to_string();
-    assert_eq!(branch_id.len(), 32, "genid prints a 32-char hex id");
+    assert_eq!(pin_id.len(), 32, "genid prints a 32-char hex id");
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -313,8 +313,8 @@ fn invite_with_branch_restriction_renders_in_list() {
             &invitee_pubkey,
             "--scope",
             "read",
-            "--branch",
-            &branch_id,
+            "--legacy-pin",
+            &pin_id,
         ])
         .assert()
         .success();
@@ -330,12 +330,10 @@ fn invite_with_branch_restriction_renders_in_list() {
         list_out.contains("capabilities in pile:  2"),
         "post-invite has two caps; got:\n{list_out}"
     );
-    // `team list` prints the full branch id (commit c8aec6b6: full
-    // pubkeys + sig handles always shown).
-    let full_branch = branch_id.to_lowercase();
+    let full_pin = pin_id.to_lowercase();
     assert!(
-        list_out.contains(&format!("branches=[{full_branch}]")),
-        "invitee cap shows branches=[{full_branch}]; got:\n{list_out}",
+        list_out.contains(&format!("legacy-pins=[{full_pin}]")),
+        "invitee cap shows legacy-pins=[{full_pin}]; got:\n{list_out}",
     );
     // PERM_READ should appear on the invitee line; PERM_ADMIN on
     // the founder line.

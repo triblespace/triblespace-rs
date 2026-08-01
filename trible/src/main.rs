@@ -8,7 +8,6 @@ use tracing_subscriber::EnvFilter;
 pub const DEFAULT_MAX_PILE_SIZE: usize = 1 << 44; // 16 TiB
 
 mod cli;
-use cli::branch::BranchCommand;
 use cli::pile::PileCommand;
 use cli::store::StoreCommand;
 use cli::team::Command as TeamCommand;
@@ -24,11 +23,6 @@ enum TribleCli {
     Completion {
         #[arg(value_enum)]
         shell: Shell,
-    },
-    /// Synchronize branches between piles and remote stores.
-    Branch {
-        #[command(subcommand)]
-        cmd: BranchCommand,
     },
     /// Commands for working with local pile files.
     Pile {
@@ -71,7 +65,6 @@ fn main() -> Result<()> {
             let bin_name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, bin_name, &mut io::stdout());
         }
-        TribleCli::Branch { cmd } => cli::branch::run(cmd)?,
         TribleCli::Pile { cmd } => cli::pile::run(cmd)?,
         TribleCli::Store { cmd } => cli::store::run(cmd)?,
         TribleCli::Team { cmd } => cli::team::run(cmd)?,

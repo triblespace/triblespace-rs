@@ -2,16 +2,20 @@
 //!
 //! Owns the inner store, spawns the iroh network thread on construction,
 //! and exposes the standard storage traits (`BlobStore + BlobStorePut +
-//! PinStore`) with two layers of network behavior built in:
+//! PinStore`) with two layers of legacy transport behavior built in:
 //!
 //! - **Reads** auto-call [`refresh`](Peer::refresh), which drains pending
-//!   incoming gossip events into the wrapped store and re-publishes any
-//!   deltas from external writers (e.g. another process appended to the
-//!   same pile file). Mirrors `Pile::refresh` — the explicit method is
-//!   available for tight loops, but normal storage use Just Works.
-//! - **Writes** delegate to the inner store and then announce blobs to
-//!   the DHT and gossip branch updates over the topic mesh, all via the
-//!   network thread.
+//!   incoming blob and scalar-HEAD observations into the wrapped store and
+//!   re-publishes eligible mutable-pin deltas from external writers (e.g.
+//!   another process appended to the same pile file). Mirrors
+//!   `Pile::refresh` — the explicit method is available for tight loops.
+//!   Persistence failures are sticky and fail-stop: automatic trait refreshes
+//!   cannot change their associated error types, but a later explicit
+//!   [`refresh`](Peer::refresh) reports the retained [`PeerRefreshError`].
+//! - **Writes** delegate to the inner store. Blobs are announced to the DHT;
+//!   eligible mutable pins are announced through the legacy HEAD topic.
+//!   Signed branch assertions are forwarded only to local storage and are not
+//!   replicated or synthesized by this layer.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
 //! and any tiering (bounded weak retention, generational eviction) lives
@@ -31,13 +35,11 @@
 //! "Promote to durable" is not an operation — durability is
 //! reachability from strong pins; the Peer performs no promotion.
 //!
-//! Branch-state discovery is gossip-driven: HEAD updates for the
-//! team's branches flood the team topic and arrive via the
-//! `NetEvent` channel; the network thread autonomously walks
-//! reachable closures via DHT-routed blob fetches. There are no
-//! peer-targeted RPCs on the public surface — peers serve content
-//! but don't get asked "what branches do you have." That question
-//! is asked of the team, via the topic, not of any individual peer.
+//! Legacy mutable-HEAD discovery is gossip-driven: observations flood the team
+//! topic and arrive as local tracking pins while the network thread follows a
+//! bounded, untrusted child-hint walk from each advertised metadata blob. These
+//! observations are transport state, not StrongPin authority. There is
+//! currently no signed-assertion wire protocol.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -52,6 +54,10 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::repo::branch_assertion::{
+    BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore,
+};
+use triblespace_core::repo::branch_frontier::{ParentLookup, PartialCommitDag};
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
@@ -63,6 +69,40 @@ use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
 
 pub use crate::host::{PeerConfig, SyncDirection};
+
+/// A fail-stop persistence error observed while applying network events.
+///
+/// Once a peer records this error, every later [`Peer::refresh`] returns the
+/// same value without consuming more events. In particular, a failed fetched
+/// blob write can never be followed by materializing the associated legacy
+/// HEAD. Callers may close or repair the wrapped store and restart the peer;
+/// continuing after an unknown partial write would make the storage invariant
+/// unprovable.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{operation}: {detail}")]
+pub struct PeerRefreshError {
+    operation: &'static str,
+    detail: String,
+}
+
+impl PeerRefreshError {
+    fn new(operation: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            operation,
+            detail: error.to_string(),
+        }
+    }
+
+    /// Storage operation that first faulted this peer.
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// Original storage error rendered at the boundary where it occurred.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
 
 /// A store wrapped in distributed network sync.
 ///
@@ -100,9 +140,9 @@ pub use crate::host::{PeerConfig, SyncDirection};
 ///     self_cap: [0u8; 32],
 ///     direction: SyncDirection::Bidirectional,
 /// });
-/// // From here `peer` is just a `BlobStore + BlobStorePut +
-/// // PinStore` — wrap it in `Repository::new` and use it like
-/// // any other triblespace storage.
+/// // From here `peer` forwards the wrapped store's blob, local-pin,
+/// // durability, and branch-assertion capabilities — wrap it in
+/// // `Repository::new` and use it like any other storage.
 /// drop(peer);
 /// ```
 pub struct Peer<S>
@@ -125,9 +165,9 @@ where
     /// the last refresh.
     last_blob_reader: Option<S::Reader>,
 
-    /// Baseline branch heads for diff-and-publish on `refresh`. Updated on
-    /// every Peer-driven write so we don't double-gossip our own changes.
-    last_branches: HashMap<Id, RawHash>,
+    /// Baseline legacy mutable heads for diff-and-publish on `refresh`.
+    /// Updated on every Peer-driven pin write so we do not double-gossip it.
+    last_legacy_metadata_heads: HashMap<Id, RawHash>,
 
     /// Direction of swarm participation — controls whether we publish
     /// local HEADs and/or react to remote HEADs.
@@ -138,6 +178,10 @@ where
     /// in long-running sync drivers. Read through [`crate::clock`] so
     /// simulated runs measure quiescence in virtual time.
     last_event_at: crate::clock::Mono,
+
+    /// First persistence failure while absorbing network events. Network
+    /// ingestion is fail-stop: after this is set, no later event is consumed.
+    refresh_error: Option<PeerRefreshError>,
 
     /// Team root pubkey, copied from `PeerConfig::team_root` so the
     /// refresh loop can verify incoming `CapDelivered` events against
@@ -218,9 +262,10 @@ where
             sender,
             receiver,
             last_blob_reader: None,
-            last_branches: HashMap::new(),
+            last_legacy_metadata_heads: HashMap::new(),
             direction,
             last_event_at: crate::clock::mono_now(),
+            refresh_error: None,
             team_root,
             signing_key,
             last_dispatch_attempt: HashMap::new(),
@@ -229,7 +274,7 @@ where
         // Drive the first refresh synchronously so the DHT learns
         // about pre-existing blobs before construction returns and the
         // first incoming AUTH can land.
-        peer.refresh();
+        let _ = peer.refresh();
 
         peer
     }
@@ -305,40 +350,63 @@ where
     /// callers using the storage normally don't need to invoke it.
     /// Mirrors `Pile::refresh` — the explicit method is available for
     /// "do it now" semantics or tight loops with no read activity.
-    pub fn refresh(&mut self) {
+    ///
+    /// Network ingestion is fail-stop. If persisting an incoming fetched blob
+    /// fails, this returns an error before consuming a later HEAD event and
+    /// remembers that error permanently for this `Peer`. This deliberately
+    /// favors an explicit restart/repair over advancing tracking state across
+    /// a possibly partial append.
+    pub fn refresh(&mut self) -> Result<(), PeerRefreshError> {
+        if let Some(error) = &self.refresh_error {
+            return Err(error.clone());
+        }
+        match self.refresh_once() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.refresh_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn refresh_once(&mut self) -> Result<(), PeerRefreshError> {
         // ── Phase 1: drain incoming events ────────────────────────────
-        // WriteOnly suppresses incoming-event handling: we always
-        // drain the channel to keep it from filling, but skip the
-        // store mutation. The local node has nothing to learn from
-        // the swarm.
+        // WriteOnly suppresses incoming blob/legacy-HEAD materialization, but
+        // capability request, delivery, and confirmation events are control
+        // traffic and must still reach local policy state.
         while let Some(event) = self.receiver.try_recv() {
             self.last_event_at = crate::clock::mono_now();
-            if self.direction == SyncDirection::WriteOnly {
-                continue;
-            }
             match event {
                 NetEvent::Blob(data) => {
+                    if self.direction == SyncDirection::WriteOnly {
+                        continue;
+                    }
                     // `data` is already an anybytes::Bytes (refcounted) —
                     // pass it into the store without re-wrapping.
-                    let _ = self
-                        .store
+                    self.store
                         .lock()
                         .expect("store mutex")
-                        .put::<UnknownBlob, Bytes>(data);
+                        .put::<UnknownBlob, Bytes>(data)
+                        .map_err(|error| {
+                            PeerRefreshError::new("persist incoming fetched blob", error)
+                        })?;
                 }
-                NetEvent::Head {
-                    branch,
-                    head,
+                NetEvent::LegacyHead {
+                    pin,
+                    metadata_head,
                     publisher,
                 } => {
-                    if let Some(remote_id) = Id::new(branch) {
+                    if self.direction == SyncDirection::WriteOnly {
+                        continue;
+                    }
+                    if let Some(remote_id) = Id::new(pin) {
                         let mut store = self.store.lock().expect("store mutex");
-                        match read_remote_name(&mut *store, &head, remote_id) {
+                        match read_legacy_pin_name(&mut *store, &metadata_head, remote_id) {
                             Some(name) => {
                                 let r = crate::tracking::ensure_tracking_pin(
                                     &mut *store,
                                     remote_id,
-                                    &head,
+                                    &metadata_head,
                                     &name,
                                     &publisher,
                                     // Gossip-driven auto-tracking stays strong
@@ -347,15 +415,15 @@ where
                                     false,
                                 );
                                 tracing::trace!(
-                                    head = %hex::encode(&head[..4]),
+                                    metadata_head = %hex::encode(&metadata_head[..4]),
                                     ok = r.is_some(),
                                     "head event -> ensure_tracking_pin"
                                 );
                             }
                             None => {
                                 tracing::warn!(
-                                    head = %hex::encode(&head[..4]),
-                                    "peer: head event but branch meta unreadable; dropped"
+                                    metadata_head = %hex::encode(&metadata_head[..4]),
+                                    "peer: legacy HEAD event but pin metadata unreadable; dropped"
                                 );
                             }
                         }
@@ -420,7 +488,7 @@ where
         // ── Phase 2: refresh the snapshot served by the network thread ─
         //
         // MUST happen before any announce/gossip below: peers who hear
-        // our announce/gossip will dial us to fetch the closure, and
+        // our announce/gossip will dial us to fetch the hinted subgraph, and
         // the network thread serves them out of this snapshot. If we
         // gossiped first, a fast-dialing peer would hit `has_blob =
         // false` on the still-stale snapshot and the server would deny
@@ -438,54 +506,56 @@ where
         // covers the initial pile contents without a separate startup
         // sweep (and without the race that two separate `reader()`
         // calls introduced).
-        if let Ok(current) = store.reader() {
-            if self.direction != SyncDirection::ReadOnly {
-                match self.last_blob_reader.as_ref() {
-                    Some(baseline) => {
-                        for handle in current.blobs_diff(baseline).flatten() {
-                            self.sender.announce(handle.raw);
-                        }
+        let current = store
+            .reader()
+            .map_err(|error| PeerRefreshError::new("snapshot local blobs", error))?;
+        if self.direction != SyncDirection::ReadOnly {
+            match self.last_blob_reader.as_ref() {
+                Some(baseline) => {
+                    for handle in current.blobs_diff(baseline) {
+                        let handle = handle
+                            .map_err(|error| PeerRefreshError::new("diff local blobs", error))?;
+                        self.sender.announce(handle.raw);
                     }
-                    None => {
-                        use triblespace_core::repo::BlobStoreList;
-                        for handle in current.blobs().filter_map(Result::ok) {
-                            self.sender.announce(handle.raw);
-                        }
+                }
+                None => {
+                    use triblespace_core::repo::BlobStoreList;
+                    for handle in current.blobs() {
+                        let handle = handle.map_err(|error| {
+                            PeerRefreshError::new("enumerate local blobs", error)
+                        })?;
+                        self.sender.announce(handle.raw);
                     }
                 }
             }
-            self.last_blob_reader = Some(current);
         }
+        self.last_blob_reader = Some(current);
 
-        // ── Phase 4: diff-and-publish branch deltas ───────────────────
+        // ── Phase 4: diff-and-publish legacy mutable-head deltas ──────
         // ReadOnly skips this entire phase — followers don't gossip.
         if self.direction != SyncDirection::ReadOnly {
-            let bids: Vec<Id> = match store.pins() {
-                Ok(it) => it.filter_map(|r| r.ok()).collect(),
-                Err(_) => return,
-            };
-            for bid in bids {
-                if crate::tracking::is_tracking_pin(&mut *store, bid) {
+            let pin_ids = store
+                .pins()
+                .map_err(|error| PeerRefreshError::new("enumerate local pins", error))?;
+            let pin_ids: Vec<Id> = pin_ids
+                .map(|result| {
+                    result
+                        .map_err(|error| PeerRefreshError::new("read local pin index entry", error))
+                })
+                .collect::<Result<_, _>>()?;
+            for pin_id in pin_ids {
+                let Some(metadata_head) = legacy_pin_metadata_head(&mut *store, pin_id) else {
                     continue;
-                }
-                // Local-only policy pins (renewal policy, pending
-                // requests, per-team-cap pins) carry per-peer
-                // state that mustn't leak to the team mesh. See
-                // `crate::policy`.
-                if crate::policy::is_local_only_pin(&mut *store, bid) {
-                    continue;
-                }
-                let head = match store.head(bid) {
-                    Ok(Some(h)) => h,
-                    _ => continue,
                 };
-                if self.last_branches.get(&bid) != Some(&head.raw) {
-                    let bid_bytes: [u8; 16] = bid.into();
-                    self.sender.gossip(bid_bytes, head.raw);
-                    self.last_branches.insert(bid, head.raw);
+                if self.last_legacy_metadata_heads.get(&pin_id) != Some(&metadata_head.raw) {
+                    let pin_bytes: [u8; 16] = pin_id.into();
+                    self.sender.gossip_legacy_head(pin_bytes, metadata_head.raw);
+                    self.last_legacy_metadata_heads
+                        .insert(pin_id, metadata_head.raw);
                 }
             }
         }
+        Ok(())
     }
 
     /// Persist an incoming join request: store the partial-cap blob,
@@ -866,20 +936,20 @@ where
         dispatched + redispatched
     }
 
-    /// Force-republish all current non-tracking branches to the gossip
-    /// topic, regardless of whether they appear changed since the last
-    /// publish.
+    /// Force-republish all positively identified legacy mutable pins carrying
+    /// the old pin-metadata schema to the gossip topic, regardless of whether
+    /// they appear changed since the last publish. Generic local pins never
+    /// become replication roots merely by existing in [`PinStore`].
     ///
-    /// Use this for periodic "I'm still here, here's my state"
-    /// announcements that help newly-joined gossip neighbors learn about
-    /// us. Long-running sync daemons typically call this every few seconds.
-    /// Cheap to call repeatedly — iroh-gossip dedupes identical messages
-    /// on the wire.
+    /// Use this for an immediate "I'm still here, here's my legacy state"
+    /// announcement. The host loop already performs periodic rebroadcasts.
+    /// Each v2 frame carries a fresh anti-deduplication nonce so an explicit
+    /// call is intentionally deliverable rather than free.
     ///
     /// Distinct from [`refresh`](Self::refresh): refresh publishes only
     /// the deltas it detects against its diff baselines. This method
     /// republishes everything unconditionally.
-    pub fn republish_branches(&mut self) {
+    pub fn republish_legacy_heads(&mut self) {
         // ReadOnly suppresses publishing entirely — even republish.
         if self.direction == SyncDirection::ReadOnly {
             return;
@@ -890,21 +960,16 @@ where
         if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
             self.sender.update_snapshot(snap);
         }
-        let bids: Vec<Id> = match store.pins() {
+        let pin_ids: Vec<Id> = match store.pins() {
             Ok(it) => it.filter_map(|r| r.ok()).collect(),
             Err(_) => return,
         };
-        for bid in bids {
-            if crate::tracking::is_tracking_pin(&mut *store, bid) {
-                continue;
-            }
-            if crate::policy::is_local_only_pin(&mut *store, bid) {
-                continue;
-            }
-            if let Ok(Some(head)) = store.head(bid) {
-                let bid_bytes: [u8; 16] = bid.into();
-                self.sender.gossip(bid_bytes, head.raw);
-                self.last_branches.insert(bid, head.raw);
+        for pin_id in pin_ids {
+            if let Some(metadata_head) = legacy_pin_metadata_head(&mut *store, pin_id) {
+                let pin_bytes: [u8; 16] = pin_id.into();
+                self.sender.gossip_legacy_head(pin_bytes, metadata_head.raw);
+                self.last_legacy_metadata_heads
+                    .insert(pin_id, metadata_head.raw);
             }
         }
     }
@@ -913,8 +978,8 @@ where
     /// methods that aren't part of the storage traits (e.g.
     /// `Pile::flush`, `Yard::collect`, `WeakPinStore::weak_pins`).
     ///
-    /// Writes through this borrow bypass the Peer's auto-publish and
-    /// become invisible to the network until the next
+    /// Writes through this borrow bypass blob announcement and eligible legacy
+    /// mutable-head gossip, becoming invisible to the network until the next
     /// [`refresh`](Self::refresh) (which is auto-called on the next
     /// read). Don't hold the guard across calls back into the Peer —
     /// its own methods take the same lock.
@@ -924,6 +989,11 @@ where
 
     /// Consume the Peer and return the underlying store. The network
     /// thread shuts down when the Peer drops.
+    ///
+    /// Call [`refresh`](Self::refresh) immediately before this when shutdown
+    /// must account for queued network data. `into_store` intentionally only
+    /// unwraps ownership; it cannot encode both the store and a sticky refresh
+    /// error in its return type.
     ///
     /// # Panics
     ///
@@ -1024,7 +1094,7 @@ where
 
 // ── Trait delegations ───────────────────────────────────────────────
 //
-// Reads (`reader`, `head`, `branches`) call `refresh()` first so they
+// Reads (`reader`, `head`, `pins`) call `refresh()` first so they
 // always see the latest gossiped state AND any external writes that
 // landed since the last refresh get announced. Writes (`put`, `update`)
 // delegate to the inner store and then push the new state out via the
@@ -1069,7 +1139,7 @@ where
     type ReaderError = S::ReaderError;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        self.refresh();
+        let _ = self.refresh();
         let local = self.store.lock().expect("store mutex").reader()?;
         // The fetch capability: a clone of the command sender plus a
         // landing handle into the *shared* store, so a `&self` async
@@ -1080,6 +1150,49 @@ where
             sink: Arc::new(SharedStore(self.store.clone())),
         });
         Ok(PeerReader { local, fetch })
+    }
+}
+
+impl<S> StorageFlush for Peer<S>
+where
+    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+{
+    type Error = <S as StorageFlush>::Error;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.store.lock().expect("store mutex").flush()
+    }
+}
+
+impl<S> BranchAssertionStore for Peer<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + PinStore
+        + WeakPinStore
+        + StorageFlush
+        + BranchAssertionStore
+        + Send
+        + 'static,
+{
+    type Error = <S as BranchAssertionStore>::Error;
+
+    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
+        let _ = self.refresh();
+        self.store.lock().expect("store mutex").assertion_snapshot()
+    }
+
+    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
+        // Assertions are already immutable, verified values; unlike mutable
+        // local tracking pins, appending one needs no CAS or scalar-head
+        // announcement.
+        // TODO(strongpin-assertion-replication): replicate the signed exact
+        // assertion over a dedicated protocol; legacy HEAD gossip cannot
+        // represent its `(author, name handle) -> commit` identity.
+        self.store
+            .lock()
+            .expect("store mutex")
+            .append_assertion(assertion)
     }
 }
 
@@ -1098,14 +1211,14 @@ where
         S: 'a;
 
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        self.refresh();
+        let _ = self.refresh();
         let mut store = self.store.lock().expect("store mutex");
         let ids: Vec<Result<Id, S::PinsError>> = store.pins()?.collect();
         Ok(ids.into_iter())
     }
 
     fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        self.refresh();
+        let _ = self.refresh();
         self.store.lock().expect("store mutex").head(id)
     }
 
@@ -1118,26 +1231,26 @@ where
         let mut store = self.store.lock().expect("store mutex");
         let result = store.update(id, old, new.clone())?;
         if let PushResult::Success() = &result {
-            if let Some(head) = new {
+            if let Some(metadata_head) = new {
                 // Refresh the snapshot served by the network thread
                 // BEFORE gossiping — see `refresh` Phase 2 for the
                 // ordering rationale.
                 if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
                     self.sender.update_snapshot(snap);
                 }
-                // Tracking branches are local mirror state and must NOT be
+                // Tracking pins are local mirror state and must NOT be
                 // re-gossiped — otherwise the publisher would receive its
-                // own tracking branch back and create a tracking-of-the-
-                // tracking, ad infinitum. Same logic for policy branches
+                // own tracking pin back and create tracking-of-tracking,
+                // ad infinitum. Same logic for policy pins
                 // (renewal state, pending requests, per-team-cap pins) —
                 // they're per-peer local state.
-                if !crate::tracking::is_tracking_pin(&mut *store, id)
-                    && !crate::policy::is_local_only_pin(&mut *store, id)
+                if is_legacy_pin_metadata(&mut *store, id, metadata_head)
                     && self.direction != SyncDirection::ReadOnly
                 {
-                    let bid_bytes: [u8; 16] = id.into();
-                    self.sender.gossip(bid_bytes, head.raw);
-                    self.last_branches.insert(id, head.raw);
+                    let pin_bytes: [u8; 16] = id.into();
+                    self.sender.gossip_legacy_head(pin_bytes, metadata_head.raw);
+                    self.last_legacy_metadata_heads
+                        .insert(id, metadata_head.raw);
                 }
             }
         }
@@ -1145,41 +1258,87 @@ where
     }
 }
 
-/// Read the branch name from a branch metadata blob. Tries `metadata::name`
-/// first (normal branches) and falls back to `remote_name` (tracking
-/// branches mirrored from a remote peer).
-fn read_remote_name<S: BlobStore>(
+/// Return the current head only when `pin_id` is positively identifiable as a
+/// legacy mutable pin carrying the old pin-metadata schema.
+///
+/// Generic [`PinStore`] entries are local retention or bookkeeping primitives,
+/// not an implicit replication surface. An eligible legacy pin must have a readable
+/// metadata blob with exactly one `metadata::name` on the unique entity scoped
+/// to the pin id, and must not carry a tracking or local-policy marker.
+fn legacy_pin_metadata_head<S: BlobStore + PinStore>(
     store: &mut S,
-    head_hash: &RawHash,
-    remote_id: Id,
+    pin_id: Id,
+) -> Option<Inline<Handle<SimpleArchive>>> {
+    let metadata_head = store.head(pin_id).ok().flatten()?;
+    is_legacy_pin_metadata(store, pin_id, metadata_head).then_some(metadata_head)
+}
+
+fn is_legacy_pin_metadata<S: BlobStore>(
+    store: &mut S,
+    pin_id: Id,
+    metadata_head: Inline<Handle<SimpleArchive>>,
+) -> bool {
+    use triblespace_core::blob::encodings::longstring::LongString;
+    use triblespace_core::macros::{find, pattern};
+
+    let Ok(reader) = store.reader() else {
+        return false;
+    };
+    let Ok(meta): Result<triblespace_core::trible::TribleSet, _> = reader.get(metadata_head) else {
+        return false;
+    };
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, pin_id) else {
+        return false;
+    };
+    let is_tracking = find!(
+        remote: Id,
+        pattern!(&meta, [{ branch_entity @ crate::tracking::tracking_remote_pin: ?remote }])
+    )
+    .next()
+    .is_some();
+    let is_local_only = find!(
+        kind: Id,
+        pattern!(&meta, [{ _?marker @ crate::policy::local_only_pin: ?kind }])
+    )
+    .next()
+    .is_some();
+    if is_tracking || is_local_only {
+        return false;
+    }
+    let mut names = find!(
+        name: Inline<Handle<LongString>>,
+        pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?name }])
+    );
+    matches!((names.next(), names.next()), (Some(_), None))
+}
+
+/// Read the display name from a positively identified legacy pin-metadata head.
+///
+/// Local tracking pins carry `remote_name`, but accepting that marker here
+/// would create tracking-of-tracking across mixed-version peers. Only the
+/// original legacy pin-metadata schema (`metadata::name`) is transport-eligible.
+fn read_legacy_pin_name<S: BlobStore>(
+    store: &mut S,
+    metadata_head_hash: &RawHash,
+    remote_pin_id: Id,
 ) -> Option<String> {
     use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::repo::BlobStoreGet;
 
     let reader = store.reader().ok()?;
-    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*head_hash);
+    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*metadata_head_hash);
     let meta: triblespace_core::trible::TribleSet = reader.get(meta_handle).ok()?;
-    let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, remote_id).ok()?;
+    let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, remote_pin_id).ok()?;
 
     let mut names = find!(
         h: Inline<Handle<LongString>>,
         pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?h }])
     );
     let name_handle = match (names.next(), names.next()) {
-        (Some(name), None) => Some(name),
-        (None, None) => {
-            let mut remote_names = find!(
-            h: Inline<Handle<LongString>>,
-                pattern!(&meta, [{ branch_entity @ crate::tracking::remote_name: ?h }])
-            );
-            match (remote_names.next(), remote_names.next()) {
-                (Some(name), None) => Some(name),
-                _ => None,
-            }
-        }
-        _ => None,
-    }?;
+        (Some(name), None) => name,
+        _ => return None,
+    };
 
     let name_view: anybytes::View<str> = reader.get(name_handle).ok()?;
     Some(name_view.as_ref().to_string())
@@ -1382,6 +1541,20 @@ where
     }
 }
 
+impl<L> PartialCommitDag for PeerReader<L>
+where
+    L: PartialCommitDag,
+{
+    type Error = L::Error;
+
+    fn parents(
+        &mut self,
+        commit: Inline<Handle<SimpleArchive>>,
+    ) -> Result<ParentLookup, Self::Error> {
+        self.local.parents(commit)
+    }
+}
+
 // Conservative reference discovery works through the local `get`: the
 // default scan checks each 32-byte chunk against the store snapshot,
 // which — post-fetch — also holds any weak-pinned lazily-landed blobs.
@@ -1451,5 +1624,235 @@ where
                 .try_from_blob()
                 .map_err(PeerReaderGetError::Conversion)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::blob::IntoBlob;
+    use triblespace_core::blob::encodings::longstring::LongString;
+    use triblespace_core::id::Id;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::trible::TribleSet;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("injected put failure")]
+    struct InjectedPutError;
+
+    #[derive(Default)]
+    struct FailingPutRepo {
+        inner: MemoryRepo,
+    }
+
+    impl BlobStorePut for FailingPutRepo {
+        type PutError = InjectedPutError;
+
+        fn put<S, T>(&mut self, _item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            Err(InjectedPutError)
+        }
+    }
+
+    impl BlobStore for FailingPutRepo {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.inner.reader()
+        }
+    }
+
+    impl PinStore for FailingPutRepo {
+        type PinsError = <MemoryRepo as PinStore>::PinsError;
+        type HeadError = <MemoryRepo as PinStore>::HeadError;
+        type UpdateError = <MemoryRepo as PinStore>::UpdateError;
+        type ListIter<'a> = <MemoryRepo as PinStore>::ListIter<'a>;
+
+        fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
+            self.inner.pins()
+        }
+
+        fn head(
+            &mut self,
+            id: Id,
+        ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
+            self.inner.head(id)
+        }
+
+        fn update(
+            &mut self,
+            id: Id,
+            old: Option<Inline<Handle<SimpleArchive>>>,
+            new: Option<Inline<Handle<SimpleArchive>>>,
+        ) -> Result<PushResult, Self::UpdateError> {
+            self.inner.update(id, old, new)
+        }
+    }
+
+    impl WeakPinStore for FailingPutRepo {
+        type WeakPinError = <MemoryRepo as WeakPinStore>::WeakPinError;
+        type WeakListIter<'a> = <MemoryRepo as WeakPinStore>::WeakListIter<'a>;
+
+        fn pin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.pin_weak(handle)
+        }
+
+        fn unpin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.unpin_weak(handle)
+        }
+
+        fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError> {
+            self.inner.weak_pins()
+        }
+    }
+
+    impl StorageFlush for FailingPutRepo {
+        type Error = <MemoryRepo as StorageFlush>::Error;
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn incoming_blob_failure_is_sticky_and_blocks_the_following_head() {
+        let signing_key = SigningKey::from_bytes(&[6; 32]);
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            FailingPutRepo::default(),
+            signing_key.clone(),
+            SyncDirection::Bidirectional,
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+
+        wiring
+            .evt_tx
+            .send(NetEvent::Blob(Bytes::from(b"fetched blob".to_vec())))
+            .unwrap();
+        wiring
+            .evt_tx
+            .send(NetEvent::LegacyHead {
+                pin: [1; 16],
+                metadata_head: [2; 32],
+                publisher: signing_key.verifying_key().to_bytes(),
+            })
+            .unwrap();
+
+        let first = peer.refresh().unwrap_err();
+        assert_eq!(first.operation(), "persist incoming fetched blob");
+        assert_eq!(peer.refresh().unwrap_err(), first);
+        assert!(
+            peer.store.lock().unwrap().inner.pins.is_empty(),
+            "the later HEAD must not materialize after a fetched-blob write failed"
+        );
+    }
+
+    #[test]
+    fn write_only_discards_data_events_but_absorbs_cap_requests() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let requester = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            signing_key.clone(),
+            SyncDirection::WriteOnly,
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+
+        let ignored = Bytes::from(b"incoming data must be ignored".to_vec());
+        let ignored_handle = Blob::<UnknownBlob>::new(ignored.clone()).get_handle();
+        wiring
+            .evt_tx
+            .send(NetEvent::Blob(ignored))
+            .expect("event channel open");
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: requester.to_bytes(),
+                partial_cap_bytes: Bytes::from(b"partial capability".to_vec()),
+            })
+            .expect("event channel open");
+
+        peer.refresh().unwrap();
+
+        let mut store = peer.store.lock().expect("store mutex");
+        let reader = store.reader().expect("memory reader");
+        assert!(
+            reader.get::<Bytes, UnknownBlob>(ignored_handle).is_err(),
+            "write-only peers must not materialize incoming blob events"
+        );
+        let pending = crate::policy::list_pending_requests(&mut *store);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].requester, requester);
+    }
+
+    #[test]
+    fn generic_local_pins_are_not_gossiped_as_legacy_heads() {
+        let signing_key = SigningKey::from_bytes(&[9; 32]);
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            signing_key.clone(),
+            SyncDirection::Bidirectional,
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+
+        let generic_id = Id::new([1; 16]).unwrap();
+        let generic_head = peer
+            .put::<SimpleArchive, _>(TribleSet::new())
+            .expect("store generic pin value");
+        while wiring.cmd_rx.try_recv().is_ok() {}
+        peer.update(generic_id, None, Some(generic_head))
+            .expect("update generic pin");
+        assert!(
+            wiring.cmd_rx.try_iter().all(|command| !matches!(
+                command,
+                crate::channel::NetCommand::GossipLegacyHead { .. }
+            )),
+            "generic local pins must not become legacy gossip roots"
+        );
+
+        let legacy_pin_id = Id::new([2; 16]).unwrap();
+        let name: Inline<Handle<LongString>> = peer
+            .put("main".to_owned().to_blob())
+            .expect("store legacy pin name");
+        let metadata = triblespace_core::repo::branch::branch_unsigned(legacy_pin_id, name, None);
+        let metadata_head = peer.put(metadata).expect("store legacy pin metadata");
+        while wiring.cmd_rx.try_recv().is_ok() {}
+        peer.update(legacy_pin_id, None, Some(metadata_head))
+            .expect("update legacy pin");
+        assert!(wiring.cmd_rx.try_iter().any(|command| {
+            matches!(
+                command,
+                crate::channel::NetCommand::GossipLegacyHead { pin, metadata_head: observed }
+                    if pin == <[u8; 16]>::from(legacy_pin_id) && observed == metadata_head.raw
+            )
+        }));
     }
 }

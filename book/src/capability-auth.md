@@ -4,8 +4,8 @@ The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/
 crate ships a chain-of-trust capability system on top of iroh's
 TLS-verified peer identities. Every connection on the
 `/triblespace/pile-sync/4` ALPN must present a capability before any
-other op is served. This chapter explains the team model, the CLI
-lifecycle, and the two-tier scope gate the relay enforces.
+other op is served. This chapter explains the team model, the CLI lifecycle,
+and the blob-reachability scope gate the relay enforces.
 
 For the design rationale (single team root vs multi-root web-of-trust,
 sign-the-bytes convention, embedded parent sig optimisation), see the
@@ -35,10 +35,10 @@ Each capability is two blobs stored in the pile:
   blob) plus `repo::signed_by` + `signature_r` + `signature_s`,
   reusing the existing commit-signature attribute conventions.
 
-Signatures attest to the cap blob's canonical bytes (matching how
-`Workspace::commit` signs commit metadata), not to a hash of those
-bytes — keeping signatures hash-agnostic across any future change to
-the handle scheme.
+Signatures attest directly to the cap blob's canonical bytes, not to its handle.
+This differs from repository commit signatures, which attest to the commit's
+content blob bytes; both remain hash-agnostic across future handle-scheme
+changes.
 
 Non-root caps embed their parent's signature inline as a sub-entity
 within the cap blob (`cap_embedded_parent_sig`). This halves cold-cache
@@ -61,11 +61,13 @@ trible team create --pile PATH [--key KEY_PATH]
 
 trible team invite --pile PATH --team-root HEX --cap HEX --key ISSUER
                    --invitee HEX --scope (read|write|admin)
-                   [--branch HEX]...
+                   [--legacy-pin HEX]...
     Issue a sub-capability to another peer. ISSUER must hold a cap
     that subsumes the requested scope. The invitee's pubkey appears
     on its own (use `trible pile net identity` on the invitee's
-    machine to print it). Prints the invitee's cap-sig handle.
+    machine to print it). `--legacy-pin` restricts only the current blob
+    RPC's mutable-pin roots; it cannot name a StrongPin branch. Prints the
+    invitee's cap-sig handle.
 
 trible team request-join --admin HEX --scope (read|write|admin)
                          [--key PATH] [--pile PATH]
@@ -149,6 +151,14 @@ $ TRIBLE_TEAM_ROOT=1a8a6a9d... \
   trible pile net sync /path/to/their.pile --peers <founder-id>
 ```
 
+The current protocol does **not** yet provide a bootstrap-safe transfer for a
+capability chain that the verifier does not already hold. Ordinary authenticated
+blob RPC cannot solve that circular dependency, and branch-restricted caps do
+not make orphan cap/sig blobs reachable. Deployments must pre-seed the required
+verification chains on serving peers for now; a narrowly scoped pre-auth chain
+presentation protocol remains required before this flow is turnkey from two
+cold piles.
+
 Without those env vars the peer falls back to a single-user
 team-of-one (`team_root = signing_key.verifying_key()`), which means
 only their own caps will pass — useful for solo workflows but rejects
@@ -158,13 +168,15 @@ every other peer's cap.
 
 Protocol v4 (`/triblespace/pile-sync/4`) makes auth mandatory:
 
-| Op            | Byte | Meaning                                 |
-|---------------|------|-----------------------------------------|
-| `OP_LIST`     | 0x01 | List all branches and heads             |
-| `OP_GET_BLOB` | 0x02 | Fetch one blob by hash                  |
-| `OP_CHILDREN` | 0x03 | List blob hashes referenced by a parent |
-| `OP_HEAD`     | 0x04 | Head hash of one branch                 |
-| `OP_AUTH`     | 0x05 | Present a capability sig handle         |
+| Op            | Byte | Meaning                                  |
+|---------------|------|------------------------------------------|
+| `OP_GET_BLOB` | 0x02 | Fetch one in-scope blob by hash          |
+| `OP_CHILDREN` | 0x03 | List in-scope child hashes of one parent |
+| `OP_AUTH`     | 0x05 | Present a capability signature handle    |
+
+Bytes `0x01` and `0x04` belonged to the retired `OP_LIST` and `OP_HEAD`
+operations. Protocol v4 has no branch-list or branch-head RPC and no remote
+write operation. It is an authenticated, read-only content protocol.
 
 The **first stream** on every connection must be `OP_AUTH`. The server
 fetches the referenced sig blob, walks back to the team root through
@@ -173,11 +185,12 @@ embedded parent sigs and `cap_parent` handles, and either accepts
 streams on the same connection inherit that verified capability for
 the lifetime of the connection — there's no per-stream re-auth.
 
-Streams sent before OP_AUTH or after AUTH_REJECTED are silently
-closed. The server doesn't leak a "you sent the wrong thing" error
-back to the client.
+If the first stream is not `OP_AUTH`, or its capability is rejected, the
+server closes the connection. A later `OP_AUTH` cannot replace the verified
+connection identity: that stream receives `AUTH_REJECTED`, while the existing
+authenticated connection state remains unchanged.
 
-## Two-Tier Scope Gate
+## Current Blob Scope Gate
 
 Capabilities encode their scope as tribles hung off `cap_scope_root`:
 
@@ -187,25 +200,19 @@ Capabilities encode their scope as tribles hung off `cap_scope_root`:
   permission to a specific branch. An empty branch-restriction set
   means "all branches".
 
-The relay enforces scope at two levels:
+`scope_branch` currently carries a legacy 16-byte mutable-pin id. It cannot
+name an exact StrongPin `(author key, name handle)` identity and must not be
+used as authorization for signed-assertion ingest. The assertion-replication
+milestone therefore includes a new exact-identity scope schema (or an explicit
+intentionally broader policy).
 
-### Branch level (`OP_LIST`, `OP_HEAD`)
-
-`VerifiedCapability::grants_read_on(branch)` filters which branches
-the peer can see. Out-of-scope branches are silently dropped from
-`OP_LIST` responses; `OP_HEAD` for an out-of-scope branch returns
-`NIL_HASH` (indistinguishable from "branch doesn't exist", as far as
-the wire is concerned).
-
-### Blob level (`OP_GET_BLOB`, `OP_CHILDREN`)
-
-A peer with branch-X-only scope could otherwise circumvent the branch
-gate by guessing or probing raw blob hashes from branch Y. The
-blob-level gate closes that hole: a hash is in scope only if it's
-reachable (via 32-byte child chunks) from at least one branch head the
-cap grants read on. Out-of-scope blobs surface as `None` (length =
-`u64::MAX`) on `OP_GET_BLOB`; `OP_CHILDREN` filters its returned list
-to in-scope hashes only.
+For the current read-only RPCs, a branch-restricted capability limits blob
+access by reachability from the matching legacy mutable-pin roots in the
+server's local snapshot. Guessing a hash outside those reachable sets does not
+bypass the restriction: `OP_GET_BLOB` returns the missing sentinel and
+`OP_CHILDREN` filters out-of-scope hashes. `OP_LIST` and `OP_HEAD` no longer
+exist, so those root ids are not themselves enumerated through the ALPN
+protocol.
 
 Unrestricted caps (`granted_branches() == None` — no `scope_branch`
 tribles) short-circuit to "every present blob is in scope".
@@ -213,8 +220,14 @@ tribles) short-circuit to "every present blob is in scope".
 Permission semantics mirror `scope_subsumes`: `PERM_WRITE` and
 `PERM_ADMIN` imply `PERM_READ`; `PERM_ADMIN` is required to delegate
 sub-capabilities. The reachability scan is recomputed per request
-today; per-stream caching is a future optimisation for
-chain-walk-heavy workloads.
+today; per-stream caching is a future optimisation for chain-walk-heavy
+workloads.
+
+Legacy HEAD gossip is a separate migration bridge. Its in-frame `publisher`
+bytes are a routing hint, not a verified StrongPin author signature, and the
+frame is not an assertion-admission decision. Receivers may retain the fetched
+observation as a local tracking pin, but `pile net sync` never turns it into a
+locally signed assertion automatically.
 
 ## Eviction
 
@@ -242,10 +255,10 @@ several real wins:
   required the team root SECRET to sign. Now the root SECRET lives
   in cold storage; every day-to-day operation (invite, approve,
   retract) uses a regular admin cap.
-- **Monotonic gossip.** The wire protocol no longer has to gossip
-  revocation blobs as a special category that has to land *before*
-  the affected cap is verified. Caps and renewals are first-class
-  blobs; everything else is local issuer policy.
+- **No distributed revocation ordering.** Transport no longer has to deliver a
+  revocation blob *before* an affected cap is verified. Approved capabilities
+  and renewals travel through the direct auth-handshake path; everything else
+  is local issuer policy.
 
 The trade-off: there's no way to immediately invalidate a
 compromised key network-wide. The mitigation is to keep natural
@@ -264,15 +277,16 @@ keeping renewed; `team retract --entry HEX` removes one.
 ## `PeerConfig` Surface
 
 ```rust,ignore
-use triblespace::net::peer::{Peer, PeerConfig};
+use triblespace::net::peer::{Peer, PeerConfig, SyncDirection};
 
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
-    peers: vec![bootstrap_endpoint_id],
-    gossip: true,                           // false = pull/serve-only
+    peers: vec![bootstrap_endpoint_addr],
+    gossip: true,                           // legacy HEAD observation mesh
     team_root: team_root_pubkey,            // 32 bytes — the team's CA AND
                                             // the gossip mesh id when gossip=true
     self_cap: my_own_cap_sig_handle,        // what we present on OP_AUTH
+    direction: SyncDirection::Bidirectional,
 });
 ```
 
@@ -290,5 +304,5 @@ For a hosted relay running for a team, the operator only needs:
   config)
 
 That's it. No per-user accounts, no shared secrets, no team
-configuration database. Caps live in the pile alongside everything
-else and gossip propagates them naturally.
+configuration database. Caps live in the pile alongside everything else;
+approval and renewal deliver them directly over the auth-handshake ALPN.

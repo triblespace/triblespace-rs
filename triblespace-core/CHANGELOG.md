@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crash-durability barrier.
 - `MemoryRepo::branches` is renamed to `pins`; mutable cells are no longer
   presented as content-branch authority even in test storage.
+- The public raw-pile vocabulary now exposes historical mutable records as
+  `PileRecordContent::{Pin, PinTombstone}` and `PilePinStoreIter`. Existing wire
+  markers and bytes remain unchanged; only the misleading public names are
+  removed.
 
 ## [0.41.4] - 2026-05-17
 

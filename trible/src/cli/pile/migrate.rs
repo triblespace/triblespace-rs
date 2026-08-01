@@ -1,12 +1,9 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use triblespace::prelude::*;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::BlobStoreMeta;
 use triblespace_core::repo::PushResult;
 use triblespace_core::trible::TribleSet;
 
@@ -40,27 +37,19 @@ pub enum Command {
         /// Show what would change without mutating the pile.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-        /// Do not rename duplicate branches (useful for forensic inspection).
-        #[arg(long, default_value_t = false)]
-        no_rename_duplicates: bool,
     },
 }
 
 pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
     match cmd {
         Command::List => list_migrations(&pile_path),
-        Command::Run {
-            migration,
-            dry_run,
-            no_rename_duplicates,
-        } => {
-            let rename_duplicates = !no_rename_duplicates;
+        Command::Run { migration, dry_run } => {
             match migration {
                 None => {
-                    migrate_branch_metadata_name(&pile_path, dry_run, rename_duplicates)?;
+                    migrate_branch_metadata_name(&pile_path, dry_run)?;
                 }
                 Some(Migration::BranchMetadataName) => {
-                    migrate_branch_metadata_name(&pile_path, dry_run, rename_duplicates)?;
+                    migrate_branch_metadata_name(&pile_path, dry_run)?;
                 }
             }
             Ok(())
@@ -78,7 +67,6 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
         // it can so the report never implies a repair it will not perform.
         let mut indeterminate_name = 0usize;
         let mut unreadable_meta = 0usize;
-        let mut duplicate_names: HashMap<String, usize> = HashMap::new();
 
         for bid in pile.pins().context("list branches")? {
             let bid = bid.context("branch id")?;
@@ -116,15 +104,7 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
                     indeterminate_name += 1;
                 }
             }
-
-            if let Some(name) =
-                load_branch_name(&reader, &meta, bid).context("decode branch name")?
-            {
-                *duplicate_names.entry(name).or_insert(0) += 1;
-            }
         }
-
-        let duplicates = duplicate_names.values().filter(|v| **v > 1).count();
 
         println!("Known migrations:");
         if missing_name == 0 {
@@ -139,15 +119,10 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
         } else {
             println!("- branch-metadata-name: needed ({missing_name} branch(es))");
         }
-        if duplicates > 0 {
-            println!(
-                "  note: {duplicates} duplicate branch name(s) detected (run migration to auto-rename)"
-            );
-        }
         // Reported separately from `missing_name` because these are NOT
-        // fixed by running the migration — they need `pile reid` or metadata
-        // repair. Folding them into the migratable count would promise a
-        // repair that does not happen.
+        // fixed by running the migration — they require manual metadata
+        // repair or a deliberate generation rewrite. Folding them into the
+        // migratable count would promise a repair that does not happen.
         if indeterminate_name > 0 {
             println!(
                 "  warning: {indeterminate_name} branch(es) have no determinable name \
@@ -174,16 +149,10 @@ struct BranchInfo {
     branch_id: Id,
     meta_handle: BranchMetaHandle,
     meta_entity: Id,
-    name: Option<String>,
-    has_head: bool,
     meta: TribleSet,
 }
 
-fn migrate_branch_metadata_name(
-    pile_path: &PathBuf,
-    dry_run: bool,
-    rename_duplicates: bool,
-) -> Result<()> {
+fn migrate_branch_metadata_name(pile_path: &PathBuf, dry_run: bool) -> Result<()> {
     // The migration rewrites this pile in place, but opening it must still be
     // fail-loud: a corrupt tail is amputated explicitly (`trible pile amputate`),
     // never as a silent side effect of running a migration.
@@ -211,24 +180,10 @@ fn migrate_branch_metadata_name(
                 continue;
             };
 
-            let head_count = find!(
-                head: BranchMetaHandle,
-                pattern!(&meta, [{ meta_entity @ triblespace_core::repo::head: ?head }])
-            )
-            .count();
-            // Name migration is orthogonal to head repair. Preserve every
-            // scoped head fact byte-for-byte; `has_head` is only a preference
-            // when choosing which duplicate name to keep.
-            let has_head = head_count >= 1;
-
-            let name = load_branch_name(&reader, &meta, bid).context("decode branch name")?;
-
             branches.push(BranchInfo {
                 branch_id: bid,
                 meta_handle,
                 meta_entity,
-                name,
-                has_head,
                 meta,
             });
         }
@@ -274,7 +229,6 @@ fn migrate_branch_metadata_name(
                 PushResult::Success() => {
                     info.meta_handle = new_meta_handle;
                     info.meta = new_meta;
-                    info.name = Some(legacy_name);
                     migrated += 1;
                 }
                 PushResult::Conflict(_) => {
@@ -286,19 +240,10 @@ fn migrate_branch_metadata_name(
             }
         }
 
-        let mut renamed = 0usize;
-        if rename_duplicates {
-            renamed =
-                rename_duplicate_branch_names(&mut pile, &branches, dry_run).context("dedupe")?;
-        }
-
         if dry_run {
             println!("Dry run complete.");
         } else {
             println!("Migrated {migrated} branch metadata blobs.");
-            if rename_duplicates {
-                println!("Renamed {renamed} duplicate branch(es).");
-            }
         }
         Ok(())
     })();
@@ -336,32 +281,6 @@ fn legacy_branch_name(meta: &TribleSet, branch_id: Id) -> Result<Option<String>>
     Ok(Some(name))
 }
 
-fn load_branch_name(
-    reader: &impl BlobStoreGet,
-    meta: &TribleSet,
-    branch_id: Id,
-) -> Result<Option<String>> {
-    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, branch_id) else {
-        return Ok(None);
-    };
-    let mut names = find!(
-        handle: NameHandle,
-        pattern!(meta, [{ branch_entity @ triblespace_core::metadata::name: ?handle }])
-    );
-
-    let Some(handle) = names.next() else {
-        return legacy_branch_name(meta, branch_id);
-    };
-    if names.next().is_some() {
-        return Ok(None);
-    }
-
-    let view: View<str> = reader
-        .get(handle)
-        .map_err(|err| anyhow!("read branch name blob: {err:?}"))?;
-    Ok(Some(view.as_ref().to_string()))
-}
-
 fn rewrite_branch_meta(meta: &TribleSet, meta_entity: Id, name_handle: NameHandle) -> TribleSet {
     let mut out = TribleSet::new();
     let name_attr = triblespace_core::metadata::name.id();
@@ -376,105 +295,55 @@ fn rewrite_branch_meta(meta: &TribleSet, meta_entity: Id, name_handle: NameHandl
     out
 }
 
-fn rename_duplicate_branch_names(
-    pile: &mut Pile,
-    branches: &[BranchInfo],
-    dry_run: bool,
-) -> Result<usize> {
-    let mut by_name: HashMap<&str, Vec<&BranchInfo>> = HashMap::new();
-    for info in branches {
-        let Some(name) = info.name.as_deref() else {
-            continue;
-        };
-        by_name.entry(name).or_default().push(info);
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let reader = pile.reader().context("pile reader")?;
+    #[test]
+    fn name_migration_preserves_duplicate_legacy_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicates.pile");
+        std::fs::File::create(&path).unwrap();
+        let pins = [Id::new([1; 16]).unwrap(), Id::new([2; 16]).unwrap()];
 
-    let mut renamed = 0usize;
-    for (name, items) in by_name {
-        if items.len() < 2 {
-            continue;
-        }
-
-        // Choose the canonical branch to keep the name. Prefer non-empty branches
-        // (those with a commit head), then prefer the most recently updated branch
-        // metadata blob as a stable tie-breaker.
-        let mut best: Option<(&BranchInfo, u64)> = None;
-        for info in &items {
-            let ts = reader
-                .metadata(info.meta_handle)
-                .ok()
-                .flatten()
-                .map(|m| m.timestamp)
-                .unwrap_or(0);
-            match best {
-                None => best = Some((info, ts)),
-                Some((cur, cur_ts)) => {
-                    let better = match (cur.has_head, info.has_head) {
-                        (false, true) => true,
-                        (true, false) => false,
-                        _ => ts > cur_ts,
-                    };
-                    if better {
-                        best = Some((info, ts));
-                    }
-                }
+        let mut pile = Pile::open(&path).unwrap();
+        for pin in pins {
+            let subject = triblespace_core::id::genid();
+            let metadata: TribleSet = entity! {
+                triblespace_core::id::ExclusiveId::force_ref(&subject) @
+                triblespace_core::repo::branch: pin,
+                legacy_branch_metadata::legacy_name: "main".to_owned(),
             }
+            .into();
+            let head = pile.put(metadata).unwrap();
+            assert!(matches!(
+                pile.update(pin, None, Some(head)).unwrap(),
+                PushResult::Success()
+            ));
         }
-        let Some((canonical, _)) = best else {
-            continue;
-        };
+        pile.close().unwrap();
 
-        for orphan in items
+        migrate_branch_metadata_name(&path, false).unwrap();
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.refresh().unwrap();
+        let heads: Vec<_> = pins
             .into_iter()
-            .filter(|i| i.branch_id != canonical.branch_id)
-        {
-            let suffix = format!("{:X}", orphan.branch_id);
-            let prefix_len = 8.min(suffix.len());
-            let new_name = format!("{name}--orphan-{}", &suffix[..prefix_len]);
-
-            if dry_run {
-                println!(
-                    "Would rename duplicate branch {:X} {name:?} -> {new_name:?} (kept {:X})",
-                    orphan.branch_id, canonical.branch_id
-                );
-                continue;
-            }
-
-            let name_handle: NameHandle = pile
-                .put::<blobencodings::LongString, _>(new_name.clone())
-                .context("store renamed branch name blob")?;
-
-            let meta: TribleSet = reader
-                .get::<TribleSet, blobencodings::SimpleArchive>(orphan.meta_handle)
-                .context("read duplicate branch metadata")?;
-
-            let new_meta = rewrite_branch_meta(&meta, orphan.meta_entity, name_handle);
-            let new_meta_handle: BranchMetaHandle = pile
-                .put(new_meta.clone())
-                .context("store renamed branch metadata")?;
-
-            match pile
-                .update(
-                    orphan.branch_id,
-                    Some(orphan.meta_handle),
-                    Some(new_meta_handle),
-                )
-                .map_err(|e| anyhow!("update branch {:X}: {e:?}", orphan.branch_id))?
-            {
-                PushResult::Success() => {
-                    renamed += 1;
-                }
-                PushResult::Conflict(_) => {
-                    anyhow::bail!(
-                        "branch {:X} advanced concurrently while renaming; rerun migration",
-                        orphan.branch_id
-                    );
-                }
-            }
+            .map(|pin| (pin, pile.head(pin).unwrap().unwrap()))
+            .collect();
+        let reader = pile.reader().unwrap();
+        for (pin, head) in heads {
+            let metadata: TribleSet = reader.get(head).unwrap();
+            let subject = triblespace_core::repo::branch::branch_entity(&metadata, pin).unwrap();
+            let mut names = find!(
+                name: NameHandle,
+                pattern!(&metadata, [{ subject @ triblespace_core::metadata::name: ?name }])
+            );
+            let name: View<str> = reader.get(names.next().unwrap()).unwrap();
+            assert_eq!(name.as_ref(), "main");
+            assert!(names.next().is_none());
         }
+        drop(reader);
+        pile.close().unwrap();
     }
-
-    Ok(renamed)
 }

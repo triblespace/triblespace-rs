@@ -2,14 +2,14 @@ use anyhow::Result;
 use clap::Parser;
 
 pub mod blob;
-pub mod branch;
+pub mod pin;
 
 #[derive(Parser)]
 pub enum StoreCommand {
-    /// Operations on branches stored in a remote object store.
-    Branch {
+    /// Operations on mutable legacy pins stored in an object store.
+    Pin {
         #[command(subcommand)]
-        cmd: branch::Command,
+        cmd: pin::Command,
     },
     /// Operations on blobs stored in a remote object store.
     Blob {
@@ -20,7 +20,7 @@ pub enum StoreCommand {
 
 pub fn run(cmd: StoreCommand) -> Result<()> {
     match cmd {
-        StoreCommand::Branch { cmd } => branch::run(cmd),
+        StoreCommand::Pin { cmd } => pin::run(cmd),
         StoreCommand::Blob { cmd } => blob::run(cmd),
     }
 }

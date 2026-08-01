@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The pile branch CLI now mirrors StrongPin directly.** Exact
+  `ed25519:<author>/blake3:<name-handle>` descriptors replace truncated branch
+  ids and human names as selectors. The surface is reduced to durable
+  single-assertion publication, deterministic list/show/candidate-rooted log observation, and
+  an explicit source-to-destination local `forget` rewrite. Mutable create,
+  set, rename, delete, reflog, consolidation, merge-import, and the legacy
+  top-level merge/extract/re-id/squash rewrites are removed rather than kept as
+  compatibility paths.
+- **`trible pile create` is now durable and no-clobber.** Creating a pile
+  refuses an existing pathname instead of truncating an append-only generation,
+  synchronizes the new inode and its containing directory, and accepts a plain
+  relative filename without treating its empty parent component as a directory.
+  Missing parent directories are rejected instead of being created through an
+  incompletely durable multi-directory side effect.
+- **Remote mutable cells are exposed only as local pins.** The misleading
+  `store branch` surface is replaced by `store pin list`; direct object-store
+  StrongPin assertions remain unavailable until a backend can meet coherent
+  snapshot and durable-append contracts.
+- **Legacy network observations are no longer auto-authored.** `pile net sync`
+  may retain scalar HEAD gossip as publisher-scoped local tracking pins, but it
+  never converts those unauthenticated observations into locally signed branch
+  assertions. Assertion replication and foreign-author admission remain an
+  explicit future protocol boundary.
+- **Bounded network sync now fails loud and closes durably.** `pile net sync`
+  validates the complete pile before starting transport and consumes the
+  `Peer<Pile>` through `Pile::close` on every normal return, surfacing a corrupt
+  tail, incoming persistence failure, or final flush failure instead of
+  silently succeeding. Ctrl-C uses the same orderly close path, and malformed
+  explicit peer ids are rejected rather than silently dropped.
+- **Capability CLI wording no longer aliases legacy pins with StrongPin
+  branches.** `team invite --legacy-pin` replaces `--branch`, and audit output
+  labels those 16-byte `scope_branch` values as `legacy-pins`; they restrict the
+  current blob RPC only and cannot select `(author, name-handle)` authority.
+- **The legacy name-schema migration no longer renames duplicate names.** It
+  performs only the requested ShortString-to-LongString attribute migration;
+  duplicate presentation names are not an ambiguity in the StrongPin model and
+  no longer trigger a hidden destructive rewrite.
+
 ## [0.41.4] - 2026-05-17
 
 ### Fixed

@@ -1,19 +1,18 @@
-//! Two-peer convergence properties, exercised deterministically without
-//! the iroh transport in the loop. "Gossip" is simulated by copying
-//! blobs directly between two independent `Repository<MemoryRepo>`
-//! instances and hand-creating tracking branches — the interesting bit
-//! is what `merge_tracking_into_local` does on each side, which is
-//! where the distributed sync design actually lives.
+//! Two-peer local-acceptance properties, exercised deterministically without
+//! a replication protocol. Blobs are copied directly between independent
+//! `Repository<MemoryRepo>` instances and a local tracking pin is pointed at
+//! the copied commit. The tests cover `merge_tracking_into_local`; they do not
+//! pretend that legacy scalar-HEAD gossip replicates StrongPin assertions.
 //!
-//! Key property documented here: **sequential gossip converges in one
-//! round-pair.** When peers see each other's states one-at-a-time
-//! (the realistic gossip ordering), the first peer to merge produces a
+//! Key property documented here: **sequential acceptance converges in one
+//! round-pair.** When peers accept each other's states one-at-a-time, the
+//! first peer to merge produces a
 //! merge commit `AM` whose ancestry already contains the other peer's
 //! original commit. The second peer's sync then sees `AM` in its
-//! tracking branch, finds its own head (`commit_B`) already in
+//! local tracking pin, finds its own head (`commit_B`) already in
 //! `ancestors(AM)`, and fast-forwards. No second merge commit is needed.
 //!
-//! Second property exercised here: **parallel gossip merges converge in
+//! Second property exercised here: **parallel local merges converge in
 //! zero extra rounds.** Merge commits in triblespace are content-addressed:
 //! they carry no author-specific bits (no signature, no `created_at`, no
 //! random entity id), so two peers merging the same parent set produce
@@ -21,16 +20,20 @@
 //! scenarios that would have diverged in any centralized-signer system
 //! just… don't.
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace_core::blob::IntoBlob;
+use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::id::Id;
+use triblespace_core::id::{Id, genid};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::macros::entity;
 use triblespace_core::prelude::{BlobStore, PinStore};
+use triblespace_core::repo::branch_assertion::BranchIdentity;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, Repository};
+use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, PushResult, Repository};
 use triblespace_core::trible::TribleSet;
-use triblespace_net::tracking::{MergeOutcome, ensure_tracking_pin, merge_tracking_into_local};
+use triblespace_net::tracking::{self, MergeOutcome, merge_tracking_into_local};
 
 fn new_repo(seed: u8) -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
@@ -54,53 +57,61 @@ fn copy_all_blobs(src: &mut Repository<MemoryRepo>, dst: &mut Repository<MemoryR
     }
 }
 
-/// Return the hash of the branch-metadata blob that `repo`'s named
-/// branch currently points at. This is what a real gossip message would
-/// carry for that branch.
-fn remote_head_hash(repo: &mut Repository<MemoryRepo>, name: &str) -> [u8; 32] {
-    let branch_id = repo
-        .lookup_branch(name)
-        .expect("lookup branch")
-        .expect("branch exists");
-    repo.storage_mut()
-        .head(branch_id)
-        .expect("head")
-        .expect("branch has head")
-        .raw
+fn mirror_commit(
+    local: &mut Repository<MemoryRepo>,
+    remote_identity: BranchIdentity,
+    remote_commit: Inline<Handle<SimpleArchive>>,
+    branch_name: &str,
+    remote_publisher: [u8; 32],
+) -> Id {
+    let tracking_id = *genid();
+    let name_handle: Inline<Handle<LongString>> = local
+        .storage_mut()
+        .put(branch_name.to_owned().to_blob())
+        .unwrap();
+    let publisher = VerifyingKey::from_bytes(&remote_publisher).unwrap();
+    let meta: TribleSet = entity! {
+        triblespace_core::repo::branch: tracking_id,
+        triblespace_core::repo::head: remote_commit,
+        tracking::remote_name: name_handle,
+        tracking::tracking_remote_pin: remote_identity.id().entity(),
+        tracking::tracking_peer: publisher,
+    }
+    .into();
+    let meta_handle = local.storage_mut().put(meta).unwrap();
+    assert!(matches!(
+        local
+            .storage_mut()
+            .update(tracking_id, None, Some(meta_handle))
+            .unwrap(),
+        PushResult::Success()
+    ));
+    tracking_id
 }
 
-fn lookup_id(repo: &mut Repository<MemoryRepo>, name: &str) -> Id {
-    repo.lookup_branch(name).unwrap().unwrap()
-}
-
-/// Simulate one sync round from `remote` into `local`:
-/// - copy all of remote's blobs into local
-/// - ensure/update a tracking branch in local pointing at remote's HEAD
-/// - run `merge_tracking_into_local` on `local` for the named branch
+/// Simulate one local acceptance round from `remote` into `local`:
+/// copy the immutable blobs, create a local tracking pin over the exact remote
+/// identity's index plus commit, then merge into the local authored branch.
 fn sync_round(
     local: &mut Repository<MemoryRepo>,
     remote: &mut Repository<MemoryRepo>,
     branch_name: &str,
-    remote_publisher: &[u8; 32],
 ) -> MergeOutcome {
     copy_all_blobs(remote, local);
-    let remote_branch_id = lookup_id(remote, branch_name);
-    let remote_head = remote_head_hash(remote, branch_name);
-    let tracking_id = ensure_tracking_pin(
-        local.storage_mut(),
-        remote_branch_id,
-        &remote_head,
+    let remote_identity = remote.branch_identity(branch_name);
+    let remote_commit = head_commit(remote, branch_name);
+    let tracking_id = mirror_commit(
+        local,
+        remote_identity,
+        remote_commit,
         branch_name,
-        remote_publisher,
-        false,
-    )
-    .expect("ensure tracking");
+        remote.verifying_key().to_bytes(),
+    );
     merge_tracking_into_local(local, tracking_id, branch_name).expect("merge")
 }
 
 fn head_commit(repo: &mut Repository<MemoryRepo>, name: &str) -> Inline<Handle<SimpleArchive>> {
-    let id = lookup_id(repo, name);
-    let ws = repo.pull(id).unwrap();
+    let ws = repo.pull(repo.branch_identity(name)).unwrap();
     ws.head().expect("branch has head")
 }
 
@@ -108,19 +119,15 @@ fn head_commit(repo: &mut Repository<MemoryRepo>, name: &str) -> Inline<Handle<S
 fn sequential_sync_converges_under_divergent_commits() {
     let mut a = new_repo(0x0A);
     let mut b = new_repo(0x0B);
-    let pub_a = [0x0Au8; 32];
-    let pub_b = [0x0Bu8; 32];
 
     // Both peers independently commit to "main".
     {
-        let id = a.ensure_branch("main", None).unwrap();
-        let mut ws = a.pull(id).unwrap();
+        let mut ws = a.create_workspace("main").unwrap();
         ws.commit(TribleSet::new(), "A's commit");
         a.push(&mut ws).unwrap();
     }
     {
-        let id = b.ensure_branch("main", None).unwrap();
-        let mut ws = b.pull(id).unwrap();
+        let mut ws = b.create_workspace("main").unwrap();
         ws.commit(TribleSet::new(), "B's commit");
         b.push(&mut ws).unwrap();
     }
@@ -131,7 +138,7 @@ fn sequential_sync_converges_under_divergent_commits() {
 
     // First sync: A pulls B's commit, merges into A's local "main" →
     // produces a merge commit AM whose parents are (commit_A, commit_B).
-    let out_a = sync_round(&mut a, &mut b, "main", &pub_b);
+    let out_a = sync_round(&mut a, &mut b, "main");
     assert!(
         matches!(out_a, MergeOutcome::Merged { .. }),
         "A must produce a merge commit (commits are divergent)"
@@ -146,7 +153,7 @@ fn sequential_sync_converges_under_divergent_commits() {
     // Second sync: B pulls A's state — which now includes AM — and
     // observes that its own local head (commit_B) is already in the
     // ancestors of AM. merge_commit takes the fast-forward path.
-    let out_b = sync_round(&mut b, &mut a, "main", &pub_a);
+    let out_b = sync_round(&mut b, &mut a, "main");
     assert!(
         matches!(out_b, MergeOutcome::Merged { .. }),
         "B must advance (fast-forward reports Merged too)"
@@ -165,15 +172,15 @@ fn sequential_sync_converges_under_divergent_commits() {
     );
 
     // A third sync round is now a no-op on both sides.
-    let a_again = sync_round(&mut a, &mut b, "main", &pub_b);
-    let b_again = sync_round(&mut b, &mut a, "main", &pub_a);
+    let a_again = sync_round(&mut a, &mut b, "main");
+    let b_again = sync_round(&mut b, &mut a, "main");
     assert!(matches!(a_again, MergeOutcome::UpToDate));
     assert!(matches!(b_again, MergeOutcome::UpToDate));
 }
 
 #[test]
 fn parallel_merges_produce_identical_commits() {
-    // Simulated parallel gossip: both peers see each other's original
+    // Simulated parallel acceptance: both peers see each other's original
     // commits first, then BOTH merge before either has seen the other's
     // merge. Because merge commits are content-addressed (no signature,
     // no `created_at`, entity id derived from the parent set), the two
@@ -181,19 +188,15 @@ fn parallel_merges_produce_identical_commits() {
     // immediately — no extra round needed to resolve divergence.
     let mut a = new_repo(0x0A);
     let mut b = new_repo(0x0B);
-    let pub_a = [0x0Au8; 32];
-    let pub_b = [0x0Bu8; 32];
 
     // Both peers commit independently.
     {
-        let id = a.ensure_branch("main", None).unwrap();
-        let mut ws = a.pull(id).unwrap();
+        let mut ws = a.create_workspace("main").unwrap();
         ws.commit(TribleSet::new(), "A's commit");
         a.push(&mut ws).unwrap();
     }
     {
-        let id = b.ensure_branch("main", None).unwrap();
-        let mut ws = b.pull(id).unwrap();
+        let mut ws = b.create_workspace("main").unwrap();
         ws.commit(TribleSet::new(), "B's commit");
         b.push(&mut ws).unwrap();
     }
@@ -202,15 +205,15 @@ fn parallel_merges_produce_identical_commits() {
     copy_all_blobs(&mut a, &mut b);
     copy_all_blobs(&mut b, &mut a);
 
-    let a_branch_id = lookup_id(&mut a, "main");
-    let b_branch_id = lookup_id(&mut b, "main");
-    let a_head = remote_head_hash(&mut a, "main");
-    let b_head = remote_head_hash(&mut b, "main");
+    let a_identity = a.branch_identity("main");
+    let b_identity = b.branch_identity("main");
+    let a_head = head_commit(&mut a, "main");
+    let b_head = head_commit(&mut b, "main");
+    let pub_a = a.verifying_key().to_bytes();
+    let pub_b = b.verifying_key().to_bytes();
 
-    let tracking_in_a =
-        ensure_tracking_pin(a.storage_mut(), b_branch_id, &b_head, "main", &pub_b, false).unwrap();
-    let tracking_in_b =
-        ensure_tracking_pin(b.storage_mut(), a_branch_id, &a_head, "main", &pub_a, false).unwrap();
+    let tracking_in_a = mirror_commit(&mut a, b_identity, b_head, "main", pub_b);
+    let tracking_in_b = mirror_commit(&mut b, a_identity, a_head, "main", pub_a);
 
     // Parallel merge: both sides merge against their pre-merge views,
     // against the same parent set.
@@ -226,8 +229,8 @@ fn parallel_merges_produce_identical_commits() {
 
     // And a follow-up sync is a pure no-op — both sides are already at
     // the same head, no merge commit to produce or fast-forward to.
-    let a_next = sync_round(&mut a, &mut b, "main", &pub_b);
-    let b_next = sync_round(&mut b, &mut a, "main", &pub_a);
+    let a_next = sync_round(&mut a, &mut b, "main");
+    let b_next = sync_round(&mut b, &mut a, "main");
     assert!(matches!(a_next, MergeOutcome::UpToDate));
     assert!(matches!(b_next, MergeOutcome::UpToDate));
 }
@@ -238,16 +241,14 @@ fn single_round_converges_when_only_one_side_advanced() {
     // without producing a merge commit.
     let mut a = new_repo(0x0A);
     let mut b = new_repo(0x0B);
-    let pub_a = [0x0Au8; 32];
 
     {
-        let id = a.ensure_branch("main", None).unwrap();
-        let mut ws = a.pull(id).unwrap();
+        let mut ws = a.create_workspace("main").unwrap();
         ws.commit(TribleSet::new(), "A's only commit");
         a.push(&mut ws).unwrap();
     }
 
-    let outcome = sync_round(&mut b, &mut a, "main", &pub_a);
+    let outcome = sync_round(&mut b, &mut a, "main");
     assert!(
         matches!(outcome, MergeOutcome::Merged { .. }),
         "fast-forward still reports Merged (advance-to-tip)"
@@ -259,6 +260,6 @@ fn single_round_converges_when_only_one_side_advanced() {
     );
 
     // Second round is a no-op on both sides.
-    let again = sync_round(&mut b, &mut a, "main", &pub_a);
+    let again = sync_round(&mut b, &mut a, "main");
     assert!(matches!(again, MergeOutcome::UpToDate));
 }

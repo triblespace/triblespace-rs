@@ -30,7 +30,7 @@
 //!
 //! All three are marked with the same `local_only_pin` attribute
 //! (value = the kind tag) so a single helper distinguishes them from
-//! gossipable team-data branches.
+//! gossipable legacy team-data pins.
 //!
 //! See `decide#4b59ce27` (daemon + local-only retraction policy) for
 //! the design rationale.
@@ -49,7 +49,7 @@ use triblespace_core::trible::TribleSet;
 attributes! {
     // ── Pin role markers ──────────────────────────────────────────────
     /// Tags a pin as local-only (skip in gossip publish, skip in
-    /// content-branch-name lookups). Value is one of the `KIND_*` tags
+    /// legacy content-name lookups). Value is one of the `KIND_*` tags
     /// below indicating the role.
     "3361F2DE0BD68BA8712EC5B9CCC7EF2A" as pub local_only_pin: GenId;
 
@@ -150,11 +150,11 @@ pub const STATUS_REJECTED: Id = triblespace_core::id::id_hex!("3E54420C1F7EECFCE
 /// `local_only_pin` attribute. Used by the gossip-publish loop to
 /// skip policy pins (they mustn't leak A's renewal decisions or
 /// pending-request queue to the team).
-pub fn is_local_only_pin<S>(store: &mut S, branch_id: Id) -> bool
+pub fn is_local_only_pin<S>(store: &mut S, pin_id: Id) -> bool
 where
     S: BlobStore + PinStore,
 {
-    let Ok(Some(head_handle)) = store.head(branch_id) else {
+    let Ok(Some(head_handle)) = store.head(pin_id) else {
         return false;
     };
     let Ok(reader) = store.reader() else {
@@ -182,9 +182,9 @@ where
 {
     use triblespace_core::inline::IntoInline;
     let team_root_inline: Inline<ED25519PublicKey> = team_root.to_inline();
-    let bids: Vec<Id> = store.pins().ok()?.filter_map(|r| r.ok()).collect();
-    for bid in bids {
-        let Ok(Some(head)) = store.head(bid) else {
+    let pin_ids: Vec<Id> = store.pins().ok()?.filter_map(|r| r.ok()).collect();
+    for pin_id in pin_ids {
+        let Ok(Some(head)) = store.head(pin_id) else {
             continue;
         };
         let Ok(reader) = store.reader() else {
@@ -203,22 +203,22 @@ where
         )
         .any(|(kind, team)| kind == KIND_TEAM_CAP && team.raw == team_root_inline.raw);
         if matches {
-            return Some(bid);
+            return Some(pin_id);
         }
     }
     None
 }
 
-/// Find the local-only branch of a given kind (e.g.
-/// `KIND_RENEWAL_POLICY`, `KIND_PENDING_REQUESTS`). Branches of these
-/// kinds are singletons per peer, so the first match wins.
+/// Find the local-only pin of a given kind (e.g. `KIND_RENEWAL_POLICY`,
+/// `KIND_PENDING_REQUESTS`). Pins of these kinds are singletons per peer, so
+/// the first match wins.
 pub fn find_local_only_pin_of_kind<S>(store: &mut S, kind: Id) -> Option<Id>
 where
     S: BlobStore + PinStore,
 {
-    let bids: Vec<Id> = store.pins().ok()?.filter_map(|r| r.ok()).collect();
-    for bid in bids {
-        let Ok(Some(head)) = store.head(bid) else {
+    let pin_ids: Vec<Id> = store.pins().ok()?.filter_map(|r| r.ok()).collect();
+    for pin_id in pin_ids {
+        let Ok(Some(head)) = store.head(pin_id) else {
             continue;
         };
         let Ok(reader) = store.reader() else {
@@ -233,7 +233,7 @@ where
         )
         .any(|k| k == kind);
         if matches {
-            return Some(bid);
+            return Some(pin_id);
         }
     }
     None
@@ -253,7 +253,7 @@ pub struct PendingRequest {
 
 /// Snapshot of the current pending-requests set.
 ///
-/// Branch metadata is "current state" rather than commit history —
+/// Pin metadata is "current state" rather than commit history —
 /// the head metadata blob holds all currently-known requests as
 /// distinct entities. This keeps the schema simple at low cardinality
 /// (a peer realistically has at most a handful of pending requests
@@ -262,10 +262,10 @@ pub fn list_pending_requests<S>(store: &mut S) -> Vec<PendingRequest>
 where
     S: BlobStore + PinStore,
 {
-    let Some(bid) = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) else {
+    let Some(pin_id) = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) else {
         return Vec::new();
     };
-    let Ok(Some(head)) = store.head(bid) else {
+    let Ok(Some(head)) = store.head(pin_id) else {
         return Vec::new();
     };
     let Ok(reader) = store.reader() else {
@@ -311,7 +311,7 @@ where
 /// is fresh and is the value the CLI's `team approve <id>` consumes.
 ///
 /// Returns the entity id of the new request entry. Returns `None` if
-/// the underlying blob/branch writes fail (the caller decides whether
+/// the underlying blob/pin writes fail (the caller decides whether
 /// to retry, log, or drop).
 pub fn record_pending_request<S>(
     store: &mut S,
@@ -323,10 +323,10 @@ where
     S: BlobStore + BlobStorePut + PinStore,
 {
     // Find or create the pending-requests pin.
-    let (bid, prev_head) = match find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) {
-        Some(bid) => {
-            let head = store.head(bid).ok().flatten();
-            (bid, head)
+    let (pin_id, prev_head) = match find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) {
+        Some(pin_id) => {
+            let head = store.head(pin_id).ok().flatten();
+            (pin_id, head)
         }
         None => (*genid(), None),
     };
@@ -362,7 +362,7 @@ where
     meta += request_set;
 
     let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(bid, prev_head, Some(new_head)).ok()? {
+    match store.update(pin_id, prev_head, Some(new_head)).ok()? {
         PushResult::Success() => Some(*request_id),
         PushResult::Conflict(_) => None,
     }
@@ -378,7 +378,7 @@ where
 /// active cap is what's current; old caps don't accumulate".
 ///
 /// Returns the pin id on success. `None` on a blob-write or
-/// branch-update failure (caller decides retry/log/drop).
+/// pin-update failure (caller decides retry/log/drop).
 pub fn pin_team_cap<S>(
     store: &mut S,
     team_root: ed25519_dalek::VerifyingKey,
@@ -390,10 +390,10 @@ where
 {
     use triblespace_core::id::ExclusiveId;
 
-    let (bid, prev_head) = match find_team_cap_pin(store, team_root) {
-        Some(bid) => {
-            let head = store.head(bid).ok().flatten();
-            (bid, head)
+    let (pin_id, prev_head) = match find_team_cap_pin(store, team_root) {
+        Some(pin_id) => {
+            let head = store.head(pin_id).ok().flatten();
+            (pin_id, head)
         }
         None => (*genid(), None),
     };
@@ -413,8 +413,8 @@ where
     .into();
 
     let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(bid, prev_head, Some(new_head)).ok()? {
-        PushResult::Success() => Some(bid),
+    match store.update(pin_id, prev_head, Some(new_head)).ok()? {
+        PushResult::Success() => Some(pin_id),
         PushResult::Conflict(_) => None,
     }
 }
@@ -429,8 +429,8 @@ pub fn current_team_cap<S>(
 where
     S: BlobStore + PinStore,
 {
-    let bid = find_team_cap_pin(store, team_root)?;
-    let head = store.head(bid).ok()??;
+    let pin_id = find_team_cap_pin(store, team_root)?;
+    let head = store.head(pin_id).ok()??;
     let reader = store.reader().ok()?;
     let meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(head).ok()?;
     find!(
@@ -450,7 +450,7 @@ where
 }
 
 /// A single renewal-policy entry as recorded on the renewal-policy
-/// branch. The auto-renewal daemon enumerates these and re-issues a
+/// pin. The auto-renewal daemon enumerates these and re-issues a
 /// fresh cap for any whose `issued_at` upper bound is within the
 /// configured renewal window of `now` AND that don't carry a
 /// `retracted_at` attribute.
@@ -481,10 +481,10 @@ pub fn list_renewal_policy<S>(store: &mut S) -> Vec<PolicyEntry>
 where
     S: BlobStore + PinStore,
 {
-    let Some(bid) = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) else {
+    let Some(pin_id) = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) else {
         return Vec::new();
     };
-    let Ok(Some(head)) = store.head(bid) else {
+    let Ok(Some(head)) = store.head(pin_id) else {
         return Vec::new();
     };
     let Ok(reader) = store.reader() else {
@@ -647,8 +647,8 @@ where
         return Some(existing.id);
     }
 
-    let (bid, prev_head) = match find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) {
-        Some(bid) => (bid, store.head(bid).ok().flatten()),
+    let (pin_id, prev_head) = match find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) {
+        Some(pin_id) => (pin_id, store.head(pin_id).ok().flatten()),
         None => (*genid(), None),
     };
 
@@ -679,7 +679,7 @@ where
     meta += entry_set;
 
     let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(bid, prev_head, Some(new_head)).ok()? {
+    match store.update(pin_id, prev_head, Some(new_head)).ok()? {
         PushResult::Success() => Some(*entity_id),
         PushResult::Conflict(_) => None,
     }
@@ -704,8 +704,8 @@ where
 {
     use triblespace_core::id::ExclusiveId;
 
-    let bid = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
-    let prev_head = store.head(bid).ok()??;
+    let pin_id = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
+    let prev_head = store.head(pin_id).ok()??;
     let reader = store.reader().ok()?;
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
 
@@ -779,7 +779,7 @@ where
     meta += new_tribles;
 
     let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(bid, Some(prev_head), Some(new_head)).ok()? {
+    match store.update(pin_id, Some(prev_head), Some(new_head)).ok()? {
         PushResult::Success() => Some(()),
         PushResult::Conflict(_) => None,
     }
@@ -799,8 +799,8 @@ where
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::TryToInline;
 
-    let bid = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
-    let prev_head = store.head(bid).ok()??;
+    let pin_id = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
+    let prev_head = store.head(pin_id).ok()??;
     let reader = store.reader().ok()?;
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
 
@@ -830,7 +830,7 @@ where
     meta += trible;
 
     let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(bid, Some(prev_head), Some(new_head)).ok()? {
+    match store.update(pin_id, Some(prev_head), Some(new_head)).ok()? {
         PushResult::Success() => Some(()),
         PushResult::Conflict(_) => None,
     }
@@ -868,8 +868,8 @@ where
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::TryToInline;
 
-    let bid = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
-    let prev_head = store.head(bid).ok()??;
+    let pin_id = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
+    let prev_head = store.head(pin_id).ok()??;
     let reader = store.reader().ok()?;
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
 
@@ -884,14 +884,14 @@ where
     meta += trible;
 
     let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(bid, Some(prev_head), Some(new_head)).ok()? {
+    match store.update(pin_id, Some(prev_head), Some(new_head)).ok()? {
         PushResult::Success() => Some(()),
         PushResult::Conflict(_) => None,
     }
 }
 
 /// Mark a pending request as approved or rejected. The entity-level
-/// fact (request_status) is rewritten on the same branch's head blob.
+/// fact (`request_status`) is rewritten on the same pin's head blob.
 ///
 /// This is what `team approve` and (eventually) `team reject` call
 /// after they've taken their respective external actions (e.g. for
@@ -900,8 +900,8 @@ pub fn set_request_status<S>(store: &mut S, request_id: Id, new_status: Id) -> O
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
-    let bid = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS)?;
-    let prev_head = store.head(bid).ok()??;
+    let pin_id = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS)?;
+    let prev_head = store.head(pin_id).ok()??;
 
     let reader = store.reader().ok()?;
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
@@ -932,7 +932,7 @@ where
     meta += new_trible;
 
     let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(bid, Some(prev_head), Some(new_head)).ok()? {
+    match store.update(pin_id, Some(prev_head), Some(new_head)).ok()? {
         PushResult::Success() => Some(()),
         PushResult::Conflict(_) => None,
     }
@@ -1023,8 +1023,8 @@ mod tests {
     }
 
     #[test]
-    fn pending_branch_is_local_only() {
-        // Recording a request must produce a branch carrying the
+    fn pending_pin_is_local_only() {
+        // Recording a request must produce a pin carrying the
         // local-only marker so the gossip publisher skips it.
         let mut store = MemoryRepo::default();
         let requester = SigningKey::generate(&mut OsRng).verifying_key();
@@ -1033,8 +1033,8 @@ mod tests {
         let _ =
             record_pending_request(&mut store, requester, partial, point_now()).expect("record");
 
-        let bid =
-            find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS).expect("branch exists");
-        assert!(is_local_only_pin(&mut store, bid));
+        let pin_id =
+            find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS).expect("pin exists");
+        assert!(is_local_only_pin(&mut store, pin_id));
     }
 }

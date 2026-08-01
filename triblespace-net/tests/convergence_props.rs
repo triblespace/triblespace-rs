@@ -1,30 +1,35 @@
-//! Property-based convergence tests for the branch-sync merge logic.
+//! Property-based tests for local acceptance and branch-merge confluence.
 //!
 //! Like `two_peer_convergence`, these exercise `merge_tracking_into_local`
-//! directly — "gossip" is simulated by copying blobs between independent
-//! `Repository<MemoryRepo>` instances and hand-creating tracking pins, so
-//! the merge algorithm is tested without the iroh transport in the loop.
+//! directly: blobs are copied between independent `Repository<MemoryRepo>`
+//! instances and a well-formed local tracking pin is pointed at the commit
+//! being accepted. This deliberately does not model a StrongPin replication
+//! protocol; it isolates the local tracking-pin-to-assertion merge behavior.
 //! Being pure and deterministic, the merge is ideal for property testing.
 //!
 //! The headline property is **confluence**: when N peers commit
-//! divergently and then gossip in *any* order, they all converge to the
-//! **same** head — and that head is independent of the gossip order. This
-//! is the join-semilattice / CRDT property the whole distributed design
-//! rests on (content-addressed merge commits over a parent set are
-//! commutative, associative, and idempotent), checked here across
-//! randomized gossip schedules and seeds.
+//! divergently and their commits are then accepted in *any* order, they all
+//! converge to the **same** head — and that head is independent of the
+//! acceptance order. This is the join-semilattice / CRDT property of the
+//! content-addressed merge operation, checked here across randomized local
+//! acceptance schedules and seeds.
 
 use ed25519_dalek::SigningKey;
 use rand::{Rng, SeedableRng};
+use triblespace_core::blob::IntoBlob;
+use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::id::Id;
+use triblespace_core::id::{Id, genid};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::macros::entity;
 use triblespace_core::prelude::{BlobStore, PinStore};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, Repository};
+use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, PushResult, Repository};
 use triblespace_core::trible::TribleSet;
-use triblespace_net::tracking::{MergeOutcome, ensure_tracking_pin, merge_tracking_into_local};
+use triblespace_net::tracking::{
+    MergeOutcome, merge_tracking_into_local, remote_name, tracking_peer, tracking_remote_pin,
+};
 
 // ── Helpers (mirrors two_peer_convergence's, kept self-contained) ──────
 
@@ -40,58 +45,78 @@ fn copy_all_blobs(src: &mut Repository<MemoryRepo>, dst: &mut Repository<MemoryR
     }
 }
 
-fn lookup_id(repo: &mut Repository<MemoryRepo>, name: &str) -> Id {
-    repo.lookup_branch(name).unwrap().unwrap()
-}
-
-fn remote_head_hash(repo: &mut Repository<MemoryRepo>, name: &str) -> [u8; 32] {
-    let branch_id = lookup_id(repo, name);
-    repo.storage_mut()
-        .head(branch_id)
-        .expect("head")
-        .expect("branch has head")
-        .raw
-}
-
 fn head_commit(repo: &mut Repository<MemoryRepo>, name: &str) -> Inline<Handle<SimpleArchive>> {
-    let id = lookup_id(repo, name);
-    let ws = repo.pull(id).unwrap();
+    let identity = repo.branch_identity(name);
+    let ws = repo.pull(identity).unwrap();
     ws.head().expect("branch has head")
 }
 
 /// The checked-out content of `repo`'s branch — the merged TribleSet.
-/// This is the *value* that must converge regardless of gossip order,
+/// This is the *value* that must converge regardless of acceptance order,
 /// even where the commit-DAG hash is path-dependent (N>2 pairwise
 /// merges build different merge-commit trees).
 fn content(repo: &mut Repository<MemoryRepo>, name: &str) -> TribleSet {
-    let id = lookup_id(repo, name);
-    repo.pull(id)
+    let identity = repo.branch_identity(name);
+    repo.pull(identity)
         .unwrap()
         .checkout(..)
         .expect("checkout")
         .into_facts()
 }
 
-/// One sync round: copy `from`'s blobs into `to`, point a tracking pin at
-/// `from`'s HEAD, merge into `to`'s local branch.
+/// Materialize the mutable local transport state consumed by
+/// `merge_tracking_into_local`.
+///
+/// This is intentionally not remote branch publication: the fixture points a
+/// local tracking pin directly at an already-copied commit and carries only the
+/// tracking marker, remote display name, and publisher namespace hint.
+fn tracking_pin_for_commit(
+    repo: &mut Repository<MemoryRepo>,
+    branch: &str,
+    commit: Inline<Handle<SimpleArchive>>,
+    publisher: &[u8; 32],
+) -> Id {
+    let tracking_id = *genid();
+    let remote_marker = *genid();
+    let name_handle: Inline<Handle<LongString>> = repo
+        .storage_mut()
+        .put(branch.to_string().to_blob())
+        .expect("store tracking name");
+    let publisher = ed25519_dalek::VerifyingKey::from_bytes(publisher)
+        .expect("peer fixture carries a valid public key");
+    let metadata: TribleSet = entity! {
+        triblespace_core::repo::branch: tracking_id,
+        triblespace_core::repo::head: commit,
+        remote_name: name_handle,
+        tracking_remote_pin: remote_marker,
+        tracking_peer: publisher,
+    }
+    .into();
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata)
+        .expect("store tracking metadata");
+    assert!(matches!(
+        repo.storage_mut()
+            .update(tracking_id, None, Some(metadata_handle))
+            .expect("publish local tracking pin"),
+        PushResult::Success()
+    ));
+    tracking_id
+}
+
+/// One local acceptance round: copy `from`'s blobs into `to`, point a local
+/// tracking pin at `from`'s current commit, then merge it into `to`'s exact
+/// StrongPin branch identity.
 fn sync_round(
     to: &mut Repository<MemoryRepo>,
     from: &mut Repository<MemoryRepo>,
     branch: &str,
     from_pub: &[u8; 32],
 ) -> MergeOutcome {
+    let from_commit = head_commit(from, branch);
     copy_all_blobs(from, to);
-    let from_branch_id = lookup_id(from, branch);
-    let from_head = remote_head_hash(from, branch);
-    let tracking_id = ensure_tracking_pin(
-        to.storage_mut(),
-        from_branch_id,
-        &from_head,
-        branch,
-        from_pub,
-        false,
-    )
-    .expect("ensure tracking");
+    let tracking_id = tracking_pin_for_commit(to, branch, from_commit, from_pub);
     merge_tracking_into_local(to, tracking_id, branch).expect("merge")
 }
 
@@ -112,15 +137,13 @@ fn diverged_peers(n: usize) -> Vec<Peer> {
     (0..n)
         .map(|i| {
             let seed = 0x10 + i as u8;
-            // The publisher must be a *valid* ed25519 verifying key
-            // (create_tracking_pin reconstructs it), so derive it from
-            // the signing key rather than using arbitrary label bytes.
+            // The tracking fixture carries a real ed25519 publisher key, so
+            // derive it from the repository key instead of using label bytes.
             let sk = SigningKey::from_bytes(&[seed; 32]);
             let pubkey = sk.verifying_key().to_bytes();
             let mut repo =
                 Repository::new(MemoryRepo::default(), sk, TribleSet::new()).expect("repo");
-            let id = repo.ensure_branch(BRANCH, None).unwrap();
-            let mut ws = repo.pull(id).unwrap();
+            let mut ws = repo.create_workspace(BRANCH).unwrap();
             // A distinct, non-empty payload per peer so the merged
             // *content* (the union of tribles) is observable and the
             // commits genuinely diverge.
@@ -197,7 +220,7 @@ fn all_converged(peers: &mut [Peer]) -> Inline<Handle<SimpleArchive>> {
 // ── Properties ─────────────────────────────────────────────────────────
 
 /// CONFLUENCE (content): N peers commit divergently; under *any*
-/// randomized gossip order they converge to the **same content** every
+/// randomized acceptance order they converge to the **same content** every
 /// time — the union of all N payloads, independent of the order peers
 /// learned each other's state. This is the join-semilattice property the
 /// distributed design rests on.
@@ -217,7 +240,7 @@ fn converged_content_is_order_independent() {
         let mut peers = diverged_peers(n);
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0_F1_00 + trial);
 
-        // Randomized gossip phase: arbitrary (from -> to) syncs.
+        // Randomized local-acceptance phase: arbitrary (from -> to) rounds.
         for _ in 0..(n * n * 3) {
             let from = rng.gen_range(0..n);
             let to = rng.gen_range(0..n);
@@ -232,12 +255,12 @@ fn converged_content_is_order_independent() {
         for i in 1..n {
             assert_eq!(content(&mut peers[i].repo, BRANCH), c0, "peer {i} content");
         }
-        // ...and that content is identical across gossip orders.
+        // ...and that content is identical across acceptance orders.
         match &canonical {
             None => canonical = Some(c0),
             Some(c) => assert_eq!(
                 &c0, c,
-                "converged content must be independent of gossip order (trial {trial})"
+                "converged content must be independent of acceptance order (trial {trial})"
             ),
         }
     }
@@ -295,8 +318,8 @@ fn merge_content_is_independent_of_remote_arrival_order() {
 }
 
 /// TRANSITIVE convergence: peers in a line `0—1—2—…—(n-1)` where only
-/// *adjacent* pairs ever sync. No peer talks directly to a non-neighbor,
-/// yet the whole line converges to the full union — gossip propagates
+/// *adjacent* pairs ever exchange and locally accept commits. No peer accepts
+/// directly from a non-neighbor, yet the whole line converges to the full union
 /// through intermediaries. Because the merge is monotonic, repeated
 /// adjacent passes reach the global join; the test bounds the pass count
 /// to catch any failure to propagate.
@@ -347,8 +370,8 @@ fn line_topology_converges_transitively() {
 fn commit_more(peer: &mut Peer, tag: u8) {
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::macros::entity;
-    let id = lookup_id(&mut peer.repo, BRANCH);
-    let mut ws = peer.repo.pull(id).unwrap();
+    let identity = peer.repo.branch_identity(BRANCH);
+    let mut ws = peer.repo.pull(identity).unwrap();
     let mut idb = [0u8; 16];
     idb[0] = 0x60;
     idb[1] = tag;
@@ -366,8 +389,8 @@ fn commit_more(peer: &mut Peer, tag: u8) {
 }
 
 /// Convergence under *ongoing* writes: peers keep committing *while*
-/// the gossip is in flight, not just once up front. After the writes
-/// stop and the mesh drains, everyone converges to the union of ALL
+/// local acceptance rounds are in flight, not just once up front. After the
+/// writes stop and the schedule drains, everyone converges to the union of ALL
 /// commits — the realistic "live system" case the commit-once-then-sync
 /// tests don't reach. Monotonic merge means a moving target still
 /// converges once writes cease.
@@ -379,7 +402,7 @@ fn convergence_under_ongoing_writes() {
 
     let mut extra = 0u8;
     for round in 0..(n * n * 4) {
-        // Interleave live writes with random gossip.
+        // Interleave live writes with random local acceptance rounds.
         if round % 4 == 0 {
             let i = rng.gen_range(0..n);
             extra += 1;
@@ -422,8 +445,8 @@ fn convergence_under_ongoing_writes() {
 
 /// A late joiner bootstrapping into a running mesh. Peers 0,1,2 converge
 /// first (peer 3 isolated); then peer 3 — carrying its own divergent
-/// commit — joins and gossips. Everyone converges *both ways*: the late
-/// joiner catches up to the established union, and the settled peers
+/// commit — joins the acceptance schedule. Everyone converges *both ways*:
+/// the late joiner catches up to the established union, and the settled peers
 /// absorb the joiner's payload. Tests the "new node joins an existing
 /// system" path, which the all-start-together scenarios don't.
 #[test]

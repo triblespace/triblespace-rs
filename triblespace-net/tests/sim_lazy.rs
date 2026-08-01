@@ -112,7 +112,7 @@ fn fetch_blob_pulls_from_the_holder() {
         // settle the mesh (neighbor-up + announce).
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
         assert!(
@@ -120,7 +120,7 @@ fn fetch_blob_pulls_from_the_holder() {
             "precondition: B lacks the blob"
         );
 
-        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 120)
+        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh().unwrap(), 120)
             .await
             .flatten()
             .expect("B must obtain the blob from the swarm");
@@ -163,7 +163,7 @@ fn lazy_read_lands_weak_pinned_in_store() {
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
         // Precondition: B holds nothing locally and has no weak pins.
@@ -176,11 +176,15 @@ fn lazy_read_lands_weak_pinned_in_store() {
 
         // The lazy read: record the demand-born weak pin, fetch from
         // the swarm, land the verified bytes in the store.
-        let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 120)
-            .await
-            .expect("fetch future completes")
-            .expect("want recorded (MemoryRepo pins are infallible)")
-            .expect("B must obtain the blob from the swarm");
+        let got = drive_future(
+            peer_b.get_or_fetch_async(hash),
+            || peer_a.refresh().unwrap(),
+            120,
+        )
+        .await
+        .expect("fetch future completes")
+        .expect("want recorded (MemoryRepo pins are infallible)")
+        .expect("B must obtain the blob from the swarm");
         assert_eq!(
             blake3::hash(&got).as_bytes(),
             &hash,
@@ -248,16 +252,20 @@ fn lazy_store_eviction_is_safe_and_refetches() {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
         // Lazily read all three, in order — each lands weak-pinned.
         for (_, hash) in &blobs {
-            let got = drive_future(peer_b.get_or_fetch_async(*hash), || peer_a.refresh(), 120)
-                .await
-                .expect("fetch future completes")
-                .expect("want recorded")
-                .expect("swarm must serve each blob");
+            let got = drive_future(
+                peer_b.get_or_fetch_async(*hash),
+                || peer_a.refresh().unwrap(),
+                120,
+            )
+            .await
+            .expect("fetch future completes")
+            .expect("want recorded")
+            .expect("swarm must serve each blob");
             assert_eq!(blake3::hash(&got).as_bytes(), hash);
         }
         assert_eq!(
@@ -311,10 +319,14 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         );
 
         // The evicted blob is re-fetchable from the swarm.
-        let refetched = drive_future(peer_b.fetch_blob(blobs[0].1), || peer_a.refresh(), 120)
-            .await
-            .flatten()
-            .expect("evicted blob re-fetchable — eviction is always safe");
+        let refetched = drive_future(
+            peer_b.fetch_blob(blobs[0].1),
+            || peer_a.refresh().unwrap(),
+            120,
+        )
+        .await
+        .flatten()
+        .expect("evicted blob re-fetchable — eviction is always safe");
         assert_eq!(blake3::hash(&refetched).as_bytes(), &blobs[0].1);
     });
 }
@@ -346,7 +358,7 @@ fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
         assert!(
             peer_b.try_local(hash).is_none(),
@@ -363,7 +375,7 @@ fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
                     std::task::Poll::Ready(r) => break r,
                     std::task::Poll::Pending => {
                         SimNet::step(&vclock(), Duration::from_millis(20)).await;
-                        peer_a.refresh();
+                        peer_a.refresh().unwrap();
                     }
                 }
             }
@@ -414,7 +426,7 @@ fn transparent_async_get_fetches_through_reader() {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
         assert!(
             peer_b.try_local(hash).is_none(),
@@ -433,7 +445,7 @@ fn transparent_async_get_fetches_through_reader() {
                     std::task::Poll::Ready(r) => break r,
                     std::task::Poll::Pending => {
                         SimNet::step(&vclock(), Duration::from_millis(20)).await;
-                        peer_a.refresh();
+                        peer_a.refresh().unwrap();
                     }
                 }
             }
@@ -481,7 +493,7 @@ fn fetch_blob_unavailable_is_clean() {
         let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
 
         let (_blob, hash) = content_blob(0x99);
-        // providers_for has a 3s internal DHT timeout; give the sim
+        // The DHT fallback has a 3s internal timeout; give the sim
         // enough virtual steps to cross it, then expect a None reply.
         // No-op on_step: the inline fetch borrows `peer_a`, and stepping
         // alone advances virtual time across the timeout (no refresh
@@ -501,11 +513,12 @@ fn fetch_blob_unavailable_is_clean() {
 /// B who publishes, so the on-demand fetch must consult that knowledge
 /// instead of always paying the DHT lookup. Proven under a BLACK-HOLE
 /// DHT: previously the on-demand path passed our own id as publisher,
-/// so `providers_for`'s publisher-first branch never fired — this fetch
+/// so the publisher-first path never fired — this fetch
 /// resolved Unavailable despite a reachable publisher one gossip hop
 /// away. Now the gossip-known publisher serves it directly, no DHT.
 #[test]
 fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
+    use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::id::Id;
 
     let _g = sim_guard();
@@ -524,13 +537,18 @@ fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
         let cap_a = admin_cap(&root, &ka);
         let cap_b = admin_cap(&root, &kb);
 
-        // A holds a branch (so it gossips a HEAD — that's how B learns
-        // A is a publisher) plus an ORPHAN content blob outside the
-        // branch closure, so the eager tracking walk cannot land the
-        // fetch target at B behind the test's back.
-        let (branch_blob, _) = content_blob(0x31);
+        // A holds a legacy mutable pin with the old metadata schema (so it
+        // gossips a HEAD — that's how B learns A is a publisher) plus an ORPHAN
+        // content blob outside the hinted subgraph, so the eager tracking walk
+        // cannot land the fetch target at B behind the test's back.
         let (orphan_blob, orphan_hash) = content_blob(0x32);
         let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        let branch_id = Id::new([0x77; 16]).unwrap();
+        let branch_name: Inline<Handle<LongString>> = store_a
+            .put("main".to_owned().to_blob())
+            .expect("store legacy pin name");
+        let branch_blob =
+            triblespace_core::repo::branch::branch_unsigned(branch_id, branch_name, None).to_blob();
         store_a
             .put::<SimpleArchive, _>(branch_blob.clone())
             .unwrap();
@@ -538,22 +556,18 @@ fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
             .put::<SimpleArchive, _>(orphan_blob.clone())
             .unwrap();
         store_a
-            .update(
-                Id::new([0x77; 16]).unwrap(),
-                None,
-                Some(branch_blob.get_handle()),
-            )
+            .update(branch_id, None, Some(branch_blob.get_handle()))
             .unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
-        // Settle: A's refresh gossips the branch HEAD; B's host notes A
+        // Settle: A's refresh gossips the legacy HEAD; B's host notes A
         // as a known publisher when the frame arrives.
         for _ in 0..60u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
         assert!(
             peer_b.try_local(orphan_hash).is_none(),
@@ -562,11 +576,87 @@ fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
 
         // The DHT is dark, so the ONLY way this fetch can succeed is
         // the gossip-known-publisher shortcut.
-        let got = drive_future(peer_b.fetch_blob(orphan_hash), || peer_a.refresh(), 200)
-            .await
-            .flatten()
-            .expect("gossip-known publisher must serve the read-miss fetch without the DHT");
+        let got = drive_future(
+            peer_b.fetch_blob(orphan_hash),
+            || peer_a.refresh().unwrap(),
+            200,
+        )
+        .await
+        .flatten()
+        .expect("gossip-known publisher must serve the read-miss fetch without the DHT");
         assert_eq!(blake3::hash(&got).as_bytes(), &orphan_hash);
+    });
+}
+
+/// A gossip routing hint is not authoritative availability. If the hinted
+/// publisher does not hold an unrelated requested blob, its clean miss must
+/// fall through to the DHT instead of suppressing an honest holder.
+#[test]
+fn lazy_fetch_falls_through_stale_gossip_publisher() {
+    use triblespace_core::blob::encodings::longstring::LongString;
+    use triblespace_core::id::Id;
+
+    let _g = sim_guard();
+    run_paused(0x57A1_E001, async {
+        let net = SimNet::new(0x57A1_E001, SimConfig::default());
+        let root = key(0xE0);
+        let ka = key(0xA0);
+        let kb = key(0xB0);
+        let kc = key(0xC0);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+        let cap_c = admin_cap(&root, &kc);
+        let all = [cap_a.clone(), cap_b.clone(), cap_c.clone()];
+
+        // A gossips a real legacy pin, making it B's most recent routing hint,
+        // but deliberately does not hold the target blob.
+        let mut store_a = store_with_caps(&all);
+        let branch_id = Id::new([0x67; 16]).unwrap();
+        let branch_name: Inline<Handle<LongString>> = store_a
+            .put("stale-hint".to_owned().to_blob())
+            .expect("store legacy pin name");
+        let branch_blob =
+            triblespace_core::repo::branch::branch_unsigned(branch_id, branch_name, None).to_blob();
+        store_a
+            .put::<SimpleArchive, _>(branch_blob.clone())
+            .unwrap();
+        store_a
+            .update(branch_id, None, Some(branch_blob.get_handle()))
+            .unwrap();
+
+        let (target_blob, target_hash) = content_blob(0x68);
+        let mut store_c = store_with_caps(&all);
+        store_c
+            .put::<SimpleArchive, _>(target_blob.clone())
+            .unwrap();
+        let store_b = store_with_caps(&all);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        // C advertises content through the DHT but does not contribute a gossip
+        // publisher hint, keeping A first in B's on-demand route.
+        let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1), false);
+
+        for _ in 0..60u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh().unwrap();
+            peer_c.refresh().unwrap();
+        }
+        assert!(peer_b.try_local(target_hash).is_none());
+
+        let got = drive_future(
+            peer_b.fetch_blob(target_hash),
+            || {
+                peer_a.refresh().unwrap();
+                peer_c.refresh().unwrap();
+            },
+            400,
+        )
+        .await
+        .flatten()
+        .expect("stale publisher miss must fall through to the DHT holder");
+        assert_eq!(blake3::hash(&got).as_bytes(), &target_hash);
     });
 }
 
@@ -642,13 +732,13 @@ fn lazy_read_unavailable_under_partition_then_heals() {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
         // Sever A↔B: the DHT still resolves A as the provider, but B's
         // dial to A fails.
         net.partition(pk(&ka), pk(&kb));
-        let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
+        let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh().unwrap(), 300)
             .await
             .flatten();
         assert!(
@@ -667,7 +757,7 @@ fn lazy_read_unavailable_under_partition_then_heals() {
 
         // Heal the link; the same read now succeeds.
         net.heal(pk(&ka), pk(&kb));
-        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
+        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh().unwrap(), 300)
             .await
             .flatten()
             .expect("after heal the holder is reachable again");
@@ -701,17 +791,17 @@ fn lazy_read_unavailable_under_crash_then_revives() {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
         net.crash(pk(&ka));
-        let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
+        let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh().unwrap(), 300)
             .await
             .flatten();
         assert!(blocked.is_none(), "holder crashed → Unavailable");
 
         net.revive(pk(&ka));
-        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
+        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh().unwrap(), 300)
             .await
             .flatten()
             .expect("after revive the holder serves again");
@@ -747,14 +837,18 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
-        let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 200)
-            .await
-            .expect("fetch future completes")
-            .expect("want recorded")
-            .expect("the lazy read fetches from the swarm");
+        let got = drive_future(
+            peer_b.get_or_fetch_async(hash),
+            || peer_a.refresh().unwrap(),
+            200,
+        )
+        .await
+        .expect("fetch future completes")
+        .expect("want recorded")
+        .expect("the lazy read fetches from the swarm");
         assert_eq!(blake3::hash(&got).as_bytes(), &hash);
 
         // The fetch landed weak-pinned: resident, evictable, retained.
@@ -814,7 +908,7 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
 
             for _ in 0..40u32 {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
-                peer_a.refresh();
+                peer_a.refresh().unwrap();
             }
 
             let pa = pk(&ka);
@@ -856,7 +950,7 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
                 }
 
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
-                peer_a.refresh();
+                peer_a.refresh().unwrap();
             }
 
             // LIVENESS invariant.
@@ -902,8 +996,8 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
 
         for _ in 0..50u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
-            peer_c.refresh();
+            peer_a.refresh().unwrap();
+            peer_c.refresh().unwrap();
         }
         assert!(
             peer_b.try_local(hash).is_none(),
@@ -915,7 +1009,7 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
         let got = drive_future(
             peer_b.fetch_blob(hash),
             || {
-                peer_c.refresh();
+                peer_c.refresh().unwrap();
             },
             400,
         )
@@ -951,7 +1045,7 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
         // Drive the fetch, counting steps until completion.
@@ -962,7 +1056,7 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
                 break v;
             }
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
             steps += 1;
             if steps > 600 {
                 break None;
@@ -1001,7 +1095,7 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
         assert!(
             peer_b.try_local(hash).is_none(),
@@ -1040,7 +1134,7 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
                     break;
                 }
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
-                peer_a.refresh();
+                peer_a.refresh().unwrap();
             }
             (r1, r2)
         };
@@ -1088,7 +1182,7 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
         let pa = pk(&ka);
@@ -1096,7 +1190,7 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
 
         // Partition → a failed attempt → heal.
         net.partition(pa, pb);
-        let _ = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 120).await;
+        let _ = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh().unwrap(), 120).await;
         net.heal(pa, pb);
 
         // Timed recovery attempt.
@@ -1107,7 +1201,7 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
                 break v;
             }
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
             steps += 1;
             if steps > 400 {
                 break None;
@@ -1213,7 +1307,7 @@ fn reconcile_tick_services_out_of_band_want() {
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh();
+            peer_a.refresh().unwrap();
         }
 
         // Out-of-band want: written through the store guard, bypassing
@@ -1234,7 +1328,7 @@ fn reconcile_tick_services_out_of_band_want() {
 
         // The reconcile pass: notice the want, fetch, land.
         let mut rec = Reconciler::new();
-        let stats = drive_future(rec.tick(&mut peer_b), || peer_a.refresh(), 300)
+        let stats = drive_future(rec.tick(&mut peer_b), || peer_a.refresh().unwrap(), 300)
             .await
             .expect("reconcile tick completes");
         assert_eq!(stats.wants, 1, "the out-of-band weak pin is the want set");

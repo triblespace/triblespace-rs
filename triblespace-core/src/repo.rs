@@ -1011,8 +1011,9 @@ where
     /// Open a complete assertion frontier as a writable workspace.
     ///
     /// A missing asserted tip or unresolved ancestry remains explicit. Partial
-    /// frontiers have a safe conservative read view, but cannot license a new
-    /// authored descendant until their maximal antichain is known completely.
+    /// frontiers expose a deterministic candidate-root descriptor only,
+    /// but cannot be checked out or license a new authored descendant until
+    /// their maximal antichain is known completely.
     pub fn pull(
         &mut self,
         identity: BranchIdentity,
@@ -2101,12 +2102,11 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     ///
     /// Notes:
     /// - The merge does *not* automatically import the entire base history
-    ///   reachable from `other`'s head. If the incoming parent commits
-    ///   reference blobs that do not exist in this repository's storage,
-    ///   reading those commits later will fail until the missing blobs are
-    ///   explicitly imported (for example via `repo::transfer(reachable(...))`).
-    /// - This design keeps merge permissive and leaves cross-repository blob
-    ///   import as an explicit user action.
+    ///   reachable from `other`'s head. Cross-repository callers must import
+    ///   that closure explicitly (for example via
+    ///   `repo::transfer(reachable(...))`) before ancestry can be classified.
+    ///   Missing or malformed ancestry makes the merge fail loudly rather than
+    ///   creating a commit with an unverified parent.
     pub fn merge(
         &mut self,
         other: &mut Workspace<Blobs>,
@@ -2146,11 +2146,11 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     ///
     /// Returns the workspace's new head in all cases.
     ///
-    /// The ancestor checks are best-effort: if the relevant commit blobs are
-    /// missing from the workspace's view, the function falls through to the
-    /// always-correct merge-commit path. Callers that mirror remote chains
-    /// should ensure reachable blobs were imported (e.g. via `reachable` +
-    /// `transfer`) for the optimization to kick in.
+    /// The ancestor checks are strict. If either history is missing or
+    /// malformed in the workspace view, the function returns
+    /// [`MergeError::AncestryWalkFailed`] and does not invent a divergent merge
+    /// over an unverified parent. Callers that mirror remote chains must import
+    /// the reachable closure (for example via `reachable` + `transfer`) first.
     pub fn merge_commit(
         &mut self,
         other: Inline<Handle<SimpleArchive>>,

@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deletion, CAS, or scalar-head operation. A partial-DAG resolver distinguishes
   an unreadable target (`TipPending`) from readable candidates with unknown
   ancestry (`Partial`) and the true maximal antichain (`Complete`). Partial
-  frontiers can build a conservative read view but cannot license an asserted
-  merge; complete divergence builds one deterministic flat authorless merge.
+  frontiers expose only a candidate-root descriptor and cannot be
+  checked out or license an asserted merge; complete divergence builds one
+  deterministic flat authorless merge.
   Generated acyclic-DAG tests pin delivery-order independence and
   `Max(Max(A) ∪ B) = Max(A ∪ B)`.
 - **Pile stores branch assertions as one canonical fixed record.** The new V3
@@ -29,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BranchId || AssertionId` PATCH without physical-order semantics. Duplicate
   append is idempotent, concatenated piles union cleanly, and the assertion
   store crosses `sync_all` before reporting durable success. Legacy CAS branch
-  records remain readable but are not dual-authored by this dark storage seam;
-  legacy pile rewrites fail closed rather than silently omit assertions.
+  records remain readable but are not dual-authored by the assertion-native
+  path; legacy pile rewrites fail closed rather than silently omit assertions.
 - **Demand-curve receipts render as explicit performance fingerprints.** The
   feature-gated `tribleset-bench` GORBIE notebook normalizes fragmented TSV
   axes in memory and gives every engine/storage/execution subject the same
@@ -78,6 +79,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Storage composition now carries assertion authority explicitly.** Async
+  adapters expose signed-assertion snapshots and partial commit-DAG lookup;
+  `HybridStore` composes a blob store with a separate assertion store; and the
+  lazy wrapper preserves assertion storage while recording genuinely missing
+  commit metadata as durable wants. `ObjectStoreRemote` is intentionally only
+  a blob plus replica-local-pin backend: its CAS namespace moves from
+  `branches/` to `pins/`, reads verify content hashes, and it does not pretend
+  generic LIST or file-backend PUT semantics satisfy StrongPin snapshot and
+  durability contracts.
+- **Network tracking is an explicit legacy-to-local bridge.** `Peer` forwards
+  local assertion, durability, and partial-DAG capabilities, while mutable
+  tracking pins may feed an explicit caller-controlled merge and locally
+  authored assertion. The default sync loop only records those observations:
+  it never launders an unauthenticated scalar HEAD into local authorship.
+  Legacy hint walks now stream hash-verified partial progress while bounding
+  generations, retries, provider fan-out, concurrency, time, and response
+  growth; store-relative `OP_CHILDREN` hints are never treated as proof of a
+  global closure.
+  Signed assertion replication remains a separate protocol and foreign-author
+  admission milestone.
+- **The command-line branch model is now exact and assertion-native.**
+  `trible pile branch` accepts only full `(Ed25519 author, Blake3 name-handle)`
+  descriptors, publishes one already-present canonical commit per `assert`,
+  and exposes deterministic `list`, `show`, and candidate-rooted `log` views.
+  Local `forget` writes a fresh no-clobber pile generation while preserving
+  every non-target record byte-for-byte; it is explicitly not replicated
+  deletion. The unpublished mutable-pin branch commands and legacy
+  merge/extract/re-id/squash rewrites are deleted instead of emulated.
+  Empty pile creation now uses a durable no-clobber publication as well, so a
+  repeated `pile create` cannot erase an existing append-only generation.
 - **Yard collection now preserves assertion-native branches.** Yard implements
   the grow-only assertion store across all generations, treats every accepted
   assertion's name and commit closure as hard retention roots even when weak
@@ -1527,7 +1558,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **One record decoder; the CLI no longer hand-rolls pile parsing.**
   `triblespace-core` now exports `repo::pile::PileRecords` — a record-level
   iterator over a pile file yielding `PileRecord { offset, len, content }`
-  with `PileRecordContent::{Blob, Branch, BranchTombstone, WeakPin,
+  with `PileRecordContent::{Blob, Pin, PinTombstone, WeakPin,
   WeakUnpin}` — backed by the same decoder the `Pile` replay path uses, so
   V1 (64-byte) and V3 (uniform 256-aligned) records are both understood. An
   unknown or truncated record surfaces as `ReadError::CorruptPile`, never a

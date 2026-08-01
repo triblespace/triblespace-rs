@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `Peer` forwards the wrapped store's signed-assertion, flush, and partial
+  commit-DAG capabilities so local StrongPin repository work remains usable
+  through the network wrapper. Legacy tracking pins can feed an explicit
+  caller-controlled local merge and authored assertion, but the sync loop does
+  not adopt them automatically and scalar HEAD gossip is not presented as
+  signed assertion replication. Tracking identity is scoped by both remote id
+  and publisher hint so two publishers cannot overwrite one local observation.
+- Legacy HEAD hint walks are generation-gated per `(remote pin, publisher)`:
+  an older success cannot regress a newer observation, and an older failure
+  cannot resurrect its retry. Exact rebroadcasts coalesce without renewing
+  their fixed lease; retry keys, attempts, concurrent walks, provider fan-out,
+  wall time, fetched blobs, and fetched bytes are all bounded.
+- Publisher hints are attempted first but fall through to distinct DHT
+  providers. `OP_CHILDREN` is an untrusted store-relative batching hint, not a
+  global-closure proof: accepted hashes must occur in verified parent bytes,
+  fetched children are hash-checked, total response failure retries, and an
+  unavailable individual hint remains non-authoritative. Verified blobs stream
+  into the local event ledger immediately, so an interrupted bounded slice
+  leaves monotone progress while its HEAD remains completion/generation-gated.
+- `GET_BLOB` rejects a declared response above the protocol's explicit 256 MiB
+  transport ceiling before allocating, while `CHILDREN` accepts at most 65,536
+  hashes. These are network resource bounds, not TribleSpace blob-format
+  invariants; larger local blobs remain valid.
+- Network ingestion is fail-stop on persistence errors. A failed fetched-blob
+  write becomes a sticky `PeerRefreshError`; no later tracking HEAD event is
+  applied past it, and bounded CLI sync reports the error after closing the
+  underlying pile.
+- Protocol v4 now enforces `OP_AUTH` as the literal first stream on a
+  connection and rejects later re-authentication. `WriteOnly` peers discard
+  incoming blobs and legacy HEADs while still processing capability control
+  events, and only positively identified legacy pin-metadata blobs are
+  eligible for HEAD gossip; generic local pins never become transport roots.
+- Tracking metadata no longer copies the unauthenticated remote `updated_at`
+  annotation. Remote ordering is determined by locally observed generations,
+  not a publisher-carried timestamp.
+
 ## [0.41.4] - 2026-05-17
 
 ### Added

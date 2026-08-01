@@ -1,31 +1,33 @@
 //! Tracking pin management.
 //!
-//! A tracking pin is a local reification of a remote branch's head.
-//! It's a [`PinStore`] entry — a named, atomically-updatable handle —
-//! that mirrors what a remote peer reported their branch head was at
-//! the time of last sync. Per the Pin/Branch taxonomy (decide#6de2dd95):
-//! locally, the tracking entry has no commit history of its own, so
-//! it's a Pin, not a Branch. The thing it points at on the remote IS
-//! a Branch.
+//! A tracking pin is a local reification of a legacy remote mutable-pin
+//! observation. It's a [`PinStore`] entry — a named, atomically-updatable
+//! handle — that mirrors the metadata blob a remote publisher reported for
+//! one of its pin ids. The `(publisher hint, remote pin id)` tuple is transport
+//! namespace, not an authenticated [`StrongPin`](triblespace_core::repo::StrongPin)
+//! identity and not branch authority.
 //!
 //! Tracking pins use `remote_name` instead of `metadata::name` in
-//! their pin metadata, making them invisible to normal content-branch
-//! operations (`ensure_branch`, `resolve_branch_name`, faculties).
+//! their pin metadata, keeping this mutable transport state separate from
+//! exact, signed content-branch assertions.
 //!
-//! The tracking pin has its own local pin id. Repository can pull/merge
-//! it like any other commit-history pin (a Branch).
+//! The tracking pin has its own local pin id. [`merge_tracking_into_local`]
+//! reads its mirrored commit directly, then publishes that commit through the
+//! repository's exact local `(author, name handle)` identity.
 
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::prelude::attributes;
 use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
+use triblespace_core::repo::branch_assertion::BranchAssertionStore;
+use triblespace_core::repo::branch_frontier::PartialCommitDag;
 use triblespace_core::repo::{
-    BlobStore, BlobStoreGet, BlobStorePut, PinStore, PushResult, Repository,
+    AssertionPullError, BlobStore, BlobStoreGet, BlobStorePut, PinStore, PushResult, Repository,
+    StorageFlush,
 };
 use triblespace_core::trible::TribleSet;
 
@@ -40,7 +42,7 @@ attributes! {
     // Presence marks a *weak* (lazy/evictable) tracking pin: its history
     // is synced but content blobs are fetched on demand and may be
     // evicted under budget, rather than eagerly replicated via
-    // `fetch_reachable`. Valued by the pin's own id (a pure marker).
+    // the legacy hint walker. Valued by the pin's own id (a pure marker).
     "CCD0C9D01CD09EFAC0BA04A804E6D7A0" as pub weak_tracking: GenId;
 }
 
@@ -48,11 +50,11 @@ attributes! {
 /// `tracking_remote_pin` attribute in its metadata).
 ///
 /// Tracking pins are local-only state that must not be re-gossipped.
-pub fn is_tracking_pin<S>(store: &mut S, branch_id: Id) -> bool
+pub fn is_tracking_pin<S>(store: &mut S, pin_id: Id) -> bool
 where
     S: BlobStore + PinStore,
 {
-    let Ok(Some(head_handle)) = store.head(branch_id) else {
+    let Ok(Some(head_handle)) = store.head(pin_id) else {
         return false;
     };
     let Ok(reader) = store.reader() else {
@@ -61,7 +63,7 @@ where
     let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else {
         return false;
     };
-    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, branch_id) else {
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, pin_id) else {
         return false;
     };
     find!(
@@ -76,11 +78,11 @@ where
 /// is synced but content is fetched lazily and is evictable (the
 /// `weak_tracking` marker is present in its metadata). A weak pin is
 /// still a tracking pin; `is_tracking_pin` also returns true for it.
-pub fn is_weak_tracking_pin<S>(store: &mut S, branch_id: Id) -> bool
+pub fn is_weak_tracking_pin<S>(store: &mut S, pin_id: Id) -> bool
 where
     S: BlobStore + PinStore,
 {
-    let Ok(Some(head_handle)) = store.head(branch_id) else {
+    let Ok(Some(head_handle)) = store.head(pin_id) else {
         return false;
     };
     let Ok(reader) = store.reader() else {
@@ -89,7 +91,7 @@ where
     let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else {
         return false;
     };
-    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, branch_id) else {
+    let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, pin_id) else {
         return false;
     };
     find!(
@@ -105,11 +107,13 @@ where
 pub struct TrackingPinInfo {
     /// The local pin id under which the tracking pin is registered.
     pub local_id: Id,
-    /// The remote node's branch id that this tracking pin mirrors.
-    /// (The remote side is a branch — has commit history — even
-    /// though the local mirror is a pin.)
-    pub remote_branch_id: Id,
-    /// The branch name on the remote (stored as `remote_name` to keep
+    /// Legacy remote pin id carried by the observation. It is scoped by
+    /// [`Self::publisher`] and is not an exact StrongPin identity.
+    pub remote_pin_id: Id,
+    /// Publisher key carried by the legacy frame. It scopes the remote-id
+    /// namespace but is a routing/observation hint, not authenticated authorship.
+    pub publisher: PublisherKey,
+    /// The presentation name on the remote (stored as `remote_name` to keep
     /// it invisible to normal `metadata::name` lookups, which only
     /// surface content branches).
     pub remote_name: String,
@@ -117,9 +121,9 @@ pub struct TrackingPinInfo {
 
 /// Enumerate all tracking pins currently in `store`.
 ///
-/// This is the canonical "what remote branches do I know about" query —
-/// the persistent equivalent of an in-memory remote-head map. Use it from
-/// auto-merge loops, status displays, etc.
+/// This is the canonical "what legacy remote observations do I retain" query,
+/// the persistent equivalent of an in-memory remote-head map. Use it for
+/// diagnostics or an explicit admission/authorship workflow.
 pub fn list_tracking_pins<S>(store: &mut S) -> Vec<TrackingPinInfo>
 where
     S: BlobStore + PinStore,
@@ -128,10 +132,10 @@ where
     let Ok(iter) = store.pins() else {
         return result;
     };
-    let bids: Vec<Id> = iter.filter_map(|r| r.ok()).collect();
+    let pin_ids: Vec<Id> = iter.filter_map(|r| r.ok()).collect();
 
-    for bid in bids {
-        let Ok(Some(meta_handle)) = store.head(bid) else {
+    for pin_id in pin_ids {
+        let Ok(Some(meta_handle)) = store.head(pin_id) else {
             continue;
         };
         let Ok(reader) = store.reader() else {
@@ -141,15 +145,11 @@ where
             continue;
         };
 
-        let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, bid) else {
+        let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, pin_id) else {
             continue;
         };
 
-        let mut remote_ids = find!(
-            v: Id,
-            pattern!(&meta, [{ branch_entity @ tracking_remote_pin: ?v }])
-        );
-        let (Some(remote_branch_id), None) = (remote_ids.next(), remote_ids.next()) else {
+        let Some((remote_pin_id, publisher)) = tracking_identity(&meta, branch_entity) else {
             continue;
         };
 
@@ -166,45 +166,87 @@ where
         };
 
         result.push(TrackingPinInfo {
-            local_id: bid,
-            remote_branch_id,
+            local_id: pin_id,
+            remote_pin_id,
+            publisher,
             remote_name: name_view.as_ref().to_string(),
         });
     }
     result
 }
 
-/// Find the local tracking pin for the given remote branch id, if any.
+/// Read the immutable observation key carried by tracking metadata.
+///
+/// Both fields must be unique on the tracking pin's scoped metadata entity.
+/// The publisher bytes must also decode as an Ed25519 public key; malformed
+/// metadata is never allowed to alias a valid tracking identity.
+fn tracking_identity(meta: &TribleSet, branch_entity: Id) -> Option<(Id, PublisherKey)> {
+    let mut remote_ids = find!(
+        v: Id,
+        pattern!(meta, [{ branch_entity @ tracking_remote_pin: ?v }])
+    );
+    let (Some(remote_pin_id), None) = (remote_ids.next(), remote_ids.next()) else {
+        return None;
+    };
+
+    let mut publishers = find!(
+        publisher: Inline<ED25519PublicKey>,
+        pattern!(meta, [{ branch_entity @ tracking_peer: ?publisher }])
+    );
+    let (Some(publisher), None) = (publishers.next(), publishers.next()) else {
+        return None;
+    };
+    ed25519_dalek::VerifyingKey::from_bytes(&publisher.raw).ok()?;
+
+    Some((remote_pin_id, publisher.raw))
+}
+
+/// Find the local tracking pin for the exact `(remote pin id, publisher)`
+/// identity, if any.
 /// Returns the pin id (the same `Id` used as the storage key in
 /// `PinStore`).
-pub fn find_tracking_pin<S>(store: &mut S, remote_branch_id: Id) -> Option<Id>
+pub fn find_tracking_pin<S>(
+    store: &mut S,
+    remote_pin_id: Id,
+    publisher: &PublisherKey,
+) -> Option<Id>
 where
     S: BlobStore + PinStore,
 {
-    list_tracking_pins(store)
-        .into_iter()
-        .find(|info| info.remote_branch_id == remote_branch_id)
-        .map(|info| info.local_id)
+    let pin_ids: Vec<Id> = store.pins().ok()?.filter_map(Result::ok).collect();
+    for pin_id in pin_ids {
+        let Ok(Some(meta_handle)) = store.head(pin_id) else {
+            continue;
+        };
+        let reader = store.reader().ok()?;
+        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else {
+            continue;
+        };
+        let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, pin_id) else {
+            continue;
+        };
+        if tracking_identity(&meta, branch_entity) == Some((remote_pin_id, *publisher)) {
+            return Some(pin_id);
+        }
+    }
+    None
 }
 
-/// Read the actual commit handle from a remote branch's metadata blob.
+/// Read the actual commit handle from a legacy pin-metadata blob.
 ///
-/// The network protocol gossips the branch metadata blob hash as "HEAD"
-/// (because that's what's stored on the publisher's pin head), but
-/// inside that metadata `repo::head` points to a commit. This resolves
-/// the indirection so tracking pins store actual commit handles in
-/// their local head — which lets `Repository::pull(tracking_pin)`
-/// behave the same as a checkout of a real branch.
-fn resolve_commit_in_branch_meta<S: BlobStore>(
+/// The legacy network protocol gossips the pin-metadata blob hash as
+/// "HEAD" (because that is what the publisher's pin contains), while the
+/// metadata's `repo::head` points to the actual commit. This helper resolves
+/// that indirection before a local tracking-pin metadata blob is written.
+fn resolve_commit_in_legacy_pin_metadata<S: BlobStore>(
     store: &mut S,
-    branch_meta_hash: &RawHash,
-    remote_branch_id: Id,
+    metadata_head: &RawHash,
+    remote_pin_id: Id,
 ) -> Option<Inline<Handle<SimpleArchive>>> {
     let reader = store.reader().ok()?;
-    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*branch_meta_hash);
+    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*metadata_head);
     let meta: TribleSet = reader.get(meta_handle).ok()?;
-    let branch_entity =
-        triblespace_core::repo::branch::branch_entity(&meta, remote_branch_id).ok()?;
+    let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, remote_pin_id).ok()?;
     let mut heads = find!(
         h: Inline<Handle<SimpleArchive>>,
         pattern!(&meta, [{ branch_entity @ triblespace_core::repo::head: ?h }])
@@ -213,37 +255,15 @@ fn resolve_commit_in_branch_meta<S: BlobStore>(
     heads.next().is_none().then_some(head)
 }
 
-/// Read the `metadata::updated_at` attribute from a branch metadata blob,
-/// if present. Returns `None` if the blob is missing, can't be parsed, or
-/// doesn't carry a timestamp.
-fn read_updated_at<S: BlobStore>(
-    store: &mut S,
-    branch_meta_hash: &RawHash,
-    remote_branch_id: Id,
-) -> Option<Inline<NsTAIInterval>> {
-    let reader = store.reader().ok()?;
-    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*branch_meta_hash);
-    let meta: TribleSet = reader.get(meta_handle).ok()?;
-    let branch_entity =
-        triblespace_core::repo::branch::branch_entity(&meta, remote_branch_id).ok()?;
-    let mut timestamps = find!(
-        ts: Inline<NsTAIInterval>,
-        pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::updated_at: ?ts }])
-    );
-    let timestamp = timestamps.next()?;
-    timestamps.next().is_none().then_some(timestamp)
-}
-
 /// Create a new tracking pin. Returns the local pin id.
 ///
-/// `remote_head_hash` is the (remote) branch metadata blob hash
-/// gossiped over the network. The tracking pin resolves it to the
-/// inner commit handle so `Repository::pull(pin_id).head()` returns
-/// a real commit.
+/// `remote_metadata_head` is the legacy pin-metadata blob hash gossiped over
+/// the network. The tracking pin resolves it to the inner commit handle
+/// consumed by [`merge_tracking_into_local`].
 pub fn create_tracking_pin<S>(
     store: &mut S,
-    remote_branch_id: Id,
-    remote_head_hash: &RawHash,
+    remote_pin_id: Id,
+    remote_metadata_head: &RawHash,
     remote_name_str: &str,
     publisher: &PublisherKey,
     weak: bool,
@@ -251,12 +271,9 @@ pub fn create_tracking_pin<S>(
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
-    // Resolve the gossiped branch metadata hash to the actual commit.
-    let commit_handle = resolve_commit_in_branch_meta(store, remote_head_hash, remote_branch_id)?;
-    // Mirror the remote's publication timestamp so future updates can
-    // reject stale gossips without needing an ancestry walk.
-    let remote_updated_at = read_updated_at(store, remote_head_hash, remote_branch_id);
-
+    // Resolve the gossiped legacy pin metadata to the actual commit.
+    let commit_handle =
+        resolve_commit_in_legacy_pin_metadata(store, remote_metadata_head, remote_pin_id)?;
     // tracking_id stays random (it's the pin's identity in the local
     // pile and must not collide across tracking setups). The metadata
     // entity id is intrinsic — derived from the actual tribles below.
@@ -272,9 +289,8 @@ where
         triblespace_core::repo::branch: tracking_id,
         triblespace_core::repo::head: commit_handle,
         remote_name: name_handle,
-        tracking_remote_pin: remote_branch_id,
+        tracking_remote_pin: remote_pin_id,
         tracking_peer: pub_key,
-        triblespace_core::metadata::updated_at?: remote_updated_at,
         weak_tracking?: weak.then_some(tracking_id),
     }
     .into();
@@ -286,14 +302,14 @@ where
     }
 }
 
-/// Update a tracking pin's head. `new_head_hash` is the gossiped
-/// (remote) branch metadata blob hash, which is resolved to the inner
+/// Update a tracking pin's head. `new_remote_metadata_head` is the gossiped
+/// legacy pin-metadata blob hash, which is resolved to the inner
 /// commit handle before storage.
 pub fn update_tracking_pin<S>(
     store: &mut S,
     tracking_pin_id: Id,
-    remote_branch_id: Id,
-    new_head_hash: &RawHash,
+    remote_pin_id: Id,
+    new_remote_metadata_head: &RawHash,
     remote_name_str: &str,
     publisher: &PublisherKey,
     weak: bool,
@@ -303,6 +319,17 @@ where
 {
     let old_meta = store.head(tracking_pin_id).ok()??;
 
+    // A tracking pin's remote identity is immutable. In particular, a caller
+    // must never be able to reuse a local pin selected for one publisher as
+    // the mirror of the same 16-byte remote id from another publisher.
+    let reader = store.reader().ok()?;
+    let old_meta_set: TribleSet = reader.get(old_meta).ok()?;
+    let branch_entity =
+        triblespace_core::repo::branch::branch_entity(&old_meta_set, tracking_pin_id).ok()?;
+    if tracking_identity(&old_meta_set, branch_entity) != Some((remote_pin_id, *publisher)) {
+        return None;
+    }
+
     // No wall-clock gate here. Idempotency on no-op updates lives at
     // the storage layer (`Pile::update` short-circuits when
     // `new == current`), so a repeated identical gossip just resolves
@@ -311,9 +338,8 @@ where
     // downstream by `merge_commit`'s ancestry check (no-op if remote
     // is already in local's ancestry; fast-forward if local is in
     // remote's ancestry; merge commit otherwise).
-    let new_ts = read_updated_at(store, new_head_hash, remote_branch_id);
-
-    let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash, remote_branch_id)?;
+    let commit_handle =
+        resolve_commit_in_legacy_pin_metadata(store, new_remote_metadata_head, remote_pin_id)?;
 
     let name_string = remote_name_str.to_string();
     let name_handle: Inline<Handle<LongString>> =
@@ -327,9 +353,8 @@ where
         triblespace_core::repo::branch: tracking_pin_id,
         triblespace_core::repo::head: commit_handle,
         remote_name: name_handle,
-        tracking_remote_pin: remote_branch_id,
+        tracking_remote_pin: remote_pin_id,
         tracking_peer: pub_key,
-        triblespace_core::metadata::updated_at?: new_ts,
         weak_tracking?: weak.then_some(tracking_pin_id),
     }
     .into();
@@ -345,12 +370,12 @@ where
     }
 }
 
-/// Find or create a tracking pin for `(remote_branch_id, publisher)`.
+/// Find or create a tracking pin for `(remote_pin_id, publisher)`.
 /// Returns the local pin id.
 pub fn ensure_tracking_pin<S>(
     store: &mut S,
-    remote_branch_id: Id,
-    remote_head_hash: &RawHash,
+    remote_pin_id: Id,
+    remote_metadata_head: &RawHash,
     remote_name_str: &str,
     publisher: &PublisherKey,
     weak: bool,
@@ -358,22 +383,22 @@ pub fn ensure_tracking_pin<S>(
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
-    if let Some(tracking_id) = find_tracking_pin(store, remote_branch_id) {
+    if let Some(tracking_id) = find_tracking_pin(store, remote_pin_id, publisher) {
         update_tracking_pin(
             store,
             tracking_id,
-            remote_branch_id,
-            remote_head_hash,
+            remote_pin_id,
+            remote_metadata_head,
             remote_name_str,
             publisher,
             weak,
-        );
+        )?;
         Some(tracking_id)
     } else {
         create_tracking_pin(
             store,
-            remote_branch_id,
-            remote_head_hash,
+            remote_pin_id,
+            remote_metadata_head,
             remote_name_str,
             publisher,
             weak,
@@ -396,36 +421,38 @@ pub enum MergeOutcome {
 
 /// Merge a tracking pin into its same-named local branch.
 ///
-/// Looks up (or creates) a local branch named `local_name`, then uses
+/// Reads the mirrored commit from the local tracking pin, opens the exact
+/// `(repository author, local_name)` branch identity, then uses
 /// [`Workspace::merge_commit`](triblespace_core::repo::Workspace::merge_commit)
 /// to decide between no-op / fast-forward / merge commit. The tracking
 /// pin itself is never modified — this is a one-way "pull from the
-/// tracking pin into the local content branch".
+/// tracking pin into the local signed branch".
 ///
-/// Used by `pile net pull` (one-shot) and `pile net sync` (periodic
-/// auto-merge loop). Factored out here so both share the same semantics
-/// and a single test point.
+/// This is deliberately not called by the default sync loop. A caller must
+/// first make its own admission decision, then invoke this helper as an
+/// explicit local-authorship act; the legacy publisher field is not a verified
+/// StrongPin signature.
 pub fn merge_tracking_into_local<S>(
     repo: &mut Repository<S>,
     tracking_id: Id,
     local_name: &str,
 ) -> anyhow::Result<MergeOutcome>
 where
-    S: BlobStore + BlobStorePut + PinStore,
+    S: BlobStore + PinStore + StorageFlush + BranchAssertionStore,
+    S::Reader: PartialCommitDag,
 {
-    let local_id = repo
-        .ensure_branch(local_name, None)
-        .map_err(|_| anyhow::anyhow!("ensure branch '{local_name}'"))?;
-    let remote_ws = repo
-        .pull(tracking_id)
-        .map_err(|_| anyhow::anyhow!("pull tracking pin"))?;
-    let Some(remote_commit) = remote_ws.head() else {
+    let Some(remote_commit) = tracking_commit(repo.storage_mut(), tracking_id)? else {
         return Ok(MergeOutcome::Empty);
     };
 
-    let mut local_ws = repo
-        .pull(local_id)
-        .map_err(|_| anyhow::anyhow!("pull local branch"))?;
+    let local_identity = repo.branch_identity(local_name);
+    let mut local_ws = match repo.pull(local_identity) {
+        Ok(workspace) => workspace,
+        Err(AssertionPullError::Absent) => repo
+            .create_workspace(local_name)
+            .map_err(|_| anyhow::anyhow!("create local branch '{local_name}'"))?,
+        Err(_) => return Err(anyhow::anyhow!("pull local branch '{local_name}'")),
+    };
     let prev_head = local_ws.head();
     let new_head = local_ws
         .merge_commit(remote_commit)
@@ -438,6 +465,53 @@ where
     Ok(MergeOutcome::Merged { new_head })
 }
 
+/// Resolve the commit mirrored by a legacy local tracking pin.
+///
+/// Tracking pins remain mutable local transport state; they are deliberately
+/// not branch assertions and therefore cannot be passed to
+/// [`Repository::pull`]. Only the destination branch crosses the repository's
+/// exact-identity authoring boundary.
+fn tracking_commit<S>(
+    store: &mut S,
+    tracking_id: Id,
+) -> anyhow::Result<Option<Inline<Handle<SimpleArchive>>>>
+where
+    S: BlobStore + PinStore,
+{
+    let Some(meta_handle) = store
+        .head(tracking_id)
+        .map_err(|_| anyhow::anyhow!("read tracking pin"))?
+    else {
+        return Ok(None);
+    };
+    let reader = store
+        .reader()
+        .map_err(|_| anyhow::anyhow!("open tracking pin blob snapshot"))?;
+    let meta: TribleSet = reader
+        .get(meta_handle)
+        .map_err(|_| anyhow::anyhow!("read tracking pin metadata"))?;
+    let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, tracking_id)
+        .map_err(|_| anyhow::anyhow!("malformed tracking pin metadata"))?;
+
+    if tracking_identity(&meta, branch_entity).is_none() {
+        return Err(anyhow::anyhow!(
+            "pin {tracking_id:X} is not a well-formed tracking pin"
+        ));
+    }
+
+    let mut heads = find!(
+        head: Inline<Handle<SimpleArchive>>,
+        pattern!(&meta, [{ branch_entity @ triblespace_core::repo::head: ?head }])
+    );
+    match (heads.next(), heads.next()) {
+        (None, None) => Ok(None),
+        (Some(head), None) => Ok(Some(head)),
+        _ => Err(anyhow::anyhow!(
+            "tracking pin {tracking_id:X} has multiple heads"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,7 +519,7 @@ mod tests {
     use triblespace_core::blob::Blob;
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::id::genid;
-    use triblespace_core::inline::TryToInline;
+    use triblespace_core::repo::branch_frontier::BranchResolution;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
     fn test_repo() -> Repository<MemoryRepo> {
@@ -454,62 +528,85 @@ mod tests {
         Repository::new(store, signing_key, TribleSet::new()).unwrap()
     }
 
+    fn publish_commit(
+        repo: &mut Repository<MemoryRepo>,
+        name: &str,
+        message: &str,
+    ) -> Inline<Handle<SimpleArchive>> {
+        let mut workspace = repo.create_workspace(name).unwrap();
+        workspace.commit(TribleSet::new(), message);
+        let commit = workspace.head().unwrap();
+        repo.push(&mut workspace).unwrap();
+        commit
+    }
+
+    fn test_tracking_pin(
+        repo: &mut Repository<MemoryRepo>,
+        commit: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> Id {
+        let tracking_id = *genid();
+        let remote_pin_id = *genid();
+        let name_handle: Inline<Handle<LongString>> = repo
+            .storage_mut()
+            .put("remote-main".to_string().to_blob())
+            .unwrap();
+        let publisher = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let meta: TribleSet = entity! {
+            triblespace_core::repo::branch: tracking_id,
+            triblespace_core::repo::head?: commit,
+            remote_name: name_handle,
+            tracking_remote_pin: remote_pin_id,
+            tracking_peer: publisher,
+        }
+        .into();
+        let meta_handle = repo.storage_mut().put(meta).unwrap();
+        assert!(matches!(
+            repo.storage_mut()
+                .update(tracking_id, None, Some(meta_handle))
+                .unwrap(),
+            PushResult::Success()
+        ));
+        tracking_id
+    }
+
     #[test]
-    fn remote_head_and_freshness_ignore_carried_annotation_entities() {
+    fn legacy_metadata_head_ignores_carried_annotation_entities() {
         let mut store = MemoryRepo::default();
-        let remote_branch_id = *genid();
+        let remote_pin_id = *genid();
         let actual_commit: Inline<Handle<SimpleArchive>> = store
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
         let mut decoy_set = TribleSet::new();
-        decoy_set += entity! { triblespace_core::metadata::tag: remote_branch_id };
+        decoy_set += entity! { triblespace_core::metadata::tag: remote_pin_id };
         let decoy_commit: Inline<Handle<SimpleArchive>> =
             store.put::<SimpleArchive, _>(decoy_set.to_blob()).unwrap();
-        let actual_ts: Inline<NsTAIInterval> = {
-            let at = hifitime::Epoch::from_tai_seconds(1.0);
-            (at, at).try_to_inline().unwrap()
-        };
-        let decoy_ts: Inline<NsTAIInterval> = {
-            let at = hifitime::Epoch::from_tai_seconds(2.0);
-            (at, at).try_to_inline().unwrap()
-        };
-
         let mut meta: TribleSet = entity! {
-            triblespace_core::repo::branch: remote_branch_id,
+            triblespace_core::repo::branch: remote_pin_id,
             triblespace_core::repo::head: actual_commit,
-            triblespace_core::metadata::updated_at: actual_ts,
         }
         .into();
         let annotation = genid();
         meta += entity! { &annotation @
             triblespace_core::repo::head: decoy_commit,
-            triblespace_core::metadata::updated_at: decoy_ts,
         };
         let meta_handle: Inline<Handle<SimpleArchive>> = store.put(meta).unwrap();
 
         assert_eq!(
-            resolve_commit_in_branch_meta(&mut store, &meta_handle.raw, remote_branch_id),
+            resolve_commit_in_legacy_pin_metadata(&mut store, &meta_handle.raw, remote_pin_id),
             Some(actual_commit)
-        );
-        assert_eq!(
-            read_updated_at(&mut store, &meta_handle.raw, remote_branch_id),
-            Some(actual_ts)
         );
     }
 
     #[test]
     fn merge_tracking_ff_into_empty_local() {
         // Tracking has a commit, local "main" doesn't exist yet. Merge
-        // should create main and fast-forward it to the tracking head.
+        // should publish main directly at the tracking head.
         let mut repo = test_repo();
 
-        let source_id = repo.ensure_branch("source", None).unwrap();
-        let mut src_ws = repo.pull(source_id).unwrap();
-        src_ws.commit(TribleSet::new(), "remote commit");
-        let source_head = src_ws.head().unwrap();
-        repo.push(&mut src_ws).unwrap();
+        let source_head = publish_commit(&mut repo, "source", "remote commit");
+        let tracking_id = test_tracking_pin(&mut repo, Some(source_head));
 
-        let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        let outcome = merge_tracking_into_local(&mut repo, tracking_id, "main").unwrap();
         assert_eq!(
             outcome,
             MergeOutcome::Merged {
@@ -517,8 +614,7 @@ mod tests {
             }
         );
 
-        let main_id = repo.lookup_branch("main").unwrap().expect("main exists");
-        let main_ws = repo.pull(main_id).unwrap();
+        let main_ws = repo.pull(repo.branch_identity("main")).unwrap();
         assert_eq!(main_ws.head(), Some(source_head));
     }
 
@@ -528,21 +624,17 @@ mod tests {
         // a no-op.
         let mut repo = test_repo();
 
-        let source_id = repo.ensure_branch("source", None).unwrap();
-        let mut src_ws = repo.pull(source_id).unwrap();
-        src_ws.commit(TribleSet::new(), "shared commit");
-        let shared_head = src_ws.head().unwrap();
-        repo.push(&mut src_ws).unwrap();
+        let shared_head = publish_commit(&mut repo, "source", "shared commit");
+        let tracking_id = test_tracking_pin(&mut repo, Some(shared_head));
 
         // Seed main with the same head via a first merge.
-        let _ = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        let _ = merge_tracking_into_local(&mut repo, tracking_id, "main").unwrap();
 
         // Second call should report UpToDate.
-        let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        let outcome = merge_tracking_into_local(&mut repo, tracking_id, "main").unwrap();
         assert_eq!(outcome, MergeOutcome::UpToDate);
 
-        let main_id = repo.lookup_branch("main").unwrap().unwrap();
-        let main_ws = repo.pull(main_id).unwrap();
+        let main_ws = repo.pull(repo.branch_identity("main")).unwrap();
         assert_eq!(main_ws.head(), Some(shared_head));
     }
 
@@ -552,19 +644,15 @@ mod tests {
         // Merge should produce a new merge commit with both as parents.
         let mut repo = test_repo();
 
-        let main_id = repo.ensure_branch("main", None).unwrap();
-        let mut main_ws = repo.pull(main_id).unwrap();
+        let mut main_ws = repo.create_workspace("main").unwrap();
         main_ws.commit(TribleSet::new(), "local commit");
         let commit_a = main_ws.head().unwrap();
         repo.push(&mut main_ws).unwrap();
 
-        let source_id = repo.ensure_branch("source", None).unwrap();
-        let mut src_ws = repo.pull(source_id).unwrap();
-        src_ws.commit(TribleSet::new(), "remote commit");
-        let commit_b = src_ws.head().unwrap();
-        repo.push(&mut src_ws).unwrap();
+        let commit_b = publish_commit(&mut repo, "source", "remote commit");
+        let tracking_id = test_tracking_pin(&mut repo, Some(commit_b));
 
-        let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        let outcome = merge_tracking_into_local(&mut repo, tracking_id, "main").unwrap();
         let merge_head = match outcome {
             MergeOutcome::Merged { new_head } => new_head,
             other => panic!("expected Merged, got {other:?}"),
@@ -577,7 +665,7 @@ mod tests {
 
         // Local main should now be at the merge commit, and both
         // parents should appear in its ancestor set.
-        let mut main_ws = repo.pull(main_id).unwrap();
+        let mut main_ws = repo.pull(repo.branch_identity("main")).unwrap();
         assert_eq!(main_ws.head(), Some(merge_head));
 
         use triblespace_core::repo::CommitSelector;
@@ -596,50 +684,72 @@ mod tests {
 
     #[test]
     fn merge_tracking_empty_source_is_empty_outcome() {
-        // Tracking branch exists but has no head (no commits yet).
+        // Tracking pin exists but has no mirrored commit.
         // Merge should report Empty and leave main untouched.
         let mut repo = test_repo();
 
-        let source_id = repo.ensure_branch("source", None).unwrap();
-        let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        let tracking_id = test_tracking_pin(&mut repo, None);
+        let outcome = merge_tracking_into_local(&mut repo, tracking_id, "main").unwrap();
         assert_eq!(outcome, MergeOutcome::Empty);
 
-        // No main branch was created either — there was nothing to
-        // fast-forward to.
-        // (ensure_branch inside the helper *does* create it though —
-        // that's fine, it's just empty.)
-        let main_id = repo.lookup_branch("main").unwrap().expect("main created");
-        let main_ws = repo.pull(main_id).unwrap();
-        assert_eq!(main_ws.head(), None);
+        // Empty branches are unrepresentable in the assertion model, so the
+        // helper must not publish or otherwise manufacture one.
+        assert!(matches!(
+            repo.resolve_name("main").unwrap(),
+            BranchResolution::Absent
+        ));
     }
 
     #[test]
-    fn find_tracking_branch_roundtrips() {
+    fn merge_rejects_non_tracking_pin() {
+        let mut repo = test_repo();
+        let commit = publish_commit(&mut repo, "source", "source commit");
+        let ordinary_pin = *genid();
+        let meta: TribleSet = entity! {
+            triblespace_core::repo::branch: ordinary_pin,
+            triblespace_core::repo::head: commit,
+        }
+        .into();
+        let meta_handle = repo.storage_mut().put(meta).unwrap();
+        repo.storage_mut()
+            .update(ordinary_pin, None, Some(meta_handle))
+            .unwrap();
+
+        let error = merge_tracking_into_local(&mut repo, ordinary_pin, "main").unwrap_err();
+        assert!(error.to_string().contains("not a well-formed tracking pin"));
+        assert!(matches!(
+            repo.resolve_name("main").unwrap(),
+            BranchResolution::Absent
+        ));
+    }
+
+    #[test]
+    fn find_tracking_pin_roundtrips() {
         let mut store = MemoryRepo::default();
 
-        // Build a fake remote branch metadata blob first so we have something
+        // Build a fake legacy pin-metadata blob first so we have something
         // to point to. Use branch_unsigned to avoid signing-key plumbing.
         use triblespace_core::blob::IntoBlob;
         use triblespace_core::blob::encodings::longstring::LongString;
         use triblespace_core::repo::branch::branch_unsigned;
         let name_blob = "remote-branch".to_string().to_blob();
         let name_handle: Inline<Handle<LongString>> = store.put(name_blob).unwrap();
-        let remote_branch_id = genid();
+        let remote_pin_id = genid();
         // Create a dummy commit blob and set it as the remote head.
         let commit_meta: TribleSet = TribleSet::new();
         let commit_blob: Blob<SimpleArchive> = commit_meta.to_blob();
         let commit_handle = store.put::<SimpleArchive, _>(commit_blob.clone()).unwrap();
-        let remote_meta = branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob));
+        let remote_meta = branch_unsigned(*remote_pin_id, name_handle, Some(commit_blob));
         let remote_meta_handle = store.put::<SimpleArchive, _>(remote_meta).unwrap();
 
         let publisher = [0u8; 32];
-        let remote_head_hash: RawHash = remote_meta_handle.raw;
+        let remote_metadata_head: RawHash = remote_meta_handle.raw;
 
         // Create the tracking pin.
         let tracking_id = create_tracking_pin(
             &mut store,
-            *remote_branch_id,
-            &remote_head_hash,
+            *remote_pin_id,
+            &remote_metadata_head,
             "remote-branch",
             &publisher,
             false,
@@ -647,7 +757,7 @@ mod tests {
         .expect("create");
 
         // Now find it.
-        let found = find_tracking_pin(&mut store, *remote_branch_id);
+        let found = find_tracking_pin(&mut store, *remote_pin_id, &publisher);
         assert_eq!(
             found,
             Some(tracking_id),
@@ -660,8 +770,8 @@ mod tests {
         // ensure should be idempotent.
         let same = ensure_tracking_pin(
             &mut store,
-            *remote_branch_id,
-            &remote_head_hash,
+            *remote_pin_id,
+            &remote_metadata_head,
             "remote-branch",
             &publisher,
             false,
@@ -685,7 +795,166 @@ mod tests {
         .expect("tracking pin should have a head");
         assert_eq!(
             track_head, commit_handle,
-            "tracking pin head should be the inner commit, not the branch metadata blob"
+            "tracking pin head should be the inner commit, not the pin-metadata blob"
+        );
+    }
+
+    #[test]
+    fn ensure_does_not_report_success_when_existing_pin_update_fails() {
+        use triblespace_core::repo::branch::branch_unsigned;
+
+        let mut store = MemoryRepo::default();
+        let remote_pin_id = *genid();
+        let name_handle: Inline<Handle<LongString>> =
+            store.put("remote".to_owned().to_blob()).unwrap();
+        let commit_blob: Blob<SimpleArchive> = TribleSet::new().to_blob();
+        let metadata = branch_unsigned(remote_pin_id, name_handle, Some(commit_blob));
+        let metadata_head: Inline<Handle<SimpleArchive>> = store.put(metadata).unwrap();
+        let publisher = SigningKey::from_bytes(&[31; 32]).verifying_key().to_bytes();
+
+        let tracking_id = ensure_tracking_pin(
+            &mut store,
+            remote_pin_id,
+            &metadata_head.raw,
+            "remote",
+            &publisher,
+            false,
+        )
+        .expect("initial tracking pin");
+        let old_head = store.head(tracking_id).unwrap();
+
+        let absent_metadata_head = [0xFF; 32];
+        assert_eq!(
+            ensure_tracking_pin(
+                &mut store,
+                remote_pin_id,
+                &absent_metadata_head,
+                "remote",
+                &publisher,
+                false,
+            ),
+            None,
+            "a failed update must not be reported as the existing tracking pin"
+        );
+        assert_eq!(store.head(tracking_id).unwrap(), old_head);
+    }
+
+    #[test]
+    fn same_remote_id_from_two_publishers_stays_in_distinct_tracking_pins() {
+        use triblespace_core::repo::branch::branch_unsigned;
+
+        fn remote_metadata_head(
+            store: &mut MemoryRepo,
+            remote_pin_id: Id,
+            name_handle: Inline<Handle<LongString>>,
+            marker: Id,
+        ) -> (RawHash, Inline<Handle<SimpleArchive>>) {
+            let commit_set: TribleSet = entity! {
+                triblespace_core::metadata::tag: marker,
+            }
+            .into();
+            let commit_blob: Blob<SimpleArchive> = commit_set.to_blob();
+            let commit_handle = store.put(commit_blob.clone()).unwrap();
+            let remote_meta = branch_unsigned(remote_pin_id, name_handle, Some(commit_blob));
+            let remote_meta_handle: Inline<Handle<SimpleArchive>> = store.put(remote_meta).unwrap();
+            (remote_meta_handle.raw, commit_handle)
+        }
+
+        fn tracking_head_and_publisher(
+            store: &mut MemoryRepo,
+            tracking_id: Id,
+        ) -> (Inline<Handle<SimpleArchive>>, PublisherKey) {
+            let meta_handle = store.head(tracking_id).unwrap().unwrap();
+            let reader = store.reader().unwrap();
+            let meta: TribleSet = reader.get(meta_handle).unwrap();
+            let branch_entity =
+                triblespace_core::repo::branch::branch_entity(&meta, tracking_id).unwrap();
+            let mut heads = find!(
+                head: Inline<Handle<SimpleArchive>>,
+                pattern!(&meta, [{ branch_entity @ triblespace_core::repo::head: ?head }])
+            );
+            let (Some(head), None) = (heads.next(), heads.next()) else {
+                panic!("tracking pin must carry one scoped head");
+            };
+            let (_, publisher) = tracking_identity(&meta, branch_entity)
+                .expect("tracking pin must carry one exact remote identity");
+            (head, publisher)
+        }
+
+        let mut store = MemoryRepo::default();
+        let remote_pin_id = *genid();
+        let name_handle: Inline<Handle<LongString>> =
+            store.put("shared-remote-id".to_owned().to_blob()).unwrap();
+        let publisher_a = SigningKey::from_bytes(&[17; 32]).verifying_key().to_bytes();
+        let publisher_b = SigningKey::from_bytes(&[23; 32]).verifying_key().to_bytes();
+        let (head_a, commit_a) =
+            remote_metadata_head(&mut store, remote_pin_id, name_handle, *genid());
+        let (head_b, commit_b) =
+            remote_metadata_head(&mut store, remote_pin_id, name_handle, *genid());
+
+        let tracking_a = ensure_tracking_pin(
+            &mut store,
+            remote_pin_id,
+            &head_a,
+            "shared-remote-id",
+            &publisher_a,
+            false,
+        )
+        .expect("create publisher A tracking pin");
+        let tracking_b = ensure_tracking_pin(
+            &mut store,
+            remote_pin_id,
+            &head_b,
+            "shared-remote-id",
+            &publisher_b,
+            false,
+        )
+        .expect("create publisher B tracking pin");
+
+        assert_ne!(
+            tracking_a, tracking_b,
+            "remote pin ids belong to each publisher's namespace"
+        );
+        assert_eq!(
+            find_tracking_pin(&mut store, remote_pin_id, &publisher_a),
+            Some(tracking_a)
+        );
+        assert_eq!(
+            find_tracking_pin(&mut store, remote_pin_id, &publisher_b),
+            Some(tracking_b)
+        );
+        assert_eq!(
+            tracking_head_and_publisher(&mut store, tracking_a),
+            (commit_a, publisher_a)
+        );
+        assert_eq!(
+            tracking_head_and_publisher(&mut store, tracking_b),
+            (commit_b, publisher_b)
+        );
+
+        // A later update from A must select only A's tracking pin and leave
+        // B's same-numbered remote pin untouched.
+        let (head_a2, commit_a2) =
+            remote_metadata_head(&mut store, remote_pin_id, name_handle, *genid());
+        assert_eq!(
+            ensure_tracking_pin(
+                &mut store,
+                remote_pin_id,
+                &head_a2,
+                "shared-remote-id",
+                &publisher_a,
+                false,
+            ),
+            Some(tracking_a)
+        );
+        assert_eq!(
+            tracking_head_and_publisher(&mut store, tracking_a),
+            (commit_a2, publisher_a)
+        );
+        assert_eq!(
+            tracking_head_and_publisher(&mut store, tracking_b),
+            (commit_b, publisher_b),
+            "publisher A's update must not overwrite publisher B's pin"
         );
     }
 
@@ -696,17 +965,17 @@ mod tests {
 
         let mut store = MemoryRepo::default();
 
-        // Build a remote branch metadata blob to point a tracking pin at.
-        // Returns (remote_branch_id, remote_meta_hash).
+        // Build a legacy pin-metadata blob to point a tracking pin at.
+        // Returns (remote_pin_id, remote_meta_hash).
         let mut make_remote = |label: &str| -> (Id, RawHash) {
             let name_handle: Inline<Handle<LongString>> =
                 store.put(label.to_string().to_blob()).unwrap();
-            let remote_branch_id = genid();
+            let remote_pin_id = genid();
             let commit_blob: Blob<SimpleArchive> = TribleSet::new().to_blob();
             let _commit_handle = store.put::<SimpleArchive, _>(commit_blob.clone()).unwrap();
-            let remote_meta = branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob));
+            let remote_meta = branch_unsigned(*remote_pin_id, name_handle, Some(commit_blob));
             let remote_meta_handle = store.put::<SimpleArchive, _>(remote_meta).unwrap();
-            (*remote_branch_id, remote_meta_handle.raw)
+            (*remote_pin_id, remote_meta_handle.raw)
         };
 
         let publisher = [0u8; 32];

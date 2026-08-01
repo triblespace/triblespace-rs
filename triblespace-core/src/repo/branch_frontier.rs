@@ -5,9 +5,9 @@
 //! readable tips whose relation is unknown are
 //! [`BranchResolution::Partial`]. Malformed
 //! metadata and backend failures remain errors. Unrelated history and payload
-//! content stay lazy. Complete and partial divergent frontiers can both provide
-//! a correct read view, but only a complete frontier may license an authored
-//! merge assertion.
+//! content stay lazy. A partial divergent frontier exposes a deterministic
+//! candidate-root descriptor, but missing ancestry prevents checkout and only a
+//! complete frontier may license an authored merge assertion.
 //!
 //! [`BranchResolution::TipPending`]: crate::repo::branch_frontier::BranchResolution::TipPending
 //! [`BranchResolution::Partial`]: crate::repo::branch_frontier::BranchResolution::Partial
@@ -54,8 +54,8 @@ pub enum BranchResolution {
     /// target cannot yet be established as a well-formed commit.
     TipPending(TipPendingFrontier),
     /// Every surviving tip is well-formed, but missing ancestry prevents some
-    /// pairwise relation from being decided. Its conservative view is safe to
-    /// read and unsafe to assert.
+    /// pairwise relation from being decided. Its conservative root is a
+    /// descriptor only: it is neither checkout-safe nor assertion-safe.
     Partial(PartialFrontier),
     /// The complete maximal antichain is known.
     Complete(CompleteFrontier),
@@ -105,13 +105,14 @@ impl PartialFrontier {
         &self.missing_ancestry
     }
 
-    /// Build a conservative read view over every candidate.
+    /// Build a deterministic root descriptor over every unresolved candidate.
     ///
-    /// Checkout of this view is correct whether the unknown candidates later
-    /// prove ordered or incomparable. Its synthetic merge MUST NOT be asserted:
-    /// if a later ancestry fetch proves one candidate dominated, that assertion
-    /// would leave a permanent redundant merge in grow-only history.
-    pub fn conservative_head(&self) -> ResolvedHead {
+    /// This retains every non-definitely-dominated candidate, but missing
+    /// ancestry still makes high-level checkout unavailable. Its synthetic
+    /// merge MUST NOT be asserted: if a later ancestry fetch proves one
+    /// candidate dominated, that assertion would leave a permanent redundant
+    /// merge in grow-only history.
+    pub fn candidate_root(&self) -> ResolvedHead {
         resolved_head(&self.tips)
     }
 }
@@ -135,7 +136,7 @@ impl CompleteFrontier {
     }
 }
 
-/// Canonical read head for a complete or conservative partial frontier.
+/// Canonical root descriptor for a complete or unresolved candidate frontier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolvedHead {
     /// The frontier already has one maximal asserted commit.

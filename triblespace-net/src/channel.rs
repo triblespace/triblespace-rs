@@ -2,8 +2,8 @@
 //!
 //! `NetCommand`: outgoing effects sent from a [`Peer`](crate::peer::Peer)
 //! into the network thread. All fire-and-forget — there are no RPC
-//! variants because branch-state discovery is gossip-driven, not
-//! peer-targeted.
+//! variants because legacy scalar-HEAD observation is gossip-driven, not
+//! peer-targeted. Signed assertions are outside this channel today.
 //! `NetEvent`: incoming data sent back from the network thread to be
 //! applied into the wrapped store.
 //!
@@ -17,24 +17,29 @@ use anybytes::Bytes;
 
 use crate::protocol::{RawHash, RawPinId};
 
-/// A 32-byte public key identifying a publisher.
+/// A 32-byte endpoint/publisher hint carried by legacy transport.
 pub type PublisherKey = [u8; 32];
 
 /// Commands sent to the network thread.
 ///
-/// The surface is minimal by design — branch-state discovery is
-/// gossip-driven (HEAD updates flood the team topic; the network
-/// thread autonomously walks reachable closures via the DHT-routed
+/// The surface is minimal by design — legacy mutable-HEAD observation is
+/// gossip-driven (HEAD frames flood the team topic; the network
+/// thread autonomously walks content-bound, store-relative hints via the DHT-routed
 /// `OP_GET_BLOB` + `OP_CHILDREN` path). No peer-targeted RPCs.
 pub enum NetCommand {
     /// Announce a blob hash to the DHT (fire-and-forget). Local
     /// puts trigger this; new providers improve the swarm's
     /// content-distribution fan-out.
     Announce(RawHash),
-    /// Gossip a HEAD change for a branch (fire-and-forget). Local
-    /// branch updates trigger this; subscribers on the team topic
-    /// receive the flood message and walk the closure to catch up.
-    Gossip { branch: RawPinId, head: RawHash },
+    /// Gossip a legacy mutable-pin HEAD change (fire-and-forget). Eligible
+    /// local pin updates trigger this; subscribers on the team topic
+    /// receive the flood message and run a bounded hint walk to catch up.
+    GossipLegacyHead {
+        /// Publisher-scoped id of the legacy mutable pin.
+        pin: RawPinId,
+        /// Hash of the legacy pin-metadata blob carried by the HEAD frame.
+        metadata_head: RawHash,
+    },
     /// Dispatch a freshly-signed cap+sig pair to `subject` via the
     /// auth-handshake ALPN. Used by the renewal daemon (push-based
     /// renewal) and by the `team approve` subcommand (response to a
@@ -63,11 +68,14 @@ pub enum NetCommand {
 pub enum NetEvent {
     /// A blob was fetched from the network.
     Blob(Bytes),
-    /// A remote branch HEAD was learned (via gossip or fetch).
-    /// Includes the publisher's public key for provenance.
-    Head {
-        branch: RawPinId,
-        head: RawHash,
+    /// A legacy remote HEAD observation was learned via gossip and fetched.
+    /// `publisher` is the frame's routing/namespace hint, not authenticated
+    /// StrongPin provenance.
+    LegacyHead {
+        /// Publisher-scoped id of the observed legacy mutable pin.
+        pin: RawPinId,
+        /// Hash of the fetched legacy pin-metadata blob.
+        metadata_head: RawHash,
         publisher: PublisherKey,
     },
     /// A peer asked us to issue them a capability. The partial cap

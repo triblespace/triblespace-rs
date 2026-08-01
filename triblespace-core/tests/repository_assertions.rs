@@ -266,7 +266,7 @@ fn missing_ancestry_is_partial_and_not_writable() {
     };
     assert!(frontier.missing_ancestry().contains(&missing_parent));
     assert!(matches!(
-        frontier.conservative_head(),
+        frontier.candidate_root(),
         ResolvedHead::Synthetic(_)
     ));
     assert!(matches!(

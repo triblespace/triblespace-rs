@@ -1,16 +1,6 @@
 use assert_cmd::Command;
-use ed25519_dalek::SigningKey;
 use predicates::prelude::*;
 use tempfile::tempdir;
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::Repository;
-use triblespace_core::trible::TribleSet;
-
-fn random_signing_key() -> SigningKey {
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).expect("getrandom");
-    SigningKey::from_bytes(&seed)
-}
 
 #[test]
 fn store_blob_list_outputs_file() {
@@ -166,62 +156,20 @@ fn store_blob_inspect_outputs_metadata() {
 }
 
 #[test]
-fn store_branch_list_outputs_id() {
+fn store_pin_list_outputs_id() {
     let dir = tempdir().unwrap();
-    let branch_id = [1u8; 16];
-    let branch_hex = hex::encode(branch_id);
-    let branches_dir = dir.path().join("branches");
-    std::fs::create_dir_all(&branches_dir).unwrap();
-    std::fs::write(branches_dir.join(&branch_hex), b"branch").unwrap();
+    let pin_id = [1u8; 16];
+    let pin_hex = hex::encode(pin_id);
+    let pins_dir = dir.path().join("pins");
+    std::fs::create_dir_all(&pins_dir).unwrap();
+    std::fs::write(pins_dir.join(&pin_hex), b"pin").unwrap();
 
     let url = format!("file://{}", dir.path().display());
 
     Command::cargo_bin("trible")
         .unwrap()
-        .args(["store", "branch", "list", &url])
+        .args(["store", "pin", "list", &url])
         .assert()
         .success()
-        .stdout(predicate::str::contains(branch_hex.to_ascii_uppercase()));
-}
-
-#[test]
-fn branch_push_pull_transfers_branch() {
-    // const MAX_SIZE removed; new Pile API accepts a hash protocol type parameter
-    let dir = tempdir().unwrap();
-    let local = dir.path().join("local.pile");
-    std::fs::File::create(&local).unwrap();
-    let remote_dir = dir.path().join("remote");
-    std::fs::create_dir_all(remote_dir.join("branches")).unwrap();
-    std::fs::create_dir_all(remote_dir.join("blobs")).unwrap();
-    let url = format!("file://{}", remote_dir.display());
-
-    let branch_id = {
-        let pile: Pile = Pile::open(&local).unwrap();
-        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
-
-        let branch_id = repo.create_branch("main", None).unwrap();
-        repo.close().unwrap();
-        branch_id
-    };
-    let branch_hex = hex::encode(branch_id);
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args(["branch", "push", &url, local.to_str().unwrap(), &branch_hex])
-        .assert()
-        .success();
-
-    let other = dir.path().join("other.pile");
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args(["branch", "pull", &url, other.to_str().unwrap(), &branch_hex])
-        .assert()
-        .success();
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args(["pile", "branch", "list", other.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(branch_hex.to_ascii_uppercase()));
+        .stdout(predicate::str::contains(pin_hex.to_ascii_uppercase()));
 }

@@ -61,7 +61,7 @@ Run `trible <COMMAND>` to invoke a subcommand.
 
 ### Work with piles
 
-- `pile create <PATH>` — initialize an empty pile, creating parent directories as needed.
+- `pile create <PATH>` — initialize a new empty pile without replacing an existing file; the parent directory must already exist.
 - `pile diagnose check <PILE>` — verify pile integrity.
 - `pile diagnose locate-hash <PILE> <HANDLE>` — scan raw pile bytes and report where a handle appears (blob header vs payload references).
 - `pile migrate <PILE> list` — list known migrations and whether they are needed for this pile.
@@ -75,16 +75,20 @@ trible pile migrate <PILE> run branch-metadata-name
 
 #### Branches
 
-- `pile branch list <PILE>` — list branch ids, heads, and names.
-- `pile branch create <PILE> <NAME>` — create a new branch.
-- `pile branch delete <PILE> <BRANCH_ID>` — delete a branch (writes a tombstone record).
-- `pile branch stats <PILE> <BRANCH_ID>` — fast branch stats (commit count + accumulated content blob bytes + accumulated triple count via `bytes / 64`).
-- `pile branch stats <PILE> <BRANCH_ID> --full` — additionally materialize content to compute unique triples/entities/attributes (slower).
-- `pile branch consolidate <PILE> <BRANCH_ID...>` — consolidate multiple branches into a single new branch. The command creates a single merge commit whose parents are the selected branch heads and prints the new branch id.
-- `pile merge <PILE> <TARGET_ID> <SOURCE_ID...>` — merge source branch heads into a target branch by creating merge-only commits.
+- `pile branch assert <PILE> <NAME> <COMMIT> --signing-key <KEY>` — durably publish one assertion for a locally present canonical commit.
+- `pile branch list <PILE> [--signing-key <KEY> | --author <AUTHOR> | --all]` — list exact identities and their local `complete`, `partial`, or `tip-pending` resolution.
+- `pile branch show <PILE> <BRANCH>` — inspect one exact descriptor, its assertions, frontier, missing ancestry, and derived read head.
+- `pile branch log <PILE> <BRANCH>` — walk locally available ancestry from the resolver's candidate tips.
+- `pile branch forget <SOURCE> <DESTINATION> <BRANCH>` — create a new local pile generation without that exact identity's assertion records. This is physical forgetting, not replicated deletion; the source remains untouched and synchronization can reintroduce the assertions.
+
+`<BRANCH>` is always the full descriptor
+`ed25519:<64 hex>/blake3:<64 hex>`. The truncated 16-byte branch id printed as
+`index=…` is advisory only and is never accepted as a selector. Empty branches,
+mutable scalar heads, rename, consolidation, and replicated deletion are not
+part of the StrongPin model.
 
 Signing key format
-- Commands that create commits (e.g. `create`, `merge`, `merge-import`, `consolidate`) accept a signing key file path via the `--signing-key` flag. The file must contain a single 64-character hex string (32 bytes encoded as hex). You can also set TRIBLES_SIGNING_KEY to the path of such a file. Generated keys (when created by Codex tooling) are written as hex text to the configured path.
+- `branch assert` requires a stable signing-key file via `--signing-key` or the `TRIBLES_SIGNING_KEY` path. The file contains one 64-character hex Ed25519 seed. Commands never invent an ephemeral branch author.
 
 #### Blobs
 
@@ -95,16 +99,15 @@ Signing key format
 
 ### Distributed pile sync
 
-Built on `triblespace-net` (iroh QUIC + DHT + gossip). All commands
-authenticate via capability chains rooted at a team's pubkey; see
-the *Capability auth* section below for the team setup. Without a
-team configured, falls back to single-user team-of-one (the user is
-their own team root).
+Built on `triblespace-net` (iroh QUIC + DHT + gossip). Direct blob RPC
+connections authenticate through capability chains rooted at a team's pubkey;
+the legacy gossip frame itself is only a transport observation, not
+authenticated branch authorship. `identity` and `status` are local diagnostic
+commands. See the *Capability auth* section below for team setup.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
 - `pile net status [--key PATH]` — print the auth configuration this node would present on `OP_AUTH`: node id, team root, self_cap, and where each value comes from (env var vs fallback). For debugging stuck-auth scenarios.
-- `pile net sync <PILE> [--peers ID,...] [--key PATH]` — long-running bidirectional sync on the team's gossip mesh. The mesh is identified by the team root pubkey directly (no separate topic argument): every team has exactly one mesh, derived from its identity. Auto-merges incoming tracking branches into same-named local ones every tick. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` env vars; falls back to the node's own pubkey for single-user / team-of-one workflows.
-- `pile net pull <PILE> <REMOTE> --branch NAME [--key PATH]` — one-shot pull of a named branch from a specific peer (REMOTE is the peer's iroh node id, 64-char hex). Pull-only mode — no gossip subscription, direct QUIC + DHT fetch, materializes a tracking branch and merges into local. Same env-var fallback as `sync`.
+- `pile net sync <PILE> [--peers ID,...] [--key PATH]` — long-running blob and legacy mutable-HEAD sync on the team's gossip mesh. The mesh is identified by the team root pubkey directly (no separate topic argument): every team has exactly one mesh, derived from its identity. Incoming HEAD observations remain local tracking pins and are never converted automatically into locally signed assertions. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` env vars; falls back to the node's own pubkey for single-user / team-of-one workflows. Signed-assertion replication still requires a dedicated protocol and admission policy.
 
 ### Capability auth
 
@@ -116,7 +119,7 @@ off the founder's via delegation. See
 the full design.
 
 - `team create --pile PATH [--key KEY_PATH]` — mint a new team root keypair, sign the founder's self-cap with admin scope, and write both into the pile. Prints the team root pubkey (publish to peers), team root SECRET (archive offline), founder cap handles, and the cap's expiry timestamp.
-- `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--branch HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--branch` (repeatable) restricts the cap to specific branches; without it the cap applies to every branch within the granted permission set.
+- `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--legacy-pin HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--legacy-pin` (repeatable) restricts the current blob RPC to reachability from mutable local-pin roots; it does not select an exact StrongPin branch.
 - `team request-join --admin HEX --scope (read|write|admin) [--key PATH] [--pile PATH]` — send an `OP_REQUEST_CAP` to an admin asking to be issued a capability via the running auth-handshake daemon.
 - `team approve --pile PATH --entry HEX --team-root HEX --cap HEX [--key PATH]` — approve a pending join request, sign the cap, dispatch it via the auth-handshake ALPN, and add a renewal-policy entry so the cap stays renewed.
 - `team retract --pile PATH --entry HEX` — stop auto-renewing a (subject, scope) entry. The peer's cap chain dies at its next natural expiry. Pure local decision, takes effect on the next daemon tick. There is no team-root broadcast revocation primitive; eviction is per-issuer non-renewal.
@@ -135,17 +138,18 @@ the full design.
 - `store blob forget <URL> <HANDLE>` — remove an object from a remote store.
 - `store blob inspect <URL> <HANDLE>` — display metadata for a remote blob.
 
-#### Branches
+#### Mutable legacy pins
 
-- `store branch list <URL>` — list branches at a remote store.
-- `branch push <URL> <PILE> <ID>` — push a branch to a remote store.
-- `branch pull <URL> <PILE> <ID>` — pull a branch from a remote store.
+- `store pin list <URL>` — list every mutable legacy pin id at an object-store URL. This is an unclassified storage view and can include old content-branch heads as well as local policy or tracking pins.
 
-See `INVENTORY.md` for notes on possible cleanup and future functionality.
+`ObjectStoreRemote` intentionally exposes only blobs and replica-local pins.
+It does not claim the coherent snapshot and durable-append contracts required
+by a StrongPin assertion store: generic object-store listing is not a
+point-in-time snapshot, and the advertised file backend exposes no directory
+durability barrier. Remote assertion persistence and replication therefore need
+an explicit assertion ledger rather than a scalar-HEAD or LIST-plus-GET shim.
 
 ## Development
 
-Command implementations live in `src/cli/` with modules for `branch`, `pile`,
-and `store`. The modules expose their subcommands and are re-exported from
-`main.rs` to preserve the existing CLI interface. Contributions are always
-welcome!
+Command implementations live in `src/cli/`, with assertion-native branch
+operations under `pile`, plus `store` and team-management modules.

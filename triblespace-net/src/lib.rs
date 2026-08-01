@@ -2,15 +2,16 @@
 //!
 //! The main type is [`Peer<S>`](peer::Peer): a store wrapper that owns an
 //! iroh network thread internally and exposes the standard storage traits
-//! (`BlobStore + BlobStorePut + PinStore`). Reads auto-drain incoming
-//! gossip; writes auto-publish to the gossip topic and DHT. The user thinks
-//! of it as "my store, but networked."
+//! (`BlobStore + BlobStorePut + PinStore`). Reads drain incoming blob and
+//! legacy scalar-HEAD observations; blob writes are announced through the DHT
+//! and eligible mutable pins through the legacy gossip topic. Signed branch
+//! assertions remain local: this crate does not yet replicate them.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
 mod channel;
 
-/// Base backoff shared by the crate's retry loops (failed head-walk
+/// Base backoff shared by the crate's retry loops (failed legacy hint-walk
 /// retries in [`host`], failed want-fetch retries in
 /// [`reconcile::Reconciler`]); doubles per attempt up to
 /// [`RETRY_BACKOFF_CAP`]. Values chosen so a transient fault (peer

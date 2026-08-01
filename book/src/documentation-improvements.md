@@ -13,26 +13,36 @@ The following themes unblock common deployment or operational scenarios and
 should be tackled first when planning documentation work:
 
 ### Remote object stores
-`repo::objectstore::ObjectStoreRemote::with_url` wires the repository into
+`repo::objectstore::ObjectStoreRemote::with_url` wires blob storage and
+replica-local mutable pins into
 [`object_store`](https://docs.rs/object_store/latest/object_store/) services such
-as S3, local filesystems or Azure storage. The future chapter should walk
-through credential configuration, namespace selection, and pairing the remote
-backend with other stores (for example via `HybridStore`). It also needs to call
-out how branch updates rely on `PutMode::Update`/`UpdateVersion` retries, how
-conflicts bubble up to callers, and how listings stream through
-`BlockingIter` so readers know what consistency guarantees to expect. 【F:src/repo/objectstore.rs†L108-L316】
+as S3, local filesystems or Azure storage. It is deliberately not a StrongPin
+assertion store: the generic `ObjectStore::list` contract is not a coherent
+point-in-time snapshot, and the local-filesystem backend does not expose the
+file and directory durability barriers required by `BranchAssertionStore`.
+The future chapter should cover credentials, namespace selection, the clean
+`pins/` versus `blobs/` split, hash validation on reads, and the additional
+backend-specific durability capability required before remote blobs can sit on
+a repository publication path. A future remote assertion ledger needs an
+explicit immutable-snapshot protocol and truthful durability boundary; a
+LIST-plus-GET shim is not sufficient.
 
 ### Hybrid storage recipes
-`repo::hybridstore::HybridStore` mixes a blob store with a separate branch
-store. Documenting a few reference layouts—remote blobs with local branches,
-piles with in-memory branches, or even two-tier caches—will help teams evaluate
-trade-offs quickly. 【F:src/repo/hybridstore.rs†L1-L86】
+`repo::hybridstore::HybridStore` mixes a blob store with a separate signed
+assertion store. Documenting a few reference layouts—durable piles with a
+separate assertion ledger, piles with in-memory assertions for tests, or
+two-tier blob caches—will help teams evaluate trade-offs quickly. Remote blob
+storage becomes such a layout only once its adapter truthfully exposes the
+pre-publication flush boundary. Assertion append is already durable by its own
+trait contract.
 
 ### Signature verification
-Both `repo::commit::verify` and `repo::branch::verify` expose helpers for
-validating signed metadata before accepting remote history. A hands-on example
-should explain when to perform verification, how to surface failures to callers,
-and which key material needs to be distributed between collaborators. 【F:src/repo/commit.rs†L84-L122】 【F:src/repo/branch.rs†L95-L136】
+`repo::commit::verify` validates signed commit metadata, while
+`BranchAssertion::decode_verified` is the only constructor for assertion bytes
+received from storage or a peer. A hands-on example should distinguish
+cryptographic validity from authorization: signature verification admits no
+foreign assertion by itself, and the remote ingest boundary must still enforce
+an exact identity policy and resource bounds.
 
 ### Repository migration helpers
 `repo::transfer` rewrites whichever handles you feed it and returns the old and

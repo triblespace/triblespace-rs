@@ -1,6 +1,7 @@
 # Pile Format
 
-The on-disk pile keeps every blob and pin in one append-only file. The
+The on-disk pile keeps blobs, signed branch assertions, and local pins in one
+append-only file. The
 write-ahead log *is* the database: all indices are reconstructed from the bytes
 already stored on disk. This design avoids background compaction, manifest
 management, or auxiliary metadata while still providing a durable
@@ -16,8 +17,8 @@ memory map never exposes half-written records.
 
 ## Record model: uniform 256-byte records (V3)
 
-Every record the pile writes today — blob, legacy branch (pin) head, legacy
-branch tombstone, signed branch assertion, weak-pin marker, weak-unpin marker
+Every record the pile writes today — blob, local pin head, local pin
+tombstone, signed branch assertion, weak-pin marker, weak-unpin marker
 — uses the **V3** layout: a fixed **256-byte header**, followed (for blobs) by
 the payload, padded so the whole record is a **256-byte multiple**. This
 uniformity is load-bearing:
@@ -39,7 +40,7 @@ per-record metadata belongs in tribles, not in the header, so identical bytes
 never fork into distinct blobs.
 
 The reader still accepts the original **V1** records (64-byte-aligned blob,
-branch, and tombstone layouts — see [Legacy V1 records](#legacy-v1-records)),
+pin-head, and tombstone layouts — see [Legacy V1 records](#legacy-v1-records)),
 so piles written before V3 read byte-identical with no migration step. New
 writes are always V3. The skew direction to watch is the other one: **a binary
 that predates a particular record marker treats that record as unknown and
@@ -69,7 +70,7 @@ refreshing state.
    `applied_length`, and rebuilds the blob/pin indices in memory. It **fails
    loud** on a corrupt or torn tail (`ReadError::CorruptPile { valid_length }`)
    and never mutates the file. Callers rarely need to invoke it directly:
-   `reader`, legacy pin operations, and branch-assertion snapshot/append
+   `reader`, local pin operations, and branch-assertion snapshot/append
    operations call `refresh` internally before they inspect or apply records,
    so external writers are visible without a standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
@@ -80,7 +81,7 @@ refreshing state.
    every newer-format record past the first one it misreads as corruption).
    The `trible pile amputate <path>` command wraps it for operators.
 4. **Append new records.** `put` (through the `BlobStorePut` trait) normally
-   extends the file via one `write_vectored` call; small legacy pin records use
+   extends the file via one `write_vectored` call; small local pin records use
    one fixed-header write. A branch assertion takes the exclusive lock, writes
    one 256-byte record, replays it, and crosses `sync_all` before reporting
    success because its storage trait promises durable append. Every append
@@ -134,7 +135,7 @@ remembers the last offset it processed and, after appending, scans any gap left
 by concurrent writes before advancing this `applied_length`. Writers may race
 and duplicate blobs, but content addressing keeps the data consistent. Each
 handle tracks hashes of pending appends separately so repeated writes are
-deduplicated until a `refresh`. Legacy pin updates and branch assertions do not
+deduplicated until a `refresh`. Local pin updates and branch assertions do not
 require the referenced commit blob to exist in the pile, so assertions may
 arrive before their content under lazy replication.
 
@@ -177,10 +178,11 @@ fn add_blob(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
 
 This pattern illustrates the typical flow: open, load with `refresh`, rely on
 the built-in refreshes performed by `reader` and pin helpers, mutate via
-`put`, then hand the `PileReader` snapshot to read-only consumers. Updating
-pin heads requires a brief critical section—`flush → refresh → lock →
-refresh → append → unlock`—so a caller observes a consistent head even when
-multiple processes contend for the same file descriptor. `refresh` acquires a
+`put`, then hand the `PileReader` snapshot to read-only consumers. Updating a
+mutable local pin requires a brief critical section—`flush → refresh → lock →
+refresh → append → unlock`—so a caller observes a consistent local value even
+when multiple processes contend for the same file descriptor. This mechanism
+does not participate in StrongPin branch resolution. `refresh` acquires a
 shared lock so it cannot race with an explicit `amputate`, which takes an
 exclusive lock before truncating a corrupted tail.
 
@@ -205,8 +207,8 @@ refreshes can extend the pile's copy without changing existing readers, and
 `blobs_diff` can compare two snapshots through PATCH's structurally shared set
 difference instead of enumerating either complete index.
 
-Tools that need the raw log rather than the collapsed state—reflogs,
-consolidation, forensics—should use
+Tools that need the raw log rather than the collapsed state—forensics,
+physical diagnostics, or deliberate generation rewrites—should use
 [`PileRecords`](../../src/repo/pile.rs), an iterator over every record in a
 pile file in log order. It shares its decoder with the replay path described
 above, so it understands every record format ever written; do not hand-roll a
@@ -239,29 +241,32 @@ The payload follows at `record_start + 256` and is post-padded to the next
 256-byte boundary. The [Pile Blob Metadata](./pile-blob-metadata.md) chapter
 explains how to query these fields through the `PileReader` API.
 
-## Pin Records (branch head / tombstone)
+## Local and Legacy Pin Records
 
 ```text
             ┌────16 byte───┐┌────16 byte───┐┌────────────32 byte───────────┐┌───192 byte───┐
           ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────┐┌──────────────┐
- head     │ │ branch marker││   branch id  ││             hash             ││  reserved 0s │
+ head     │ │  pin marker  ││    pin id    ││             hash             ││  reserved 0s │
  (256 B)  └ └──────────────┘└──────────────┘└──────────────────────────────┘└──────────────┘
 
             ┌────16 byte───┐┌────16 byte───┐┌──────────────224 byte────────────────────────┐
           ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────────────────────┐
- tombstone│ │ tomb marker  ││   branch id  ││                 reserved 0s                  │
+ tombstone│ │ tomb marker  ││    pin id    ││                 reserved 0s                  │
  (256 B)  └ └──────────────┘└──────────────┘└──────────────────────────────────────────────┘
 ```
 
-Pin-head records map a pin (branch) identifier to the hash of a blob; a
-tombstone retracts the mapping. Appends are intentionally lightweight: the
+Pin-head records map a local pin identifier to the hash of a blob; a tombstone
+retracts the mapping. Appends are intentionally lightweight: the
 pile does not check whether the referenced blob exists locally, allowing
-deployments that store heads on disk while serving blob contents from a remote
+local retention and transport state to point at content served by another
 store.
 
-These records remain readable for migration, but their last-writer-wins/CAS
-semantics are distinct from the grow-only branch assertions below. Writers must
-not dual-author both forms as though they were one branch state.
+Pins have mutable last-writer-wins/CAS semantics because they are local
+operational state. They are distinct from the grow-only branch assertions
+below: a pin is not a branch, its 16-byte id is not a `BranchIdentity`, and its
+physical arrival order says nothing about branch precedence. Legacy files may
+contain records once used as branch heads; reading those bytes does not make
+that model authoritative.
 
 ## Signed Branch-Assertion Records
 
@@ -286,10 +291,13 @@ head, or silent pressure eviction. Authorization remains an ingest-layer
 decision over a configured identity/key set; the raw Pile store verifies
 authenticity but does not choose which authors a deployment trusts.
 
-Legacy `squash`, `extract`, and `reid` rewrites fail closed when their source
-contains assertion records. Until those operations gain assertion-native
-semantics, accepting such a source would create a plausible destination while
-silently dropping shared state.
+The complete branch identity is the assertion's author key plus name handle.
+The 16-byte `BranchId` stored in the in-memory index is only a prefix; lookups
+recheck the full descriptor. The pile stores assertions, not a cached resolved
+head. Resolution walks commit ancestry and reports absent, tip-pending, partial,
+or complete state. A synthetic flat merge for a divergent frontier is derived
+by the repository and is not written as branch state unless an author later
+publishes an ordinary signed descendant.
 
 ## Weak-Pin Records (want / retention markers)
 
@@ -302,7 +310,7 @@ silently dropping shared state.
 
 A weak-pin marker (and its weak-unpin counterpart, same layout with a
 different marker) is keyed by **blob handle** — per-blob and anonymous, no pin
-id. Together with the pin records they make retention one strength axis,
+id. Together with local pin records they make retention one strength axis,
 resolved last-writer-wins by log position:
 `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin` (the pin-head record *is* `pin`, the
 tombstone *is* `unpin`). A weak pin is simultaneously the demand-born
@@ -314,7 +322,7 @@ markers are durable records, reopening a pile reloads the weak set.
 
 Piles written before V3 contain 64-byte-aligned records: a 64-byte blob header
 (marker, timestamp, length, hash) followed by a payload padded to a 64-byte
-boundary, and 64-byte branch / tombstone records. The reader recognises the V1
+boundary, and 64-byte pin-head / tombstone records. The reader recognises the V1
 markers and reads these records byte-identical; they are never rewritten. V1
 had no weak-pin records.
 

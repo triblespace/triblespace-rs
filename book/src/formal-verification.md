@@ -55,7 +55,7 @@ rough sketch of how to exercise them in Kani, Miri, or fuzzing harnesses.
 | `PATCH` & `ByteTable` (`src/patch/*.rs`) | Cuckoo displacement respects `MAX_RETRIES` without losing entries; `Branch::modify_child` grows tables when required and preserves `leaf_count`/`segment_count`; `table_grow` copies every occupant exactly once. | Introduce a `patch_harness.rs` that stress-tests `plan_insert`, `table_insert`, and `Branch::grow`, plus a micro-fuzzer that drives inserts/removals across random table sizes. |
 | Inline encodings (`src/inline/encodings/*.rs`) | Encoders respect declared byte widths; `TryFromInline` conversions and `InlineEncoding::validate` reject truncated buffers; zero-copy views stay aligned. | Reuse `value_harness.rs`, adding per-encoding helpers plus a Miri regression suite that loads slices at every alignment. |
 | Query engine (`src/query/*.rs`) | Constraint solver never aliases conflicting bindings; the depth-first search enumerates every complete binding exactly once, and never twice, across backtracking and rayon splits; confirmation is kill-only, so any confirmer order yields identical liveness; and a frontier's width is semantically inert — the same bag of rows comes out at width 1 and at any wider batch. | Expand `proofs/query_harness.rs` with minimal counterexamples, and fuzz constraint graphs via `cargo fuzz`. |
-| Repository & commits (`src/repo/*.rs`, `proofs/commit_harness.rs`) | Branch heads remain append-only; `Workspace::pull` never forgets reachable blobs; selector algebra matches Git semantics. | Add bounded commit DAG generators in `commit_harness.rs` plus deterministic simulation traces covering merges and garbage collection. |
+| Repository & commits (`src/repo/*.rs`, `proofs/commit_harness.rs`) | Exact branch identity compares the full author key and name handle, never only `BranchId`; verified assertions form a grow-only set; resolution is invariant under insertion order and returns exactly the maximal ancestry frontier; missing data is classified as `TipPending` or `Partial`, never guessed complete; a synthetic flat merge is deterministic derived state and is never silently promoted to an assertion. | Add bounded commit-DAG and assertion-set generators, permute insertion order and duplicates, force index-prefix collisions, and model missing tips versus missing ancestry. |
 | Storage primitives (`src/blob`, `src/repo`, `src/patch/leaf.rs`) | Blob handles stay reference counted; pile headers remain within reserved capacity; byte slices from archives stay valid for the life of the store. | Combine Miri tests for aliasing with nightly fuzzers that replay repository sync transcripts. |
 
 ## Expansion Plan
@@ -67,7 +67,8 @@ rough sketch of how to exercise them in Kani, Miri, or fuzzing harnesses.
    - `TribleSet` operations preserving canonical ordering and deduplication.
     - Join heuristics in `atreides` ensuring variable bindings never alias
       conflicting values.
-   - Repository merge logic maintaining append-only pile semantics.
+   - Repository assertion resolution maintaining set-union semantics and exact
+     identity under arbitrary replay order.
 2. Extract shared helpers for generating bounded arbitrary data (e.g.
    `Vec::bounded_any`) so harnesses remain expressive without exploding the
    search space.
@@ -110,8 +111,8 @@ rough sketch of how to exercise them in Kani, Miri, or fuzzing harnesses.
      tests.
    - Join-order heuristics to explore combinations of constraint graphs and filter
      predicates.
-   - Repository sync workflows by fuzzing sequences of commits, pulls, and
-     merges.
+   - Repository workflows by fuzzing sequences of commits, assertion appends,
+     partial ancestry arrival, resolution, and merges.
 2. Reuse structured generators from `proptest` where deterministic shrinking is
    valuable, and bridge them into fuzz harnesses when possible to keep the state
    space constrained.
@@ -120,8 +121,11 @@ rough sketch of how to exercise them in Kani, Miri, or fuzzing harnesses.
 
 ### Phase 4 – Deterministic Simulation Testing
 
-1. Model repository replication scenarios with deterministic event queues to
-   explore conflict resolution, garbage collection, and concurrent writers.
+1. Model assertion replication scenarios with deterministic event queues to
+   explore duplicate/reordered delivery, partial commit-DAG arrival, and
+   concurrent writers. The current network has no signed-assertion replication
+   protocol, so these models specify the protocol still to be implemented
+   rather than claiming coverage of legacy HEAD gossip.
 2. Encode the simulations as regular unit tests backed by recorded execution
    traces so they can double as documentation for expected behaviour.
 3. Capture simulation scenarios discovered during fuzzing to prevent

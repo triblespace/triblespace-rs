@@ -70,11 +70,11 @@ pub enum Command {
         /// Scope to grant. Must be a subset of the issuer's own scope.
         #[arg(long, value_enum, default_value = "read")]
         scope: ScopeArg,
-        /// Restrict the cap to specific branches (hex branch ids,
-        /// 32-char). Repeatable. Without this flag the cap applies
-        /// to every branch within the granted permission set.
-        #[arg(long = "branch", value_name = "BRANCH_HEX")]
-        branches: Vec<String>,
+        /// Restrict legacy blob RPC scope to specific mutable local pins
+        /// (32 hex chars). Repeatable. This cannot name an exact StrongPin
+        /// `(author, name-handle)` branch identity.
+        #[arg(long = "legacy-pin", value_name = "PIN_HEX")]
+        legacy_pins: Vec<String>,
     },
     /// List capabilities stored in the local pile.
     List {
@@ -222,8 +222,8 @@ pub fn run(cmd: Command) -> Result<()> {
             key,
             invitee,
             scope,
-            branches,
-        } => run_invite(pile, team_root, cap, key, invitee, scope, branches),
+            legacy_pins,
+        } => run_invite(pile, team_root, cap, key, invitee, scope, legacy_pins),
         Command::List { pile } => run_list(pile),
         Command::ListPending { pile } => run_list_pending(pile),
         Command::ListIssued { pile } => run_list_issued(pile),
@@ -471,21 +471,21 @@ fn run_invite(
     key: Option<PathBuf>,
     invitee_hex: String,
     scope: ScopeArg,
-    branches_hex: Vec<String>,
+    legacy_pins_hex: Vec<String>,
 ) -> Result<()> {
     let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
     let invitee = parse_pubkey_hex(&invitee_hex)?;
-    let branches: Vec<Id> = branches_hex
+    let legacy_pins: Vec<Id> = legacy_pins_hex
         .iter()
         .map(|h| {
             let bytes: [u8; 16] = hex::decode(h.trim())
-                .map_err(|e| anyhow!("--branch decode '{h}': {e}"))?
+                .map_err(|e| anyhow!("--legacy-pin decode '{h}': {e}"))?
                 .as_slice()
                 .try_into()
-                .map_err(|_| anyhow!("--branch '{h}' must be 16 bytes (32 hex chars)"))?;
-            Id::new(bytes).ok_or_else(|| anyhow!("--branch '{h}' is the all-zeros nil id"))
+                .map_err(|_| anyhow!("--legacy-pin '{h}' must be 16 bytes (32 hex chars)"))?;
+            Id::new(bytes).ok_or_else(|| anyhow!("--legacy-pin '{h}' is the all-zeros nil id"))
         })
         .collect::<Result<_>>()?;
 
@@ -516,8 +516,8 @@ fn run_invite(
         let (parent_cap_blob, parent_sig_blob) = fetch_cap_blob_pair(pile, issuer_cap_sig_handle)?;
 
         // Build the invitee's scope: a permission tag plus zero or
-        // more `scope_branch` restrictions. Caller is responsible for
-        // ensuring the requested branch set is a subset of the
+        // more legacy `scope_branch` pin restrictions. Caller is responsible
+        // for ensuring the requested pin set is a subset of the
         // issuer's own scope; verify_chain rejects the issued cap
         // chain at use time if not (the relay's scope_subsumes check
         // catches it).
@@ -528,10 +528,10 @@ fn run_invite(
             ExclusiveId::force_ref(&scope_root) @
             triblespace_core::metadata::tag: scope.perm_id(),
         });
-        for branch in &branches {
+        for pin in &legacy_pins {
             scope_facts += TribleSet::from(entity! {
                 ExclusiveId::force_ref(&scope_root) @
-                capability::scope_branch: *branch,
+                capability::scope_branch: *pin,
             });
         }
 
@@ -593,7 +593,7 @@ struct CapSummary {
     subject: VerifyingKey,
     issuer: VerifyingKey,
     perms: Vec<Id>,
-    branches: Vec<Id>,
+    legacy_pins: Vec<Id>,
     expires_at: Option<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>>,
 }
 
@@ -674,7 +674,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 }])
             ) {
                 // Walk the scope sub-graph for permission tags AND any
-                // `scope_branch` restrictions. A scope can carry zero or
+                // legacy `scope_branch` pin restrictions. A scope can carry zero or
                 // more of either; a malformed cap with no perms surfaces
                 // as an empty list rather than breaking the whole
                 // listing.
@@ -686,7 +686,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 )
                 .map(|(p,)| p)
                 .collect();
-                let branches: Vec<Id> = find!(
+                let legacy_pins: Vec<Id> = find!(
                     (b: Id),
                     pattern!(&set, [{
                         scope_root @ capability::scope_branch: ?b
@@ -698,7 +698,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                     subject,
                     issuer,
                     perms,
-                    branches,
+                    legacy_pins,
                     expires_at: Some(expires_at),
                 });
             }
@@ -732,11 +732,11 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join("|")
             };
-            let branch_str = if cap.branches.is_empty() {
+            let pin_str = if cap.legacy_pins.is_empty() {
                 String::new()
             } else {
                 let mut bs: Vec<String> = cap
-                    .branches
+                    .legacy_pins
                     .iter()
                     .map(|b| {
                         let bytes: [u8; 16] = (*b).into();
@@ -744,7 +744,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                     })
                     .collect();
                 bs.sort();
-                format!(", branches=[{}]", bs.join(","))
+                format!(", legacy-pins=[{}]", bs.join(","))
             };
             let expiry_str = cap
                 .expires_at
@@ -753,7 +753,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 .unwrap_or_else(|| "<no expiry>".to_string());
             println!("    issuer:  {}", hex::encode(cap.issuer.to_bytes()),);
             println!("    subject: {}", hex::encode(cap.subject.to_bytes()),);
-            println!("    scope:   {perm_str}{branch_str}");
+            println!("    scope:   {perm_str}{pin_str}");
             println!("    expires: {expiry_str}");
             println!();
         }
@@ -862,7 +862,7 @@ fn run_show(
             )
             .map(|(p,)| p)
             .collect();
-            let branches: Vec<Id> = find!(
+            let legacy_pins: Vec<Id> = find!(
                 (b: Id),
                 pattern!(&cap_set, [{
                     scope_root @ capability::scope_branch: ?b
@@ -876,10 +876,10 @@ fn run_show(
             } else {
                 perms.iter().map(perm_label).collect::<Vec<_>>().join("|")
             };
-            let branch_str = if branches.is_empty() {
+            let pin_str = if legacy_pins.is_empty() {
                 String::new()
             } else {
-                let mut bs: Vec<String> = branches
+                let mut bs: Vec<String> = legacy_pins
                     .iter()
                     .map(|b| {
                         let bytes: [u8; 16] = (*b).into();
@@ -887,7 +887,7 @@ fn run_show(
                     })
                     .collect();
                 bs.sort();
-                format!(", branches=[{}]", bs.join(","))
+                format!(", legacy-pins=[{}]", bs.join(","))
             };
             let signer_matches_issuer = if signer == issuer {
                 "✓"
@@ -898,7 +898,7 @@ fn run_show(
             println!("level {depth}:");
             println!("  issuer:   {}", hex::encode(issuer.to_bytes()));
             println!("  subject:  {}", hex::encode(subject.to_bytes()));
-            println!("  scope:    {perm_str}{branch_str}");
+            println!("  scope:    {perm_str}{pin_str}");
             println!("  expires:  {}", format_expiry(&expiry));
             println!("  cap blob: {}", hex::encode(cap_handle.raw));
             println!("  signer matches cap_issuer: {signer_matches_issuer}");

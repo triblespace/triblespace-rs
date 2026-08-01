@@ -3,30 +3,25 @@ use clap::Parser;
 
 #[derive(Parser)]
 pub enum Command {
-    /// List all branch identifiers at the given URL.
+    /// List every mutable legacy pin identifier at an object-store URL.
     List {
-        /// URL of the object store to inspect (e.g. "s3://bucket/path" or "file:///path")
+        /// Object-store URL (for example `s3://bucket/path` or `file:///path`).
         url: String,
     },
 }
 
-pub fn run(cmd: Command) -> Result<()> {
-    match cmd {
+pub fn run(command: Command) -> Result<()> {
+    match command {
         Command::List { url } => {
             use triblespace::prelude::PinStore;
             use triblespace_core::repo::async_store::Blocking;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
-
             use url::Url;
 
             let url = Url::parse(&url)?;
             let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
-            // Ensure remote listing is up-to-date when needed; callers can
-            // refresh explicitly if they prefer.
-            let iter = remote.pins()?;
-            for branch_res in iter {
-                let id = branch_res?;
-                println!("{id:X}");
+            for pin in remote.pins()? {
+                println!("{:X}", pin?);
             }
             Ok(())
         }
