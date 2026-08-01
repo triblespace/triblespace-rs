@@ -23,6 +23,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::str::FromStr;
 
 use ed25519::signature::Signer;
 use ed25519::Signature;
@@ -133,6 +134,77 @@ impl BranchIdentity {
         )
     }
 }
+
+impl fmt::Display for BranchIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ed25519:{}/blake3:{}",
+            hex::encode(self.author),
+            hex::encode(self.name.raw)
+        )
+    }
+}
+
+impl FromStr for BranchIdentity {
+    type Err = BranchIdentityParseError;
+
+    fn from_str(selector: &str) -> Result<Self, Self::Err> {
+        let encoded = selector
+            .strip_prefix("ed25519:")
+            .ok_or(BranchIdentityParseError::InvalidFormat)?;
+        let (author, name) = encoded
+            .split_once("/blake3:")
+            .ok_or(BranchIdentityParseError::InvalidFormat)?;
+        if author.len() != 64 || name.len() != 64 || name.contains('/') {
+            return Err(BranchIdentityParseError::InvalidFormat);
+        }
+
+        let mut author_bytes = [0u8; 32];
+        hex::decode_to_slice(author, &mut author_bytes)
+            .map_err(|_| BranchIdentityParseError::InvalidAuthorHex)?;
+        let author = VerifyingKey::from_bytes(&author_bytes)
+            .map_err(|_| BranchIdentityParseError::InvalidAuthorKey)?;
+
+        let mut name_bytes = [0u8; 32];
+        hex::decode_to_slice(name, &mut name_bytes)
+            .map_err(|_| BranchIdentityParseError::InvalidNameHex)?;
+        Ok(Self::new(author, Inline::new(name_bytes)))
+    }
+}
+
+/// Why a textual exact branch descriptor could not be parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchIdentityParseError {
+    /// The selector is not `ed25519:<64 hex>/blake3:<64 hex>`.
+    InvalidFormat,
+    /// The author component is not hexadecimal.
+    InvalidAuthorHex,
+    /// The decoded author is not a valid Ed25519 verifying key.
+    InvalidAuthorKey,
+    /// The name-handle component is not hexadecimal.
+    InvalidNameHex,
+}
+
+impl fmt::Display for BranchIdentityParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFormat => write!(
+                f,
+                "branch selector must be ed25519:<64 hex>/blake3:<64 hex>"
+            ),
+            Self::InvalidAuthorHex => write!(f, "branch selector author is not hexadecimal"),
+            Self::InvalidAuthorKey => {
+                write!(f, "branch selector author is not a valid Ed25519 key")
+            }
+            Self::InvalidNameHex => {
+                write!(f, "branch selector name handle is not hexadecimal")
+            }
+        }
+    }
+}
+
+impl Error for BranchIdentityParseError {}
 
 /// A canonical branch assertion whose signature has already been verified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +545,44 @@ mod tests {
         assert_ne!(a.id(), renamed.id());
         assert_ne!(a, rekeyed);
         assert_ne!(a.id(), rekeyed.id());
+    }
+
+    #[test]
+    fn exact_identity_selector_has_one_stable_rendering() {
+        let identity = BranchIdentity::new(signing_key(3).verifying_key(), name(1));
+        let selector = identity.to_string();
+
+        assert_eq!(
+            selector,
+            concat!(
+                "ed25519:ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1/",
+                "blake3:0101010101010101010101010101010101010101010101010101010101010101"
+            )
+        );
+        assert_eq!(selector.parse::<BranchIdentity>().unwrap(), identity);
+    }
+
+    #[test]
+    fn exact_identity_selector_rejects_ambiguous_or_malformed_inputs() {
+        let identity = BranchIdentity::new(signing_key(3).verifying_key(), name(1));
+        let selector = identity.to_string();
+
+        assert_eq!(
+            identity.id().to_string().parse::<BranchIdentity>(),
+            Err(BranchIdentityParseError::InvalidFormat)
+        );
+        assert_eq!(
+            selector
+                .replace("ed25519:", "key:")
+                .parse::<BranchIdentity>(),
+            Err(BranchIdentityParseError::InvalidFormat)
+        );
+        assert_eq!(
+            selector
+                .replace("blake3:01", "blake3:zz")
+                .parse::<BranchIdentity>(),
+            Err(BranchIdentityParseError::InvalidNameHex)
+        );
     }
 
     #[test]

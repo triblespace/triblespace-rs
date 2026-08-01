@@ -12,8 +12,8 @@ use hex::FromHex;
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{AssertionPullError, Repository};
 use triblespace_core::repo::Workspace;
+use triblespace_core::repo::{AssertionPullError, Repository};
 use triblespace_core::trible::TribleSet;
 
 use syn::parse::Parse;
