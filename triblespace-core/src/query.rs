@@ -691,8 +691,7 @@ impl BindingStore {
     }
 
     /// How far `variable`'s level cursor has run — the count of entries the
-    /// level has consumed or skipped. With `Level::proposed` this bounds the
-    /// candidates still pending without scanning the liveness words.
+    /// level has consumed or skipped.
     pub(crate) fn consumed(&self, variable: VariableId) -> usize {
         self.levels[variable].pos
     }
@@ -713,6 +712,7 @@ impl BindingStore {
         &mut self,
         variable: VariableId,
         width: usize,
+        end: usize,
         parent_block: &[u32],
         parent_select: &[u32],
         stride: usize,
@@ -727,11 +727,17 @@ impl BindingStore {
             .as_deref()
             .expect("an active level must have a proposal buffer");
         let pos = &mut level.pos;
+        debug_assert!(*pos <= end);
         let mut rows = 0;
         while rows < width {
             let Some(i) = buffer.next_live(*pos) else {
+                *pos = end;
                 break;
             };
+            if i >= end {
+                *pos = end;
+                break;
+            }
             *pos = i + 1;
             let parent = parent_select[buffer.parent_of(i) as usize] as usize;
             out.extend_from_slice(&parent_block[parent * stride..(parent + 1) * stride]);
@@ -758,6 +764,7 @@ impl BindingStore {
         &mut self,
         variable: VariableId,
         width: usize,
+        end: usize,
         parent_select: &[u32],
         drawn_out: &mut Vec<u32>,
         parents_out: &mut Vec<u32>,
@@ -770,10 +777,16 @@ impl BindingStore {
             .as_deref()
             .expect("an active level must have a proposal buffer");
         let pos = &mut level.pos;
+        debug_assert!(*pos <= end);
         while drawn_out.len() < width {
             let Some(i) = buffer.next_live(*pos) else {
+                *pos = end;
                 break;
             };
+            if i >= end {
+                *pos = end;
+                break;
+            }
             *pos = i + 1;
             drawn_out.push(i as u32);
             parents_out.push(parent_select[buffer.parent_of(i) as usize]);
@@ -789,9 +802,12 @@ impl BindingStore {
     /// would pay a second pass over a level's dead tail that the next draw
     /// pays anyway. The one caller asks only once the cheap `O(1)`
     /// conditions for an in-place descent already hold.
-    pub(crate) fn spent(&self, variable: VariableId) -> bool {
+    pub(crate) fn spent(&self, variable: VariableId, end: usize) -> bool {
         let level = &self.levels[variable];
-        level.buffer().next_live(level.pos).is_none()
+        level
+            .buffer()
+            .next_live(level.pos)
+            .is_none_or(|candidate| candidate >= end)
     }
 }
 
@@ -1218,6 +1234,10 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
 #[derive(Clone, Copy, Debug)]
 struct Level {
     variable: VariableId,
+    /// Absolute half-open interval in the immutable proposal buffer owned by
+    /// this producer. Only nonterminal full-cohort siblings fence it.
+    candidate_begin: usize,
+    candidate_end: usize,
     width: usize,
     proposed: usize,
 }
@@ -1434,10 +1454,9 @@ where
         (0..self.depth).any(|depth| {
             let frontier = &self.depths[depth];
             frontier.group < frontier.group_limit
-                || self
-                    .stack
-                    .get(depth)
-                    .is_some_and(|level| level.proposed > self.bindings.consumed(level.variable))
+                || self.stack.get(depth).is_some_and(|level| {
+                    level.candidate_end > self.bindings.consumed(level.variable)
+                })
         })
     }
 
@@ -1482,6 +1501,65 @@ where
 
         let root = &mut right.depths[0];
         root.group_limit = root.group + 1;
+        Some(right)
+    }
+
+    /// Transfers one full query-width suffix from a confirmed nonterminal
+    /// candidate region without fragmenting the downstream cohort.
+    ///
+    /// The proposal and every confirmation have already completed, so the
+    /// published buffer is immutable. `self` retains the geometrically
+    /// widening latency prefix and every source continuation. The fenced
+    /// sibling receives exactly `self.width` live candidates and starts at
+    /// that width; repeated steals therefore peel whole natural cohorts and
+    /// never expose backend thresholds to the scheduler.
+    ///
+    /// Terminal candidates deliberately remain indivisible here. Main's
+    /// existing terminal-page transfer is the only terminal work unit, so
+    /// this experiment isolates nonterminal cohort parallelism from recursive
+    /// splitting of completed work.
+    fn split_pending_candidates(&mut self) -> Option<Self> {
+        debug_assert_eq!(self.mode, Search::NextChunk);
+        debug_assert_eq!(self.stack.len(), self.depth + 1);
+
+        if self.unbound.is_empty() {
+            return None;
+        }
+
+        let depth = self.depth;
+        let level = *self.stack.last().expect("a level to chunk");
+        let start = self.bindings.consumed(level.variable);
+        let end = level.candidate_end;
+        debug_assert!(level.candidate_begin <= start);
+        debug_assert!(end <= level.proposed);
+
+        let buffer = self.bindings.levels[level.variable].buffer();
+        let live = buffer.count_live_range(start, end);
+        if live <= self.width {
+            return None;
+        }
+        let mid = buffer
+            .live_suffix_start(start, end, self.width)
+            .expect("more than one query-width of live candidates");
+        debug_assert!(mid > start);
+        debug_assert_eq!(buffer.count_live_range(mid, end), self.width);
+
+        let mut right = self.clone();
+        let left_level = self.stack.last_mut().expect("a level to fence");
+        left_level.candidate_begin = start;
+        left_level.candidate_end = mid;
+
+        let right_level = right.stack.last_mut().expect("a cloned level to fence");
+        right_level.candidate_begin = mid;
+        right_level.candidate_end = end;
+        right_level.width = self.width;
+        right.bindings.levels[level.variable].pos = mid;
+
+        drop(right.stack.drain(..depth));
+        drop(right.depths.drain(..depth));
+        right.depth = 0;
+        let root = &mut right.depths[0];
+        root.group_limit = root.group;
         Some(right)
     }
 
@@ -1758,6 +1836,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         );
         self.stack.push(Level {
             variable,
+            candidate_begin: 0,
+            candidate_end: proposed,
             width: INITIAL_FRONTIER_WIDTH.min(self.width),
             proposed,
         });
@@ -1812,6 +1892,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     fn next_chunk(&mut self) {
         let level = *self.stack.last().expect("a level to chunk");
         let variable = level.variable;
+        let candidate_end = level.candidate_end;
         let parent = self.depth;
         let group = self.depths[parent].group - 1;
         let range = self.depths[parent].group_range(group);
@@ -1826,7 +1907,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         // wide enough to take them all. Both are known before drawing, and
         // both are `O(1)`.
         let source_rows = range.len();
-        let speculate = level.proposed == source_rows
+        let speculate = level.candidate_begin == 0
+            && level.candidate_end == level.proposed
+            && level.proposed == source_rows
             && level.width >= source_rows
             && self.depths[parent].group >= self.depths[parent].group_limit;
 
@@ -1834,6 +1917,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.bindings.draw(
                 variable,
                 level.width,
+                candidate_end,
                 &self.depths[parent].order[range],
                 &mut self.drawn,
                 &mut self.parents,
@@ -1844,6 +1928,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.bindings.take_chunk(
                 variable,
                 level.width,
+                candidate_end,
                 &head[parent].block,
                 &head[parent].order[range],
                 slots,
@@ -1866,7 +1951,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             // — it can decline a merge it should have made, never force one
             // it should not. Both branches are O(1): the level already knows
             // how many candidates it proposed and how far the cursor ran.
-            let remaining = top.proposed.saturating_sub(consumed);
+            let remaining = top.candidate_end.saturating_sub(consumed);
             top.width = if remaining < next.saturating_mul(2) {
                 // `.min(self.width)` is load-bearing, not belt-and-braces:
                 // `remaining` is bounded by the region, not by the ceiling,
@@ -1902,7 +1987,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                 .iter()
                 .enumerate()
                 .all(|(row, &parent_row)| parent_row as usize == row)
-            && self.bindings.spent(variable);
+            && self.bindings.spent(variable, candidate_end);
 
         let (head, tail) = self.depths.split_at_mut(parent + 1);
         let source = &mut head[parent];
@@ -2077,19 +2162,19 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 //
 // Usage: `find!(...).into_par_iter().map(...).collect::<Vec<_>>()`.
 //
-// The producer's `split` transfers one *whole planned frontier group* to a
+// The producer first tries to transfer one *whole planned frontier group* to a
 // sibling. A group is the rows sharing both an ordered variable-choice prefix
 // and their preferred next variable. The original producer skips that group
 // and retains the source continuation, so it can draw the next geometric page
-// while the sibling evaluates the current one. The sibling is re-rooted and
-// fenced at the group: it cannot replay later groups or ancestor work.
+// while the sibling evaluates the current one. A confirmed nonterminal region
+// may additionally peel a full query-width suffix. Every sibling is re-rooted
+// and fenced: it cannot replay later groups or ancestor work.
 //
-// No proposal buffer is bisected. This is the load-bearing difference from
-// candidate sharding: every owned group reaches `propose`/`confirm` at its
-// natural width, preserving geometric widening and accelerator-sized batches.
-// A heavy sole root group is honestly serial until executing it produces a
-// child group with a source continuation; the parallel path does not invent a
-// destructive intra-group split merely to keep rayon busy.
+// No proposal or confirmation call sees a bisected buffer. A candidate split
+// happens only after that call has published its immutable result, and only if
+// the sibling can own one full natural-width cohort. Terminal candidate regions
+// are never recursively split: main's existing whole terminal-page transfer is
+// retained unchanged.
 //
 // A built-in CPU constraint may nevertheless expose *work inside one logical
 // confirm call* to the same pool. `IntoParallelIterator` marks the query's
@@ -2099,10 +2184,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // word boundaries, where each worker owns disjoint killable words. That leaves
 // the frontier, proposal buffer, and any accelerator routing whole: it is data
 // parallelism inside a leaf, not another search-state split.
-// Every successful split advances the original owner's group/page cursor and
-// fences that unit out of the sibling's future, so ownership is a strict
-// progress measure. Rayon's pressure splitter needs no engine-specific split
-// budget.
+// Every successful split advances a group/page cursor or shortens one owned
+// candidate interval by a full cohort, so ownership is a strict progress
+// measure. Rayon's pressure splitter needs no engine-specific split budget.
 //
 // `fold_with` is the terminal leaf: it just drives the existing sequential
 // `Iterator::next()` and feeds results into the folder. No duplicated
@@ -2192,10 +2276,17 @@ mod parallel {
                     }
                     Search::Done => return (self, None),
                     Search::NextChunk => {
-                        // Draw the next geometric page intact. Planning its
-                        // child frontier exposes one or more whole groups on
-                        // the next loop iteration; those are the stealable
-                        // units, not slices of this proposal buffer.
+                        if let Some(right) = q.split_pending_candidates() {
+                            return (
+                                self,
+                                Some(QueryParIter {
+                                    inner: Box::new(right),
+                                }),
+                            );
+                        }
+                        // Draw the next geometric page from this producer's
+                        // fenced interval. Planning the child may expose
+                        // further whole groups on the next loop iteration.
                         q.next_chunk();
                     }
                 }
@@ -2436,7 +2527,7 @@ mod tests {
 
             let mut drawn = Vec::new();
             let mut parents = Vec::new();
-            left.draw(0, 1, &[0], &mut drawn, &mut parents);
+            left.draw(0, 1, 3, &[0], &mut drawn, &mut parents);
             assert_eq!(left.levels[0].pos, 1);
             assert_eq!(right.levels[0].pos, 0);
             assert_eq!(right.levels[0].buffer()[0], value(1));
@@ -2696,6 +2787,12 @@ mod tests {
         #[derive(Clone)]
         struct IntentRecorder(Arc<AtomicU8>);
 
+        #[derive(Clone)]
+        struct CohortFixture {
+            roots: u32,
+            downstream_widths: Arc<std::sync::Mutex<Vec<usize>>>,
+        }
+
         impl<'a> Constraint<'a> for IntentRecorder {
             fn variables(&self) -> VariableSet {
                 variable_set([0])
@@ -2718,6 +2815,54 @@ mod tests {
                 for row in 0..frontier.len() {
                     proposals.open(row as u32);
                     proposals.push(Fixture::value(0x55, row as u32));
+                }
+            }
+
+            fn confirm(
+                &self,
+                _variable: VariableId,
+                _frontier: &Frontier<'_>,
+                _candidates: &mut Candidates<'_>,
+            ) {
+            }
+        }
+
+        impl<'a> Constraint<'a> for CohortFixture {
+            fn variables(&self) -> VariableSet {
+                variable_set([0, 1])
+            }
+
+            fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+                match variable {
+                    0 => Some(self.roots as usize),
+                    1 => Some(if binding.get(0).is_some() {
+                        1
+                    } else {
+                        usize::MAX
+                    }),
+                    _ => None,
+                }
+            }
+
+            fn propose(
+                &self,
+                variable: VariableId,
+                frontier: &Frontier<'_>,
+                proposals: &mut ProposalBuffer,
+            ) {
+                if variable == 1 {
+                    self.downstream_widths.lock().unwrap().push(frontier.len());
+                }
+                for row in 0..frontier.len() {
+                    proposals.open(row as u32);
+                    if variable == 0 {
+                        proposals.extend((0..self.roots).map(|root| Fixture::value(0xc0, root)));
+                    } else {
+                        let root = u32::from_be_bytes(
+                            frontier.row(row).get(0).unwrap()[28..].try_into().unwrap(),
+                        );
+                        proposals.push(Fixture::value(0xc1, root));
+                    }
                 }
             }
 
@@ -2840,6 +2985,13 @@ mod tests {
             binding.get(0).copied()
         }
 
+        fn projected_pair(binding: &Binding<'_>) -> Option<(u32, u32)> {
+            Some((
+                u32::from_be_bytes(binding.get(0)?[28..].try_into().unwrap()),
+                u32::from_be_bytes(binding.get(1)?[28..].try_into().unwrap()),
+            ))
+        }
+
         fn query(fanout: u32) -> TestQuery {
             Query::new(
                 Fixture(fanout),
@@ -2948,6 +3100,59 @@ mod tests {
             actual.sort_unstable();
             assert_eq!(actual, expected, "splitting must preserve the exact bag");
             assert_eq!(actual.iter().filter(|row| row[31] == 2).count(), 1);
+        }
+
+        #[test]
+        fn nonterminal_splits_peel_full_live_cohorts_and_keep_the_prefix_lazy() {
+            let downstream_widths = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut left = Query::new(
+                CohortFixture {
+                    roots: 10,
+                    downstream_widths: Arc::clone(&downstream_widths),
+                },
+                projected_pair as fn(&Binding<'_>) -> Option<(u32, u32)>,
+            )
+            .with_frontier_width(4);
+
+            left.plan();
+            left.next_group();
+            assert_eq!(left.mode, Search::NextChunk);
+            assert_eq!(left.stack[0].width, 1);
+
+            let right = left
+                .split_pending_candidates()
+                .expect("ten live rows can peel one four-row cohort");
+            let middle = left
+                .split_pending_candidates()
+                .expect("six remaining rows can peel a second cohort");
+            assert!(left.split_pending_candidates().is_none());
+
+            assert_eq!(
+                (
+                    left.stack[0].candidate_begin,
+                    left.stack[0].candidate_end,
+                    left.stack[0].width,
+                ),
+                (0, 2, 1)
+            );
+            for sibling in [&middle, &right] {
+                assert_eq!(
+                    (
+                        sibling.stack[0].candidate_end - sibling.stack[0].candidate_begin,
+                        sibling.stack[0].width,
+                    ),
+                    (4, 4)
+                );
+            }
+
+            let mut actual: Vec<_> = left.chain(middle).chain(right).collect();
+            actual.sort_unstable();
+            let expected: Vec<_> = (0..10).map(|root| (root, root)).collect();
+            assert_eq!(actual, expected);
+
+            let widths = downstream_widths.lock().unwrap();
+            assert_eq!(widths.iter().filter(|&&width| width == 4).count(), 2);
+            assert!(widths.iter().all(|&width| matches!(width, 1 | 4)));
         }
 
         fn advance_to_emit(query: &mut TestQuery) {

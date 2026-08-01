@@ -347,6 +347,73 @@ impl ProposalBuffer {
                 .sum::<usize>()
     }
 
+    /// Number of live entries in the half-open interval `start..end`.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn count_live_range(&self, start: usize, end: usize) -> usize {
+        let end = end.min(self.entries.len());
+        if start >= end {
+            return 0;
+        }
+
+        let first = start / BITS;
+        let last = (end - 1) / BITS;
+        (first..=last)
+            .map(|word| {
+                let lo = if word == first { start % BITS } else { 0 };
+                let hi = if word == last {
+                    (end - 1) % BITS + 1
+                } else {
+                    BITS
+                };
+                (self.live[word] & bit_range_mask(lo, hi)).count_ones() as usize
+            })
+            .sum()
+    }
+
+    /// Start index of the suffix containing exactly `count` live entries in
+    /// `start..end`.
+    ///
+    /// Dead slots remain in one of the two immutable candidate intervals, but
+    /// the returned boundary itself names the suffix's first live entry.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn live_suffix_start(
+        &self,
+        start: usize,
+        end: usize,
+        count: usize,
+    ) -> Option<usize> {
+        let end = end.min(self.entries.len());
+        if count == 0 || start >= end {
+            return None;
+        }
+
+        let first = start / BITS;
+        let last = (end - 1) / BITS;
+        let mut needed = count;
+        for word_index in (first..=last).rev() {
+            let lo = if word_index == first { start % BITS } else { 0 };
+            let hi = if word_index == last {
+                (end - 1) % BITS + 1
+            } else {
+                BITS
+            };
+            let mut word = self.live[word_index] & bit_range_mask(lo, hi);
+            let in_word = word.count_ones() as usize;
+            if in_word < needed {
+                needed -= in_word;
+                continue;
+            }
+
+            for _ in 1..needed {
+                let high = u32::BITS - 1 - word.leading_zeros();
+                word &= !(1u32 << high);
+            }
+            let high = u32::BITS - 1 - word.leading_zeros();
+            return Some(word_index * BITS + high as usize);
+        }
+        None
+    }
+
     /// Whether entry `i` is live.
     pub fn is_live(&self, i: usize) -> bool {
         debug_assert!(i < self.entries.len(), "liveness read past the buffer");
@@ -958,6 +1025,26 @@ mod tests {
         }
         let expected: Vec<usize> = (0..5).chain((5..70).filter(|i| i % 2 == 0)).collect();
         assert_eq!(live_indices(&b), expected);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn live_suffix_selection_respects_dead_and_unaligned_boundaries() {
+        let mut b = filled(100);
+        {
+            let mut all = b.region(0);
+            for i in [5usize, 7, 31, 32, 63, 64, 91, 98] {
+                all.kill(i);
+            }
+        }
+
+        assert_eq!(b.count_live_range(5, 99), 86);
+        let split = b.live_suffix_start(5, 99, 17).unwrap();
+        assert_eq!(b.count_live_range(split, 99), 17);
+        assert_eq!(b.count_live_range(5, split), 69);
+        assert!(b.is_live(split));
+        assert_eq!(b.live_suffix_start(5, 99, 87), None);
+        assert_eq!(b.live_suffix_start(5, 99, 0), None);
     }
 
     /// Read-side neutrality: entries 0..5 are live but are not this region's
