@@ -16,10 +16,11 @@ memory map never exposes half-written records.
 
 ## Record model: uniform 256-byte records (V3)
 
-Every record the pile writes today — blob, branch (pin) head, branch
-tombstone, weak-pin marker, weak-unpin marker — uses the **V3** layout: a
-fixed **256-byte header**, followed (for blobs) by the payload, padded so the
-whole record is a **256-byte multiple**. This uniformity is load-bearing:
+Every record the pile writes today — blob, legacy branch (pin) head, legacy
+branch tombstone, signed branch assertion, weak-pin marker, weak-unpin marker
+— uses the **V3** layout: a fixed **256-byte header**, followed (for blobs) by
+the payload, padded so the whole record is a **256-byte multiple**. This
+uniformity is load-bearing:
 
 - **Position independence.** Blob data starts at the constant
   `record_start + 256`; there is no offset-derived padding. A record means
@@ -40,9 +41,11 @@ never fork into distinct blobs.
 The reader still accepts the original **V1** records (64-byte-aligned blob,
 branch, and tombstone layouts — see [Legacy V1 records](#legacy-v1-records)),
 so piles written before V3 read byte-identical with no migration step. New
-writes are always V3. The skew direction to watch is the other one: **binaries
-from before V3 treat V3 records as unknown and fail loud with
-`ReadError::CorruptPile`** — they do not truncate anything. When an old binary
+writes are always V3. The skew direction to watch is the other one: **a binary
+that predates a particular record marker treats that record as unknown and
+fails loud with `ReadError::CorruptPile`** during normal reads. It does not
+truncate implicitly, but an operator who explicitly runs `amputate` through
+that binary *will* truncate at the first unknown marker. When an old binary
 reports corruption on a pile a newer binary wrote, the fix is to upgrade the
 binary, never to "repair" the pile.
 
@@ -66,9 +69,9 @@ refreshing state.
    `applied_length`, and rebuilds the blob/pin indices in memory. It **fails
    loud** on a corrupt or torn tail (`ReadError::CorruptPile { valid_length }`)
    and never mutates the file. Callers rarely need to invoke it directly:
-   `reader`, `pins`, `head`, and `update` call `refresh` internally before they
-   inspect or apply records, so external writers are visible without a
-   standalone scan.
+   `reader`, legacy pin operations, and branch-assertion snapshot/append
+   operations call `refresh` internally before they inspect or apply records,
+   so external writers are visible without a standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
    path: it re-runs validation under an exclusive lock and truncates the file
    back to the last valid record, discarding a torn tail left by a crash. It
@@ -76,10 +79,13 @@ refreshing state.
    under version skew is a silent data-loss hazard (an old binary would "eat"
    every newer-format record past the first one it misreads as corruption).
    The `trible pile amputate <path>` command wraps it for operators.
-4. **Append new records.** `put` (through the `BlobStorePut` trait) and pin
-   update helpers extend the file via a single `write_vectored` call. Each
-   append immediately feeds the bytes back through the record scanner so
-   in-memory indices stay synchronised without waiting for a manual `refresh`.
+4. **Append new records.** `put` (through the `BlobStorePut` trait) normally
+   extends the file via one `write_vectored` call; small legacy pin records use
+   one fixed-header write. A branch assertion takes the exclusive lock, writes
+   one 256-byte record, replays it, and crosses `sync_all` before reporting
+   success because its storage trait promises durable append. Every append
+   feeds its bytes back through the record scanner so in-memory indices stay
+   synchronised without waiting for a manual `refresh`.
    Records larger than ~1&nbsp;GiB can't be appended in a single atomic
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
    macOS and `MAX_RW_COUNT` (~2&nbsp;GiB) on Linux. In that case `put` takes
@@ -108,8 +114,11 @@ after a crash, so validation and repair only operate on that region. Each
 record's validation state is cached for the lifetime of the process under this
 assumption, avoiding repeated hash verification for frequently accessed blobs.
 
-Hash verification only happens when blobs are read. Opening even a very large
-pile is therefore fast while still catching corruption before data is used.
+Blob hash verification only happens when blobs are read. Signed branch
+assertions are different: replay verifies every Ed25519 signature eagerly so
+raw or invalid assertion bytes never enter a public snapshot. Opening remains
+lazy over blob payloads, but its cost now includes one verification per new
+assertion record.
 
 Every record begins with a 16&nbsp;byte magic marker that identifies its kind.
 The sections below illustrate the layout of each type.
@@ -125,9 +134,9 @@ remembers the last offset it processed and, after appending, scans any gap left
 by concurrent writes before advancing this `applied_length`. Writers may race
 and duplicate blobs, but content addressing keeps the data consistent. Each
 handle tracks hashes of pending appends separately so repeated writes are
-deduplicated until a `refresh`. Pin updates only record the referenced hash and
-do not verify that the corresponding blob exists in the pile, so a pile may act
-as a head-only store when blob data resides elsewhere.
+deduplicated until a `refresh`. Legacy pin updates and branch assertions do not
+require the referenced commit blob to exist in the pile, so assertions may
+arrive before their content under lazy replication.
 
 ```rust,ignore
 use std::error::Error;
@@ -250,6 +259,38 @@ pile does not check whether the referenced blob exists locally, allowing
 deployments that store heads on disk while serving blob contents from a remote
 store.
 
+These records remain readable for migration, but their last-writer-wins/CAS
+semantics are distinct from the grow-only branch assertions below. Writers must
+not dual-author both forms as though they were one branch state.
+
+## Signed Branch-Assertion Records
+
+```text
+            ┌────16 byte───┐┌────32 byte────┐┌────32 byte────┐┌────32 byte────┐┌────64 byte────┐┌──80 byte──┐
+          ┌ ┌──────────────┐┌───────────────┐┌───────────────┐┌───────────────┐┌───────────────┐┌───────────┐
+ assertion│ │ DACC… marker ││  author key   ││  name handle  ││ commit handle ││   signature   ││  zero pad │
+ (256 B)  └ └──────────────┘└───────────────┘└───────────────┘└───────────────┘└───────────────┘└───────────┘
+```
+
+The marker is `DACC331F5C1C2036E6725C7B24EE2A51`. Bytes 16–176 are exactly the
+canonical 160-byte `BranchAssertion` encoding; neither `BranchId` nor
+`AssertionId` is stored because both are derived from those bytes. The final
+80 bytes must be zero. Replay rejects nonzero padding instead of treating it as
+an extension envelope, and strictly verifies the Ed25519 signature before
+exposing the assertion.
+
+Assertion records form a set: concatenating piles unions them, physical order
+has no meaning, and exact duplicates collapse in the in-memory
+`BranchId || AssertionId` PATCH. There is no replacement, tombstone, scalar
+head, or silent pressure eviction. Authorization remains an ingest-layer
+decision over a configured identity/key set; the raw Pile store verifies
+authenticity but does not choose which authors a deployment trusts.
+
+Legacy `squash`, `extract`, and `reid` rewrites fail closed when their source
+contains assertion records. Until those operations gain assertion-native
+semantics, accepting such a source would create a plausible destination while
+silently dropping shared state.
+
 ## Weak-Pin Records (want / retention markers)
 
 ```text
@@ -280,9 +321,11 @@ had no weak-pin records.
 ## Recovery
 
 `refresh` scans an existing file to ensure every header uses a known marker
-and that the whole record fits. It does not verify any hashes. If a truncated
-or unknown block is found the function reports the number of bytes that were
-valid so far using `ReadError::CorruptPile` — and leaves the file untouched.
+and that the whole record fits. It does not verify blob hashes, but it does
+strictly verify signed branch assertions before admitting them. If a truncated,
+unknown, or invalid assertion record is found, the function reports the number
+of bytes that were valid so far using `ReadError::CorruptPile` — and leaves the
+file untouched.
 
 If the file shrinks between scans into data that has already been applied, the
 process aborts immediately. Previously returned `Bytes` handles would dangle
@@ -297,9 +340,9 @@ validation under an exclusive lock and truncates the file to the valid length
 if corruption is encountered, discarding incomplete data left by an
 interrupted write. Run it deliberately (e.g. via `trible pile amputate <path>`)
 — never as a routine part of opening — and only once you know the "corruption"
-isn't just an older binary meeting newer record kinds. Hash verification
-happens lazily only when individual blobs are loaded so that opening a large
-pile remains fast.
+isn't just an older binary meeting newer record kinds. Blob hash verification
+happens lazily only when individual blobs are loaded; assertion signature
+verification is part of replay.
 
 For more details on interacting with a pile see the [`Pile` struct
 documentation](https://docs.rs/triblespace/latest/triblespace/repo/pile/struct.Pile.html).

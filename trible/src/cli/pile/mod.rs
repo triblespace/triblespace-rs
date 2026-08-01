@@ -3,6 +3,7 @@ use clap::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use triblespace_core::repo::branch_assertion::BranchAssertionStore;
 use triblespace_core::repo::pile::Pile;
 
 pub mod blob;
@@ -168,6 +169,37 @@ pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
             path.display(),
             path.display()
         ));
+    }
+    Ok(pile)
+}
+
+/// Refuse to feed assertion-bearing piles through a legacy rewrite.
+///
+/// `squash`, `extract`, and `reid` currently reconstruct only the legacy
+/// pin/commit representation. Letting one of them accept a mixed source would
+/// produce a plausible destination while silently omitting the grow-only
+/// assertion set. They must fail closed until the final assertion-native
+/// publication migration gives each operation an explicit meaning.
+pub(crate) fn open_legacy_rewrite_source(path: &Path, operation: &str) -> Result<Pile> {
+    let mut pile = open_refreshed(path)?;
+    let check = pile
+        .assertion_snapshot()
+        .map_err(|err| anyhow!("inspect assertions in {}: {err}", path.display()))
+        .and_then(|snapshot| {
+            let assertion_count = snapshot.len();
+            if assertion_count == 0 {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "refusing to {operation} {}: source contains {assertion_count} signed branch \
+                     assertion record(s), but this legacy rewrite cannot preserve them",
+                    path.display()
+                ))
+            }
+        });
+    if let Err(err) = check {
+        let _ = pile.close();
+        return Err(err);
     }
     Ok(pile)
 }

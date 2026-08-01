@@ -1,6 +1,6 @@
-//! A Pile is an append-only collection of blobs and branches stored in a single
-//! file. It is designed as a durable local repository storage that can be safely
-//! shared between threads.
+//! A Pile is an append-only collection of blobs, legacy pin registers, and
+//! grow-only branch assertions stored in one file. It is designed as durable
+//! local repository storage that can be safely shared between threads.
 //!
 //! The pile operates as a **WAL-as-a-DB**: the write-ahead log _is_ the database.
 //! All indices and metadata are reconstructed from the log on startup and no
@@ -57,13 +57,18 @@ use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
+use crate::repo::branch_assertion::{
+    AssertionId, AssertionKeyCollision, BranchAssertion, BranchAssertionSnapshot,
+    BranchAssertionStore, BRANCH_ASSERTION_LEN,
+};
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
 /// V3 record markers — the uniform 256-byte-header format (minted 2026-06-29 via
-/// `trible genid`). Every V3 record (blob/branch/tombstone) has a FIXED 256-byte
-/// header and is padded to a 256-byte multiple. Consequences:
+/// `trible genid`). Every V3 record (blob, legacy branch cell, signed branch
+/// assertion, or weak marker) has a FIXED 256-byte header and is padded to a
+/// 256-byte multiple. Consequences:
 ///   * blob data starts at a constant `record_start + V3_HEADER_LEN` — reads are
 ///     position-INDEPENDENT (no offset-derived pad), so a record survives
 ///     relocation/`cat` and is found correctly regardless of its offset;
@@ -76,6 +81,11 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C
 const MAGIC_MARKER_BLOB_V3: RawId = hex!("9C33EEB525065A62EAEC4BE43DCC355A");
 const MAGIC_MARKER_BRANCH_V3: RawId = hex!("AC363D04AFE1AF17B39581B1E23021D7");
 const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205671E4F");
+/// Signed grow-only branch-assertion marker (minted 2026-08-01 via
+/// `trible genid`). The record is marker + canonical 160-byte assertion +
+/// zeroed padding, exactly one V3 unit. Nonzero padding is rejected so these
+/// records cannot become an implicit extension envelope.
+const MAGIC_MARKER_BRANCH_ASSERTION_V3: RawId = hex!("DACC331F5C1C2036E6725C7B24EE2A51");
 /// Weak-pin marker pair (minted 2026-07-01 via `trible genid`). Retention is
 /// one strength axis resolved last-writer-wins by log position:
 /// `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin` — the branch record IS `pin`, the
@@ -98,6 +108,8 @@ const GPU_DATA_ALIGNMENT: usize = 256;
 /// and the whole record is padded to a multiple of this.
 const V3_HEADER_LEN: usize = 256;
 const V3_ALIGNMENT: usize = GPU_DATA_ALIGNMENT;
+const BRANCH_ASSERTION_RESERVED_LEN: usize =
+    V3_HEADER_LEN - std::mem::size_of::<RawId>() - BRANCH_ASSERTION_LEN;
 /// Post-data padding that rounds a V3 record up to a 256-byte multiple. The
 /// header is already 256, so this only rounds the data length.
 fn v3_post_pad(data_len: usize) -> usize {
@@ -340,6 +352,25 @@ impl BranchTombstoneHeaderV3 {
     }
 }
 
+/// V3 signed branch assertion — one complete fixed 256-byte record.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct BranchAssertionHeaderV3 {
+    magic_marker: RawId,
+    assertion: [u8; BRANCH_ASSERTION_LEN],
+    reserved: [u8; BRANCH_ASSERTION_RESERVED_LEN],
+}
+
+impl BranchAssertionHeaderV3 {
+    fn new(assertion: BranchAssertion) -> Self {
+        Self {
+            magic_marker: MAGIC_MARKER_BRANCH_ASSERTION_V3,
+            assertion: assertion.encode(),
+            reserved: [0u8; BRANCH_ASSERTION_RESERVED_LEN],
+        }
+    }
+}
+
 /// V3 weak-pin marker — fixed 256 bytes. Keyed by blob handle (no branch id);
 /// see the docs on [`MAGIC_MARKER_WEAK_PIN_V3`] for the retention lattice.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
@@ -385,6 +416,7 @@ const _: () = {
     assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<BranchHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<BranchTombstoneHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<BranchAssertionHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakPinHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakUnpinHeaderV3>() == V3_HEADER_LEN);
 };
@@ -435,6 +467,11 @@ pub enum PileRecordContent {
     BranchTombstone {
         /// The branch being tombstoned.
         branch_id: Id,
+    },
+    /// A strictly verified, grow-only branch assertion.
+    BranchAssertion {
+        /// The canonical signed assertion carried by this record.
+        assertion: BranchAssertion,
     },
     /// A weak-pin marker for a blob handle.
     WeakPin {
@@ -554,6 +591,20 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
                 content: PileRecordContent::BranchTombstone { branch_id },
             })
         }
+        MAGIC_MARKER_BRANCH_ASSERTION_V3 => {
+            let (header, _) =
+                BranchAssertionHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let assertion =
+                BranchAssertion::decode_verified(header.assertion).map_err(|_| corrupt())?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::BranchAssertion { assertion },
+            })
+        }
         MAGIC_MARKER_WEAK_PIN_V3 => {
             let (header, _) =
                 WeakPinHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
@@ -648,13 +699,12 @@ fn indexed_blob_record(
 
 /// Iterator over the raw records of a pile file, in log order.
 ///
-/// This is the record-level view of the append-only log: every blob, branch
-/// update, branch tombstone, and weak-pin marker ever appended, including
-/// records that later ones supersede (superseded branch heads, tombstoned
-/// branches, retracted weak pins). It shares its decoder with the [`Pile`]
-/// replay path, so both V1 and V3 records are understood; tools that need
-/// history or forensics (reflogs, consolidation, corruption reports) should
-/// consume this instead of hand-rolling a parser.
+/// This is the record-level view of the append-only log: every blob, legacy
+/// branch update/tombstone, signed branch assertion, and weak-pin marker ever
+/// appended, including records that later ones supersede. It shares its
+/// decoder with the [`Pile`] replay path, so both V1 and V3 records are
+/// understood; tools that need history or forensics (reflogs, consolidation,
+/// corruption reports) should consume this instead of hand-rolling a parser.
 ///
 /// The iterator yields `Err(`[`ReadError::CorruptPile`]`)` and then ends when
 /// it encounters an unknown magic marker or a truncated record — a partial
@@ -669,8 +719,8 @@ pub struct PileRecords {
 
 impl PileRecords {
     /// Opens the pile file at `path` read-only and returns an iterator over
-    /// its records. No index is built and nothing is validated eagerly; blob
-    /// payloads are not hashed.
+    /// its records. No index is built and blob payloads are not hashed; signed
+    /// branch assertions are nevertheless verified before being yielded.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = File::open(path)?;
         let length = file.metadata()?.len();
@@ -722,12 +772,14 @@ enum Applied {
     Blob { hash: Inline<Hash<Blake3>> },
     Branch { id: Id, hash: Inline<Hash<Blake3>> },
     BranchTombstone { id: Id },
+    BranchAssertion { id: AssertionId },
     WeakPin { handle: Inline<Handle<UnknownBlob>> },
     WeakUnpin { handle: Inline<Handle<UnknownBlob>> },
 }
 
 #[derive(Debug)]
-/// A grow-only collection of blobs and pin heads backed by a single file on disk.
+/// A grow-only collection of blobs, pin records, and signed branch assertions
+/// backed by a single file on disk.
 ///
 /// Branch updates do not verify that referenced blobs exist in the pile, allowing the
 /// pile to operate as a head-only store when blob data lives elsewhere.
@@ -745,6 +797,7 @@ pub struct Pile {
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
     validations: ValidationCache,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
+    assertions: BranchAssertionSnapshot,
     /// LWW-resolved weak-pin set: weak-pin records insert the handle,
     /// weak-unpin records remove it; log-order application makes the last
     /// record for a handle win by construction.
@@ -1019,6 +1072,55 @@ impl From<ReadError> for PileWriteError {
     }
 }
 
+/// Error returned by the grow-only branch-assertion store.
+#[derive(Debug)]
+pub enum PileAssertionError {
+    /// Existing pile bytes could not be replayed safely.
+    ReadError(ReadError),
+    /// Appending or durably flushing the assertion failed.
+    IoError(std::io::Error),
+    /// Two different verified assertions produced the same 48-byte index key.
+    KeyCollision(AssertionKeyCollision),
+}
+
+impl std::fmt::Display for PileAssertionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadError(err) => write!(f, "pile replay failed: {err}"),
+            Self::IoError(err) => write!(f, "assertion append failed: {err}"),
+            Self::KeyCollision(err) => std::fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl std::error::Error for PileAssertionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadError(err) => Some(err),
+            Self::IoError(err) => Some(err),
+            Self::KeyCollision(err) => Some(err),
+        }
+    }
+}
+
+impl From<ReadError> for PileAssertionError {
+    fn from(err: ReadError) -> Self {
+        Self::ReadError(err)
+    }
+}
+
+impl From<std::io::Error> for PileAssertionError {
+    fn from(err: std::io::Error) -> Self {
+        Self::IoError(err)
+    }
+}
+
+impl From<AssertionKeyCollision> for PileAssertionError {
+    fn from(err: AssertionKeyCollision) -> Self {
+        Self::KeyCollision(err)
+    }
+}
+
 /// Error returned when retrieving a blob from a [`Pile`].
 #[derive(Debug)]
 pub enum GetBlobError<E: Error> {
@@ -1099,6 +1201,7 @@ impl Pile {
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
             validations: ValidationCache::default(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
+            assertions: BranchAssertionSnapshot::new(),
             weak_pins: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
         })
@@ -1220,6 +1323,15 @@ impl Pile {
                 self.branches.remove(&branch_id.into());
                 Applied::BranchTombstone { id: branch_id }
             }
+            PileRecordContent::BranchAssertion { assertion } => {
+                let id = assertion.id();
+                self.assertions
+                    .insert(assertion)
+                    .map_err(|_| ReadError::CorruptPile {
+                        valid_length: start_offset,
+                    })?;
+                Applied::BranchAssertion { id }
+            }
             PileRecordContent::WeakPin { handle } => {
                 self.weak_pins.insert(&Entry::new(&handle.raw));
                 Applied::WeakPin { handle }
@@ -1315,6 +1427,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.blobs);
             std::ptr::drop_in_place(&mut this.validations);
             std::ptr::drop_in_place(&mut this.branches);
+            std::ptr::drop_in_place(&mut this.assertions);
             std::ptr::drop_in_place(&mut this.weak_pins);
         }
 
@@ -1564,6 +1677,7 @@ impl Pile {
                     }
                     Some(Applied::Branch { .. }) => {}
                     Some(Applied::BranchTombstone { .. }) => {}
+                    Some(Applied::BranchAssertion { .. }) => {}
                     Some(Applied::WeakPin { .. }) => {}
                     Some(Applied::WeakUnpin { .. }) => {}
                     None => {
@@ -1698,6 +1812,60 @@ impl PinStore for Pile {
         let out = res?;
         unlock_res?;
         Ok(out)
+    }
+}
+
+impl BranchAssertionStore for Pile {
+    type Error = PileAssertionError;
+
+    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
+        self.refresh()?;
+        Ok(self.assertions.clone())
+    }
+
+    /// Append one verified assertion as a fixed 256-byte Pile record.
+    ///
+    /// Unlike the legacy pin and weak-pin APIs, this method fulfils the trait's
+    /// durability promise before returning: both fresh appends and idempotent
+    /// duplicates pass through `sync_all` while the exclusive Pile lock is
+    /// held. A fresh record is decoded and applied through the normal replay
+    /// path before the durability barrier, so the disk parser remains the one
+    /// source of truth for admission.
+    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
+        self.file.lock()?;
+        let result = (|| {
+            self.refresh_locked()?;
+
+            if self.assertions.contains(&assertion)? {
+                self.file.sync_all()?;
+                self.dirty = false;
+                return Ok(());
+            }
+
+            let header = BranchAssertionHeaderV3::new(assertion);
+            self.dirty = true;
+            self.file.write_all(header.as_bytes())?;
+            match self.apply_next()? {
+                Some(Applied::BranchAssertion { id }) if id == assertion.id() => {}
+                Some(_) => {
+                    return Err(PileAssertionError::IoError(std::io::Error::other(
+                        "unexpected record after branch assertion write",
+                    )));
+                }
+                None => {
+                    return Err(PileAssertionError::IoError(std::io::Error::other(
+                        "branch assertion missing after write",
+                    )));
+                }
+            }
+            self.file.sync_all()?;
+            self.dirty = false;
+            Ok(())
+        })();
+        let unlock_result = self.file.unlock();
+        result?;
+        unlock_result?;
+        Ok(())
     }
 }
 
@@ -1846,6 +2014,7 @@ impl crate::repo::BlobStoreMeta for PileReader {
 mod tests {
     use super::*;
 
+    use ed25519_dalek::SigningKey;
     use rand::RngCore;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -1856,6 +2025,14 @@ mod tests {
 
     use crate::repo::BlobStoreMeta;
     use crate::repo::PushResult;
+
+    fn branch_assertion(key: u8, name: u8, commit: u8) -> BranchAssertion {
+        BranchAssertion::sign(
+            &SigningKey::from_bytes(&[key; 32]),
+            Inline::new([name; 32]),
+            Inline::new([commit; 32]),
+        )
+    }
 
     fn fresh_empty_pile_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         let path = dir.path().join(name);
@@ -1886,6 +2063,147 @@ mod tests {
             std::mem::size_of::<IndexEntry>(),
             std::mem::size_of::<usize>()
         );
+    }
+
+    #[test]
+    fn branch_assertion_record_is_fixed_verified_idempotent_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "assertion.pile");
+        let assertion = branch_assertion(7, 11, 19);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.append_assertion(assertion).unwrap();
+        assert!(!pile.dirty, "durable assertion append must cross sync_all");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            V3_HEADER_LEN as u64
+        );
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..16], &MAGIC_MARKER_BRANCH_ASSERTION_V3);
+        assert_eq!(&bytes[16..16 + BRANCH_ASSERTION_LEN], &assertion.encode());
+        assert!(bytes[16 + BRANCH_ASSERTION_LEN..]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        let snapshot = pile.assertion_snapshot().unwrap();
+        assert_eq!(
+            snapshot.iter().copied().collect::<Vec<_>>(),
+            vec![assertion]
+        );
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        pile.append_assertion(assertion).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+        pile.close().unwrap();
+
+        let mut second_handle = Pile::open(&path).unwrap();
+        second_handle.append_assertion(assertion).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+        second_handle.close().unwrap();
+
+        let records: Vec<_> = PileRecords::open(&path)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].content,
+            PileRecordContent::BranchAssertion { assertion: decoded }
+                if decoded == assertion
+        ));
+
+        let mut reopened = Pile::open(&path).unwrap();
+        let snapshot = reopened.assertion_snapshot().unwrap();
+        assert_eq!(
+            snapshot.iter().copied().collect::<Vec<_>>(),
+            vec![assertion]
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn branch_assertion_record_rejects_bad_signatures_and_nonzero_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        let assertion = branch_assertion(7, 11, 19);
+        let canonical = BranchAssertionHeaderV3::new(assertion);
+
+        for (name, corrupt_at) in [
+            ("signature.pile", 16 + 96),
+            ("reserved.pile", V3_HEADER_LEN - 1),
+        ] {
+            let path = fresh_empty_pile_path(&dir, name);
+            let mut bytes = canonical.as_bytes().to_vec();
+            bytes[corrupt_at] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+
+            let mut pile = Pile::open(&path).unwrap();
+            assert!(matches!(
+                pile.refresh(),
+                Err(ReadError::CorruptPile { valid_length: 0 })
+            ));
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn truncated_branch_assertion_reports_and_amputates_at_the_record_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = BranchAssertionHeaderV3::new(branch_assertion(7, 11, 19));
+        let second = BranchAssertionHeaderV3::new(branch_assertion(7, 11, 23));
+
+        for prefix_len in [1usize, 16, 175, V3_HEADER_LEN - 1] {
+            let path = fresh_empty_pile_path(&dir, &format!("truncated-{prefix_len}.pile"));
+            let mut bytes = first.as_bytes().to_vec();
+            bytes.extend_from_slice(&second.as_bytes()[..prefix_len]);
+            std::fs::write(&path, bytes).unwrap();
+
+            let mut pile = Pile::open(&path).unwrap();
+            assert!(matches!(
+                pile.refresh(),
+                Err(ReadError::CorruptPile { valid_length })
+                    if valid_length == V3_HEADER_LEN
+            ));
+            pile.amputate().unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                V3_HEADER_LEN as u64
+            );
+            assert_eq!(pile.assertion_snapshot().unwrap().len(), 1);
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn cat_merge_unions_branch_assertions_without_log_order_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let left_path = fresh_empty_pile_path(&dir, "left.pile");
+        let right_path = fresh_empty_pile_path(&dir, "right.pile");
+        let first = branch_assertion(7, 11, 19);
+        let second = branch_assertion(7, 11, 23);
+
+        let mut left = Pile::open(&left_path).unwrap();
+        left.append_assertion(first).unwrap();
+        left.close().unwrap();
+
+        let mut right = Pile::open(&right_path).unwrap();
+        right.append_assertion(second).unwrap();
+        right.append_assertion(first).unwrap();
+        right.close().unwrap();
+
+        let right_bytes = std::fs::read(&right_path).unwrap();
+        let mut left_file = OpenOptions::new().append(true).open(&left_path).unwrap();
+        left_file.write_all(&right_bytes).unwrap();
+        left_file.sync_all().unwrap();
+        drop(left_file);
+
+        let mut merged = Pile::open(&left_path).unwrap();
+        let snapshot = merged.assertion_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 2);
+        let assertions: Vec<_> = snapshot.iter().copied().collect();
+        assert!(assertions.contains(&first));
+        assert!(assertions.contains(&second));
+        merged.close().unwrap();
     }
 
     #[test]
@@ -3263,11 +3581,11 @@ mod tests {
         pile.close().unwrap();
     }
 
-    /// Mixed pile: a legacy V1 blob, V3 blobs, branch records, and weak
-    /// markers interleaved — the scan walks every record kind cleanly and
-    /// each index (blobs, branches, weak pins) resolves correctly.
+    /// Mixed pile: a legacy V1 blob and every current V3 record family
+    /// interleaved — the scan walks them cleanly and each independent index
+    /// resolves correctly.
     #[test]
-    fn mixed_v1_v3_branch_and_weak_markers_interleave() {
+    fn mixed_v1_v3_record_families_interleave() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "mixed.pile");
 
@@ -3294,13 +3612,15 @@ mod tests {
             Blob::<UnknownBlob>::new(Bytes::from_source(vec![11u8; 13])).get_handle();
         let retracted: Inline<Handle<UnknownBlob>> =
             Blob::<UnknownBlob>::new(Bytes::from_source(vec![12u8; 13])).get_handle();
+        let assertion = branch_assertion(7, 11, 19);
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
 
-        // Interleave: weak-pin, V3 blob, branch head, weak-pin + weak-unpin,
-        // another V3 blob.
+        // Interleave every current V3 state family with blobs and one legacy
+        // V1 record.
         pile.pin_weak(want).unwrap();
+        pile.append_assertion(assertion).unwrap();
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
@@ -3326,6 +3646,14 @@ mod tests {
         drop(reader);
 
         assert_eq!(pile.head(branch_id).unwrap(), Some(h1.transmute()));
+        assert_eq!(
+            pile.assertion_snapshot()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![assertion]
+        );
 
         let pinned: HashSet<_> = pile.weak_pins().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);

@@ -93,7 +93,7 @@ impl AssertionId {
 ///
 /// The name's content may be absent locally without making the identity
 /// malformed: its content-addressed handle is the identity component.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BranchIdentity {
     author: [u8; 32],
     name: Inline<Handle<LongString>>,
@@ -135,7 +135,7 @@ impl BranchIdentity {
 }
 
 /// A canonical branch assertion whose signature has already been verified.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BranchAssertion {
     identity: BranchIdentity,
     commit: CommitHandle,
@@ -305,6 +305,18 @@ impl BranchAssertionSnapshot {
         Ok(())
     }
 
+    /// Check exact membership while still surfacing an index-key collision.
+    pub(crate) fn contains(
+        &self,
+        assertion: &BranchAssertion,
+    ) -> Result<bool, AssertionKeyCollision> {
+        match self.assertions.get(&assertion.index_key()) {
+            Some(existing) if existing == assertion => Ok(true),
+            Some(_) => Err(AssertionKeyCollision),
+            None => Ok(false),
+        }
+    }
+
     /// Union another grow-only snapshot into this one.
     pub fn union(&mut self, other: Self) -> Result<(), AssertionKeyCollision> {
         for assertion in other.iter() {
@@ -371,7 +383,17 @@ impl BranchAssertionSnapshot {
 /// Storage surface for the shared grow-only assertion layer.
 ///
 /// Duplicate append is success. The trait deliberately has no update, delete,
-/// tombstone, compare-and-swap, or scalar-head method.
+/// tombstone, compare-and-swap, or scalar-head method. Implementations must
+/// retain every accepted assertion or fail explicitly; storage pressure must
+/// never silently evict replicated state.
+///
+/// Signature verification is not authorization. A replication ingest boundary
+/// MUST restrict assertions to its configured identity/key set before calling
+/// [`Self::append_assertion`]. The raw store remains policy-agnostic and does
+/// not require the asserted commit metadata to be present locally. Skipping
+/// that gate does not change the fold's mathematical correctness, but permits
+/// unbounded storage and attention consumption; overload must reject explicitly
+/// rather than silently drop accepted state.
 pub trait BranchAssertionStore {
     /// Storage error.
     type Error: Error + fmt::Debug + Send + Sync + 'static;

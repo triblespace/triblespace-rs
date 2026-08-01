@@ -27,7 +27,7 @@ pub fn run(
 
     // Open source pile. Fail loud on a corrupt tail — reading the source
     // must never mutate it (destructive repair is `trible pile amputate`).
-    let mut src_pile = super::open_refreshed(&source)?;
+    let mut src_pile = super::open_legacy_rewrite_source(&source, "squash")?;
 
     // Enumerate branches.
     let branch_ids: Vec<Id> = src_pile

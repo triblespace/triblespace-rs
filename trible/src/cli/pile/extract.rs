@@ -68,7 +68,7 @@ struct BranchInfo {
 pub fn extract(source: &Path, dest: &Path, branch: &str) -> Result<ExtractSummary> {
     // Open source pile read-path only. Fail loud on a corrupt tail —
     // reading the source must never mutate it.
-    let mut src_pile = super::open_refreshed(source)?;
+    let mut src_pile = super::open_legacy_rewrite_source(source, "extract from")?;
 
     let result = (|src_pile: &mut Pile| -> Result<ExtractSummary> {
         // Enumerate pins and classify the named ones so we can resolve
@@ -275,6 +275,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::Blob;
+    use triblespace_core::repo::branch_assertion::{BranchAssertion, BranchAssertionStore};
     use triblespace_core::repo::Repository;
     use triblespace_core::trible::Trible;
 
@@ -405,6 +406,39 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("branch 'nope' not found"), "got: {msg}");
         assert!(msg.contains("ladder"), "listing names branches: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_rewrite_refuses_to_drop_branch_assertions() {
+        let dir = scratch_dir("assertions");
+        let src = dir.join("source.pile");
+        let dst = dir.join("dest.pile");
+        std::fs::File::create(&src).unwrap();
+
+        let assertion = BranchAssertion::sign(
+            &test_key(),
+            Inline::<Handle<LongString>>::new([11; 32]),
+            Inline::<Handle<SimpleArchive>>::new([19; 32]),
+        );
+        let mut pile = Pile::open(&src).unwrap();
+        pile.append_assertion(assertion).unwrap();
+        pile.close().unwrap();
+
+        let err = extract(&src, &dst, "anything").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to extract from"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("1 signed branch assertion"),
+            "got: {message}"
+        );
+        assert!(
+            !dst.exists(),
+            "guard must run before creating a destination"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

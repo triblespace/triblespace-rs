@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merge; complete divergence builds one deterministic flat authorless merge.
   Generated acyclic-DAG tests pin delivery-order independence and
   `Max(Max(A) ∪ B) = Max(A ∪ B)`.
+- **Pile stores branch assertions as one canonical fixed record.** The new V3
+  record is exactly 256 bytes: its marker, the verified 160-byte signed
+  assertion, and 80 mandatory zero bytes. Replay verifies signatures eagerly,
+  rejects noncanonical padding, and folds assertions into the opaque
+  `BranchId || AssertionId` PATCH without physical-order semantics. Duplicate
+  append is idempotent, concatenated piles union cleanly, and the assertion
+  store crosses `sync_all` before reporting durable success. Legacy CAS branch
+  records remain readable but are not dual-authored by this dark storage seam;
+  legacy pile rewrites fail closed rather than silently omit assertions.
 - **Demand-curve receipts render as explicit performance fingerprints.** The
   feature-gated `tribleset-bench` GORBIE notebook normalizes fragmented TSV
   axes in memory and gives every engine/storage/execution subject the same

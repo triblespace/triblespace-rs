@@ -326,6 +326,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     let finder = Finder::new(&needle);
     let mut blob_header_matches = 0usize;
     let mut branch_header_matches = 0usize;
+    let mut assertion_field_matches = 0usize;
     let mut weak_marker_matches = 0usize;
     let mut payload_matches = 0usize;
     let mut parse_error = None;
@@ -369,6 +370,22 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                 }
             }
             PileRecordContent::BranchTombstone { .. } => {}
+            PileRecordContent::BranchAssertion { assertion } => {
+                if assertion.identity().name().raw == needle {
+                    assertion_field_matches += 1;
+                    println!(
+                        "branch assertion name-handle match at byte {}",
+                        record.offset
+                    );
+                }
+                if assertion.commit().raw == needle {
+                    assertion_field_matches += 1;
+                    println!(
+                        "branch assertion commit-handle match at byte {}",
+                        record.offset
+                    );
+                }
+            }
             PileRecordContent::WeakPin { handle } | PileRecordContent::WeakUnpin { handle } => {
                 if handle.raw == needle {
                     weak_marker_matches += 1;
@@ -381,6 +398,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     println!("\nSummary for {needle_str}:");
     println!("  blob headers:   {blob_header_matches}");
     println!("  branch headers: {branch_header_matches}");
+    println!("  assertion refs: {assertion_field_matches}");
     println!("  weak markers:   {weak_marker_matches}");
     println!("  payload refs:   {payload_matches}");
     if let Some(err) = parse_error {

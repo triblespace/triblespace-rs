@@ -29,7 +29,7 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
 
     // Open source pile and load its indices. Fail loud on a corrupt tail —
     // reading the source must never mutate it (destructive repair is `trible pile amputate`).
-    let mut src_pile = super::open_refreshed(&source)?;
+    let mut src_pile = super::open_legacy_rewrite_source(&source, "re-id")?;
 
     // Enumerate branches (all pins).
     let branch_ids: Vec<Id> = src_pile
