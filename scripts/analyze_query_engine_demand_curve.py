@@ -119,17 +119,32 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def dependency_locks(manifest: Mapping[str, str]) -> tuple[str, str]:
+    shared = manifest.get("dependency_lock_sha256")
+    if shared is not None:
+        return shared, shared
+    return (
+        manifest["old_dependency_lock_sha256"],
+        manifest["current_dependency_lock_sha256"],
+    )
+
+
 def validate_artifact(result_dir: Path, manifest: Mapping[str, str]) -> None:
+    old_lock, current_lock = dependency_locks(manifest)
     expected = {
         "harness.rs": manifest["harness_sha256"],
         "runner.sh": manifest["runner_sha256"],
-        "locks/Cargo.lock": manifest["dependency_lock_sha256"],
         "bin/query_engine_demand_curve-old": manifest["old_binary_sha256"],
         "bin/query_engine_demand_curve-current": manifest["current_binary_sha256"],
         "bin/query_engine_demand_curve-current-w1": manifest[
             "current_w1_binary_sha256"
         ],
     }
+    if old_lock == current_lock and (result_dir / "locks/Cargo.lock").is_file():
+        expected["locks/Cargo.lock"] = old_lock
+    else:
+        expected["locks/Cargo.lock-old"] = old_lock
+        expected["locks/Cargo.lock-current"] = current_lock
     for relative, expected_hash in expected.items():
         path = result_dir / relative
         if not path.is_file():
@@ -153,9 +168,13 @@ def validate(
     observed_harness = one((row["harness"] for row in rows), "harness hash")
     if observed_harness != manifest["harness_sha256"]:
         raise ValueError("manifest/observation harness mismatch")
-    observed_lock = one((row["dependency_lock"] for row in rows), "dependency lock")
-    if observed_lock != manifest["dependency_lock_sha256"]:
-        raise ValueError("manifest/observation dependency-lock mismatch")
+    old_lock, current_lock = dependency_locks(manifest)
+    for row in rows:
+        expected_lock = (
+            old_lock if row["engine"] == manifest["old_revision"] else current_lock
+        )
+        if row["dependency_lock"] != expected_lock:
+            raise ValueError("manifest/observation dependency-lock mismatch")
     if any(int(row["gpu_errors"]) != 0 for row in rows):
         raise ValueError("at least one observation reports a GPU error")
 
@@ -525,7 +544,13 @@ def render_summary(
             f"{count:,} {kind}" for kind, count in sorted(record_counts.items())
         )
         + ".",
-        f"- One dependency lock (`{manifest['dependency_lock_sha256'][:12]}…`) is baked into every arm.",
+        (
+            f"- One dependency lock (`{dependency_locks(manifest)[0][:12]}…`) is baked into every arm."
+            if dependency_locks(manifest)[0] == dependency_locks(manifest)[1]
+            else "- Each subject carries its own frozen dependency lock "
+            f"(old `{dependency_locks(manifest)[0][:12]}…`, "
+            f"current `{dependency_locks(manifest)[1][:12]}…`)."
+        ),
         f"- {scale_count} {scale_noun}, each with one corpus digest; "
         "every identity cell has one exact projected-tuple digest across all three arms.",
         "- No observation reports a GPU error.",
