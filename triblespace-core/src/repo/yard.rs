@@ -26,7 +26,10 @@ use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use crate::prelude::blobencodings::SimpleArchive;
 
-use super::pile::{GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError};
+use super::branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore};
+use super::pile::{
+    GetBlobError, InsertError, Pile, PileAssertionError, PileReader, PileWriteError, ReadError,
+};
 use super::{
     reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
     PinStore, PushResult, StorageClose, TransferError, WeakPinStore,
@@ -341,6 +344,21 @@ impl Yard {
         })
     }
 
+    /// Union the grow-only assertion sets stored in every segment.
+    ///
+    /// Yard owns its generation files exclusively while it is open. Within
+    /// that ownership boundary, joining per-segment snapshots is a coherent
+    /// snapshot: assertion state is a set and has no log-order semantics.
+    fn collect_assertions(&mut self) -> Result<BranchAssertionSnapshot, PileAssertionError> {
+        let mut assertions = BranchAssertionSnapshot::new();
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                assertions.union(segment.pile_mut().assertion_snapshot()?)?;
+            }
+        }
+        Ok(assertions)
+    }
+
     /// Re-append the surviving weak-pin markers to the young generation's
     /// pile. A pile rewrite ([`reclaim_generation`]) transfers only live
     /// blobs, so it drops the weak-pin marker records along with the dead
@@ -369,8 +387,11 @@ impl Yard {
 
     /// Recompute the keep set and logically collect cold weak pins and orphans.
     pub fn collect(&mut self) -> Result<(), YardCollectError> {
+        let assertions = self
+            .collect_assertions()
+            .map_err(YardCollectError::Assertions)?;
         let reader = self.reader().map_err(YardCollectError::Reader)?;
-        let strong_keep = self.strong_keep_set(&reader);
+        let durable_keep = self.durable_keep_set(&reader, &assertions);
         let present = reader.live_set();
         let weak_keep = self
             .weak_state
@@ -378,7 +399,7 @@ impl Yard {
             .expect("weak pin mutex poisoned")
             .trim_to_present_budget(&present, self.config.weak_budget);
 
-        let mut keep = strong_keep;
+        let mut keep = durable_keep;
         keep.union(weak_keep);
         for generation in &mut self.generations {
             for segment in &mut generation.segments {
@@ -398,14 +419,17 @@ impl Yard {
         let mut dumped = Vec::new();
 
         {
+            let assertions = self
+                .collect_assertions()
+                .map_err(YardCollectError::Assertions)?;
             let reader = self.reader().map_err(YardCollectError::Reader)?;
-            let strong_keep = self.strong_keep_set(&reader);
+            let durable_keep = self.durable_keep_set(&reader, &assertions);
 
             for level in 0..last {
-                let strong_here = self.generations[level].segments[0]
+                let durable_here = self.generations[level].segments[0]
                     .live
-                    .intersect(&strong_keep);
-                if strong_here.len() as usize <= self.strong_budget_for(level) {
+                    .intersect(&durable_keep);
+                if durable_here.len() as usize <= self.strong_budget_for(level) {
                     continue;
                 }
 
@@ -564,6 +588,22 @@ impl Yard {
         keep
     }
 
+    /// Keep set for state that may never be silently evicted.
+    ///
+    /// Legacy strong pins retain their historical weak-veto semantics. Branch
+    /// assertions are different: every accepted assertion remains true, so its
+    /// target and complete locally-present closure are hard roots even when a
+    /// demand-born weak marker predates arrival of those blobs.
+    fn durable_keep_set(
+        &self,
+        reader: &YardReader,
+        assertions: &BranchAssertionSnapshot,
+    ) -> HandleSet {
+        let mut keep = self.strong_keep_set(reader);
+        keep.union(assertion_keep_set(reader, assertions));
+        keep
+    }
+
     #[cfg(test)]
     fn put_in_generation<S, T>(
         &mut self,
@@ -585,6 +625,26 @@ impl Yard {
             .live
             .insert(&Entry::new(&unknown.raw));
         Ok(handle)
+    }
+}
+
+impl BranchAssertionStore for Yard {
+    type Error = PileAssertionError;
+
+    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
+        self.collect_assertions()
+    }
+
+    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
+        // Avoid writing a physical duplicate merely because its first copy is
+        // in an older segment. A collision is surfaced before any append.
+        if self.collect_assertions()?.contains(&assertion)? {
+            return Ok(());
+        }
+        self.generations[0]
+            .active_mut()
+            .pile_mut()
+            .append_assertion(assertion)
     }
 }
 
@@ -846,6 +906,31 @@ impl YardReader {
         }
         None
     }
+
+    /// Discover locally-present children without consulting or mutating the
+    /// weak-pin state. Assertion retention uses this path because a weak want
+    /// that predates a blob's arrival must not veto a durable branch root.
+    fn children_without_weak_veto(
+        &self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> Vec<Inline<Handle<UnknownBlob>>> {
+        let Some(Ok(blob)) = self.get_local::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
+            return Vec::new();
+        };
+        let bytes = blob.bytes.as_ref();
+        let mut result = Vec::new();
+        let mut offset = 0usize;
+        while offset + INLINE_LEN <= bytes.len() {
+            let mut raw = [0u8; INLINE_LEN];
+            raw.copy_from_slice(&bytes[offset..offset + INLINE_LEN]);
+            let candidate = Inline::<Handle<UnknownBlob>>::new(raw);
+            if matches!(self.get_local::<Bytes, UnknownBlob>(candidate), Some(Ok(_))) {
+                result.push(candidate);
+            }
+            offset += INLINE_LEN;
+        }
+        result
+    }
 }
 
 impl PartialEq for YardReader {
@@ -918,6 +1003,27 @@ impl BlobChildren for YardReader {
     }
 }
 
+impl super::branch_frontier::PartialCommitDag for YardReader {
+    type Error = super::commit::StoredCommitError<
+        YardGetError<crate::blob::encodings::simplearchive::UnarchiveError>,
+    >;
+
+    fn parents(
+        &mut self,
+        commit: super::CommitHandle,
+    ) -> Result<super::branch_frontier::ParentLookup, Self::Error> {
+        use super::branch_frontier::ParentLookup;
+
+        match self.get::<crate::trible::TribleSet, SimpleArchive>(commit) {
+            Ok(metadata) => super::commit::direct_parents(&metadata)
+                .map(ParentLookup::Present)
+                .map_err(super::commit::StoredCommitError::Metadata),
+            Err(YardGetError::NotFound) => Ok(ParentLookup::Missing),
+            Err(err) => Err(super::commit::StoredCommitError::Read(err)),
+        }
+    }
+}
+
 impl BlobStoreList for YardReader {
     type Iter<'a> = YardListIter;
     type Err = Infallible;
@@ -961,6 +1067,40 @@ fn collect_list<E>(
     Ok(set)
 }
 
+/// Trace every locally-present blob reachable from every asserted target,
+/// deliberately bypassing the Yard weak veto.
+///
+/// Missing roots are still included in the returned set (and disappear when
+/// intersected with a segment's live set). If they arrive later, the next
+/// collection retains them and discovers whatever closure is then present.
+fn assertion_keep_set(reader: &YardReader, assertions: &BranchAssertionSnapshot) -> HandleSet {
+    let mut queue = std::collections::VecDeque::new();
+    let mut keep = HandleSet::new();
+    for assertion in assertions.iter() {
+        let target: Inline<Handle<UnknownBlob>> = assertion.commit().transmute();
+        queue.push_back(target);
+
+        // The name handle is part of the exact branch descriptor. Retain its
+        // content when present, but do not scan arbitrary LongString bytes as
+        // a reference graph: only commit targets carry recursive structure.
+        let name: Inline<Handle<UnknownBlob>> = assertion.identity().name().transmute();
+        keep.insert(&Entry::new(&name.raw));
+    }
+
+    while let Some(handle) = queue.pop_front() {
+        if keep.get(&handle.raw).is_some() {
+            continue;
+        }
+        keep.insert(&Entry::new(&handle.raw));
+        for child in reader.children_without_weak_veto(handle) {
+            if keep.get(&child.raw).is_none() {
+                queue.push_back(child);
+            }
+        }
+    }
+    keep
+}
+
 fn reclaim_generation(
     path: &Path,
     temp_path: &Path,
@@ -973,6 +1113,13 @@ fn reclaim_generation(
         Err(err) => return Err(YardReclaimError::Io(err)),
     }
 
+    // Assertions are immutable set members, so preserving the exact local
+    // segment snapshot inside the replacement file is sufficient. Copy them
+    // before the atomic rename: re-appending after replacement would leave a
+    // crash window in which accepted replicated state had vanished.
+    let assertions = old_pile
+        .assertion_snapshot()
+        .map_err(YardReclaimError::Assertions)?;
     let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
@@ -984,6 +1131,12 @@ fn reclaim_generation(
 
     for result in transfer(&reader, &mut new_pile, handles) {
         result.map_err(YardReclaimError::Transfer)?;
+    }
+
+    for assertion in assertions.iter().copied() {
+        new_pile
+            .append_assertion(assertion)
+            .map_err(YardReclaimError::Assertions)?;
     }
 
     new_pile.close().map_err(YardReclaimError::Close)?;
@@ -1079,6 +1232,7 @@ impl<E: Error + 'static> Error for YardGetError<E> {}
 
 #[derive(Debug)]
 pub enum YardCollectError {
+    Assertions(PileAssertionError),
     Reader(YardReaderError),
     Transfer(TransferError<Infallible, YardGetError<Infallible>, InsertError>),
     Flush(super::pile::FlushError),
@@ -1089,6 +1243,7 @@ pub enum YardCollectError {
 impl fmt::Display for YardCollectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Assertions(err) => write!(f, "failed to snapshot yard assertions: {err}"),
             Self::Reader(err) => write!(f, "failed to create yard reader: {err}"),
             Self::Transfer(err) => write!(f, "failed to compact yard generation: {err}"),
             Self::Flush(err) => write!(f, "failed to flush yard generation pile: {err}"),
@@ -1123,6 +1278,7 @@ impl Error for YardCloseError {}
 pub enum YardReclaimError {
     Io(std::io::Error),
     Pile(ReadError),
+    Assertions(PileAssertionError),
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     Close(super::pile::FlushError),
     WeakMarkers(std::io::Error),
@@ -1144,6 +1300,7 @@ impl fmt::Display for YardReclaimError {
         match self {
             Self::Io(err) => write!(f, "failed to replace yard generation pile: {err}"),
             Self::Pile(err) => write!(f, "failed to read yard generation pile: {err}"),
+            Self::Assertions(err) => write!(f, "failed to preserve yard assertions: {err}"),
             Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::WeakMarkers(err) => {
@@ -1246,6 +1403,126 @@ mod tests {
             get_raw(&reader, weak),
             Err(YardGetError::NotFound)
         ));
+    }
+
+    #[test]
+    fn assertion_closure_ignores_weak_veto() {
+        use crate::blob::encodings::longstring::LongString;
+        use crate::repo::commit;
+        use crate::trible::TribleSet;
+        use ed25519_dalek::SigningKey;
+
+        let (_dir, mut yard) = yard_with(
+            1,
+            YardConfig {
+                weak_budget: 0,
+                ..YardConfig::default()
+            },
+        );
+        let key = SigningKey::from_bytes(&[7; 32]);
+
+        let content_blob: Blob<SimpleArchive> = TribleSet::new().to_blob();
+        let content = content_blob.get_handle();
+        let parent_blob: Blob<SimpleArchive> =
+            commit::commit_metadata(&key, [], None, Some(content_blob.clone()), None).to_blob();
+        let parent = parent_blob.get_handle();
+        let target_blob: Blob<SimpleArchive> =
+            commit::commit_metadata(&key, [parent], None, None, None).to_blob();
+        let target = target_blob.get_handle();
+        let name_blob: Blob<LongString> = "weak-before-arrival".to_owned().to_blob();
+        let name = name_blob.get_handle();
+
+        // Assertions may arrive before their referenced blobs. The misses
+        // create demand-born weak wants; those wants must not later veto the
+        // accepted assertion's name, target, or target closure.
+        yard.append_assertion(BranchAssertion::sign(&key, name, target))
+            .unwrap();
+        yard.pin_weak(name).unwrap();
+        yard.pin_weak(target).unwrap();
+        yard.pin_weak(parent).unwrap();
+        yard.pin_weak(content).unwrap();
+
+        assert_eq!(yard.put::<LongString, _>(name_blob).unwrap(), name);
+        assert_eq!(yard.put::<SimpleArchive, _>(content_blob).unwrap(), content);
+        assert_eq!(yard.put::<SimpleArchive, _>(parent_blob).unwrap(), parent);
+        assert_eq!(yard.put::<SimpleArchive, _>(target_blob).unwrap(), target);
+        let dead = yard
+            .put::<RawBytes, _>(raw_blob(b"unasserted orphan"))
+            .unwrap();
+
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+
+        let restored_name: anybytes::View<str> = reader.get(name).unwrap();
+        assert_eq!(&*restored_name, "weak-before-arrival");
+        assert!(reader.get::<TribleSet, SimpleArchive>(target).is_ok());
+        assert!(reader.get::<TribleSet, SimpleArchive>(parent).is_ok());
+        assert!(reader.get::<TribleSet, SimpleArchive>(content).is_ok());
+        assert!(matches!(
+            get_raw(&reader, dead),
+            Err(YardGetError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn assertions_survive_compact_reclaim_and_restart() {
+        use crate::repo::branch_frontier::BranchResolution;
+        use crate::repo::{PublishOutcome, Repository};
+        use crate::trible::TribleSet;
+        use ed25519_dalek::SigningKey;
+
+        let config = YardConfig {
+            weak_budget: 0,
+            strong_level_budget: 0,
+            fanout: 1,
+        };
+        let (_dir, paths, yard) = yard_with_paths(2, config);
+        let key = SigningKey::from_bytes(&[13; 32]);
+        let mut repo = Repository::new(yard, key.clone(), TribleSet::new()).unwrap();
+        let identity = repo.branch_identity("main");
+        let name = identity.name();
+        let mut workspace = repo.create_workspace("main").unwrap();
+        workspace.commit(TribleSet::new(), "first");
+        let head = workspace.head().unwrap();
+        assert!(matches!(
+            repo.push(&mut workspace).unwrap(),
+            PublishOutcome::Published(_)
+        ));
+        let assertions_before = repo.storage_mut().assertion_snapshot().unwrap();
+        let dead = repo
+            .storage_mut()
+            .put::<RawBytes, _>(raw_blob(b"physically reclaimed"))
+            .unwrap();
+
+        // A zero durable budget moves the complete asserted closure down and
+        // atomically rewrites the young segment that holds the assertion.
+        repo.storage_mut().compact().unwrap();
+        assert!(repo.storage().contains_in_generation(1, head));
+        repo.storage_mut().reclaim().unwrap();
+        repo.into_storage().close().unwrap();
+
+        let mut reopened = Yard::open(paths, config).unwrap();
+        assert_eq!(
+            reopened.assertion_snapshot().unwrap(),
+            assertions_before,
+            "physical rewrites must preserve the grow-only assertion set"
+        );
+        let reader = reopened.reader().unwrap();
+        let restored_name: anybytes::View<str> = reader.get(name).unwrap();
+        assert_eq!(&*restored_name, "main");
+        assert!(matches!(
+            get_raw(&reader, dead),
+            Err(YardGetError::NotFound)
+        ));
+
+        let mut repo = Repository::new(reopened, key, TribleSet::new()).unwrap();
+        match repo.resolve(&identity).unwrap() {
+            BranchResolution::Complete(frontier) => assert_eq!(frontier.tips(), &[head]),
+            other => panic!("reopened asserted branch was not complete: {other:?}"),
+        }
+        let mut workspace = repo.pull(identity).unwrap();
+        assert!(workspace.checkout(..).unwrap().is_empty());
+        repo.into_storage().close().unwrap();
     }
 
     #[test]

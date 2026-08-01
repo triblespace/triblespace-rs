@@ -78,6 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Yard collection now preserves assertion-native branches.** Yard implements
+  the grow-only assertion store across all generations, treats every accepted
+  assertion's name and commit closure as hard retention roots even when weak
+  want markers predate blob arrival, and copies each segment's assertion set
+  into its replacement Pile before the atomic reclaim rename.
 - **Breaking: `Repository` publishes own-key grow-only branch assertions.**
   `create_workspace(name)` now begins an unpublished branch without writing an
   empty state; its first changed `push` makes staged blobs durable, validates

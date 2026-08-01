@@ -1,16 +1,16 @@
 # Garbage Collection and Forgetting
 
-Repositories grow over time as commits, branch metadata, and user blobs
+Repositories grow over time as commits, branch assertions, and user blobs
 accumulate. Because every blob is content addressed and immutable, nothing is
-ever overwritten and there is no automatic reclamation when branches move or
-objects become orphaned. To keep disk usage in check a repository can
-periodically _forget_ blobs that are no longer referenced.
+overwritten in place. A retention backend such as `Yard` can periodically
+_forget_ blobs that are not reachable from durable roots, while a raw `Pile`
+remains append-only until an explicit rewrite.
 
-Forgetting is deliberately conservative. It only removes local copies, so
-re-synchronising from a peer or pushing a commit that references an "forgotten"
-blob will transparently restore it. Forgetting therefore complements the
-monotonic model: history never disappears globally, but any node can opt-out of
-retaining data it no longer needs.
+Forgetting is deliberately conservative. It only removes local copies, so an
+explicit low-level forget can leave an assertion `TipPending` until a peer
+restores its target. Automatic repository collection is stricter: every
+accepted branch assertion is a durable root, so its locally present name,
+commit target, and target closure survive collection.
 
 The main challenge is deciding which blobs are still reachable without
 reconstructing every `TribleSet`. The sections below outline how the repository
@@ -19,14 +19,26 @@ own tools.
 
 ## Understanding the Roots
 
-The walk begins with a _root set_—the handles you know must stay alive. In a
-typical repository this includes the metadata blob for each branch (which in
-turn names the commit heads), tags, or any additional anchors your deployment
-requires. Roots are cheap to enumerate: walk the branch store via
-[`BranchStore::branches`](https://docs.rs/triblespace/latest/triblespace/core/repo/trait.BranchStore.html#tymethod.branches)
-and load each branch head, or read the subset of metadata relevant to the
-retention policy you are enforcing. Everything reachable from those handles
-will be retained by the traversal; everything else is eligible for forgetting.
+The walk begins with a _root set_—the handles you know must stay alive. For an
+assertion-native repository, every assertion's commit target is a hard root.
+Collectors must use all accepted assertions, not only a branch's currently
+resolved frontier: missing ancestry can make domination impossible to prove,
+and collection must not turn uncertainty into deletion. Admission policy and
+quota bound which remote assertions become accepted; pressure never silently
+weakens accepted state.
+
+The content-addressed name handle in each exact branch descriptor is retained
+directly when present. It is not traversed as a generic blob graph: arbitrary
+`LongString` bytes do not acquire reference semantics merely because they
+contain a 32-byte sequence. Commit targets, in contrast, are traversed
+recursively, retaining parents, content, metadata, messages, attachments, and
+any other locally present referenced blobs.
+
+`Yard` also has demand-born weak pins for cache wants. They may veto legacy
+strong-pin reachability, but they do not veto an assertion root or anything in
+its closure. A common arrival order is assertion, failed read (which creates a
+weak want), then fetched commit; the later collection must retain that commit,
+not interpret its old want marker as permission to erase published history.
 
 ## Conservative Reachability
 
@@ -50,9 +62,9 @@ eligible for forgetting.
 
 ## Traversal Algorithm
 
-1. Enumerate all branches and load their metadata blobs.
-2. Extract candidate handles from the metadata. This reveals the current commit
-   head along with any other referenced blobs.
+1. Take one coherent snapshot of all accepted branch assertions.
+2. Add every asserted commit target to the hard root set and retain each
+   descriptor's name handle directly when it is present.
 3. Recursively walk the discovered commits and content blobs. Each blob is
    scanned in 32-byte steps; any chunk whose lookup succeeds is enqueued instead
    of deserialising the archive.
@@ -73,39 +85,43 @@ The repository module already provides most of the required plumbing. The
 helper exposes the traversal as a reusable iterator so you can compose other
 operations along the way, while
 [`transfer`](https://docs.rs/triblespace/latest/triblespace/repo/fn.transfer.html)
-duplicates whichever handles you feed it. The in-memory `MemoryBlobStore` can
-retain live blobs, duplicate them into a scratch store, and report how many
-handles were touched without writing bespoke walkers:
+duplicates whichever handles you feed it. A store that combines blobs and
+assertions can derive the hard roots directly from its assertion snapshot:
 
 ```rust,ignore
-use triblespace::core::blob::memoryblobstore::MemoryBlobStore;
-use triblespace::core::repo::{self, BlobStoreKeep, BlobStoreList, BranchStore};
-use triblespace::core::inline::encodings::hash::Blake3;
+use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::repo::branch_assertion::BranchAssertionStore;
+use triblespace::core::repo::memoryrepo::MemoryRepo;
+use triblespace::core::repo::{self, BlobStore, BlobStoreKeep};
 
-let mut store = MemoryBlobStore::default();
+let mut store = MemoryRepo::default();
 // ... populate the store or import data ...
 
-let mut branch_store = /* your BranchStore implementation */;
+let assertions = store.assertion_snapshot()?;
 let reader = store.reader()?;
+let commit_roots: Vec<_> = assertions
+    .iter()
+    .map(|assertion| assertion.commit().transmute())
+    .collect();
+let names: Vec<_> = assertions
+    .iter()
+    .map(|assertion| assertion.identity().name().transmute())
+    .collect();
 
-// Collect the branch metadata handles we want to keep alive.
-let mut roots = Vec::new();
-for branch_id in branch_store.branches()? {
-    if let Some(meta) = branch_store.head(branch_id?)? {
-        roots.push(meta.transmute());
-    }
-}
+// Walk only commit structure, then retain names directly without treating
+// arbitrary LongString bytes as edges in the blob graph.
+store.keep(
+    repo::reachable(&reader, commit_roots.clone()).chain(names.iter().copied()),
+);
 
-// Trim unreachable blobs in-place.
-store.keep(repo::reachable(&reader, roots.clone()));
-
-// Optionally copy the same reachable blobs into another store.
+// Optionally copy the same reachable blobs into another store. `transfer`
+// reports an error if an asserted target or name is not materialised locally.
 let mut scratch = MemoryBlobStore::default();
-let visited = repo::reachable(&reader, roots.clone()).count();
+let visited = repo::reachable(&reader, commit_roots.clone()).count() + names.len();
 let mapping: Vec<_> = repo::transfer(
     &reader,
     &mut scratch,
-    repo::reachable(&reader, roots),
+    repo::reachable(&reader, commit_roots).chain(names),
 )
 .collect::<Result<_, _>>()?;
 
@@ -113,14 +129,15 @@ println!("visited {} blobs, copied {}", visited, mapping.len());
 println!("rewrote {} handles", mapping.len());
 ```
 
-In practice you will seed the walker with the handles extracted from branch
-metadata or other root sets instead of iterating the entire store. The helper
-takes any `IntoIterator` of handles, so once branch heads (and other roots) have
-been identified, they can be fed directly into the traversal without writing
-custom queues or visitor logic. Passing the resulting iterator to
-`MemoryBlobStore::keep` or `repo::transfer` makes it easy to implement
+In practice you seed the walker with every asserted target plus any additional
+application roots. The helper takes any `IntoIterator` of handles, so those
+roots can be fed directly into the traversal without writing custom queues or
+visitor logic. Passing the resulting iterator to `MemoryBlobStore::keep` or
+`repo::transfer` makes it easy to implement
 mark-and-sweep collectors or selective replication pipelines without duplicating
-traversal code.
+traversal code. The compact transfer example deliberately treats an incomplete
+assertion closure as an error; a synchroniser can instead report missing direct
+names and roots as wants while transferring the locally present subset.
 
 When you already have metadata represented as a `TribleSet`, the
 [`potential_handles`](https://docs.rs/triblespace/latest/triblespace/repo/fn.potential_handles.html)
@@ -139,6 +156,10 @@ helper converts its value column into the conservative stream of
   retained, include it in the root set. Collisions between 32-byte handles are
   effectively impossible, so cautious root selection simply preserves anything
   that might be referenced.
+- **Rewrite assertion records atomically.** A physical Pile replacement must
+  write the segment's complete assertion set into the temporary Pile before the
+  atomic rename. Re-appending assertions afterwards creates a crash window in
+  which accepted grow-only state has vanished.
 
 ## Future Work
 
