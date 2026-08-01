@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproducible scalar-status-quo/current-frontier demand-curve experiment.
+# Reproducible old/current demand-curve experiment.
 # Builds every subject before timing, then runs two pairwise ABBA blocks:
 #   old scalar (A) versus current default frontier (B)
 #   current width-one ablation (C) versus current default frontier (B)
@@ -110,42 +110,46 @@ prepare_subject current "$CURRENT_REV"
 OLD_WORKTREE="$DEMAND_CURVE_CACHE_ROOT/subjects/old-${OLD_REV:0:12}"
 CURRENT_WORKTREE="$DEMAND_CURVE_CACHE_ROOT/subjects/current-${CURRENT_REV:0:12}"
 
-prepare_shared_lock() {
-    local source_lock="$CURRENT_WORKTREE/Cargo.lock"
+prepare_lock() {
+    local label=$1
+    local worktree=$2
+    local source_lock="$worktree/Cargo.lock"
     if [[ ! -f "$source_lock" ]]; then
-        echo "resolving one shared dependency lock outside the timed region" >&2
-        cargo generate-lockfile --manifest-path "$CURRENT_WORKTREE/Cargo.toml" \
-            >"$OUT/build-logs/dependency-lock.log" 2>&1
+        echo "resolving $label dependency lock outside the timed region" >&2
+        cargo generate-lockfile --manifest-path "$worktree/Cargo.toml" \
+            >"$OUT/build-logs/dependency-lock-$label.log" 2>&1
     else
-        printf 'reusing %s\n' "$source_lock" >"$OUT/build-logs/dependency-lock.log"
+        printf 'reusing %s\n' "$source_lock" \
+            >"$OUT/build-logs/dependency-lock-$label.log"
     fi
     [[ -f "$source_lock" ]] || {
         echo "dependency resolution did not create $source_lock" >&2
         exit 2
     }
-    cp "$source_lock" "$OLD_WORKTREE/Cargo.lock"
-    cp "$source_lock" "$OUT/locks/Cargo.lock"
-    shasum -a 256 "$OUT/locks/Cargo.lock" | awk '{print $1}'
+    cp "$source_lock" "$OUT/locks/Cargo.lock-$label"
+    shasum -a 256 "$OUT/locks/Cargo.lock-$label" | awk '{print $1}'
 }
 
-DEPENDENCY_LOCK_SHA256=$(prepare_shared_lock)
+OLD_DEPENDENCY_LOCK_SHA256=$(prepare_lock old "$OLD_WORKTREE")
+CURRENT_DEPENDENCY_LOCK_SHA256=$(prepare_lock current "$CURRENT_WORKTREE")
 
 build_subject() {
     local label=$1
     local worktree=$2
     local revision=$3
     local target_label=$4
-    shift 4
+    local dependency_lock_sha256=$5
+    shift 5
     [[ "$(shasum -a 256 "$worktree/Cargo.lock" | awk '{print $1}')" == \
-        "$DEPENDENCY_LOCK_SHA256" ]] || {
-        echo "$label worktree does not contain the frozen dependency lock" >&2
+        "$dependency_lock_sha256" ]] || {
+        echo "$label worktree does not contain its frozen dependency lock" >&2
         exit 2
     }
     echo "building $label ($revision)" >&2
     env \
         DEMAND_CURVE_ENGINE_REVISION="$revision" \
         DEMAND_CURVE_HARNESS_SHA256="$HARNESS_SHA256" \
-        DEMAND_CURVE_LOCK_SHA256="$DEPENDENCY_LOCK_SHA256" \
+        DEMAND_CURVE_LOCK_SHA256="$dependency_lock_sha256" \
         CARGO_TARGET_DIR="$DEMAND_CURVE_CACHE_ROOT/targets/$target_label-${revision:0:12}" \
         cargo rustc \
             --manifest-path "$worktree/Cargo.toml" \
@@ -159,13 +163,17 @@ build_subject() {
 }
 
 if [[ "$OLD_FRONTIER_STATS" == 1 ]]; then
-    build_subject old "$OLD_WORKTREE" "$OLD_REV" old --cfg demand_frontier_stats
+    build_subject old "$OLD_WORKTREE" "$OLD_REV" old \
+        "$OLD_DEPENDENCY_LOCK_SHA256" --cfg demand_frontier_stats
 else
-    build_subject old "$OLD_WORKTREE" "$OLD_REV" old
+    build_subject old "$OLD_WORKTREE" "$OLD_REV" old \
+        "$OLD_DEPENDENCY_LOCK_SHA256"
 fi
 build_subject current "$CURRENT_WORKTREE" "$CURRENT_REV" current \
+    "$CURRENT_DEPENDENCY_LOCK_SHA256" \
     --cfg demand_frontier_stats
 build_subject current-w1 "$CURRENT_WORKTREE" "$CURRENT_REV" current \
+    "$CURRENT_DEPENDENCY_LOCK_SHA256" \
     --cfg demand_frontier_stats --cfg demand_frontier_w1
 
 {
@@ -176,7 +184,8 @@ build_subject current-w1 "$CURRENT_WORKTREE" "$CURRENT_REV" current \
     printf 'current_revision\t%s\n' "$CURRENT_REV"
     printf 'harness_sha256\t%s\n' "$HARNESS_SHA256"
     printf 'runner_sha256\t%s\n' "$RUNNER_SHA256"
-    printf 'dependency_lock_sha256\t%s\n' "$DEPENDENCY_LOCK_SHA256"
+    printf 'old_dependency_lock_sha256\t%s\n' "$OLD_DEPENDENCY_LOCK_SHA256"
+    printf 'current_dependency_lock_sha256\t%s\n' "$CURRENT_DEPENDENCY_LOCK_SHA256"
     printf 'build_cache_root\t%s\n' "$DEMAND_CURVE_CACHE_ROOT"
     printf 'old_binary_sha256\t%s\n' \
         "$(shasum -a 256 "$OUT/bin/query_engine_demand_curve-old" | awk '{print $1}')"
@@ -229,6 +238,12 @@ run_one() {
     printf -v ordinal '%03d' "$invocation_sequence"
     local route
     route=$(route_expectation "$label" "$scale")
+    local dependency_lock_sha256
+    case "$label" in
+        old) dependency_lock_sha256=$OLD_DEPENDENCY_LOCK_SHA256 ;;
+        current|current-w1) dependency_lock_sha256=$CURRENT_DEPENDENCY_LOCK_SHA256 ;;
+        *) echo "unknown subject label: $label" >&2; exit 2 ;;
+    esac
     local stem="$ordinal-$scale-$position-$label"
     local raw_file="$OUT/raw/$stem.tsv"
     echo "running $stem (causal route: $route)" >&2
@@ -237,7 +252,7 @@ run_one() {
         --expect-engine "$revision" \
         --expect-variant "$variant" \
         --expect-harness "$HARNESS_SHA256" \
-        --expect-lock "$DEPENDENCY_LOCK_SHA256" \
+        --expect-lock "$dependency_lock_sha256" \
         --run-id "$RUN_ID" \
         --abba-position "$position" \
         --invocation-sequence "$invocation_sequence" \
@@ -292,7 +307,8 @@ awk -F '\t' \
     -v expected_harness="$HARNESS_SHA256" \
     -v old_revision="$OLD_REV" \
     -v current_revision="$CURRENT_REV" \
-    -v expected_lock="$DEPENDENCY_LOCK_SHA256" '
+    -v old_lock="$OLD_DEPENDENCY_LOCK_SHA256" \
+    -v current_lock="$CURRENT_DEPENDENCY_LOCK_SHA256" '
     function value(name) { return $(column[name]) }
     function fail(message) {
         print message > "/dev/stderr"
@@ -312,17 +328,18 @@ awk -F '\t' \
             fail(sprintf("run_id mismatch at line %d", NR))
         if (value("harness") != expected_harness)
             fail(sprintf("harness mismatch at line %d", NR))
-        if (value("dependency_lock") != expected_lock)
-            fail(sprintf("dependency lock mismatch at line %d", NR))
-
         engine = value("engine")
         variant = value("engine_variant")
         if (engine == old_revision) {
             if (variant != "default")
                 fail(sprintf("old revision has variant %s at line %d", variant, NR))
+            if (value("dependency_lock") != old_lock)
+                fail(sprintf("old dependency lock mismatch at line %d", NR))
         } else if (engine == current_revision) {
             if (variant != "default" && variant != "frontier-w1")
                 fail(sprintf("current revision has variant %s at line %d", variant, NR))
+            if (value("dependency_lock") != current_lock)
+                fail(sprintf("current dependency lock mismatch at line %d", NR))
         } else {
             fail(sprintf("unexpected engine revision %s at line %d", engine, NR))
         }
