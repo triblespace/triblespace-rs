@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Async adapters now forward `BranchAssertionStore`, `PartialCommitDag`, and
+  truthful `StorageFlush` capabilities. `HybridStore` composes blobs with a
+  separate signed-assertion store, and `Lazy` preserves assertion authority
+  while turning only genuine missing commit metadata into durable wants.
+- `ObjectStoreRemote` now names mutable replica-local cells under `pins/` and
+  verifies blob content against requested handles. It intentionally does not
+  implement StrongPin assertion storage or `StorageFlush`: generic object-store
+  listing is not a coherent assertion snapshot, and its file backend exposes no
+  crash-durability barrier.
+- `MemoryRepo::branches` is renamed to `pins`; mutable cells are no longer
+  presented as content-branch authority even in test storage.
+
 ## [0.41.4] - 2026-05-17
 
 Lock-step bump alongside the trailing-dot-leak +

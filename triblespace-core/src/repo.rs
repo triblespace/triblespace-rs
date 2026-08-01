@@ -57,7 +57,7 @@ pub mod branch_frontier;
 pub mod capability;
 /// Commit metadata construction and signature verification.
 pub mod commit;
-/// Storage adapter that delegates blobs and branches to separate backends.
+/// Storage adapter that delegates blobs and signed assertions to separate backends.
 pub mod hybridstore;
 /// Range-native derived-index manifests and typed artifacts.
 pub mod index_home;
@@ -67,7 +67,7 @@ pub mod lazy;
 /// Fully in-memory repository implementation for tests and ephemeral use.
 pub mod memoryrepo;
 #[cfg(feature = "object-store")]
-/// Repository backed by an `object_store`-compatible remote (S3, local FS, etc.).
+/// Blob and replica-local-pin backend for `object_store`-compatible remotes.
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
@@ -349,9 +349,8 @@ pub trait BlobChildren: BlobStoreGet {
 // optimized implementations (e.g. network stores with batch protocols).
 // Use `impl_blob_children_default!` for the scan-and-check fallback.
 
-/// Outcome of a compare-and-swap pin update (used by both the
-/// primitive `PinStore::update` and the higher-level
-/// `Repository::push` for content branches).
+/// Outcome of a compare-and-swap update on the separate mutable
+/// [`PinStore`] primitive. StrongPin branch publication does not use this type.
 #[derive(Debug)]
 pub enum PushResult {
     /// The CAS succeeded — the pin now points to the new value.
@@ -378,16 +377,15 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// pile's compaction sweep treats every pin head as a reachability
 /// root: blobs reachable from a pin survive; the rest are reclaimed.
 ///
-/// Pins back several specialized use patterns, distinguished at
-/// higher layers via metadata markers:
-/// - A **branch** is a pin whose value resolves to a commit-chain
-///   head (Repository's content abstraction). Branch metadata
-///   carries `metadata::name` for human-readable lookup.
-/// - A **tracking pin** mirrors a remote peer's branch head and
-///   carries `tracking_remote_pin` + `remote_name`.
+/// Pins back several specialized local or legacy use patterns,
+/// distinguished at higher layers via metadata markers:
+/// - A **tracking pin** mirrors a legacy remote HEAD observation and carries
+///   `tracking_remote_pin` + `remote_name`.
 /// - A **local-only pin** (renewal policy, pending requests,
 ///   per-team cap holdings) carries `local_only_pin: <kind>` and is
 ///   excluded from gossip publication.
+/// - Older stores may contain mutable content-branch heads. They remain
+///   readable as legacy pins but are not StrongPin branch authority.
 ///
 /// `PinStore` itself doesn't know about these distinctions — it just
 /// provides the primitive: enumerate ids, read the current head, CAS
@@ -412,10 +410,9 @@ pub trait PinStore {
     where
         Self: 'a;
 
-    /// Lists every pin in the store. Returns a fallible iterator over
-    /// pin ids (any role — branches, tracking pins, local-only pins).
-    /// Callers that want only content branches filter by checking for
-    /// the `metadata::name` attribute on each pin's head metadata.
+    /// Lists every pin in the store. Returns a fallible iterator over ids of
+    /// every role. Callers classify higher-level roles from the referenced
+    /// metadata; this enumeration does not imply that any pin is a branch.
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError>;
 
     /// Cheap point-in-time snapshot of the (pin id → head) map.
@@ -495,9 +492,9 @@ pub trait PinStore {
 /// is weak-pinned but absent), the cache-retention marker, and the
 /// eviction target. `unpin_weak` retracts it.
 ///
-/// Strong pins remain authoritative for GC — the keep set is
-/// `reachable(strong pins)` plus budgeted weak — and weak state never
-/// blocks strong retention.
+/// Mutable pins are hard local retention roots alongside every accepted branch
+/// assertion. Weak state may be evicted under pressure and never blocks either
+/// kind of hard root.
 pub trait WeakPinStore: PinStore {
     /// Error type for weak-pin operations.
     type WeakPinError: Error + Debug + Send + Sync + 'static;

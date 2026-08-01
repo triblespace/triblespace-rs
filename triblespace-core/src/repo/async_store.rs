@@ -36,8 +36,10 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
+    branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore},
+    branch_frontier::{ParentLookup, PartialCommitDag},
     BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
-    BlobStorePut, PinStore, PushResult,
+    BlobStorePut, CommitHandle, PinStore, PushResult, StorageFlush,
 };
 // Only used by the `object-store`-gated `Blocking` impls below.
 #[cfg(feature = "object-store")]
@@ -133,8 +135,14 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
     fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
 }
 
-/// Async counterpart of [`PinStore`]: named,
-/// atomically-updatable handles to `SimpleArchive` blobs.
+/// Async counterpart of [`PinStore`]: replica-local, atomically-updatable
+/// handles to `SimpleArchive` blobs.
+///
+/// Pins are transport/retention state local to one replica. They are not
+/// StrongPin branch authority and must never be exposed as a scalar branch
+/// head. A tracking pin may feed an explicit local merge-and-publish action,
+/// but shared branch state itself lives exclusively in
+/// [`AsyncBranchAssertionStore`].
 pub trait AsyncPinStore {
     /// Error type for listing pins.
     type PinsError: Error + Debug + Send + Sync + 'static;
@@ -162,6 +170,45 @@ pub trait AsyncPinStore {
         old: Option<Inline<Handle<SimpleArchive>>>,
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send;
+}
+
+/// Async storage surface for the shared grow-only branch-assertion layer.
+///
+/// This is the remote-backend counterpart of [`BranchAssertionStore`]. It
+/// deliberately has no scalar head, update, delete, or compare-and-swap
+/// operation: an assertion is immutable replicated state, and duplicate
+/// append is an idempotent success.
+pub trait AsyncBranchAssertionStore {
+    /// Storage or validation error.
+    type Error: Error + Debug + Send + Sync + 'static;
+
+    /// Return one coherent snapshot containing only verified assertions.
+    fn assertion_snapshot(
+        &mut self,
+    ) -> impl Future<Output = Result<BranchAssertionSnapshot, Self::Error>> + Send;
+
+    /// Durably append one verified assertion. Duplicate append is success.
+    fn append_assertion(
+        &mut self,
+        assertion: BranchAssertion,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Async counterpart of [`PartialCommitDag`].
+///
+/// Remote readers need an awaitable commit lookup in order to distinguish a
+/// genuinely absent commit from corrupt metadata or a backend failure without
+/// hiding network I/O behind a synchronous method.
+pub trait AsyncPartialCommitDag {
+    /// Non-absence lookup failure.
+    type Error;
+
+    /// Return direct parents, or [`ParentLookup::Missing`] only for genuine
+    /// object absence.
+    fn parents(
+        &mut self,
+        commit: CommitHandle,
+    ) -> impl Future<Output = Result<ParentLookup, Self::Error>> + Send;
 }
 
 /// Async counterpart of [`BlobStoreMeta`].
@@ -335,6 +382,40 @@ where
     }
 }
 
+impl<S> AsyncBranchAssertionStore for SyncAsAsync<S>
+where
+    S: BranchAssertionStore + Send,
+{
+    type Error = S::Error;
+
+    fn assertion_snapshot(
+        &mut self,
+    ) -> impl Future<Output = Result<BranchAssertionSnapshot, Self::Error>> + Send {
+        async move { self.0.assertion_snapshot() }
+    }
+
+    fn append_assertion(
+        &mut self,
+        assertion: BranchAssertion,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move { self.0.append_assertion(assertion) }
+    }
+}
+
+impl<S> AsyncPartialCommitDag for SyncAsAsync<S>
+where
+    S: PartialCommitDag + Send,
+{
+    type Error = S::Error;
+
+    fn parents(
+        &mut self,
+        commit: CommitHandle,
+    ) -> impl Future<Output = Result<ParentLookup, Self::Error>> + Send {
+        async move { self.0.parents(commit) }
+    }
+}
+
 impl<S> AsyncBlobStoreMeta for SyncAsAsync<S>
 where
     S: BlobStoreMeta + Sync,
@@ -370,6 +451,17 @@ where
     {
         let raw = handle.raw;
         async move { self.0.forget::<Sch>(Inline::new(raw)) }
+    }
+}
+
+impl<S> StorageFlush for SyncAsAsync<S>
+where
+    S: StorageFlush,
+{
+    type Error = S::Error;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.0.flush()
     }
 }
 
@@ -542,6 +634,28 @@ impl<A: AsyncPinStore> PinStore for Blocking<A> {
 }
 
 #[cfg(feature = "object-store")]
+impl<A: AsyncBranchAssertionStore> BranchAssertionStore for Blocking<A> {
+    type Error = A::Error;
+
+    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
+        self.rt.block_on(self.inner.assertion_snapshot())
+    }
+
+    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
+        self.rt.block_on(self.inner.append_assertion(assertion))
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncPartialCommitDag> PartialCommitDag for Blocking<A> {
+    type Error = A::Error;
+
+    fn parents(&mut self, commit: CommitHandle) -> Result<ParentLookup, Self::Error> {
+        self.rt.block_on(self.inner.parents(commit))
+    }
+}
+
+#[cfg(feature = "object-store")]
 impl<A: AsyncBlobStoreMeta> BlobStoreMeta for Blocking<A> {
     type MetaError = A::MetaError;
 
@@ -584,6 +698,17 @@ impl<A: StorageClose> StorageClose for Blocking<A> {
 
     fn close(self) -> Result<(), Self::Error> {
         self.inner.close()
+    }
+}
+
+// Forward the explicit sync point only for async wrappers whose inner backend
+// truthfully exposes one.
+#[cfg(feature = "object-store")]
+impl<A: StorageFlush> StorageFlush for Blocking<A> {
+    type Error = A::Error;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.inner.flush()
     }
 }
 
@@ -674,6 +799,34 @@ mod tests {
             .map(|h| h.raw)
             .collect();
         assert!(listed.contains(&h.raw));
+    }
+
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn assertion_and_flush_capabilities_roundtrip_through_both_adapters() {
+        use crate::blob::encodings::longstring::LongString;
+        use crate::repo::branch_assertion::{BranchAssertion, BranchAssertionStore};
+        use crate::repo::memoryrepo::MemoryRepo;
+        use crate::repo::StorageFlush;
+        use ed25519_dalek::SigningKey;
+
+        let mut store = Blocking::new(SyncAsAsync::new(MemoryRepo::default())).unwrap();
+        let assertion = BranchAssertion::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            Inline::<Handle<LongString>>::new([11; 32]),
+            Inline::new([19; 32]),
+        );
+
+        store.append_assertion(assertion).unwrap();
+        store.append_assertion(assertion).unwrap();
+        store.flush().unwrap();
+
+        let snapshot = store.assertion_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot.iter().copied().collect::<Vec<_>>(),
+            vec![assertion]
+        );
     }
 
     // Statically assert the futures are `Send` — the whole point of the

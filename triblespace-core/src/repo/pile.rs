@@ -790,8 +790,9 @@ enum Applied {
 /// A grow-only collection of blobs, pin records, and signed branch assertions
 /// backed by a single file on disk.
 ///
-/// Branch updates do not verify that referenced blobs exist in the pile, allowing the
-/// pile to operate as a head-only store when blob data lives elsewhere.
+/// Mutable local-pin updates do not verify that referenced blobs exist in the
+/// pile, allowing the pile to operate as a pin-only store when blob data lives
+/// elsewhere.
 ///
 /// [`Pile::refresh`] aborts immediately if the underlying file shrinks below
 /// data that has already been applied, preventing undefined behavior from
@@ -805,7 +806,7 @@ pub struct Pile {
     dirty: bool,
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
     validations: ValidationCache,
-    branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
+    pins: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     assertions: BranchAssertionSnapshot,
     /// LWW-resolved weak-pin set: weak-pin records insert the handle,
     /// weak-unpin records remove it; log-order application makes the last
@@ -1230,7 +1231,7 @@ impl Pile {
             dirty: false,
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
             validations: ValidationCache::default(),
-            branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
+            pins: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             assertions: BranchAssertionSnapshot::new(),
             weak_pins: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
@@ -1343,14 +1344,14 @@ impl Pile {
             PileRecordContent::Branch { branch_id, head } => {
                 let entry = Entry::with_value(&branch_id.into(), head);
                 // Replace existing mapping (if any) with the new head.
-                self.branches.replace(&entry);
+                self.pins.replace(&entry);
                 Applied::Branch {
                     id: branch_id,
                     hash: head.into(),
                 }
             }
             PileRecordContent::BranchTombstone { branch_id } => {
-                self.branches.remove(&branch_id.into());
+                self.pins.remove(&branch_id.into());
                 Applied::BranchTombstone { id: branch_id }
             }
             PileRecordContent::BranchAssertion { assertion } => {
@@ -1456,7 +1457,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.file);
             std::ptr::drop_in_place(&mut this.blobs);
             std::ptr::drop_in_place(&mut this.validations);
-            std::ptr::drop_in_place(&mut this.branches);
+            std::ptr::drop_in_place(&mut this.pins);
             std::ptr::drop_in_place(&mut this.assertions);
             std::ptr::drop_in_place(&mut this.weak_pins);
         }
@@ -1741,9 +1742,9 @@ impl PinStore for Pile {
         // branches so external writers are visible to callers.
         self.refresh()?;
         // Create an owned ordered iterator from the PATCH clone so the
-        // returned iterator does not borrow from `self.branches`. This avoids
+        // returned iterator does not borrow from `self.pins`. This avoids
         // allocating a temporary Vec of ids while preserving tree-order.
-        let cloned = self.branches.clone();
+        let cloned = self.pins.clone();
         let inner = cloned.into_iter_ordered();
         Ok(PileBranchStoreIter { inner })
     }
@@ -1753,13 +1754,13 @@ impl PinStore for Pile {
         // This keeps callers up-to-date with any external writers that appended
         // to the pile file.
         self.refresh()?;
-        Ok(self.branches.get(&id.into()).copied())
+        Ok(self.pins.get(&id.into()).copied())
     }
 
     fn pin_snapshot(&mut self) -> Result<super::PinSnapshot, Self::PinsError> {
         // PATCH is persistent, so this is one cheap immutable snapshot.
         self.refresh()?;
-        Ok(self.branches.clone())
+        Ok(self.pins.clone())
     }
 
     /// Updates the head of `id` to `new` if it matches `old`.
@@ -1783,7 +1784,7 @@ impl PinStore for Pile {
         self.file.lock()?;
         let res = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
-            let current_hash = self.branches.get(&id.into()).copied();
+            let current_hash = self.pins.get(&id.into()).copied();
             if current_hash != old {
                 return Ok(PushResult::Conflict(current_hash));
             }
@@ -3220,8 +3221,8 @@ mod tests {
         pile.flush().unwrap();
 
         assert_eq!(pile.head(branch_id).unwrap(), None);
-        let branches: HashSet<Id> = pile.pins().unwrap().map(|r| r.unwrap()).collect();
-        assert!(!branches.contains(&branch_id));
+        let pins: HashSet<Id> = pile.pins().unwrap().map(|r| r.unwrap()).collect();
+        assert!(!pins.contains(&branch_id));
         pile.close().unwrap();
     }
 

@@ -18,7 +18,7 @@ use crate::repo::WeakPinStore;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 
-/// Simple in-memory implementation of [`BlobStore`] and [`PinStore`].
+/// Simple in-memory blob, assertion, and local-pin store.
 ///
 /// Useful for unit tests or ephemeral repositories where persistence is not
 /// required.
@@ -26,10 +26,9 @@ use crate::inline::InlineEncoding;
 pub struct MemoryRepo {
     /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore,
-    /// Map from pin id to the handle of its current head (a commit for content branches; arbitrary SimpleArchive blob for other pin roles).
-    pub branches: HashMap<Id, Inline<Handle<SimpleArchive>>>,
-    /// Verified grow-only branch assertions, independent of the legacy pin
-    /// map while the branch migration is in flight.
+    /// Map from local pin id to its current arbitrary SimpleArchive value.
+    pub pins: HashMap<Id, Inline<Handle<SimpleArchive>>>,
+    /// Verified grow-only branch assertions.
     assertions: BranchAssertionSnapshot,
     /// LWW-resolved weak-pin set (see [`WeakPinStore`]). In memory the
     /// last-writer-wins resolution is just insert/remove. Weak pins here
@@ -92,13 +91,13 @@ impl PinStore for MemoryRepo {
         // per-instance seed would make every run reorder them, which
         // breaks deterministic simulation replay. Pile's PATCH-backed
         // pins() is already byte-ordered for the same reason.
-        let mut ids: Vec<Id> = self.branches.keys().cloned().collect();
+        let mut ids: Vec<Id> = self.pins.keys().cloned().collect();
         ids.sort();
         Ok(ids.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
     }
 
     fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        Ok(self.branches.get(&id).cloned())
+        Ok(self.pins.get(&id).cloned())
     }
 
     fn update(
@@ -107,16 +106,16 @@ impl PinStore for MemoryRepo {
         old: Option<Inline<Handle<SimpleArchive>>>,
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
-        let current = self.branches.get(&id);
+        let current = self.pins.get(&id);
         if current != old.as_ref() {
             return Ok(PushResult::Conflict(current.cloned()));
         }
         match new {
             Some(new) => {
-                self.branches.insert(id, new);
+                self.pins.insert(id, new);
             }
             None => {
-                self.branches.remove(&id);
+                self.pins.remove(&id);
             }
         }
         Ok(PushResult::Success())

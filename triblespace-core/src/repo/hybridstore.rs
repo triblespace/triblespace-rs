@@ -1,35 +1,81 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
-use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
-use crate::prelude::blobencodings::SimpleArchive;
+use crate::repo::branch_assertion::{
+    BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore,
+};
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
-use crate::repo::PinStore;
-use crate::repo::PushResult;
+use crate::repo::StorageClose;
+use crate::repo::StorageFlush;
+use std::error::Error;
+use std::fmt;
 
-/// Store that delegates blob and branch operations to two independent stores.
+/// Failure while closing one or both halves of a [`HybridStore`].
 ///
-/// This allows mixing different storage implementations in one repository,
-/// e.g. an on-disk blob store with an in-memory branch store.
+/// Closing always attempts both stores. If both fail, [`Self::Both`] retains
+/// both original errors so callers can diagnose every cleanup failure.
 #[derive(Debug)]
-pub struct HybridStore<B, R> {
-    /// Storage for commit, content and metadata blobs.
-    pub blobs: B,
-    /// Storage for branch heads.
-    pub branches: R,
+pub enum HybridCloseError<BlobError, AssertionError> {
+    /// Closing the blob store failed.
+    Blobs(BlobError),
+    /// Closing the assertion store failed.
+    Assertions(AssertionError),
+    /// Closing both stores failed.
+    Both {
+        /// Error returned by the blob store.
+        blobs: BlobError,
+        /// Error returned by the assertion store.
+        assertions: AssertionError,
+    },
 }
 
-impl<B, R> HybridStore<B, R> {
-    /// Creates a new [`HybridStore`] from the given blob and branch stores.
-    pub fn new(blobs: B, branches: R) -> Self {
-        Self { blobs, branches }
+impl<BlobError, AssertionError> fmt::Display for HybridCloseError<BlobError, AssertionError>
+where
+    BlobError: fmt::Display,
+    AssertionError: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blobs(error) => write!(f, "failed to close blob store: {error}"),
+            Self::Assertions(error) => write!(f, "failed to close assertion store: {error}"),
+            Self::Both { blobs, assertions } => write!(
+                f,
+                "failed to close blob store ({blobs}) and assertion store ({assertions})"
+            ),
+        }
     }
 }
 
-impl<B, R> BlobStorePut for HybridStore<B, R>
+impl<BlobError, AssertionError> Error for HybridCloseError<BlobError, AssertionError>
+where
+    BlobError: Error,
+    AssertionError: Error,
+{
+}
+
+/// Store that delegates blobs and signed branch assertions to independent stores.
+///
+/// This allows mixing different storage implementations in one repository,
+/// e.g. an on-disk blob store with an in-memory assertion store.
+#[derive(Debug)]
+pub struct HybridStore<B, A> {
+    /// Storage for commit, content and metadata blobs.
+    pub blobs: B,
+    /// Storage for grow-only, signed branch assertions.
+    pub assertions: A,
+}
+
+impl<B, A> HybridStore<B, A> {
+    /// Creates a new [`HybridStore`] from the given blob and assertion stores.
+    pub fn new(blobs: B, assertions: A) -> Self {
+        Self { blobs, assertions }
+    }
+}
+
+impl<B, A> BlobStorePut for HybridStore<B, A>
 where
     B: BlobStorePut,
 {
@@ -45,7 +91,7 @@ where
     }
 }
 
-impl<B, R> BlobStore for HybridStore<B, R>
+impl<B, A> BlobStore for HybridStore<B, A>
 where
     B: BlobStore,
 {
@@ -57,34 +103,157 @@ where
     }
 }
 
-impl<B, R> PinStore for HybridStore<B, R>
+impl<B, A> BranchAssertionStore for HybridStore<B, A>
 where
-    R: PinStore,
+    A: BranchAssertionStore,
 {
-    type PinsError = R::PinsError;
-    type HeadError = R::HeadError;
-    type UpdateError = R::UpdateError;
+    type Error = A::Error;
 
-    type ListIter<'a>
-        = R::ListIter<'a>
-    where
-        R: 'a,
-        B: 'a;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        self.branches.pins()
+    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
+        self.assertions.assertion_snapshot()
     }
 
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        self.branches.head(id)
+    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
+        self.assertions.append_assertion(assertion)
+    }
+}
+
+impl<B, A> StorageFlush for HybridStore<B, A>
+where
+    B: StorageFlush,
+{
+    type Error = B::Error;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        // BranchAssertionStore::append_assertion is already a durability
+        // boundary. Only pending blob writes need an explicit flush here.
+        self.blobs.flush()
+    }
+}
+
+impl<B, A> StorageClose for HybridStore<B, A>
+where
+    B: StorageClose,
+    A: StorageClose,
+{
+    type Error = HybridCloseError<B::Error, A::Error>;
+
+    fn close(self) -> Result<(), Self::Error> {
+        let Self { blobs, assertions } = self;
+        let blobs = blobs.close();
+        let assertions = assertions.close();
+
+        match (blobs, assertions) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(HybridCloseError::Blobs(error)),
+            (Ok(()), Err(error)) => Err(HybridCloseError::Assertions(error)),
+            (Err(blobs), Err(assertions)) => Err(HybridCloseError::Both { blobs, assertions }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::convert::Infallible;
+    use std::fmt;
+    use std::rc::Rc;
+
+    use ed25519_dalek::SigningKey;
+
+    use super::*;
+    use crate::repo::memoryrepo::MemoryRepo;
+
+    #[derive(Debug)]
+    struct FlushProbe(Rc<Cell<usize>>);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct CloseFailure(&'static str);
+
+    impl fmt::Display for CloseFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
     }
 
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<PushResult, Self::UpdateError> {
-        self.branches.update(id, old, new)
+    impl Error for CloseFailure {}
+
+    #[derive(Debug)]
+    struct CloseProbe {
+        calls: Rc<Cell<usize>>,
+        error: Option<CloseFailure>,
+    }
+
+    impl StorageClose for CloseProbe {
+        type Error = CloseFailure;
+
+        fn close(self) -> Result<(), Self::Error> {
+            self.calls.set(self.calls.get() + 1);
+            self.error.map_or(Ok(()), Err)
+        }
+    }
+
+    impl StorageFlush for FlushProbe {
+        type Error = Infallible;
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delegates_branch_assertions_to_the_assertion_store() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let assertion = BranchAssertion::sign(&key, Inline::new([11; 32]), Inline::new([19; 32]));
+        let mut hybrid = HybridStore::new((), MemoryRepo::default());
+
+        hybrid.append_assertion(assertion).unwrap();
+        hybrid.append_assertion(assertion).unwrap();
+
+        let snapshot = hybrid.assertion_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot.iter().copied().collect::<Vec<_>>(),
+            vec![assertion]
+        );
+    }
+
+    #[test]
+    fn flushes_only_the_blob_store() {
+        let flushes = Rc::new(Cell::new(0));
+        let mut hybrid = HybridStore::new(FlushProbe(flushes.clone()), ());
+
+        hybrid.flush().unwrap();
+
+        assert_eq!(flushes.get(), 1);
+    }
+
+    #[test]
+    fn close_attempts_both_stores_and_preserves_both_failures() {
+        let blob_calls = Rc::new(Cell::new(0));
+        let assertion_calls = Rc::new(Cell::new(0));
+        let hybrid = HybridStore::new(
+            CloseProbe {
+                calls: blob_calls.clone(),
+                error: Some(CloseFailure("blob close")),
+            },
+            CloseProbe {
+                calls: assertion_calls.clone(),
+                error: Some(CloseFailure("assertion close")),
+            },
+        );
+
+        let error = hybrid.close().unwrap_err();
+
+        assert_eq!(blob_calls.get(), 1);
+        assert_eq!(assertion_calls.get(), 1);
+        assert!(matches!(
+            error,
+            HybridCloseError::Both {
+                blobs: CloseFailure("blob close"),
+                assertions: CloseFailure("assertion close"),
+            }
+        ));
     }
 }

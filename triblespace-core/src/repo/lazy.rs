@@ -97,6 +97,8 @@ use crate::inline::{Inline, InlineEncoding, RawInline};
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
 };
+use super::branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore};
+use super::branch_frontier::{ParentLookup, PartialCommitDag};
 use super::{
     BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult, StorageFlush,
     WeakPinStore,
@@ -143,6 +145,42 @@ where
         match self {
             Self::Pin(e) => Some(e),
             Self::Flush(e) => Some(e),
+        }
+    }
+}
+
+/// Error from lazy commit-parent lookup.
+///
+/// An inner reader error is kept intact so corruption, malformed metadata, and
+/// backend failures cannot be mistaken for fetchable absence. The second arm
+/// is specifically the failure to make a genuine inner-store absence into a
+/// durable want.
+#[derive(Debug)]
+pub enum LazyCommitDagError<E, W> {
+    /// The wrapped reader failed while classifying or decoding the commit.
+    Inner(E),
+    /// The wrapped reader reported absence, but recording that demand failed.
+    WantRecord(W),
+}
+
+impl<E: std::error::Error, W: std::error::Error> std::fmt::Display for LazyCommitDagError<E, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inner(error) => write!(f, "commit-parent lookup failed: {error}"),
+            Self::WantRecord(error) => write!(f, "missing commit want was not recorded: {error}"),
+        }
+    }
+}
+
+impl<E, W> std::error::Error for LazyCommitDagError<E, W>
+where
+    E: std::error::Error + 'static,
+    W: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Inner(error) => Some(error),
+            Self::WantRecord(error) => Some(error),
         }
     }
 }
@@ -502,6 +540,35 @@ where
     }
 }
 
+/// The lazy wrapper changes how missing blobs are read, not the authority
+/// model of the wrapped repository. Signed assertions therefore pass through
+/// the same mutex as every other mutable store operation and retain the
+/// wrapped store's coherent-snapshot and durable-idempotent-append semantics.
+impl<S> BranchAssertionStore for Lazy<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + PinStore
+        + WeakPinStore
+        + StorageFlush
+        + BranchAssertionStore
+        + Send
+        + 'static,
+{
+    type Error = <S as BranchAssertionStore>::Error;
+
+    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
+        self.store.lock().expect("store mutex").assertion_snapshot()
+    }
+
+    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
+        self.store
+            .lock()
+            .expect("store mutex")
+            .append_assertion(assertion)
+    }
+}
+
 // ── Async surface ────────────────────────────────────────────────────
 
 /// Async put: semantically identical to the sync [`BlobStorePut`] (a
@@ -823,11 +890,51 @@ where
     }
 }
 
+/// Commit-parent lookup over the lazy read surface.
+///
+/// The wrapped reader remains responsible for distinguishing genuine absence
+/// from malformed metadata, corrupt bytes, and backend failure. Only its
+/// [`ParentLookup::Missing`] result is converted into lazy demand: the commit
+/// handle is weak-pinned and flushed before `Missing` is exposed. Thus every
+/// missing handle returned to branch resolution is durably on record, while
+/// every non-absence failure survives unchanged in
+/// [`LazyCommitDagError::Inner`].
+impl<S> PartialCommitDag for LazyReader<S>
+where
+    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S::Reader: PartialCommitDag,
+{
+    type Error = LazyCommitDagError<<S::Reader as PartialCommitDag>::Error, WantRecordErrorOf<S>>;
+
+    fn parents(&mut self, commit: super::CommitHandle) -> Result<ParentLookup, Self::Error> {
+        match self
+            .local
+            .parents(commit)
+            .map_err(LazyCommitDagError::Inner)?
+        {
+            ParentLookup::Present(parents) => Ok(ParentLookup::Present(parents)),
+            ParentLookup::Missing => {
+                let mut store = self.store.lock().expect("store mutex");
+                store
+                    .pin_weak(commit)
+                    .map_err(|error| LazyCommitDagError::WantRecord(WantRecordError::Pin(error)))?;
+                store.flush().map_err(|error| {
+                    LazyCommitDagError::WantRecord(WantRecordError::Flush(error))
+                })?;
+                Ok(ParentLookup::Missing)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::encodings::longstring::LongString;
+    use crate::repo::commit::{CommitMetadataError, StoredCommitError};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
+    use ed25519_dalek::SigningKey;
     use futures::executor::block_on;
     use futures::task::{waker, ArcWake};
     use std::sync::atomic::AtomicUsize;
@@ -841,6 +948,27 @@ mod tests {
     fn fresh_pile(path: &std::path::Path) -> Pile {
         std::fs::File::create(path).unwrap();
         Pile::open(path).unwrap()
+    }
+
+    /// `Lazy` is transparent to the grow-only authority layer: duplicate
+    /// assertion append stays idempotent and a snapshot remains coherent after
+    /// a later append through the wrapper.
+    #[test]
+    fn assertion_store_forwards_idempotent_append_and_coherent_snapshot() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let name = Inline::<Handle<LongString>>::new([11; 32]);
+        let first = BranchAssertion::sign(&key, name, Inline::new([19; 32]));
+        let second = BranchAssertion::sign(&key, name, Inline::new([23; 32]));
+        let mut lazy = Lazy::new(MemoryRepo::default());
+
+        lazy.append_assertion(first).unwrap();
+        lazy.append_assertion(first).unwrap();
+        let snapshot = lazy.assertion_snapshot().unwrap();
+        assert_eq!(snapshot.iter().copied().collect::<Vec<_>>(), vec![first]);
+
+        lazy.append_assertion(second).unwrap();
+        assert_eq!(snapshot.len(), 1, "an earlier snapshot stays coherent");
+        assert_eq!(lazy.assertion_snapshot().unwrap().len(), 2);
     }
 
     /// A local hit serves from the snapshot: no want is recorded.
@@ -1028,6 +1156,62 @@ mod tests {
             ),
             "want-record failure must surface as WantRecord, got {err:?}"
         );
+    }
+
+    /// Commit-DAG absence is the only inner outcome that becomes lazy
+    /// `Missing`, and it is exposed only after its want has been recorded.
+    /// Present-but-noncanonical commit metadata remains a metadata error;
+    /// present-but-undecodable archive bytes remain a read error.
+    #[test]
+    fn commit_dag_distinguishes_absence_metadata_and_decode_failure() {
+        let mut lazy = Lazy::new(MemoryRepo::default());
+
+        let malformed_shape = crate::trible::TribleSet::new().to_blob();
+        let malformed_shape = BlobStorePut::put::<SimpleArchive, _>(&mut lazy, malformed_shape)
+            .expect("store malformed commit-shaped archive");
+
+        let malformed_archive = Blob::<SimpleArchive>::new(Bytes::from(vec![1]));
+        let malformed_archive = BlobStorePut::put::<SimpleArchive, _>(&mut lazy, malformed_archive)
+            .expect("store malformed SimpleArchive bytes");
+
+        let missing = Inline::<Handle<SimpleArchive>>::new([31; 32]);
+        let mut reader = BlobStore::reader(&mut lazy).unwrap();
+
+        assert_eq!(reader.parents(missing).unwrap(), ParentLookup::Missing);
+        assert!(matches!(
+            reader.parents(malformed_shape),
+            Err(LazyCommitDagError::Inner(StoredCommitError::Metadata(
+                CommitMetadataError::Malformed
+            )))
+        ));
+        assert!(matches!(
+            reader.parents(malformed_archive),
+            Err(LazyCommitDagError::Inner(StoredCommitError::Read(_)))
+        ));
+        drop(reader);
+
+        let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            wants,
+            vec![missing.transmute()],
+            "only genuine absence records a want"
+        );
+    }
+
+    /// An inner absence is not advertised as `Missing` when the durable-want
+    /// precondition fails.
+    #[test]
+    fn commit_dag_want_record_failure_is_not_missing() {
+        let mut lazy = Lazy::new(FailingPins::default());
+        let missing = Inline::<Handle<SimpleArchive>>::new([37; 32]);
+        let mut reader = BlobStore::reader(&mut lazy).unwrap();
+
+        assert!(matches!(
+            reader.parents(missing),
+            Err(LazyCommitDagError::WantRecord(WantRecordError::Pin(
+                PinRefused
+            )))
+        ));
     }
 
     // ── Async waiting read ───────────────────────────────────────────

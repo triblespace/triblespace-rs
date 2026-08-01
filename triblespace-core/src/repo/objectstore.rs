@@ -19,6 +19,7 @@ use url::Url;
 
 use hex::FromHex;
 
+use crate::blob::encodings::simplearchive::UnarchiveError;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
@@ -31,24 +32,30 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 use crate::prelude::blobencodings::SimpleArchive;
+use crate::trible::TribleSet;
 
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
-    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncPinStore,
+    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncPartialCommitDag, AsyncPinStore,
 };
+use super::branch_frontier::ParentLookup;
+use super::commit::{self, StoredCommitError};
 use super::BlobMetadata;
 use super::PushResult;
 
-const BRANCH_INFIX: &str = "branches";
+const LOCAL_PIN_INFIX: &str = "pins";
 const BLOB_INFIX: &str = "blobs";
 
-/// Repository backed by an [`object_store`] compatible storage backend.
+/// Blob and replica-local pin storage backed by an [`object_store`]
+/// compatible backend.
 ///
 /// All data is stored in an external service (e.g. S3, local filesystem)
 /// via the `object_store` crate, which is async at its core — so this
 /// type is **async-native**: it implements the
 /// [`AsyncBlobStore`] family
 /// directly, awaiting each operation, with no owned runtime.
+/// It deliberately does not implement branch-assertion storage or a crash
+/// durability barrier, so it is not by itself a StrongPin repository backend.
 ///
 /// Synchronous callers wrap it in
 /// [`Blocking`](super::async_store::Blocking), which carries the single
@@ -103,7 +110,7 @@ impl PartialEq for ObjectStoreReader {
 impl Eq for ObjectStoreReader {}
 
 impl ObjectStoreRemote {
-    /// Creates a repository pointing at the object store described by
+    /// Creates a storage handle pointing at the object store described by
     /// `url`. The returned value is async-native — wrap it in
     /// [`Blocking`](super::async_store::Blocking) for synchronous use.
     pub fn with_url(url: &Url) -> Result<ObjectStoreRemote, object_store::Error> {
@@ -160,34 +167,36 @@ impl AsyncBlobStore for ObjectStoreRemote {
 }
 
 impl AsyncPinStore for ObjectStoreRemote {
-    type PinsError = ListBranchesErr;
-    type HeadError = PullBranchErr;
-    type UpdateError = PushBranchErr;
+    type PinsError = ListPinsErr;
+    type HeadError = ReadPinErr;
+    type UpdateError = UpdatePinErr;
 
     fn pins(
         &mut self,
     ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send
     {
         async move {
-            let prefix = self.prefix.child(BRANCH_INFIX);
+            // These CAS cells are replica-local transport/retention pins, not
+            // shared StrongPin branch authority.
+            let prefix = self.prefix.child(LOCAL_PIN_INFIX);
             let stream = self.store.list(Some(&prefix)).filter_map(|r| async move {
                 match r {
-                    Ok(meta) if meta.size == 0 => None, // tombstoned branch (0-byte object)
+                    Ok(meta) if meta.size == 0 => None, // tombstoned local pin (0-byte object)
                     Ok(meta) => {
                         let name = match meta.location.filename() {
                             Some(name) => name,
-                            None => return Some(Err(ListBranchesErr::NotAFile("no filename"))),
+                            None => return Some(Err(ListPinsErr::NotAFile("no filename"))),
                         };
                         let digest = match RawId::from_hex(name) {
                             Ok(digest) => digest,
-                            Err(e) => return Some(Err(ListBranchesErr::BadNameHex(e))),
+                            Err(e) => return Some(Err(ListPinsErr::BadNameHex(e))),
                         };
                         let Some(id) = Id::new(digest) else {
-                            return Some(Err(ListBranchesErr::BadId));
+                            return Some(Err(ListPinsErr::BadId));
                         };
                         Some(Ok(id))
                     }
-                    Err(e) => Some(Err(ListBranchesErr::List(e))),
+                    Err(e) => Some(Err(ListPinsErr::List(e))),
                 }
             });
             Ok(stream.collect().await)
@@ -200,7 +209,7 @@ impl AsyncPinStore for ObjectStoreRemote {
     ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send
     {
         async move {
-            let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
+            let path = self.prefix.child(LOCAL_PIN_INFIX).child(hex::encode(id));
             match self.store.get(&path).await {
                 Ok(object) => {
                     let bytes = object.bytes().await?;
@@ -211,7 +220,7 @@ impl AsyncPinStore for ObjectStoreRemote {
                     Ok(Some(Inline::new(value)))
                 }
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(PullBranchErr::StoreErr(e)),
+                Err(e) => Err(ReadPinErr::StoreErr(e)),
             }
         }
     }
@@ -223,8 +232,8 @@ impl AsyncPinStore for ObjectStoreRemote {
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
         async move {
-            let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
-            // We encode "deleted branch" as an empty object. This lets us
+            let path = self.prefix.child(LOCAL_PIN_INFIX).child(hex::encode(id));
+            // We encode a cleared local pin as an empty object. This lets us
             // preserve CAS semantics for delete via conditional PUT
             // (PutMode::Update), since `object_store` does not currently
             // expose conditional delete.
@@ -237,7 +246,7 @@ impl AsyncPinStore for ObjectStoreRemote {
                 None => bytes::Bytes::new(),
             };
 
-            let parse_branch = |bytes: &bytes::Bytes| -> Result<
+            let parse_pin = |bytes: &bytes::Bytes| -> Result<
                 Option<Inline<Handle<SimpleArchive>>>,
                 TryFromSliceError,
             > {
@@ -258,7 +267,7 @@ impl AsyncPinStore for ObjectStoreRemote {
                                 version: obj.meta.version.clone(),
                             };
                             let stored_bytes = obj.bytes().await?;
-                            let stored_hash = parse_branch(&stored_bytes)?;
+                            let stored_hash = parse_pin(&stored_bytes)?;
                             if stored_hash != Some(old_hash) {
                                 return Ok(PushResult::Conflict(stored_hash));
                             }
@@ -276,13 +285,13 @@ impl AsyncPinStore for ObjectStoreRemote {
                                     result = self.store.get(&path).await;
                                     continue;
                                 }
-                                Err(e) => return Err(PushBranchErr::StoreErr(e)),
+                                Err(e) => return Err(UpdatePinErr::StoreErr(e)),
                             }
                         }
                         Err(object_store::Error::NotFound { .. }) => {
-                            return Ok(PushResult::Conflict(None))
+                            return Ok(PushResult::Conflict(None));
                         }
-                        Err(e) => return Err(PushBranchErr::StoreErr(e)),
+                        Err(e) => return Err(UpdatePinErr::StoreErr(e)),
                     }
                 }
             } else {
@@ -303,7 +312,7 @@ impl AsyncPinStore for ObjectStoreRemote {
                                             version: obj.meta.version.clone(),
                                         };
                                         let stored_bytes = obj.bytes().await?;
-                                        let stored_hash = parse_branch(&stored_bytes)?;
+                                        let stored_hash = parse_pin(&stored_bytes)?;
                                         if stored_hash.is_some() {
                                             return Ok(PushResult::Conflict(stored_hash));
                                         }
@@ -321,17 +330,17 @@ impl AsyncPinStore for ObjectStoreRemote {
                                                 result = self.store.get(&path).await;
                                                 continue;
                                             }
-                                            Err(e) => return Err(PushBranchErr::StoreErr(e)),
+                                            Err(e) => return Err(UpdatePinErr::StoreErr(e)),
                                         }
                                     }
                                     // raced with delete; retry create
                                     Err(object_store::Error::NotFound { .. }) => break,
-                                    Err(e) => return Err(PushBranchErr::StoreErr(e)),
+                                    Err(e) => return Err(UpdatePinErr::StoreErr(e)),
                                 }
                             }
                             continue;
                         }
-                        Err(e) => return Err(PushBranchErr::StoreErr(e)),
+                        Err(e) => return Err(UpdatePinErr::StoreErr(e)),
                     }
                 }
             }
@@ -396,7 +405,35 @@ impl AsyncBlobStoreGet for ObjectStoreReader {
             let bytes = object.bytes().await?;
             let bytes: Bytes = bytes.into();
             let blob: Blob<S> = Blob::new(bytes);
+            let actual = blob.get_handle().raw;
+            if actual != raw {
+                return Err(GetBlobErr::Validation {
+                    expected: raw,
+                    actual,
+                });
+            }
             blob.try_from_blob().map_err(GetBlobErr::Conversion)
+        }
+    }
+}
+
+impl AsyncPartialCommitDag for ObjectStoreReader {
+    type Error = StoredCommitError<GetBlobErr<UnarchiveError>>;
+
+    fn parents(
+        &mut self,
+        commit: super::CommitHandle,
+    ) -> impl Future<Output = Result<ParentLookup, Self::Error>> + Send {
+        async move {
+            match self.get::<TribleSet, SimpleArchive>(commit).await {
+                Ok(metadata) => commit::direct_parents(&metadata)
+                    .map(ParentLookup::Present)
+                    .map_err(StoredCommitError::Metadata),
+                Err(GetBlobErr::Store(object_store::Error::NotFound { .. })) => {
+                    Ok(ParentLookup::Missing)
+                }
+                Err(error) => Err(StoredCommitError::Read(error)),
+            }
         }
     }
 }
@@ -461,6 +498,13 @@ impl AsyncBlobStoreMeta for ObjectStoreReader {
 pub enum GetBlobErr<E: Error> {
     /// The underlying object store operation failed.
     Store(object_store::Error),
+    /// The object bytes do not hash to the content-addressed path requested.
+    Validation {
+        /// Handle encoded by the requested object path.
+        expected: [u8; 32],
+        /// Handle derived from the returned bytes.
+        actual: [u8; 32],
+    },
     /// The blob bytes could not be converted to the requested type.
     Conversion(E),
 }
@@ -469,6 +513,12 @@ impl<E: Error> fmt::Display for GetBlobErr<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(e) => write!(f, "object store error: {e}"),
+            Self::Validation { expected, actual } => write!(
+                f,
+                "object content hash mismatch: expected {}, got {}",
+                hex::encode(expected),
+                hex::encode(actual)
+            ),
             Self::Conversion(e) => write!(f, "conversion error: {e}"),
         }
     }
@@ -478,6 +528,7 @@ impl<E: Error> Error for GetBlobErr<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(e) => Some(e),
+            Self::Validation { .. } => None,
             Self::Conversion(_) => None,
         }
     }
@@ -511,9 +562,9 @@ impl fmt::Display for ListBlobsErr {
 }
 impl Error for ListBlobsErr {}
 
-/// Error returned when listing branches from the object store.
+/// Error returned when listing replica-local pins from the object store.
 #[derive(Debug)]
-pub enum ListBranchesErr {
+pub enum ListPinsErr {
     /// The underlying list operation failed.
     List(object_store::Error),
     /// A listed object had no filename component.
@@ -524,7 +575,7 @@ pub enum ListBranchesErr {
     BadId,
 }
 
-impl fmt::Display for ListBranchesErr {
+impl fmt::Display for ListPinsErr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::List(e) => write!(f, "list failed: {e}"),
@@ -534,43 +585,43 @@ impl fmt::Display for ListBranchesErr {
         }
     }
 }
-impl Error for ListBranchesErr {}
+impl Error for ListPinsErr {}
 
-/// Error returned when reading a branch head from the object store.
+/// Error returned when reading a replica-local pin from the object store.
 #[derive(Debug)]
-pub enum PullBranchErr {
+pub enum ReadPinErr {
     /// The stored bytes could not be parsed as a valid handle.
     ValidationErr(TryFromSliceError),
     /// The underlying object store operation failed.
     StoreErr(object_store::Error),
 }
 
-impl fmt::Display for PullBranchErr {
+impl fmt::Display for ReadPinErr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::StoreErr(e) => write!(f, "pull failed: {e}"),
-            Self::ValidationErr(e) => write!(f, "pull failed: {e}"),
+            Self::StoreErr(e) => write!(f, "pin read failed: {e}"),
+            Self::ValidationErr(e) => write!(f, "pin read failed: {e}"),
         }
     }
 }
 
-impl Error for PullBranchErr {}
+impl Error for ReadPinErr {}
 
-impl From<object_store::Error> for PullBranchErr {
+impl From<object_store::Error> for ReadPinErr {
     fn from(err: object_store::Error) -> Self {
         Self::StoreErr(err)
     }
 }
 
-impl From<TryFromSliceError> for PullBranchErr {
+impl From<TryFromSliceError> for ReadPinErr {
     fn from(err: TryFromSliceError) -> Self {
         Self::ValidationErr(err)
     }
 }
 
-/// Error returned when updating a branch head in the object store.
+/// Error returned when updating a replica-local pin in the object store.
 #[derive(Debug)]
-pub enum PushBranchErr {
+pub enum UpdatePinErr {
     /// The stored bytes could not be parsed as a valid handle during a
     /// compare-and-swap.
     ValidationErr(TryFromSliceError),
@@ -578,25 +629,69 @@ pub enum PushBranchErr {
     StoreErr(object_store::Error),
 }
 
-impl fmt::Display for PushBranchErr {
+impl fmt::Display for UpdatePinErr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::ValidationErr(e) => write!(f, "commit failed: {e}"),
-            Self::StoreErr(e) => write!(f, "commit failed: {e}"),
+            Self::ValidationErr(e) => write!(f, "pin update failed: {e}"),
+            Self::StoreErr(e) => write!(f, "pin update failed: {e}"),
         }
     }
 }
 
-impl Error for PushBranchErr {}
+impl Error for UpdatePinErr {}
 
-impl From<object_store::Error> for PushBranchErr {
+impl From<object_store::Error> for UpdatePinErr {
     fn from(err: object_store::Error) -> Self {
         Self::StoreErr(err)
     }
 }
 
-impl From<TryFromSliceError> for PushBranchErr {
+impl From<TryFromSliceError> for UpdatePinErr {
     fn from(err: TryFromSliceError) -> Self {
         Self::ValidationErr(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repo::branch_frontier::PartialCommitDag;
+    use futures::executor::block_on;
+    use object_store::memory::InMemory;
+
+    fn remote() -> ObjectStoreRemote {
+        ObjectStoreRemote {
+            store: Arc::new(InMemory::new()),
+            prefix: Path::from("repo"),
+        }
+    }
+
+    #[test]
+    fn partial_commit_dag_distinguishes_absence_from_malformed_content() {
+        let mut remote = remote();
+        let mut reader = block_on(remote.reader()).unwrap();
+        let missing = Inline::new([31; 32]);
+        assert_eq!(
+            block_on(AsyncPartialCommitDag::parents(&mut reader, missing)).unwrap(),
+            ParentLookup::Missing
+        );
+
+        let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![1]));
+        let malformed_handle = block_on(remote.put::<SimpleArchive, _>(malformed)).unwrap();
+        let mut reader = block_on(remote.reader()).unwrap();
+        let error = block_on(AsyncPartialCommitDag::parents(
+            &mut reader,
+            malformed_handle,
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StoredCommitError::Read(GetBlobErr::Conversion(_))
+        ));
+
+        // The sync edge adapter preserves the same absence semantics used by
+        // Repository's frontier resolver.
+        let mut blocking = crate::repo::async_store::Blocking::new(reader).unwrap();
+        assert_eq!(blocking.parents(missing).unwrap(), ParentLookup::Missing);
     }
 }
