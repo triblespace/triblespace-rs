@@ -1,13 +1,16 @@
 //! Resolve grow-only branch assertions under partially available ancestry.
 //!
 //! Only definitely dominated assertions disappear. A missing surviving tip is
-//! [`BranchResolution::TipPending`](self::BranchResolution::TipPending);
+//! [`BranchResolution::TipPending`];
 //! readable tips whose relation is unknown are
-//! [`BranchResolution::Partial`](self::BranchResolution::Partial). Malformed
+//! [`BranchResolution::Partial`]. Malformed
 //! metadata and backend failures remain errors. Unrelated history and payload
 //! content stay lazy. Complete and partial divergent frontiers can both provide
 //! a correct read view, but only a complete frontier may license an authored
 //! merge assertion.
+//!
+//! [`BranchResolution::TipPending`]: crate::repo::branch_frontier::BranchResolution::TipPending
+//! [`BranchResolution::Partial`]: crate::repo::branch_frontier::BranchResolution::Partial
 
 use std::collections::{HashMap, HashSet};
 
@@ -59,6 +62,12 @@ pub enum BranchResolution {
 }
 
 /// Conservative candidates containing one or more unreadable asserted tips.
+///
+/// Callers recover by fetching [`Self::missing_tips`] and rerunning resolution.
+/// Deeper gaps observed during the same pass are deliberately withheld: a
+/// fetched tip can prove another candidate dominated and make those wants
+/// irrelevant. A fair fetch-and-rerun loop therefore costs at most one extra
+/// demand round while avoiding irrelevant ancestry downloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TipPendingFrontier {
     tips: Vec<CommitHandle>,
@@ -382,6 +391,30 @@ mod tests {
         }
     }
 
+    fn candidate_tips(resolution: &BranchResolution) -> &[CommitHandle] {
+        match resolution {
+            BranchResolution::Absent => &[],
+            BranchResolution::TipPending(frontier) => frontier.tips(),
+            BranchResolution::Partial(frontier) => frontier.tips(),
+            BranchResolution::Complete(frontier) => frontier.tips(),
+        }
+    }
+
+    fn reachable_from(dag: &TestDag, roots: &[CommitHandle]) -> HashSet<CommitHandle> {
+        let mut reachable = HashSet::new();
+        let mut stack = roots.to_vec();
+        while let Some(commit) = stack.pop() {
+            if !reachable.insert(commit) {
+                continue;
+            }
+            match dag.parents.get(&commit) {
+                Some(ParentLookup::Present(parents)) => stack.extend(parents),
+                other => panic!("generated full DAG is missing {commit:?}: {other:?}"),
+            }
+        }
+        reachable
+    }
+
     fn present(dag: &mut TestDag, commit: CommitHandle, parents: &[CommitHandle]) {
         dag.parents
             .insert(commit, ParentLookup::Present(parents.to_vec()));
@@ -469,6 +502,58 @@ mod tests {
     }
 
     #[test]
+    fn singleton_resolution_reads_the_tip_but_never_walks_its_closure() {
+        struct TipOnlyDag {
+            tip: CommitHandle,
+            forbidden_parent: CommitHandle,
+            calls: usize,
+        }
+
+        impl PartialCommitDag for TipOnlyDag {
+            type Error = Infallible;
+
+            fn parents(&mut self, commit: CommitHandle) -> Result<ParentLookup, Self::Error> {
+                self.calls += 1;
+                assert_eq!(
+                    commit, self.tip,
+                    "singleton resolution resurrected an eager ancestry-closure walk"
+                );
+                Ok(ParentLookup::Present(vec![self.forbidden_parent]))
+            }
+        }
+
+        let tip = commit(4);
+        let mut dag = TipOnlyDag {
+            tip,
+            forbidden_parent: commit(5),
+            calls: 0,
+        };
+        assert_eq!(
+            resolve_branch(&snapshot([tip]), &identity(), &mut dag).unwrap(),
+            BranchResolution::Complete(CompleteFrontier { tips: vec![tip] })
+        );
+        assert_eq!(dag.calls, 1, "the surviving tip is checked exactly once");
+    }
+
+    #[test]
+    fn backend_errors_are_never_downgraded_to_missing_metadata() {
+        struct FailingDag;
+
+        impl PartialCommitDag for FailingDag {
+            type Error = &'static str;
+
+            fn parents(&mut self, _: CommitHandle) -> Result<ParentLookup, Self::Error> {
+                Err("backend failure")
+            }
+        }
+
+        assert_eq!(
+            resolve_branch(&snapshot([commit(4)]), &identity(), &mut FailingDag).unwrap_err(),
+            "backend failure"
+        );
+    }
+
+    #[test]
     fn divergent_frontier_builds_one_flat_order_independent_merge() {
         let (a, b, c) = (commit(1), commit(2), commit(3));
         let mut dag = TestDag::default();
@@ -494,6 +579,13 @@ mod tests {
             panic!("three tips must synthesize a merge")
         };
         assert_eq!(first, second);
+
+        let pair = merge_metadata([a, b]).to_blob().get_handle();
+        let nested = merge_metadata([pair, c]).to_blob();
+        assert_ne!(
+            first, nested,
+            "a nested pairwise merge must not masquerade as the canonical flat frontier"
+        );
     }
 
     #[test]
@@ -613,6 +705,81 @@ mod tests {
                 return Ok(());
             };
             prop_assert_eq!(left.resolved_head(), right.resolved_head());
+        }
+
+        #[test]
+        fn adding_ancestry_only_refines_the_conservative_frontier(
+            node_count in 1usize..9,
+            parent_masks in prop::collection::vec(any::<u16>(), 8),
+            assertion_mask in 1u16..=u16::MAX,
+            coarse_missing_mask in any::<u16>(),
+            refinement_mask in any::<u16>(),
+        ) {
+            let commits: Vec<_> = (0..node_count)
+                .map(|index| commit(index as u8 + 1))
+                .collect();
+            let mut full = TestDag::default();
+            for index in 0..node_count {
+                let lower = if index == 0 { 0 } else { (1u16 << index) - 1 };
+                let parents: Vec<_> = (0..index)
+                    .filter(|parent| parent_masks[index] & (1u16 << parent) & lower != 0)
+                    .map(|parent| commits[parent])
+                    .collect();
+                present(&mut full, commits[index], &parents);
+            }
+            let assertions: Vec<_> = commits
+                .iter()
+                .enumerate()
+                .filter_map(|(index, commit)| {
+                    (assertion_mask & (1u16 << index) != 0).then_some(*commit)
+                })
+                .collect();
+            prop_assume!(!assertions.is_empty());
+            let snapshot = snapshot(assertions.iter().copied());
+
+            let mut coarse = full.clone();
+            let mut refined = full.clone();
+            let refined_missing_mask = coarse_missing_mask & refinement_mask;
+            for (index, commit) in commits.iter().enumerate() {
+                if coarse_missing_mask & (1u16 << index) != 0 {
+                    coarse.parents.remove(commit);
+                }
+                if refined_missing_mask & (1u16 << index) != 0 {
+                    refined.parents.remove(commit);
+                }
+            }
+
+            let coarse_resolution = resolve_branch(&snapshot, &identity(), &mut coarse).unwrap();
+            let refined_resolution = resolve_branch(&snapshot, &identity(), &mut refined).unwrap();
+            let full_resolution = resolve_branch(&snapshot, &identity(), &mut full).unwrap();
+            let coarse_tips = candidate_tips(&coarse_resolution);
+            let refined_tips = candidate_tips(&refined_resolution);
+            let full_tips = candidate_tips(&full_resolution);
+
+            prop_assert!(
+                refined_tips.iter().all(|tip| coarse_tips.contains(tip)),
+                "adding ancestry introduced a new candidate"
+            );
+            prop_assert!(
+                full_tips.iter().all(|tip| refined_tips.contains(tip)),
+                "partial ancestry discarded a truly maximal candidate"
+            );
+            prop_assert_eq!(
+                reachable_from(&full, coarse_tips),
+                reachable_from(&full, &assertions),
+                "the coarse conservative view changed eventual content"
+            );
+            prop_assert_eq!(
+                reachable_from(&full, refined_tips),
+                reachable_from(&full, &assertions),
+                "the refined conservative view changed eventual content"
+            );
+            if matches!(&coarse_resolution, BranchResolution::Complete(_)) {
+                prop_assert_eq!(&coarse_resolution, &refined_resolution);
+            }
+            if matches!(&refined_resolution, BranchResolution::Complete(_)) {
+                prop_assert_eq!(&refined_resolution, &full_resolution);
+            }
         }
     }
 }

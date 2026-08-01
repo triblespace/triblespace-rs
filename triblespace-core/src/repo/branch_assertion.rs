@@ -1,7 +1,7 @@
 //! Immutable signed assertions are the replicated state of a branch.
 //!
 //! A branch identity is the exact `(author key, name handle)` descriptor. Its
-//! 16-byte [`BranchId`](self::BranchId) is the intrinsic id of the equivalent
+//! 16-byte [`BranchId`] is the intrinsic id of the equivalent
 //! two-fact entity, and is therefore only an index prefix: equality always
 //! compares the full descriptor. An assertion adds one commit and one Ed25519
 //! signature. There is deliberately no timestamp, extension map, replacement,
@@ -13,10 +13,13 @@
 //! author key [32] | name handle [32] | commit handle [32] | signature [64]
 //! ```
 //!
-//! Public [`BranchAssertion`](self::BranchAssertion) values have already passed
+//! Public [`BranchAssertion`] values have already passed
 //! strict signature verification. Raw bytes can enter the semantic layer only
-//! through
-//! [`BranchAssertion::decode_verified`](self::BranchAssertion::decode_verified).
+//! through [`BranchAssertion::decode_verified`].
+//!
+//! [`BranchId`]: crate::repo::branch_assertion::BranchId
+//! [`BranchAssertion`]: crate::repo::branch_assertion::BranchAssertion
+//! [`BranchAssertion::decode_verified`]: crate::repo::branch_assertion::BranchAssertion::decode_verified
 
 use std::error::Error;
 use std::fmt;
@@ -401,6 +404,24 @@ mod tests {
     fn canonical_codec_roundtrips_and_rejects_every_single_byte_change() {
         let assertion = BranchAssertion::sign(&signing_key(7), name(11), commit(19));
         let encoded = assertion.encode();
+        assert_eq!(
+            encoded,
+            hex!(
+                "EA4A6C63E29C520ABEF5507B132EC5F9954776AEBEBE7B92421EEA691446D22C
+                 0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B
+                 1313131313131313131313131313131313131313131313131313131313131313
+                 ED9FC8AE03C142D1927C6ADA258D3198B271E5A0107413844DA758C220B01CB
+                 2D269F760C1BDC729B23A51067E7011CE78EB05683ACCE6067BACD4A87EFE7E0F"
+            )
+        );
+        assert_eq!(
+            assertion.identity().id().raw(),
+            hex!("AFF4BA00CA5D7270149C932647173802")
+        );
+        assert_eq!(
+            assertion.id().raw(),
+            hex!("87D84224C432A5E9F93850C35B2AC17FD689960387A777120A255492756FD732")
+        );
         assert_eq!(encoded.len(), BRANCH_ASSERTION_LEN);
         assert_eq!(
             BranchAssertion::decode_verified(encoded).unwrap(),
