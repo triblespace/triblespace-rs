@@ -41,7 +41,10 @@ bytemuck = { version = "1.15.0", features = ["extern_crate_alloc"]}
 proptest = { version = "1.6.0", optional = true }
 hifitime = "4.1.2"
 f256 = "0.7.0"
-jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "8a066da4a70eb1188f5c6dca70c009e07aa6d048" }
+# `6cdd751` is the current `8a066da4` lineage plus Jerky's layer-major
+# batched rank descents. Keep the exact rev pinned until that lineage rejoins
+# Jerky main so SuccinctArchive's CPU confirm has a reproducible substrate.
+jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "6cdd751efb03543669f2ab8cd5ae3bb162f32d07" }
 itertools = "0.14.0"
 sptr = "0.3.2"
 indxvec = "1.9.0"
