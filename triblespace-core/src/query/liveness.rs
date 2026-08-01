@@ -347,6 +347,57 @@ impl ProposalBuffer {
                 .sum::<usize>()
     }
 
+    /// Cursor immediately after the first `count` live entries in
+    /// `start..end`, provided that at least one further live entry remains.
+    ///
+    /// A parallel query uses this to transfer exactly one page from a
+    /// confirmed candidate interval. Selecting through packed liveness words
+    /// keeps dead candidates out of the page width while preserving their
+    /// immutable positions in the shared proposal buffer.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn live_prefix_split(
+        &self,
+        start: usize,
+        end: usize,
+        count: usize,
+    ) -> Option<usize> {
+        let end = end.min(self.entries.len());
+        if count == 0 || start >= end {
+            return None;
+        }
+
+        let first = start / BITS;
+        let last = (end - 1) / BITS;
+        let mut needed = count;
+        for word_index in first..=last {
+            let lo = if word_index == first { start % BITS } else { 0 };
+            let hi = if word_index == last {
+                (end - 1) % BITS + 1
+            } else {
+                BITS
+            };
+            let mut word = self.live[word_index] & bit_range_mask(lo, hi);
+            let in_word = word.count_ones() as usize;
+            if in_word < needed {
+                needed -= in_word;
+                continue;
+            }
+
+            // Select the `needed`th set bit from the low end. Clearing each
+            // least-significant bit advances through the live entries without
+            // visiting dead slots individually.
+            for _ in 1..needed {
+                word &= word - 1;
+            }
+            let split = word_index * BITS + word.trailing_zeros() as usize + 1;
+            return self
+                .next_live(split)
+                .is_some_and(|candidate| candidate < end)
+                .then_some(split);
+        }
+        None
+    }
+
     /// Whether entry `i` is live.
     pub fn is_live(&self, i: usize) -> bool {
         debug_assert!(i < self.entries.len(), "liveness read past the buffer");
@@ -958,6 +1009,26 @@ mod tests {
         }
         let expected: Vec<usize> = (0..5).chain((5..70).filter(|i| i % 2 == 0)).collect();
         assert_eq!(live_indices(&b), expected);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn live_prefix_split_counts_live_entries_and_requires_a_remainder() {
+        let mut b = filled(100);
+        {
+            let mut all = b.region(0);
+            for i in [0usize, 2, 31, 32, 63, 64, 70, 98] {
+                all.kill(i);
+            }
+        }
+
+        // Live entries in this range begin 3, 4, 5, 6, 7, 8. The split is
+        // immediately after the fourth one, irrespective of killed slots.
+        assert_eq!(b.live_prefix_split(2, 99, 4), Some(7));
+        assert_eq!(b.live_prefix_split(2, 8, 4), Some(7));
+        assert_eq!(b.live_prefix_split(2, 7, 4), None);
+        assert_eq!(b.live_prefix_split(2, 99, 0), None);
+        assert_eq!(b.live_prefix_split(99, 99, 1), None);
     }
 
     /// Read-side neutrality: entries 0..5 are live but are not this region's
