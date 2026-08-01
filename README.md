@@ -94,10 +94,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SigningKey::generate(&mut OsRng),
         literature::describe(),
     )?;
-    let branch_id = repo
-        .create_branch("main", None)
-        .expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull workspace");
+    let identity = repo.branch_identity("main");
+    let mut ws = repo
+        .create_workspace("main")
+        .expect("create workspace");
 
     // The entity! macro returns a Fragment carrying both facts and any
     // blob payloads it auto-put while building. Accumulate into another
@@ -151,9 +151,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Concurrent commits ─────────────────────────────────────────
     // We stage a new author; a collaborator independently stages a
     // different new author. The writes don't overlap semantically,
-    // but they both started from the same head — try_push detects
-    // the lineage divergence so we can fold the collaborator's
-    // history in.
+    // but they both started from the same signed tip. Publishing is
+    // grow-only, so both tips remain visible and resolution derives their
+    // canonical merged view.
 
     let butler = ufoid();
     ws.commit(
@@ -164,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "add Butler",
     );
 
-    let mut collaborator = repo.pull(*branch_id).expect("pull");
+    let mut collaborator = repo.pull(identity).expect("pull");
     let leguin = ufoid();
     collaborator.commit(
         entity! { &leguin @
@@ -175,23 +175,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     repo.push(&mut collaborator).expect("publish collaborator");
 
-    // Our push fails because the branch advanced while we were
-    // working. The returned workspace carries the collaborator's
-    // history; we replay our pending addition on top of it.
-    if let Some(mut conflict_ws) = repo
-        .try_push(&mut ws)
-        .expect("attempt push")
-    {
-        conflict_ws.commit(
-            entity! { &butler @
-                literature::firstname: "Octavia",
-                literature::lastname: "Butler",
-            },
-            "add Butler (rebased)",
-        );
-        repo.push(&mut conflict_ws).expect("publish resolution");
-        ws = conflict_ws;
-    }
+    // A stale workspace may publish too: it adds another signed assertion
+    // instead of racing a mutable compare-and-set branch pointer.
+    repo.push(&mut ws).expect("publish concurrent tip");
+
+    // Both tips and their ancestry are local, so the frontier is Complete.
+    // Pulling it produces a writable workspace rooted at a deterministic,
+    // authorless merge of the maximal tips.
+    let mut ws = repo.pull(identity).expect("pull complete frontier");
 
     // Final catalog: all three authors present, no overwrites.
     let catalog = ws.checkout(..)?;

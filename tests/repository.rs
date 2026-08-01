@@ -1,27 +1,20 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::repo::commit;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::Repository;
+use triblespace::core::repo::{AssertionPullError, Repository};
 use triblespace::prelude::*;
 
 #[test]
-fn branch_from_and_pull_with_key() {
-    // prepare storage with an initial commit
-    let mut store = MemoryRepo::default();
-    let key = SigningKey::generate(&mut OsRng);
-    let commit_set = commit::commit_metadata(&key, [], None, None, None);
-    let initial = store.put(commit_set).unwrap();
+fn repository_refuses_a_foreign_branch_identity() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let foreign = SigningKey::generate(&mut OsRng);
+    let owner_repo = Repository::new(MemoryRepo::default(), owner, TribleSet::new()).unwrap();
+    let identity = owner_repo.branch_identity("feature");
+    let mut foreign_repo =
+        Repository::new(MemoryRepo::default(), foreign, TribleSet::new()).unwrap();
 
-    let mut repo = Repository::new(store, key.clone(), TribleSet::new()).unwrap();
-    let branch_id = repo
-        .create_branch("feature", Some(initial))
-        .expect("branch from");
-    let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(TribleSet::new(), "work");
-    repo.push(&mut ws).expect("push");
-
-    // pull using a different key should succeed
-    let other_key = SigningKey::generate(&mut OsRng);
-    repo.pull_with_key(*branch_id, other_key).expect("pull");
+    assert!(matches!(
+        foreign_repo.pull(identity),
+        Err(AssertionPullError::ForeignIdentity(_))
+    ));
 }

@@ -20,9 +20,8 @@ cargo add triblespace ed25519-dalek rand
 
 The walkthrough below mirrors the quick-start program featured in the
 README. It defines the attributes your application needs, stages and queries
-book data, publishes the first commit with automatic retries, and finally shows
-how to use `try_push` when you want to inspect and reconcile a conflict
-manually.
+book data, publishes the first signed branch assertion, and finally shows how
+concurrent publications resolve to one canonical frontier.
 
 ```rust,ignore
 use ed25519_dalek::SigningKey;
@@ -82,10 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // for quick experiments. Swap in a `Pile` when you need durable storage.
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
-    let branch_id = repo
-        .create_branch("main", None)
-        .expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull workspace");
+    let identity = repo.branch_identity("main");
+    let mut ws = repo
+        .create_workspace("main")
+        .expect("create workspace");
 
     // The entity! macro returns a Fragment carrying both facts and any
     // blob payloads it auto-put while building. Accumulate into another
@@ -136,49 +135,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     repo.push(&mut ws).expect("publish initial library");
 
-    // ── Conflict resolution ────────────────────────────────────────
+    // ── Concurrent publication ─────────────────────────────────────
     // We rename the author; a collaborator independently records a
-    // different name. try_push detects the conflict.
+    // different name from the same starting tip.
 
     ws.commit(
         entity! { &herbert @ literature::firstname: "Francis" },
         "use pen name",
     );
 
-    let mut collaborator = repo.pull(*branch_id).expect("pull");
+    let mut collaborator = repo.pull(identity).expect("pull");
     collaborator.commit(
         entity! { &herbert @ literature::firstname: "Franklin" },
         "record legal first name",
     );
     repo.push(&mut collaborator).expect("publish collaborator");
 
-    // try_push fails because the branch advanced. The returned
-    // workspace carries the collaborator's history.
-    if let Some(mut conflict_ws) = repo
-        .try_push(&mut ws)
-        .expect("attempt push")
-    {
-        // Inspect what the collaborator wrote.
-        let their_catalog = conflict_ws.checkout(..)?;
-        for first in find!(
-            first: String,
-            pattern!(&their_catalog, [{ &herbert @ literature::firstname: ?first }])
-        ) {
-            println!("Collaborator recorded: '{first}'.");
-        }
+    // The stale workspace publishes another signed assertion. Nothing is
+    // overwritten and there is no retry loop around a mutable branch pointer.
+    repo.push(&mut ws).expect("publish concurrent tip");
 
-        // Accept their history — abandon our conflicting firstname
-        // commit and continue from the collaborator's state instead.
-        ws = conflict_ws;
-
-        // Record our preferred name as an alias rather than overwriting.
-        ws.commit(
-            entity! { &herbert @ literature::alias: "Francis" },
-            "keep pen-name as alias",
-        );
-
-        repo.push(&mut ws).expect("publish resolution");
+    // Because both tips and their ancestry are present, pulling resolves the
+    // complete maximal frontier and roots the workspace at its deterministic
+    // authorless merge.
+    let mut merged = repo.pull(identity).expect("pull complete frontier");
+    let merged_catalog = merged.checkout(..)?;
+    for first in find!(
+        first: String,
+        pattern!(&merged_catalog, [{ &herbert @ literature::firstname: ?first }])
+    ) {
+        println!("Recorded name: '{first}'.");
     }
+
+    merged.commit(
+        entity! { &herbert @ literature::alias: "Francis" },
+        "keep pen-name as alias",
+    );
+    repo.push(&mut merged).expect("publish merged descendant");
 
     Ok(())
 }
@@ -199,10 +192,10 @@ To persist data across runs, swap `MemoryRepo::default()` for
 
 ## Understanding the pieces
 
-* **Branch setup.** `Repository::create_branch` registers the branch and returns
-  an `ExclusiveId` guard. Dereference the guard (or call `ExclusiveId::release`)
-  to obtain the `Id` that `Repository::pull` expects when creating a
-  `Workspace`.
+* **Branch setup.** `Repository::branch_identity` derives the exact
+  `(author key, name handle)` descriptor. `Repository::create_workspace`
+  creates a detached empty workspace; the branch becomes visible only after
+  its first commit is published because empty branches are unrepresentable.
 * **Minting attributes.** The `attributes!` macro names the fields that can be
   stored in the repository. Attribute identifiers are global—if two crates use
   the same identifier they will read each other's data—so give them meaningful
@@ -210,14 +203,14 @@ To persist data across runs, swap `MemoryRepo::default()` for
 * **Committing data.** The `entity!` macro builds a set of attribute/value
   assertions. When paired with the `ws.commit` call it records a transaction in
   the workspace that becomes visible to others once pushed.
-* **Publishing changes.** `Repository::push` merges any concurrent history into
-  the workspace and retries automatically, making it ideal for monotonic
-  updates where you are happy to accept the merged result.
-* **Manual conflict resolution.** `Repository::try_push` performs a single
-  optimistic attempt and returns a conflict workspace when the branch has
-  advanced. Inspect that workspace to see the competing history, then decide
-  whether to merge your changes or abandon them — as the example does by
-  accepting the collaborator's name and recording ours as an alias.
+* **Publishing changes.** `Repository::push` makes staged blobs durable and
+  appends one signed grow-only assertion for a changed workspace. Concurrent
+  stale workspaces may both publish; neither overwrites the other.
+* **Resolving concurrency.** `Repository::resolve` reports an absent, pending,
+  partial, or complete frontier. `Repository::pull` opens only a complete
+  frontier. When several maximal tips remain it roots the workspace at their
+  deterministic authorless merge, so the next authored commit can converge
+  them without a compare-and-set retry loop.
 * **Closing repositories.** When working with pile-backed repositories it is
   important to close them explicitly so buffered data is flushed and any errors
   are reported while you can still decide how to handle them. Calling
@@ -229,11 +222,10 @@ To persist data across runs, swap `MemoryRepo::default()` for
 See the [crate documentation](https://docs.rs/triblespace/latest/triblespace/) for
 additional modules and examples.
 
-## Switching signing identities
+## Signing identity
 
-The setup above generates a single signing key for brevity, but collaborating
-authors typically hold individual keys. Call `Repository::set_signing_key`
-before branching or pulling when you need a different default identity, or use
-`Repository::create_branch_with_key` and `Repository::pull_with_key` to choose a
-specific key per branch or workspace. The [Managing signing identities](repository-workflows.html#managing-signing-identities)
-section covers this workflow in more detail.
+Each `Repository` is an own-key authoring boundary: its signing key is fixed at
+construction and every branch it publishes is identified by that key plus the
+content-addressed name. A foreign identity is refused before storage is read or
+written. Importing assertions by other authors is a separate, policy-bearing
+replication operation rather than a key override on a local workspace.

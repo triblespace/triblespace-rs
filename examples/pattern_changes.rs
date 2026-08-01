@@ -22,12 +22,12 @@ fn main() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("branch");
+    let identity = repo.branch_identity("main");
 
     // ── commit initial data ──────────────────────────────────────────
     let herbert = ufoid();
     let dune = ufoid();
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
     let mut initial = TribleSet::new();
     initial +=
         entity! { &herbert @ literature::firstname: "Frank", literature::lastname: "Herbert" };
@@ -38,7 +38,7 @@ fn main() {
     // ── first checkout: load everything ──────────────────────────────
     // `full` starts as a clone of the first checkout.
     let mut changed = repo
-        .pull(*branch_id)
+        .pull(identity)
         .expect("pull")
         .checkout(..)
         .expect("checkout");
@@ -57,7 +57,7 @@ fn main() {
 
     // ── simulate an external update ──────────────────────────────────
     let messiah = ufoid();
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.pull(identity).expect("pull");
     ws.commit(
         entity! { &messiah @ literature::title: "Dune Messiah", literature::author: &herbert },
         "add Dune Messiah",
@@ -67,7 +67,7 @@ fn main() {
     // ── incremental update ───────────────────────────────────────────
     // Pull fresh, exclude all commits we've already processed.
     changed = repo
-        .pull(*branch_id)
+        .pull(identity)
         .expect("pull")
         .checkout(full.commits()..)
         .expect("delta");

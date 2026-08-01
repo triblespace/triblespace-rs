@@ -959,8 +959,8 @@ fn checkout_benchmark(c: &mut Criterion) {
         let storage = MemoryRepo::default();
         let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())
             .expect("repo");
-        let branch_id = repo.create_branch("bench", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull");
+        let identity = repo.branch_identity("bench");
+        let mut ws = repo.create_workspace("bench").expect("create workspace");
 
         let mut total_tribles: u64 = 0;
         for _ in 0..n_commits {
@@ -987,7 +987,7 @@ fn checkout_benchmark(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_tribles));
         group.bench_function(BenchmarkId::new("checkout", n_commits), |b| {
             b.iter(|| {
-                let mut ws = repo.pull(*branch_id).expect("pull");
+                let mut ws = repo.pull(identity).expect("pull");
                 ws.checkout(..).expect("checkout")
             });
         });

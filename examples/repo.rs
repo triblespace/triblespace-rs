@@ -16,36 +16,27 @@ fn main() {
     let mut pile = Pile::open(&path).expect("open pile");
     pile.refresh().expect("load pile");
 
-    // Create a repository from the pile and initialize the main branch
+    // Create a repository from the pile and stage the first main workspace.
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .expect("create repo");
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws1 = repo.pull(*branch_id).expect("pull");
+    let identity = repo.branch_identity("main");
+    let mut ws1 = repo.create_workspace("main").expect("create workspace");
 
     // First workspace adds Alice and pushes
     let mut change = TribleSet::new();
     change += entity! { &ufoid() @ literature::firstname: "Alice" };
 
     ws1.commit(change, "add alice");
-    // Single-attempt push; handle conflicts manually when required.
-    repo.try_push(&mut ws1).expect("try_push ws1");
+    repo.push(&mut ws1).expect("publish ws1");
 
-    // Second workspace adds Bob and attempts to push, merging on conflict
-    let mut ws2 = repo.pull(*branch_id).expect("pull");
+    // A later workspace resolves the branch assertions and adds Bob.
+    let mut ws2 = repo.pull(identity).expect("pull");
     let mut change = TribleSet::new();
     change += entity! { &ufoid() @ literature::firstname: "Bob" };
     ws2.commit(change, "add bob");
 
-    match repo.try_push(&mut ws2).expect("try_push ws2") {
-        None => println!("Push ws2 succeeded"),
-        Some(mut other) => loop {
-            other.merge(&mut ws2).expect("merge");
-            match repo.try_push(&mut other).expect("push conflict") {
-                None => break,
-                Some(next) => other = next,
-            }
-        },
-    }
+    repo.push(&mut ws2).expect("publish ws2");
+    println!("Published two signed branch assertions");
 
     repo.close().expect("close pile");
 }

@@ -158,44 +158,33 @@ relation therefore contains one pair per accepted `(start, end)`, not one row
 per distinct route between them; ordinary query joins can still introduce bag
 multiplicity through their other witnesses.
 
-## Keep the index current with a repository
+## Build from a resolved repository view
 
-For a durable branch, wrap the same automaton in a `PathRollup` and register it
-before the branch's first data push:
+Branch publication and derived-index maintenance are separate operations. The
+assertion-native `Repository` has no hidden on-push hook: publish the source,
+resolve its exact branch identity, then build the path relation from the
+complete checkout you intend to index:
 
 ```rust,ignore
-use triblespace_paths::PathRollup;
+use triblespace_paths::PathIndex;
 
-let rollup = PathRollup::new(friend_automaton);
-repo.register_index(rollup.clone());
-
-let branch_id = *repo.create_branch("main", None)?;
-let mut ws = repo.pull(branch_id)?;
+let identity = repo.branch_identity("main");
+let mut ws = repo.create_workspace("main")?;
 ws.commit(graph, "add social graph");
 repo.push(&mut ws)?;
 
-// Hook errors do not roll back the source commit. Surface or repair them
-// before treating the derived index as current.
-if let Some(failure) = repo.take_hook_errors().into_iter().next() {
-    return Err(failure.error);
-}
-
-// Attachment reads the branch metadata directly; no checkout is required.
-let paths = rollup.attach_exact(repo.storage_mut(), branch_id)?;
+let mut resolved = repo.pull(identity)?;
+let facts = resolved.checkout(..)?;
+let paths = PathIndex::from_tribles(friend_automaton, facts.iter())?;
 ```
 
-`Repository::register_index` installs an on-commit hook. Each newly reachable
-commit becomes one inclusive `[commit, commit]` logical range, even when the
-commit is contentless or produces no path artifact. The range record and the
-source branch head are published together in the same branch-metadata CAS.
-`IndexHome` applies base-FANOUT LSM compaction while appending those logical
-leaves.
-
-Registration is not retrospective. Register before the first relevant push, or
-explicitly build and audit a covering manifest for existing history. If a hook
-fails, the source commit still lands and `Repository::take_hook_errors` records
-the failure; a later `attach_exact` then rejects the stale frontier rather than
-silently serving an old relation.
+`Repository::pull` succeeds only for a complete frontier. That makes the
+checkout's source boundary explicit: a missing asserted tip or unresolved
+ancestry cannot silently produce a derived index that claims to be current.
+For persistent incremental indexes, `PathRollup` remains the typed range
+recipe, but the application must run range construction and publication as an
+explicit derived-data workflow. It is not part of the source assertion's
+durable append point.
 
 ## What a persisted summary means
 
@@ -240,19 +229,13 @@ range still exists as a certified contentless record, but it has no
 
 ## Freshness and the trust boundary
 
-`attach_exact` reads the branch metadata pin, source commit head, and typed
-manifest from one snapshot. It checks that the manifest claims exactly that
-head and validates every summary's canonical bytes and automaton fingerprint.
-A mismatch fails with `IndexError::StaleCoverage` or an artifact error.
-
-The hot attachment path intentionally does **not** walk the full commit DAG to
-prove that all manifest ranges form an exact cover. Metadata produced by
-`Repository::register_index` earns that trust through its monotone, same-CAS
-maintenance path. For imported, manually assembled, or otherwise untrusted
-metadata, read the `IndexHome` snapshot and call
-`Manifest::audit_exact_cover` against a blob reader before trusting it, or
-rebuild the manifest. See [Range-Native Derived Indexes](index-ranges.md) for
-the inclusive frontier and exact-cover rules.
+A durable consumer must bind a manifest to the exact complete source frontier
+it covered, validate every summary's canonical bytes and automaton fingerprint,
+and reject stale coverage. Imported or manually assembled metadata should be
+checked with `Manifest::audit_exact_cover` against a blob reader before it is
+trusted, or rebuilt. See [Range-Native Derived Indexes](index-ranges.md) for the
+inclusive frontier and exact-cover rules. This audit belongs to the derived
+index workflow; source branch assertions remain a small, index-neutral ledger.
 
 ## Cost model: sparse input, potentially dense answer
 

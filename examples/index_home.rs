@@ -1,14 +1,19 @@
-//! Index-home end-to-end: register an index kind once, commit normally,
-//! then query WITHOUT a checkout by attaching the manifest's segments
-//! straight from the branch head.
+//! Persist and attach a succinct range manifest explicitly.
+//!
+//! Source publication uses grow-only branch assertions. Derived index
+//! maintenance is a separate operation: build a typed range artifact, certify
+//! the source frontier in a manifest, and publish that manifest to its index
+//! home. No hidden repository hook couples the two ledgers.
 //!
 //! Run with: `cargo run --example index_home`
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::examples::literature;
-use triblespace::core::repo::index_home::{IndexHome, SuccinctRollup};
-use triblespace::core::repo::Repository;
+use triblespace::core::repo::index_home::{
+    append_range, set_index_head, CommitRange, IndexHome, Manifest, SuccinctRollup,
+};
+use triblespace::core::repo::{self, PinStore, PushResult, Repository};
 use triblespace::prelude::*;
 
 fn main() {
@@ -16,42 +21,73 @@ fn main() {
     let path = tmp.path().join("index_home.pile");
     std::fs::File::create(&path).expect("create pile file");
 
-    // Open the pile fail-loud: `refresh` loads existing records and errors
-    // on a corrupt tail (repair is explicit — `Pile::amputate`).
     let mut pile = Pile::open(&path).expect("open pile");
     pile.refresh().expect("load pile");
-
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+    let mut repository = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .expect("create repo");
 
-    // 1) Register the index kind ONCE. From here on every push maintains
-    //    the index incrementally from its own commit delta: the on-commit
-    //    hook folds the new segment's manifest into the same branch-head
-    //    tribleset the push CASes in — one atomic repoint carries the
-    //    commit and its index maintenance together.
-    repo.register_index(SuccinctRollup::new());
-
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-
-    // 2) Commit normally; no explicit index calls anywhere.
+    // Publish one source commit under the exact (author, name) identity.
+    let identity = repository.branch_identity("main");
+    let branch_id = identity.id().entity();
+    let mut workspace = repository
+        .create_workspace("main")
+        .expect("create workspace");
+    let mut people = TribleSet::new();
     for name in ["Ada", "Grace", "Barbara"] {
-        let mut ws = repo.pull(*branch_id).expect("pull");
-        let delta: TribleSet = entity! { &ufoid() @ literature::firstname: name }.into();
-        ws.commit(delta, "add person");
-        repo.push(&mut ws).expect("push");
+        people += entity! { &ufoid() @ literature::firstname: name };
     }
-    assert!(
-        repo.take_hook_errors().is_empty(),
-        "index hooks ran clean on every push"
-    );
+    workspace.commit(people.clone(), "add people");
+    let source_head = workspace.head().expect("commit head");
+    repository
+        .push(&mut workspace)
+        .expect("publish source assertion");
 
-    // 3) Query WITHOUT a checkout: one branch-head lookup, a bounded number
-    //    of segment fetches (`attach_all`), then a union query across the
-    //    segments. No commit walk, no materialisation of the branch.
-    let mut home = IndexHome::new(repo.storage_mut(), *branch_id, SuccinctRollup::new());
+    // Build and persist one inclusive [commit, commit] index leaf, then bind
+    // the manifest to the exact complete source frontier it covers.
+    let rollup = SuccinctRollup::new();
+    let mut manifest = Manifest::new(&rollup)
+        .expect("create manifest")
+        .to_tribles();
+    append_range(
+        repository.storage_mut(),
+        &rollup,
+        &people,
+        CommitRange::leaf(source_head),
+        &mut manifest,
+    )
+    .expect("append range");
+    set_index_head(
+        repository.storage_mut(),
+        &rollup,
+        &mut manifest,
+        Some(source_head),
+    )
+    .expect("certify source frontier");
+
+    // IndexHome uses a small independently replaceable pin for the derived
+    // manifest. That pin is not branch publication and carries no source data.
+    let branch_entity = ufoid();
+    manifest += entity! { &branch_entity @
+        repo::branch: branch_id,
+        repo::head: source_head,
+    }
+    .into_facts();
+    let manifest_head = repository
+        .storage_mut()
+        .put(manifest.to_blob())
+        .expect("store manifest");
+    assert!(matches!(
+        repository
+            .storage_mut()
+            .update(branch_id, None, Some(manifest_head))
+            .expect("publish manifest"),
+        PushResult::Success()
+    ));
+
+    // Query attached persisted segments without materializing the source
+    // branch checkout again.
+    let mut home = IndexHome::new(repository.storage_mut(), branch_id, rollup);
     let segments = home.attach_all().expect("attach segments");
-    println!("manifest names {} segment(s)", segments.len());
-
     let union = SuccinctRollup::union(&segments);
     let mut names: Vec<String> = find!(
         (name: Inline<_>),
@@ -61,8 +97,7 @@ fn main() {
     .collect();
     names.sort();
 
-    println!("queried without checkout: {names:?}");
+    println!("queried persisted manifest: {names:?}");
     assert_eq!(names, ["Ada", "Barbara", "Grace"]);
-
-    repo.close().expect("close pile");
+    repository.close().expect("close pile");
 }

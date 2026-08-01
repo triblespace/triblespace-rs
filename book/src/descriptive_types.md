@@ -79,7 +79,7 @@ manager in one of two shapes:
 
 1. Accept a `&mut Repository<_>` and open/pull the workspace you need inside
    the function. This works well for tasks that need to coordinate multiple
-   checkouts or want to control the retry loop themselves, and the mutable
+   checkouts or want to control publication themselves, and the mutable
    borrow is typically short-lived: you only need it while creating or
    pushing workspaces.
 2. Ask the manager to mint a `&mut Workspace<_>` for the duration of a task
@@ -100,14 +100,14 @@ Example (pseudocode):
 ```rust,ignore
 // manager owns a Repository for the process/session lifetime
 let mut repo = manager.repo_mut();
-let branch_id = manager.default_branch_id;
+let identity = manager.default_branch_identity;
 
 // option 1: task pulls its own workspace
-let mut ws = repo.pull(branch_id)?;
+let mut ws = repo.pull(identity)?;
 let content = ws.checkout(ws.head())?;
 
 // option 2: manager provides a workspace to a task callback
-manager.with_workspace(branch_id, |ws| {
+manager.with_workspace(identity, |ws| {
     let snapshot = ws.checkout(ws.head())?;
     render(snapshot);
     Ok(())
@@ -260,32 +260,20 @@ On update, create new step entities only for truly new step text and add a
 new snapshot entity that references the steps. This keeps history immutable
 and easy to reason about.
 
-### 6. Push/merge retry loop for writers
+### 6. Grow-only publication for writers
 
-When pushing writes, use the standard push/merge loop to handle concurrent
-writers. Two options are available:
-
-- Manual conflict handling with `try_push` (single attempt; returns a
-  conflicting workspace on CAS failure):
+Publication does not update a mutable branch pointer. A changed workspace
+appends one signed assertion after its staged blobs are durable:
 
 ```rust,ignore
 ws.commit(content, "plan-update");
-let mut current_ws = ws;
-while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
-    incoming.merge(&mut current_ws)?;
-    current_ws = incoming;
-}
-```
-
-- Automatic retries with `push` (convenience wrapper that merges and retries
-  until success or error):
-
-```rust,ignore
-ws.commit(content, "plan-update");
-// `push` will handle merge+retry internally; it returns Ok(()) on success
-// or an error if the operation ultimately failed.
 repo.push(&mut ws)?;
 ```
+
+If another workspace publishes from the same base, both assertions remain.
+Resolve or pull the exact `BranchIdentity` again: a complete divergent frontier
+gets a deterministic authorless merge head, while a pending or partial frontier
+stays explicitly non-writable until the missing commit metadata arrives.
 
 ## Practical anti‑patterns
 - Do not unfold the graph or convert it into nested Rust structs.
@@ -340,8 +328,8 @@ materialize small views lazily.
 - Manager-owned repo: long-lived Repository instances should be owned by a
   session/exporter/manager; library code should accept a Workspace or
   TribleSet rather than opening piles itself.
-- Use push/merge retry loops for writers; avoid holding repo locks across
-  async/await points.
+- Treat `push` as one durable assertion publication; resolve concurrency by
+  branch identity, and avoid holding repo locks across async/await points.
 
 The sections below contain copy‑pasteable recipes for common operations.
 
@@ -358,8 +346,8 @@ When reviewing code that touches tribles, look for these items:
 - Does the code use find! to select only the fields it needs, rather than
   unfolding the entire graph?
 - Are blob reads kept lazy (only read LongString when necessary)?
-- Are push flows using the push/merge retry loop to avoid losing concurrent
-  updates?
+- Do push flows retain the exact branch identity and re-resolve concurrent
+  assertions instead of inventing a mutable-head retry loop?
 - Is the code avoiding holding the repo's Mutex across awaits and long
   blocking operations?
 

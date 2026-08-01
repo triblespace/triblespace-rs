@@ -119,8 +119,8 @@ mod readme_example {
         let storage = MemoryRepo::default();
         let mut repo =
             Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-        let branch_id = repo.create_branch("main", None).expect("create branch");
-        let mut ws = repo.pull(*branch_id).expect("pull workspace");
+        let identity = repo.branch_identity("main");
+        let mut ws = repo.create_workspace("main").expect("create workspace");
 
         let herbert = ufoid();
         let dune = ufoid();
@@ -170,32 +170,32 @@ mod readme_example {
             "use pen name",
         );
 
-        let mut collaborator = repo.pull(*branch_id).expect("pull");
+        let mut collaborator = repo.pull(identity).expect("pull");
         collaborator.commit(
             entity! { &herbert @ literature::firstname: "Franklin" },
             "record legal first name",
         );
         repo.push(&mut collaborator).expect("publish collaborator");
 
-        if let Some(mut conflict_ws) = repo.try_push(&mut ws).expect("attempt push") {
-            let their_catalog = conflict_ws.checkout(..)?;
-            for first in find!(
-                first: String,
-                pattern!(&their_catalog, [{ &herbert @ literature::firstname: ?first }])
-            ) {
-                println!("Collaborator recorded: '{first}'.");
-            }
+        // Publication is grow-only: the stale workspace contributes a second
+        // signed tip instead of racing a mutable branch pointer.
+        repo.push(&mut ws).expect("publish concurrent tip");
 
-            // Accept their history — abandon our conflicting commit.
-            ws = conflict_ws;
+        let mut merged = repo.pull(identity).expect("pull complete frontier");
+        let merged_catalog = merged.checkout(..)?;
+        let mut first_names: Vec<String> = find!(
+            first: String,
+            pattern!(&merged_catalog, [{ &herbert @ literature::firstname: ?first }])
+        )
+        .collect();
+        first_names.sort();
+        assert_eq!(first_names, ["Francis", "Frank", "Franklin"]);
 
-            ws.commit(
-                entity! { &herbert @ literature::alias: "Francis" },
-                "keep pen-name as alias",
-            );
-
-            repo.push(&mut ws).expect("publish resolution");
-        }
+        merged.commit(
+            entity! { &herbert @ literature::alias: "Francis" },
+            "keep pen-name as alias",
+        );
+        repo.push(&mut merged).expect("publish merged descendant");
 
         Ok(())
     }

@@ -1,29 +1,41 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::repo::branch_frontier::BranchResolution;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::Repository;
+use triblespace::core::repo::{PublishOutcome, Repository};
 use triblespace::prelude::*;
 
 #[test]
-fn push_and_merge_conflict_resolution() {
+fn concurrent_publications_form_a_complete_frontier() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws1 = repo.pull(*branch_id).expect("pull");
-    let mut ws2 = repo.pull(*branch_id).expect("pull");
+    let identity = repo.branch_identity("main");
+    let mut ws1 = repo
+        .create_workspace("main")
+        .expect("create first workspace");
+    let mut ws2 = repo
+        .create_workspace("main")
+        .expect("create second workspace");
 
     ws1.commit(TribleSet::new(), "first");
     ws2.commit(TribleSet::new(), "second");
 
-    repo.push(&mut ws1).expect("push");
+    assert!(matches!(
+        repo.push(&mut ws1).expect("publish first workspace"),
+        PublishOutcome::Published(_)
+    ));
+    assert!(matches!(
+        repo.push(&mut ws2).expect("publish second workspace"),
+        PublishOutcome::Published(_)
+    ));
 
-    let mut conflict_ws = match repo.try_push(&mut ws2).expect("push") {
-        Some(ws) => ws,
-        _ => panic!("expected conflict"),
+    let BranchResolution::Complete(frontier) =
+        repo.resolve(&identity).expect("resolve concurrent tips")
+    else {
+        panic!("concurrent readable tips must form a complete frontier");
     };
-
-    conflict_ws.merge(&mut ws2).unwrap();
-
-    repo.push(&mut conflict_ws).expect("push");
+    assert_eq!(frontier.tips().len(), 2);
+    repo.pull(identity)
+        .expect("a complete divergent frontier is writable");
 }

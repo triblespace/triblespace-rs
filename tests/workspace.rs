@@ -17,8 +17,7 @@ fn workspace_commit_updates_head() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     ws.commit(TribleSet::new(), "change");
 
@@ -30,8 +29,7 @@ fn workspace_checkout_empty_branch_returns_empty_set() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let result = ws.checkout(..).expect("checkout empty branch");
 
@@ -45,8 +43,7 @@ fn workspace_checkout_unions_commits() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let e1 = ufoid();
     let a1 = ufoid();
@@ -83,8 +80,7 @@ fn workspace_checkout_single_commit() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let e = ufoid();
     let a = ufoid();
@@ -108,8 +104,7 @@ fn workspace_checkout_vec_commits() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let mut sets = Vec::new();
     let mut commits = Vec::new();
@@ -149,8 +144,7 @@ fn workspace_checkout_metadata_returns_repo_metadata() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     ws.commit(TribleSet::new(), "first");
     let c1 = ws.head().unwrap();
@@ -178,8 +172,7 @@ fn workspace_checkout_with_metadata_returns_both() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let data_e = ufoid();
     let data_a = ufoid();
@@ -213,8 +206,7 @@ fn workspace_commit_uses_repo_metadata() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let data_e = ufoid();
     let data_a = ufoid();
@@ -241,8 +233,7 @@ fn workspace_checkout_range_variants() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let mut sets = Vec::new();
     let mut handles = Vec::new();
@@ -289,8 +280,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let signing = SigningKey::generate(&mut OsRng);
 
@@ -356,8 +346,7 @@ fn workspace_checkout_symmetric_diff() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let mut sets = Vec::new();
     let mut handles = Vec::new();
@@ -387,8 +376,7 @@ fn workspace_checkout_set_operation_selectors() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let mut sets = Vec::new();
     let mut handles = Vec::new();
@@ -433,8 +421,7 @@ fn workspace_get_local_and_base() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let e = ufoid();
     let a = ufoid();
@@ -449,9 +436,9 @@ fn workspace_get_local_and_base() {
     let local: TribleSet = ws.get(handle).expect("get local");
     assert_eq!(local, set);
 
+    let identity = *ws.identity();
     repo.push(&mut ws).expect("push");
-    let branch_id = ws.branch_id();
-    let mut ws2 = repo.pull(branch_id).expect("pull");
+    let mut ws2 = repo.pull(identity).expect("pull");
 
     let base: TribleSet = ws2.get(handle).expect("get base");
     assert_eq!(base, set);
@@ -464,8 +451,7 @@ fn workspace_checkout_head_collects_history() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let mut sets = Vec::new();
     for i in 0..3i128 {
@@ -496,8 +482,7 @@ fn workspace_nth_ancestor_selector() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let mut sets = Vec::new();
     for i in 0..3i128 {
@@ -533,8 +518,8 @@ fn workspace_parents_selector() {
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
 
     // Base commit so both workspaces share a common ancestor.
-    let main_branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws_main = repo.pull(*main_branch_id).expect("pull branch state");
+    let identity = repo.branch_identity("main");
+    let mut ws_main = repo.create_workspace("main").expect("create workspace");
     let e0 = ufoid();
     let a0 = ufoid();
     let v0: Inline<R256> = 0i128.to_inline();
@@ -545,7 +530,7 @@ fn workspace_parents_selector() {
     repo.push(&mut ws_main).expect("push base");
 
     // Fork a second workspace from the same base commit.
-    let mut ws_feature = repo.pull(ws_main.branch_id()).expect("pull branch state");
+    let mut ws_feature = repo.pull(identity).expect("pull branch state");
 
     // Divergent commits on both workspaces.
     let e1 = ufoid();
@@ -585,8 +570,7 @@ fn workspace_history_of_entity() {
     let storage = MemoryRepo::default();
     let mut repo =
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-    let branch_id = repo.create_branch("main", None).expect("create branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut ws = repo.create_workspace("main").expect("create workspace");
 
     let entity = ufoid();
     let a1 = ufoid();

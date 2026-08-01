@@ -12,17 +12,14 @@ fn main() {
     )
     .unwrap();
 
-    // create a new branch and add a commit
-    let branch_id = repo.create_branch("feature", None).expect("create branch");
-    let mut workspace = repo.pull(*branch_id).expect("pull");
+    // Create a detached workspace and add its first commit. Empty branches are
+    // deliberately unrepresentable until a commit is published.
+    let mut workspace = repo.create_workspace("feature").expect("create workspace");
     workspace.commit(TribleSet::new(), "start feature work");
 
-    // attempt to push, merging conflicts before retrying
-    while let Some(mut incoming) = repo.try_push(&mut workspace).expect("push") {
-        // merge our local changes into the conflicting workspace
-        incoming.merge(&mut workspace).expect("merge");
-        // push the merged workspace on the next iteration
-        workspace = incoming;
-    }
+    // Publication appends a signed grow-only assertion. Concurrent stale
+    // workspaces may publish too; branch resolution later derives the maximal
+    // commit frontier instead of returning a CAS conflict.
+    repo.push(&mut workspace).expect("publish");
     println!("pushed");
 }
