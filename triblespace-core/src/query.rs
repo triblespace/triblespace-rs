@@ -1504,15 +1504,16 @@ where
         Some(right)
     }
 
-    /// Transfers one full query-width suffix from a confirmed nonterminal
-    /// candidate region without fragmenting the downstream cohort.
+    /// Transfers the next exact geometric page from a confirmed nonterminal
+    /// candidate region.
     ///
     /// The proposal and every confirmation have already completed, so the
-    /// published buffer is immutable. `self` retains the geometrically
-    /// widening latency prefix and every source continuation. The fenced
-    /// sibling receives exactly `self.width` live candidates and starts at
-    /// that width; repeated steals therefore peel whole natural cohorts and
-    /// never expose backend thresholds to the scheduler.
+    /// published buffer is immutable. `self` keeps the next page and the
+    /// time-to-first-result path. The sibling begins at precisely the cursor
+    /// sequential search would reach and inherits the exact successor width
+    /// from the geometric/tail recurrence. Recursive steals therefore expose
+    /// the serial page schedule without changing any downstream frontier
+    /// width or accelerator route.
     ///
     /// Terminal candidates deliberately remain indivisible here. Main's
     /// existing terminal-page transfer is the only terminal work unit, so
@@ -1534,33 +1535,41 @@ where
         debug_assert!(end <= level.proposed);
 
         let buffer = self.bindings.levels[level.variable].buffer();
-        let live = buffer.count_live_range(start, end);
-        if live <= self.width {
-            return None;
-        }
-        let mid = buffer
-            .live_suffix_start(start, end, self.width)
-            .expect("more than one query-width of live candidates");
-        debug_assert!(mid > start);
-        debug_assert_eq!(buffer.count_live_range(mid, end), self.width);
+        let mid = buffer.live_prefix_split(start, end, level.width)?;
 
-        let mut right = self.clone();
-        let left_level = self.stack.last_mut().expect("a level to fence");
-        left_level.candidate_begin = start;
-        left_level.candidate_end = mid;
+        let next = level
+            .width
+            .saturating_mul(FRONTIER_RAMP_BASE)
+            .min(self.width);
+        let remaining = end - mid;
+        let continuation_width = if remaining < next.saturating_mul(2) {
+            remaining.max(next).min(self.width)
+        } else {
+            next
+        };
 
-        let right_level = right.stack.last_mut().expect("a cloned level to fence");
-        right_level.candidate_begin = mid;
-        right_level.candidate_end = end;
-        right_level.width = self.width;
-        right.bindings.levels[level.variable].pos = mid;
+        let mut continuation = self.clone();
+        let prefix_level = self.stack.last_mut().expect("a level to fence");
+        prefix_level.candidate_begin = start;
+        prefix_level.candidate_end = mid;
 
-        drop(right.stack.drain(..depth));
-        drop(right.depths.drain(..depth));
-        right.depth = 0;
-        let root = &mut right.depths[0];
+        let continuation_level = continuation
+            .stack
+            .last_mut()
+            .expect("a cloned level to continue");
+        continuation_level.candidate_begin = mid;
+        continuation_level.candidate_end = end;
+        continuation_level.width = continuation_width;
+        continuation.bindings.levels[level.variable].pos = mid;
+
+        // The prefix owns only this exact page. The clone retains every source
+        // continuation and can be split again into the next serial page.
+        drop(self.stack.drain(..depth));
+        drop(self.depths.drain(..depth));
+        self.depth = 0;
+        let root = &mut self.depths[0];
         root.group_limit = root.group;
-        Some(right)
+        Some(continuation)
     }
 
     /// Transfers the un-emitted remainder of a complete frontier page to a
@@ -2167,14 +2176,15 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // and their preferred next variable. The original producer skips that group
 // and retains the source continuation, so it can draw the next geometric page
 // while the sibling evaluates the current one. A confirmed nonterminal region
-// may additionally peel a full query-width suffix. Every sibling is re-rooted
-// and fenced: it cannot replay later groups or ancestor work.
+// may additionally transfer its next exact geometric page while the clone
+// retains the remainder. Every page producer is re-rooted and fenced: it
+// cannot replay later groups or ancestor work.
 //
 // No proposal or confirmation call sees a bisected buffer. A candidate split
-// happens only after that call has published its immutable result, and only if
-// the sibling can own one full natural-width cohort. Terminal candidate regions
-// are never recursively split: main's existing whole terminal-page transfer is
-// retained unchanged.
+// happens only after that call has published its immutable result and only on a
+// boundary the serial geometric schedule would create itself. Terminal
+// candidate regions are never recursively split: main's existing whole
+// terminal-page transfer is retained unchanged.
 //
 // A built-in CPU constraint may nevertheless expose *work inside one logical
 // confirm call* to the same pool. `IntoParallelIterator` marks the query's
@@ -2185,7 +2195,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // the frontier, proposal buffer, and any accelerator routing whole: it is data
 // parallelism inside a leaf, not another search-state split.
 // Every successful split advances a group/page cursor or shortens one owned
-// candidate interval by a full cohort, so ownership is a strict progress
+// candidate interval by an exact page, so ownership is a strict progress
 // measure. Rayon's pressure splitter needs no engine-specific split budget.
 //
 // `fold_with` is the terminal leaf: it just drives the existing sequential
@@ -3103,9 +3113,9 @@ mod tests {
         }
 
         #[test]
-        fn nonterminal_splits_peel_full_live_cohorts_and_keep_the_prefix_lazy() {
+        fn nonterminal_splits_reproduce_the_exact_geometric_page_schedule() {
             let downstream_widths = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let mut left = Query::new(
+            let mut first = Query::new(
                 CohortFixture {
                     roots: 10,
                     downstream_widths: Arc::clone(&downstream_widths),
@@ -3114,45 +3124,48 @@ mod tests {
             )
             .with_frontier_width(4);
 
-            left.plan();
-            left.next_group();
-            assert_eq!(left.mode, Search::NextChunk);
-            assert_eq!(left.stack[0].width, 1);
+            first.plan();
+            first.next_group();
+            assert_eq!(first.mode, Search::NextChunk);
+            assert_eq!(first.stack[0].width, 1);
 
-            let right = left
+            let mut second = first
                 .split_pending_candidates()
-                .expect("ten live rows can peel one four-row cohort");
-            let middle = left
+                .expect("the first one-row page leaves a continuation");
+            let mut third = second
                 .split_pending_candidates()
-                .expect("six remaining rows can peel a second cohort");
-            assert!(left.split_pending_candidates().is_none());
+                .expect("the next four-row page leaves a continuation");
+            let fourth = third
+                .split_pending_candidates()
+                .expect("the second four-row page leaves a final row");
+            assert!(first.split_pending_candidates().is_none());
+            assert!(second.split_pending_candidates().is_none());
+            assert!(third.split_pending_candidates().is_none());
 
             assert_eq!(
                 (
-                    left.stack[0].candidate_begin,
-                    left.stack[0].candidate_end,
-                    left.stack[0].width,
+                    first.stack[0].candidate_begin,
+                    first.stack[0].candidate_end,
+                    first.stack[0].width,
                 ),
-                (0, 2, 1)
+                (0, 1, 1)
             );
-            for sibling in [&middle, &right] {
+            for (query, interval) in [(&second, (1, 5)), (&third, (5, 9)), (&fourth, (9, 10))] {
                 assert_eq!(
-                    (
-                        sibling.stack[0].candidate_end - sibling.stack[0].candidate_begin,
-                        sibling.stack[0].width,
-                    ),
-                    (4, 4)
+                    (query.stack[0].candidate_begin, query.stack[0].candidate_end),
+                    interval
                 );
+                assert_eq!(query.stack[0].width, 4);
             }
 
-            let mut actual: Vec<_> = left.chain(middle).chain(right).collect();
+            let mut actual: Vec<_> = first.chain(second).chain(third).chain(fourth).collect();
             actual.sort_unstable();
             let expected: Vec<_> = (0..10).map(|root| (root, root)).collect();
             assert_eq!(actual, expected);
 
-            let widths = downstream_widths.lock().unwrap();
-            assert_eq!(widths.iter().filter(|&&width| width == 4).count(), 2);
-            assert!(widths.iter().all(|&width| matches!(width, 1 | 4)));
+            let mut widths = downstream_widths.lock().unwrap().clone();
+            widths.sort_unstable();
+            assert_eq!(widths, [1, 1, 4, 4]);
         }
 
         fn advance_to_emit(query: &mut TestQuery) {

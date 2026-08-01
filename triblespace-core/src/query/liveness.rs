@@ -347,36 +347,14 @@ impl ProposalBuffer {
                 .sum::<usize>()
     }
 
-    /// Number of live entries in the half-open interval `start..end`.
-    #[cfg(feature = "parallel")]
-    pub(crate) fn count_live_range(&self, start: usize, end: usize) -> usize {
-        let end = end.min(self.entries.len());
-        if start >= end {
-            return 0;
-        }
-
-        let first = start / BITS;
-        let last = (end - 1) / BITS;
-        (first..=last)
-            .map(|word| {
-                let lo = if word == first { start % BITS } else { 0 };
-                let hi = if word == last {
-                    (end - 1) % BITS + 1
-                } else {
-                    BITS
-                };
-                (self.live[word] & bit_range_mask(lo, hi)).count_ones() as usize
-            })
-            .sum()
-    }
-
-    /// Start index of the suffix containing exactly `count` live entries in
-    /// `start..end`.
+    /// Cursor immediately after the first `count` live entries in
+    /// `start..end`, provided that at least one further live entry remains.
     ///
-    /// Dead slots remain in one of the two immutable candidate intervals, but
-    /// the returned boundary itself names the suffix's first live entry.
+    /// This is the exact boundary that a sequential `take_chunk(count)` would
+    /// produce. Dead candidates stay in their immutable buffer positions but
+    /// do not count toward the page width.
     #[cfg(feature = "parallel")]
-    pub(crate) fn live_suffix_start(
+    pub(crate) fn live_prefix_split(
         &self,
         start: usize,
         end: usize,
@@ -390,7 +368,7 @@ impl ProposalBuffer {
         let first = start / BITS;
         let last = (end - 1) / BITS;
         let mut needed = count;
-        for word_index in (first..=last).rev() {
+        for word_index in first..=last {
             let lo = if word_index == first { start % BITS } else { 0 };
             let hi = if word_index == last {
                 (end - 1) % BITS + 1
@@ -405,11 +383,13 @@ impl ProposalBuffer {
             }
 
             for _ in 1..needed {
-                let high = u32::BITS - 1 - word.leading_zeros();
-                word &= !(1u32 << high);
+                word &= word - 1;
             }
-            let high = u32::BITS - 1 - word.leading_zeros();
-            return Some(word_index * BITS + high as usize);
+            let split = word_index * BITS + word.trailing_zeros() as usize + 1;
+            return self
+                .next_live(split)
+                .is_some_and(|candidate| candidate < end)
+                .then_some(split);
         }
         None
     }
@@ -1029,22 +1009,20 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn live_suffix_selection_respects_dead_and_unaligned_boundaries() {
+    fn live_prefix_split_counts_live_entries_and_requires_a_remainder() {
         let mut b = filled(100);
         {
             let mut all = b.region(0);
-            for i in [5usize, 7, 31, 32, 63, 64, 91, 98] {
+            for i in [0usize, 2, 31, 32, 63, 64, 70, 98] {
                 all.kill(i);
             }
         }
 
-        assert_eq!(b.count_live_range(5, 99), 86);
-        let split = b.live_suffix_start(5, 99, 17).unwrap();
-        assert_eq!(b.count_live_range(split, 99), 17);
-        assert_eq!(b.count_live_range(5, split), 69);
-        assert!(b.is_live(split));
-        assert_eq!(b.live_suffix_start(5, 99, 87), None);
-        assert_eq!(b.live_suffix_start(5, 99, 0), None);
+        assert_eq!(b.live_prefix_split(2, 99, 4), Some(7));
+        assert_eq!(b.live_prefix_split(2, 8, 4), Some(7));
+        assert_eq!(b.live_prefix_split(2, 7, 4), None);
+        assert_eq!(b.live_prefix_split(2, 99, 0), None);
+        assert_eq!(b.live_prefix_split(99, 99, 1), None);
     }
 
     /// Read-side neutrality: entries 0..5 are live but are not this region's
