@@ -1533,6 +1533,21 @@ where
         debug_assert_eq!(self.mode, Search::NextChunk);
         debug_assert_eq!(self.stack.len(), self.depth + 1);
 
+        // A candidate interval is a safe search split only when consuming it
+        // completes the binding. Otherwise the two halves become distinct
+        // parent frontiers for the remaining constraint calls, permanently
+        // narrowing every downstream batch. That changes physical routing:
+        // a region that was large enough for an accelerator as a whole can
+        // fall below its own crossover in every shard. The core protocol has
+        // no device/crossover capability (deliberately), so there is no sound
+        // backend-neutral way to predict which intermediate split is cheap.
+        // Keep future `propose`/`confirm` cohorts whole; terminal candidate
+        // intervals may still split because no constraint can observe their
+        // child frontier.
+        if !self.unbound.is_empty() {
+            return None;
+        }
+
         let depth = self.depth;
         let level = *self.stack.last().expect("a level to chunk");
         let start = self.bindings.consumed(level.variable);
