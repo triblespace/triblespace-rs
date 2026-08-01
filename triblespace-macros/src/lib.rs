@@ -12,7 +12,7 @@ use hex::FromHex;
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::Repository;
+use triblespace_core::repo::{AssertionPullError, Repository};
 use triblespace_core::repo::Workspace;
 use triblespace_core::trible::TribleSet;
 
@@ -81,10 +81,6 @@ fn metadata_signing_key() -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&bytes))
 }
 
-fn parse_branch_id(value: &str) -> Option<Id> {
-    Id::from_hex(value)
-}
-
 struct MetadataContext<'a> {
     workspace: &'a mut Workspace<Pile>,
     invocation_id: triblespace_core::id::Id,
@@ -114,14 +110,9 @@ where
         _ => return,
     };
 
-    let branch_value = match std::env::var("TRIBLESPACE_METADATA_BRANCH") {
-        Ok(b) if !b.trim().is_empty() => b,
+    let branch_name = match std::env::var("TRIBLESPACE_METADATA_BRANCH_NAME") {
+        Ok(name) if !name.trim().is_empty() => name,
         _ => return,
-    };
-
-    let branch_id = match parse_branch_id(&branch_value) {
-        Some(id) => id,
-        None => return,
     };
 
     let pile = match Pile::open(Path::new(&pile_path)) {
@@ -142,8 +133,16 @@ where
         Err(_) => return,
     };
 
-    let mut workspace = match repo.pull(branch_id) {
+    let identity = repo.branch_identity(&branch_name);
+    let mut workspace = match repo.pull(identity) {
         Ok(ws) => ws,
+        Err(AssertionPullError::Absent) => match repo.create_workspace(&branch_name) {
+            Ok(ws) => ws,
+            Err(_) => {
+                let _ = repo.close();
+                return;
+            }
+        },
         Err(_) => {
             let _ = repo.close();
             return;

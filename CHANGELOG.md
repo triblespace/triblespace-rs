@@ -89,7 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookup/ensure, key overrides, `try_push`, conflict workspaces, and branch-head
   commit hooks) is removed rather than dual-authored. Local authoring rejects a
   foreign `(author key, name handle)` descriptor before any store operation;
-  policy-bearing replicated ingest remains a separate capability.
+  policy-bearing replicated ingest remains a separate capability. Optional
+  proc-macro instrumentation now names its own-key assertion branch with
+  `TRIBLESPACE_METADATA_BRANCH_NAME`; a truncated branch id can no longer
+  reconstruct the exact descriptor required for authoring.
 
 - **SuccinctArchive CPU range confirmation batches wavelet descents.** The
   frontier still forms and routes each complete candidate region before any
