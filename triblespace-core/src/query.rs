@@ -1513,8 +1513,8 @@ where
         Some(right)
     }
 
-    /// Divides the unread suffix of one fully proposed-and-confirmed candidate
-    /// region between two producers.
+    /// Transfers work from one fully proposed-and-confirmed candidate region
+    /// to a sibling without turning a useful future batch into sub-batches.
     ///
     /// [`Query::next_group`] has already returned from the constraint before
     /// the engine enters [`Search::NextChunk`], so the level's
@@ -1523,30 +1523,24 @@ where
     /// intervals; it does not repeat or narrow the proposal/confirmation call
     /// that chose the current route.
     ///
-    /// `self` owns the lower interval and retains every source continuation.
-    /// The sibling owns the upper interval and is re-rooted at the current
-    /// parent frontier with its group cursor fenced shut, so exhausting that
-    /// interval ends the sibling instead of replaying later groups or an
-    /// ancestor page. Both branches share the proposal buffer and frontier
-    /// matrices by `Arc`.
+    /// If binding this variable completes the query, there is no downstream
+    /// constraint call to observe a narrower frontier, so the unread interval
+    /// is bisected normally. Otherwise the split is asymmetric: `self` keeps
+    /// the lazy prefix and its geometric width, while the sibling receives a
+    /// suffix containing exactly one full query-width cohort of *live*
+    /// candidates and starts its draw at that width. Repeated steals peel
+    /// further whole cohorts; a sub-width remainder is never subdivided.
+    /// Thus a child frontier whose rows agree on their next variable reaches
+    /// `propose`/`confirm` at the same natural batch ceiling as unsplit search,
+    /// without teaching the engine about any backend's dispatch threshold.
+    ///
+    /// The sibling is re-rooted at the current parent frontier with its group
+    /// cursor fenced shut, so exhausting its interval ends it instead of
+    /// replaying later groups or an ancestor page. Both branches share the
+    /// proposal buffer and frontier matrices by `Arc`.
     fn split_pending_candidates(&mut self) -> Option<Self> {
         debug_assert_eq!(self.mode, Search::NextChunk);
         debug_assert_eq!(self.stack.len(), self.depth + 1);
-
-        // A candidate interval is a safe search split only when consuming it
-        // completes the binding. Otherwise the two halves become distinct
-        // parent frontiers for the remaining constraint calls, permanently
-        // narrowing every downstream batch. That changes physical routing:
-        // a region that was large enough for an accelerator as a whole can
-        // fall below its own crossover in every shard. The core protocol has
-        // no device/crossover capability (deliberately), so there is no sound
-        // backend-neutral way to predict which intermediate split is cheap.
-        // Keep future `propose`/`confirm` cohorts whole; terminal candidate
-        // intervals may still split because no constraint can observe their
-        // child frontier.
-        if !self.unbound.is_empty() {
-            return None;
-        }
 
         let depth = self.depth;
         let level = *self.stack.last().expect("a level to chunk");
@@ -1554,11 +1548,25 @@ where
         let end = level.candidate_end;
         debug_assert!(level.candidate_begin <= start);
         debug_assert!(end <= level.proposed);
-        if end.saturating_sub(start) < 2 {
-            return None;
-        }
-
-        let mid = start + (end - start) / 2;
+        let terminal = self.unbound.is_empty();
+        let (mid, sibling_width) = if terminal {
+            if end.saturating_sub(start) < 2 {
+                return None;
+            }
+            (start + (end - start) / 2, level.width)
+        } else {
+            let buffer = self.bindings.levels[level.variable].buffer();
+            let live = buffer.count_live_range(start, end);
+            if live <= self.width {
+                return None;
+            }
+            let mid = buffer
+                .live_suffix_start(start, end, self.width)
+                .expect("more than one query-width of live candidates");
+            debug_assert!(mid > start);
+            debug_assert_eq!(buffer.count_live_range(mid, end), self.width);
+            (mid, self.width)
+        };
         let mut right = self.clone();
 
         let left_level = self.stack.last_mut().expect("a level to fence");
@@ -1568,6 +1576,7 @@ where
         let right_level = right.stack.last_mut().expect("a cloned level to fence");
         right_level.candidate_begin = mid;
         right_level.candidate_end = end;
+        right_level.width = sibling_width;
         right.bindings.levels[level.variable].pos = mid;
 
         drop(right.stack.drain(..depth));
@@ -2830,6 +2839,16 @@ mod tests {
         #[derive(Clone)]
         struct IntentRecorder(Arc<AtomicU8>);
 
+        /// Two-level fixture for the work-first cohort split. The root emits
+        /// a wide candidate interval; every resulting row then chooses the
+        /// same second variable, whose proposer records the physical frontier
+        /// width it receives.
+        #[derive(Clone)]
+        struct CohortFixture {
+            roots: u32,
+            downstream_widths: Arc<std::sync::Mutex<Vec<usize>>>,
+        }
+
         /// Two homogeneous arms over one variable: the first proposes a wide
         /// region, the second confirms it and records the route-sized facts a
         /// real accelerator adapter observes. This pins that terminal row
@@ -2964,6 +2983,54 @@ mod tests {
                 for row in 0..frontier.len() {
                     proposals.open(row as u32);
                     proposals.push(Fixture::value(0x55, row as u32));
+                }
+            }
+
+            fn confirm(
+                &self,
+                _variable: VariableId,
+                _frontier: &Frontier<'_>,
+                _candidates: &mut Candidates<'_>,
+            ) {
+            }
+        }
+
+        impl<'a> Constraint<'a> for CohortFixture {
+            fn variables(&self) -> VariableSet {
+                variable_set([0, 1])
+            }
+
+            fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+                match variable {
+                    0 => Some(self.roots as usize),
+                    1 => Some(if binding.get(0).is_some() {
+                        1
+                    } else {
+                        usize::MAX
+                    }),
+                    _ => None,
+                }
+            }
+
+            fn propose(
+                &self,
+                variable: VariableId,
+                frontier: &Frontier<'_>,
+                proposals: &mut ProposalBuffer,
+            ) {
+                if variable == 1 {
+                    self.downstream_widths.lock().unwrap().push(frontier.len());
+                }
+                for row in 0..frontier.len() {
+                    proposals.open(row as u32);
+                    if variable == 0 {
+                        proposals.extend((0..self.roots).map(|root| Fixture::value(0xc0, root)));
+                    } else {
+                        let root = u32::from_be_bytes(
+                            frontier.row(row).get(0).unwrap()[28..].try_into().unwrap(),
+                        );
+                        proposals.push(Fixture::value(0xc1, root));
+                    }
                 }
             }
 
@@ -3115,6 +3182,13 @@ mod tests {
         fn projected_index(binding: &Binding<'_>) -> Option<u32> {
             let value = binding.get(0)?;
             Some(u32::from_be_bytes(value[28..].try_into().unwrap()))
+        }
+
+        fn projected_pair(binding: &Binding<'_>) -> Option<(u32, u32)> {
+            Some((
+                u32::from_be_bytes(binding.get(0)?[28..].try_into().unwrap()),
+                u32::from_be_bytes(binding.get(1)?[28..].try_into().unwrap()),
+            ))
         }
 
         fn row_digest(rows: &[u32]) -> u64 {
@@ -3375,6 +3449,61 @@ mod tests {
                 1,
                 "a sibling replayed the completed confirmation"
             );
+        }
+
+        #[test]
+        fn nonterminal_splits_peel_full_live_cohorts_and_keep_the_prefix_lazy() {
+            let downstream_widths = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut left = Query::new(
+                CohortFixture {
+                    roots: 10,
+                    downstream_widths: Arc::clone(&downstream_widths),
+                },
+                projected_pair as fn(&Binding<'_>) -> Option<(u32, u32)>,
+            )
+            .with_frontier_width(4);
+
+            left.plan();
+            left.next_group();
+            assert_eq!(left.mode, Search::NextChunk);
+            assert_eq!(left.stack[0].width, 1);
+
+            let right = left
+                .split_pending_candidates()
+                .expect("ten live rows can peel one four-row cohort");
+            let middle = left
+                .split_pending_candidates()
+                .expect("six remaining rows can peel a second cohort");
+            assert!(left.split_pending_candidates().is_none());
+
+            assert_eq!(
+                (
+                    left.stack[0].candidate_begin,
+                    left.stack[0].candidate_end,
+                    left.stack[0].width,
+                ),
+                (0, 2, 1),
+                "the latency owner keeps its geometric width"
+            );
+            for sibling in [&middle, &right] {
+                assert_eq!(
+                    (
+                        sibling.stack[0].candidate_end - sibling.stack[0].candidate_begin,
+                        sibling.stack[0].width,
+                    ),
+                    (4, 4),
+                    "a stolen sibling owns and immediately draws one full cohort"
+                );
+            }
+
+            let mut actual: Vec<_> = left.chain(middle).chain(right).collect();
+            actual.sort_unstable();
+            let expected: Vec<_> = (0..10).map(|root| (root, root)).collect();
+            assert_eq!(actual, expected);
+
+            let widths = downstream_widths.lock().unwrap();
+            assert_eq!(widths.iter().filter(|&&width| width == 4).count(), 2);
+            assert!(widths.iter().all(|&width| matches!(width, 1 | 4)));
         }
 
         #[test]
