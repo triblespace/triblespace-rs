@@ -18,7 +18,7 @@ exclude already-seen commits.
 
 ```rust,ignore
 // Initial load — full starts as a clone of the first checkout.
-let mut changed = repo.pull(branch_id)?.checkout(..)?;
+let mut changed = repo.pull(branch_identity)?.checkout(..)?;
 let mut full = changed.clone();
 
 loop {
@@ -31,7 +31,7 @@ loop {
     }
 
     // Advance: exclude all commits we've already processed.
-    changed = repo.pull(branch_id)?.checkout(full.commits()..)?;
+    changed = repo.pull(branch_identity)?.checkout(full.commits()..)?;
     full += &changed;
 }
 ```

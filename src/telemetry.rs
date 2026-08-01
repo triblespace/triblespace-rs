@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::metadata;
+use crate::core::repo::branch_assertion::BranchIdentity;
+use crate::core::repo::branch_frontier::BranchResolution;
 use crate::core::repo::pile::Pile;
 use crate::core::repo::{Repository, Workspace};
 use crate::prelude::blobencodings::LongString;
-use crate::prelude::inlineencodings::{Blake3, GenId, Handle, ShortString, U256BE};
+use crate::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
 use crate::prelude::*;
 use ed25519_dalek::SigningKey;
 use rand_core06::OsRng;
@@ -94,7 +96,7 @@ struct TelemetryInner {
     registry: Mutex<Vec<Arc<Mutex<ThreadTelemetry>>>>,
     session: Id,
     base: Instant,
-    branch_id: Id,
+    branch_identity: BranchIdentity,
     flush_interval: Duration,
     shutdown: AtomicBool,
 }
@@ -108,7 +110,9 @@ impl TelemetryInner {
         self.workspaces.get_or(|| {
             let mut repo_guard = self.repo.lock().expect("telemetry repo lock");
             let repo = repo_guard.as_mut().expect("telemetry repo not closed");
-            let ws = repo.pull(self.branch_id).expect("telemetry pull workspace");
+            let ws = repo
+                .pull(self.branch_identity)
+                .expect("telemetry pull workspace");
             let arc = Arc::new(Mutex::new(ThreadTelemetry {
                 workspace: ws,
                 last_flush: Instant::now(),
@@ -308,16 +312,12 @@ impl Telemetry {
         }
         let pile_path = PathBuf::from(pile_path);
 
-        let branch_hex = std::env::var(ENV_TELEMETRY_BRANCH).ok()?;
-        let branch_hex = branch_hex.trim();
-        if branch_hex.len() != 32 {
-            log::warn!(
-                "TELEMETRY_BRANCH must be a 32-char hex ID, got {} chars",
-                branch_hex.len()
-            );
+        let branch_name = std::env::var(ENV_TELEMETRY_BRANCH).ok()?;
+        let branch_name = branch_name.trim();
+        if branch_name.is_empty() {
+            log::warn!("TELEMETRY_BRANCH must not be empty");
             return None;
         }
-        let branch_id = Id::from_hex(branch_hex)?;
 
         let flush_ms = std::env::var(ENV_TELEMETRY_FLUSH_MS)
             .ok()
@@ -350,9 +350,29 @@ impl Telemetry {
         let metadata_fragment = schema::build_telemetry_metadata();
         let metadata_set: TribleSet = metadata_fragment.into();
         let mut repo = Repository::new(pile, signing_key, metadata_set).ok()?;
+        let branch_identity = repo.branch_identity(branch_name);
 
         // Commit session start entity.
-        let mut ws = repo.pull(branch_id).ok()?;
+        let mut ws = match repo.resolve(&branch_identity) {
+            Ok(BranchResolution::Absent) => repo.create_workspace(branch_name).ok()?,
+            Ok(BranchResolution::Complete(_)) => repo.pull(branch_identity).ok()?,
+            Ok(incomplete) => {
+                log::warn!(
+                    "telemetry branch {branch_name:?} is not locally complete ({incomplete:?}); \
+                     telemetry disabled"
+                );
+                let _ = repo.close();
+                return None;
+            }
+            Err(err) => {
+                log::warn!(
+                    "telemetry branch {branch_name:?} could not be resolved ({err:?}); \
+                     telemetry disabled"
+                );
+                let _ = repo.close();
+                return None;
+            }
+        };
         let session_entity = ExclusiveId::force_ref(&session_id);
         let mut init = TribleSet::new();
         init += entity! { session_entity @
@@ -373,7 +393,7 @@ impl Telemetry {
             registry: Mutex::new(Vec::new()),
             session: session_id,
             base,
-            branch_id,
+            branch_identity,
             flush_interval,
             shutdown: AtomicBool::new(false),
         });
@@ -421,7 +441,7 @@ impl Drop for Telemetry {
 
                 // Commit session end entity.
                 let end_ns = self.inner.now_ns();
-                if let Ok(mut ws) = repo.pull(self.inner.branch_id) {
+                if let Ok(mut ws) = repo.pull(self.inner.branch_identity) {
                     let session_entity = ExclusiveId::force_ref(&self.inner.session);
                     let mut end = TribleSet::new();
                     end += entity! { session_entity @

@@ -46,11 +46,9 @@ fn ancestors_respects_bounded_commit_dags() {
     }
 
     let mut repo = Repository::new(storage, signing_key, TribleSet::new()).unwrap();
-    let branch_id = repo
-        .create_branch("kani", commit_handles.last().copied())
-        .expect("branch creation")
-        .release();
-    let mut workspace = repo.pull(branch_id).expect("pull workspace");
+    let mut workspace = repo
+        .create_workspace("kani")
+        .expect("detached workspace creation");
 
     for (index, &handle) in commit_handles.iter().enumerate() {
         let patch = repo::ancestors(handle)

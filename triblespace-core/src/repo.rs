@@ -1148,7 +1148,7 @@ pub type CommitSet = PATCH<INLINE_LEN, IdentitySchema, ()>;
 /// # Example: incremental updates
 ///
 /// ```rust,ignore
-/// let mut changed = repo.pull(branch_id)?.checkout(..)?;
+/// let mut changed = repo.pull(branch_identity)?.checkout(..)?;
 /// let mut full = changed.facts().clone();
 ///
 /// loop {
@@ -1158,7 +1158,7 @@ pub type CommitSet = PATCH<INLINE_LEN, IdentitySchema, ()>;
 ///     }
 ///
 ///     // Advance — exclude exactly the commits we already processed.
-///     changed = repo.pull(branch_id)?.checkout(changed.commits()..)?;
+///     changed = repo.pull(branch_identity)?.checkout(changed.commits()..)?;
 ///     full += &changed;
 /// }
 /// ```

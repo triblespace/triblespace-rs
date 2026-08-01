@@ -34,11 +34,9 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
-use subject::core::blob::encodings::longstring::LongString;
 use subject::core::blob::encodings::simplearchive::SimpleArchive;
 use subject::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use subject::core::inline::encodings::hash::Handle;
-use subject::core::metadata;
 use subject::core::prelude::inlineencodings::GenId;
 use subject::core::prelude::*;
 // Raw engine protocol surface — needed only by the R2 fixtures: F11's
@@ -59,6 +57,8 @@ use subject::core::query::Candidates;
 // engine/batched-frontier onward.
 #[cfg(feature = "frontier")]
 use subject::core::query::Frontier;
+use subject::core::repo::branch_assertion::{BranchAssertionStore, BranchIdentity};
+use subject::core::repo::branch_frontier::{BranchResolution, ResolvedHead};
 use subject::core::repo::pile::Pile;
 use subject::core::repo::{self, Repository};
 
@@ -365,6 +365,65 @@ fn commit_chain(
     chain
 }
 
+/// Select one exact asserted branch identity by its resolved name and return
+/// its single complete tip. The benchmark ladder is deliberately linear; a
+/// divergent or incompletely replicated branch is a different workload, not a
+/// head that this adapter may choose on the caller's behalf.
+fn asserted_branch(pile: &mut Pile, branch: Option<&str>) -> (String, CommitHandle) {
+    let snapshot = pile
+        .assertion_snapshot()
+        .expect("snapshot branch assertions");
+    let mut identities: Vec<BranchIdentity> = snapshot
+        .iter()
+        .map(|assertion| *assertion.identity())
+        .collect();
+    identities.sort_unstable();
+    identities.dedup();
+
+    let mut reader = pile.reader().expect("pile reader");
+    let mut named = Vec::new();
+    for identity in identities {
+        let Ok(name): Result<anybytes::View<str>, _> = reader.get(identity.name()) else {
+            continue;
+        };
+        named.push((identity, name.as_ref().to_owned()));
+    }
+
+    let candidates: Vec<_> = match branch {
+        Some(want) => named.into_iter().filter(|(_, name)| name == want).collect(),
+        None => named
+            .into_iter()
+            .filter(|(_, name)| name != "manifest")
+            .collect(),
+    };
+    let [(identity, branch_name)] = candidates.as_slice() else {
+        let names: Vec<_> = candidates.iter().map(|(_, name)| name).collect();
+        match branch {
+            Some(want) => panic!(
+                "expected exactly one asserted branch named {want:?}, found {} ({names:?})",
+                candidates.len()
+            ),
+            None => panic!(
+                "cannot auto-pick a data branch ({} non-manifest exact identities: {names:?}) -- pass --branch",
+                candidates.len()
+            ),
+        }
+    };
+
+    let resolution = repo::branch_frontier::resolve_branch(&snapshot, identity, &mut reader)
+        .expect("resolve asserted data branch");
+    let head = match resolution {
+        BranchResolution::Complete(frontier) => match frontier.resolved_head() {
+            ResolvedHead::Existing(head) => head,
+            ResolvedHead::Synthetic(_) => {
+                panic!("branch {branch_name:?} has a divergent frontier; expected one linear tip")
+            }
+        },
+        other => panic!("branch {branch_name:?} is not completely replicated: {other:?}"),
+    };
+    (branch_name.clone(), head)
+}
+
 /// Order-independent content digest of a trible set: each trible's 64
 /// bytes folded to a `u64` (FNV-1a over its eight words) and the fold
 /// XOR-accumulated across the set.
@@ -420,53 +479,8 @@ pub fn pile_checkout(
 ) -> Result<(TribleSet, Vec<(u64, u64)>, usize, u64), String> {
     let mut pile = Pile::open(path).expect("open pile");
     pile.refresh().expect("load pile records");
+    let (branch_name, head) = asserted_branch(&mut pile, branch);
     let reader = pile.reader().expect("pile reader");
-
-    // Resolve branches by metadata::name. With `branch`, exact match;
-    // else auto-pick the single branch not named "manifest".
-    let branch_ids: Vec<Id> = pile
-        .pins()
-        .expect("list branches")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("list branches");
-    let mut named: Vec<(Id, String, TribleSet)> = Vec::new();
-    for id in branch_ids {
-        let Ok(Some(meta_handle)) = pile.head(id) else { continue };
-        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue };
-        let handles: Vec<Inline<Handle<LongString>>> = find!(
-            (n: Inline<Handle<LongString>>),
-            pattern!(&meta, [{ metadata::name: ?n }])
-        )
-        .map(|(n,)| n)
-        .collect();
-        let [h] = handles[..] else { continue };
-        let Ok(name): Result<anybytes::View<str>, _> = reader.get(h) else { continue };
-        named.push((id, name.as_ref().to_owned(), meta));
-    }
-    let (branch_id, branch_name, branch_meta) = match branch {
-        Some(want) => named
-            .into_iter()
-            .find(|(_, n, _)| n == want)
-            .unwrap_or_else(|| panic!("no branch named {want:?} in pile")),
-        None => {
-            let mut data: Vec<_> = named.into_iter().filter(|(_, n, _)| n != "manifest").collect();
-            match data.len() {
-                1 => data.remove(0),
-                n => panic!(
-                    "cannot auto-pick a data branch ({n} non-manifest branches: {:?}) — pass --branch",
-                    data.iter().map(|(_, n, _)| n.clone()).collect::<Vec<_>>()
-                ),
-            }
-        }
-    };
-
-    let heads: Vec<CommitHandle> = find!(
-        (c: Inline<Handle<SimpleArchive>>),
-        pattern!(&branch_meta, [{ repo::head: ?c }])
-    )
-    .map(|(c,)| c)
-    .collect();
-    let [head] = heads[..] else { panic!("branch {branch_name:?} has no unique head commit") };
     let chain = commit_chain(&reader, head);
 
     // Rung -> k: one walk, per-commit tribles = SimpleArchive blob
@@ -487,7 +501,10 @@ pub fn pile_checkout(
         handles.push(*handle);
         cum.push(total);
     }
-    assert!(!handles.is_empty(), "branch {branch_name:?} has no content commits");
+    assert!(
+        !handles.is_empty(),
+        "branch {branch_name:?} has no content commits"
+    );
     let (k, carve) = if rung < cum[0] {
         (1, Some(rung))
     } else {
@@ -511,7 +528,9 @@ pub fn pile_checkout(
     // Workspace::checkout, one span per warmed iteration.
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .expect("create repository view");
-    let mut ws = repo.pull(branch_id).expect("pull branch");
+    let mut ws = repo
+        .create_workspace("benchmark-checkout")
+        .expect("create detached checkout workspace");
     let mut spans: Vec<(u64, u64)> = Vec::new();
     let mut out: Option<TribleSet> = None;
     // (checked-out size, carved size, carved content digest). The
