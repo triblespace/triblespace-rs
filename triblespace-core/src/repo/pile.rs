@@ -723,6 +723,15 @@ impl PileRecords {
     /// branch assertions are nevertheless verified before being yielded.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = File::open(path)?;
+        Self::from_file(&file)
+    }
+
+    /// Returns an iterator over the records in an already-open pile file.
+    ///
+    /// Unlike [`Self::open`], this does not resolve a path again. Callers that
+    /// already hold a lock on `file` therefore scan the same file description
+    /// they locked, even if the path is concurrently replaced.
+    pub fn from_file(file: &File) -> Result<Self, ReadError> {
         let length = file.metadata()?.len();
         let bytes = if length == 0 {
             // Mapping a zero-length file is an error on most platforms; an
@@ -731,7 +740,7 @@ impl PileRecords {
         } else {
             // SAFETY: the pile file is append-only by contract; existing
             // bytes are never mutated, so the mapping stays valid.
-            unsafe { Bytes::map_file(&file)? }
+            unsafe { Bytes::map_file(file)? }
         };
         Ok(Self {
             bytes,
@@ -2141,6 +2150,61 @@ mod tests {
             vec![assertion]
         );
         reopened.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pile_records_from_file_keeps_the_opened_file_when_path_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "records.pile");
+        let displaced_path = dir.path().join("displaced.pile");
+
+        let original_payload = b"original inode".to_vec();
+        let original_handle = {
+            let mut pile = Pile::open(&path).unwrap();
+            let handle = pile
+                .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(original_payload.clone())))
+                .unwrap();
+            pile.close().unwrap();
+            handle
+        };
+        let original_file = File::open(&path).unwrap();
+
+        std::fs::rename(&path, &displaced_path).unwrap();
+        std::fs::File::create(&path).unwrap();
+        let replacement_payload = b"replacement inode".to_vec();
+        let replacement_handle = {
+            let mut pile = Pile::open(&path).unwrap();
+            let handle = pile
+                .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(replacement_payload.clone())))
+                .unwrap();
+            pile.close().unwrap();
+            handle
+        };
+
+        let from_descriptor: Vec<_> = PileRecords::from_file(&original_file)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let from_replacement: Vec<_> = PileRecords::open(&path)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert!(matches!(
+            from_descriptor.as_slice(),
+            [PileRecord {
+                content: PileRecordContent::Blob { hash, .. },
+                ..
+            }] if *hash == original_handle.into()
+        ));
+        assert!(matches!(
+            from_replacement.as_slice(),
+            [PileRecord {
+                content: PileRecordContent::Blob { hash, .. },
+                ..
+            }] if *hash == replacement_handle.into()
+        ));
     }
 
     #[test]
