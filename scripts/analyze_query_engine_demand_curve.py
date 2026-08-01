@@ -67,9 +67,23 @@ REQUIRED_FIELDS = {
     "elapsed_ns",
     "rows",
     "result_digest",
+    "work_available",
     *CELL_FIELDS,
     *WORK_FIELDS,
 }
+
+
+def work_measured(row: Mapping[str, str]) -> bool:
+    """Whether this row's WORK_FIELDS are measurements rather than placeholders.
+
+    The harness compiles its frontier probe behind `--cfg demand_frontier_stats`.
+    Without it, `NoWorkProbe` emits `LogicalWork::default()` — every work column
+    is a hardcoded zero — and records `work_available=false` to say so. A zero
+    `widest_frontier` from such a row is the absence of a measurement, not the
+    measurement of an absence, and the two are indistinguishable downstream once
+    a median is taken.
+    """
+    return str(row.get("work_available", "")).strip().lower() == "true"
 
 
 def geometric_mean(values: Iterable[float]) -> float:
@@ -431,6 +445,22 @@ def affine_residuals(
 
 
 def work_summary(rows: Sequence[Mapping[str, str]]) -> list[dict[str, object]]:
+    # A harness built without `--cfg demand_frontier_stats` emits NO "work"
+    # records at all — `emit("work", ...)` is gated on `work.available`. The
+    # frontier tables downstream would then render empty, which reads as "we
+    # probed and found no batching" when the truth is "we never probed". Absence
+    # of evidence must not be typeset as evidence of absence, so refuse here
+    # rather than produce an honest-looking empty table.
+    if not any(row["record"] == "work" for row in rows):
+        raise ValueError(
+            "refusing to summarise work statistics: this run contains no 'work' "
+            "records, so no frontier counter was ever probed. The harness gates "
+            "their emission on `--cfg demand_frontier_stats`; rebuild with "
+            'RUSTFLAGS="--cfg demand_frontier_stats" and rerun. An empty '
+            "frontier table is the absence of a measurement, not the measurement "
+            "of an absence."
+        )
+
     groups: dict[tuple[str, ...], list[Mapping[str, str]]] = defaultdict(list)
     for row in rows:
         if row["record"] != "work":
@@ -468,6 +498,18 @@ def work_summary(rows: Sequence[Mapping[str, str]]) -> list[dict[str, object]]:
     for key, group in sorted(groups.items(), key=lambda item: item[0]):
         item: dict[str, object] = dict(zip(key_fields, key, strict=True))
         item["observations"] = len(group)
+        unmeasured = [row for row in group if not work_measured(row)]
+        if unmeasured:
+            cell = ", ".join(f"{name}={value}" for name, value in zip(key_fields, key))
+            raise ValueError(
+                f"refusing to summarise work statistics: {len(unmeasured)} of "
+                f"{len(group)} rows in cell ({cell}) have work_available=false, so "
+                "their frontier counters are placeholder zeros rather than "
+                "measurements. Rebuild the harness with "
+                'RUSTFLAGS="--cfg demand_frontier_stats" and rerun; a zero '
+                "widest_frontier from an unprobed binary is invalid evidence, not "
+                "a valid measurement of no batching."
+            )
         for field in WORK_FIELDS:
             values = [int(row[field]) for row in group]
             item[f"{field}_median"] = statistics.median(values)
