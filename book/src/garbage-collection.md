@@ -8,10 +8,11 @@ remains append-only until an explicit rewrite.
 
 Forgetting is deliberately conservative. It only removes local copies, so an
 explicit low-level forget can leave a branch `TipPending` until a peer restores
-its asserted target. Automatic repository collection is stricter for recognized
-branch pins: every valid assertion whose locally present descriptor decodes as
-a canonical `BranchPinDescriptor` roots that descriptor, its name, its commit
-target, and the target's locally present closure.
+its asserted target. Automatic repository collection recognizes the generic
+`StrongPinDescriptor`: every valid assertion whose locally present outer
+descriptor decodes canonically roots that outer blob, the locally present
+closure of its exact inner descriptor, and the locally present closure of every
+distinct asserted value. The collector does not need to know the inner kind.
 
 The main challenge is deciding which blobs are still reachable without
 reconstructing every `TribleSet`. The sections below outline how the repository
@@ -22,21 +23,21 @@ own tools.
 
 The walk begins with a _root set_—the handles you know must stay alive. Generic
 asserted-pin storage itself is kind-neutral: an unknown descriptor never turns
-its opaque value into a permanent content root. The branch adapter recognizes a
-branch only when the pin's descriptor blob is locally present and decodes as
-the canonical `BranchPinDescriptor`. It then treats every valid assertion's
-commit target as a hard root. Collectors must use all such assertions, not only
-a branch's currently resolved frontier: missing ancestry can make domination
-impossible to prove, and collection must not turn uncertainty into deletion.
+its opaque value into a permanent content root. An exact, locally present
+`StrongPinDescriptor` is the explicit opt-in. It grants retention semantics to
+its wrapped descriptor and every authentic value, without granting resolution,
+authorization, or any other meaning. Collectors use all distinct values, not a
+kind-specific resolved frontier: retention must not turn uncertainty into
+deletion.
 Admission policy and quota bound which remote assertions become accepted;
 pressure never silently weakens accepted state.
 
-The content-addressed descriptor and name handle are retained directly. The
-name is not traversed as a generic blob graph: arbitrary
-`LongString` bytes do not acquire reference semantics merely because they
-contain a 32-byte sequence. Commit targets, in contrast, are traversed
-recursively, retaining parents, content, metadata, messages, attachments, and
-any other locally present referenced blobs.
+The outer descriptor is retained directly because its inner handle begins at
+byte 16 and is not visible to the aligned conservative scanner. After exact
+decoding, Yard explicitly seeds traversal with the inner handle and asserted
+values. A branch's V2 inner descriptor places its name handle at byte 32, so a
+locally present name is then retained by ordinary closure discovery. Name bytes
+may remain absent without invalidating an exact branch identity.
 
 `Yard` also derives soft cache roots from signed asserted wants. It recognizes
 the fixed `WantPinDescriptor`, unions authentic values across all authors,
@@ -45,7 +46,7 @@ orders those exact handles canonically, and selects a global prefix of at most
 selected values that are present. An absent low-ranked value therefore reserves
 its slot instead of letting a present tail value enter a cache frontier that the
 reconciler cannot reproduce. These soft roots retain only the named blobs; they
-never veto or weaken a branch hard root or its closure. Satisfaction, budget
+never veto or weaken a strong hard root or its closure. Satisfaction, budget
 eviction, and local absence do not erase the underlying assertions—the want
 view is a grow-only set.
 
@@ -73,15 +74,15 @@ eligible for forgetting.
 ## Traversal Algorithm
 
 1. Take one coherent snapshot of all generic pin assertions.
-2. For each valid assertion, load its descriptor locally. If it is a canonical
-   `BranchPinDescriptor`, retain the descriptor and name directly and add the
-   assertion's commit value to the hard root set. Preserve unknown assertion
-   records without treating their values as branch roots.
+2. Group valid assertions by outer pin handle. If that locally present blob
+   decodes as a canonical `StrongPinDescriptor`, retain the outer directly and
+   add its exact inner handle plus every distinct assertion value to the hard
+   root set. Missing or malformed outers are neutral; preserve their assertion
+   records unchanged.
 3. Independently project authentic `WantPinDescriptor` values across every
    author. Retain up to the configured budget of canonically ordered, locally
-   present exact values as soft cache roots; do not traverse them as branch
-   structure.
-4. Recursively walk the discovered commits and content blobs. Each blob is
+   present exact values as soft cache roots; do not traverse their closure.
+4. Recursively walk the discovered inner descriptors, values, and content. Each blob is
    scanned in 32-byte steps; any chunk whose lookup succeeds is enqueued instead
    of deserialising the archive.
 5. Stream the discovered handles into whatever operation you need. The
@@ -102,17 +103,17 @@ helper exposes the traversal as a reusable iterator so you can compose other
 operations along the way, while
 [`transfer`](https://docs.rs/triblespace/latest/triblespace/repo/fn.transfer.html)
 duplicates whichever handles you feed it. A store that combines blobs and
-generic assertions can derive branch roots by projecting the typed descriptor
-from its assertion snapshot:
+generic assertions can derive hard roots by projecting the generic strong
+descriptor from its assertion snapshot:
 
 ```rust,ignore
-use triblespace::core::blob::encodings::{longstring::LongString, UnknownBlob};
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
-use triblespace::core::repo::branch_pin::{commit_from_value, BranchPinDescriptor};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pin_assertion::PinAssertionStore;
+use triblespace::core::repo::strong_pin::StrongPinDescriptor;
 use triblespace::core::repo::{self, BlobStore, BlobStoreGet, BlobStoreKeep};
 
 let mut store = MemoryRepo::default();
@@ -120,34 +121,31 @@ let mut store = MemoryRepo::default();
 
 let assertions = store.pin_assertion_snapshot()?;
 let reader = store.reader()?;
-let mut commit_roots = Vec::<Inline<Handle<UnknownBlob>>>::new();
+let mut strong_roots = Vec::<Inline<Handle<UnknownBlob>>>::new();
 let mut direct = Vec::<Inline<Handle<UnknownBlob>>>::new();
 
 for assertion in assertions.iter() {
-    let descriptor = Inline::<Handle<BranchPinDescriptor>>::new(
-        assertion.identity().pin().raw(),
-    );
-    let Ok(name) = reader.get::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
+    let outer = StrongPinDescriptor::descriptor_handle(assertion.identity().pin());
+    let Ok(inner) = reader.get::<Inline<Handle<UnknownBlob>>, StrongPinDescriptor>(outer)
     else {
-        // Missing or unknown descriptors stay in the assertion ledger but do
-        // not lend branch-root semantics to an opaque value.
+        // Missing, malformed, and unwrapped descriptors remain durable but
+        // retention-neutral.
         continue;
     };
 
-    direct.push(descriptor.transmute());
-    direct.push(name.transmute());
-    commit_roots.push(commit_from_value(assertion.value()).transmute());
+    direct.push(outer.transmute());
+    strong_roots.push(inner);
+    strong_roots.push(Inline::new(assertion.value().raw()));
 }
 
-// Walk commit structure, then retain descriptors and names directly without
-// treating arbitrary LongString bytes as edges in the blob graph.
-let live: Vec<_> = repo::reachable(&reader, commit_roots)
+// Walk every inner/value closure, retaining the unaligned outer directly.
+let live: Vec<_> = repo::reachable(&reader, strong_roots)
     .chain(direct)
     .collect();
 store.keep(live.iter().copied());
 
 // Optionally copy the same reachable blobs into another store. `transfer`
-// reports an error if a selected target, descriptor, or name is not local.
+// reports an error if selected content is not local.
 let mut scratch = MemoryBlobStore::default();
 let visited = live.len();
 let mapping: Vec<_> = repo::transfer(&reader, &mut scratch, live)
@@ -157,15 +155,15 @@ println!("visited {} blobs, copied {}", visited, mapping.len());
 println!("rewrote {} handles", mapping.len());
 ```
 
-In practice you seed the walker with every recognized branch-pin target plus
-any additional application roots. The helper takes any `IntoIterator` of handles, so those
+In practice you seed the walker with every recognized strong inner descriptor
+and asserted value plus any additional application roots. The helper takes any `IntoIterator` of handles, so those
 roots can be fed directly into the traversal without writing custom queues or
 visitor logic. Passing the resulting iterator to `MemoryBlobStore::keep` or
 `repo::transfer` makes it easy to implement
 mark-and-sweep collectors or selective replication pipelines without duplicating
 traversal code. The compact transfer example deliberately treats an incomplete
-assertion closure as an error; a synchroniser can instead report missing direct
-names and roots as wants while transferring the locally present subset.
+assertion closure as an error; a synchroniser can instead report missing roots
+as wants while transferring the locally present subset.
 
 When you already have metadata represented as a `TribleSet`, the
 [`potential_handles`](https://docs.rs/triblespace/latest/triblespace/repo/fn.potential_handles.html)

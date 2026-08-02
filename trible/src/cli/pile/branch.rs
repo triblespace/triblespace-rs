@@ -2,7 +2,7 @@
 //!
 //! A branch is the grow-only set of signed assertions made by one exact
 //! `(author key, name handle)` identity. Human-readable names are presentation
-//! blobs, while generic storage indexes the exact `(author, descriptor)` pin
+//! blobs, while generic storage indexes the exact `(author, strong descriptor)` pin
 //! identity. Neither a name nor a digest is a selector. There is consequently
 //! no create, set, rename, consolidate, raw assert, or replicated delete
 //! operation here; publication goes through a repository workspace carrying
@@ -20,13 +20,11 @@ use ed25519_dalek::VerifyingKey;
 
 use triblespace::prelude::{BlobStore, BlobStoreGet, View};
 use triblespace_core::blob::encodings::longstring::LongString;
-use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::Inline;
 use triblespace_core::repo::branch_frontier::{
     resolve_branch, BranchResolution, ParentLookup, PartialCommitDag, ResolvedHead,
 };
 use triblespace_core::repo::branch_pin::{
-    commit_from_value, BranchIdentity, BranchPinDescriptor, BranchRank,
+    commit_from_value, load_branch_pin, BranchIdentity, BranchRank,
 };
 use triblespace_core::repo::pile::{Pile, PileReader, PileRecordContent, PileRecords};
 use triblespace_core::repo::pin_assertion::{
@@ -444,22 +442,12 @@ pub(super) fn exact_identities(
             continue;
         }
 
-        let descriptor =
-            Inline::<Handle<BranchPinDescriptor>>::new(assertion.identity().pin().raw());
-        if reader
-            .metadata(descriptor)
-            .map_err(|error| anyhow!("inspect pin descriptor: {error}"))?
-            .is_none()
-        {
-            continue;
-        }
-        let Ok(name) = reader.get::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
-        else {
-            // A generic pin whose locally present descriptor is not the exact
-            // canonical branch shape belongs to another kind.
+        let Ok(decoded) = load_branch_pin(reader, assertion.identity().pin()) else {
+            // Missing, malformed, unknown, and non-branch strong descriptors
+            // remain generic assertions rather than discoverable branches.
             continue;
         };
-        let identity = BranchIdentity::new(assertion.identity().author(), name);
+        let identity = BranchIdentity::new(assertion.identity().author(), decoded.name);
         if identity.pin_identity() == *assertion.identity() {
             identities.insert(identity);
         }

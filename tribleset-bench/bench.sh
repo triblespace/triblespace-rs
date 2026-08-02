@@ -88,6 +88,11 @@ fi
 if [ -f "$SUBJECT/triblespace-core/src/query/regularpathconstraint.rs" ]; then
   FEATURES="$FEATURES rpq"
 fi
+# strong-pin-wrapper: branch discovery must first decode the generic outer
+# retention descriptor before interpreting the wrapped BranchPinDescriptor.
+if [ -f "$SUBJECT/triblespace-core/src/repo/strong_pin.rs" ]; then
+  FEATURES="$FEATURES strong-pin-wrapper"
+fi
 FEATURES="${FEATURES# }"
 if [ -n "$FEATURES" ]; then
   echo "bench.sh: subject capabilities -> ${FEATURES// /, }" >&2

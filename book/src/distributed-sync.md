@@ -18,8 +18,9 @@ exact identity is `(author Ed25519 key, descriptor blob handle)`, indexed by a
 full-width digest and rechecked exactly. The envelope's value and 32-byte label
 are opaque until a typed adapter recognizes the descriptor.
 
-For the branch kind, a locally present canonical `BranchPinDescriptor` maps the
-generic pin handle back to a branch-name handle. Its value is a commit and its
+For the branch kind, a locally present canonical `StrongPinDescriptor` first
+maps the generic pin handle to an inner descriptor; that inner canonical
+`BranchPinDescriptor` maps to a branch-name handle. Its value is a commit and its
 label is a causally monotone `BranchRank`. The rank may skip an ancestry check
 that cannot succeed; it never proves domination or removes a claim. Resolution
 derives the maximal ancestry frontier and reports
@@ -102,8 +103,9 @@ following:
 - transfer canonical generic envelope bytes, not synthesize a scalar HEAD;
 - identify every pin by the complete `(author key, descriptor handle)` pair and
   preserve descriptors for kinds the receiver does not understand;
-- recognize a branch only through the canonical `BranchPinDescriptor`, whose
-  content names the human-facing branch name;
+- recognize a branch only by unwrapping canonical `StrongPinDescriptor` content
+  and then decoding the canonical `BranchPinDescriptor` whose content names the
+  human-facing branch name;
 - verify a surviving witness strictly before any asserted tip or fetch demand
   enters the semantic result;
 - deduplicate branch state by `(exact pin identity, commit)` while tolerating

@@ -75,6 +75,8 @@ pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
 pub mod pin_assertion;
+/// Retention-only wrapper for asserted pin descriptors.
+pub mod strong_pin;
 /// Grow-only fetch wants as a typed asserted-pin G-set.
 pub mod want;
 /// Generational collection of piles for lazy-retention blob storage.
@@ -191,6 +193,21 @@ attributes! {
     "9DF34F84959928F93A3C40AEB6E9E499" as pub signature_r: ed::ED25519RComponent;
     /// The `s` part of a ed25519 signature.
     "1ACE03BF70242B289FDF00E4327C3BC6" as pub signature_s: ed::ED25519SComponent;
+}
+
+/// Stage the deterministic descriptor chain needed by a strong branch pin.
+///
+/// The human-facing name bytes are presentation content and may legitimately
+/// be absent when an exact identity arrived out of band. The inner and outer
+/// descriptors, however, are reconstructible from the name handle and every
+/// locally authored publication makes both durable before its assertion.
+fn stage_branch_descriptors(staged: &mut MemoryBlobStore, name: Inline<Handle<LongString>>) {
+    staged
+        .put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(name))
+        .expect("MemoryBlobStore::put is infallible");
+    staged
+        .put::<strong_pin::StrongPinDescriptor, _>(BranchPinDescriptor::strong_blob(name))
+        .expect("MemoryBlobStore::put is infallible");
 }
 
 /// The `ListBlobs` trait is used to list all blobs in a repository.
@@ -894,9 +911,10 @@ where
 
     /// Create an empty workspace without publishing an empty branch.
     ///
-    /// The name blob is staged locally so a later publication makes the exact
-    /// branch descriptor self-describing. No assertion and no repository blob
-    /// is written by this operation; empty branches remain unrepresentable.
+    /// The name blob and both deterministic descriptor layers are staged
+    /// locally so a later publication is self-describing and retention-aware.
+    /// No assertion and no repository blob is written by this operation;
+    /// empty branches remain unrepresentable.
     pub fn create_workspace(
         &mut self,
         name: &str,
@@ -907,9 +925,7 @@ where
         staged
             .put::<LongString, _>(name_blob)
             .expect("MemoryBlobStore::put is infallible");
-        staged
-            .put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(identity.name()))
-            .expect("MemoryBlobStore::put is infallible");
+        stage_branch_descriptors(&mut staged, identity.name());
         let base_blobs = self
             .storage
             .reader()
@@ -1033,14 +1049,13 @@ where
 
         let mut staged = MemoryBlobStore::new();
         // Resolution can succeed from the exact identity even when
-        // replication delivered the assertion before its typed descriptor.
+        // replication delivered the assertion before its descriptor chain.
         // Every writable workspace therefore repairs that ordering locally:
-        // push flushes this descriptor before it appends any new assertion,
-        // allowing kind-aware retention to recognize the branch after a
-        // crash regardless of arrival order.
-        staged
-            .put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(identity.name()))
-            .expect("MemoryBlobStore::put is infallible");
+        // push flushes both deterministic layers before it appends any new
+        // assertion, allowing generic strong retention to activate after a
+        // crash regardless of arrival order. Name bytes remain optional
+        // presentation content and cannot be reconstructed from their handle.
+        stage_branch_descriptors(&mut staged, identity.name());
         let resolved_rank = complete
             .resolved_rank()
             .ok_or(AssertionPullError::RankExhausted)?;
@@ -1091,15 +1106,12 @@ where
         self.require_own_identity(&workspace.identity)
             .map_err(PublishError::ForeignIdentity)?;
 
-        // Enforce the typed-retention boundary at publication itself rather
+        // Enforce the strong-retention boundary at publication itself rather
         // than relying on constructor staging, which callers may legitimately
-        // replace. The descriptor is deterministic from the exact identity
+        // replace. Both descriptors are deterministic from the exact identity
         // and must cross the durability boundary before any assertion that
-        // Yard will later interpret as a branch root.
-        workspace
-            .staged
-            .put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(workspace.identity.name()))
-            .expect("MemoryBlobStore::put is infallible");
+        // Yard will later interpret as a hard root.
+        stage_branch_descriptors(&mut workspace.staged, workspace.identity.name());
         let staged = workspace
             .staged
             .reader()

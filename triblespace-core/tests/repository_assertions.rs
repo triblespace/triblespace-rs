@@ -3,6 +3,7 @@ use std::fs::File;
 
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, MemoryBlobStore};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -16,6 +17,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::pin_assertion::{
     PinAssertion, PinAssertionSnapshot, PinAssertionStore, PinIdentity, SubsumptionLabel,
 };
+use triblespace_core::repo::strong_pin::StrongPinDescriptor;
 use triblespace_core::repo::{
     AssertionPullError, BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PublishError,
     PublishOutcome, Repository, StorageFlush, Workspace,
@@ -305,21 +307,37 @@ fn pull_repairs_an_assertion_first_descriptor_arrival() {
         ))
         .unwrap();
 
-    // Deliberately do not put the descriptor: replicated generic records are
-    // allowed to arrive before their typed content.
+    // Deliberately put neither descriptor nor the name bytes: replicated
+    // generic records and an exact identity may arrive before presentation
+    // content. Pull remains sound and reconstructs only the deterministic
+    // descriptor chain.
     let descriptor = BranchPinDescriptor::blob(identity.name());
     let descriptor_handle = descriptor.get_handle();
+    let strong_descriptor = BranchPinDescriptor::strong_blob(identity.name());
+    let strong_handle = strong_descriptor.get_handle();
     let mut pulled = repo.pull(identity).unwrap();
+    let decoded_inner: Inline<Handle<UnknownBlob>> = pulled.get(strong_handle).unwrap();
+    assert_eq!(decoded_inner.raw, descriptor_handle.raw);
     let decoded: Inline<Handle<LongString>> = pulled.get(descriptor_handle).unwrap();
     assert_eq!(decoded, identity.name());
+    assert!(pulled
+        .get::<anybytes::View<str>, LongString>(identity.name())
+        .is_err());
 
     // Publication reconstructs the descriptor too; constructor staging is a
     // convenience, not the crash-order invariant.
     pulled.staged = MemoryBlobStore::new();
     assert_eq!(repo.push(&mut pulled).unwrap(), PublishOutcome::NoChange);
     let reader = repo.storage_mut().reader().unwrap();
+    let decoded_inner: Inline<Handle<UnknownBlob>> = reader
+        .get::<Inline<Handle<UnknownBlob>>, StrongPinDescriptor>(strong_handle)
+        .unwrap();
+    assert_eq!(decoded_inner.raw, descriptor_handle.raw);
     let decoded: Inline<Handle<LongString>> = reader.get(descriptor_handle).unwrap();
     assert_eq!(decoded, identity.name());
+    assert!(reader
+        .get::<anybytes::View<str>, LongString>(identity.name())
+        .is_err());
 }
 
 #[test]

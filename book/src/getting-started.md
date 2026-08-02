@@ -209,7 +209,7 @@ To persist data across runs, swap `MemoryRepo::default()` for
   assertions. When paired with the `ws.commit` call it records a transaction in
   the workspace that becomes visible to others once pushed.
 * **Publishing changes.** `Repository::push` makes staged blobs—including the
-  canonical `BranchPinDescriptor`—durable and appends one generic signed
+  inner `BranchPinDescriptor` and outer `StrongPinDescriptor`—durable and appends one generic signed
   envelope carrying the commit value and `BranchRank`. Concurrent stale
   workspaces may both publish; neither overwrites the other.
 * **Resolving concurrency.** `Repository::resolve` reports an absent, pending,
