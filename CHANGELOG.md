@@ -93,6 +93,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Join-request ACKs now certify durable admission.** The auth-handshake host
+  waits for the synchronous Peer to record and flush an incoming
+  `OP_REQUEST_CAP` before returning `STATUS_OK`. Queue admission alone no longer
+  acknowledges the request; policy refusal, persistence failure, and Peer
+  shutdown return rejection, while an ambiguous timeout remains safely
+  recoverable through exact idempotent replay.
+
 - **Derived-index catalogs are immutable cache values, not scalar publication
   state.** `IndexHome`, `IndexSnapshot`, their branch-wrapper metadata, and the
   `PinStore` dependency are removed. `store_manifest` returns one

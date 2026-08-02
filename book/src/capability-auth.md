@@ -296,10 +296,12 @@ stream is one-shot:
 | `OP_FETCH_CAPABILITY_BLOB`       | 0x03 | Fetch one exact verified proof member  |
 
 Request, delivery, and delivery-confirmation event queues are separately
-bounded. For `OP_REQUEST_CAP` and `OP_DELIVER_CAP`, `STATUS_OK` means only that
-the complete payload obtained a queue slot; it is **not** an acknowledgement
-that policy state or blobs are durable. A storage or policy failure after
-admission can still decline the operation.
+bounded. For `OP_REQUEST_CAP`, `STATUS_OK` is sent only after the exact pending
+request has crossed the receiver's storage flush boundary. Queue admission,
+policy refusal, and persistence failure are not acknowledged. A timeout remains
+an intentionally ambiguous outcome; exact replay is idempotent and resolves it.
+For `OP_DELIVER_CAP`, `STATUS_OK` still means that the fully verified payload
+obtained a queue slot, not that credential selection and activation are durable.
 
 The durable pending-request map is capped at 1,024 requesters. One requester
 gets one `Pending` payload until a local actor approves or rejects it: exact
