@@ -81,10 +81,12 @@ pub const EVENT_GRANT_DISABLED: Id =
 /// author's operational policy view.
 ///
 /// Historical observed, rejected, and issued request facts remain in the
-/// monotone ledger but do not consume this threshold. Producers must serialize
-/// observation writes for one author when they require a hard bound: generic
-/// asserted-pin append is deliberately not a distributed transaction, and the
-/// reducer preserves concurrently admitted facts rather than discarding them.
+/// monotone ledger but do not consume this threshold. This is a writer-local
+/// resource guard, not a replicated invariant: producers must serialize
+/// observation writes for one author when they require the bound locally.
+/// Independently mutated copies may each admit requests and later union above
+/// this threshold; the reducer preserves every valid fact rather than
+/// discarding or invalidating concurrent observations.
 pub const MAX_PENDING_REQUESTS: usize = 1024;
 
 /// Fixed inner descriptor for one author's complete issuer-policy event set.
@@ -495,7 +497,7 @@ impl fmt::Display for ObserveRequestRefusal {
             ),
             Self::Capacity => write!(
                 f,
-                "policy already has {MAX_PENDING_REQUESTS} pending requests"
+                "local prospective policy view is at or above the {MAX_PENDING_REQUESTS}-request admission limit"
             ),
         }
     }
@@ -853,9 +855,12 @@ where
 /// Durably observe one exact authenticated request.
 ///
 /// Malformed claims and local admission-policy failures are ordinary typed
-/// refusals and mutate nothing. Calls for the same author must be serialized
-/// when the one-outstanding and capacity checks are required as hard local
-/// limits; concurrent asserted-pin writers intentionally union their facts.
+/// refusals and mutate nothing. For serialized calls against one store, a fresh
+/// request is admitted only when it is the requester's sole pending identity and
+/// the prospective local pending count is at most [`MAX_PENDING_REQUESTS`].
+/// That guard is deliberately not closed under replica union: concurrent
+/// asserted-pin writers may each admit facts, and the reducer preserves all of
+/// them as valid concurrent observations.
 pub fn observe_request<S>(
     store: &mut S,
     author: &SigningKey,
@@ -1064,7 +1069,9 @@ where
 ///
 /// Only Complete exposes an operational view. Missing content and known-invalid
 /// evidence are global fail-closed states for this deliberately coarse first
-/// ledger layout.
+/// ledger layout. Complete means closure-valid for the supplied assertion
+/// snapshot; it does not imply that every independently mutated replica has
+/// converged into that snapshot.
 #[derive(Debug)]
 pub enum PolicyLedgerResolution {
     Complete(PolicyLedgerView),
@@ -2109,6 +2116,69 @@ mod tests {
         assert_eq!(
             store.inner.pin_assertion_snapshot().unwrap().len(),
             before_assertions
+        );
+    }
+
+    #[test]
+    fn independent_local_admissions_union_as_concurrent_pending_facts() {
+        let mut fixture = LedgerFixture::new();
+        let requester = fixture.subject.verifying_key();
+        let first = fixture.request(requester, PERM_READ);
+        let first_cap = fixture.blobs.get(&first.partial_cap()).unwrap().clone();
+        let second = fixture.request(requester, PERM_WRITE);
+        let second_cap = fixture.blobs.get(&second.partial_cap()).unwrap().clone();
+        let mut left = MemoryRepo::default();
+        let mut right = MemoryRepo::default();
+
+        assert!(matches!(
+            observe_request(&mut left, &fixture.author, requester, first_cap)
+                .expect("left replica admits against its local view"),
+            ObserveRequestOutcome::Observed(_)
+        ));
+        assert!(matches!(
+            observe_request(&mut right, &fixture.author, requester, second_cap)
+                .expect("right replica admits against its local view"),
+            ObserveRequestOutcome::Observed(_)
+        ));
+
+        let pin = PolicyLedgerDescriptor::pin_identity(fixture.author.verifying_key());
+        let left_snapshot = left.pin_assertion_snapshot().unwrap();
+        let right_snapshot = right.pin_assertion_snapshot().unwrap();
+        let mut merged = PinAssertionSnapshot::new();
+        for assertion in left_snapshot
+            .for_pin(&pin)
+            .into_iter()
+            .chain(right_snapshot.for_pin(&pin))
+        {
+            merged.insert(assertion).unwrap();
+        }
+        let left_reader = left.reader().unwrap();
+        let right_reader = right.reader().unwrap();
+        let PolicyLedgerResolution::Complete(view) =
+            resolve_policy_ledger(&merged, fixture.author.verifying_key(), |handle| {
+                left_reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+                    .or_else(|| {
+                        right_reader
+                            .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                            .ok()
+                    })
+            })
+        else {
+            panic!("union of independently valid observations remains complete");
+        };
+
+        assert_eq!(view.requests().len(), 2);
+        assert!(view.requests().get(&first).unwrap().is_pending());
+        assert!(view.requests().get(&second).unwrap().is_pending());
+        assert_eq!(
+            view.requests()
+                .iter()
+                .filter(|(request, state)| request.requester() == requester && state.is_pending())
+                .count(),
+            2,
+            "writer-local one-outstanding guards are intentionally not closed under union"
         );
     }
 

@@ -307,10 +307,13 @@ reason.
 For `OP_DELIVER_CAP`, `STATUS_OK` still means that the fully verified payload
 obtained a queue slot, not that credential selection and activation are durable.
 
-The durable pending-request map is capped at 1,024 requesters. One requester
-gets one `Pending` payload until a local actor approves or rejects it: exact
-replay is a no-op, and a different payload cannot churn the outstanding slot.
-After local disposition, the same requester may open that stable slot again.
+For serialized writes against one receiver, the prospective policy view admits
+at most 1,024 pending request identities and one pending identity per requester.
+Those are local admission/resource guards, not replicated invariants. Copies may
+be mutated independently and later unioned; every valid `RequestObserved` fact
+survives, so the merged view may contain multiple pending identities for one
+requester or exceed 1,024. Exact replay remains one fact, and local disposition
+allows that receiver to admit another request.
 
 On the requesting side, `team request-join --pile PATH` records the exact
 partial capability before sending it. A first delivered credential must match

@@ -105,10 +105,12 @@ expired pin without authorizing it.
 Authenticated connections and post-auth streams are globally bounded, and a
 subject may hold at most one live inbound pile-sync connection. Capability
 request, delivery, and confirmation queues are bounded as well. A wire
-`STATUS_OK` for request or delivery acknowledges queue admission, not durable
-policy acceptance. Stream tails retain their subject and global connection
-leases; an independent monotonic expiry deadline closes idle authority, and
-each operation authorizes only after its complete frame has arrived.
+`STATUS_OK` for a request certifies that this receiver flushed the exact request
+closure and durably appended its `RequestObserved` assertion. For delivery it
+still acknowledges bounded queue admission rather than completed credential
+activation. Stream tails retain their subject and global connection leases; an
+independent monotonic expiry deadline closes idle authority, and each operation
+authorizes only after its complete frame has arrived.
 
 ## Crate layout
 

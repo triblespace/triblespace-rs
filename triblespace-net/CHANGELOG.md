@@ -54,9 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded policy queue as one event and become active only after the complete
   selected bundle is stored.
 - **Capability policy is bounded and locally selected.** Request, delivery, and
-  confirmation queues have independent limits. The pending map holds at most
-  1,024 requesters and one outstanding `Pending` payload per requester until
-  local approval or rejection. `team request-join` now requires `--pile` and
+  confirmation queues have independent limits. A serialized policy writer
+  admits at most 1,024 pending requests and one pending identity per requester
+  in its prospective local view. These are resource guards rather than
+  replicated invariants: independently admitted facts survive pile union even
+  when the merged view exceeds either limit. `team request-join` requires
+  `--pile` and
   durably records the outbound partial request before sending. Initial delivery
   must match that intent. Its exact request head enters a durable `Activating`
   journal only after the proof bundle is flushed; credential activation is
