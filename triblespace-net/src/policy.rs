@@ -1,5 +1,4 @@
-//! Local-only policy pins: renewal state, outbound join intent, and per-team
-//! cap holdings.
+//! Local-only policy pins: outbound join intent and per-team cap holdings.
 //!
 //! These pins live only in the peer's repository. They are never branch
 //! authority and are not part of the network protocol: they hold typed current
@@ -7,12 +6,7 @@
 //! exclude them from the legacy mutable-pin roots that branch-scoped
 //! capabilities may traverse.
 //!
-//! Three roles:
-//!
-//!   - **`KIND_RENEWAL_POLICY`** — A's per-issuer view: "I am willing
-//!     to auto-renew these (subject, scope) pairs; here's the latest
-//!     cap I issued to each; here are the ones I've retracted." The
-//!     auto-renewal daemon scans this pin each tick.
+//! Two roles:
 //!
 //!   - **`KIND_TEAM_CAP`** — one pin per team this peer is a
 //!     member of, holding the peer's own current cap chain so the
@@ -28,22 +22,18 @@
 //! kind tag) so a single helper distinguishes them from legacy mutable
 //! content pins.
 //!
-//! See `decide#4b59ce27` (daemon + local-only retraction policy) for
-//! the design rationale.
-
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::prelude::attributes;
 use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, PushResult};
 use triblespace_core::trible::TribleSet;
 
-use crate::policy_ledger::{policy_scope, policy_subject, request_partial_cap};
+use crate::policy_ledger::request_partial_cap;
 
 attributes! {
     // ── Pin role markers ──────────────────────────────────────────────
@@ -57,26 +47,6 @@ attributes! {
     /// head metadata entity alongside `local_only_pin =
     /// KIND_TEAM_CAP`.
     "E1EE471B597A4142AD26CA1FED368D2F" as pub cap_for_team: ED25519PublicKey;
-
-    // ── Legacy renewal policy entry ───────────────────────────────────
-    /// Effective validity interval of the most recently signed capability
-    /// chain. Its upper bound is the earliest expiry anywhere in the chain,
-    /// not merely the leaf capability's expiry. The daemon's "near expiry?"
-    /// check compares `now + renewal_window` against that upper bound.
-    "AEF94EAB060C3D78AE373715885897C0" as pub policy_effective_expiry: NsTAIInterval;
-    /// Handle of the most recent cap blob A signed for this entry.
-    "BF6B9C894E3CA2AB5FBCC12B925C9680" as pub policy_latest_cap: Handle<SimpleArchive>;
-    /// Handle of the most recent sig blob accompanying the cap above.
-    "5A72B59BF016C7024385B6976BD8AD0E" as pub policy_latest_sig: Handle<SimpleArchive>;
-    /// Set when A has chosen to stop auto-renewing this entry. The
-    /// daemon skips entries with this attribute; the corresponding
-    /// peer's chain dies naturally at the current cap's expiry.
-    "57C45D022B79C4D3A021AC0114D973EE" as pub policy_retracted_at: NsTAIInterval;
-    /// Legacy positive-delivery marker for the cap/signature named by this
-    /// entry. Cleared when that legacy entry is re-signed. Asserted-policy
-    /// redispatch derives authentication from `CredentialAuthenticated`
-    /// events and deliberately does not consult this attribute.
-    "2E289E766CFD4F2554D430C31337BE2B" as pub policy_delivered_at: NsTAIInterval;
 
     // ── Outbound request activation journal ───────────────────────────
     /// Exact outbound request-head metadata retained while a first delivered
@@ -99,12 +69,6 @@ attributes! {
 }
 
 // ── Pin role kind tags ────────────────────────────────────────────────
-
-/// Pin holds A's renewal policy state. Each entity on the pin head
-/// metadata blob is one `(policy_subject, policy_scope)` pair with
-/// associated cap + sig handles and an optional retraction timestamp.
-pub const KIND_RENEWAL_POLICY: Id =
-    triblespace_core::id::id_hex!("914CFF7C82FDE32CB84D85CE98613E62");
 
 /// Pin holds A's own cap chain for a specific team. The pin head
 /// metadata also carries `cap_for_team: <team_root_pubkey>` so a
@@ -193,9 +157,8 @@ where
     if matches { Some(pin_id) } else { None }
 }
 
-/// Find the local-only pin of a given kind (e.g. `KIND_RENEWAL_POLICY` or
-/// `KIND_OUTBOUND_CAP_REQUEST`). Pins of these kinds have one intrinsic id per
-/// peer repository, so lookup never depends on pin-list order.
+/// Find the local-only pin of a given kind. Pins of singleton kinds have one
+/// intrinsic id per peer repository, so lookup never depends on pin-list order.
 pub fn find_local_only_pin_of_kind<S>(store: &mut S, kind: Id) -> Option<Id>
 where
     S: BlobStore + PinStore,
@@ -751,416 +714,14 @@ where
     current_team_credential(store, team_root).map(|credential| (credential.cap, credential.sig))
 }
 
-/// A single renewal-policy entry as recorded on the renewal-policy
-/// pin. The auto-renewal daemon enumerates these and re-issues a
-/// fresh cap for any whose `effective_expiry` upper bound is within the
-/// configured renewal window of `now` AND that don't carry a
-/// `retracted_at` attribute.
-pub struct PolicyEntry {
-    pub id: Id,
-    pub subject: ed25519_dalek::VerifyingKey,
-    pub scope: Id,
-    pub effective_expiry: Inline<NsTAIInterval>,
-    pub latest_cap: Inline<Handle<SimpleArchive>>,
-    pub latest_sig: Inline<Handle<SimpleArchive>>,
-    /// `Some(t)` if A has chosen to stop auto-renewing this entry;
-    /// the daemon must skip entries with this set.
-    pub retracted_at: Option<Inline<NsTAIInterval>>,
-    /// Legacy positive-delivery marker for the current cap/signature. The
-    /// asserted-policy redispatch consumer does not consult this field.
-    pub delivered_at: Option<Inline<NsTAIInterval>>,
-}
-
-/// Enumerate the current renewal-policy entries.
-///
-/// Includes retracted entries (with `retracted_at` populated) so
-/// callers can render the full audit view; the daemon's renewal
-/// loop filters them out at action time.
-pub fn list_renewal_policy<S>(store: &mut S) -> Vec<PolicyEntry>
-where
-    S: BlobStore + PinStore,
-{
-    let Some(pin_id) = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) else {
-        return Vec::new();
-    };
-    let Ok(Some(head)) = store.head(pin_id) else {
-        return Vec::new();
-    };
-    let Ok(reader) = store.reader() else {
-        return Vec::new();
-    };
-    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else {
-        return Vec::new();
-    };
-
-    // Required fields (effective expiry, latest cap/sig, subject, scope).
-    let core: Vec<(
-        Id,
-        ed25519_dalek::VerifyingKey,
-        Id,
-        Inline<NsTAIInterval>,
-        Inline<Handle<SimpleArchive>>,
-        Inline<Handle<SimpleArchive>>,
-    )> = find!(
-        (
-            e: Id,
-            subject: ed25519_dalek::VerifyingKey,
-            scope: Id,
-            effective_expiry: Inline<NsTAIInterval>,
-            cap: Inline<Handle<SimpleArchive>>,
-            sig: Inline<Handle<SimpleArchive>>,
-        ),
-        pattern!(&meta, [{
-            ?e @
-            policy_subject: ?subject,
-            policy_scope: ?scope,
-            policy_effective_expiry: ?effective_expiry,
-            policy_latest_cap: ?cap,
-            policy_latest_sig: ?sig,
-        }])
-    )
-    .collect();
-
-    // Optional retracted_at / delivered_at lookups per entry
-    // (separate queries — keeping either in the main pattern would
-    // filter out entries that lack the optional attribute, which is
-    // the opposite of what we want).
-    core.into_iter()
-        .map(
-            |(id, subject, scope, effective_expiry, latest_cap, latest_sig)| {
-                let retracted_at = find!(
-                    t: Inline<NsTAIInterval>,
-                    pattern!(&meta, [{ id @ policy_retracted_at: ?t }])
-                )
-                .next();
-                let delivered_at = find!(
-                    t: Inline<NsTAIInterval>,
-                    pattern!(&meta, [{ id @ policy_delivered_at: ?t }])
-                )
-                .next();
-                PolicyEntry {
-                    id,
-                    subject,
-                    scope,
-                    effective_expiry,
-                    latest_cap,
-                    latest_sig,
-                    retracted_at,
-                    delivered_at,
-                }
-            },
-        )
-        .collect()
-}
-
-/// Filter `list_renewal_policy` to entries that are due for renewal:
-/// not retracted, and the upper bound of their `effective_expiry` interval
-/// falls within `renewal_window` of `now`. This schedules renewal from the
-/// whole capability chain's authority lifetime rather than the leaf alone.
-///
-/// The daemon's typical call: `renewable_within(store,
-/// Duration::from_secs(3600))` → entries whose current cap expires
-/// in the next hour or already has. The window should be > the
-/// daemon's tick cadence so a renewal isn't missed across one
-/// missed tick.
-pub fn renewable_within<S>(store: &mut S, renewal_window: hifitime::Duration) -> Vec<PolicyEntry>
-where
-    S: BlobStore + PinStore,
-{
-    let now = crate::clock::epoch_now();
-    let cutoff = now + renewal_window;
-    list_renewal_policy(store)
-        .into_iter()
-        .filter(|e| e.retracted_at.is_none())
-        .filter(|e| {
-            use triblespace_core::inline::TryFromInline;
-            match <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(&e.effective_expiry) {
-                // The current chain's effective upper bound has already passed
-                // `cutoff` — i.e. it expires sooner than the renewal
-                // window says we want, so it's due.
-                Ok((_lower, upper)) => upper <= cutoff,
-                // A malformed interval treats as overdue (defensive —
-                // re-issuing repairs the entry).
-                Err(_) => true,
-            }
-        })
-        .collect()
-}
-
-// ── Renewal-policy entry writes ───────────────────────────────────────
-
-/// Insert (or refresh) a renewal-policy entry. Find-or-create the
-/// renewal-policy pin on first call.
-///
-/// The entity id is fresh on each call — policy entries are keyed by
-/// `(subject, scope)`, not by their generated entity id, and the
-/// daemon's renewable-scan recomputes from the effective-expiry field rather
-/// than relying on entity stability. If an entry for the same
-/// `(subject, scope)` already exists, the caller should remove or
-/// supersede it before adding the new one (typically via the
-/// `update_policy_entry` helper below, which rewrites the effective expiry
-/// + handles in place).
-///
-/// Returns the new entry's entity id.
-///
-/// Idempotent on `(subject, scope)`: if an *active* (non-retracted)
-/// entry already exists for the same pair, returns that entry's id
-/// without minting a duplicate. This handles the
-/// killed-approve-then-retry case (the killed CLI's writes are
-/// durable, the retry would otherwise create a phantom-twin entry
-/// that the renewal daemon would dispatch in parallel with the
-/// original — wasted wire bytes, no correctness benefit). Genuine
-/// re-issuance with a fresh cap+sig should go through
-/// [`update_policy_entry`] instead, which rewrites in place.
-pub fn record_policy_entry<S>(
-    store: &mut S,
-    subject: ed25519_dalek::VerifyingKey,
-    scope: Id,
-    effective_expiry: Inline<NsTAIInterval>,
-    cap: Inline<Handle<SimpleArchive>>,
-    sig: Inline<Handle<SimpleArchive>>,
-) -> Option<Id>
-where
-    S: BlobStore + BlobStorePut + PinStore,
-{
-    use triblespace_core::id::ExclusiveId;
-
-    // Idempotent guard: if an active entry for this (subject, scope)
-    // already exists, return its id rather than minting a duplicate.
-    if let Some(existing) = list_renewal_policy(store)
-        .into_iter()
-        .find(|e| e.retracted_at.is_none() && e.subject == subject && e.scope == scope)
-    {
-        return Some(existing.id);
-    }
-
-    let (pin_id, prev_head) = match find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) {
-        Some(pin_id) => (pin_id, store.head(pin_id).ok().flatten()),
-        None => (local_only_pin_id(KIND_RENEWAL_POLICY), None),
-    };
-
-    let mut meta: TribleSet = match &prev_head {
-        Some(h) => {
-            let reader = store.reader().ok()?;
-            reader.get::<TribleSet, SimpleArchive>(*h).ok()?
-        }
-        None => {
-            let marker_id = genid();
-            entity! { ExclusiveId::force_ref(&marker_id) @
-                local_only_pin: KIND_RENEWAL_POLICY,
-            }
-            .into()
-        }
-    };
-
-    let entity_id = genid();
-    let entry_set: TribleSet = entity! {
-        ExclusiveId::force_ref(&entity_id) @
-        policy_subject: subject,
-        policy_scope: scope,
-        policy_effective_expiry: effective_expiry,
-        policy_latest_cap: cap,
-        policy_latest_sig: sig,
-    }
-    .into();
-    meta += entry_set;
-
-    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(pin_id, prev_head, Some(new_head)).ok()? {
-        PushResult::Success() => Some(*entity_id),
-        PushResult::Conflict(_) => None,
-    }
-}
-
-/// Update an existing renewal-policy entry in place: rewrite its
-/// `policy_effective_expiry`, `policy_latest_cap`, and `policy_latest_sig`
-/// tribles. Called by the renewal daemon after each successful
-/// re-sign + dispatch.
-///
-/// The `(subject, scope)` keys remain stable; only the time and
-/// handle fields change.
-pub fn update_policy_entry<S>(
-    store: &mut S,
-    entry_id: Id,
-    new_effective_expiry: Inline<NsTAIInterval>,
-    new_cap: Inline<Handle<SimpleArchive>>,
-    new_sig: Inline<Handle<SimpleArchive>>,
-) -> Option<()>
-where
-    S: BlobStore + BlobStorePut + PinStore,
-{
-    use triblespace_core::id::ExclusiveId;
-
-    let pin_id = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
-    let prev_head = store.head(pin_id).ok()??;
-    let reader = store.reader().ok()?;
-    let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
-
-    // Remove the three existing tribles we're replacing.
-    let cur_effective_expiry: Option<Inline<NsTAIInterval>> = find!(
-        t: Inline<NsTAIInterval>,
-        pattern!(&meta, [{ entry_id @ policy_effective_expiry: ?t }])
-    )
-    .next();
-    let cur_cap: Option<Inline<Handle<SimpleArchive>>> = find!(
-        h: Inline<Handle<SimpleArchive>>,
-        pattern!(&meta, [{ entry_id @ policy_latest_cap: ?h }])
-    )
-    .next();
-    let cur_sig: Option<Inline<Handle<SimpleArchive>>> = find!(
-        h: Inline<Handle<SimpleArchive>>,
-        pattern!(&meta, [{ entry_id @ policy_latest_sig: ?h }])
-    )
-    .next();
-
-    if let Some(old) = cur_effective_expiry {
-        let t: TribleSet = entity! {
-            ExclusiveId::force_ref(&entry_id) @
-            policy_effective_expiry: old,
-        }
-        .into();
-        meta = meta.difference(&t);
-    }
-    if let Some(old) = cur_cap {
-        let t: TribleSet = entity! {
-            ExclusiveId::force_ref(&entry_id) @
-            policy_latest_cap: old,
-        }
-        .into();
-        meta = meta.difference(&t);
-    }
-    if let Some(old) = cur_sig {
-        let t: TribleSet = entity! {
-            ExclusiveId::force_ref(&entry_id) @
-            policy_latest_sig: old,
-        }
-        .into();
-        meta = meta.difference(&t);
-    }
-
-    // Re-signing supersedes the prior cap, so its legacy positive-delivery
-    // marker no longer describes the entry's current signature.
-    let cur_delivered_at: Option<Inline<NsTAIInterval>> = find!(
-        t: Inline<NsTAIInterval>,
-        pattern!(&meta, [{ entry_id @ policy_delivered_at: ?t }])
-    )
-    .next();
-    if let Some(old) = cur_delivered_at {
-        let t: TribleSet = entity! {
-            ExclusiveId::force_ref(&entry_id) @
-            policy_delivered_at: old,
-        }
-        .into();
-        meta = meta.difference(&t);
-    }
-
-    let new_tribles: TribleSet = entity! {
-        ExclusiveId::force_ref(&entry_id) @
-        policy_effective_expiry: new_effective_expiry,
-        policy_latest_cap: new_cap,
-        policy_latest_sig: new_sig,
-    }
-    .into();
-    meta += new_tribles;
-
-    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(pin_id, Some(prev_head), Some(new_head)).ok()? {
-        PushResult::Success() => Some(()),
-        PushResult::Conflict(_) => None,
-    }
-}
-
-/// Mark a legacy renewal-policy entry as delivered (`policy_delivered_at =
-/// now`). Retained while remaining local writers migrate to asserted policy;
-/// asserted-policy redispatch does not consult this marker.
-pub fn mark_policy_delivered<S>(store: &mut S, entry_id: Id) -> Option<()>
-where
-    S: BlobStore + BlobStorePut + PinStore,
-{
-    use triblespace_core::id::ExclusiveId;
-    use triblespace_core::inline::TryToInline;
-
-    let pin_id = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
-    let prev_head = store.head(pin_id).ok()??;
-    let reader = store.reader().ok()?;
-    let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
-
-    // Repeating the exact legacy mark is a true no-op. A fresh re-sign removes
-    // this field in `update_policy_entry`, so an existing value already marks
-    // the current `(subject, latest_sig)` selected by the caller.
-    let cur: Option<Inline<NsTAIInterval>> = find!(
-        t: Inline<NsTAIInterval>,
-        pattern!(&meta, [{ entry_id @ policy_delivered_at: ?t }])
-    )
-    .next();
-    if cur.is_some() {
-        return Some(());
-    }
-
-    let now = crate::clock::epoch_now();
-    let delivered_at: Inline<NsTAIInterval> = (now, now).try_to_inline().ok()?;
-
-    let trible: TribleSet = entity! {
-        ExclusiveId::force_ref(&entry_id) @
-        policy_delivered_at: delivered_at,
-    }
-    .into();
-    meta += trible;
-
-    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(pin_id, Some(prev_head), Some(new_head)).ok()? {
-        PushResult::Success() => Some(()),
-        PushResult::Conflict(_) => None,
-    }
-}
-
-/// Mark a renewal-policy entry as retracted (sets `policy_retracted_at
-/// = now`). The daemon's `renewable_within` filter then skips it on
-/// subsequent ticks; the corresponding peer's chain dies naturally at
-/// the current cap's expiry.
-pub fn retract_policy_entry<S>(store: &mut S, entry_id: Id) -> Option<()>
-where
-    S: BlobStore + BlobStorePut + PinStore,
-{
-    use triblespace_core::id::ExclusiveId;
-    use triblespace_core::inline::TryToInline;
-
-    let pin_id = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
-    let prev_head = store.head(pin_id).ok()??;
-    let reader = store.reader().ok()?;
-    let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
-
-    let now = crate::clock::epoch_now();
-    let retracted_at: Inline<NsTAIInterval> = (now, now).try_to_inline().ok()?;
-
-    let trible: TribleSet = entity! {
-        ExclusiveId::force_ref(&entry_id) @
-        policy_retracted_at: retracted_at,
-    }
-    .into();
-    meta += trible;
-
-    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(pin_id, Some(prev_head), Some(new_head)).ok()? {
-        PushResult::Success() => Some(()),
-        PushResult::Conflict(_) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use triblespace_core::blob::Blob;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::blob::{Blob, IntoBlob};
-    use triblespace_core::inline::TryToInline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::trible::TribleSet;
-
-    fn point_now() -> Inline<NsTAIInterval> {
-        let now = hifitime::Epoch::now().expect("system time");
-        (now, now).try_to_inline().expect("point interval")
-    }
 
     fn distinct_partial_cap(subject: ed25519_dalek::VerifyingKey) -> Blob<SimpleArchive> {
         use triblespace_core::id::ExclusiveId;
@@ -1185,11 +746,6 @@ mod tests {
 
     #[test]
     fn policy_pin_ids_are_intrinsic_and_keyed_by_role() {
-        assert_ne!(
-            local_only_pin_id(KIND_RENEWAL_POLICY),
-            local_only_pin_id(KIND_OUTBOUND_CAP_REQUEST)
-        );
-
         let first_team = key_for(40);
         let second_team = key_for(41);
         let first_team_pin = team_cap_pin_id(first_team);
@@ -1361,70 +917,5 @@ mod tests {
             Some(true)
         );
         assert!(expected_outbound_cap_request_handle(&mut store).is_none());
-    }
-
-    #[test]
-    fn renewal_policy_is_scheduled_by_effective_chain_expiry() {
-        let mut store = MemoryRepo::default();
-        let subject = key_for(5);
-        let due_scope = *genid();
-        let later_scope = *genid();
-        let now = crate::clock::epoch_now();
-        let due_effective_expiry = (now, now + hifitime::Duration::from_seconds(30.0))
-            .try_to_inline()
-            .expect("due effective interval");
-        let later_effective_expiry = (now, now + hifitime::Duration::from_days(1.0))
-            .try_to_inline()
-            .expect("later effective interval");
-
-        let due_id = record_policy_entry(
-            &mut store,
-            subject,
-            due_scope,
-            due_effective_expiry,
-            Inline::new([0xD0; 32]),
-            Inline::new([0xD1; 32]),
-        )
-        .expect("record due policy");
-        record_policy_entry(
-            &mut store,
-            subject,
-            later_scope,
-            later_effective_expiry,
-            Inline::new([0xE0; 32]),
-            Inline::new([0xE1; 32]),
-        )
-        .expect("record later policy");
-
-        let listed = list_renewal_policy(&mut store);
-        assert_eq!(listed.len(), 2);
-        assert_eq!(
-            listed
-                .iter()
-                .find(|entry| entry.id == due_id)
-                .expect("due entry")
-                .effective_expiry,
-            due_effective_expiry
-        );
-
-        let renewable = renewable_within(&mut store, hifitime::Duration::from_hours(1.0));
-        assert_eq!(renewable.len(), 1);
-        assert_eq!(renewable[0].id, due_id);
-    }
-
-    #[test]
-    fn repeated_mark_policy_delivered_is_a_head_preserving_noop() {
-        let mut store = MemoryRepo::default();
-        let subject = key_for(2);
-        let scope = *genid();
-        let cap = Inline::new([0xC0; 32]);
-        let sig = Inline::new([0x52; 32]);
-        let entry = record_policy_entry(&mut store, subject, scope, point_now(), cap, sig)
-            .expect("record policy");
-        mark_policy_delivered(&mut store, entry).expect("first confirmation");
-        let pin = find_local_only_pin_of_kind(&mut store, KIND_RENEWAL_POLICY).expect("policy pin");
-        let confirmed_head = store.head(pin).unwrap();
-        mark_policy_delivered(&mut store, entry).expect("confirmation replay");
-        assert_eq!(store.head(pin).unwrap(), confirmed_head);
     }
 }
