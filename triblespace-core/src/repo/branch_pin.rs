@@ -9,24 +9,29 @@
 //!
 //! > `label(A) >= label(B)` implies A is not a strict ancestor of B
 //!
-//! — is licensed *here*, by this kind, and only because commit depth is
-//! strictly increasing along ancestry: if A is a strict ancestor of B then
-//! every path from A reaches B through at least one edge, so
-//! `depth(A) < depth(B)`. Equal depth therefore rules out strict ancestry
-//! between distinct commits, which is why `>=` rather than `>` is the correct
-//! test after identical values have been grouped.
+//! — is licensed *here*, by this kind, and only because honest branch ranks are
+//! constructed inductively: a root is zero, an ordinary child is its parent's
+//! successor, and a merge is the successor of its greatest parent rank. Thus a
+//! strict ancestry edge always increases rank. Equal rank therefore rules out
+//! strict ancestry between distinct commits, which is why `>=` rather than `>`
+//! is the correct test after identical values have been grouped.
+//!
+//! Rank is deliberately not “DAG depth”. Publication derives it from the
+//! asserted/workspace provenance already in hand and never materialises a
+//! remote ancestry chain merely to count it. Ranks from independent histories
+//! have no quantitative meaning; the only contract is increase along ancestry.
+//! A dishonest rank can suppress exact walks and conservatively retain extra
+//! tips, but cannot drop one because labels never decide domination directly.
 //!
 //! A kind that cannot make an argument of this shape supplies no label
 //! comparison at all and takes zero skips — degraded, never wrong.
 
-use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
 use anybytes::Bytes;
 use hex_literal::hex;
 
-use super::branch_frontier::{ParentLookup, PartialCommitDag};
 use super::pin_assertion::{PinAssertion, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle};
 use super::CommitHandle;
 use crate::blob::encodings::longstring::LongString;
@@ -156,155 +161,70 @@ pub(crate) fn value_from_commit(commit: CommitHandle) -> ValueHandle {
 
 /// Sign one typed branch assertion in the generic envelope.
 ///
-/// The caller must have computed `depth` from the complete commit DAG; this
-/// adapter only owns its canonical encoding. Publication code stages
-/// [`BranchPinDescriptor::blob`] before durably appending the returned record.
+/// The caller carries `rank` through the workspace's asserted provenance;
+/// publication never walks remote history merely to derive the label. It
+/// stages [`BranchPinDescriptor::blob`] before durably appending the record.
 pub fn sign_branch_assertion(
     key: &SigningKey,
     name: Inline<Handle<LongString>>,
     commit: CommitHandle,
-    depth: u64,
+    rank: BranchRank,
 ) -> PinAssertion {
     PinAssertion::sign(
         key,
         BranchPinDescriptor::pin_handle(name),
         value_from_commit(commit),
-        depth_label(depth),
+        rank.label(),
     )
 }
 
-/// Encode a commit depth as this kind's subsumption label.
+/// The branch kind's 256-bit, big-endian topological rank.
 ///
-/// Big-endian in the leading 8 bytes, zero tail. Big-endian is **required**:
-/// the store compares labels bytewise, so a little-endian encoding would order
-/// by low byte first and disagree with numeric order — silently, and in the
-/// unsound direction, since it would license skips that ancestry does not
-/// justify. The trailing 24 bytes stay zero and are available to a future
-/// composite (depth then tiebreaker) that remains totally ordered by the same
-/// comparison, with no change to the store.
-pub fn depth_label(depth: u64) -> SubsumptionLabel {
-    let mut raw = [0u8; 32];
-    raw[..8].copy_from_slice(&depth.to_be_bytes());
-    SubsumptionLabel::from_raw(raw)
-}
+/// This wrapper is the typed proof boundary. The generic label remains opaque;
+/// only branch code constructs successors and uses their order to suppress
+/// impossible strict-ancestry walks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BranchRank(SubsumptionLabel);
 
-/// Compute the canonical longest-path depth of one complete commit DAG.
-///
-/// Roots have depth zero and every other commit has
-/// `1 + max(parent depths)`. This is iterative rather than recursive so an
-/// adversarially deep but valid history cannot overflow the Rust call stack.
-/// Publication must finish this walk before signing: a workspace counter is
-/// insufficient because callers may set or merge arbitrary imported heads.
-pub fn commit_depth<D: PartialCommitDag>(
-    dag: &mut D,
-    tip: CommitHandle,
-) -> Result<u64, CommitDepthError<D::Error>> {
-    #[derive(Clone, Copy)]
-    enum Visit {
-        Enter(CommitHandle),
-        Exit(CommitHandle),
+impl BranchRank {
+    /// Rank of a root with no parents.
+    pub const ROOT: Self = Self(SubsumptionLabel::from_raw([0u8; 32]));
+
+    /// Recover the rank claimed by a branch assertion.
+    pub const fn from_label(label: SubsumptionLabel) -> Self {
+        Self(label)
     }
 
-    let mut stack = vec![Visit::Enter(tip)];
-    let mut active = HashSet::new();
-    let mut parents = HashMap::<CommitHandle, Vec<CommitHandle>>::new();
-    let mut depths = HashMap::<CommitHandle, u64>::new();
+    /// Return the exact generic label bytes carried in the signed assertion.
+    pub const fn label(self) -> SubsumptionLabel {
+        self.0
+    }
 
-    while let Some(visit) = stack.pop() {
-        match visit {
-            Visit::Enter(commit) => {
-                if depths.contains_key(&commit) {
-                    continue;
-                }
-                if !active.insert(commit) {
-                    return Err(CommitDepthError::Cycle { commit });
-                }
-                let ParentLookup::Present(mut direct) =
-                    dag.parents(commit).map_err(CommitDepthError::Lookup)?
-                else {
-                    return Err(CommitDepthError::Missing { commit });
-                };
-                direct.sort_unstable_by_key(|parent| parent.raw);
-                direct.dedup();
-                parents.insert(commit, direct.clone());
-                stack.push(Visit::Exit(commit));
-                for parent in direct.into_iter().rev() {
-                    if active.contains(&parent) {
-                        return Err(CommitDepthError::Cycle { commit: parent });
-                    }
-                    if !depths.contains_key(&parent) {
-                        stack.push(Visit::Enter(parent));
-                    }
-                }
-            }
-            Visit::Exit(commit) => {
-                active.remove(&commit);
-                let direct = parents
-                    .get(&commit)
-                    .expect("every exiting commit was entered");
-                let depth = match direct
-                    .iter()
-                    .map(|parent| {
-                        depths
-                            .get(parent)
-                            .copied()
-                            .expect("a parent exits before its child")
-                    })
-                    .max()
-                {
-                    None => 0,
-                    Some(parent_depth) => parent_depth
-                        .checked_add(1)
-                        .ok_or(CommitDepthError::Overflow { commit })?,
-                };
-                depths.insert(commit, depth);
+    /// The smallest rank greater than this one under bytewise order.
+    ///
+    /// Treating all 32 bytes as one big-endian integer uses the entire opaque
+    /// slot and avoids a realistic cutoff. `None` is still explicit for an
+    /// adversarial all-`0xFF` parent label.
+    pub fn successor(self) -> Option<Self> {
+        let mut raw = self.0.raw();
+        for byte in raw.iter_mut().rev() {
+            let (next, carry) = byte.overflowing_add(1);
+            *byte = next;
+            if !carry {
+                return Some(Self(SubsumptionLabel::from_raw(raw)));
             }
         }
+        None
     }
 
-    Ok(*depths
-        .get(&tip)
-        .expect("the requested tip exits before traversal completes"))
-}
-
-/// A commit cannot receive a sound branch depth label yet.
-#[derive(Debug)]
-pub enum CommitDepthError<E> {
-    /// Reading local commit metadata failed for a non-absence reason.
-    Lookup(E),
-    /// A commit needed for the depth proof is not present locally.
-    Missing { commit: CommitHandle },
-    /// The supplied parent relation contains a cycle.
-    Cycle { commit: CommitHandle },
-    /// The longest path cannot be represented in the label's leading `u64`.
-    Overflow { commit: CommitHandle },
-}
-
-impl<E> fmt::Display for CommitDepthError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Lookup(_) => write!(f, "commit metadata lookup failed while computing depth"),
-            Self::Missing { commit } => {
-                write!(f, "commit {commit:?} is missing while computing depth")
-            }
-            Self::Cycle { commit } => {
-                write!(f, "commit parent cycle reaches {commit:?}")
-            }
-            Self::Overflow { commit } => {
-                write!(f, "commit depth overflows u64 at {commit:?}")
-            }
-        }
-    }
-}
-
-impl<E> Error for CommitDepthError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Lookup(error) => Some(error),
-            Self::Missing { .. } | Self::Cycle { .. } | Self::Overflow { .. } => None,
+    /// Root for an empty parent set; otherwise one past the greatest parent.
+    pub fn after<I>(parents: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = Self>,
+    {
+        match parents.into_iter().max() {
+            None => Some(Self::ROOT),
+            Some(parent) => parent.successor(),
         }
     }
 }
@@ -313,7 +233,6 @@ where
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use std::convert::Infallible;
 
     fn name(byte: u8) -> Inline<Handle<LongString>> {
         Inline::new([byte; 32])
@@ -379,114 +298,55 @@ mod tests {
     }
 
     #[test]
-    fn typed_signing_uses_the_descriptor_commit_and_depth_codec() {
+    fn typed_signing_uses_the_descriptor_commit_and_rank() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let name = name(11);
         let commit = Inline::new([19; 32]);
-        let assertion = sign_branch_assertion(&key, name, commit, 23);
+        let rank = BranchRank::ROOT.successor().unwrap();
+        let assertion = sign_branch_assertion(&key, name, commit, rank);
         assert_eq!(
             assertion.identity(),
             &BranchPinDescriptor::pin_identity(key.verifying_key(), name)
         );
         assert_eq!(assertion.value(), value_from_commit(commit));
-        assert_eq!(assertion.label(), depth_label(23));
-    }
-
-    #[derive(Default)]
-    struct TestDag(HashMap<CommitHandle, Vec<CommitHandle>>);
-
-    impl PartialCommitDag for TestDag {
-        type Error = Infallible;
-
-        fn parents(&mut self, commit: CommitHandle) -> Result<ParentLookup, Self::Error> {
-            Ok(match self.0.get(&commit) {
-                Some(parents) => ParentLookup::Present(parents.clone()),
-                None => ParentLookup::Missing,
-            })
-        }
-    }
-
-    fn commit(byte: u8) -> CommitHandle {
-        Inline::new([byte; 32])
+        assert_eq!(assertion.label(), rank.label());
     }
 
     #[test]
-    fn commit_depth_is_longest_path_and_merge_is_max_parent_plus_one() {
-        let root = commit(1);
-        let short = commit(2);
-        let long = commit(3);
-        let long_tip = commit(4);
-        let merge = commit(5);
-        let mut dag = TestDag(HashMap::from([
-            (root, vec![]),
-            (short, vec![root]),
-            (long, vec![root]),
-            (long_tip, vec![long]),
-            // Duplicate parents are semantically one edge and do not alter
-            // the longest-path definition.
-            (merge, vec![short, long_tip, short]),
-        ]));
-        assert_eq!(commit_depth(&mut dag, root).unwrap(), 0);
-        assert_eq!(commit_depth(&mut dag, short).unwrap(), 1);
-        assert_eq!(commit_depth(&mut dag, long_tip).unwrap(), 2);
-        assert_eq!(commit_depth(&mut dag, merge).unwrap(), 3);
-    }
+    fn rank_is_a_full_width_big_endian_successor() {
+        let zero = BranchRank::ROOT;
+        let one = zero.successor().unwrap();
+        assert_eq!(zero.label().raw(), [0u8; 32]);
+        assert_eq!(one.label().raw()[31], 1);
+        assert!(one > zero);
 
-    #[test]
-    fn commit_depth_refuses_missing_ancestry_and_cycles() {
-        let tip = commit(9);
-        let missing = commit(8);
-        let mut incomplete = TestDag(HashMap::from([(tip, vec![missing])]));
-        assert!(matches!(
-            commit_depth(&mut incomplete, tip),
-            Err(CommitDepthError::Missing { commit }) if commit == missing
-        ));
+        let mut ff = [0u8; 32];
+        ff[31] = 0xFF;
+        let carried = BranchRank::from_label(SubsumptionLabel::from_raw(ff))
+            .successor()
+            .unwrap();
+        assert_eq!(carried.label().raw()[30], 1);
+        assert_eq!(carried.label().raw()[31], 0);
 
-        let a = commit(10);
-        let b = commit(11);
-        let mut cyclic = TestDag(HashMap::from([(a, vec![b]), (b, vec![a])]));
-        assert!(matches!(
-            commit_depth(&mut cyclic, a),
-            Err(CommitDepthError::Cycle { .. })
-        ));
-    }
-
-    #[test]
-    fn depth_label_is_monotone_under_the_stores_bytewise_order() {
-        let mut prev = depth_label(0);
-        for d in [1u64, 2, 255, 256, 65_535, 65_536, 1 << 40, u64::MAX] {
-            let cur = depth_label(d);
-            assert!(cur > prev, "depth {d} did not increase bytewise");
-            prev = cur;
-        }
-    }
-
-    /// NEGATIVE CONTROL for the encoding obligation.
-    ///
-    /// Little-endian still yields a total order, so a positive-only test would
-    /// pass — the order merely disagrees with numeric order, which breaks
-    /// monotonicity in the UNSOUND direction: it licenses skips ancestry does
-    /// not justify. This fails if anyone "simplifies" `depth_label` to native
-    /// or little-endian bytes.
-    #[test]
-    fn a_little_endian_encoding_would_not_be_monotone() {
-        let le = |d: u64| {
-            let mut raw = [0u8; 32];
-            raw[..8].copy_from_slice(&d.to_le_bytes());
-            SubsumptionLabel::from_raw(raw)
-        };
-        assert!(le(256) < le(1), "little-endian must misorder 1 vs 256");
         assert!(
-            depth_label(256) > depth_label(1),
-            "big-endian must order 1 < 256"
+            BranchRank::from_label(SubsumptionLabel::from_raw([0xFF; 32]))
+                .successor()
+                .is_none()
         );
     }
 
-    /// The tail is reserved for a composite that keeps the same total order.
     #[test]
-    fn depth_occupies_the_leading_eight_bytes_and_leaves_the_tail_free() {
-        let l = depth_label(9);
-        assert_eq!(l.raw()[..8], 9u64.to_be_bytes());
-        assert!(l.raw()[8..].iter().all(|b| *b == 0));
+    fn roots_children_and_merges_are_inductive_not_dag_walks() {
+        assert_eq!(BranchRank::after([]).unwrap(), BranchRank::ROOT);
+        let left = BranchRank::ROOT.successor().unwrap();
+        let right = BranchRank::ROOT.successor().unwrap();
+        assert_eq!(left, right, "independent children may share a rank");
+        let merge = BranchRank::after([left, right]).unwrap();
+        assert!(merge > left);
+        assert!(merge > right);
+
+        let child = merge.successor().unwrap();
+        assert!(child > merge);
+        assert!(child.label() > merge.label());
     }
 }
