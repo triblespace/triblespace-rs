@@ -50,9 +50,9 @@ pub use anybytes::Bytes;
 /// - [`Blob::new`] hashes the bytes and stores the resulting handle.
 ///   Subsequent `get_handle` / `as_ref` calls are O(1).
 /// - [`Blob::with_handle`] is the explicit "trust me" constructor for
-///   read paths where the handle is already known (a blob-store
-///   reader pulling a known-keyed entry, a pile-format decoder where
-///   the index has the hash). Caller asserts `handle == Blake3(bytes)`.
+///   read paths that have already hashed these exact bytes and compared
+///   them with the handle in the same trusted local path. Merely receiving
+///   bytes under a known key is not validation.
 /// - [`Blob::transmute`] / [`Blob::as_transmute`] preserve the cached
 ///   handle across schema casts — the Blake3 hash is over bytes, not
 ///   over schema, so the digest survives the phantom change.
@@ -103,11 +103,9 @@ where
     /// Constructs a blob from bytes *and* a precomputed handle,
     /// skipping the hash step.
     ///
-    /// Used by blob-store readers (`MemoryBlobStoreReader::get` and
-    /// friends) and pile-format decoders that already know the
-    /// handle the blob is stored under — they read the bytes out of
-    /// their backing storage already keyed by hash, so recomputing
-    /// it would be pure overhead.
+    /// Used by validated pile-format reads where the exact returned byte
+    /// sequence was just hashed against the record handle, making another
+    /// Blake3 pass pure overhead.
     ///
     /// # Safety
     ///
@@ -115,11 +113,12 @@ where
     /// is trusted on read paths; if these diverge,
     /// `MemoryBlobStore::insert(blob)` will store the bytes under
     /// `handle` (not the true Blake3 hash), and subsequent lookups
-    /// will silently miss or return wrong data. Always pair this
-    /// with a hash you got from a trusted source (the same store
-    /// you're reading from, the pile header, a verified network
-    /// fetch). For callers without that guarantee, use
-    /// [`Blob::new`] which hashes from bytes.
+    /// will silently miss or return wrong data. This constructor is safe only
+    /// when the caller validated **these exact bytes** against `handle` in the
+    /// same function or an equally tight trusted local path; trusting the
+    /// source of the handle, a store key, callback result, or network response
+    /// is not sufficient. For every trust boundary, use [`Blob::new`] and
+    /// compare its computed handle instead.
     pub fn with_handle(bytes: Bytes, handle: Inline<Handle<S>>) -> Self {
         Self {
             bytes,
