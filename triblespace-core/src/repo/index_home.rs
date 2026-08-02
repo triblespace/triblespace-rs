@@ -33,9 +33,10 @@ use crate::query::{
     VariableSet,
 };
 use crate::repo::index_range::{
-    convex_union, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
-    RangeValidationError, StoredCommitDag,
+    convex_union, validate_exact_frontier_cover, RangeCoverCandidate, RangeRecord,
+    RangeRecordError, RangeValidationError, StoredCommitDag,
 };
+use crate::repo::rollup_pin::RollupRecord;
 use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle};
 use crate::trible::{Fragment, TribleSet};
 
@@ -142,6 +143,179 @@ pub trait IndexKind {
         &self,
         segments: &[Self::Segment],
     ) -> Result<Vec<Self::PreparedArtifact>, ArtifactError>;
+}
+
+/// Structural or typed validation failure for one standalone rollup node.
+#[derive(Debug)]
+pub enum RangeNodeError {
+    /// A core or node archive did not contain exactly one range record.
+    RecordCardinality {
+        /// Which half of the pair was malformed.
+        archive: &'static str,
+        /// Number of range records discovered in the archive.
+        actual: usize,
+    },
+    /// The asserted core archive contained facts beyond its canonical core.
+    CoreNotStandalone { entity: Id },
+    /// The artifact-node archive contained unrelated subjects.
+    NodeNotStandalone { entity: Id },
+    /// The stored range belongs to another runtime recipe.
+    RecipeMismatch { expected: Id, actual: Id },
+    /// The node's intrinsic range core differs from the asserted hard core.
+    CoreMismatch { core: Id, node: Id },
+    /// A recipe emitted control facts or facts for another subject.
+    InvalidArtifactFacts { entity: Id },
+    /// A core-only node parsed typed artifacts despite having no artifact facts.
+    CoreHasArtifacts { count: usize },
+    /// A distinct node archive contained no complete typed artifact.
+    ArtifactlessNode,
+    /// A range record was structurally invalid.
+    Range(RangeRecordError),
+    /// Typed artifact facts were malformed.
+    Artifact(ArtifactError),
+}
+
+impl fmt::Display for RangeNodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RecordCardinality { archive, actual } => write!(
+                f,
+                "standalone range {archive} contains {actual} range records, expected one"
+            ),
+            Self::CoreNotStandalone { entity } => write!(
+                f,
+                "range core {entity:x} contains artifact facts or unrelated subjects"
+            ),
+            Self::NodeNotStandalone { entity } => {
+                write!(f, "range node {entity:x} contains unrelated subjects")
+            }
+            Self::RecipeMismatch { expected, actual } => write!(
+                f,
+                "range recipe {actual:x} does not match runtime recipe {expected:x}"
+            ),
+            Self::CoreMismatch { core, node } => write!(
+                f,
+                "range node core {node:x} does not match asserted core {core:x}"
+            ),
+            Self::InvalidArtifactFacts { entity } => write!(
+                f,
+                "index recipe emitted invalid artifact facts for range {entity:x}"
+            ),
+            Self::CoreHasArtifacts { count } => write!(
+                f,
+                "core-only range node parsed {count} typed artifacts, expected none"
+            ),
+            Self::ArtifactlessNode => {
+                write!(f, "a distinct range node must contain a typed artifact")
+            }
+            Self::Range(error) => error.fmt(f),
+            Self::Artifact(error) => write!(f, "invalid typed range artifacts: {error}"),
+        }
+    }
+}
+
+impl Error for RangeNodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Range(error) => Some(error),
+            Self::Artifact(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<RangeRecordError> for RangeNodeError {
+    fn from(error: RangeRecordError) -> Self {
+        Self::Range(error)
+    }
+}
+
+/// Hard-retained canonical core for one logical source range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRangeCore {
+    handle: Inline<Handle<SimpleArchive>>,
+    record: RangeRecord,
+}
+
+impl StoredRangeCore {
+    /// Exact core-only archive handle carried by a rollup assertion value.
+    pub const fn handle(&self) -> Inline<Handle<SimpleArchive>> {
+        self.handle
+    }
+
+    /// Canonical artifact-neutral range record.
+    pub const fn record(&self) -> &RangeRecord {
+        &self.record
+    }
+
+    /// Stable intrinsic range entity id.
+    pub fn entity(&self) -> Id {
+        self.record.entity()
+    }
+
+    /// Recipe owning this range.
+    pub fn recipe(&self) -> Id {
+        self.record.recipe()
+    }
+
+    /// Inclusive source range.
+    pub fn range(&self) -> &CommitRange {
+        self.record.range()
+    }
+
+    /// Offer an asserted complete node as a candidate for this validated core.
+    ///
+    /// This deliberately does not require loading the node: cover selection
+    /// can use the hard range metadata first, then structurally and
+    /// type-check only the alternatives it selects before attachment.
+    pub fn candidate(&self, node: Inline<Handle<SimpleArchive>>) -> RangeCoverCandidate {
+        RangeCoverCandidate::new(node, self.record.range().clone())
+    }
+}
+
+/// One validated complete artifact-node alternative over a hard range core.
+#[derive(Debug, Clone)]
+pub struct StoredRangeNode<A> {
+    core: StoredRangeCore,
+    handle: Inline<Handle<SimpleArchive>>,
+    record: RangeRecord,
+    artifacts: Vec<A>,
+}
+
+impl<A> StoredRangeNode<A> {
+    /// Hard-retained canonical core shared by all alternatives for this range.
+    pub const fn core(&self) -> &StoredRangeCore {
+        &self.core
+    }
+
+    /// Exact complete node archive carried by the rollup assertion label.
+    pub const fn handle(&self) -> Inline<Handle<SimpleArchive>> {
+        self.handle
+    }
+
+    /// Full range record, including this node's typed artifact facts.
+    pub const fn record(&self) -> &RangeRecord {
+        &self.record
+    }
+
+    /// Parsed typed physical artifacts carried atomically by this node.
+    pub fn artifacts(&self) -> &[A] {
+        &self.artifacts
+    }
+
+    /// Exact asserted pair used to publish or reload this alternative.
+    pub const fn rollup_record(&self) -> RollupRecord {
+        RollupRecord::new(self.core.handle, self.handle)
+    }
+
+    /// Locally usable cover candidate keyed by this complete node handle.
+    ///
+    /// There is intentionally no constructor from raw handles: obtaining a
+    /// `StoredRangeNode` requires structural and typed parsing through
+    /// [`store_range`] or [`load_range`].
+    pub fn candidate(&self) -> RangeCoverCandidate {
+        self.core.candidate(self.handle)
+    }
 }
 
 /// One logical LSM record and its zero-or-more physical artifacts.
@@ -557,6 +731,8 @@ fn replace_manifest_subjects<K: IndexKind>(
 pub enum IndexError {
     /// Storage operation failed.
     Storage(ArtifactError),
+    /// A standalone range core/node pair was malformed.
+    RangeNode(RangeNodeError),
     /// Manifest was malformed.
     Manifest(ManifestError),
     /// Typed artifact build/store/parse/attach failed.
@@ -573,6 +749,7 @@ impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => write!(f, "index-manifest storage error: {error}"),
+            Self::RangeNode(error) => error.fmt(f),
             Self::Manifest(error) => error.fmt(f),
             Self::Artifact(error) => write!(f, "index artifact error: {error}"),
             Self::Merge(error) => write!(f, "index merge error: {error}"),
@@ -589,6 +766,7 @@ impl Error for IndexError {
             | Self::Artifact(error)
             | Self::Merge(error)
             | Self::Range(error) => Some(error.as_ref()),
+            Self::RangeNode(error) => Some(error),
             Self::Manifest(error) => Some(error),
             Self::StaleCoverage(error) => Some(error),
         }
@@ -598,6 +776,12 @@ impl Error for IndexError {
 impl From<ManifestError> for IndexError {
     fn from(error: ManifestError) -> Self {
         Self::Manifest(error)
+    }
+}
+
+impl From<RangeNodeError> for IndexError {
+    fn from(error: RangeNodeError) -> Self {
+        Self::RangeNode(error)
     }
 }
 
@@ -681,6 +865,206 @@ pub fn store_artifact<S: BlobStorePut, K: IndexKind>(
     kind.put(storage, artifact).map_err(IndexError::Artifact)
 }
 
+fn artifact_facts_are_valid(entity: Id, facts: &TribleSet) -> bool {
+    facts.iter().all(|fact| {
+        *fact.e() == entity
+            && !matches!(
+                *fact.a(),
+                attribute
+                    if attribute == crate::repo::index_range::index_recipe.id()
+                        || attribute == crate::repo::index_range::commit_start.id()
+                        || attribute == crate::repo::index_range::commit_end.id()
+                        || attribute == seg_level.id()
+                        || attribute == seg_seq.id()
+                        || attribute == index_head.id()
+            )
+    })
+}
+
+fn one_range_record(
+    facts: &TribleSet,
+    archive: &'static str,
+) -> Result<RangeRecord, RangeNodeError> {
+    let mut records = RangeRecord::discover(facts)?;
+    if records.len() != 1 {
+        return Err(RangeNodeError::RecordCardinality {
+            archive,
+            actual: records.len(),
+        });
+    }
+    Ok(records.pop().expect("one range record was checked"))
+}
+
+/// Persist one canonical hard range core and one complete artifact node.
+///
+/// `artifacts` are already-stored typed components. The core archive contains
+/// only the intrinsic `(recipe, commit_start*, commit_end*)` facts. The node
+/// contains that same core plus every fact emitted by `kind`; when `artifacts`
+/// is empty, both content-addressed handles are exactly equal. The returned
+/// value has been reloaded through [`load_range`], so cover selection cannot
+/// observe a node before structural and typed parsing succeeds.
+pub fn store_range<S: BlobStore, K: IndexKind>(
+    storage: &mut S,
+    kind: &K,
+    range: CommitRange,
+    artifacts: Vec<K::StoredArtifact>,
+) -> Result<StoredRangeNode<K::StoredArtifact>, IndexError> {
+    let (recipe, _) = recipe_descriptor(kind)?;
+    let core_record = RangeRecord::new(recipe, range);
+    let entity = core_record.entity();
+    let core_facts = core_record.to_tribles();
+    let mut node_record = core_record.clone();
+
+    for artifact in &artifacts {
+        let emitted = kind.emit(entity, artifact);
+        if emitted.is_empty() || !artifact_facts_are_valid(entity, &emitted) {
+            return Err(RangeNodeError::InvalidArtifactFacts { entity }.into());
+        }
+        *node_record.facts_mut() += emitted;
+    }
+
+    let node_facts = node_record.to_tribles();
+    if !artifacts.is_empty() && node_facts == core_facts {
+        return Err(RangeNodeError::InvalidArtifactFacts { entity }.into());
+    }
+
+    let core = storage
+        .put::<SimpleArchive, _>(core_facts.clone())
+        .map_err(storage_error)?;
+    let node = if node_facts == core_facts {
+        core
+    } else {
+        storage
+            .put::<SimpleArchive, _>(node_facts)
+            .map_err(storage_error)?
+    };
+    let reader = storage.reader().map_err(storage_error)?;
+    load_range(&reader, kind, RollupRecord::new(core, node))
+}
+
+/// Load and validate one canonical hard range core without loading a node.
+///
+/// This is the cheap first phase of rollup selection: the core archive must
+/// contain exactly one artifact-neutral record for `kind`, but an asserted
+/// node may still be unavailable locally. Once the preferred cover has been
+/// selected through [`StoredRangeCore::candidate`], [`load_range`] validates
+/// the chosen complete node before it can be attached.
+pub fn load_range_core<R: BlobStoreGet, K: IndexKind>(
+    reader: &R,
+    kind: &K,
+    handle: Inline<Handle<SimpleArchive>>,
+) -> Result<StoredRangeCore, IndexError> {
+    let (expected_recipe, _) = recipe_descriptor(kind)?;
+    let core_facts = reader
+        .get::<TribleSet, SimpleArchive>(handle)
+        .map_err(storage_error)?;
+    let core_record = one_range_record(&core_facts, "core")?;
+    if core_record.recipe() != expected_recipe {
+        return Err(RangeNodeError::RecipeMismatch {
+            expected: expected_recipe,
+            actual: core_record.recipe(),
+        }
+        .into());
+    }
+    let canonical_core = RangeRecord::new(expected_recipe, core_record.range().clone());
+    if core_facts != canonical_core.to_tribles() {
+        return Err(RangeNodeError::CoreNotStandalone {
+            entity: core_record.entity(),
+        }
+        .into());
+    }
+
+    Ok(StoredRangeCore {
+        handle,
+        record: canonical_core,
+    })
+}
+
+/// Load and validate one asserted hard-core/artifact-node pair atomically.
+///
+/// Neither archive is fact-unioned with another node, even when two nodes have
+/// the same intrinsic range entity. The hard value must be exactly one
+/// core-only record. The label must be exactly one full record with that same
+/// intrinsic core and the runtime recipe's complete typed artifact relation.
+pub fn load_range<R: BlobStoreGet, K: IndexKind>(
+    reader: &R,
+    kind: &K,
+    rollup: RollupRecord,
+) -> Result<StoredRangeNode<K::StoredArtifact>, IndexError> {
+    let core = load_range_core(reader, kind, rollup.range_record())?;
+    let expected_recipe = core.recipe();
+
+    let node_facts = if rollup.node() == rollup.range_record() {
+        core.record().to_tribles()
+    } else {
+        reader
+            .get::<TribleSet, SimpleArchive>(rollup.node())
+            .map_err(storage_error)?
+    };
+    let node_record = one_range_record(&node_facts, "node")?;
+    if node_record.to_tribles() != node_facts {
+        return Err(RangeNodeError::NodeNotStandalone {
+            entity: node_record.entity(),
+        }
+        .into());
+    }
+    if node_record.recipe() != expected_recipe {
+        return Err(RangeNodeError::RecipeMismatch {
+            expected: expected_recipe,
+            actual: node_record.recipe(),
+        }
+        .into());
+    }
+    if node_record.entity() != core.entity() {
+        return Err(RangeNodeError::CoreMismatch {
+            core: core.entity(),
+            node: node_record.entity(),
+        }
+        .into());
+    }
+
+    let artifacts = kind
+        .parse(reader, node_record.facts(), node_record.entity())
+        .map_err(RangeNodeError::Artifact)?;
+    if rollup.node() == rollup.range_record() {
+        if !artifacts.is_empty() {
+            return Err(RangeNodeError::CoreHasArtifacts {
+                count: artifacts.len(),
+            }
+            .into());
+        }
+    } else if artifacts.is_empty() {
+        return Err(RangeNodeError::ArtifactlessNode.into());
+    }
+
+    Ok(StoredRangeNode {
+        core,
+        handle: rollup.node(),
+        record: node_record,
+        artifacts,
+    })
+}
+
+/// Attach every physical artifact in one already-validated standalone node.
+pub fn attach_range<R: BlobStoreGet, K: IndexKind>(
+    reader: &R,
+    kind: &K,
+    node: &StoredRangeNode<K::StoredArtifact>,
+) -> Result<Vec<K::Segment>, IndexError> {
+    let (expected, _) = recipe_descriptor(kind)?;
+    if node.core.recipe() != expected {
+        return Err(RangeNodeError::RecipeMismatch {
+            expected,
+            actual: node.core.recipe(),
+        }
+        .into());
+    }
+    node.artifacts
+        .iter()
+        .map(|artifact| kind.attach(reader, artifact).map_err(IndexError::Artifact))
+        .collect()
+}
+
 fn make_entry<K: IndexKind>(
     kind: &K,
     recipe: Id,
@@ -697,19 +1081,7 @@ fn make_entry<K: IndexKind>(
     };
     for artifact in &artifacts {
         let emitted = kind.emit(entity, artifact);
-        if emitted.iter().any(|fact| {
-            *fact.e() != entity
-                || matches!(
-                    *fact.a(),
-                    attribute
-                        if attribute == crate::repo::index_range::index_recipe.id()
-                            || attribute == crate::repo::index_range::commit_start.id()
-                            || attribute == crate::repo::index_range::commit_end.id()
-                            || attribute == seg_level.id()
-                            || attribute == seg_seq.id()
-                            || attribute == index_head.id()
-                )
-        }) {
+        if !artifact_facts_are_valid(entity, &emitted) {
             return Err(ManifestError::InvalidArtifactFacts { entity });
         }
         *record.facts_mut() += emitted;
@@ -1328,5 +1700,240 @@ where
                 .map(|segment| segment.pattern(e, a, v))
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob::MemoryBlobStore;
+    use crate::id::{fucid, ExclusiveId};
+
+    struct SilentArtifactKind;
+
+    impl IndexKind for SilentArtifactKind {
+        type Segment = ();
+        type PreparedArtifact = ();
+        type StoredArtifact = ();
+
+        fn recipe_fragment(&self) -> Fragment {
+            succinct_recipe_fragment()
+        }
+
+        fn build(&self, _source: &TribleSet) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
+            Ok(Vec::new())
+        }
+
+        fn put<S: BlobStorePut>(
+            &self,
+            _storage: &mut S,
+            _artifact: Self::PreparedArtifact,
+        ) -> Result<Self::StoredArtifact, ArtifactError> {
+            Ok(())
+        }
+
+        fn emit(&self, _entity: Id, _artifact: &Self::StoredArtifact) -> TribleSet {
+            TribleSet::new()
+        }
+
+        fn parse<R: BlobStoreGet>(
+            &self,
+            _reader: &R,
+            _facts: &TribleSet,
+            _entity: Id,
+        ) -> Result<Vec<Self::StoredArtifact>, ArtifactError> {
+            Ok(Vec::new())
+        }
+
+        fn attach<R: BlobStoreGet>(
+            &self,
+            _reader: &R,
+            _artifact: &Self::StoredArtifact,
+        ) -> Result<Self::Segment, ArtifactError> {
+            Ok(())
+        }
+
+        fn merge(
+            &self,
+            _segments: &[Self::Segment],
+        ) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn commit(byte: u8) -> CommitHandle {
+        Inline::new([byte; 32])
+    }
+
+    fn source(name: &'static str) -> TribleSet {
+        let subject = fucid();
+        entity! { &subject @ metadata::name: name }.into_facts()
+    }
+
+    fn store_succinct_range(
+        storage: &mut MemoryBlobStore,
+        kind: &SuccinctRollup,
+        source: &TribleSet,
+        range: CommitRange,
+    ) -> StoredRangeNode<StoredSuccinctArtifact> {
+        let artifacts = kind
+            .build(source)
+            .unwrap()
+            .into_iter()
+            .map(|artifact| store_artifact(storage, kind, artifact).unwrap())
+            .collect();
+        store_range(storage, kind, range, artifacts).unwrap()
+    }
+
+    #[test]
+    fn standalone_nonempty_range_roundtrips_and_attaches() {
+        let mut storage = MemoryBlobStore::new();
+        let kind = SuccinctRollup::new();
+        let source = source("Ada");
+        let range = CommitRange::leaf(commit(1));
+        let stored = store_succinct_range(&mut storage, &kind, &source, range.clone());
+
+        assert_ne!(stored.core().handle(), stored.handle());
+        assert_eq!(stored.core().range(), &range);
+        assert_eq!(stored.record().range(), &range);
+        assert_eq!(stored.artifacts().len(), 1);
+        assert_eq!(stored.candidate().node(), stored.handle());
+
+        let reader = storage.reader().unwrap();
+        let core = load_range_core(&reader, &kind, stored.core().handle()).unwrap();
+        assert_eq!(core, *stored.core());
+        assert_eq!(core.candidate(stored.handle()), stored.candidate());
+        let absent_node = Inline::<Handle<SimpleArchive>>::new([0xff; 32]);
+        assert_eq!(core.candidate(absent_node).node(), absent_node);
+        let loaded = load_range(&reader, &kind, stored.rollup_record()).unwrap();
+        assert_eq!(loaded.core(), stored.core());
+        assert_eq!(loaded.handle(), stored.handle());
+        assert_eq!(loaded.artifacts(), stored.artifacts());
+
+        let attached = attach_range(&reader, &kind, &loaded).unwrap();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(TribleSet::from(&attached[0]), source);
+    }
+
+    #[test]
+    fn standalone_empty_range_uses_its_core_as_the_node() {
+        let mut storage = MemoryBlobStore::new();
+        let kind = SuccinctRollup::new();
+        let range = CommitRange::leaf(commit(1));
+        let stored = store_range(&mut storage, &kind, range.clone(), Vec::new()).unwrap();
+
+        assert_eq!(stored.core().handle(), stored.handle());
+        assert_eq!(stored.core().range(), &range);
+        assert!(stored.artifacts().is_empty());
+
+        let reader = storage.reader().unwrap();
+        let loaded = load_range(&reader, &kind, stored.rollup_record()).unwrap();
+        assert!(loaded.artifacts().is_empty());
+        assert!(attach_range(&reader, &kind, &loaded).unwrap().is_empty());
+    }
+
+    #[test]
+    fn standalone_range_rejects_each_silent_artifact() {
+        let mut storage = MemoryBlobStore::new();
+        let error = store_range(
+            &mut storage,
+            &SilentArtifactKind,
+            CommitRange::leaf(commit(1)),
+            vec![()],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IndexError::RangeNode(RangeNodeError::InvalidArtifactFacts { .. })
+        ));
+    }
+
+    #[test]
+    fn standalone_range_rejects_a_node_for_another_core() {
+        let mut storage = MemoryBlobStore::new();
+        let kind = SuccinctRollup::new();
+        let first = store_succinct_range(
+            &mut storage,
+            &kind,
+            &source("Ada"),
+            CommitRange::leaf(commit(1)),
+        );
+        let second = store_succinct_range(
+            &mut storage,
+            &kind,
+            &source("Grace"),
+            CommitRange::leaf(commit(2)),
+        );
+
+        let reader = storage.reader().unwrap();
+        let error = load_range(
+            &reader,
+            &kind,
+            RollupRecord::new(first.core().handle(), second.handle()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            IndexError::RangeNode(RangeNodeError::CoreMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn alternative_nodes_for_one_core_stay_atomic() {
+        let mut storage = MemoryBlobStore::new();
+        let kind = SuccinctRollup::new();
+        let range = CommitRange::leaf(commit(1));
+        let first_source = source("Ada");
+        let second_source = source("Grace");
+        let first = store_succinct_range(&mut storage, &kind, &first_source, range.clone());
+        let second = store_succinct_range(&mut storage, &kind, &second_source, range.clone());
+
+        assert_eq!(first.core().handle(), second.core().handle());
+        assert_ne!(first.handle(), second.handle());
+        assert_ne!(first.candidate().node(), second.candidate().node());
+
+        let reader = storage.reader().unwrap();
+        let first = load_range(&reader, &kind, first.rollup_record()).unwrap();
+        let second = load_range(&reader, &kind, second.rollup_record()).unwrap();
+        let first_attached = attach_range(&reader, &kind, &first).unwrap();
+        let second_attached = attach_range(&reader, &kind, &second).unwrap();
+
+        assert_eq!(TribleSet::from(&first_attached[0]), first_source);
+        assert_eq!(TribleSet::from(&second_attached[0]), second_source);
+    }
+
+    #[test]
+    fn standalone_node_preserves_unknown_same_subject_facts() {
+        let mut storage = MemoryBlobStore::new();
+        let kind = SuccinctRollup::new();
+        let stored = store_succinct_range(
+            &mut storage,
+            &kind,
+            &source("Ada"),
+            CommitRange::leaf(commit(1)),
+        );
+        let entity = stored.record().entity();
+        let mut annotated = stored.record().to_tribles();
+        annotated += entity! { ExclusiveId::force_ref(&entity) @
+            metadata::name: "future annotation",
+        };
+        let annotated_handle = storage.put::<SimpleArchive, _>(annotated).unwrap();
+
+        let reader = storage.reader().unwrap();
+        let loaded = load_range(
+            &reader,
+            &kind,
+            RollupRecord::new(stored.core().handle(), annotated_handle),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.handle(), annotated_handle);
+        assert_eq!(loaded.artifacts(), stored.artifacts());
+        assert!(loaded
+            .record()
+            .facts()
+            .iter()
+            .any(|fact| { *fact.e() == entity && *fact.a() == metadata::name.id() }));
     }
 }

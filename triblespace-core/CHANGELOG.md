@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added standalone typed range-node storage: a hard core-only range archive is
+  paired with one complete artifact-node archive, loaded and validated without
+  unioning alternative nodes that share the same intrinsic range.
 - Removed the unused mutable-manifest range replacement helpers and monotone
   commit-batch guard. Range records retain their immutable open-fact model;
   pool cover selection derives freshness from the authoritative frontier.
