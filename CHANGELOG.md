@@ -87,6 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The remote scalar-pin compatibility island is removed.**
+  `AsyncPinStore`, its sync/async adapter implementations, the object-store
+  `pins/` CAS namespace, and `trible store pin` are deleted. Remote object
+  storage now exposes content-addressed blobs only; asserted state requires a
+  backend that can provide a coherent assertion snapshot and durable append.
+  The still-live synchronous `PinStore` remains temporarily scoped to local
+  policy, retention, serving, and index consumers while those semantics are
+  migrated explicitly.
 - **Breaking: signed asserted wants replace anonymous weak pins.** The fixed
   `WantPinDescriptor` gives each author one grow-only set of exact wanted blob
   values through the generic `PinAssertionStore`; `WantStore` scopes reads and
@@ -111,11 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verified its surviving claim may cross into fetch policy. The blocking async
   adapter lowers this trait only for a `SyncAsAsync` store which already
   satisfies the local contract; a remote `ObjectStoreReader` cannot masquerade
-  as a synchronous resolver DAG. `ObjectStoreRemote` is intentionally only
-  a blob plus legacy mutable-pin backend: its CAS namespace moves from
-  `branches/` to `pins/`, reads verify content hashes, and it does not pretend
-  generic LIST or file-backend PUT semantics satisfy coherent asserted-pin
-  snapshot and durability contracts.
+  as a synchronous resolver DAG. `ObjectStoreRemote` remains an async-native,
+  content-addressed blob backend: reads verify content hashes, and it does not
+  pretend generic LIST or file-backend PUT semantics satisfy coherent
+  asserted-pin snapshot and durability contracts.
 - **Network transport now stops cleanly at the asserted-pin boundary.** The scalar
   mutable-HEAD gossip/tracking bridge, publisher-hint state, direction modes,
   and `OP_CHILDREN` are deleted. Pile-sync v5 exposes only mandatory

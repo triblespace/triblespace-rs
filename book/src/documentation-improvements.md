@@ -14,15 +14,15 @@ should be tackled first when planning documentation work:
 
 ### Remote object stores
 `repo::objectstore::ObjectStoreRemote::with_url` wires blob storage and the
-legacy mutable-pin namespace into
+content-addressed `blobs/` namespace into
 [`object_store`](https://docs.rs/object_store/latest/object_store/) services such
 as S3, local filesystems or Azure storage. It deliberately does not implement
 `PinAssertionStore`: the generic `ObjectStore::list` contract is not a coherent
 point-in-time snapshot, and the local-filesystem backend does not expose the
 file and directory durability barriers required by a grow-only assertion
 ledger.
-The future chapter should cover credentials, namespace selection, the clean
-`pins/` versus `blobs/` split, hash validation on reads, and the additional
+The future chapter should cover credentials, namespace selection, hash
+validation on reads, and the additional
 backend-specific durability capability required before remote blobs can sit on
 a repository publication path. A future remote assertion ledger needs an
 explicit immutable-snapshot protocol and truthful durability boundary; a

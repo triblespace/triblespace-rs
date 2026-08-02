@@ -154,22 +154,3 @@ fn store_blob_inspect_outputs_metadata() {
         .success()
         .stdout(predicate::str::contains("Length:"));
 }
-
-#[test]
-fn store_pin_list_outputs_id() {
-    let dir = tempdir().unwrap();
-    let pin_id = [1u8; 16];
-    let pin_hex = hex::encode(pin_id);
-    let pins_dir = dir.path().join("pins");
-    std::fs::create_dir_all(&pins_dir).unwrap();
-    std::fs::write(pins_dir.join(&pin_hex), b"pin").unwrap();
-
-    let url = format!("file://{}", dir.path().display());
-
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args(["store", "pin", "list", &url])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(pin_hex.to_ascii_uppercase()));
-}

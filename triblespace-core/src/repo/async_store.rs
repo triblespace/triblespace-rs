@@ -3,12 +3,9 @@
 //! The sync [`BlobStore`] family is the right
 //! contract for *local* backends: `MemoryBlobStore` and a
 //! `Pile`-over-mmap are genuinely synchronous, and a sync `get` that
-//! returns a `Result` is the truth. But genuinely *remote* backends —
+//! returns a `Result` is the truth. Genuinely *remote* backends —
 //! `ObjectStore` (cloud object storage) and a networked `Peer` — are
-//! async at their core. Today they fake sync by owning a private tokio
-//! `Runtime` and `block_on`-ing every call, which is both wasteful and
-//! actively broken (`block_on` inside an existing runtime panics, so a
-//! sync-faked remote store can't be used from async code at all).
+//! async at their core and implement the traits in this module directly.
 //!
 //! This module gives those backends an honest home: an async mirror of
 //! the blob-store traits, written in the same explicit
@@ -21,18 +18,16 @@
 //!   zero-await futures — so an async consumer can read a local store
 //!   for free, with no runtime and no blocking (the futures resolve on
 //!   first poll).
-//! - the inverse (an async store behind a single `block_on` boundary)
-//!   is `Blocking`, landing in a later increment so the scattered
-//!   `block_on`s in `ObjectStore` collapse into one place.
+//! - [`Blocking`](crate::repo::async_store::Blocking) places an async store
+//!   behind one explicit runtime boundary for synchronous consumers. It must
+//!   not be invoked from inside another async runtime.
 
 use std::error::Error;
 use std::fmt::Debug;
 use std::future::Future;
 
-use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
@@ -40,7 +35,7 @@ use crate::repo::{
     pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore},
     want::{WantCachePolicy, WantCachePolicySource},
     BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
-    BlobStorePut, CommitHandle, PinStore, PushResult, StorageFlush,
+    BlobStorePut, CommitHandle, StorageFlush,
 };
 // Only used by the `object-store`-gated `Blocking` impls below.
 #[cfg(feature = "object-store")]
@@ -134,41 +129,6 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
 
     /// Create a shareable reader snapshot of the current store state.
     fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
-}
-
-/// Async counterpart of the legacy [`PinStore`] atomically-updatable cells.
-///
-/// They are not asserted-pin or branch authority and must never be exposed as a
-/// scalar branch head. Shared state lives in [`AsyncPinAssertionStore`]; this
-/// compatibility surface remains only while policy, retention, and durable
-/// fetch consumers migrate.
-pub trait AsyncPinStore {
-    /// Error type for listing pins.
-    type PinsError: Error + Debug + Send + Sync + 'static;
-    /// Error type for head lookups.
-    type HeadError: Error + Debug + Send + Sync + 'static;
-    /// Error type for CAS updates.
-    type UpdateError: Error + Debug + Send + Sync + 'static;
-
-    /// List every pin id (eagerly collected — see [`AsyncBlobStoreList`]
-    /// for why `Vec` over `Stream`).
-    fn pins(
-        &mut self,
-    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send;
-
-    /// Current head of a pin: `Some(head)`, `None` if tombstoned.
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send;
-
-    /// Compare-and-swap update of a pin's head.
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send;
 }
 
 /// Async storage surface for the generic grow-only asserted-pin layer.
@@ -357,39 +317,6 @@ where
 
     fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
         async move { self.0.reader().map(SyncAsAsync) }
-    }
-}
-
-impl<S> AsyncPinStore for SyncAsAsync<S>
-where
-    S: PinStore + Send,
-{
-    type PinsError = S::PinsError;
-    type HeadError = S::HeadError;
-    type UpdateError = S::UpdateError;
-
-    fn pins(
-        &mut self,
-    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send
-    {
-        async move { self.0.pins().map(|it| it.collect()) }
-    }
-
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send
-    {
-        async move { self.0.head(id) }
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
-        async move { self.0.update(id, old, new) }
     }
 }
 
@@ -627,34 +554,6 @@ impl<A: AsyncBlobStore> BlobStore for Blocking<A> {
 }
 
 #[cfg(feature = "object-store")]
-impl<A: AsyncPinStore> PinStore for Blocking<A> {
-    type PinsError = A::PinsError;
-    type HeadError = A::HeadError;
-    type UpdateError = A::UpdateError;
-    type ListIter<'a>
-        = std::vec::IntoIter<Result<Id, A::PinsError>>
-    where
-        A: 'a;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        self.rt.block_on(self.inner.pins()).map(|v| v.into_iter())
-    }
-
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        self.rt.block_on(self.inner.head(id))
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<PushResult, Self::UpdateError> {
-        self.rt.block_on(self.inner.update(id, old, new))
-    }
-}
-
-#[cfg(feature = "object-store")]
 impl<A: AsyncPinAssertionStore> PinAssertionStore for Blocking<A> {
     type Error = A::Error;
 
@@ -789,16 +688,6 @@ mod tests {
             .map(|h| h.raw)
             .collect();
         assert!(listed.contains(&h1.raw) && listed.contains(&h2.raw));
-    }
-
-    #[test]
-    fn async_pins_on_fresh_repo_are_empty() {
-        use crate::repo::memoryrepo::MemoryRepo;
-        let mut repo = SyncAsAsync::new(MemoryRepo::default());
-        let pins = block_on(repo.pins()).unwrap();
-        assert!(pins.is_empty(), "fresh repo has no pins");
-        let head = block_on(repo.head(Id::new([7u8; 16]).unwrap())).unwrap();
-        assert!(head.is_none(), "unknown pin has no head");
     }
 
     #[test]

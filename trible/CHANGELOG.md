@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- **The dead remote mutable-pin CLI is removed.** `trible store pin list` is
+  deleted together with the object-store CAS namespace it inspected; `store`
+  now contains only content-addressed blob operations.
 - **The pile branch CLI now mirrors the typed branch-pin model.** Exact
   `ed25519:<author>/blake3:<name-handle>` descriptors replace truncated branch
   ids and human names as selectors. The surface is reduced to deterministic
@@ -24,10 +27,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   relative filename without treating its empty parent component as a directory.
   Missing parent directories are rejected instead of being created through an
   incompletely durable multi-directory side effect.
-- **Remote mutable cells are exposed only as local pins.** The misleading
-  `store branch` surface is replaced by `store pin list`; direct object-store
-  generic assertions remain unavailable until a backend can meet coherent
-  snapshot and durable-append contracts.
 - **Legacy mutable-HEAD transport is gone.** `pile net sync` announces content
   and services only signed lazy-fetch wants authored by its node key; it neither
   exchanges scalar HEADs nor materializes tracking pins. Assertion replication and foreign-author

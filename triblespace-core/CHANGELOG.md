@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed `AsyncPinStore`, its adapter implementations, and
+  `ObjectStoreRemote`'s legacy `pins/` CAS namespace. The remote backend now
+  stores content-addressed blobs only; it does not pretend that object-store
+  listing and conditional PUT provide an asserted-state ledger.
 - Lazy demand is now an author-scoped `PinAssertion` G-set rather than mutable
   weak-pin state. `Lazy::new(store, SigningKey)` requires the author capability,
   `WantStore` exposes only that author's wants, and a miss crosses the durable
@@ -29,11 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PartialCommitDag` and truthful `StorageFlush`; `HybridStore` composes blobs
   with a separate asserted-pin store, and `Lazy` preserves assertion authority
   while turning only genuine missing commit metadata into durable wants.
-- `ObjectStoreRemote` now names legacy mutable cells under `pins/` and
-  verifies blob content against requested handles. It intentionally does not
-  implement `PinAssertionStore` or `StorageFlush`: generic object-store listing
-  is not a coherent assertion snapshot, and its file backend exposes no
-  crash-durability barrier.
 - `MemoryRepo::branches` is renamed to `pins`; mutable cells are no longer
   presented as content-branch authority even in test storage.
 - The public raw-pile vocabulary now exposes historical mutable records as

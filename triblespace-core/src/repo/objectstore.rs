@@ -1,6 +1,4 @@
-use std::array::TryFromSliceError;
 use std::convert::Infallible;
-use std::convert::TryInto;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -13,7 +11,6 @@ use object_store::parse_url;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use object_store::PutMode;
-use object_store::UpdateVersion;
 use object_store::{self};
 use url::Url;
 
@@ -25,8 +22,6 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
-use crate::id::Id;
-use crate::id::RawId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
@@ -36,19 +31,15 @@ use crate::trible::TribleSet;
 
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
-    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncPartialCommitDag, AsyncPinStore,
+    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncPartialCommitDag,
 };
 use super::branch_frontier::ParentLookup;
 use super::commit::{self, StoredCommitError};
 use super::want::{WantCachePolicy, WantCachePolicySource};
 use super::BlobMetadata;
-use super::PushResult;
-
-const LOCAL_PIN_INFIX: &str = "pins";
 const BLOB_INFIX: &str = "blobs";
 
-/// Blob and legacy mutable-pin storage backed by an [`object_store`]
-/// compatible backend.
+/// Blob storage backed by an [`object_store`] compatible backend.
 ///
 /// All data is stored in an external service (e.g. S3, local filesystem)
 /// via the `object_store` crate, which is async at its core — so this
@@ -172,188 +163,6 @@ impl AsyncBlobStore for ObjectStoreRemote {
             prefix: self.prefix.clone(),
         };
         async move { Ok(reader) }
-    }
-}
-
-impl AsyncPinStore for ObjectStoreRemote {
-    type PinsError = ListPinsErr;
-    type HeadError = ReadPinErr;
-    type UpdateError = UpdatePinErr;
-
-    fn pins(
-        &mut self,
-    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send
-    {
-        async move {
-            // These CAS cells are the legacy mutable-pin namespace, not shared
-            // asserted-pin authority.
-            let prefix = self.prefix.child(LOCAL_PIN_INFIX);
-            let stream = self.store.list(Some(&prefix)).filter_map(|r| async move {
-                match r {
-                    Ok(meta) if meta.size == 0 => None, // tombstoned local pin (0-byte object)
-                    Ok(meta) => {
-                        let name = match meta.location.filename() {
-                            Some(name) => name,
-                            None => return Some(Err(ListPinsErr::NotAFile("no filename"))),
-                        };
-                        let digest = match RawId::from_hex(name) {
-                            Ok(digest) => digest,
-                            Err(e) => return Some(Err(ListPinsErr::BadNameHex(e))),
-                        };
-                        let Some(id) = Id::new(digest) else {
-                            return Some(Err(ListPinsErr::BadId));
-                        };
-                        Some(Ok(id))
-                    }
-                    Err(e) => Some(Err(ListPinsErr::List(e))),
-                }
-            });
-            Ok(stream.collect().await)
-        }
-    }
-
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send
-    {
-        async move {
-            let path = self.prefix.child(LOCAL_PIN_INFIX).child(hex::encode(id));
-            match self.store.get(&path).await {
-                Ok(object) => {
-                    let bytes = object.bytes().await?;
-                    if bytes.is_empty() {
-                        return Ok(None);
-                    }
-                    let value = (&bytes[..]).try_into()?;
-                    Ok(Some(Inline::new(value)))
-                }
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(ReadPinErr::StoreErr(e)),
-            }
-        }
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
-        async move {
-            let path = self.prefix.child(LOCAL_PIN_INFIX).child(hex::encode(id));
-            // We encode a cleared local pin as an empty object. This lets us
-            // preserve CAS semantics for delete via conditional PUT
-            // (PutMode::Update), since `object_store` does not currently
-            // expose conditional delete.
-            //
-            // TODO: Once `object_store` supports conditional delete,
-            // migrate away from 0-byte tombstones and treat empty objects
-            // as corruption.
-            let new_bytes = match new {
-                Some(new) => bytes::Bytes::copy_from_slice(&new.raw),
-                None => bytes::Bytes::new(),
-            };
-
-            let parse_pin = |bytes: &bytes::Bytes| -> Result<
-                Option<Inline<Handle<SimpleArchive>>>,
-                TryFromSliceError,
-            > {
-                if bytes.is_empty() {
-                    return Ok(None);
-                }
-                let value = (&bytes[..]).try_into()?;
-                Ok(Some(Inline::new(value)))
-            };
-
-            if let Some(old_hash) = old {
-                let mut result = self.store.get(&path).await;
-                loop {
-                    match result {
-                        Ok(obj) => {
-                            let version = UpdateVersion {
-                                e_tag: obj.meta.e_tag.clone(),
-                                version: obj.meta.version.clone(),
-                            };
-                            let stored_bytes = obj.bytes().await?;
-                            let stored_hash = parse_pin(&stored_bytes)?;
-                            if stored_hash != Some(old_hash) {
-                                return Ok(PushResult::Conflict(stored_hash));
-                            }
-                            match self
-                                .store
-                                .put_opts(
-                                    &path,
-                                    new_bytes.clone().into(),
-                                    PutMode::Update(version).into(),
-                                )
-                                .await
-                            {
-                                Ok(_) => return Ok(PushResult::Success()),
-                                Err(object_store::Error::Precondition { .. }) => {
-                                    result = self.store.get(&path).await;
-                                    continue;
-                                }
-                                Err(e) => return Err(UpdatePinErr::StoreErr(e)),
-                            }
-                        }
-                        Err(object_store::Error::NotFound { .. }) => {
-                            return Ok(PushResult::Conflict(None));
-                        }
-                        Err(e) => return Err(UpdatePinErr::StoreErr(e)),
-                    }
-                }
-            } else {
-                loop {
-                    match self
-                        .store
-                        .put_opts(&path, new_bytes.clone().into(), PutMode::Create.into())
-                        .await
-                    {
-                        Ok(_) => return Ok(PushResult::Success()),
-                        Err(object_store::Error::AlreadyExists { .. }) => {
-                            let mut result = self.store.get(&path).await;
-                            loop {
-                                match result {
-                                    Ok(obj) => {
-                                        let version = UpdateVersion {
-                                            e_tag: obj.meta.e_tag.clone(),
-                                            version: obj.meta.version.clone(),
-                                        };
-                                        let stored_bytes = obj.bytes().await?;
-                                        let stored_hash = parse_pin(&stored_bytes)?;
-                                        if stored_hash.is_some() {
-                                            return Ok(PushResult::Conflict(stored_hash));
-                                        }
-                                        match self
-                                            .store
-                                            .put_opts(
-                                                &path,
-                                                new_bytes.clone().into(),
-                                                PutMode::Update(version).into(),
-                                            )
-                                            .await
-                                        {
-                                            Ok(_) => return Ok(PushResult::Success()),
-                                            Err(object_store::Error::Precondition { .. }) => {
-                                                result = self.store.get(&path).await;
-                                                continue;
-                                            }
-                                            Err(e) => return Err(UpdatePinErr::StoreErr(e)),
-                                        }
-                                    }
-                                    // raced with delete; retry create
-                                    Err(object_store::Error::NotFound { .. }) => break,
-                                    Err(e) => return Err(UpdatePinErr::StoreErr(e)),
-                                }
-                            }
-                            continue;
-                        }
-                        Err(e) => return Err(UpdatePinErr::StoreErr(e)),
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -570,96 +379,6 @@ impl fmt::Display for ListBlobsErr {
     }
 }
 impl Error for ListBlobsErr {}
-
-/// Error returned when listing legacy mutable pins from the object store.
-#[derive(Debug)]
-pub enum ListPinsErr {
-    /// The underlying list operation failed.
-    List(object_store::Error),
-    /// A listed object had no filename component.
-    NotAFile(&'static str),
-    /// A listed object's filename was not valid hexadecimal.
-    BadNameHex(<RawId as FromHex>::Error),
-    /// The decoded bytes represent the nil identifier.
-    BadId,
-}
-
-impl fmt::Display for ListPinsErr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::List(e) => write!(f, "list failed: {e}"),
-            Self::NotAFile(e) => write!(f, "list failed: {e}"),
-            Self::BadNameHex(e) => write!(f, "list failed: {e}"),
-            Self::BadId => write!(f, "list failed: bad id"),
-        }
-    }
-}
-impl Error for ListPinsErr {}
-
-/// Error returned when reading a legacy mutable pin from the object store.
-#[derive(Debug)]
-pub enum ReadPinErr {
-    /// The stored bytes could not be parsed as a valid handle.
-    ValidationErr(TryFromSliceError),
-    /// The underlying object store operation failed.
-    StoreErr(object_store::Error),
-}
-
-impl fmt::Display for ReadPinErr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::StoreErr(e) => write!(f, "pin read failed: {e}"),
-            Self::ValidationErr(e) => write!(f, "pin read failed: {e}"),
-        }
-    }
-}
-
-impl Error for ReadPinErr {}
-
-impl From<object_store::Error> for ReadPinErr {
-    fn from(err: object_store::Error) -> Self {
-        Self::StoreErr(err)
-    }
-}
-
-impl From<TryFromSliceError> for ReadPinErr {
-    fn from(err: TryFromSliceError) -> Self {
-        Self::ValidationErr(err)
-    }
-}
-
-/// Error returned when updating a legacy mutable pin in the object store.
-#[derive(Debug)]
-pub enum UpdatePinErr {
-    /// The stored bytes could not be parsed as a valid handle during a
-    /// compare-and-swap.
-    ValidationErr(TryFromSliceError),
-    /// The underlying object store operation failed.
-    StoreErr(object_store::Error),
-}
-
-impl fmt::Display for UpdatePinErr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::ValidationErr(e) => write!(f, "pin update failed: {e}"),
-            Self::StoreErr(e) => write!(f, "pin update failed: {e}"),
-        }
-    }
-}
-
-impl Error for UpdatePinErr {}
-
-impl From<object_store::Error> for UpdatePinErr {
-    fn from(err: object_store::Error) -> Self {
-        Self::StoreErr(err)
-    }
-}
-
-impl From<TryFromSliceError> for UpdatePinErr {
-    fn from(err: TryFromSliceError) -> Self {
-        Self::ValidationErr(err)
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -132,12 +132,8 @@ the full design.
 - `store blob forget <URL> <HANDLE>` — remove an object from a remote store.
 - `store blob inspect <URL> <HANDLE>` — display metadata for a remote blob.
 
-#### Mutable legacy pins
-
-- `store pin list <URL>` — list every legacy mutable pin id at an object-store URL. This is an unclassified storage view and can include old content-branch heads as well as policy or retention cells.
-
-`ObjectStoreRemote` intentionally exposes only blobs and the legacy mutable-pin namespace.
-It does not claim the coherent snapshot and durable-append contracts required
+`ObjectStoreRemote` intentionally exposes only blobs. It does not claim the
+coherent snapshot and durable-append contracts required
 by `PinAssertionStore`: generic object-store listing is not a
 point-in-time snapshot, and the advertised file backend exposes no directory
 durability barrier. Remote assertion persistence and replication therefore need

@@ -70,7 +70,7 @@ pub mod lazy;
 /// Fully in-memory repository implementation for tests and ephemeral use.
 pub mod memoryrepo;
 #[cfg(feature = "object-store")]
-/// Blob and legacy mutable-pin backend for `object_store`-compatible remotes.
+/// Content-addressed blob backend for `object_store`-compatible remotes.
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
@@ -384,10 +384,11 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// root: blobs reachable from a pin survive; the rest are reclaimed.
 ///
 /// Legacy callers distinguish roles at higher layers with metadata markers:
-/// renewal policy, pending requests, credential holdings, retention roots, and
-/// durable fetch wants. Older stores may also contain mutable content-branch
-/// heads. None of these scalar cells are asserted-pin or branch authority, and
-/// pile copying means they cannot honestly be treated as semantically local.
+/// renewal and pending-request policy, credential holdings, branch-scoped
+/// serving state, retention roots, and derived-index catalog snapshots. Older
+/// stores may also contain mutable content-branch heads. None of these scalar
+/// cells are asserted-pin or branch authority, and pile copying means they
+/// cannot honestly be treated as semantically local.
 ///
 /// `PinStore` itself doesn't know about these distinctions — it just
 /// provides the primitive: enumerate ids, read the current head, CAS
