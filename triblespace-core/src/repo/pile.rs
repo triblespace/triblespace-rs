@@ -67,8 +67,8 @@ use crate::repo::branch_assertion::{
 };
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
-const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
-const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
+const MAGIC_MARKER_PIN: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
+const MAGIC_MARKER_PIN_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
 /// V3 record markers — the uniform 256-byte-header format (minted 2026-06-29 via
 /// `trible genid`). Every V3 record (blob, legacy pin cell, signed branch
 /// assertion, or weak marker) has a FIXED 256-byte header and is padded to a
@@ -83,8 +83,8 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C
 /// New writes are V3; the reader still accepts the original V1
 /// [`MAGIC_MARKER_BLOB`] record so existing piles read byte-identical.
 const MAGIC_MARKER_BLOB_V3: RawId = hex!("9C33EEB525065A62EAEC4BE43DCC355A");
-const MAGIC_MARKER_BRANCH_V3: RawId = hex!("AC363D04AFE1AF17B39581B1E23021D7");
-const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205671E4F");
+const MAGIC_MARKER_PIN_V3: RawId = hex!("AC363D04AFE1AF17B39581B1E23021D7");
+const MAGIC_MARKER_PIN_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205671E4F");
 /// Signed grow-only branch-assertion marker (minted 2026-08-01 via
 /// `trible genid`). The record is marker + canonical 160-byte assertion +
 /// zeroed padding, exactly one V3 unit. Nonzero padding is rejected so these
@@ -92,8 +92,8 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205
 const MAGIC_MARKER_BRANCH_ASSERTION_V3: RawId = hex!("DACC331F5C1C2036E6725C7B24EE2A51");
 /// Weak-pin marker pair (minted 2026-07-01 via `trible genid`). Retention is
 /// one strength axis resolved last-writer-wins by log position:
-/// `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin` — the historical branch record
-/// IS `pin`, and its tombstone IS `unpin`; these two are the soft siblings. A
+/// `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin`; the mutable-pin record IS
+/// `pin`, and its tombstone IS `unpin`; these two are the soft siblings. A
 /// weak pin is per-blob and anonymous (keyed by blob handle, no pin id): "I want this
 /// blob; fetch it if absent; evictable under pressure." It is simultaneously
 /// the demand/want-signal (a sync daemon's work queue), the cache-retention
@@ -245,20 +245,20 @@ impl IndexEntry {
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct BranchHeader {
+struct PinHeader {
     magic_marker: RawId,
-    branch_id: RawId,
+    pin_id: RawId,
     hash: RawInline,
 }
 
-// `BranchHeader` / `BranchTombstoneHeader` have no constructors — new writes are
+// `PinHeader` / `PinTombstoneHeader` have no constructors — new writes are
 // V3; these structs exist only so the reader can decode legacy V1 records.
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct BranchTombstoneHeader {
+struct PinTombstoneHeader {
     magic_marker: RawId,
-    branch_id: RawId,
+    pin_id: RawId,
     /// Reserved bytes to preserve 64 byte record alignment.
     reserved: RawInline,
 }
@@ -316,43 +316,41 @@ impl BlobHeaderV3 {
     }
 }
 
-/// V3 mutable-pin record — fixed 256 bytes. The struct keeps its historical
-/// `BranchHeader` name because it describes an existing on-disk format.
+/// V3 mutable-pin record — fixed 256 bytes.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct BranchHeaderV3 {
+struct PinHeaderV3 {
     magic_marker: RawId,
-    branch_id: RawId,
+    pin_id: RawId,
     hash: RawInline,
     reserved: [u8; 192],
 }
 
-impl BranchHeaderV3 {
+impl PinHeaderV3 {
     fn new(pin_id: Id, hash: Inline<Handle<SimpleArchive>>) -> Self {
         Self {
-            magic_marker: MAGIC_MARKER_BRANCH_V3,
-            branch_id: *pin_id,
+            magic_marker: MAGIC_MARKER_PIN_V3,
+            pin_id: *pin_id,
             hash: hash.raw,
             reserved: [0u8; 192],
         }
     }
 }
 
-/// V3 mutable-pin tombstone. The struct name reflects its historical on-disk
-/// marker rather than the current [`PinStore`](crate::repo::PinStore) vocabulary.
+/// V3 mutable-pin tombstone.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct BranchTombstoneHeaderV3 {
+struct PinTombstoneHeaderV3 {
     magic_marker: RawId,
-    branch_id: RawId,
+    pin_id: RawId,
     reserved: [u8; 224],
 }
 
-impl BranchTombstoneHeaderV3 {
+impl PinTombstoneHeaderV3 {
     fn new(pin_id: Id) -> Self {
         Self {
-            magic_marker: MAGIC_MARKER_BRANCH_TOMBSTONE_V3,
-            branch_id: *pin_id,
+            magic_marker: MAGIC_MARKER_PIN_TOMBSTONE_V3,
+            pin_id: *pin_id,
             reserved: [0u8; 224],
         }
     }
@@ -420,8 +418,8 @@ impl WeakUnpinHeaderV3 {
 // Compile-time guarantee that every V3 header is exactly 256 bytes.
 const _: () = {
     assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
-    assert!(std::mem::size_of::<BranchHeaderV3>() == V3_HEADER_LEN);
-    assert!(std::mem::size_of::<BranchTombstoneHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<PinHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<PinTombstoneHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<BranchAssertionHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakPinHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakUnpinHeaderV3>() == V3_HEADER_LEN);
@@ -570,25 +568,25 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<DecodedPileRecord, ReadE
                 },
             })
         }
-        MAGIC_MARKER_BRANCH => {
-            let (header, _) = BranchHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            let pin_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+        MAGIC_MARKER_PIN => {
+            let (header, _) = PinHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let pin_id = Id::new(header.pin_id).ok_or_else(corrupt)?;
             Ok(DecodedPileRecord {
                 offset,
-                len: std::mem::size_of::<BranchHeader>(),
+                len: std::mem::size_of::<PinHeader>(),
                 content: DecodedPileRecordContent::Pin {
                     pin_id,
                     head: Inline::<Hash<Blake3>>::new(header.hash).into(),
                 },
             })
         }
-        MAGIC_MARKER_BRANCH_TOMBSTONE => {
+        MAGIC_MARKER_PIN_TOMBSTONE => {
             let (header, _) =
-                BranchTombstoneHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            let pin_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+                PinTombstoneHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let pin_id = Id::new(header.pin_id).ok_or_else(corrupt)?;
             Ok(DecodedPileRecord {
                 offset,
-                len: std::mem::size_of::<BranchTombstoneHeader>(),
+                len: std::mem::size_of::<PinTombstoneHeader>(),
                 content: DecodedPileRecordContent::PinTombstone { pin_id },
             })
         }
@@ -617,9 +615,9 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<DecodedPileRecord, ReadE
                 },
             })
         }
-        MAGIC_MARKER_BRANCH_V3 => {
-            let (header, _) = BranchHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            let pin_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+        MAGIC_MARKER_PIN_V3 => {
+            let (header, _) = PinHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let pin_id = Id::new(header.pin_id).ok_or_else(corrupt)?;
             Ok(DecodedPileRecord {
                 offset,
                 len: V3_HEADER_LEN,
@@ -629,10 +627,10 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<DecodedPileRecord, ReadE
                 },
             })
         }
-        MAGIC_MARKER_BRANCH_TOMBSTONE_V3 => {
+        MAGIC_MARKER_PIN_TOMBSTONE_V3 => {
             let (header, _) =
-                BranchTombstoneHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            let pin_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+                PinTombstoneHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let pin_id = Id::new(header.pin_id).ok_or_else(corrupt)?;
             Ok(DecodedPileRecord {
                 offset,
                 len: V3_HEADER_LEN,
@@ -1891,11 +1889,11 @@ impl PinStore for Pile {
             self.dirty = true;
             let (expected, write_res) = match new {
                 Some(new) => {
-                    let header = BranchHeaderV3::new(id, new);
+                    let header = PinHeaderV3::new(id, new);
                     (V3_HEADER_LEN, self.file.write(header.as_bytes()))
                 }
                 None => {
-                    let header = BranchTombstoneHeaderV3::new(id);
+                    let header = PinTombstoneHeaderV3::new(id);
                     (V3_HEADER_LEN, self.file.write(header.as_bytes()))
                 }
             };
