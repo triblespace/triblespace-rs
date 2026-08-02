@@ -11,6 +11,9 @@ use crate::prelude::*;
 use crate::repo::branch_assertion::{
     AssertionKeyCollision, BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore,
 };
+use crate::repo::pin_assertion::{
+    PinAssertion, PinAssertionKeyCollision, PinAssertionSnapshot, PinAssertionStore,
+};
 use crate::repo::PinStore;
 use crate::repo::PushResult;
 use crate::repo::WeakPinStore;
@@ -30,6 +33,8 @@ pub struct MemoryRepo {
     pub pins: HashMap<Id, Inline<Handle<SimpleArchive>>>,
     /// Verified grow-only branch assertions.
     assertions: BranchAssertionSnapshot,
+    /// Generic grow-only asserted pins.
+    pin_assertions: PinAssertionSnapshot,
     /// LWW-resolved weak-pin set (see [`WeakPinStore`]). In memory the
     /// last-writer-wins resolution is just insert/remove. Weak pins here
     /// are exactly as ephemeral as the blobs themselves — the trait is a
@@ -46,6 +51,18 @@ impl BranchAssertionStore for MemoryRepo {
 
     fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
         self.assertions.insert(assertion)
+    }
+}
+
+impl PinAssertionStore for MemoryRepo {
+    type Error = PinAssertionKeyCollision;
+
+    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+        Ok(self.pin_assertions.clone())
+    }
+
+    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+        self.pin_assertions.insert(assertion)
     }
 }
 
@@ -178,6 +195,7 @@ impl crate::repo::StorageClose for MemoryRepo {
 mod tests {
     use super::*;
     use crate::blob::encodings::longstring::LongString;
+    use crate::repo::pin_assertion::{PinHandle, SubsumptionLabel, ValueHandle};
     use ed25519_dalek::SigningKey;
 
     fn handle(byte: u8) -> Inline<Handle<UnknownBlob>> {
@@ -209,6 +227,34 @@ mod tests {
         repo.append_assertion(second).unwrap();
         assert_eq!(first.len(), 1, "an earlier snapshot stays coherent");
         assert_eq!(repo.assertion_snapshot().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pin_assertion_store_is_grow_only_idempotent_and_snapshot_coherent() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let first = PinAssertion::sign(
+            &key,
+            PinHandle::from_raw([11; 32]),
+            ValueHandle::from_raw([19; 32]),
+            SubsumptionLabel::from_raw([1; 32]),
+        );
+        let mut repo = MemoryRepo::default();
+
+        repo.append_pin_assertion(first).unwrap();
+        repo.append_pin_assertion(first).unwrap();
+
+        let snapshot = repo.pin_assertion_snapshot().unwrap();
+        assert_eq!(snapshot.iter().copied().collect::<Vec<_>>(), vec![first]);
+
+        let second = PinAssertion::sign(
+            &key,
+            PinHandle::from_raw([11; 32]),
+            ValueHandle::from_raw([23; 32]),
+            SubsumptionLabel::from_raw([2; 32]),
+        );
+        repo.append_pin_assertion(second).unwrap();
+        assert_eq!(snapshot.len(), 1, "an earlier snapshot stays coherent");
+        assert_eq!(repo.pin_assertion_snapshot().unwrap().len(), 2);
     }
 
     /// Weak pins resolve last-writer-wins: pin → listed, unpin →

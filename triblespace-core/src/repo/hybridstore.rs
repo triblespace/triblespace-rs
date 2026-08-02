@@ -6,6 +6,7 @@ use crate::inline::InlineEncoding;
 use crate::repo::branch_assertion::{
     BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore,
 };
+use crate::repo::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
 use crate::repo::StorageClose;
@@ -56,7 +57,7 @@ where
 {
 }
 
-/// Store that delegates blobs and signed branch assertions to independent stores.
+/// Store that delegates blobs and signed assertions to independent stores.
 ///
 /// This allows mixing different storage implementations in one repository,
 /// e.g. an on-disk blob store with an in-memory assertion store.
@@ -64,7 +65,7 @@ where
 pub struct HybridStore<B, A> {
     /// Storage for commit, content and metadata blobs.
     pub blobs: B,
-    /// Storage for grow-only, signed branch assertions.
+    /// Storage for grow-only branch and generic pin assertions.
     pub assertions: A,
 }
 
@@ -118,6 +119,21 @@ where
     }
 }
 
+impl<B, A> PinAssertionStore for HybridStore<B, A>
+where
+    A: PinAssertionStore,
+{
+    type Error = A::Error;
+
+    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+        self.assertions.pin_assertion_snapshot()
+    }
+
+    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+        self.assertions.append_pin_assertion(assertion)
+    }
+}
+
 impl<B, A> StorageFlush for HybridStore<B, A>
 where
     B: StorageFlush,
@@ -125,8 +141,8 @@ where
     type Error = B::Error;
 
     fn flush(&mut self) -> Result<(), Self::Error> {
-        // BranchAssertionStore::append_assertion is already a durability
-        // boundary. Only pending blob writes need an explicit flush here.
+        // Both assertion-store append operations are already durability
+        // boundaries. Only pending blob writes need an explicit flush here.
         self.blobs.flush()
     }
 }
@@ -163,6 +179,7 @@ mod tests {
 
     use super::*;
     use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::pin_assertion::{PinHandle, SubsumptionLabel, ValueHandle};
 
     #[derive(Debug)]
     struct FlushProbe(Rc<Cell<usize>>);
@@ -213,6 +230,26 @@ mod tests {
 
         let snapshot = hybrid.assertion_snapshot().unwrap();
         assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot.iter().copied().collect::<Vec<_>>(),
+            vec![assertion]
+        );
+    }
+
+    #[test]
+    fn delegates_generic_pin_assertions_to_the_assertion_store() {
+        let assertion = PinAssertion::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            PinHandle::from_raw([11; 32]),
+            ValueHandle::from_raw([19; 32]),
+            SubsumptionLabel::from_raw([3; 32]),
+        );
+        let mut hybrid = HybridStore::new((), MemoryRepo::default());
+
+        hybrid.append_pin_assertion(assertion).unwrap();
+        hybrid.append_pin_assertion(assertion).unwrap();
+
+        let snapshot = hybrid.pin_assertion_snapshot().unwrap();
         assert_eq!(
             snapshot.iter().copied().collect::<Vec<_>>(),
             vec![assertion]

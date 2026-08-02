@@ -38,6 +38,7 @@ use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
     branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore},
     branch_frontier::{ParentLookup, PartialCommitDag},
+    pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore},
     BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
     BlobStorePut, CommitHandle, PinStore, PushResult, StorageFlush,
 };
@@ -140,9 +141,9 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
 ///
 /// Pins are transport/retention state local to one replica. They are not
 /// StrongPin branch authority and must never be exposed as a scalar branch
-/// head. Shared branch state lives exclusively in
-/// [`AsyncBranchAssertionStore`]; callers may use pins for local policy,
-/// retention, or durable fetch intent.
+/// head. Shared asserted state lives in [`AsyncBranchAssertionStore`] and
+/// [`AsyncPinAssertionStore`]; callers may use replica-local pins for local
+/// policy, retention, or durable fetch intent.
 pub trait AsyncPinStore {
     /// Error type for listing pins.
     type PinsError: Error + Debug + Send + Sync + 'static;
@@ -191,6 +192,27 @@ pub trait AsyncBranchAssertionStore {
     fn append_assertion(
         &mut self,
         assertion: BranchAssertion,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Async storage surface for the generic grow-only asserted-pin layer.
+///
+/// This is the remote-backend counterpart of [`PinAssertionStore`]. It has no
+/// scalar head, update, delete, or compare-and-swap operation: assertions are
+/// immutable replicated state and duplicate append is an idempotent success.
+pub trait AsyncPinAssertionStore {
+    /// Storage or validation error.
+    type Error: Error + Debug + Send + Sync + 'static;
+
+    /// Return one coherent snapshot of asserted-pin witnesses.
+    fn pin_assertion_snapshot(
+        &mut self,
+    ) -> impl Future<Output = Result<PinAssertionSnapshot, Self::Error>> + Send;
+
+    /// Durably append one verified assertion. Duplicate append is success.
+    fn append_pin_assertion(
+        &mut self,
+        assertion: PinAssertion,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -403,6 +425,26 @@ where
         assertion: BranchAssertion,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move { self.0.append_assertion(assertion) }
+    }
+}
+
+impl<S> AsyncPinAssertionStore for SyncAsAsync<S>
+where
+    S: PinAssertionStore + Send,
+{
+    type Error = S::Error;
+
+    fn pin_assertion_snapshot(
+        &mut self,
+    ) -> impl Future<Output = Result<PinAssertionSnapshot, Self::Error>> + Send {
+        async move { self.0.pin_assertion_snapshot() }
+    }
+
+    fn append_pin_assertion(
+        &mut self,
+        assertion: PinAssertion,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move { self.0.append_pin_assertion(assertion) }
     }
 }
 
@@ -651,6 +693,19 @@ impl<A: AsyncBranchAssertionStore> BranchAssertionStore for Blocking<A> {
 }
 
 #[cfg(feature = "object-store")]
+impl<A: AsyncPinAssertionStore> PinAssertionStore for Blocking<A> {
+    type Error = A::Error;
+
+    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+        self.rt.block_on(self.inner.pin_assertion_snapshot())
+    }
+
+    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+        self.rt.block_on(self.inner.append_pin_assertion(assertion))
+    }
+}
+
+#[cfg(feature = "object-store")]
 impl<S> PartialCommitDag for Blocking<SyncAsAsync<S>>
 where
     S: PartialCommitDag,
@@ -784,6 +839,29 @@ mod tests {
         assert!(head.is_none(), "unknown pin has no head");
     }
 
+    #[test]
+    fn generic_pin_assertions_roundtrip_through_async_facade() {
+        use crate::repo::memoryrepo::MemoryRepo;
+        use crate::repo::pin_assertion::{PinAssertion, PinHandle, SubsumptionLabel, ValueHandle};
+        use ed25519_dalek::SigningKey;
+
+        let assertion = PinAssertion::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            PinHandle::from_raw([11; 32]),
+            ValueHandle::from_raw([19; 32]),
+            SubsumptionLabel::from_raw([3; 32]),
+        );
+        let mut store = SyncAsAsync::new(MemoryRepo::default());
+
+        block_on(store.append_pin_assertion(assertion)).unwrap();
+        block_on(store.append_pin_assertion(assertion)).unwrap();
+        let snapshot = block_on(store.pin_assertion_snapshot()).unwrap();
+        assert_eq!(
+            snapshot.iter().copied().collect::<Vec<_>>(),
+            vec![assertion]
+        );
+    }
+
     // Blocking and SyncAsAsync are inverses: a sync store wrapped up
     // into async and back down through Blocking behaves as a plain sync
     // store. This is the round-trip that proves Blocking yields a full,
@@ -814,6 +892,9 @@ mod tests {
         use crate::blob::encodings::longstring::LongString;
         use crate::repo::branch_assertion::{BranchAssertion, BranchAssertionStore};
         use crate::repo::memoryrepo::MemoryRepo;
+        use crate::repo::pin_assertion::{
+            PinAssertion, PinAssertionStore, PinHandle, SubsumptionLabel, ValueHandle,
+        };
         use crate::repo::StorageFlush;
         use ed25519_dalek::SigningKey;
 
@@ -823,9 +904,17 @@ mod tests {
             Inline::<Handle<LongString>>::new([11; 32]),
             Inline::new([19; 32]),
         );
+        let pin_assertion = PinAssertion::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            PinHandle::from_raw([13; 32]),
+            ValueHandle::from_raw([29; 32]),
+            SubsumptionLabel::from_raw([5; 32]),
+        );
 
         store.append_assertion(assertion).unwrap();
         store.append_assertion(assertion).unwrap();
+        store.append_pin_assertion(pin_assertion).unwrap();
+        store.append_pin_assertion(pin_assertion).unwrap();
         store.flush().unwrap();
 
         let snapshot = store.assertion_snapshot().unwrap();
@@ -833,6 +922,11 @@ mod tests {
         assert_eq!(
             snapshot.iter().copied().collect::<Vec<_>>(),
             vec![assertion]
+        );
+        let snapshot = store.pin_assertion_snapshot().unwrap();
+        assert_eq!(
+            snapshot.iter().copied().collect::<Vec<_>>(),
+            vec![pin_assertion]
         );
     }
 

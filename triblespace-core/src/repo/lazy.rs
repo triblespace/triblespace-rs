@@ -99,6 +99,7 @@ use super::async_store::{
 };
 use super::branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore};
 use super::branch_frontier::{ParentLookup, PartialCommitDag};
+use super::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
 use super::{
     BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult, StorageFlush,
     WeakPinStore,
@@ -535,6 +536,37 @@ where
     }
 }
 
+/// Generic asserted pins are authority state too, so `Lazy` forwards their
+/// coherent snapshots and durable appends through the same store mutex without
+/// involving blob-want wakeups.
+impl<S> PinAssertionStore for Lazy<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + PinStore
+        + WeakPinStore
+        + StorageFlush
+        + PinAssertionStore
+        + Send
+        + 'static,
+{
+    type Error = <S as PinAssertionStore>::Error;
+
+    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+        self.store
+            .lock()
+            .expect("store mutex")
+            .pin_assertion_snapshot()
+    }
+
+    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+        self.store
+            .lock()
+            .expect("store mutex")
+            .append_pin_assertion(assertion)
+    }
+}
+
 // ── Async surface ────────────────────────────────────────────────────
 
 /// Async put: semantically identical to the sync [`BlobStorePut`] (a
@@ -883,6 +915,7 @@ mod tests {
     use crate::repo::commit::{CommitMetadataError, StoredCommitError};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
+    use crate::repo::pin_assertion::{PinHandle, SubsumptionLabel, ValueHandle};
     use ed25519_dalek::SigningKey;
     use futures::executor::block_on;
     use futures::task::{waker, ArcWake};
@@ -918,6 +951,33 @@ mod tests {
         lazy.append_assertion(second).unwrap();
         assert_eq!(snapshot.len(), 1, "an earlier snapshot stays coherent");
         assert_eq!(lazy.assertion_snapshot().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pin_assertion_store_forwards_idempotent_append_and_coherent_snapshot() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let first = PinAssertion::sign(
+            &key,
+            PinHandle::from_raw([11; 32]),
+            ValueHandle::from_raw([19; 32]),
+            SubsumptionLabel::from_raw([1; 32]),
+        );
+        let second = PinAssertion::sign(
+            &key,
+            PinHandle::from_raw([11; 32]),
+            ValueHandle::from_raw([23; 32]),
+            SubsumptionLabel::from_raw([2; 32]),
+        );
+        let mut lazy = Lazy::new(MemoryRepo::default());
+
+        lazy.append_pin_assertion(first).unwrap();
+        lazy.append_pin_assertion(first).unwrap();
+        let snapshot = lazy.pin_assertion_snapshot().unwrap();
+        assert_eq!(snapshot.iter().copied().collect::<Vec<_>>(), vec![first]);
+
+        lazy.append_pin_assertion(second).unwrap();
+        assert_eq!(snapshot.len(), 1, "an earlier snapshot stays coherent");
+        assert_eq!(lazy.pin_assertion_snapshot().unwrap().len(), 2);
     }
 
     /// A local hit serves from the snapshot: no want is recorded.

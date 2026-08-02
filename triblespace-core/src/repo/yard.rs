@@ -28,8 +28,10 @@ use crate::prelude::blobencodings::SimpleArchive;
 
 use super::branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore};
 use super::pile::{
-    GetBlobError, InsertError, Pile, PileAssertionError, PileReader, PileWriteError, ReadError,
+    GetBlobError, InsertError, Pile, PileAssertionError, PilePinAssertionError, PileReader,
+    PileWriteError, ReadError,
 };
+use super::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
 use super::{
     reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
     PinStore, PushResult, StorageClose, TransferError, WeakPinStore,
@@ -400,6 +402,18 @@ impl Yard {
         Ok(assertions)
     }
 
+    /// Union generic asserted-pin snapshots from every segment. Like branch
+    /// assertions, this state is a grow-only set with no generation order.
+    fn collect_pin_assertions(&mut self) -> Result<PinAssertionSnapshot, PilePinAssertionError> {
+        let mut assertions = PinAssertionSnapshot::new();
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                assertions.union(segment.pile_mut().pin_assertion_snapshot()?)?;
+            }
+        }
+        Ok(assertions)
+    }
+
     /// Re-append the authoritative mutable state to the young generation
     /// after a pile rewrite. [`reclaim_generation`] transfers blobs and
     /// assertions, not mutable pin records, so both surviving strong heads
@@ -709,6 +723,26 @@ impl BranchAssertionStore for Yard {
             .active_mut()
             .pile_mut()
             .append_assertion(assertion)
+    }
+}
+
+impl PinAssertionStore for Yard {
+    type Error = PilePinAssertionError;
+
+    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+        self.collect_pin_assertions()
+    }
+
+    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+        // Avoid copying an assertion into young when any generation already
+        // carries the exact witness. A collision is surfaced before append.
+        if self.collect_pin_assertions()?.contains(&assertion)? {
+            return Ok(());
+        }
+        self.generations[0]
+            .active_mut()
+            .pile_mut()
+            .append_pin_assertion(assertion)
     }
 }
 
@@ -1207,6 +1241,9 @@ fn reclaim_generation(
     let assertions = old_pile
         .assertion_snapshot()
         .map_err(YardReclaimError::Assertions)?;
+    let pin_assertions = old_pile
+        .pin_assertion_snapshot()
+        .map_err(YardReclaimError::PinAssertions)?;
     let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
@@ -1224,6 +1261,11 @@ fn reclaim_generation(
         new_pile
             .append_assertion(assertion)
             .map_err(YardReclaimError::Assertions)?;
+    }
+    for assertion in pin_assertions.iter().copied() {
+        new_pile
+            .append_pin_assertion(assertion)
+            .map_err(YardReclaimError::PinAssertions)?;
     }
 
     new_pile.close().map_err(YardReclaimError::Close)?;
@@ -1366,6 +1408,7 @@ pub enum YardReclaimError {
     Io(std::io::Error),
     Pile(ReadError),
     Assertions(PileAssertionError),
+    PinAssertions(PilePinAssertionError),
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     Close(super::pile::FlushError),
     PinState(std::io::Error),
@@ -1388,6 +1431,9 @@ impl fmt::Display for YardReclaimError {
             Self::Io(err) => write!(f, "failed to replace yard generation pile: {err}"),
             Self::Pile(err) => write!(f, "failed to read yard generation pile: {err}"),
             Self::Assertions(err) => write!(f, "failed to preserve yard assertions: {err}"),
+            Self::PinAssertions(err) => {
+                write!(f, "failed to preserve generic yard pin assertions: {err}")
+            }
             Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::PinState(err) => {
@@ -1408,6 +1454,8 @@ impl Error for YardReclaimError {}
 mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
+    use crate::repo::pin_assertion::{PinHandle, SubsumptionLabel, ValueHandle};
+    use ed25519_dalek::SigningKey;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     fn yard_with_paths(
@@ -1433,6 +1481,15 @@ mod tests {
 
     fn pin_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    fn pin_assertion(value: u8) -> PinAssertion {
+        PinAssertion::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            PinHandle::from_raw([11; 32]),
+            ValueHandle::from_raw([value; 32]),
+            SubsumptionLabel::from_raw([value; 32]),
+        )
     }
 
     fn get_raw(
@@ -1462,6 +1519,38 @@ mod tests {
         let reader = yard.reader().unwrap();
 
         assert_eq!(get_raw(&reader, old).unwrap(), raw_blob(b"old generation"));
+    }
+
+    #[test]
+    fn pin_assertions_union_across_generations_and_survive_reclaim() {
+        let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
+        let young = pin_assertion(19);
+        let old = pin_assertion(23);
+
+        yard.append_pin_assertion(young).unwrap();
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .append_pin_assertion(old)
+            .unwrap();
+
+        let young_len = std::fs::metadata(&paths[0]).unwrap().len();
+        yard.append_pin_assertion(old).unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths[0]).unwrap().len(),
+            young_len,
+            "an assertion already present in old must not be copied into young"
+        );
+
+        let before = yard.pin_assertion_snapshot().unwrap();
+        assert_eq!(before.len(), 2);
+        yard.reclaim().unwrap();
+        assert_eq!(yard.pin_assertion_snapshot().unwrap(), before);
+        yard.close().unwrap();
+
+        let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
+        assert_eq!(reopened.pin_assertion_snapshot().unwrap(), before);
+        reopened.close().unwrap();
     }
 
     #[test]
