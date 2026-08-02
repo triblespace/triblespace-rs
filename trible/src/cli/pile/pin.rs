@@ -66,8 +66,9 @@ pub fn run(cmd: Command) -> Result<()> {
 enum Role {
     /// A pin carrying `metadata::name` — a legacy mutable branch head.
     Branch(String),
-    /// A pin carrying `local_only_pin` — renewal policy, pending
-    /// requests, per-team-cap holding, etc.
+    /// A pin carrying `local_only_pin` — outbound request activation,
+    /// per-team credential holding, etc. Issuer grant policy uses asserted
+    /// pins instead of this scalar namespace.
     LocalOnly,
     /// Pin head exists but matches none of the known role markers.
     /// Either an exotic use or a stale anonymous pin from older

@@ -331,15 +331,15 @@ fn run_sync(
             break;
         }
 
-        // Renewal-daemon tick: scan the renewal-policy branch for
-        // entries whose current cap is within the renewal window of
-        // expiry, sign a successor, and dispatch via OP_DELIVER_CAP.
-        // Quiet by default (returns 0 when nothing is due) so the
-        // overhead is dominated by the policy-branch read.
+        // Renewal-daemon tick: from a fresh Complete issuer ledger, issue
+        // successors for enabled historical Current grants inside the renewal
+        // window, then fresh-resolve selected usable winners for remote
+        // redispatch or local founder materialization. Quiet by default
+        // (returns 0 when nothing is due).
         //
         // The window is intentionally large relative to the tick
         // cadence (1 hour vs 100 ms) so missed ticks don't break
-        // chains — entries become due well before the cap actually
+        // chains — grants become due well before the cap actually
         // expires, giving the daemon multiple chances to land the
         // successor.
         let _renewed = peer.renewal_tick(hifitime::Duration::from_seconds(3600.0));

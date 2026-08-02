@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as positive facts. Reduction fails closed on missing or invalid closure,
   verifies capability proofs and request provenance by exact content handle,
   exposes rejection alongside already-issued effects, detects conflicting
-  scope facts, and selects coherent sibling credentials by effective chain
+  scope facts, and selects a coherent issuance candidate by effective chain
   expiry with a signature-handle tie break. Policy mutations now prospectively
   reduce the complete author ledger before writing anything, flush the exact
   content closure before durably appending its assertion, and return an
@@ -41,16 +41,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operate only on a complete resolution, preserve observed/rejected/all-issued
   facts as independent sets, and write `GrantIssued` or `RequestRejected`
   assertions without the deleted incoming-request pin, scalar status, or a
-  renewal-policy dual write.
+  parallel mutable renewal record. Direct pre-authorization and founder
+  bootstrap also publish `GrantIssued`; the invitation's signature handle is
+  diagnostic rather than a cold-start bearer credential, so first delivery
+  still requires independent recipient request intent. `list-issued
+  [--author PUBKEY_HEX]` uses the same exact
+  author selection and Complete-only rule, displays the full grant state, and
+  prints one full canonical `GrantDisabled` selector per grant; `retract
+  --grant-event` requires the existing author key and idempotently publishes
+  that terminal positive fact without deleting issuance history.
+  `team create` is the sole local materialization-before-assertion exception:
+  it first flushes the new founder credential retention pin, then publishes the
+  grant and fresh-resolves a Complete view before returning the root secret.
   Successful subject authentication is likewise recorded as an exact
   `CredentialAuthenticated` effect after a fresh complete-ledger resolution;
   missing or invalid policy fails closed, while an unrelated signature is a
   no-op rather than invented evidence. Credential redispatch now consumes that
   same resolved truth: only an unauthenticated `usable_at(now)` grant for the
   daemon's configured team may drive a send. Disabled, conflicted, expired,
-  local-subject, and foreign-team grants are inert; a successor signature resets the bounded
-  per-grant cooldown. Every selected blob is materialized before the first send,
-  and any read, flush, or serving-snapshot failure defers the whole pass.
+  local-subject, and foreign-team grants are inert; a successor signature resets
+  the bounded per-grant cooldown. Renewal first resolves the local author's
+  entire ledger as Complete, then considers exactly the retained founder pin's
+  self grant and enabled historical `Current` grants for remote subjects in the
+  configured team, including expired currents whose effective expiry is due.
+  Foreign-team and unrelated local-subject grants are inert only after that
+  author-wide resolution. Ordinary successors are asserted before one
+  post-production redispatch fresh-resolves the winner. Founder self-rotation
+  asserts a direct-anchor sibling before fresh resolution, then separately
+  materializes whichever usable winner was selected onto the durable team pin,
+  coherent serving snapshot, and outbound host state without self-delivery.
+  Every selected blob is materialized before the first remote send, and any
+  read, flush, or serving-snapshot failure defers the pass. Founder
+  materialization is level-triggered: a durable selected winner that differs
+  from the process-local host observation is retried on a later fresh tick,
+  without another persisted workflow marker.
   Operation-order tests pin that one-way crash protocol; real-Pile reopen
   coverage verifies the resulting ledger and both retention descriptors replay
   as complete content.
@@ -129,11 +153,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Join-request ACKs now certify durable admission.** The auth-handshake host
-  waits for the synchronous Peer to record and flush an incoming
-  `OP_REQUEST_CAP` before returning `STATUS_OK`. Queue admission alone no longer
-  acknowledges the request; policy refusal, persistence failure, and Peer
-  shutdown return rejection, while an ambiguous timeout remains safely
-  recoverable through exact idempotent replay.
+  waits for the synchronous Peer to flush an incoming request's exact closure
+  and durably append its `RequestObserved` assertion before returning
+  `STATUS_OK`. Queue admission alone no longer acknowledges the request. Policy
+  refusal and failure before policy-loop admission return rejection; a
+  persistence failure after admission or an ambiguous timeout returns
+  `STATUS_INDETERMINATE` and remains recoverable through exact idempotent replay.
 
 - **Derived-index catalogs are immutable cache values, not scalar publication
   state.** `IndexHome`, `IndexSnapshot`, their branch-wrapper metadata, and the
@@ -200,8 +225,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connections, and streams are bounded; one subject gets one live inbound
   connection, including while admitted stream tails drain; idle authority has
   its own monotonic expiry deadline; complete operation frames are checked at
-  the use boundary; snapshot rebuild failure clears the serving view; and ACK
-  means queue admission rather than durable policy acceptance. `team
+  the use boundary; and snapshot rebuild failure clears the serving view.
+  Request ACK means durable asserted admission, while delivery ACK means bounded
+  queue admission rather than durable credential activation. `team
   request-join` now requires `--pile` so outbound join intent is durable;
   initial delivery must match it and crosses a recoverable
   pending-to-activating journal before the credential pin changes. Interrupted
@@ -222,12 +248,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape, delegation, scope, interval, and depth check while omitting only the
   wall-clock liveness requirement; malformed or unauthorized pinned state still
   fails startup loudly.
-  Founder renewal first reconciles the verified active `(subject, scope)` with
-  its unique non-retracted self-policy entry, repairing a crash on either side
-  of the credential/policy boundary without selecting a narrower local entry.
-  It schedules from the verified chain-effective deadline and uses the local
-  delivery marker as a durable proof-snapshot/outbound-auth publication
-  journal.
+  Founder renewal retains an enabled expired historical `Current` as its recovery seed,
+  verifies the anchor, and asserts a direct-anchor sibling before taking a fresh
+  Complete resolution. Rotation is the asserted policy transition;
+  materialization is the separate act of moving the selected usable winner onto
+  the durable team-cap pin, coherent serving snapshot, and outbound host state.
+  Startup never reconstructs missing policy from a founder pin: that pin is
+  usable only when a fresh Complete ledger selects its exact cap and signature.
 - **The command-line branch model is now exact and asserted-pin native.**
   `trible pile branch` accepts only full `(Ed25519 author, Blake3 name-handle)`
   descriptors and exposes deterministic `list`, `show`, and candidate-rooted

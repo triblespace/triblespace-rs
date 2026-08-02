@@ -2,8 +2,9 @@
 //!
 //! Issues, lists, retracts, and renews capabilities for a triblespace
 //! team. Capabilities are signed delegations chained from a single
-//! team root keypair; possessing a leaf capability handle authorises
-//! a peer to connect to the team's mesh under the cap's scope.
+//! team root keypair; a locally materialized and verified leaf chain
+//! authorises a peer to connect to the team's mesh under the cap's scope.
+//! A content handle alone is only a locator, never a bearer credential.
 //! Grant disablement is an issuer-authored policy fact: it stops local
 //! redispatch and renewal, while the already-issued chain remains valid until
 //! its natural expiry. There is no team-root broadcast revocation primitive
@@ -14,23 +15,23 @@
 //! The local pile stores the issued cap blobs so they're retrievable
 //! for verification when peers connect.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::Blob;
 use triblespace_core::id::Id;
-use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::repo::BlobStore;
-use triblespace_core::repo::BlobStoreGet;
-use triblespace_core::repo::BlobStorePut;
+use triblespace_core::inline::Inline;
 use triblespace_core::repo::capability;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::pin_assertion::PinAssertionStore;
+use triblespace_core::repo::BlobStore;
+use triblespace_core::repo::BlobStoreGet;
+use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
 
 type PileBlake3 = Pile;
@@ -51,8 +52,9 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Issue a capability for a teammate, delegating from the running
-    /// node's own cap.
+    /// Pre-authorize a capability for a teammate, delegating from the running
+    /// node's own cap. A cold invitee must still independently record local
+    /// request intent before first delivery can select its active credential.
     Invite {
         /// Path to the local pile file.
         #[arg(long)]
@@ -789,9 +791,9 @@ fn run_invite(
 
         // The builder is deliberately structural: it does not decide whether
         // the requested scope is a valid attenuation of the parent. Verify the
-        // completed child before either its blobs or a renewal entry become
-        // durable, so an over-broad invitation fails at issuance rather than
-        // becoming an endlessly redispatched invalid policy entry.
+        // completed child before its proof closure and GrantIssued assertion
+        // become durable, so an over-broad invitation fails at issuance rather
+        // than becoming an invalid asserted grant.
         let verification_reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
         let _verified_child = capability::verify_chain(
             team_root,
@@ -840,11 +842,18 @@ fn run_invite(
     println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
     println!("GrantIssued event: {}", hex::encode(grant_event.raw));
-    println!("the running sync daemon will redispatch and renew this asserted grant");
+    println!("pre-approval recorded; the running daemon will renew the asserted grant");
     println!();
-    println!("Share with the invitee:");
+    println!("The signature handle above is diagnostic, not a bootstrap token.");
+    println!("Share the team root and issuer identity with the invitee:");
     println!("  TRIBLE_TEAM_ROOT={}", hex::encode(team_root.to_bytes()));
-    println!("  TRIBLE_TEAM_CAP={}", hex::encode(sig_handle.raw));
+    println!(
+        "  issuer/admin={}",
+        hex::encode(issuer_key.verifying_key().to_bytes())
+    );
+    println!("The invitee must independently record the scope they want with");
+    println!("`team request-join`, then run `pile net sync` without");
+    println!("TRIBLE_TEAM_CAP until the accepted delivery materializes locally.");
 
     Ok(())
 }
@@ -2159,11 +2168,9 @@ mod tests {
             };
             assert_eq!(current.cap(), cap_handle);
             assert_eq!(current.sig(), sig_handle);
-            assert!(
-                state
-                    .usable_at(triblespace_net::clock::epoch_now())
-                    .is_none()
-            );
+            assert!(state
+                .usable_at(triblespace_net::clock::epoch_now())
+                .is_none());
             Ok(())
         })
         .unwrap();

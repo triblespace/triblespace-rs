@@ -16,8 +16,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   handle, and `team reject` applies the same exact selector. Both mutation
   commands refuse to generate a missing author key, require a complete ledger,
   and append only the corresponding provenance-bearing positive event; the
-  legacy incoming-request pin/status and approval renewal-policy dual write are
+  legacy incoming-request pin/status and parallel mutable renewal record are
   removed with no compatibility alias.
+- **The capability CLI now closes the asserted grant lifecycle.** `team
+  invite`, `team approve`, and founder bootstrap publish `GrantIssued` instead
+  of mutable renewal entries. Direct invite is explicitly issuer-side
+  pre-authorization: its printed signature handle is diagnostic and is no
+  longer presented as a cold-start bearer credential; first delivery still
+  requires independently recorded recipient intent. `team create` is the sole local
+  materialization-before-assertion exception: it flushes the new founder
+  credential retention pin, publishes the grant, then requires a fresh
+  Complete view to select that exact usable credential before revealing the
+  root secret. `team list-issued [--author PUBKEY_HEX]` uses the same exact
+  author selection and Complete-only rule as `list-pending`, displays the full
+  grant state, and prints a full canonical `GrantDisabled` selector. `team
+  retract --grant-event EVENT_HEX [--key PATH]` replaces the local entry id,
+  requires an existing author key, and idempotently publishes that terminal
+  positive fact without deleting issuance history.
 - **The dead remote mutable-pin CLI is removed.** `trible store pin list` is
   deleted together with the object-store CAS namespace it inspected; `store`
   now contains only content-addressed blob operations.

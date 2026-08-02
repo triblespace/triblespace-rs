@@ -82,6 +82,25 @@ Verification is deliberately stricter than checking a sequence of signatures:
   chain. The anchor contributes no artificial year-9999 deadline, and the
   effective deadline is rechecked during live use.
 
+### Asserted issuer policy
+
+Each signing identity has one strong, author-scoped asserted policy ledger.
+`RequestObserved` and `RequestRejected` describe exact requests;
+`GrantIssued` names one exact signed credential for a stable
+`(team root, subject, scope root)` grant; `CredentialAuthenticated` records
+that the subject proved one exact issued signature; and terminal
+`GrantDisabled` stops that grant from driving future work. These are positive,
+unionable facts. Disabling a grant does not erase its credential or invalidate
+an already-issued chain; it makes the grant unusable for redispatch and
+renewal, so authority ends at the chain's natural expiry.
+
+Policy is operational only through a fresh `PolicyLedgerResolution::Complete`
+for one exact author. Missing closure or an invalid event fails closed, and no
+command or daemon pass acts on a partial view. A complete grant view preserves
+historical issuance separately from current usability: a coherent expired
+credential on an enabled grant remains the historical `Current` renewal seed,
+while `usable_at(now)` additionally requires that the grant be enabled and live.
+
 ## Team Lifecycle (CLI)
 
 The `trible team` subcommands cover the full lifecycle. Commands which mutate
@@ -96,22 +115,28 @@ trible team create --pile PATH [--key KEY_PATH]
     founder credential pin. Prints the team root pubkey (publish this
     to peers), root SECRET (archive offline), anchor sig handle
     (rotation/recovery authority), and finite cap-sig handle (the only
-    one presented to OP_AUTH).
+    one presented to OP_AUTH), plus the founder GrantIssued event.
 
-trible team invite --pile PATH --team-root HEX --cap HEX --key ISSUER
-                   --invitee HEX --scope (read|write|admin)
+trible team invite --pile PATH --team-root HEX --cap HEX --invitee HEX
+                   [--key PATH] [--scope (read|write|admin)]
                    [--legacy-pin HEX]...
-    Issue a sub-capability to another peer. --cap must name the
+    Pre-authorize a sub-capability for another peer. --cap must name the
     issuer's finite operational sig, never the founder anchor.
-    ISSUER must hold a cap that subsumes the requested scope. The
-    invitee's pubkey appears on its own (use
+    The issuer must hold a cap that subsumes the requested scope, and its
+    signing key must already exist at the explicit or default path. Scope
+    defaults to read. The command publishes GrantIssued;
+    the running daemon later renews that asserted grant. This is issuer-side
+    pre-approval, not a bearer credential or cold bootstrap: the printed
+    signature handle is diagnostic, and first delivery still requires the
+    invitee's independently recorded local request intent. The invitee's
+    pubkey appears on its own (use
     `trible pile net identity` on the invitee's machine to print it).
     `--legacy-pin` restricts only the current blob
-    RPC's mutable-pin roots; it cannot name an asserted branch pin. Prints the
-    invitee's cap-sig handle.
+    RPC's mutable-pin roots; it cannot name an asserted branch pin. The
+    invitee's cap-sig handle is printed for audit only.
 
 trible team request-join --pile PATH --admin HEX
-                         --scope (read|write|admin) [--key PATH]
+                         [--scope (read|write|admin)] [--key PATH]
     Send an OP_REQUEST_CAP to an admin's running daemon asking to
     be issued a capability. The exact partial request is stored in the
     requester's pile before network I/O, so a first delivery must match
@@ -134,12 +159,13 @@ trible team reject --pile PATH --request-event EVENT_HEX [--key PATH]
     rejection alongside an existing issuance is reported as an
     independent fact and does not revoke the credential.
 
-trible team retract --pile PATH --entry HEX
-    Stop auto-renewing one (subject, scope) entry. The peer's
-    chain dies at its next natural expiry. Pure local decision —
-    no broadcast, no transitive cascade. This is the eviction
-    primitive: there is no team-root-signed revocation blob in
-    the descriptive-caps model.
+trible team retract --pile PATH --grant-event EVENT_HEX [--key PATH]
+    Publish GrantDisabled for the exact grant selector printed by
+    list-issued. The selector is the full 32-byte canonical
+    GrantDisabled event handle, not a truncated id. The author's key
+    must already exist and its ledger must resolve Complete. Exact
+    replay is idempotent. The issued chain remains historical and dies
+    at its natural expiry; there is no broadcast or transitive cascade.
 
 trible team list --pile PATH
     Audit summary: per-cap detail line (issuer → subject, scope,
@@ -149,12 +175,18 @@ trible team list-pending --pile PATH [--author PUBKEY_HEX]
     Show observed, rejected, pending, and every issued-signature fact
     for each exact request. Without --author, one policy author is
     detected from valid assertions without reading or creating a key;
-    multiple candidates must be selected explicitly.
+    multiple candidates must be selected explicitly. Only a Complete
+    view is displayed.
 
-trible team list-issued --pile PATH
-    Renewal-policy entries this node is keeping renewed.
+trible team list-issued --pile PATH [--author PUBKEY_HEX]
+    Show every exact grant in one author's Complete policy view,
+    including its full GrantDisabled selector, team, subject, scope,
+    disabled state, historical issuance, selected cap/sig and effective
+    expiry, authentication, and current usability. Author selection is
+    identical to list-pending.
 
 trible team show --pile PATH --cap HEX [--verify TEAM_ROOT_HEX]
+                 [--expected-subject HEX]
     Walk one chain end-to-end. Prints each level with subject,
     issuer, scope, kind, expiry (absent on the founder anchor), cap blob
     handle, proof position (leaf blob or embedded parent), and
@@ -175,6 +207,15 @@ trible team show --pile PATH --cap HEX [--verify TEAM_ROOT_HEX]
     `cap_subject`) for subject-substitution-attack detection.
 ```
 
+`team create` is the sole local bootstrap exception to the normal
+assertion-before-materialization order. Creation first stores and flushes the
+founder anchor, operational pair, and team-credential retention pin. It then
+publishes `GrantIssued`, re-resolves a fresh Complete view, and requires that
+exact live credential to win before returning the root secret. A crash between
+those steps leaves retained bootstrap material, but startup treats a founder
+pin as inert for outbound auth unless the fresh complete ledger selects that
+exact usable cap and signature.
+
 A typical bootstrap flow:
 
 ```bash
@@ -185,28 +226,42 @@ team root SECRET: <archive offline>
 founder anchor sig: a1c4a5f33b4d...
 founder cap (sig):  4e6e02d51c3676ece1eea9094f8e9d76...
 
-# Invitee, on machine B:
-$ trible pile net identity --key invitee.key
-node: e825b3a8d387b4dae1720b0edcbfaa9e...
+# Founder identity, on machine A:
+$ trible pile net identity --key founder.key
+node: 72e48118d18a22b16b5f8a83eaf5bd3a...
 
-# Founder, on machine A:
-$ trible team invite --pile team.pile \
-    --team-root 1a8a6a9d... \
-    --cap       4e6e02d5... \
-    --key       founder.key \
-    --invitee   e825b3a8... \
-    --scope     read
-issued cap (sig): 7afe59e7f895b23f05452ff7919e12e4...
-```
-
-The invitee then runs the relay (or any pile-net peer) with
-`TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` set:
-
-```bash
+# Keep the founder daemon running while requests and approvals arrive:
 $ TRIBLE_TEAM_ROOT=1a8a6a9d... \
-  TRIBLE_TEAM_CAP=7afe59e7... \
-  trible pile net sync /path/to/their.pile --peers <founder-id>
+  TRIBLE_TEAM_CAP=4e6e02d5... \
+  trible pile net sync team.pile --key founder.key
+
+# Invitee, on machine B, independently asks for the authority they want:
+$ trible team request-join --pile invitee.pile \
+    --admin 72e48118... --scope read --key invitee.key
+
+# Founder, on machine A, selects the exact observed request and approves it:
+$ trible team list-pending --pile team.pile --author 72e48118...
+request event: c47c00be...
+$ trible team approve --pile team.pile \
+    --request-event c47c00be... \
+    --team-root 1a8a6a9d... \
+    --cap 4e6e02d5... \
+    --key founder.key
+
+# Invitee runs recovery/server-only until the accepted delivery arrives.
+# Deliberately omit TRIBLE_TEAM_CAP: a bare handle is not a credential.
+$ TRIBLE_TEAM_ROOT=1a8a6a9d... \
+  trible pile net sync invitee.pile --peers 72e48118... --key invitee.key
 ```
+
+The request command records the invitee's exact partial capability before any
+network I/O. Delivery is therefore selected against intent that originated on
+the invitee's side, not against values copied from an issuer's offer. The
+issuer retries an approved, unauthenticated grant; once the complete proof
+closure arrives, the invitee durably materializes it on the team-credential pin
+and the running host can begin authenticated work. `team invite` may record an
+issuer's pre-approval for a known subject, but its printed handle never replaces
+this recipient-local selection boundary.
 
 Capability verification can complete a chain that the receiving peer does not
 already hold without exposing the ordinary authenticated blob API. The typed
@@ -232,10 +287,15 @@ credential pin.
 
 ### Durable credential authority and recovery startup
 
-The per-team `KIND_TEAM_CAP` pin is the authority for a peer's outbound
-identity. It atomically names the current finite `(cap, sig)` pair and, for the
-founder only, retains the founder-anchor sig as rotation authority. The anchor
-is never returned as the current auth cap. A configured cap handle can seed an
+The per-team `KIND_TEAM_CAP` pin materializes a peer's outbound identity. It
+atomically names the current finite `(cap, sig)` pair and, for the founder only,
+retains the founder-anchor sig as rotation authority. The anchor is never
+returned as the current auth cap. Ordinary received credentials are selected
+through the local delivery rules below. A founder pin is additionally gated by
+the issuer ledger: startup activates it for outbound auth only when a fresh
+Complete view selects that exact usable pair, and never manufactures
+`GrantIssued` from retained material. An exact expired historical pair may
+remain as recovery-only rotation material. A configured cap handle can seed an
 empty pile only after full local verification and durable promotion; once the
 pin exists, stale process configuration cannot override it.
 
@@ -309,8 +369,8 @@ stream is one-shot:
 
 Request, delivery, and delivery-confirmation event queues are separately
 bounded. For `OP_REQUEST_CAP`, `STATUS_OK` is sent only after the exact request
-closure and its `RequestObserved` assertion have crossed the receiver's storage
-flush boundary. `STATUS_REJECTED`
+closure is flushed and its `RequestObserved` assertion is durably appended.
+`STATUS_REJECTED`
 means the request definitely did not enter durable policy, either because of a
 stable policy refusal or a failure before policy-loop admission. A persistence
 error after admission instead yields `STATUS_INDETERMINATE`: append APIs cannot
@@ -395,12 +455,12 @@ scope schema plus separate foreign-author and pin-kind admission policies.
 
 There is no team-root-signed revocation blob. The descriptive-caps
 model evicts peers via **per-issuer non-renewal**: every operational cap carries
-a short natural expiry (default 30 days), the issuer's running
-daemon refreshes the cap before that expiry as long as a
-**renewal-policy entry** says it should, and `team retract` deletes
-the entry. The peer's chain dies at the next natural expiry. The
-decision is local to the issuer — nothing propagates, nothing
-cascades, nothing has to be signed by the team root.
+a finite natural expiry, the issuer's running daemon refreshes it while the
+author's asserted grant remains enabled, and
+`team retract --grant-event ...` publishes the terminal `GrantDisabled` fact.
+The peer's already-issued chain dies at its next natural expiry. The decision
+is local to the issuer — nothing propagates, nothing cascades, and nothing has
+to be signed by the team root.
 
 This trades the "instant network-wide revocation" property for
 several real wins:
@@ -424,31 +484,50 @@ several real wins:
   is local issuer policy.
 
 The trade-off: there's no way to immediately invalidate a
-compromised key network-wide. The mitigation is to keep natural
-expiries short (the 30-day default is a starting point, not a
-hard rule) and to ensure issuers stop renewing the moment they
-notice. For acutely sensitive teams the natural-expiry window can
-be tightened to hours.
+compromised key network-wide. The mitigation is to keep natural expiries short
+and to ensure issuers stop renewing the moment they notice. CLI-created initial
+credentials and requests use a 30-day ceiling (further bounded by parent
+authority), but that is not the daemon's renewal lifetime: each successor
+targets `now + 2 * renewal_window`, again bounded by its live parent. The stock
+`pile net sync` passes a one-hour window, so its successors target roughly two
+hours. Library callers can choose a different window; the current CLI exposes
+no lifetime knob.
 
-Renewal happens via the same `OP_DELIVER_CAP` path that `team
-approve` uses: the issuer's daemon signs a fresh finite sibling with a
-later effective expiry, dispatches it to the subject's daemon over the
-auth-handshake ALPN, and the subject atomically replaces the operational pair
-on its durable team-cap pin. A founder's sibling points directly to the retained
-anchor rather than to its expiring predecessor, so repeated rotation stays at
-constant proof depth. The old operational blobs become unreachable from the
-pin; the founder anchor remains pinned as recovery/rotation authority.
-The daemon reconciles the founder's unique non-retracted `(subject, scope)`
-self-policy entry against the verified active credential before deciding what
-is due. This repairs either side of a crash between credential activation and
-policy bookkeeping without reopening a narrower self-policy entry or minting an
-unnecessary second sibling. Scheduling records the verified chain-effective
-deadline, never a leaf deadline that outlives one of its parents. For this
-local entry, the cleared delivery marker is also the durable host-publication
-journal: policy and proof blobs are flushed, a coherent serving snapshot and
-outbound credential are published, and only then is delivery marked complete.
-`team list-issued` shows the renewal-policy entries this node is
-keeping renewed; `team retract --entry HEX` removes one.
+Renewal happens via the same `OP_DELIVER_CAP` path that `team approve` uses for
+ordinary subjects. Each tick first resolves the local signing author's entire
+ledger as Complete; missing or invalid evidence anywhere defers the pass before
+team or subject filtering. The ordinary work set is then exactly the configured
+team's remote-subject grants with an enabled historical `Current` whose
+effective chain expiry is inside the renewal window. A retained founder pin adds
+only its exact `(team, local subject, pinned scope)` self grant. Foreign-team and
+unrelated local-subject grants are inert after resolution. An already-expired
+enabled current remains a seed: expiry blocks dispatch but does not erase the
+history needed to recover. `Conflicted` and disabled grants produce no renewal
+work.
+
+For an ordinary grant, the issuer uses its exact live local team credential as
+parent, signs a later finite successor with the same scope facts, and publishes a
+new `GrantIssued`. Publication is not selection: the daemon then takes another
+fresh Complete resolution, materializes every selected proof blob into the
+serving view, and sends only the enabled, live, unauthenticated deterministic
+winner. The subject's daemon durably replaces its operational pair through the
+normal delivery path.
+
+Founder self-rotation is deliberately local and has two distinct steps. The
+founder verifies its retained anchor, signs and asserts a direct-anchor sibling,
+then fresh-resolves policy. It materializes whichever usable deterministic
+winner that resolution selected onto the durable team-credential pin while
+preserving the anchor, flushes the pin, publishes a coherent serving snapshot,
+and updates outbound `OP_AUTH`; it never delivers to itself. A flush, snapshot,
+or publication failure leaves the durable winner different from the
+process-local host observation, so a later fresh tick retries without a
+separate workflow marker. Restart re-resolves policy before initializing the
+host from the durable pin. Repeated founder rotation therefore stays at
+constant proof depth.
+
+`team list-issued [--author PUBKEY_HEX]` shows the complete asserted grant view
+and prints each full `GrantDisabled` selector. `team retract --grant-event
+EVENT_HEX` signs that exact terminal fact; it does not delete history.
 
 ## `PeerConfig` Surface
 

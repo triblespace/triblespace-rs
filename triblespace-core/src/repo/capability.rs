@@ -860,11 +860,13 @@ struct CapFields {
 /// and are never fetched separately. A failed lookup returns
 /// [`VerifyError::MissingBlob`] with the exact handle that was requested.
 ///
-/// Eviction in the descriptive-caps model is per-issuer non-renewal
-/// (the issuer's local retraction-policy pin), not a broadcast
-/// revocation blob. Verification therefore checks signatures and
-/// expiry only; a "revoked" peer's chain dies at its next natural
-/// expiry once the issuer stops renewing.
+/// Eviction in the descriptive-caps model is per-issuer non-renewal, not a
+/// broadcast revocation blob. The issuer publishes terminal `GrantDisabled`
+/// in its author-scoped asserted policy, but capability verification does not
+/// consult that policy. It still verifies exact team-root and expected-subject
+/// binding, signatures and proof shape, issuer/subject delegation splices,
+/// scope attenuation, depth, intervals, and live expiry. The already-issued
+/// chain dies at its next natural expiry once the issuer stops renewing it.
 ///
 /// Returns the verified leaf capability on success.
 ///

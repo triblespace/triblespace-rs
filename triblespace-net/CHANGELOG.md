@@ -66,18 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flushed before that journal is cleared, and startup completes interrupted
   transitions without consuming a concurrent replacement request. Later
   selection is monotone in issuer, scope, and effective expiry, with expiry
-  rechecked when the queued event is applied. Founder renewal reconciles its
-  verified active `(subject, scope)` to the unique non-retracted self-policy
-  before issuing, records the chain-effective deadline, and completes the
-  local delivery marker only after coherent proof serving and outbound-auth
-  publication. An `OP_REQUEST_CAP` `STATUS_OK` now follows durable pending-state
-  recording and flush. Explicit policy or pre-admission failures are rejected;
+  rechecked when the queued event is applied. An `OP_REQUEST_CAP` `STATUS_OK`
+  now follows a flush of the exact request closure and durable append of its
+  `RequestObserved` assertion. Explicit policy or pre-admission failures are rejected;
   a persistence error after admission returns `STATUS_INDETERMINATE`, because a
   failed append may already have taken effect. Exact idempotent replay resolves
   that outcome. Delivery ACKs retain their queue-admission meaning. A later
   successful subject authentication records an exact
   `CredentialAuthenticated` assertion only after resolving a complete issuer
-  ledger and uniquely matching the current subject/signature issuance;
+  ledger and uniquely matching the historical `Current` subject/signature
+  issuance, including disabled or expired evidence;
   incomplete or invalid policy fails closed. Redispatch now resolves that same
   ledger afresh and sends only unauthenticated active current grants for this
   daemon's configured team. Disabled, conflicted, expired, local-subject, and
@@ -92,9 +90,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ledger's flush-before-assertion writer. `GrantView::usable_at(now)` is the
   dispatch eligibility boundary for enabled, unexpired current credentials;
   `historical_issuance()` deliberately retains an expired current credential
-  so later renewal can replace it. `identity::load_existing_key` shares the
+  so an enabled grant can later replace it. `identity::load_existing_key` shares the
   normal identity path resolution while making no-create signing commands
   explicit.
+- **Renewal and disablement now close over the asserted grant ledger.** Every
+  tick fresh-resolves a Complete view for the local author's entire ledger;
+  incomplete or invalid evidence anywhere produces no renewal or self
+  materialization. The work set is exactly the retained founder pin's own
+  `(team, subject, scope)` grant plus remote-subject grants for the configured
+  team; foreign-team and unrelated local-subject grants are inert after
+  resolution. Scheduling uses enabled historical `Current` values,
+  deliberately retaining expired currents as renewal seeds, while dispatch
+  remains limited to live `usable_at(now)` winners. Ordinary successors are durably published
+  as `GrantIssued` before the single post-production redispatch pass
+  fresh-resolves and sends the selected unauthenticated current. Terminal
+  `GrantDisabled` stops both renewal and dispatch without deleting historical
+  issuance. Founder rotation verifies the retained anchor and asserts a
+  direct-anchor sibling before a fresh resolution; materialization then moves
+  whichever usable winner was selected onto the team-credential pin, flushes
+  it, publishes a coherent serving snapshot, and updates outbound auth without
+  a self-directed delivery. The selected durable pin and process-local observed
+  host value form a level-triggered retry condition after flush, snapshot, or
+  publication failure; restart re-resolves policy before initializing the host
+  from the durable pin. Founder startup never manufactures missing policy from
+  that pin: the bootstrap
+  credential is usable only when a fresh Complete ledger selects its exact cap
+  and signature.
 - **Serving resources fail closed.** Unauthenticated work, authenticated
   connections, and post-auth streams are globally bounded; each subject may
   hold at most one live inbound pile-sync connection, including while admitted

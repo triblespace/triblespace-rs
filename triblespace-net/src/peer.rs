@@ -672,7 +672,7 @@ where
         ) else {
             tracing::warn!(
                 issuer = %hex::encode(&issuer[..4]),
-                "CapDelivered: valid chain was not selected by local request/renewal policy"
+                "CapDelivered: valid chain was not selected by local request/current-credential policy"
             );
             return Ok(());
         };

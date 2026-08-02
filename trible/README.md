@@ -112,16 +112,25 @@ continue by delegation. See
 [`book/src/capability-auth.md`](../book/src/capability-auth.md) for
 the full design.
 
-- `team create --pile PATH [--key KEY_PATH]` — mint a team root, sign one non-expiring founder anchor, issue a finite founder operational cap beneath it, and durably pin the complete credential. Prints the public team root, root secret to archive offline, anchor and operational handles, and operational expiry.
-- `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--legacy-pin HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--legacy-pin` (repeatable) restricts the current blob RPC to reachability from mutable local-pin roots; it does not select an exact asserted branch pin.
-- `team request-join --admin HEX --scope (read|write|admin) [--key PATH] [--pile PATH]` — send an `OP_REQUEST_CAP` to an admin asking to be issued a capability via the running auth-handshake daemon.
+- `team create --pile PATH [--key KEY_PATH]` — mint a team root, sign one non-expiring founder anchor, issue a finite founder operational cap beneath it, and publish its `GrantIssued`. This sole bootstrap exception first flushes the complete founder credential retention pin, then requires a fresh Complete policy view to select that exact usable credential before returning the root secret. Prints the public team root, root secret to archive offline, anchor and operational handles, operational expiry, and grant event.
+- `team invite --pile PATH --team-root HEX --cap HEX --invitee HEX [--key PATH] [--scope (read|write|admin)] [--legacy-pin HEX]...` — pre-authorize a sub-capability and publish `GrantIssued`; the issuer key must already exist at the explicit or default path, and scope defaults to read. This is issuer-side policy, not a bearer credential or cold bootstrap: the printed signature handle is diagnostic, and first delivery still requires independently recorded request intent in the invitee's pile. The running daemon later renews the asserted grant. The issuer must hold a cap that subsumes the requested scope. `--legacy-pin` (repeatable) restricts the current blob RPC to reachability from mutable local-pin roots; it does not select an exact asserted branch pin.
+- `team request-join --pile PATH --admin HEX [--scope (read|write|admin)] [--key PATH]` — durably record the exact local request intent, then send `OP_REQUEST_CAP` to an admin's running auth-handshake daemon; scope defaults to read.
 - `team approve --pile PATH --request-event EVENT_HEX --team-root HEX --cap HEX [--key PATH]` — approve one full canonical `RequestObserved` handle with an asserted, provenance-bearing `GrantIssued`; an existing issued-signature set is an idempotent success and the key must already exist.
 - `team reject --pile PATH --request-event EVENT_HEX [--key PATH]` — assert rejection of one exact request without implying revocation of any independently issued credential; the key must already exist.
-- `team retract --pile PATH --entry HEX` — stop auto-renewing a (subject, scope) entry. The peer's cap chain dies at its next natural expiry. Pure local decision, takes effect on the next daemon tick. There is no team-root broadcast revocation primitive; eviction is per-issuer non-renewal.
+- `team retract --pile PATH --grant-event EVENT_HEX [--key PATH]` — publish terminal `GrantDisabled` for the full canonical selector printed by `list-issued`. The author key must already exist and the issuer ledger must resolve Complete. Exact replay is idempotent; the issued chain remains historical and dies at its natural expiry.
 - `team list --pile PATH` — audit the pile: per-cap details (issuer → subject, scope, expiry — sorted soonest-expiry-first).
-- `team list-pending --pile PATH [--author PUBKEY_HEX]` — display the observed, rejected, derived-pending, and complete issued-signature fact sets for incoming requests. Exactly one valid assertion author is auto-detected when omitted, without reading or creating a key.
-- `team list-issued --pile PATH` — renewal-policy entries this node is keeping renewed.
+- `team list-pending --pile PATH [--author PUBKEY_HEX]` — display the observed, rejected, derived-pending, and complete issued-signature fact sets for incoming requests. Exactly one valid assertion author is auto-detected when omitted, without reading or creating a key; only a Complete view is shown.
+- `team list-issued --pile PATH [--author PUBKEY_HEX]` — display every exact grant in one author's Complete asserted policy view, including the full `GrantDisabled` selector, disabled state, historical issuance, selected credential, authentication, and current usability. Author selection matches `list-pending`.
 - `team show --pile PATH --cap HEX [--verify HEX] [--expected-subject HEX]` — walk one chain end-to-end and print each level with subject, issuer, scope, expiry, cap handle, proof position, and a signer-matches-issuer check. Bounded by MAX_DEPTH=32; the diagnostic deep-dive that complements `team list`'s summary view.
+
+The daemon first resolves its signing author's entire ledger as Complete;
+missing or invalid evidence anywhere defers the pass. It then renews only the
+retained founder pin's exact self grant and remote-subject grants for the
+configured team. Enabled historical `Current` values remain renewal seeds after
+expiry, but only live `usable_at(now)` winners may be sent. Each successor is
+asserted first and then selected again from fresh policy. Founder self-rotation
+materializes whichever usable winner that resolution selected onto the local
+team-credential pin and host state; ordinary grants are delivered remotely.
 
 ### Work with remote stores
 

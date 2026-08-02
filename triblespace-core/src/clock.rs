@@ -19,8 +19,8 @@
 //!   can cross thread and serialization boundaries freely, which
 //!   `Instant` cannot.
 //! - [`epoch_now`](crate::clock::epoch_now) → `hifitime::Epoch`: wall-clock TAI time. Used
-//!   where the *absolute* date matters and ends up in persisted facts:
-//!   cap expiry checks, renewal-policy timestamps, retraction marks.
+//!   where the *absolute* date matters: minted capability intervals,
+//!   expiry/liveness checks, renewal cutoffs, and delivery selection.
 //!
 //! A discrete-event simulation has exactly one global timeline, so the
 //! source is process-global rather than per-node. Per-node clock skew

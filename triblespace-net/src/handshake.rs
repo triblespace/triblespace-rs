@@ -4,26 +4,30 @@
 //! yet hold a cap chaining to a team root) and the delivery channel for
 //! renewals. It runs alongside `PILE_SYNC_ALPN`, not in place of it.
 //!
-//! Two one-shot operations, no shared state held across human-approval
+//! Three one-shot operations, no shared state held across human-approval
 //! latency:
 //!
 //!   `OP_REQUEST_CAP` (subject → issuer)
 //!     subject sends a partial cap blob (subject + scope + expiry it
-//!     wants). issuer responds with an ACK only after the exact request is
-//!     durably recorded, then closes. issuer then
-//!     either: (a) auto-approves via its renewal-policy branch and
-//!     dispatches `OP_DELIVER_CAP` in the daemon's next tick, or
-//!     (b) queues the request for human approval — when the human
-//!     approves, the daemon dispatches `OP_DELIVER_CAP`.
+//!     wants). issuer responds with an ACK only after the exact closure is
+//!     flushed and its `RequestObserved` assertion is durably appended, then closes. Human
+//!     approval cites that exact request in `GrantIssued`; the daemon later
+//!     fresh-resolves a Complete issuer ledger and redispatches the selected
+//!     usable credential.
 //!
 //!   `OP_DELIVER_CAP` (issuer → subject)
-//!     issuer ships the signed (cap, sig) bytes. subject ACKs and
-//!     closes. subject verifies + pins the cap into its team-cap
-//!     branch.
+//!     issuer ships the signed (cap, sig) bytes. subject verifies the chain,
+//!     admits the bounded proof bundle, ACKs, and closes. The policy loop later
+//!     durably materializes an accepted winner on the team-credential pin.
+//!
+//!   `OP_FETCH_CAPABILITY_BLOB` (verifier → presenter)
+//!     verifier requests one exact missing proof member. The presenter serves
+//!     it only when local verification of the named leaf for the named subject
+//!     touched that handle; this is not a general unauthenticated blob read.
 //!
 //! Connection-level pubkey auth (iroh's QUIC TLS) is enough: A knows
 //! K_B from `connection.remote_id()`, B knows K_A from the dial
-//! target. No protocol-layer signature on the request is needed for v1.
+//! target. No protocol-layer signature on the request is needed for v2.
 //!
 //! See `decide#4b6edde7` for the architectural decision and
 //! `decide#4b321c47` for the surrounding cap-system design.
@@ -54,9 +58,11 @@ pub const OP_DELIVER_CAP: u8 = 0x02;
 /// It is not an unauthenticated general-purpose blob read.
 pub const OP_FETCH_CAPABILITY_BLOB: u8 = 0x03;
 
-/// Status: the exact request was durably recorded in the issuer's pending
-/// policy state. A timed-out request has an ambiguous outcome and may be
-/// replayed exactly; replay is idempotent.
+/// Success status. For `OP_REQUEST_CAP`, the exact request closure was flushed
+/// and its `RequestObserved` assertion was durably appended; a timeout is
+/// ambiguous and exact replay is idempotent. For `OP_DELIVER_CAP`,
+/// the verified bundle entered the bounded policy queue but may not yet be
+/// durably materialized.
 pub const STATUS_OK: u8 = 0x00;
 /// Status: request was definitely not accepted. This covers stable policy
 /// refusal and failures before the request entered the synchronous policy
