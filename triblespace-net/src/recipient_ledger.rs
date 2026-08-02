@@ -49,9 +49,11 @@ use triblespace_core::repo::capability::{
     decode_operational_capability, scope_subsumes, verify_chain_details_allow_expired,
 };
 use triblespace_core::repo::pin_assertion::{
-    PinAssertion, PinAssertionSnapshot, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle,
+    PinAssertion, PinAssertionId, PinAssertionKeyCollision, PinAssertionSnapshot,
+    PinAssertionStore, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle,
 };
 use triblespace_core::repo::strong_pin::StrongPinDescriptor;
+use triblespace_core::repo::{BlobStore, BlobStoreGet, StorageFlush};
 use triblespace_core::trible::{Fragment, TribleSet};
 
 use crate::policy_ledger::{
@@ -414,6 +416,387 @@ pub fn sign_recipient_event(key: &SigningKey, event: &RecipientEvent) -> PinAsse
 /// Reinterpret an asserted recipient value as its canonical archive handle.
 pub fn recipient_event_handle(value: ValueHandle) -> RecipientEventHandle {
     Inline::new(value.raw())
+}
+
+type RecipientStorageError = Box<dyn Error + Send + Sync>;
+
+/// Durable receipt for one recipient event publication.
+///
+/// A receipt is intentionally not an operational ledger view. Another writer
+/// may append a concurrent fact immediately after publication, so callers must
+/// take a fresh assertion snapshot and resolve it before causing host effects.
+/// Successful return means the complete supplied content closure was flushed
+/// before the assertion crossed its durable append boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecipientEventReceipt {
+    event: RecipientEventHandle,
+    assertion: PinAssertionId,
+}
+
+impl RecipientEventReceipt {
+    pub const fn event(&self) -> RecipientEventHandle {
+        self.event
+    }
+
+    pub const fn assertion(&self) -> PinAssertionId {
+        self.assertion
+    }
+}
+
+/// Failure to validate or durably publish one recipient event.
+#[derive(Debug)]
+pub enum RecipientLedgerWriteError {
+    Snapshot(RecipientStorageError),
+    SnapshotCollision(PinAssertionKeyCollision),
+    Reader(RecipientStorageError),
+    Read {
+        handle: Inline<Handle<SimpleArchive>>,
+        source: RecipientStorageError,
+    },
+    Incomplete {
+        missing: Vec<Inline<Handle<SimpleArchive>>>,
+        unknown_parents: Vec<RecipientEventHandle>,
+    },
+    Invalid {
+        diagnostics: Vec<RecipientLedgerDiagnostic>,
+    },
+    PostconditionFailed {
+        event: RecipientEventHandle,
+    },
+    Put {
+        stage: &'static str,
+        source: RecipientStorageError,
+    },
+    PutHandleMismatch {
+        stage: &'static str,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    VerifyStored {
+        stage: &'static str,
+        source: RecipientStorageError,
+    },
+    StoredContentMismatch {
+        stage: &'static str,
+        handle: [u8; 32],
+    },
+    Flush(RecipientStorageError),
+    Append(RecipientStorageError),
+}
+
+impl fmt::Display for RecipientLedgerWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Snapshot(error) => {
+                write!(f, "failed to snapshot recipient assertions: {error}")
+            }
+            Self::SnapshotCollision(error) => {
+                write!(
+                    f,
+                    "failed to overlay prospective recipient assertion: {error}"
+                )
+            }
+            Self::Reader(error) => write!(f, "failed to open recipient blob reader: {error}"),
+            Self::Read { handle, source } => {
+                write!(f, "failed to read recipient blob {handle:?}: {source}")
+            }
+            Self::Incomplete {
+                missing,
+                unknown_parents,
+            } => write!(
+                f,
+                "prospective recipient ledger is incomplete ({} missing blobs, {} unknown parents)",
+                missing.len(),
+                unknown_parents.len()
+            ),
+            Self::Invalid { diagnostics } => write!(
+                f,
+                "prospective recipient ledger is invalid ({} diagnostics)",
+                diagnostics.len()
+            ),
+            Self::PostconditionFailed { event } => write!(
+                f,
+                "prospective recipient ledger omitted candidate event {event:?}"
+            ),
+            Self::Put { stage, source } => {
+                write!(f, "failed to store recipient {stage}: {source}")
+            }
+            Self::PutHandleMismatch {
+                stage,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "recipient {stage} stored under the wrong handle: expected {}, got {}",
+                hex::encode_upper(expected),
+                hex::encode_upper(actual)
+            ),
+            Self::VerifyStored { stage, source } => {
+                write!(f, "failed to verify stored recipient {stage}: {source}")
+            }
+            Self::StoredContentMismatch { stage, handle } => write!(
+                f,
+                "stored recipient {stage} has wrong bytes under handle {}",
+                hex::encode_upper(handle)
+            ),
+            Self::Flush(error) => write!(f, "failed to flush recipient closure: {error}"),
+            Self::Append(error) => write!(f, "failed to append recipient assertion: {error}"),
+        }
+    }
+}
+
+impl Error for RecipientLedgerWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Snapshot(error)
+            | Self::Reader(error)
+            | Self::Flush(error)
+            | Self::Append(error) => Some(error.as_ref()),
+            Self::Read { source, .. }
+            | Self::Put { source, .. }
+            | Self::VerifyStored { source, .. } => Some(source.as_ref()),
+            Self::SnapshotCollision(error) => Some(error),
+            Self::Incomplete { .. }
+            | Self::Invalid { .. }
+            | Self::PostconditionFailed { .. }
+            | Self::PutHandleMismatch { .. }
+            | Self::StoredContentMismatch { .. } => None,
+        }
+    }
+}
+
+/// Validate one event against the complete prospective author ledger, then
+/// publish it with closure-before-assertion crash ordering.
+///
+/// `closure` contains newly created `SimpleArchive` blobs referenced directly
+/// or transitively by the event. Existing dependencies may be omitted: the
+/// prospective reducer reads them through a pinned store reader. Supplied
+/// blobs are normalized from their bytes, never trusted cached handles. No
+/// storage mutation occurs until the candidate assertion has reduced to
+/// [`RecipientLedgerResolution::Complete`] and that view contains the exact
+/// candidate event.
+///
+/// Publication writes the supplied closure, event, inner descriptor, and
+/// strong descriptor; verifies their exact stored handles and bytes; flushes
+/// all content; then durably appends the assertion. There is intentionally no
+/// flush after `append_pin_assertion`: durability on return is that trait's
+/// contract. An exact retry rewrites absent or corrupt content and descriptors
+/// before safely eliding an already-durable duplicate assertion.
+pub fn append_validated_recipient_event<S, I>(
+    store: &mut S,
+    author: &SigningKey,
+    event: RecipientEvent,
+    closure: I,
+) -> Result<RecipientEventReceipt, RecipientLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+    I: IntoIterator<Item = Blob<SimpleArchive>>,
+{
+    let event_blob = RecipientEvent::to_blob(&event);
+    let event_handle = event_blob.get_handle();
+    let assertion = sign_recipient_event(author, &event);
+
+    let mut overlay = BTreeMap::new();
+    for blob in closure {
+        let blob = Blob::new(blob.bytes);
+        overlay.insert(blob.get_handle(), blob);
+    }
+    overlay.insert(event_handle, event_blob.clone());
+    let inner = RecipientLedgerDescriptor::blob();
+    let inner_handle = inner.get_handle();
+    let outer = RecipientLedgerDescriptor::strong_blob();
+    let outer_handle = outer.get_handle();
+
+    let mut snapshot = store
+        .pin_assertion_snapshot()
+        .map_err(|error| RecipientLedgerWriteError::Snapshot(Box::new(error)))?;
+    let already_asserted = snapshot
+        .for_pin(&RecipientLedgerDescriptor::pin_identity(
+            author.verifying_key(),
+        ))
+        .contains(&assertion);
+    snapshot
+        .insert(assertion)
+        .map_err(RecipientLedgerWriteError::SnapshotCollision)?;
+    let reader = store
+        .reader()
+        .map_err(|error| RecipientLedgerWriteError::Reader(Box::new(error)))?;
+
+    // BlobStoreGet exposes no portable NotFound discriminator. Preserve the
+    // first raw read failure instead of guessing that it means semantic
+    // absence; supplied overlay members remain available prospectively.
+    let mut read_error = None;
+    let resolution = resolve_recipient_ledger(&snapshot, author.verifying_key(), |handle| {
+        if let Some(blob) = overlay.get(&handle) {
+            return Some(blob.clone());
+        }
+        if read_error.is_some() {
+            return None;
+        }
+        match reader.get::<Blob<SimpleArchive>, SimpleArchive>(handle) {
+            Ok(blob) => Some(blob),
+            Err(error) => {
+                read_error = Some((handle, Box::new(error) as RecipientStorageError));
+                None
+            }
+        }
+    });
+
+    // A replicated assertion may precede its content. Elide all puts only if
+    // this exact assertion already exists and every supplied member plus both
+    // descriptors is present with the exact expected bytes.
+    let closure_present = already_asserted
+        && overlay.values().all(|expected| {
+            verify_stored_recipient_blob(&reader, "closure member", expected).is_ok()
+        })
+        && verify_stored_recipient_blob(&reader, "inner descriptor", &inner).is_ok()
+        && verify_stored_recipient_blob(&reader, "strong descriptor", &outer).is_ok();
+    drop(reader);
+
+    if let Some((handle, source)) = read_error {
+        return Err(RecipientLedgerWriteError::Read { handle, source });
+    }
+    match resolution {
+        RecipientLedgerResolution::Complete(view)
+            if view.event_handles().contains(&event_handle) => {}
+        RecipientLedgerResolution::Complete(_) => {
+            return Err(RecipientLedgerWriteError::PostconditionFailed {
+                event: event_handle,
+            });
+        }
+        RecipientLedgerResolution::Incomplete {
+            missing,
+            unknown_parents,
+        } => {
+            return Err(RecipientLedgerWriteError::Incomplete {
+                missing,
+                unknown_parents,
+            });
+        }
+        RecipientLedgerResolution::Invalid { diagnostics } => {
+            return Err(RecipientLedgerWriteError::Invalid { diagnostics });
+        }
+    }
+
+    if closure_present {
+        // Reader visibility is not proof of crash durability. Flush on exact
+        // retries even though the already-durable assertion append is elided.
+        store
+            .flush()
+            .map_err(|error| RecipientLedgerWriteError::Flush(Box::new(error)))?;
+        return Ok(RecipientEventReceipt {
+            event: event_handle,
+            assertion: assertion.id(),
+        });
+    }
+
+    for (handle, blob) in &overlay {
+        if *handle == event_handle {
+            continue;
+        }
+        let actual = store
+            .put::<SimpleArchive, _>(blob.clone())
+            .map_err(|error| RecipientLedgerWriteError::Put {
+                stage: "closure blob",
+                source: Box::new(error),
+            })?;
+        require_recipient_stored_handle("closure blob", handle.raw, actual.raw)?;
+    }
+
+    let actual_event = store.put::<SimpleArchive, _>(event_blob).map_err(|error| {
+        RecipientLedgerWriteError::Put {
+            stage: "event blob",
+            source: Box::new(error),
+        }
+    })?;
+    require_recipient_stored_handle("event blob", event_handle.raw, actual_event.raw)?;
+
+    let actual_inner = store
+        .put::<RecipientLedgerDescriptor, _>(inner.clone())
+        .map_err(|error| RecipientLedgerWriteError::Put {
+            stage: "inner descriptor",
+            source: Box::new(error),
+        })?;
+    require_recipient_stored_handle("inner descriptor", inner_handle.raw, actual_inner.raw)?;
+
+    let actual_outer = store
+        .put::<StrongPinDescriptor, _>(outer.clone())
+        .map_err(|error| RecipientLedgerWriteError::Put {
+            stage: "strong descriptor",
+            source: Box::new(error),
+        })?;
+    require_recipient_stored_handle("strong descriptor", outer_handle.raw, actual_outer.raw)?;
+
+    let verification_reader = store
+        .reader()
+        .map_err(|error| RecipientLedgerWriteError::Reader(Box::new(error)))?;
+    for blob in overlay.values() {
+        let stage = if blob.get_handle() == event_handle {
+            "event blob"
+        } else {
+            "closure blob"
+        };
+        verify_stored_recipient_blob(&verification_reader, stage, blob)?;
+    }
+    verify_stored_recipient_blob(&verification_reader, "inner descriptor", &inner)?;
+    verify_stored_recipient_blob(&verification_reader, "strong descriptor", &outer)?;
+    drop(verification_reader);
+
+    store
+        .flush()
+        .map_err(|error| RecipientLedgerWriteError::Flush(Box::new(error)))?;
+    if !already_asserted {
+        store
+            .append_pin_assertion(assertion)
+            .map_err(|error| RecipientLedgerWriteError::Append(Box::new(error)))?;
+    }
+
+    Ok(RecipientEventReceipt {
+        event: event_handle,
+        assertion: assertion.id(),
+    })
+}
+
+fn require_recipient_stored_handle(
+    stage: &'static str,
+    expected: [u8; 32],
+    actual: [u8; 32],
+) -> Result<(), RecipientLedgerWriteError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(RecipientLedgerWriteError::PutHandleMismatch {
+            stage,
+            expected,
+            actual,
+        })
+    }
+}
+
+fn verify_stored_recipient_blob<R, S>(
+    reader: &R,
+    stage: &'static str,
+    expected: &Blob<S>,
+) -> Result<(), RecipientLedgerWriteError>
+where
+    R: BlobStoreGet,
+    S: BlobEncoding + 'static,
+    Handle<S>: triblespace_core::inline::InlineEncoding,
+{
+    let handle = expected.get_handle();
+    let stored = reader.get::<Blob<S>, S>(handle).map_err(|error| {
+        RecipientLedgerWriteError::VerifyStored {
+            stage,
+            source: Box::new(error),
+        }
+    })?;
+    if stored.bytes != expected.bytes {
+        return Err(RecipientLedgerWriteError::StoredContentMismatch {
+            stage,
+            handle: handle.raw,
+        });
+    }
+    Ok(())
 }
 
 /// Result of reducing one exact recipient author's asserted event set.
@@ -1332,33 +1715,62 @@ fn acceptance_roots(
             .iter()
             .copied()
             .filter(|event| {
-                let acceptance = &acceptances[event];
-                let first = acceptance
-                    .basis
-                    .iter()
-                    .all(|parent| matches!(events[parent], RecipientEvent::IntentDeclared { .. }));
+                let Some(acceptance) = acceptances.get(event) else {
+                    return false;
+                };
+                let first = acceptance.basis.iter().all(|parent| {
+                    matches!(
+                        events.get(parent),
+                        Some(RecipientEvent::IntentDeclared { .. })
+                    )
+                });
                 first
-                    || acceptance
-                        .basis
-                        .iter()
-                        .all(|parent| roots.contains_key(parent))
+                    || acceptance.basis.iter().all(|parent| {
+                        matches!(
+                            events.get(parent),
+                            Some(RecipientEvent::CredentialAccepted { .. })
+                        ) && roots.contains_key(parent)
+                    })
             })
             .collect();
         if ready.is_empty() {
             break;
         }
+        let mut made_progress = false;
         for event in ready {
-            let acceptance = &acceptances[&event];
+            let Some(acceptance) = acceptances.get(&event) else {
+                continue;
+            };
             let mut event_roots = BTreeSet::<RecipientEventHandle>::new();
+            let mut complete = true;
             for parent in &acceptance.basis {
-                if matches!(events[parent], RecipientEvent::IntentDeclared { .. }) {
-                    event_roots.insert(*parent);
-                } else {
-                    event_roots.extend(roots[parent].iter().copied());
+                match events.get(parent) {
+                    Some(RecipientEvent::IntentDeclared { .. }) => {
+                        event_roots.insert(*parent);
+                    }
+                    Some(RecipientEvent::CredentialAccepted { .. }) => {
+                        let Some(parent_roots) = roots.get(parent) else {
+                            complete = false;
+                            break;
+                        };
+                        event_roots.extend(parent_roots.iter().copied());
+                    }
+                    Some(RecipientEvent::IntentCanceled { .. })
+                    | Some(RecipientEvent::FounderGrantSelected { .. })
+                    | None => {
+                        complete = false;
+                        break;
+                    }
                 }
             }
-            roots.insert(event, event_roots);
-            unresolved.remove(&event);
+            if complete {
+                roots.insert(event, event_roots);
+                unresolved.remove(&event);
+                made_progress = true;
+            }
+        }
+        if !made_progress {
+            break;
         }
     }
     if unresolved.is_empty() {
@@ -1564,10 +1976,120 @@ mod tests {
     use super::*;
 
     use hifitime::Duration;
+    use std::convert::Infallible;
     use triblespace_core::inline::TryToInline;
+    use triblespace_core::repo::BlobStorePut;
     use triblespace_core::repo::capability::{
         self, PERM_ADMIN, PERM_READ, PERM_WRITE, build_capability, build_founder_anchor,
     };
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::pile::Pile;
+
+    #[derive(Debug)]
+    struct InjectedFailure(&'static str);
+
+    impl fmt::Display for InjectedFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "injected {} failure", self.0)
+        }
+    }
+
+    impl Error for InjectedFailure {}
+
+    #[derive(Debug)]
+    enum RecordingAssertionError {
+        Collision(PinAssertionKeyCollision),
+        Injected(InjectedFailure),
+    }
+
+    impl fmt::Display for RecordingAssertionError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Collision(error) => error.fmt(f),
+                Self::Injected(error) => error.fmt(f),
+            }
+        }
+    }
+
+    impl Error for RecordingAssertionError {}
+
+    impl From<PinAssertionKeyCollision> for RecordingAssertionError {
+        fn from(value: PinAssertionKeyCollision) -> Self {
+            Self::Collision(value)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingStore {
+        inner: MemoryRepo,
+        operations: Vec<&'static str>,
+        put_handles: Vec<[u8; 32]>,
+        fail_flush: bool,
+        fail_append: bool,
+        lie_about_put_handle: bool,
+    }
+
+    impl BlobStorePut for RecordingStore {
+        type PutError = Infallible;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: triblespace_core::inline::InlineEncoding,
+        {
+            let handle = self.inner.put(item)?;
+            self.operations.push("put");
+            self.put_handles.push(handle.raw);
+            if self.lie_about_put_handle {
+                Ok(Inline::new([0xEE; 32]))
+            } else {
+                Ok(handle)
+            }
+        }
+    }
+
+    impl BlobStore for RecordingStore {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.operations.push("reader");
+            self.inner.reader()
+        }
+    }
+
+    impl PinAssertionStore for RecordingStore {
+        type Error = RecordingAssertionError;
+
+        fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+            self.operations.push("snapshot");
+            self.inner.pin_assertion_snapshot().map_err(Into::into)
+        }
+
+        fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+            self.operations.push("append");
+            if self.fail_append {
+                return Err(RecordingAssertionError::Injected(InjectedFailure("append")));
+            }
+            self.inner
+                .append_pin_assertion(assertion)
+                .map_err(Into::into)
+        }
+    }
+
+    impl StorageFlush for RecordingStore {
+        type Error = InjectedFailure;
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("flush");
+            if self.fail_flush {
+                Err(InjectedFailure("flush"))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
@@ -1649,6 +2171,27 @@ mod tests {
             handle
         }
 
+        fn publishable_intent(
+            &mut self,
+            permission: Id,
+            seconds: f64,
+        ) -> (RecipientEvent, Blob<SimpleArchive>) {
+            let partial_cap = self.partial_cap(permission, seconds);
+            let claim = self
+                .blobs
+                .get(&partial_cap)
+                .expect("fixture stored partial capability")
+                .clone();
+            (
+                RecipientEvent::IntentDeclared {
+                    team_root: self.root.verifying_key(),
+                    partial_cap,
+                    supersedes: BTreeSet::new(),
+                },
+                claim,
+            )
+        }
+
         fn credential(
             &mut self,
             permission: Id,
@@ -1694,6 +2237,378 @@ mod tests {
                 self.blobs.get(&handle).cloned()
             })
         }
+    }
+
+    #[test]
+    fn validated_writer_flushes_complete_closure_before_durable_assertion() {
+        let mut fixture = Fixture::new();
+        let (event, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+        let event_handle = event.handle();
+        let assertion = sign_recipient_event(&fixture.recipient, &event);
+        let mut store = RecordingStore::default();
+        let supplied =
+            Blob::<SimpleArchive>::with_handle(partial_cap.bytes.clone(), Inline::new([0xA1; 32]));
+        assert_ne!(supplied.get_handle(), partial_cap.get_handle());
+
+        let receipt =
+            append_validated_recipient_event(&mut store, &fixture.recipient, event, [supplied])
+                .expect("valid prospective event publishes");
+        assert_eq!(receipt.event(), event_handle);
+        assert_eq!(receipt.assertion(), assertion.id());
+        assert_eq!(
+            store.operations,
+            [
+                "snapshot", "reader", "put", "put", "put", "put", "reader", "flush", "append"
+            ]
+        );
+        assert_eq!(
+            store.put_handles,
+            [
+                partial_cap.get_handle().raw,
+                event_handle.raw,
+                RecipientLedgerDescriptor::descriptor_handle().raw,
+                RecipientLedgerDescriptor::strong_blob().get_handle().raw,
+            ]
+        );
+
+        let snapshot = store.inner.pin_assertion_snapshot().unwrap();
+        let reader = store.inner.reader().unwrap();
+        let RecipientLedgerResolution::Complete(view) =
+            resolve_recipient_ledger(&snapshot, fixture.recipient.verifying_key(), |handle| {
+                reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+            })
+        else {
+            panic!("durably published closure must resolve after the write")
+        };
+        assert!(view.event_handles().contains(&event_handle));
+    }
+
+    #[test]
+    fn validated_writer_mutates_nothing_for_an_invalid_candidate() {
+        let mut fixture = Fixture::new();
+        let (event, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+        let wrong_author = key(71);
+        let mut store = RecordingStore::default();
+
+        let error =
+            append_validated_recipient_event(&mut store, &wrong_author, event, [partial_cap])
+                .unwrap_err();
+        assert!(matches!(error, RecipientLedgerWriteError::Invalid { .. }));
+        assert_eq!(store.operations, ["snapshot", "reader"]);
+        assert_eq!(store.inner.blobs.len(), 0);
+        assert!(store.inner.pin_assertion_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn validated_writer_mutates_nothing_for_an_unasserted_causal_parent() {
+        let mut fixture = Fixture::new();
+        let missing_parent = handle(92);
+        let (_, sig) = fixture.credential(PERM_READ, 100.0);
+        let event = RecipientEvent::CredentialAccepted {
+            team_root: fixture.root.verifying_key(),
+            sig,
+            basis: BTreeSet::from([missing_parent]),
+        };
+        let closure = fixture.blobs.values().cloned().collect::<Vec<_>>();
+        let mut store = RecordingStore::default();
+
+        let error =
+            append_validated_recipient_event(&mut store, &fixture.recipient, event, closure)
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            RecipientLedgerWriteError::Incomplete {
+                missing,
+                unknown_parents,
+            } if missing.is_empty() && unknown_parents == vec![missing_parent]
+        ));
+        assert_eq!(store.operations, ["snapshot", "reader"]);
+        assert_eq!(store.inner.blobs.len(), 0);
+        assert!(store.inner.pin_assertion_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn validated_writer_never_appends_before_flush_and_leaves_only_safe_orphans_on_failure() {
+        let mut fixture = Fixture::new();
+        let (event, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+
+        let mut flush_failure = RecordingStore {
+            fail_flush: true,
+            ..RecordingStore::default()
+        };
+        let error = append_validated_recipient_event(
+            &mut flush_failure,
+            &fixture.recipient,
+            event.clone(),
+            [partial_cap.clone()],
+        )
+        .unwrap_err();
+        assert!(matches!(error, RecipientLedgerWriteError::Flush(_)));
+        assert_eq!(
+            flush_failure.operations,
+            [
+                "snapshot", "reader", "put", "put", "put", "put", "reader", "flush"
+            ]
+        );
+        assert_eq!(flush_failure.inner.blobs.len(), 4);
+        assert!(
+            flush_failure
+                .inner
+                .pin_assertion_snapshot()
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut append_failure = RecordingStore {
+            fail_append: true,
+            ..RecordingStore::default()
+        };
+        let error = append_validated_recipient_event(
+            &mut append_failure,
+            &fixture.recipient,
+            event,
+            [partial_cap],
+        )
+        .unwrap_err();
+        assert!(matches!(error, RecipientLedgerWriteError::Append(_)));
+        assert_eq!(
+            append_failure.operations,
+            [
+                "snapshot", "reader", "put", "put", "put", "put", "reader", "flush", "append"
+            ]
+        );
+        assert_eq!(append_failure.inner.blobs.len(), 4);
+        assert!(
+            append_failure
+                .inner
+                .pin_assertion_snapshot()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn validated_writer_exact_republication_is_idempotent() {
+        let mut fixture = Fixture::new();
+        let (event, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+        let mut store = RecordingStore::default();
+
+        let first = append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            event.clone(),
+            [partial_cap.clone()],
+        )
+        .expect("first publication succeeds");
+        assert_eq!(store.inner.blobs.len(), 4);
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+
+        store.operations.clear();
+        store.put_handles.clear();
+        let second =
+            append_validated_recipient_event(&mut store, &fixture.recipient, event, [partial_cap])
+                .expect("exact republication succeeds");
+        assert_eq!(second, first);
+        assert_eq!(store.inner.blobs.len(), 4);
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+        assert_eq!(store.operations, ["snapshot", "reader", "flush"]);
+        assert!(store.put_handles.is_empty());
+    }
+
+    #[test]
+    fn validated_writer_repairs_an_assertion_whose_content_has_not_arrived() {
+        let mut fixture = Fixture::new();
+        let (event, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+        let event_handle = event.handle();
+        let assertion = sign_recipient_event(&fixture.recipient, &event);
+        let mut store = RecordingStore::default();
+        store
+            .inner
+            .append_pin_assertion(assertion)
+            .expect("seed assertion without its closure");
+
+        let receipt =
+            append_validated_recipient_event(&mut store, &fixture.recipient, event, [partial_cap])
+                .expect("exact retry repairs missing content");
+        assert_eq!(receipt.event(), event_handle);
+        assert_eq!(receipt.assertion(), assertion.id());
+        assert_eq!(
+            store.operations,
+            [
+                "snapshot", "reader", "put", "put", "put", "put", "reader", "flush"
+            ]
+        );
+        assert_eq!(store.inner.blobs.len(), 4);
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+
+        let snapshot = store.inner.pin_assertion_snapshot().unwrap();
+        let reader = store.inner.reader().unwrap();
+        assert!(matches!(
+            resolve_recipient_ledger(&snapshot, fixture.recipient.verifying_key(), |handle| {
+                reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+            }),
+            RecipientLedgerResolution::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn validated_writer_preserves_existing_blob_read_errors() {
+        let mut fixture = Fixture::new();
+        let (candidate, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+        let dangling = RecipientEvent::FounderGrantSelected {
+            team_root: fixture.root.verifying_key(),
+            scope_root: fixture.scope_root,
+            supersedes: BTreeSet::new(),
+        };
+        let dangling_handle = dangling.handle();
+        let mut store = RecordingStore::default();
+        store
+            .inner
+            .append_pin_assertion(sign_recipient_event(&fixture.recipient, &dangling))
+            .expect("seed assertion without event content");
+
+        let error = append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            candidate,
+            [partial_cap],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RecipientLedgerWriteError::Read { handle, .. } if handle == dangling_handle
+        ));
+        assert_eq!(store.operations, ["snapshot", "reader"]);
+        assert_eq!(store.inner.blobs.len(), 0);
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validated_writer_rejects_a_backend_returning_the_wrong_put_handle() {
+        let mut fixture = Fixture::new();
+        let (event, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+        let mut store = RecordingStore {
+            lie_about_put_handle: true,
+            ..RecordingStore::default()
+        };
+
+        let error =
+            append_validated_recipient_event(&mut store, &fixture.recipient, event, [partial_cap])
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            RecipientLedgerWriteError::PutHandleMismatch {
+                stage: "closure blob",
+                ..
+            }
+        ));
+        assert_eq!(store.operations, ["snapshot", "reader", "put"]);
+        assert_eq!(store.inner.blobs.len(), 1);
+        assert!(store.inner.pin_assertion_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn validated_writer_does_not_trust_cached_handles_on_duplicate_presence_check() {
+        let mut fixture = Fixture::new();
+        let (event, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+        let event_handle = event.handle();
+        let mut store = RecordingStore::default();
+        append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            event.clone(),
+            [partial_cap.clone()],
+        )
+        .expect("seed valid publication");
+
+        let poisoned = Blob::<UnknownBlob>::with_handle(
+            Bytes::from_source(b"wrong bytes under the event handle".to_vec()),
+            Inline::new(event_handle.raw),
+        );
+        let existing = store.inner.blobs.reader().unwrap();
+        store.inner.blobs = existing
+            .iter()
+            .map(|(handle, blob)| {
+                if handle.raw == event_handle.raw {
+                    (handle, poisoned.clone())
+                } else {
+                    (handle, blob)
+                }
+            })
+            .collect();
+        store.operations.clear();
+        store.put_handles.clear();
+
+        let error =
+            append_validated_recipient_event(&mut store, &fixture.recipient, event, [partial_cap])
+                .expect_err("a backend retaining poisoned content must fail closed");
+        assert!(matches!(
+            error,
+            RecipientLedgerWriteError::StoredContentMismatch {
+                stage: "event blob",
+                ..
+            }
+        ));
+        assert_eq!(
+            store.operations,
+            ["snapshot", "reader", "put", "put", "put", "put", "reader"]
+        );
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validated_writer_is_complete_after_pile_reopen_without_post_append_flush() {
+        let mut fixture = Fixture::new();
+        let (event, partial_cap) = fixture.publishable_intent(PERM_READ, 1_000.0);
+        let event_handle = event.handle();
+        let dir = tempfile::tempdir().expect("temporary pile directory");
+        let path = dir.path().join("recipient-ledger.pile");
+        std::fs::File::create(&path).expect("create empty pile");
+
+        {
+            let mut pile = Pile::open(&path).expect("open recipient pile");
+            let receipt = append_validated_recipient_event(
+                &mut pile,
+                &fixture.recipient,
+                event,
+                [partial_cap],
+            )
+            .expect("durably publish recipient intent");
+            assert_eq!(receipt.event(), event_handle);
+            // Deliberately drop without another flush. Content was flushed
+            // first; the assertion append is durable on return.
+        }
+
+        let mut reopened = Pile::open(&path).expect("reopen recipient pile");
+        let snapshot = reopened
+            .pin_assertion_snapshot()
+            .expect("replay durable assertion");
+        assert_eq!(snapshot.len(), 1);
+        let reader = reopened.reader().expect("open replay reader");
+        reader
+            .get::<Blob<RecipientLedgerDescriptor>, RecipientLedgerDescriptor>(
+                RecipientLedgerDescriptor::descriptor_handle(),
+            )
+            .expect("replay inner recipient descriptor");
+        reader
+            .get::<Blob<StrongPinDescriptor>, StrongPinDescriptor>(
+                RecipientLedgerDescriptor::strong_blob().get_handle(),
+            )
+            .expect("replay strong recipient descriptor");
+        let RecipientLedgerResolution::Complete(view) =
+            resolve_recipient_ledger(&snapshot, fixture.recipient.verifying_key(), |handle| {
+                reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+            })
+        else {
+            panic!("one-flush publication must replay as a complete ledger")
+        };
+        assert!(view.event_handles().contains(&event_handle));
     }
 
     #[test]
@@ -1868,6 +2783,28 @@ mod tests {
             view.pending_intents_for(fixture.root.verifying_key())
                 .is_none_or(BTreeMap::is_empty)
         );
+    }
+
+    #[test]
+    fn credential_acceptance_with_an_unasserted_parent_is_incomplete_not_a_panic() {
+        let mut fixture = Fixture::new();
+        let missing_parent = handle(91);
+        let (_, sig) = fixture.credential(PERM_READ, 100.0);
+        let acceptance = RecipientEvent::CredentialAccepted {
+            team_root: fixture.root.verifying_key(),
+            sig,
+            basis: BTreeSet::from([missing_parent]),
+        };
+        let mut snapshot = PinAssertionSnapshot::new();
+        fixture.insert_event(&mut snapshot, &acceptance);
+
+        assert!(matches!(
+            fixture.resolve(&snapshot),
+            RecipientLedgerResolution::Incomplete {
+                missing,
+                unknown_parents,
+            } if missing.is_empty() && unknown_parents == vec![missing_parent]
+        ));
     }
 
     #[test]
