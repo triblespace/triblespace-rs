@@ -909,11 +909,13 @@ pub enum InvalidCredentialReason {
 pub struct RecipientLedgerView {
     author: VerifyingKey,
     event_handles: BTreeSet<RecipientEventHandle>,
+    events: BTreeMap<RecipientEventHandle, RecipientEvent>,
     intent_frontiers: BTreeMap<[u8; 32], BTreeMap<RecipientEventHandle, IntentFrontierEntry>>,
     pending_intents: BTreeMap<[u8; 32], BTreeMap<RecipientEventHandle, PendingIntent>>,
     credentials: BTreeMap<[u8; 32], RecipientCredentialResolution>,
     founder_grants: BTreeMap<[u8; 32], FounderGrantResolution>,
     inactive_acceptances: BTreeSet<RecipientEventHandle>,
+    contested_intents: BTreeSet<RecipientEventHandle>,
 }
 
 impl RecipientLedgerView {
@@ -923,6 +925,11 @@ impl RecipientLedgerView {
 
     pub fn event_handles(&self) -> &BTreeSet<RecipientEventHandle> {
         &self.event_handles
+    }
+
+    /// Exact verified canonical event asserted under this author ledger.
+    pub fn event(&self, handle: RecipientEventHandle) -> Option<&RecipientEvent> {
+        self.events.get(&handle)
     }
 
     /// Unsuperseded declaration frontier, including disposed tips.
@@ -981,6 +988,12 @@ impl RecipientLedgerView {
     /// causal roots was later canceled or superseded in the merged view.
     pub fn inactive_acceptances(&self) -> &BTreeSet<RecipientEventHandle> {
         &self.inactive_acceptances
+    }
+
+    /// Intent roots consumed by a valid acceptance but canceled or superseded
+    /// in this complete merged view.
+    pub fn contested_intents(&self) -> &BTreeSet<RecipientEventHandle> {
+        &self.contested_intents
     }
 }
 
@@ -1358,6 +1371,11 @@ where
         .copied()
         .filter(|event| !eligible_acceptances.contains(event))
         .collect();
+    let contested_intents = acceptance_roots
+        .values()
+        .flat_map(|roots| roots.iter().copied())
+        .filter(|root| canceled_intents.contains(root) || superseded_intents.contains(root))
+        .collect();
 
     let consumed_intents: BTreeSet<_> = eligible_acceptances
         .iter()
@@ -1426,11 +1444,13 @@ where
     RecipientLedgerResolution::Complete(RecipientLedgerView {
         author,
         event_handles: asserted_handles,
+        events,
         intent_frontiers,
         pending_intents,
         credentials,
         founder_grants,
         inactive_acceptances,
+        contested_intents,
     })
 }
 
@@ -3103,7 +3123,7 @@ mod tests {
             sig,
             basis: BTreeSet::from([intent_handle]),
         };
-        fixture.insert_event(&mut snapshot, &accepted);
+        let accepted_handle = fixture.insert_event(&mut snapshot, &accepted);
 
         let RecipientLedgerResolution::Complete(view) = fixture.resolve(&snapshot) else {
             panic!("valid acceptance")
@@ -3123,6 +3143,9 @@ mod tests {
             current.capability().subject,
             fixture.recipient.verifying_key()
         );
+        assert_eq!(view.event(intent_handle), Some(&intent));
+        assert_eq!(view.event(accepted_handle), Some(&accepted));
+        assert!(view.contested_intents().is_empty());
         assert!(view.pending_intents().is_empty());
     }
 
@@ -3212,6 +3235,7 @@ mod tests {
                     Some(RecipientCredentialResolution::Unaccepted)
                 ),
                 view.inactive_acceptances().clone(),
+                view.contested_intents().clone(),
                 view.intent_frontier(team_root)
                     .and_then(|frontier| frontier.get(&intent_handle))
                     .map(IntentFrontierEntry::disposition),
@@ -3220,6 +3244,7 @@ mod tests {
         let expected = (
             true,
             BTreeSet::from([accepted_handle]),
+            BTreeSet::from([intent_handle]),
             Some(IntentDisposition::Canceled),
         );
         assert_eq!(project(&cancel_then_accept), expected);
@@ -3254,6 +3279,7 @@ mod tests {
             view.inactive_acceptances(),
             &BTreeSet::from([accepted_handle])
         );
+        assert_eq!(view.contested_intents(), &BTreeSet::from([intent_handle]));
     }
 
     #[test]
@@ -3308,6 +3334,7 @@ mod tests {
                 view.inactive_acceptances(),
                 &BTreeSet::from([accepted_handle])
             );
+            assert_eq!(view.contested_intents(), &BTreeSet::from([original_handle]));
             assert!(matches!(
                 view.intent_frontier(team_root),
                 Some(frontier)
