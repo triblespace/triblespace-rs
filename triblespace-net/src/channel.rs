@@ -68,9 +68,13 @@ pub enum NetEvent {
         partial_cap_bytes: Bytes,
         /// Admission token for the bounded pre-policy request queue. Keeping
         /// the permit in the event means capacity is released automatically
-        /// when the Peer consumes or drops this request; no acknowledgement
-        /// channel or separate queue ledger is needed.
+        /// when the Peer consumes or drops this request.
         admission: tokio::sync::OwnedSemaphorePermit,
+        /// Completed by the synchronous Peer only after the request has been
+        /// recorded and flushed. `true` is the durability receipt that permits
+        /// the host to send `STATUS_OK`; rejection, persistence failure, Peer
+        /// shutdown, and request timeout can never produce a positive ACK.
+        completion: tokio::sync::oneshot::Sender<bool>,
     },
     /// A peer issued us a capability — either in response to a prior
     /// `CapRequest` we made, or as an unsolicited renewal push. The

@@ -1263,10 +1263,9 @@ struct SnapshotHandler<T: Transport> {
 
 /// Protocol handler for `/triblespace/auth-handshake/2`. Accepts
 /// incoming `OP_REQUEST_CAP` and `OP_DELIVER_CAP` streams and
-/// forwards their payloads to the Peer's event channel. All policy
-/// (approve / queue / reject; verify / pin / drop) lives in the
-/// receiving Peer, not here — this handler just bridges the wire to
-/// the local event queue.
+/// forwards their payloads to the Peer's event channel. Request ACKs wait for
+/// the Peer's durable completion receipt; all policy (approve / queue / reject;
+/// verify / pin / drop) still lives in the receiving Peer.
 #[derive(Clone)]
 struct HandshakeHandler<T: Transport> {
     events: mpsc::Sender<NetEvent>,
@@ -1329,6 +1328,41 @@ fn partial_cap_names_subject(
     )
 }
 
+/// Admit one parsed request to the synchronous policy loop and wait for its
+/// durability receipt. The surrounding handshake deadline bounds this wait;
+/// if it fires, dropping the receiver deliberately leaves the client with an
+/// ambiguous outcome that an exact idempotent replay can resolve.
+async fn enqueue_cap_request(
+    events: &mpsc::Sender<NetEvent>,
+    request_slots: &Arc<tokio::sync::Semaphore>,
+    requester: PublisherKey,
+    partial_cap_bytes: anybytes::Bytes,
+) -> u8 {
+    let Ok(admission) = request_slots.clone().try_acquire_owned() else {
+        debug!(
+            limit = CAP_REQUEST_QUEUE_LIMIT,
+            "OP_REQUEST_CAP policy queue is full"
+        );
+        return crate::handshake::STATUS_REJECTED;
+    };
+    let (completion, durable) = tokio::sync::oneshot::channel();
+    if events
+        .send(NetEvent::CapRequest {
+            requester,
+            partial_cap_bytes,
+            admission,
+            completion,
+        })
+        .is_err()
+    {
+        return crate::handshake::STATUS_REJECTED;
+    }
+    match durable.await {
+        Ok(true) => crate::handshake::STATUS_OK,
+        Ok(false) | Err(_) => crate::handshake::STATUS_REJECTED,
+    }
+}
+
 impl<T: Transport> HandshakeHandler<T> {
     async fn handle(
         &self,
@@ -1382,27 +1416,14 @@ impl<T: Transport> HandshakeHandler<T> {
                         ) {
                             debug!("OP_REQUEST_CAP subject is malformed or differs from TLS peer");
                             crate::handshake::STATUS_REJECTED
-                        } else if let Ok(admission) =
-                            request_slots.clone().try_acquire_owned()
-                        {
-                            if events
-                                .send(NetEvent::CapRequest {
-                                    requester: peer_pubkey_bytes,
-                                    partial_cap_bytes,
-                                    admission,
-                                })
-                                .is_ok()
-                            {
-                                crate::handshake::STATUS_OK
-                            } else {
-                                crate::handshake::STATUS_REJECTED
-                            }
                         } else {
-                            debug!(
-                                limit = CAP_REQUEST_QUEUE_LIMIT,
-                                "OP_REQUEST_CAP policy queue is full"
-                            );
-                            crate::handshake::STATUS_REJECTED
+                            enqueue_cap_request(
+                                &events,
+                                &request_slots,
+                                peer_pubkey_bytes,
+                                partial_cap_bytes,
+                            )
+                            .await
                         };
                         let _ = crate::handshake::respond(&mut send, status).await;
                     }
@@ -2167,6 +2188,71 @@ async fn serve_stream<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cap_request_status_waits_for_the_peer_durability_receipt() {
+        let (events, receiver) = mpsc::channel();
+        let request_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let task_events = events.clone();
+        let task_slots = Arc::clone(&request_slots);
+        let task = tokio::spawn(async move {
+            enqueue_cap_request(
+                &task_events,
+                &task_slots,
+                [0x81; 32],
+                anybytes::Bytes::from_source(b"partial-cap".to_vec()),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        let event = receiver
+            .try_recv()
+            .expect("request reaches the synchronous Peer queue");
+        let NetEvent::CapRequest {
+            completion,
+            admission: _admission,
+            ..
+        } = event
+        else {
+            panic!("expected capability request")
+        };
+        assert!(
+            !task.is_finished(),
+            "queue admission alone must not produce a wire status"
+        );
+
+        completion.send(true).expect("host still awaits receipt");
+        assert_eq!(task.await.unwrap(), crate::handshake::STATUS_OK);
+    }
+
+    #[tokio::test]
+    async fn cap_request_negative_durability_receipt_is_rejected() {
+        let (events, receiver) = mpsc::channel();
+        let request_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let task_events = events.clone();
+        let task_slots = Arc::clone(&request_slots);
+        let task = tokio::spawn(async move {
+            enqueue_cap_request(
+                &task_events,
+                &task_slots,
+                [0x82; 32],
+                anybytes::Bytes::from_source(b"partial-cap".to_vec()),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        let event = receiver
+            .try_recv()
+            .expect("request reaches the synchronous Peer queue");
+        let NetEvent::CapRequest { completion, .. } = event else {
+            panic!("expected capability request")
+        };
+        completion.send(false).expect("host still awaits receipt");
+
+        assert_eq!(task.await.unwrap(), crate::handshake::STATUS_REJECTED);
+    }
 
     #[derive(Clone)]
     struct CloseProbe(Arc<std::sync::atomic::AtomicBool>);

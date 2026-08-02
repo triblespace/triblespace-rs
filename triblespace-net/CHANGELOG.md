@@ -67,8 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verified active `(subject, scope)` to the unique non-retracted self-policy
   before issuing, records the chain-effective deadline, and completes the
   local delivery marker only after coherent proof serving and outbound-auth
-  publication. Wire `STATUS_OK` acknowledges queue admission, not durable
-  policy acceptance.
+  publication. An `OP_REQUEST_CAP` `STATUS_OK` now follows durable pending-state
+  recording and flush; queue admission and persistence failures are rejected,
+  while a timeout can be resolved by exact idempotent replay. Delivery ACKs
+  retain their queue-admission meaning.
 - **Serving resources fail closed.** Unauthenticated work, authenticated
   connections, and post-auth streams are globally bounded; each subject may
   hold at most one live inbound pile-sync connection, including while admitted

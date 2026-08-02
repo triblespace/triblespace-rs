@@ -9,7 +9,8 @@
 //!
 //!   `OP_REQUEST_CAP` (subject → issuer)
 //!     subject sends a partial cap blob (subject + scope + expiry it
-//!     wants). issuer responds with an ACK byte and closes. issuer then
+//!     wants). issuer responds with an ACK only after the exact request is
+//!     durably recorded, then closes. issuer then
 //!     either: (a) auto-approves via its renewal-policy branch and
 //!     dispatches `OP_DELIVER_CAP` in the daemon's next tick, or
 //!     (b) queues the request for human approval — when the human
@@ -53,14 +54,13 @@ pub const OP_DELIVER_CAP: u8 = 0x02;
 /// It is not an unauthenticated general-purpose blob read.
 pub const OP_FETCH_CAPABILITY_BLOB: u8 = 0x03;
 
-/// Status: request accepted into the bounded local policy-processing queue.
-/// This is not a durability acknowledgement; the sender should expect a later
-/// `OP_DELIVER_CAP` push from the issuer, or no response if policy/storage
-/// processing subsequently declines it.
+/// Status: the exact request was durably recorded in the issuer's pending
+/// policy state. A timed-out request has an ambiguous outcome and may be
+/// replayed exactly; replay is idempotent.
 pub const STATUS_OK: u8 = 0x00;
-/// Status: request rejected (e.g. issuer is not an admin of the
-/// requested team; sender's pubkey is not eligible). Sender shouldn't
-/// retry until something changes out-of-band.
+/// Status: request was not durably accepted. This includes stable policy
+/// refusal as well as transient queue or storage failure; callers may retry
+/// transient failures, while a policy refusal needs an out-of-band change.
 pub const STATUS_REJECTED: u8 = 0x01;
 /// Status: payload malformed (couldn't decode the partial cap, length
 /// prefix exceeds bounds, etc.). Bug or version mismatch.

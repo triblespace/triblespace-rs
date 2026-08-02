@@ -364,8 +364,14 @@ where
                     requester,
                     partial_cap_bytes,
                     admission: _admission,
+                    completion,
                 } => {
-                    self.absorb_cap_request(requester, partial_cap_bytes);
+                    let result = self.absorb_cap_request(requester, partial_cap_bytes);
+                    // The host's STATUS_OK is downstream of this receipt. A
+                    // dropped receiver is an ambiguous network outcome only:
+                    // the durable request remains idempotently replayable.
+                    let _ = completion.send(matches!(result, Ok(true)));
+                    result?;
                 }
                 NetEvent::CapDelivered {
                     issuer,
@@ -474,7 +480,11 @@ where
     /// branch. The entity id becomes the value `team approve <id>`
     /// consumes; the partial-cap blob is recoverable from the entity's
     /// `request_partial_cap` handle.
-    fn absorb_cap_request(&mut self, requester: PublisherKey, partial_cap_bytes: anybytes::Bytes) {
+    fn absorb_cap_request(
+        &mut self,
+        requester: PublisherKey,
+        partial_cap_bytes: anybytes::Bytes,
+    ) -> Result<bool, PeerRefreshError> {
         use triblespace_core::blob::Blob;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::inline::TryToInline;
@@ -490,7 +500,7 @@ where
                 requester = %hex::encode(&requester[..4]),
                 "CapRequest: bad requester pubkey; dropping"
             );
-            return;
+            return Ok(false);
         };
 
         // Parse before persistence and bind the declared cap subject to the
@@ -503,7 +513,7 @@ where
                 requester = %hex::encode(&requester[..4]),
                 "CapRequest: malformed partial capability; dropping"
             );
-            return;
+            return Ok(false);
         };
         let subjects: Vec<(Id, ed25519_dalek::VerifyingKey)> = find!(
             (cap: Id, subject: ed25519_dalek::VerifyingKey),
@@ -518,7 +528,7 @@ where
                 declared_subjects = subjects.len(),
                 "CapRequest: partial capability subject does not uniquely match requester; dropping"
             );
-            return;
+            return Ok(false);
         }
 
         // Point-interval at "now" — pending-requests timeline is
@@ -527,26 +537,35 @@ where
         let received_at = (now, now).try_to_inline().expect("point interval");
         let mut store = self.store.lock().expect("store mutex");
 
-        match crate::policy::record_pending_request(
+        match crate::policy::record_pending_request_checked(
             &mut *store,
             requester_pubkey,
             blob,
             received_at,
         ) {
-            Some(req_id) => {
+            Ok(Some(req_id)) => {
+                store.flush().map_err(|error| {
+                    PeerRefreshError::new("flush pending capability request", error)
+                })?;
                 let req_id_bytes: [u8; 16] = req_id.into();
                 tracing::info!(
                     requester = %hex::encode(&requester[..4]),
                     request_id = %hex::encode(req_id_bytes),
-                    "CapRequest recorded as pending"
+                    "CapRequest durably recorded as pending"
                 );
+                Ok(true)
             }
-            None => {
+            Ok(None) => {
                 tracing::warn!(
                     requester = %hex::encode(&requester[..4]),
-                    "CapRequest: failed to record on pending-requests pin"
+                    "CapRequest: pending-request policy refused the request"
                 );
+                Ok(false)
             }
+            Err(error) => Err(PeerRefreshError::new(
+                "record pending capability request",
+                error,
+            )),
         }
     }
 
@@ -2550,6 +2569,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use triblespace_core::blob::Blob;
     use triblespace_core::id::{ExclusiveId, Id, genid};
     use triblespace_core::inline::{TryFromInline, TryToInline};
@@ -2578,6 +2598,90 @@ mod tests {
         Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
             .expect("one delivery slot")
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("injected flush failure")]
+    struct InjectedFlushError;
+
+    struct FlushProbe {
+        inner: MemoryRepo,
+        flushes: Arc<AtomicUsize>,
+        fail_flush: bool,
+    }
+
+    impl triblespace_core::repo::BlobStorePut for FlushProbe {
+        type PutError = <MemoryRepo as triblespace_core::repo::BlobStorePut>::PutError;
+
+        fn put<E, T>(&mut self, item: T) -> Result<Inline<Handle<E>>, Self::PutError>
+        where
+            E: BlobEncoding + 'static,
+            T: IntoBlob<E>,
+            Handle<E>: InlineEncoding,
+        {
+            self.inner.put(item)
+        }
+    }
+
+    impl triblespace_core::repo::BlobStore for FlushProbe {
+        type Reader = <MemoryRepo as triblespace_core::repo::BlobStore>::Reader;
+        type ReaderError = <MemoryRepo as triblespace_core::repo::BlobStore>::ReaderError;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.inner.reader()
+        }
+    }
+
+    impl triblespace_core::repo::PinStore for FlushProbe {
+        type PinsError = <MemoryRepo as triblespace_core::repo::PinStore>::PinsError;
+        type HeadError = <MemoryRepo as triblespace_core::repo::PinStore>::HeadError;
+        type UpdateError = <MemoryRepo as triblespace_core::repo::PinStore>::UpdateError;
+        type ListIter<'a> = <MemoryRepo as triblespace_core::repo::PinStore>::ListIter<'a>;
+
+        fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
+            self.inner.pins()
+        }
+
+        fn head(
+            &mut self,
+            id: Id,
+        ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
+            self.inner.head(id)
+        }
+
+        fn update(
+            &mut self,
+            id: Id,
+            old: Option<Inline<Handle<SimpleArchive>>>,
+            new: Option<Inline<Handle<SimpleArchive>>>,
+        ) -> Result<PushResult, Self::UpdateError> {
+            self.inner.update(id, old, new)
+        }
+    }
+
+    impl PinAssertionStore for FlushProbe {
+        type Error = <MemoryRepo as PinAssertionStore>::Error;
+
+        fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+            self.inner.pin_assertion_snapshot()
+        }
+
+        fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+            self.inner.append_pin_assertion(assertion)
+        }
+    }
+
+    impl StorageFlush for FlushProbe {
+        type Error = InjectedFlushError;
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_flush {
+                Err(InjectedFlushError)
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[test]
@@ -2840,6 +2944,106 @@ mod tests {
     }
 
     #[test]
+    fn cap_request_positive_receipt_survives_ungraceful_pile_reopen() {
+        use triblespace_core::repo::pile::Pile;
+
+        let signing_key = SigningKey::from_bytes(&[0x71; 32]);
+        let requester = SigningKey::from_bytes(&[0x72; 32]).verifying_key();
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let dir = tempfile::tempdir().expect("temporary pile directory");
+        let path = dir.path().join("durable-join-request.pile");
+        std::fs::File::create(&path).expect("create empty pile");
+        let mut peer = Peer::with_wiring(
+            Pile::open(&path).expect("open pile"),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+        let (completion, mut receipt) = tokio::sync::oneshot::channel();
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: requester.to_bytes(),
+                partial_cap_bytes: partial_cap_bytes(requester),
+                admission: cap_request_admission(),
+                completion,
+            })
+            .expect("event channel open");
+
+        assert!(
+            matches!(
+                receipt.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "queue admission alone must not complete the wire receipt"
+        );
+
+        peer.refresh().expect("persist queued request");
+
+        assert_eq!(
+            receipt.try_recv(),
+            Ok(true),
+            "only the post-flush receipt can license STATUS_OK"
+        );
+        // Deliberately do not call close(): process death would only drop the
+        // file handle. Reopening after that boundary proves the positive
+        // receipt was downstream of Pile's crash-durability flush.
+        drop(peer.into_store());
+        let mut reopened = Pile::open(&path).expect("reopen flushed pile");
+        assert_eq!(crate::policy::list_pending_requests(&mut reopened).len(), 1);
+        reopened.close().expect("close reopened pile");
+    }
+
+    #[test]
+    fn cap_request_flush_failure_is_not_acknowledged_and_is_fail_stop() {
+        let signing_key = SigningKey::from_bytes(&[0x73; 32]);
+        let requester = SigningKey::from_bytes(&[0x74; 32]).verifying_key();
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut peer = Peer::with_wiring(
+            FlushProbe {
+                inner: MemoryRepo::default(),
+                flushes: Arc::clone(&flushes),
+                fail_flush: true,
+            },
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+        let (completion, mut receipt) = tokio::sync::oneshot::channel();
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: requester.to_bytes(),
+                partial_cap_bytes: partial_cap_bytes(requester),
+                admission: cap_request_admission(),
+                completion,
+            })
+            .expect("event channel open");
+
+        let error = peer.refresh().expect_err("flush failure must propagate");
+
+        assert_eq!(error.operation(), "flush pending capability request");
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            receipt.try_recv(),
+            Ok(false),
+            "a persistence failure must map to STATUS_REJECTED, never STATUS_OK"
+        );
+        assert_eq!(
+            peer.refresh()
+                .expect_err("persistence failure stays sticky"),
+            error
+        );
+    }
+
+    #[test]
     fn cap_request_subject_must_match_authenticated_requester() {
         let signing_key = SigningKey::from_bytes(&[10; 32]);
         let requester = SigningKey::from_bytes(&[11; 32]).verifying_key();
@@ -2856,16 +3060,19 @@ mod tests {
         );
         let bytes = partial_cap_bytes(different_subject);
         let handle = Blob::<SimpleArchive>::new(bytes.clone()).get_handle();
+        let (completion, mut receipt) = tokio::sync::oneshot::channel();
         wiring
             .evt_tx
             .send(NetEvent::CapRequest {
                 requester: requester.to_bytes(),
                 partial_cap_bytes: bytes,
                 admission: cap_request_admission(),
+                completion,
             })
             .expect("event channel open");
 
         peer.refresh().unwrap();
+        assert_eq!(receipt.try_recv(), Ok(false));
 
         let mut store = peer.store.lock().expect("store mutex");
         assert!(crate::policy::list_pending_requests(&mut *store).is_empty());

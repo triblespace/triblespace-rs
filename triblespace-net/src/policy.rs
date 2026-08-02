@@ -772,21 +772,56 @@ pub fn record_pending_request<S>(
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
-    // Find or create the pending-requests pin.
-    let (pin_id, prev_head) = match find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) {
-        Some(pin_id) => {
-            let head = store.head(pin_id).ok().flatten();
-            (pin_id, head)
-        }
-        None => (local_only_pin_id(KIND_PENDING_REQUESTS), None),
-    };
+    record_pending_request_checked(store, requester, partial_cap, received_at)
+        .ok()
+        .flatten()
+}
+
+/// Record a pending request while preserving the storage error that the
+/// wire-level durability acknowledgement needs to distinguish from an
+/// ordinary policy refusal.
+///
+/// `Ok(Some(id))` means the exact request is installed (or was already
+/// installed). `Ok(None)` means a bounded-policy or compare-and-swap refusal;
+/// the caller may reject the request without poisoning the Peer. `Err` means a
+/// storage operation failed after admission, so the Peer must fail-stop and
+/// must not acknowledge the request.
+pub(crate) fn record_pending_request_checked<S>(
+    store: &mut S,
+    requester: ed25519_dalek::VerifyingKey,
+    partial_cap: Blob<SimpleArchive>,
+    received_at: Inline<NsTAIInterval>,
+) -> Result<Option<Id>, String>
+where
+    S: BlobStore + BlobStorePut + PinStore,
+{
+    let pin_id = local_only_pin_id(KIND_PENDING_REQUESTS);
+    let prev_head = store
+        .head(pin_id)
+        .map_err(|error| format!("read pending-request head: {error}"))?;
 
     // Reconstitute the current metadata blob (if any), or start fresh with
     // just the pin-kind marker.
     let meta: TribleSet = match &prev_head {
         Some(h) => {
-            let reader = store.reader().ok()?;
-            reader.get::<TribleSet, SimpleArchive>(*h).ok()?
+            let reader = store
+                .reader()
+                .map_err(|error| format!("snapshot pending requests: {error}"))?;
+            let meta = reader
+                .get::<TribleSet, SimpleArchive>(*h)
+                .map_err(|error| format!("read pending-request metadata: {error}"))?;
+            let has_marker = find!(
+                kind: Id,
+                pattern!(&meta, [{ _?e @ local_only_pin: ?kind }])
+            )
+            .any(|kind| kind == KIND_PENDING_REQUESTS);
+            if !has_marker {
+                // Never overwrite a populated canonical slot whose content is
+                // not the pending-request role. This is a state refusal, not a
+                // storage fault.
+                return Ok(None);
+            }
+            meta
         }
         None => {
             use triblespace_core::id::ExclusiveId;
@@ -801,14 +836,14 @@ where
     let request_entities = request_entity_ids(&meta);
     let mut current = current_requests_by_requester(pending_requests_from_meta(&meta));
     if current.len() > MAX_PENDING_REQUESTS {
-        return None;
+        return Ok(None);
     }
 
     let partial_cap_handle = (&partial_cap).get_handle();
     let requester_key = requester.to_bytes();
     let request_id = match current.get(&requester_key) {
         Some(existing) => existing.id,
-        None if current.len() >= MAX_PENDING_REQUESTS => return None,
+        None if current.len() >= MAX_PENDING_REQUESTS => return Ok(None),
         None => *genid(),
     };
 
@@ -827,7 +862,7 @@ where
         // sink: one TLS key could alternate two payloads forever. Once local
         // policy reaches a terminal disposition, one new request may reopen
         // the slot as Pending.
-        return None;
+        return Ok(None);
     }
     if !exact_replay {
         current.insert(
@@ -859,7 +894,7 @@ where
 
     // On an already-canonical exact replay there is nothing to write or CAS.
     if next_meta == meta {
-        return Some(request_id);
+        return Ok(Some(request_id));
     }
 
     // Admission and replay checks precede the irreversible blob append. A
@@ -867,14 +902,21 @@ where
     // sink, and exact replays append nothing. Persist the payload before the
     // pin points at it so every successfully installed head is readable.
     if !exact_replay {
-        let stored_handle: Inline<Handle<SimpleArchive>> = store.put(partial_cap).ok()?;
+        let stored_handle: Inline<Handle<SimpleArchive>> = store
+            .put(partial_cap)
+            .map_err(|error| format!("persist pending-request payload: {error}"))?;
         debug_assert_eq!(stored_handle, partial_cap_handle);
     }
 
-    let new_head: Inline<Handle<SimpleArchive>> = store.put(next_meta).ok()?;
-    match store.update(pin_id, prev_head, Some(new_head)).ok()? {
-        PushResult::Success() => Some(request_id),
-        PushResult::Conflict(_) => None,
+    let new_head: Inline<Handle<SimpleArchive>> = store
+        .put(next_meta)
+        .map_err(|error| format!("persist pending-request metadata: {error}"))?;
+    match store
+        .update(pin_id, prev_head, Some(new_head))
+        .map_err(|error| format!("install pending-request head: {error}"))?
+    {
+        PushResult::Success() => Ok(Some(request_id)),
+        PushResult::Conflict(_) => Ok(None),
     }
 }
 
