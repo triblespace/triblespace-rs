@@ -68,9 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before issuing, records the chain-effective deadline, and completes the
   local delivery marker only after coherent proof serving and outbound-auth
   publication. An `OP_REQUEST_CAP` `STATUS_OK` now follows durable pending-state
-  recording and flush; queue admission and persistence failures are rejected,
-  while a timeout can be resolved by exact idempotent replay. Delivery ACKs
-  retain their queue-admission meaning.
+  recording and flush. Explicit policy or pre-admission failures are rejected;
+  a persistence error after admission returns `STATUS_INDETERMINATE`, because a
+  failed append may already have taken effect. Exact idempotent replay resolves
+  that outcome. Delivery ACKs retain their queue-admission meaning.
 - **Serving resources fail closed.** Unauthenticated work, authenticated
   connections, and post-auth streams are globally bounded; each subject may
   hold at most one live inbound pile-sync connection, including while admitted

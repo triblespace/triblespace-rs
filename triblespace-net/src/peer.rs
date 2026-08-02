@@ -367,11 +367,22 @@ where
                     completion,
                 } => {
                     let result = self.absorb_cap_request(requester, partial_cap_bytes);
-                    // The host's STATUS_OK is downstream of this receipt. A
-                    // dropped receiver is an ambiguous network outcome only:
-                    // the durable request remains idempotently replayable.
-                    let _ = completion.send(matches!(result, Ok(true)));
-                    result?;
+                    match result {
+                        Ok(accepted) => {
+                            // Only a known semantic outcome crosses this
+                            // channel: true is the durable positive receipt,
+                            // false is an explicit policy refusal.
+                            let _ = completion.send(accepted);
+                        }
+                        Err(error) => {
+                            // PinAssertionStore cannot promise that Err means
+                            // no append took effect. Dropping the sender makes
+                            // the host return STATUS_INDETERMINATE, preserving
+                            // the requester's exact replayable intent.
+                            drop(completion);
+                            return Err(error);
+                        }
+                    }
                 }
                 NetEvent::CapDelivered {
                     issuer,
@@ -2595,6 +2606,7 @@ mod tests {
         flushes: Arc<AtomicUsize>,
         fail_flush: bool,
         fail_append: bool,
+        fail_after_append_once: bool,
     }
 
     impl triblespace_core::repo::BlobStorePut for FlushProbe {
@@ -2661,7 +2673,13 @@ mod tests {
             } else {
                 self.inner
                     .append_pin_assertion(assertion)
-                    .map_err(InjectedAssertionError::from)
+                    .map_err(InjectedAssertionError::from)?;
+                if self.fail_after_append_once {
+                    self.fail_after_append_once = false;
+                    Err(InjectedAssertionError::Injected)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -3024,7 +3042,7 @@ mod tests {
     }
 
     #[test]
-    fn cap_request_flush_failure_is_not_acknowledged_and_is_fail_stop() {
+    fn cap_request_flush_failure_drops_receipt_and_is_fail_stop() {
         let signing_key = SigningKey::from_bytes(&[0x73; 32]);
         let requester = SigningKey::from_bytes(&[0x74; 32]).verifying_key();
         let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
@@ -3037,6 +3055,7 @@ mod tests {
                 flushes: Arc::clone(&flushes),
                 fail_flush: true,
                 fail_append: false,
+                fail_after_append_once: false,
             },
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3059,10 +3078,12 @@ mod tests {
         assert_eq!(error.operation(), "observe capability request");
         assert!(error.detail().contains("failed to flush policy closure"));
         assert_eq!(flushes.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            receipt.try_recv(),
-            Ok(false),
-            "a persistence failure must map to STATUS_REJECTED, never STATUS_OK"
+        assert!(
+            matches!(
+                receipt.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "a storage error must close the receipt so the host reports an indeterminate outcome"
         );
         assert_eq!(
             peer.refresh()
@@ -3074,7 +3095,7 @@ mod tests {
     }
 
     #[test]
-    fn cap_request_assertion_failure_is_not_acknowledged_and_is_fail_stop() {
+    fn cap_request_assertion_failure_drops_receipt_and_is_fail_stop() {
         let signing_key = SigningKey::from_bytes(&[0x75; 32]);
         let requester = SigningKey::from_bytes(&[0x76; 32]).verifying_key();
         let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
@@ -3087,6 +3108,7 @@ mod tests {
                 flushes: Arc::clone(&flushes),
                 fail_flush: false,
                 fail_append: true,
+                fail_after_append_once: false,
             },
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3111,13 +3133,121 @@ mod tests {
         assert_eq!(error.operation(), "observe capability request");
         assert!(error.detail().contains("failed to append policy assertion"));
         assert_eq!(flushes.load(Ordering::SeqCst), 1);
-        assert_eq!(receipt.try_recv(), Ok(false));
+        assert!(
+            matches!(
+                receipt.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "an assertion error must not manufacture a definitive refusal"
+        );
         assert_eq!(
             peer.refresh().expect_err("assertion failure stays sticky"),
             error
         );
         let mut store = peer.store.lock().expect("store mutex");
         assert!(store.pin_assertion_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cap_request_post_effect_append_error_is_indeterminate_and_exact_replay_recovers() {
+        let signing_key = SigningKey::from_bytes(&[0x77; 32]);
+        let requester = SigningKey::from_bytes(&[0x78; 32]).verifying_key();
+        let partial_cap_bytes = partial_cap_bytes(requester, signing_key.verifying_key());
+        let partial_cap = Blob::<SimpleArchive>::new(partial_cap_bytes.clone()).get_handle();
+        let request = crate::policy_ledger::RequestIdentity::new(requester, partial_cap);
+        let expected = crate::policy_ledger::sign_policy_event(
+            &signing_key,
+            crate::policy_ledger::PolicyEvent::RequestObserved(request),
+        );
+        let flushes = Arc::new(AtomicUsize::new(0));
+
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            FlushProbe {
+                inner: MemoryRepo::default(),
+                flushes: Arc::clone(&flushes),
+                fail_flush: false,
+                fail_append: false,
+                fail_after_append_once: true,
+            },
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+        let (completion, mut receipt) = tokio::sync::oneshot::channel();
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: requester.to_bytes(),
+                partial_cap_bytes: partial_cap_bytes.clone(),
+                admission: cap_request_admission(),
+                completion,
+            })
+            .expect("event channel open");
+
+        let error = peer
+            .refresh()
+            .expect_err("post-effect assertion error must fail-stop");
+        assert_eq!(error.operation(), "observe capability request");
+        assert!(error.detail().contains("failed to append policy assertion"));
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(
+            peer.refresh()
+                .expect_err("post-effect failure stays sticky"),
+            error
+        );
+        {
+            let mut store = peer.store.lock().expect("store mutex");
+            let snapshot = store.pin_assertion_snapshot().unwrap();
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(
+                snapshot.for_pin(&crate::policy_ledger::PolicyLedgerDescriptor::pin_identity(
+                    signing_key.verifying_key(),
+                )),
+                vec![expected],
+                "the failed append result does not prove the assertion had no effect"
+            );
+        }
+
+        let retained = peer.into_store();
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut restarted = Peer::with_wiring(
+            retained,
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+        let (completion, mut replay_receipt) = tokio::sync::oneshot::channel();
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: requester.to_bytes(),
+                partial_cap_bytes,
+                admission: cap_request_admission(),
+                completion,
+            })
+            .expect("replay event channel open");
+
+        restarted
+            .refresh()
+            .expect("exact replay resolves the indeterminate outcome");
+        assert_eq!(replay_receipt.try_recv(), Ok(true));
+        let mut store = restarted.store.lock().expect("store mutex");
+        assert_eq!(
+            store.pin_assertion_snapshot().unwrap().len(),
+            1,
+            "exact replay must not duplicate the already-applied assertion"
+        );
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

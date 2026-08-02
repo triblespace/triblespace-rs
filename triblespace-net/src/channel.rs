@@ -70,10 +70,13 @@ pub enum NetEvent {
         /// the permit in the event means capacity is released automatically
         /// when the Peer consumes or drops this request.
         admission: tokio::sync::OwnedSemaphorePermit,
-        /// Completed by the synchronous Peer only after the request has been
-        /// recorded and flushed. `true` is the durability receipt that permits
-        /// the host to send `STATUS_OK`; rejection, persistence failure, Peer
-        /// shutdown, and request timeout can never produce a positive ACK.
+        /// Completed by the synchronous Peer only for a known policy outcome:
+        /// `true` means the request was durably recorded and permits
+        /// `STATUS_OK`; `false` means policy definitely refused it and permits
+        /// `STATUS_REJECTED`. Persistence failure drops this sender so the host
+        /// returns `STATUS_INDETERMINATE`, because a failed append may still
+        /// have taken effect. Peer shutdown and request timeout likewise never
+        /// manufacture a definitive negative receipt.
         completion: tokio::sync::oneshot::Sender<bool>,
     },
     /// A peer issued us a capability — either in response to a prior

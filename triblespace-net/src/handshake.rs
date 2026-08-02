@@ -58,13 +58,18 @@ pub const OP_FETCH_CAPABILITY_BLOB: u8 = 0x03;
 /// policy state. A timed-out request has an ambiguous outcome and may be
 /// replayed exactly; replay is idempotent.
 pub const STATUS_OK: u8 = 0x00;
-/// Status: request was not durably accepted. This includes stable policy
-/// refusal as well as transient queue or storage failure; callers may retry
-/// transient failures, while a policy refusal needs an out-of-band change.
+/// Status: request was definitely not accepted. This covers stable policy
+/// refusal and failures before the request entered the synchronous policy
+/// loop, such as queue admission or event delivery failure.
 pub const STATUS_REJECTED: u8 = 0x01;
 /// Status: payload malformed (couldn't decode the partial cap, length
 /// prefix exceeds bounds, etc.). Bug or version mismatch.
 pub const STATUS_MALFORMED: u8 = 0x02;
+/// Status: the request entered the policy loop, but its durable publication
+/// outcome is unknown. In particular, a storage API may report an error after
+/// an append became visible or durable. The requester must retain its exact
+/// local intent and may replay the same request idempotently.
+pub const STATUS_INDETERMINATE: u8 = 0x03;
 
 /// Hard cap on per-blob payload size accepted on the wire — defensive
 /// against memory abuse from misbehaving peers. Real cap blobs are

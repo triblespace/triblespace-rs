@@ -1419,6 +1419,9 @@ fn run_request_join(
             partial_handle,
             "admin rejected the request as malformed (version mismatch or bad payload)",
         ),
+        triblespace_net::handshake::STATUS_INDETERMINATE => bail!(
+            "admin reported an indeterminate persistence outcome; the durable local expectation was retained and the exact request may be replayed safely"
+        ),
         // An unknown response is not a trustworthy assertion that the request
         // was rejected. Keep the expectation for the same reason as a lost
         // ACK: accepting a later delivery remains bounded to the exact local

@@ -31,9 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content closure before durably appending its assertion, and return an
   idempotent receipt. Incoming join requests now use that path end to end:
   protocol success follows the durable receipt, ordinary policy refusals stay
-  non-fatal, and storage failures fail-stop the peer. Operation-order tests pin
-  that one-way crash protocol; real-Pile reopen coverage verifies the resulting
-  ledger and both retention descriptors replay as complete content.
+  non-fatal, and storage failures fail-stop the peer without manufacturing a
+  rejection. Their wire result is explicitly indeterminate because a failed
+  append may already have taken effect; exact replay resolves the outcome.
+  Operation-order tests pin that one-way crash protocol; real-Pile reopen
+  coverage verifies the resulting ledger and both retention descriptors replay
+  as complete content.
 - **Branches are a typed adapter over generic asserted pins.** A canonical
   64-byte V2 `BranchPinDescriptor` blob contains its kind marker, canonical
   alignment padding, and LongString name handle. Its content handle is wrapped

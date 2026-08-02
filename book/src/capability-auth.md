@@ -297,9 +297,13 @@ stream is one-shot:
 
 Request, delivery, and delivery-confirmation event queues are separately
 bounded. For `OP_REQUEST_CAP`, `STATUS_OK` is sent only after the exact pending
-request has crossed the receiver's storage flush boundary. Queue admission,
-policy refusal, and persistence failure are not acknowledged. A timeout remains
-an intentionally ambiguous outcome; exact replay is idempotent and resolves it.
+request has crossed the receiver's storage flush boundary. `STATUS_REJECTED`
+means the request definitely did not enter durable policy, either because of a
+stable policy refusal or a failure before policy-loop admission. A persistence
+error after admission instead yields `STATUS_INDETERMINATE`: append APIs cannot
+promise that an error means no effect, so the requester retains its exact local
+intent and may replay it idempotently. A timeout is ambiguous for the same
+reason.
 For `OP_DELIVER_CAP`, `STATUS_OK` still means that the fully verified payload
 obtained a queue slot, not that credential selection and activation are durable.
 

@@ -1329,9 +1329,11 @@ fn partial_cap_names_subject(
 }
 
 /// Admit one parsed request to the synchronous policy loop and wait for its
-/// durability receipt. The surrounding handshake deadline bounds this wait;
-/// if it fires, dropping the receiver deliberately leaves the client with an
-/// ambiguous outcome that an exact idempotent replay can resolve.
+/// durability receipt. `false` is reserved for an explicit policy refusal.
+/// If the policy loop drops the completion sender after a storage failure, the
+/// append outcome may be ambiguous, so the wire reports indeterminate and an
+/// exact idempotent replay can resolve it. The surrounding handshake deadline
+/// independently bounds this wait.
 async fn enqueue_cap_request(
     events: &mpsc::Sender<NetEvent>,
     request_slots: &Arc<tokio::sync::Semaphore>,
@@ -1359,7 +1361,8 @@ async fn enqueue_cap_request(
     }
     match durable.await {
         Ok(true) => crate::handshake::STATUS_OK,
-        Ok(false) | Err(_) => crate::handshake::STATUS_REJECTED,
+        Ok(false) => crate::handshake::STATUS_REJECTED,
+        Err(_) => crate::handshake::STATUS_INDETERMINATE,
     }
 }
 
@@ -2227,7 +2230,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cap_request_negative_durability_receipt_is_rejected() {
+    async fn cap_request_policy_refusal_receipt_is_rejected() {
         let (events, receiver) = mpsc::channel();
         let request_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let task_events = events.clone();
@@ -2252,6 +2255,71 @@ mod tests {
         completion.send(false).expect("host still awaits receipt");
 
         assert_eq!(task.await.unwrap(), crate::handshake::STATUS_REJECTED);
+    }
+
+    #[tokio::test]
+    async fn cap_request_dropped_completion_is_indeterminate() {
+        let (events, receiver) = mpsc::channel();
+        let request_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let task_events = events.clone();
+        let task_slots = Arc::clone(&request_slots);
+        let task = tokio::spawn(async move {
+            enqueue_cap_request(
+                &task_events,
+                &task_slots,
+                [0x83; 32],
+                anybytes::Bytes::from_source(b"partial-cap".to_vec()),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        let event = receiver
+            .try_recv()
+            .expect("request reaches the synchronous Peer queue");
+        let NetEvent::CapRequest { completion, .. } = event else {
+            panic!("expected capability request")
+        };
+        drop(completion);
+
+        assert_eq!(task.await.unwrap(), crate::handshake::STATUS_INDETERMINATE);
+    }
+
+    #[tokio::test]
+    async fn cap_request_pre_policy_admission_failures_are_rejected() {
+        let (events, receiver) = mpsc::channel();
+        let request_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = request_slots
+            .clone()
+            .try_acquire_owned()
+            .expect("occupy the only policy queue slot");
+
+        assert_eq!(
+            enqueue_cap_request(
+                &events,
+                &request_slots,
+                [0x84; 32],
+                anybytes::Bytes::from_source(b"partial-cap".to_vec()),
+            )
+            .await,
+            crate::handshake::STATUS_REJECTED,
+            "queue refusal happens before policy and is definitive"
+        );
+        assert!(receiver.try_recv().is_err());
+
+        let (events, receiver) = mpsc::channel();
+        drop(receiver);
+        assert_eq!(
+            enqueue_cap_request(
+                &events,
+                &Arc::new(tokio::sync::Semaphore::new(1)),
+                [0x85; 32],
+                anybytes::Bytes::from_source(b"partial-cap".to_vec()),
+            )
+            .await,
+            crate::handshake::STATUS_REJECTED,
+            "an event that never entered the policy loop is definitely refused"
+        );
     }
 
     #[derive(Clone)]
