@@ -46,9 +46,12 @@
 //! provably monotone (wall-clock expiry, replica-local generation counters)
 //! gets *zero* skips rather than fewer — degraded, never wrong.
 //!
-//! Numeric labels must be **big-endian**, or byte order will not agree with
-//! numeric order and the encoding will silently stop being monotone in the
-//! unsound direction.
+//! One obligation falls on every *kind* that encodes a number: it must be
+//! **big-endian**, or byte order will not agree with numeric order and the
+//! encoding will silently stop being monotone in the unsound direction. This
+//! module ships no encoder, precisely so no label model is canonised here; see
+//! [`super::branch_pin`] for the branch kind's depth codec and the negative
+//! control that pins the endianness requirement.
 
 use std::error::Error;
 use std::fmt;
@@ -99,21 +102,9 @@ pub struct ValueHandle([u8; 32]);
 pub struct SubsumptionLabel([u8; 32]);
 
 impl SubsumptionLabel {
-    /// Encode a depth-like counter: big-endian in the leading 8 bytes, zero
-    /// tail. Big-endian is required — little-endian would order bytewise in a
-    /// way that disagrees with numeric order, silently breaking monotonicity.
-    pub const fn from_depth(depth: u64) -> Self {
-        let mut raw = [0u8; 32];
-        let be = depth.to_be_bytes();
-        let mut i = 0;
-        while i < 8 {
-            raw[i] = be[i];
-            i += 1;
-        }
-        Self(raw)
-    }
-
-    /// Raw bytes, for kinds that need a composite encoding.
+    /// Raw bytes. Every encoding decision belongs to the kind; this layer
+    /// deliberately ships none, so no particular label model (depth, counter,
+    /// clock) is canonised by the generic API.
     pub const fn from_raw(raw: [u8; 32]) -> Self {
         Self(raw)
     }
@@ -388,6 +379,10 @@ mod tests {
     fn val(b: u8) -> ValueHandle {
         ValueHandle([b; 32])
     }
+    /// Opaque here on purpose: the generic layer has no label semantics.
+    fn label(b: u8) -> SubsumptionLabel {
+        SubsumptionLabel::from_raw([b; 32])
+    }
 
     #[test]
     fn record_is_192_bytes_and_fits_a_256_byte_v3_record() {
@@ -400,7 +395,7 @@ mod tests {
 
     #[test]
     fn every_one_of_the_192_bytes_is_authenticated_including_the_label() {
-        let a = PinAssertion::sign(&key(7), pin(11), val(19), SubsumptionLabel::from_depth(3));
+        let a = PinAssertion::sign(&key(7), pin(11), val(19), label(3));
         let encoded = a.encode();
         assert_eq!(
             UnverifiedPinAssertion::decode_structural(encoded)
@@ -422,42 +417,13 @@ mod tests {
 
     #[test]
     fn label_is_inside_the_signature_so_only_its_author_can_inflate_it() {
-        let a = PinAssertion::sign(&key(7), pin(11), val(19), SubsumptionLabel::from_depth(1));
+        let a = PinAssertion::sign(&key(7), pin(11), val(19), label(1));
         let mut forged = a.encode();
-        forged[LABEL_RANGE].copy_from_slice(&SubsumptionLabel::from_depth(9999).raw());
+        forged[LABEL_RANGE].copy_from_slice(&label(9).raw());
         assert!(UnverifiedPinAssertion::decode_structural(forged)
             .unwrap()
             .verify_strict()
             .is_err());
-    }
-
-    #[test]
-    fn big_endian_depth_is_monotone_under_bytewise_order() {
-        let mut prev = SubsumptionLabel::from_depth(0);
-        for d in [1u64, 2, 255, 256, 65_535, 65_536, 1 << 40, u64::MAX] {
-            let cur = SubsumptionLabel::from_depth(d);
-            assert!(cur > prev, "depth {d} did not increase bytewise");
-            prev = cur;
-        }
-    }
-
-    /// NEGATIVE CONTROL. A little-endian encoding still produces a total order,
-    /// so a positive-only test would pass — but the order disagrees with
-    /// numeric order, which silently breaks monotonicity in the UNSOUND
-    /// direction (it licenses skips that are not justified). This test exists
-    /// to fail if anyone "simplifies" `from_depth` to native/little-endian.
-    #[test]
-    fn little_endian_depth_would_not_be_monotone() {
-        let le = |d: u64| {
-            let mut raw = [0u8; 32];
-            raw[..8].copy_from_slice(&d.to_le_bytes());
-            SubsumptionLabel(raw)
-        };
-        assert!(le(256) < le(1), "little-endian must misorder 1 vs 256");
-        assert!(
-            SubsumptionLabel::from_depth(256) > SubsumptionLabel::from_depth(1),
-            "big-endian must order 1 < 256"
-        );
     }
 
     /// The label exposes ordering and nothing else. A resolver that has proven
@@ -465,11 +431,9 @@ mod tests {
     /// ancestor of b"; this type neither performs nor sanctions that step.
     #[test]
     fn label_exposes_only_bytewise_order() {
-        let deep = SubsumptionLabel::from_depth(9);
-        let shallow = SubsumptionLabel::from_depth(2);
-        assert!(deep > shallow);
-        assert!(!(shallow > deep));
-        assert_eq!(deep.raw()[..8], 9u64.to_be_bytes());
+        assert!(label(9) > label(2));
+        assert!(!(label(2) > label(9)));
+        assert_eq!(label(9).raw(), [9u8; 32]);
     }
 
     /// A constant label ties every comparison, and a tie satisfies `>=`. Had
@@ -503,16 +467,16 @@ mod tests {
     #[test]
     fn two_authors_asserting_one_pin_are_distinct_registers() {
         let p = pin(5);
-        let x = PinAssertion::sign(&key(1), p, val(9), SubsumptionLabel::from_depth(1));
-        let y = PinAssertion::sign(&key(2), p, val(9), SubsumptionLabel::from_depth(1));
+        let x = PinAssertion::sign(&key(1), p, val(9), label(1));
+        let y = PinAssertion::sign(&key(2), p, val(9), label(1));
         assert_ne!(x.identity().digest(), y.identity().digest());
         assert_ne!(x.index_key(), y.index_key());
     }
 
     #[test]
     fn duplicate_signing_is_byte_identical_so_append_is_idempotent() {
-        let a = PinAssertion::sign(&key(7), pin(11), val(19), SubsumptionLabel::from_depth(4));
-        let b = PinAssertion::sign(&key(7), pin(11), val(19), SubsumptionLabel::from_depth(4));
+        let a = PinAssertion::sign(&key(7), pin(11), val(19), label(4));
+        let b = PinAssertion::sign(&key(7), pin(11), val(19), label(4));
         assert_eq!(a.encode(), b.encode());
         assert_eq!(a.id(), b.id());
         assert_eq!(a.index_key(), b.index_key());
