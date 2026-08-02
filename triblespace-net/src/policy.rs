@@ -1,5 +1,5 @@
-//! Local-only policy pins: renewal state, pending join requests, and
-//! per-team cap holdings.
+//! Local-only policy pins: renewal state, outbound join intent, and per-team
+//! cap holdings.
 //!
 //! These pins live only in the peer's repository. They are never branch
 //! authority and are not part of the network protocol: they hold typed current
@@ -14,17 +14,15 @@
 //!     cap I issued to each; here are the ones I've retracted." The
 //!     auto-renewal daemon scans this pin each tick.
 //!
-//!   - **`KIND_PENDING_REQUESTS`** — incoming `OP_REQUEST_CAP` payloads
-//!     waiting for human approval (or auto-approval if the requester
-//!     matches an existing renewal-policy entry). The CLI's
-//!     `team list-pending` reads this pin; `team approve` mutates
-//!     status entries on it.
-//!
 //!   - **`KIND_TEAM_CAP`** — one pin per team this peer is a
 //!     member of, holding the peer's own current cap chain so the
 //!     pile retains it across compaction (the single-slot pin
 //!     mechanism from decide#5ed64e57 — overwrite on renewal, old
 //!     caps auto-GC). Identified by `cap_for_team: <team_root_pubkey>`.
+//!
+//!   - **`KIND_OUTBOUND_CAP_REQUEST`** — the exact request this peer sent and
+//!     will accept as deliberate first-credential intent, including its
+//!     crash-recovery activation journal.
 //!
 //! All roles are marked with the same `local_only_pin` attribute (value = the
 //! kind tag) so a single helper distinguishes them from legacy mutable
@@ -32,8 +30,6 @@
 //!
 //! See `decide#4b59ce27` (daemon + local-only retraction policy) for
 //! the design rationale.
-
-use std::collections::{BTreeMap, BTreeSet};
 
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -47,9 +43,7 @@ use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, PushResult};
 use triblespace_core::trible::TribleSet;
 
-use crate::policy_ledger::{
-    MAX_PENDING_REQUESTS, policy_scope, policy_subject, request_partial_cap, request_requester,
-};
+use crate::policy_ledger::{policy_scope, policy_subject, request_partial_cap};
 
 attributes! {
     // ── Pin role markers ──────────────────────────────────────────────
@@ -84,17 +78,12 @@ attributes! {
     /// events and deliberately does not consult this attribute.
     "2E289E766CFD4F2554D430C31337BE2B" as pub policy_delivered_at: NsTAIInterval;
 
-    // ── Pending request entry ─────────────────────────────────────────
-    /// Exact pending request-head metadata retained while a first delivered
+    // ── Outbound request activation journal ───────────────────────────
+    /// Exact outbound request-head metadata retained while a first delivered
     /// credential is being activated. Recovery can CAS the activation journal
     /// back to this already-durable Pending head if the candidate expires
     /// before the team-cap pin is installed.
     "F4DD1EF7EEA5B600A8D947A00BEE0468" as pub request_activation_pending_head: Handle<SimpleArchive>;
-    /// Wall-clock instant the request arrived (point interval).
-    "8CC3155E937E416C8CFDC11630E9789E" as pub request_received_at: NsTAIInterval;
-    /// Current resolution status (one of the `STATUS_*` tags).
-    "4D72D56FF30DA693679F08D629DA7574" as pub request_status: GenId;
-
     // ── Per-team-cap pin ──────────────────────────────────────────────
     /// Handle of the currently-pinned cap blob for a team. Overwritten
     /// on each renewal so old caps become unreachable.
@@ -117,11 +106,6 @@ attributes! {
 pub const KIND_RENEWAL_POLICY: Id =
     triblespace_core::id::id_hex!("914CFF7C82FDE32CB84D85CE98613E62");
 
-/// Pin holds incoming `OP_REQUEST_CAP` payloads waiting for
-/// resolution.
-pub const KIND_PENDING_REQUESTS: Id =
-    triblespace_core::id::id_hex!("A2010615F2E3B528B7069C761B38C102");
-
 /// Pin holds A's own cap chain for a specific team. The pin head
 /// metadata also carries `cap_for_team: <team_root_pubkey>` so a
 /// peer with membership in multiple teams can distinguish them.
@@ -132,19 +116,6 @@ pub const KIND_TEAM_CAP: Id = triblespace_core::id::id_hex!("9BB2E5027EDB67463CC
 /// credential state.
 pub const KIND_OUTBOUND_CAP_REQUEST: Id =
     triblespace_core::id::id_hex!("3951F37FBF274D5C17D3A701BC9FD7EE");
-
-// ── Request status tags ───────────────────────────────────────────────
-
-/// Request received, not yet acted on. CLI's `team list-pending`
-/// shows entries with this status.
-pub const STATUS_PENDING: Id = triblespace_core::id::id_hex!("08A49DEBF036B127CF60D8B33A7B9B31");
-
-/// Request approved; a cap was issued and dispatched via
-/// `OP_DELIVER_CAP`. The corresponding renewal-policy entry exists.
-pub const STATUS_APPROVED: Id = triblespace_core::id::id_hex!("6186747FD38D84D23BA82F3ABE6D9952");
-
-/// Request explicitly rejected. No cap issued.
-pub const STATUS_REJECTED: Id = triblespace_core::id::id_hex!("3E54420C1F7EECFCED83203FA749C912");
 
 /// Canonical pin id for a singleton local policy role.
 ///
@@ -172,7 +143,7 @@ fn team_cap_pin_id(team_root: ed25519_dalek::VerifyingKey) -> Id {
 
 /// Returns true if the pin's head metadata carries the `local_only_pin`
 /// attribute. Serving snapshots use this to prevent renewal decisions,
-/// credentials, and pending requests from becoming legacy content roots.
+/// credentials, and outbound join intent from becoming legacy content roots.
 pub fn is_local_only_pin<S>(store: &mut S, pin_id: Id) -> bool
 where
     S: BlobStore + PinStore,
@@ -222,8 +193,8 @@ where
     if matches { Some(pin_id) } else { None }
 }
 
-/// Find the local-only pin of a given kind (e.g. `KIND_RENEWAL_POLICY`,
-/// `KIND_PENDING_REQUESTS`). Pins of these kinds have one intrinsic id per
+/// Find the local-only pin of a given kind (e.g. `KIND_RENEWAL_POLICY` or
+/// `KIND_OUTBOUND_CAP_REQUEST`). Pins of these kinds have one intrinsic id per
 /// peer repository, so lookup never depends on pin-list order.
 pub fn find_local_only_pin_of_kind<S>(store: &mut S, kind: Id) -> Option<Id>
 where
@@ -556,345 +527,6 @@ where
     {
         PushResult::Success() => Some(true),
         PushResult::Conflict(_) => Some(false),
-    }
-}
-
-/// A single pending request as recorded on the pending-requests pin.
-#[derive(Clone, Debug)]
-pub struct PendingRequest {
-    /// Entity id of this request inside the pin head metadata blob.
-    /// Stable as long as the request isn't deleted; used as the
-    /// argument to `team approve <id>`.
-    pub id: Id,
-    pub requester: ed25519_dalek::VerifyingKey,
-    pub partial_cap: Inline<Handle<SimpleArchive>>,
-    pub received_at: Inline<NsTAIInterval>,
-    pub status: Id,
-}
-
-#[derive(Default)]
-struct PendingRequestParts {
-    requesters: Vec<ed25519_dalek::VerifyingKey>,
-    partial_caps: Vec<Inline<Handle<SimpleArchive>>>,
-    received_at: Vec<Inline<NsTAIInterval>>,
-    statuses: Vec<Id>,
-}
-
-fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
-    if !values.contains(&value) {
-        values.push(value);
-    }
-}
-
-/// Parse request records without allowing repeated values to expand into the
-/// Cartesian products that a single four-field query would produce. Only
-/// entities with exactly one value for every field and a known status are
-/// current request records.
-fn pending_requests_from_meta(meta: &TribleSet) -> Vec<PendingRequest> {
-    let mut parts = BTreeMap::<Id, PendingRequestParts>::new();
-
-    for (id, requester) in find!(
-        (e: Id, requester: ed25519_dalek::VerifyingKey),
-        pattern!(meta, [{ ?e @ request_requester: ?requester }])
-    ) {
-        push_unique(&mut parts.entry(id).or_default().requesters, requester);
-    }
-    for (id, partial_cap) in find!(
-        (e: Id, partial_cap: Inline<Handle<SimpleArchive>>),
-        pattern!(meta, [{ ?e @ request_partial_cap: ?partial_cap }])
-    ) {
-        push_unique(&mut parts.entry(id).or_default().partial_caps, partial_cap);
-    }
-    for (id, received_at) in find!(
-        (e: Id, received_at: Inline<NsTAIInterval>),
-        pattern!(meta, [{ ?e @ request_received_at: ?received_at }])
-    ) {
-        push_unique(&mut parts.entry(id).or_default().received_at, received_at);
-    }
-    for (id, status) in find!(
-        (e: Id, status: Id),
-        pattern!(meta, [{ ?e @ request_status: ?status }])
-    ) {
-        push_unique(&mut parts.entry(id).or_default().statuses, status);
-    }
-
-    parts
-        .into_iter()
-        .filter_map(|(id, parts)| {
-            let [requester] = parts.requesters.as_slice() else {
-                return None;
-            };
-            let [partial_cap] = parts.partial_caps.as_slice() else {
-                return None;
-            };
-            let [received_at] = parts.received_at.as_slice() else {
-                return None;
-            };
-            let [status] = parts.statuses.as_slice() else {
-                return None;
-            };
-            if !matches!(*status, STATUS_PENDING | STATUS_APPROVED | STATUS_REJECTED) {
-                return None;
-            }
-            Some(PendingRequest {
-                id,
-                requester: *requester,
-                partial_cap: *partial_cap,
-                received_at: *received_at,
-                status: *status,
-            })
-        })
-        .collect()
-}
-
-fn request_entity_ids(meta: &TribleSet) -> BTreeSet<Id> {
-    let request_attributes = [
-        request_requester.id(),
-        request_partial_cap.id(),
-        request_received_at.id(),
-        request_status.id(),
-    ];
-    meta.iter()
-        .filter(|trible| request_attributes.contains(trible.a()))
-        .map(|trible| *trible.e())
-        .collect()
-}
-
-fn request_tribles(request: &PendingRequest) -> TribleSet {
-    entity! {
-        triblespace_core::id::ExclusiveId::force_ref(&request.id) @
-        request_requester: request.requester,
-        request_partial_cap: request.partial_cap,
-        request_received_at: request.received_at,
-        request_status: request.status,
-    }
-    .into()
-}
-
-/// Collapse any legacy duplicates to one deterministic current entry per
-/// requester. The oldest entity id remains the stable UI identity while the
-/// fields come from the most recently received record.
-fn current_requests_by_requester(
-    requests: impl IntoIterator<Item = PendingRequest>,
-) -> BTreeMap<[u8; 32], PendingRequest> {
-    let mut current = BTreeMap::<[u8; 32], PendingRequest>::new();
-    for request in requests {
-        let key = request.requester.to_bytes();
-        match current.entry(key) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(request);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let previous = entry.get();
-                let stable_id = previous.id.min(request.id);
-                let previous_order = (previous.received_at.raw, <[u8; 16]>::from(previous.id));
-                let request_order = (request.received_at.raw, <[u8; 16]>::from(request.id));
-                if request_order > previous_order {
-                    let mut replacement = request;
-                    replacement.id = stable_id;
-                    entry.insert(replacement);
-                } else if previous.id != stable_id {
-                    entry.get_mut().id = stable_id;
-                }
-            }
-        }
-    }
-    current
-}
-
-/// Snapshot of the current pending-requests set.
-///
-/// Pin metadata is "current state" rather than commit history —
-/// the head metadata blob holds all currently-known requests as
-/// distinct entities. This keeps the schema simple at low cardinality
-/// (a peer realistically has at most a handful of pending requests
-/// open at any time).
-pub fn list_pending_requests<S>(store: &mut S) -> Vec<PendingRequest>
-where
-    S: BlobStore + PinStore,
-{
-    let Some(pin_id) = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) else {
-        return Vec::new();
-    };
-    let Ok(Some(head)) = store.head(pin_id) else {
-        return Vec::new();
-    };
-    let Ok(reader) = store.reader() else {
-        return Vec::new();
-    };
-    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else {
-        return Vec::new();
-    };
-
-    current_requests_by_requester(pending_requests_from_meta(&meta))
-        .into_values()
-        .collect()
-}
-
-/// Record an incoming `OP_REQUEST_CAP` as a pending request entity on
-/// the local pending-requests pin.
-///
-/// Find-or-create the pin on first call. The pin is a bounded current-state
-/// map keyed by requester, not an append-only event log: a requester retains
-/// its entity id when replacing its request, and an exact replay is a no-op.
-///
-/// Returns the entity id of the new request entry. Returns `None` if
-/// the underlying blob/pin writes fail (the caller decides whether
-/// to retry, log, or drop).
-pub fn record_pending_request<S>(
-    store: &mut S,
-    requester: ed25519_dalek::VerifyingKey,
-    partial_cap: Blob<SimpleArchive>,
-    received_at: Inline<NsTAIInterval>,
-) -> Option<Id>
-where
-    S: BlobStore + BlobStorePut + PinStore,
-{
-    record_pending_request_checked(store, requester, partial_cap, received_at)
-        .ok()
-        .flatten()
-}
-
-/// Record a pending request while preserving the storage error that the
-/// wire-level durability acknowledgement needs to distinguish from an
-/// ordinary policy refusal.
-///
-/// `Ok(Some(id))` means the exact request is installed (or was already
-/// installed). `Ok(None)` means a bounded-policy or compare-and-swap refusal;
-/// the caller may reject the request without poisoning the Peer. `Err` means a
-/// storage operation failed after admission, so the Peer must fail-stop and
-/// must not acknowledge the request.
-pub(crate) fn record_pending_request_checked<S>(
-    store: &mut S,
-    requester: ed25519_dalek::VerifyingKey,
-    partial_cap: Blob<SimpleArchive>,
-    received_at: Inline<NsTAIInterval>,
-) -> Result<Option<Id>, String>
-where
-    S: BlobStore + BlobStorePut + PinStore,
-{
-    let pin_id = local_only_pin_id(KIND_PENDING_REQUESTS);
-    let prev_head = store
-        .head(pin_id)
-        .map_err(|error| format!("read pending-request head: {error}"))?;
-
-    // Reconstitute the current metadata blob (if any), or start fresh with
-    // just the pin-kind marker.
-    let meta: TribleSet = match &prev_head {
-        Some(h) => {
-            let reader = store
-                .reader()
-                .map_err(|error| format!("snapshot pending requests: {error}"))?;
-            let meta = reader
-                .get::<TribleSet, SimpleArchive>(*h)
-                .map_err(|error| format!("read pending-request metadata: {error}"))?;
-            let has_marker = find!(
-                kind: Id,
-                pattern!(&meta, [{ _?e @ local_only_pin: ?kind }])
-            )
-            .any(|kind| kind == KIND_PENDING_REQUESTS);
-            if !has_marker {
-                // Never overwrite a populated canonical slot whose content is
-                // not the pending-request role. This is a state refusal, not a
-                // storage fault.
-                return Ok(None);
-            }
-            meta
-        }
-        None => {
-            use triblespace_core::id::ExclusiveId;
-            let marker_id = genid();
-            entity! { ExclusiveId::force_ref(&marker_id) @
-                local_only_pin: KIND_PENDING_REQUESTS,
-            }
-            .into()
-        }
-    };
-
-    let request_entities = request_entity_ids(&meta);
-    let mut current = current_requests_by_requester(pending_requests_from_meta(&meta));
-    if current.len() > MAX_PENDING_REQUESTS {
-        return Ok(None);
-    }
-
-    let partial_cap_handle = (&partial_cap).get_handle();
-    let requester_key = requester.to_bytes();
-    let request_id = match current.get(&requester_key) {
-        Some(existing) => existing.id,
-        None if current.len() >= MAX_PENDING_REQUESTS => return Ok(None),
-        None => *genid(),
-    };
-
-    // The wire request consists of requester identity + partial-cap content.
-    // A repeated delivery must not reopen an approved/rejected request or
-    // rewrite its arrival time.
-    let exact_replay = current
-        .get(&requester_key)
-        .is_some_and(|existing| existing.partial_cap == partial_cap_handle);
-    if current.get(&requester_key).is_some_and(|existing| {
-        existing.status == STATUS_PENDING && existing.partial_cap != partial_cap_handle
-    }) {
-        // A remote requester gets one outstanding durable slot. Replacing it
-        // before a local actor has approved or rejected the previous request
-        // would turn the bounded current-state map into an unbounded append
-        // sink: one TLS key could alternate two payloads forever. Once local
-        // policy reaches a terminal disposition, one new request may reopen
-        // the slot as Pending.
-        return Ok(None);
-    }
-    if !exact_replay {
-        current.insert(
-            requester_key,
-            PendingRequest {
-                id: request_id,
-                requester,
-                partial_cap: partial_cap_handle,
-                received_at,
-                status: STATUS_PENDING,
-            },
-        );
-    }
-
-    // Replace the complete request entities, rather than subtracting just one
-    // value per known attribute. This both removes repeated stale values and
-    // drops malformed legacy request records. Unrelated entities (including
-    // the local-only marker) are preserved verbatim.
-    let mut next_meta = TribleSet::new();
-    for trible in meta
-        .iter()
-        .filter(|trible| !request_entities.contains(trible.e()))
-    {
-        next_meta.insert(trible);
-    }
-    for request in current.values() {
-        next_meta += request_tribles(request);
-    }
-
-    // On an already-canonical exact replay there is nothing to write or CAS.
-    if next_meta == meta {
-        return Ok(Some(request_id));
-    }
-
-    // Admission and replay checks precede the irreversible blob append. A
-    // full current-state map therefore cannot be abused as an orphan-blob
-    // sink, and exact replays append nothing. Persist the payload before the
-    // pin points at it so every successfully installed head is readable.
-    if !exact_replay {
-        let stored_handle: Inline<Handle<SimpleArchive>> = store
-            .put(partial_cap)
-            .map_err(|error| format!("persist pending-request payload: {error}"))?;
-        debug_assert_eq!(stored_handle, partial_cap_handle);
-    }
-
-    let new_head: Inline<Handle<SimpleArchive>> = store
-        .put(next_meta)
-        .map_err(|error| format!("persist pending-request metadata: {error}"))?;
-    match store
-        .update(pin_id, prev_head, Some(new_head))
-        .map_err(|error| format!("install pending-request head: {error}"))?
-    {
-        PushResult::Success() => Ok(Some(request_id)),
-        PushResult::Conflict(_) => Ok(None),
     }
 }
 
@@ -1515,130 +1147,19 @@ where
     }
 }
 
-/// Mark a pending request as approved or rejected. The entity-level
-/// fact (`request_status`) is rewritten on the same pin's head blob.
-///
-/// This is what `team approve` and (eventually) `team reject` call
-/// after they've taken their respective external actions (e.g. for
-/// approve: signed + dispatched `OP_DELIVER_CAP`).
-pub fn set_request_status<S>(store: &mut S, request_id: Id, new_status: Id) -> Option<()>
-where
-    S: BlobStore + BlobStorePut + PinStore,
-{
-    let pin_id = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS)?;
-    let prev_head = store.head(pin_id).ok()??;
-
-    let reader = store.reader().ok()?;
-    let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
-
-    // Find the existing status trible and remove it; insert a fresh
-    // one with the new status value. TribleSet is a set, so we
-    // construct a single-trible set and use the diff-and-merge
-    // primitives.
-    let current_status: Option<Id> = find!(
-        s: Id,
-        pattern!(&meta, [{ request_id @ request_status: ?s }])
-    )
-    .next();
-    if let Some(old) = current_status {
-        let old_trible: TribleSet = entity! {
-            triblespace_core::id::ExclusiveId::force_ref(&request_id) @
-            request_status: old,
-        }
-        .into();
-        // Set difference: remove the old trible.
-        meta = meta.difference(&old_trible);
-    }
-    let new_trible: TribleSet = entity! {
-        triblespace_core::id::ExclusiveId::force_ref(&request_id) @
-        request_status: new_status,
-    }
-    .into();
-    meta += new_trible;
-
-    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
-    match store.update(pin_id, Some(prev_head), Some(new_head)).ok()? {
-        PushResult::Success() => Some(()),
-        PushResult::Conflict(_) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
-    use triblespace_core::inline::{InlineEncoding, TryToInline};
+    use triblespace_core::blob::{Blob, IntoBlob};
+    use triblespace_core::inline::TryToInline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::trible::TribleSet;
-
-    #[derive(Default)]
-    struct ConflictingPinRepo {
-        inner: MemoryRepo,
-    }
-
-    impl BlobStorePut for ConflictingPinRepo {
-        type PutError = <MemoryRepo as BlobStorePut>::PutError;
-
-        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
-        where
-            S: BlobEncoding + 'static,
-            T: IntoBlob<S>,
-            Handle<S>: InlineEncoding,
-        {
-            self.inner.put(item)
-        }
-    }
-
-    impl BlobStore for ConflictingPinRepo {
-        type Reader = <MemoryRepo as BlobStore>::Reader;
-        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
-
-        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            self.inner.reader()
-        }
-    }
-
-    impl PinStore for ConflictingPinRepo {
-        type PinsError = <MemoryRepo as PinStore>::PinsError;
-        type HeadError = <MemoryRepo as PinStore>::HeadError;
-        type UpdateError = <MemoryRepo as PinStore>::UpdateError;
-        type ListIter<'a> = <MemoryRepo as PinStore>::ListIter<'a>;
-
-        fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-            self.inner.pins()
-        }
-
-        fn head(
-            &mut self,
-            id: Id,
-        ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-            self.inner.head(id)
-        }
-
-        fn update(
-            &mut self,
-            _id: Id,
-            _old: Option<Inline<Handle<SimpleArchive>>>,
-            _new: Option<Inline<Handle<SimpleArchive>>>,
-        ) -> Result<PushResult, Self::UpdateError> {
-            Ok(PushResult::Conflict(None))
-        }
-    }
 
     fn point_now() -> Inline<NsTAIInterval> {
         let now = hifitime::Epoch::now().expect("system time");
         (now, now).try_to_inline().expect("point interval")
-    }
-
-    fn empty_partial_cap() -> Blob<SimpleArchive> {
-        let set = TribleSet::new();
-        {
-            use triblespace_core::blob::IntoBlob;
-            set.to_blob()
-        }
     }
 
     fn distinct_partial_cap(subject: ed25519_dalek::VerifyingKey) -> Blob<SimpleArchive> {
@@ -1662,49 +1183,12 @@ mod tests {
         SigningKey::from_bytes(&seed).verifying_key()
     }
 
-    fn seed_pending_requests(
-        store: &mut MemoryRepo,
-        count: usize,
-        partial_cap: Inline<Handle<SimpleArchive>>,
-    ) -> Vec<(Id, ed25519_dalek::VerifyingKey)> {
-        use triblespace_core::id::ExclusiveId;
-
-        let marker_id = genid();
-        let mut meta: TribleSet = entity! {
-            ExclusiveId::force_ref(&marker_id) @
-            local_only_pin: KIND_PENDING_REQUESTS,
-        }
-        .into();
-        let received_at = point_now();
-        let mut records = Vec::with_capacity(count);
-        for index in 0..count {
-            let id = *genid();
-            let requester = key_for(index);
-            let request = PendingRequest {
-                id,
-                requester,
-                partial_cap,
-                received_at,
-                status: STATUS_PENDING,
-            };
-            meta += request_tribles(&request);
-            records.push((id, requester));
-        }
-        let head = store.put(meta).expect("store seeded pending set");
-        let pin = local_only_pin_id(KIND_PENDING_REQUESTS);
-        assert!(matches!(
-            store.update(pin, None, Some(head)),
-            Ok(PushResult::Success())
-        ));
-        records
-    }
-
     #[test]
     fn policy_pin_ids_are_intrinsic_and_keyed_by_role() {
-        let pending = local_only_pin_id(KIND_PENDING_REQUESTS);
-        assert_eq!(pending, local_only_pin_id(KIND_PENDING_REQUESTS));
-        assert_ne!(pending, local_only_pin_id(KIND_RENEWAL_POLICY));
-        assert_ne!(pending, local_only_pin_id(KIND_OUTBOUND_CAP_REQUEST));
+        assert_ne!(
+            local_only_pin_id(KIND_RENEWAL_POLICY),
+            local_only_pin_id(KIND_OUTBOUND_CAP_REQUEST)
+        );
 
         let first_team = key_for(40);
         let second_team = key_for(41);
@@ -1712,292 +1196,6 @@ mod tests {
         assert_eq!(first_team_pin, team_cap_pin_id(first_team));
         assert_ne!(first_team_pin, team_cap_pin_id(second_team));
         assert_ne!(first_team_pin, local_only_pin_id(KIND_TEAM_CAP));
-    }
-
-    #[test]
-    fn lookup_uses_only_the_canonical_policy_slot() {
-        use triblespace_core::id::ExclusiveId;
-
-        let mut store = MemoryRepo::default();
-        let marker_id = genid();
-        let metadata: TribleSet = entity! {
-            ExclusiveId::force_ref(&marker_id) @
-            local_only_pin: KIND_PENDING_REQUESTS,
-        }
-        .into();
-        let head = store.put(metadata).expect("store marker");
-        let historical_random_pin = *genid();
-        assert!(matches!(
-            store.update(historical_random_pin, None, Some(head)),
-            Ok(PushResult::Success())
-        ));
-
-        assert_eq!(
-            find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS),
-            None,
-            "a matching marker on a noncanonical pin must not revive arbitrary-first lookup"
-        );
-
-        let requester = key_for(42);
-        record_pending_request(&mut store, requester, empty_partial_cap(), point_now())
-            .expect("create canonical pending pin");
-        assert_eq!(
-            find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS),
-            Some(local_only_pin_id(KIND_PENDING_REQUESTS))
-        );
-    }
-
-    #[test]
-    fn concurrent_pile_first_creation_has_one_canonical_pin() {
-        use std::sync::{Arc, Barrier};
-        use std::thread;
-        use triblespace_core::repo::pile::Pile;
-
-        let dir = tempfile::tempdir().expect("temporary pile directory");
-        let path = dir.path().join("policy-race.pile");
-        std::fs::File::create(&path).expect("create empty pile");
-        let left = Pile::open(&path).expect("open first pile handle");
-        let right = Pile::open(&path).expect("open second pile handle");
-        let barrier = Arc::new(Barrier::new(3));
-
-        let spawn_writer = |mut pile: Pile, barrier: Arc<Barrier>| {
-            thread::spawn(move || {
-                barrier.wait();
-                let result = record_pending_request(
-                    &mut pile,
-                    key_for(43),
-                    empty_partial_cap(),
-                    point_now(),
-                );
-                pile.flush().expect("flush racing pile writer");
-                result
-            })
-        };
-        let left = spawn_writer(left, Arc::clone(&barrier));
-        let right = spawn_writer(right, Arc::clone(&barrier));
-        barrier.wait();
-
-        let left_result = left.join().expect("first writer thread");
-        let right_result = right.join().expect("second writer thread");
-        assert!(
-            left_result.is_some() || right_result.is_some(),
-            "at least one first-creation CAS must win"
-        );
-
-        let mut reopened = Pile::open(&path).expect("reopen raced pile");
-        let pins: Vec<Id> = reopened
-            .pins()
-            .expect("list raced pins")
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(pins, vec![local_only_pin_id(KIND_PENDING_REQUESTS)]);
-        assert_eq!(list_pending_requests(&mut reopened).len(), 1);
-    }
-
-    #[test]
-    fn record_then_list_pending_round_trip() {
-        let mut store = MemoryRepo::default();
-        let requester = SigningKey::generate(&mut OsRng).verifying_key();
-        let partial_cap = empty_partial_cap();
-        let partial_cap_handle = (&partial_cap).get_handle();
-
-        let received_at = point_now();
-        let id = record_pending_request(&mut store, requester, partial_cap, received_at)
-            .expect("record");
-
-        let listed = list_pending_requests(&mut store);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, id);
-        assert_eq!(listed[0].requester, requester);
-        assert_eq!(listed[0].status, STATUS_PENDING);
-        assert_eq!(listed[0].partial_cap, partial_cap_handle);
-    }
-
-    #[test]
-    fn second_request_extends_pending_set() {
-        let mut store = MemoryRepo::default();
-        let req1 = SigningKey::generate(&mut OsRng).verifying_key();
-        let req2 = SigningKey::generate(&mut OsRng).verifying_key();
-        let partial = empty_partial_cap();
-
-        let id1 = record_pending_request(&mut store, req1, partial.clone(), point_now())
-            .expect("record 1");
-        let id2 = record_pending_request(&mut store, req2, partial, point_now()).expect("record 2");
-        assert_ne!(id1, id2);
-
-        let listed = list_pending_requests(&mut store);
-        assert_eq!(listed.len(), 2);
-        let ids: std::collections::HashSet<Id> = listed.iter().map(|p| p.id).collect();
-        assert!(ids.contains(&id1));
-        assert!(ids.contains(&id2));
-    }
-
-    #[test]
-    fn exact_request_replay_is_a_head_preserving_no_op() {
-        let mut store = MemoryRepo::default();
-        let requester = key_for(0);
-        let partial = distinct_partial_cap(requester);
-        let id = record_pending_request(&mut store, requester, partial.clone(), point_now())
-            .expect("initial record");
-        set_request_status(&mut store, id, STATUS_APPROVED).expect("approve");
-
-        let pin = find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS).unwrap();
-        let before = store.head(pin).unwrap().unwrap();
-        let replay_id = record_pending_request(&mut store, requester, partial, point_now())
-            .expect("idempotent replay");
-        let after = store.head(pin).unwrap().unwrap();
-
-        assert_eq!(replay_id, id);
-        assert_eq!(after, before, "an exact replay must perform no rewrite");
-        let requests = list_pending_requests(&mut store);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].status, STATUS_APPROVED);
-    }
-
-    #[test]
-    fn replacement_reuses_id_and_removes_superseded_facts() {
-        let mut store = MemoryRepo::default();
-        let requester = key_for(0);
-        let old_cap = distinct_partial_cap(requester);
-        let old_cap_handle = (&old_cap).get_handle();
-        let old_id = record_pending_request(&mut store, requester, old_cap, point_now())
-            .expect("initial record");
-        set_request_status(&mut store, old_id, STATUS_REJECTED).expect("reject");
-
-        let new_cap = distinct_partial_cap(key_for(1));
-        let new_cap_handle = (&new_cap).get_handle();
-        let replacement_id = record_pending_request(&mut store, requester, new_cap, point_now())
-            .expect("replacement");
-        assert_eq!(replacement_id, old_id);
-
-        let requests = list_pending_requests(&mut store);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].id, old_id);
-        assert_eq!(requests[0].partial_cap, new_cap_handle);
-        assert_eq!(requests[0].status, STATUS_PENDING);
-
-        let pin = find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS).unwrap();
-        let head = store.head(pin).unwrap().unwrap();
-        let reader = store.reader().unwrap();
-        let meta: TribleSet = reader.get(head).unwrap();
-        let facts: Vec<_> = meta.iter().filter(|trible| trible.e() == &old_id).collect();
-        assert_eq!(facts.len(), 4, "replacement must rebuild a clean entity");
-        assert!(!meta.iter().any(|trible| {
-            trible.e() == &old_id
-                && trible.a() == &request_partial_cap.id()
-                && trible.v::<Handle<SimpleArchive>>() == &old_cap_handle
-        }));
-    }
-
-    #[test]
-    fn pending_request_capacity_requires_local_disposition_before_replacement() {
-        let mut store = MemoryRepo::default();
-        let shared_cap = empty_partial_cap();
-        let shared_cap_handle = store.put(shared_cap).expect("store shared cap");
-        let records = seed_pending_requests(&mut store, MAX_PENDING_REQUESTS, shared_cap_handle);
-
-        let newcomer = key_for(MAX_PENDING_REQUESTS + 1);
-        let rejected_cap = distinct_partial_cap(newcomer);
-        let rejected_handle = (&rejected_cap).get_handle();
-        assert!(
-            record_pending_request(&mut store, newcomer, rejected_cap, point_now()).is_none(),
-            "a new requester must be refused at capacity"
-        );
-        let reader = store.reader().expect("memory reader");
-        assert!(
-            reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(rejected_handle)
-                .is_err(),
-            "capacity rejection must precede payload persistence"
-        );
-        assert_eq!(
-            list_pending_requests(&mut store).len(),
-            MAX_PENDING_REQUESTS
-        );
-
-        let (existing_id, existing) = records[0];
-        let replacement_cap = distinct_partial_cap(newcomer);
-        let replacement_handle = (&replacement_cap).get_handle();
-        assert!(
-            record_pending_request(&mut store, existing, replacement_cap.clone(), point_now(),)
-                .is_none(),
-            "a remote key must not rewrite its still-pending durable slot"
-        );
-        let reader = store.reader().expect("memory reader");
-        assert!(
-            reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(replacement_handle)
-                .is_err(),
-            "pending-slot rejection must precede payload persistence"
-        );
-        drop(reader);
-
-        set_request_status(&mut store, existing_id, STATUS_REJECTED)
-            .expect("local disposition releases the request slot");
-        let replaced = record_pending_request(&mut store, existing, replacement_cap, point_now())
-            .expect("an existing requester may replace at capacity");
-        assert_eq!(replaced, existing_id);
-        let requests = list_pending_requests(&mut store);
-        assert_eq!(requests.len(), MAX_PENDING_REQUESTS);
-        assert_eq!(
-            requests
-                .iter()
-                .find(|request| request.requester == existing)
-                .unwrap()
-                .partial_cap,
-            replacement_handle
-        );
-    }
-
-    #[test]
-    fn pending_request_cas_conflict_is_not_reported_as_success() {
-        let mut store = ConflictingPinRepo::default();
-        let requester = key_for(0);
-        let partial_cap = TribleSet::new().to_blob();
-
-        assert!(
-            record_pending_request(&mut store, requester, partial_cap, point_now()).is_none(),
-            "a failed head CAS must not acknowledge durable admission"
-        );
-        assert!(store.inner.pins.is_empty());
-    }
-
-    #[test]
-    fn set_request_status_flips_one_entry() {
-        let mut store = MemoryRepo::default();
-        let requester = SigningKey::generate(&mut OsRng).verifying_key();
-        let partial = empty_partial_cap();
-
-        let id =
-            record_pending_request(&mut store, requester, partial, point_now()).expect("record");
-
-        // Initial status is PENDING.
-        let before = list_pending_requests(&mut store);
-        assert_eq!(before[0].status, STATUS_PENDING);
-
-        // Flip to APPROVED.
-        set_request_status(&mut store, id, STATUS_APPROVED).expect("set status");
-        let after = list_pending_requests(&mut store);
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].status, STATUS_APPROVED);
-        assert_eq!(after[0].id, id);
-    }
-
-    #[test]
-    fn pending_pin_is_local_only() {
-        // Recording a request must produce a pin carrying the
-        // local-only marker so serving snapshots never classify it as a
-        // legacy mutable-content root.
-        let mut store = MemoryRepo::default();
-        let requester = SigningKey::generate(&mut OsRng).verifying_key();
-        let partial = empty_partial_cap();
-
-        let _ =
-            record_pending_request(&mut store, requester, partial, point_now()).expect("record");
-
-        let pin_id =
-            find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS).expect("pin exists");
-        assert!(is_local_only_pin(&mut store, pin_id));
     }
 
     #[test]

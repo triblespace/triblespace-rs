@@ -34,11 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-fatal, and storage failures fail-stop the peer without manufacturing a
   rejection. Their wire result is explicitly indeterminate because a failed
   append may already have taken effect; exact replay resolves the outcome.
+  The `team` request-lifecycle CLI now consumes that ledger directly:
+  `list-pending` auto-detects a sole valid assertion author without touching a
+  key, while `approve --request-event` and `reject --request-event` require an
+  existing author key and a full canonical `RequestObserved` handle. They
+  operate only on a complete resolution, preserve observed/rejected/all-issued
+  facts as independent sets, and write `GrantIssued` or `RequestRejected`
+  assertions without the deleted incoming-request pin, scalar status, or a
+  renewal-policy dual write.
   Successful subject authentication is likewise recorded as an exact
   `CredentialAuthenticated` effect after a fresh complete-ledger resolution;
   missing or invalid policy fails closed, while an unrelated signature is a
   no-op rather than invented evidence. Credential redispatch now consumes that
-  same resolved truth: only an unauthenticated `active_current()` grant for the
+  same resolved truth: only an unauthenticated `usable_at(now)` grant for the
   daemon's configured team may drive a send. Disabled, conflicted, expired,
   local-subject, and foreign-team grants are inert; a successor signature resets the bounded
   per-grant cooldown. Every selected blob is materialized before the first send,

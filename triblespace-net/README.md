@@ -34,9 +34,9 @@ renewal delivery. Corrupt, malformed, wrong-root, or wrong-subject credentials
 still fail startup.
 
 The outbound first-delivery path is crash-recoverable across its separate
-request and team pins. After the verified proof bundle is durable, the exact
-pending request is CAS-claimed as an activation journal before the credential
-pin changes; startup can finish that activation, and a concurrent replacement
+outbound-request and team pins. After the verified proof bundle is durable, the
+exact outbound request is CAS-claimed as an activation journal before the
+credential pin changes; startup can finish that activation, and a concurrent replacement
 request cannot be consumed by a stale delivery. Founder renewal likewise
 reconciles the unique non-retracted self-policy keyed by verified
 `(subject, scope)` with the active credential before issuing another sibling.
@@ -117,7 +117,8 @@ authorizes only after its complete frame has arrived.
 - `peer` — synchronous storage wrapper, durable policy boundary, and lazy reads
 - `protocol` — authenticated v5 blob wire format
 - `handshake` — v2 request, delivery, and exact proof-bootstrap protocol
-- `policy` — local pending requests, renewal state, and active credentials
+- `policy_ledger` — asserted incoming requests and issuer grant lifecycle
+- `policy` — local outbound join intent, legacy renewal state, and active credentials
 - `reconcile` — author-scoped asserted-want servicing
 - `identity` — node signing-key handling
 - `host` / `channel` — network thread and its bounded event bridge

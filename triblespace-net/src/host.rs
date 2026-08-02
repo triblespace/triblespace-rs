@@ -261,8 +261,8 @@ impl NetSender {
 
     /// Dispatch a freshly-signed (cap, sig) blob pair to `subject`.
     /// Fire-and-forget — the network thread handles the dial,
-    /// `OP_DELIVER_CAP`, and connection teardown. Used by the
-    /// renewal daemon and `team approve`.
+    /// `OP_DELIVER_CAP`, and connection teardown. Used by asserted-policy
+    /// credential redispatch.
     pub fn deliver_cap(
         &self,
         subject: PublisherKey,
@@ -2653,7 +2653,7 @@ mod tests {
         let marker = genid();
         local_metadata += TribleSet::from(entity! {
             ExclusiveId::force_ref(&marker) @
-            crate::policy::local_only_pin: crate::policy::KIND_PENDING_REQUESTS,
+            crate::policy::local_only_pin: crate::policy::KIND_OUTBOUND_CAP_REQUEST,
         });
         let local_head: Inline<Handle<SimpleArchive>> = store
             .put(local_metadata)

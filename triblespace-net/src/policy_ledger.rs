@@ -1199,23 +1199,28 @@ impl GrantView {
     /// Historical issuance projection, retained even after disablement.
     ///
     /// Inspection and positive-evidence recording may need this exact past
-    /// issuance. Operational dispatch must use [`Self::active_current`]
-    /// instead so disabled grants cannot drive work.
+    /// issuance. Credential dispatch must use [`Self::usable_at`] instead so
+    /// disabled or expired grants are not sent. Renewal may still inspect the
+    /// historical current issuance in order to replace an expired credential.
     pub fn historical_issuance(&self) -> &GrantIssuanceResolution {
         &self.issuance
     }
 
-    /// Return the selected credential only when this grant remains active.
+    /// Return the selected credential only when this grant is usable at `now`.
     ///
-    /// Disabled grants retain their historical issuance for inspection, but
-    /// must never be dispatched, installed, or renewed by operational callers.
-    pub fn active_current(&self) -> Option<&CurrentGrant> {
+    /// Disabled and expired grants retain their historical issuance for
+    /// inspection and renewal decisions, but must never be dispatched as
+    /// usable credentials.
+    pub fn usable_at(&self, now: Epoch) -> Option<&CurrentGrant> {
         if self.disabled {
             return None;
         }
         match &self.issuance {
-            GrantIssuanceResolution::Current(current) => Some(current),
+            GrantIssuanceResolution::Current(current) if !current.capability.is_expired_at(now) => {
+                Some(current)
+            }
             GrantIssuanceResolution::Unissued | GrantIssuanceResolution::Conflicted { .. } => None,
+            GrantIssuanceResolution::Current(_) => None,
         }
     }
 }
@@ -1272,7 +1277,6 @@ struct AssertedIssuance {
 struct ValidIssuance {
     cap: Inline<Handle<SimpleArchive>>,
     sig: Inline<Handle<SimpleArchive>>,
-    request: Option<RequestIdentity>,
     capability: VerifiedCapability,
 }
 
@@ -1433,6 +1437,7 @@ where
     }
 
     let mut valid_issuances = Vec::new();
+    let mut issued_request_signatures = BTreeSet::new();
     for issuance in asserted_issuances {
         let verified = match verify_chain_details_allow_expired(
             issuance.grant.team_root(),
@@ -1528,12 +1533,14 @@ where
             None
         };
 
+        if let Some(request) = request {
+            issued_request_signatures.insert((request, issuance.sig));
+        }
         valid_issuances.push((
             issuance.grant,
             ValidIssuance {
                 cap: verified.leaf_cap,
                 sig: issuance.sig,
-                request,
                 capability: verified.capability,
             },
         ));
@@ -1555,6 +1562,13 @@ where
     for request in rejected {
         requests.entry(request).or_default().rejected = true;
     }
+    for (request, signature) in issued_request_signatures {
+        requests
+            .entry(request)
+            .or_default()
+            .issued_signatures
+            .insert(signature);
+    }
 
     let mut grants = BTreeMap::<GrantIdentity, GrantAccumulator>::new();
     for grant in disabled {
@@ -1564,13 +1578,6 @@ where
         grants.entry(grant).or_default().authentications = signatures;
     }
     for (grant, issuance) in valid_issuances {
-        if let Some(request) = issuance.request {
-            requests
-                .entry(request)
-                .or_default()
-                .issued_signatures
-                .insert(issuance.sig);
-        }
         grants.entry(grant).or_default().issuances.push(issuance);
     }
 
@@ -1591,6 +1598,11 @@ where
                     signatures: valid_signatures,
                 }
             } else {
+                // Equal order means the signature is identical. Signature
+                // handles commit to the capability blob, so every field kept
+                // in `CurrentGrant` is then identical too. Request provenance
+                // was projected separately into commutative `RequestView`
+                // signature sets and never enters selection candidates.
                 let current = accumulator
                     .issuances
                     .into_iter()
@@ -1924,11 +1936,20 @@ mod tests {
         }
 
         fn request(&mut self, subject: VerifyingKey, permission: Id) -> RequestIdentity {
+            self.request_with_expiry(subject, permission, 1_000.0)
+        }
+
+        fn request_with_expiry(
+            &mut self,
+            subject: VerifyingKey,
+            permission: Id,
+            seconds: f64,
+        ) -> RequestIdentity {
             let fragment = entity! {
                 capability::cap_subject: subject,
                 capability::cap_issuer: self.author.verifying_key(),
                 capability::cap_scope_root: self.scope_root,
-                metadata::expires_at: self.interval(1_000.0),
+                metadata::expires_at: self.interval(seconds),
             };
             let mut set = TribleSet::from(fragment);
             set += self.scope(permission);
@@ -2566,7 +2587,7 @@ mod tests {
 
         let grant_view = view.grants().get(&grant).unwrap();
         assert!(grant_view.disabled());
-        assert!(grant_view.active_current().is_none());
+        assert!(grant_view.usable_at(fixture.now).is_none());
         let GrantIssuanceResolution::Current(current) = grant_view.historical_issuance() else {
             panic!("one valid issuance must be current");
         };
@@ -2576,7 +2597,7 @@ mod tests {
     }
 
     #[test]
-    fn current_selection_is_order_independent_and_scope_conflict_stops_selection() {
+    fn expiry_selects_current_and_scope_conflict_stops_selection() {
         let mut fixture = LedgerFixture::new();
         let grant = fixture.grant();
         let (_short_cap, short_sig) = fixture.issue(PERM_READ, 100.0);
@@ -2592,32 +2613,29 @@ mod tests {
             request: None,
         });
 
-        for assertions in [[short, long], [long, short]] {
-            let mut snapshot = PinAssertionSnapshot::new();
-            for assertion in assertions {
-                snapshot.insert(assertion).unwrap();
-            }
-            let PolicyLedgerResolution::Complete(view) = fixture.resolve(&snapshot) else {
-                panic!("complete closure must resolve");
-            };
-            let GrantIssuanceResolution::Current(current) =
-                view.grants().get(&grant).unwrap().historical_issuance()
-            else {
-                panic!("equal-scope siblings must select a current credential");
-            };
-            assert_eq!(current.cap(), long_cap);
-            assert_eq!(current.sig(), long_sig);
-            assert!(!current.authenticated());
-            assert_eq!(
-                view.grants()
-                    .get(&grant)
-                    .unwrap()
-                    .active_current()
-                    .unwrap()
-                    .sig(),
-                long_sig
-            );
-        }
+        let mut snapshot = PinAssertionSnapshot::new();
+        snapshot.insert(short).unwrap();
+        snapshot.insert(long).unwrap();
+        let PolicyLedgerResolution::Complete(view) = fixture.resolve(&snapshot) else {
+            panic!("complete closure must resolve");
+        };
+        let GrantIssuanceResolution::Current(current) =
+            view.grants().get(&grant).unwrap().historical_issuance()
+        else {
+            panic!("equal-scope siblings must select a current credential");
+        };
+        assert_eq!(current.cap(), long_cap);
+        assert_eq!(current.sig(), long_sig);
+        assert!(!current.authenticated());
+        assert_eq!(
+            view.grants()
+                .get(&grant)
+                .unwrap()
+                .usable_at(fixture.now)
+                .unwrap()
+                .sig(),
+            long_sig
+        );
 
         let (_write_cap, write_sig) = fixture.issue(PERM_WRITE, 400.0);
         let write = fixture.assertion(PolicyEvent::GrantIssued {
@@ -2641,6 +2659,49 @@ mod tests {
             signatures,
             &BTreeSet::from([short_sig, long_sig, write_sig])
         );
+    }
+
+    #[test]
+    fn identical_issuance_cited_by_two_requests_projects_both_provenances() {
+        let mut fixture = LedgerFixture::new();
+        let subject = fixture.subject.verifying_key();
+        let first = fixture.request_with_expiry(subject, PERM_READ, 800.0);
+        let second = fixture.request_with_expiry(subject, PERM_READ, 900.0);
+        let first_handle = fixture.store_event(PolicyEvent::RequestObserved(first));
+        let second_handle = fixture.store_event(PolicyEvent::RequestObserved(second));
+        assert_ne!(first_handle, second_handle);
+        let (cap, sig) = fixture.issue(PERM_READ, 200.0);
+        let grant = fixture.grant();
+        let first_issuance = fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig,
+            request: Some(first_handle),
+        });
+        let second_issuance = fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig,
+            request: Some(second_handle),
+        });
+        let mut snapshot = PinAssertionSnapshot::new();
+        snapshot.insert(first_issuance).unwrap();
+        snapshot.insert(second_issuance).unwrap();
+
+        let PolicyLedgerResolution::Complete(view) = fixture.resolve(&snapshot) else {
+            panic!("valid duplicate issuance provenance must resolve completely");
+        };
+        for request in [first, second] {
+            let request_view = view.requests().get(&request).unwrap();
+            assert!(request_view.observed());
+            assert_eq!(request_view.issued_signatures(), &BTreeSet::from([sig]));
+        }
+        let current = view
+            .grants()
+            .get(&grant)
+            .unwrap()
+            .usable_at(fixture.now)
+            .unwrap();
+        assert_eq!(current.cap(), cap);
+        assert_eq!(current.sig(), sig);
     }
 
     #[test]

@@ -85,6 +85,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded per-grant cooldown. All selected blobs are materialized before the
   first send, while any read, flush, or serving-snapshot failure defers the
   whole pass.
+- **Incoming request lifecycle state is asserted, not a local mutable cell.**
+  The legacy incoming-request pin, bounded replacement machinery, receipt
+  timestamp, and scalar pending/approved/rejected tags are removed. CLI
+  dispositions now publish `GrantIssued` and `RequestRejected` through the
+  ledger's flush-before-assertion writer. `GrantView::usable_at(now)` is the
+  dispatch eligibility boundary for enabled, unexpired current credentials;
+  `historical_issuance()` deliberately retains an expired current credential
+  so later renewal can replace it. `identity::load_existing_key` shares the
+  normal identity path resolution while making no-create signing commands
+  explicit.
 - **Serving resources fail closed.** Unauthenticated work, authenticated
   connections, and post-auth streams are globally bounded; each subject may
   hold at most one live inbound pile-sync connection, including while admitted

@@ -401,7 +401,7 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// root: blobs reachable from a pin survive; the rest are reclaimed.
 ///
 /// Legacy callers distinguish roles at higher layers with metadata markers:
-/// renewal and pending-request policy, credential holdings, branch-scoped
+/// renewal policy and outbound-request intent, credential holdings, branch-scoped
 /// serving state, and retention roots. Older stores may also contain mutable
 /// content-branch heads. None of these scalar cells are asserted-pin or branch
 /// authority, and pile copying means they cannot honestly be treated as

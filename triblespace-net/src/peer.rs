@@ -459,8 +459,8 @@ where
                     // Authentication recording is evidence about the exact
                     // historical issuance, even after a grant is disabled, so
                     // this path deliberately inspects `historical_issuance`.
-                    // Dispatch paths must instead use `active_current` so a
-                    // disabled grant can never drive operational work.
+                    // Dispatch paths must instead use `usable_at(now)` so a
+                    // disabled or expired grant can never drive a send.
                     let grant = {
                         let mut matches =
                             view.grants().iter().filter_map(|(grant, state)| {
@@ -838,9 +838,8 @@ where
             // never an OP_DELIVER_CAP round-trip to ourselves.
             .filter(|(grant, _)| grant.subject() != local_subject)
             .filter_map(|(grant, state)| {
-                let current = state.active_current()?;
-                (!current.authenticated() && !current.capability().is_expired_at(epoch_now))
-                    .then_some((*grant, current.cap(), current.sig()))
+                let current = state.usable_at(epoch_now)?;
+                (!current.authenticated()).then_some((*grant, current.cap(), current.sig()))
             })
             .filter(|(grant, _cap, sig)| {
                 self.last_dispatch_attempt.get(grant).is_none_or(
@@ -3449,7 +3448,7 @@ mod tests {
             view.grants()
                 .get(&authenticated_grant)
                 .unwrap()
-                .active_current()
+                .usable_at(now)
                 .unwrap()
                 .authenticated()
         );
@@ -3461,30 +3460,38 @@ mod tests {
                 .historical_issuance(),
             crate::policy_ledger::GrantIssuanceResolution::Conflicted { .. }
         ));
-        let expired_current = view
+        let expired_current = match view
             .grants()
             .get(&expired.grant)
             .unwrap()
-            .active_current()
-            .expect("expiry does not erase historical current selection");
+            .historical_issuance()
+        {
+            crate::policy_ledger::GrantIssuanceResolution::Current(current) => current,
+            _ => panic!("expiry does not erase historical current selection"),
+        };
         assert!(
-            expired_current
-                .capability()
-                .is_expired_at(crate::clock::epoch_now()),
+            expired_current.capability().is_expired_at(now),
             "the fixture must isolate dispatch-time liveness from reduction"
+        );
+        assert!(
+            view.grants()
+                .get(&expired.grant)
+                .unwrap()
+                .usable_at(now)
+                .is_none()
         );
         assert!(
             view.grants()
                 .get(&local_grant)
                 .unwrap()
-                .active_current()
+                .usable_at(now)
                 .is_some()
         );
         assert!(
             view.grants()
                 .get(&foreign_grant)
                 .unwrap()
-                .active_current()
+                .usable_at(now)
                 .is_some(),
             "foreign-team fixture must otherwise be dispatchable"
         );

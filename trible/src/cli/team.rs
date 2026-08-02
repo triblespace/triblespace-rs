@@ -15,6 +15,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -24,7 +25,9 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::capability;
 use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::pin_assertion::PinAssertionStore;
 use triblespace_core::repo::BlobStore;
+use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
 
@@ -83,13 +86,16 @@ pub enum Command {
         #[arg(long)]
         pile: PathBuf,
     },
-    /// List incoming join requests awaiting approval. These are
-    /// peers that sent `OP_REQUEST_CAP` to this node while
-    /// `pile net sync` was running.
+    /// List the positive facts known for incoming join requests in an
+    /// author's asserted policy ledger.
     ListPending {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
+        /// Policy assertion author (hex). When omitted, exactly one author is
+        /// auto-detected from valid assertions without reading a key file.
+        #[arg(long)]
+        author: Option<String>,
     },
     /// List the renewal-policy entries on the local pile: caps this
     /// node has issued (or auto-approved) that the daemon is
@@ -114,11 +120,11 @@ pub enum Command {
         entry: String,
     },
     /// Send an `OP_REQUEST_CAP` to a team admin asking to be issued
-    /// a capability. The admin's running daemon records the request
-    /// on its pending-requests pin (visible via `team list-pending`);
-    /// once they approve via `team approve`, the freshly-signed cap
-    /// arrives via the auth-handshake ALPN and the daemon pins it
-    /// on the team-cap pin.
+    /// a capability. The admin's running daemon records a durable
+    /// RequestObserved assertion (visible via `team list-pending`); once they
+    /// approve via `team approve`, asserted-policy redispatch sends the
+    /// freshly signed cap via the auth-handshake ALPN and the requester daemon
+    /// pins it on the team-cap pin.
     RequestJoin {
         /// Path to the requester's local pile. The requested partial
         /// capability is recorded here before it is sent, so a later
@@ -136,18 +142,16 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Approve a pending join request by signing a cap for the
-    /// requester and dispatching it via the auth-handshake ALPN.
-    /// Also creates a renewal-policy entry so the running daemon
-    /// keeps the cap renewed.
+    /// Approve an exact asserted request by issuing a provenance-bearing
+    /// grant. The running daemon redispatches its current credential.
     Approve {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
-        /// Pending-request entity id to approve (hex, from
-        /// `team list-pending`).
+        /// Full canonical RequestObserved event handle (64 hex chars), from
+        /// `team list-pending`.
         #[arg(long)]
-        entry: String,
+        request_event: String,
         /// Team root pubkey (hex). Used to verify the issuer's cap
         /// chain before signing the new cap.
         #[arg(long, env = "TRIBLE_TEAM_ROOT")]
@@ -159,6 +163,21 @@ pub enum Command {
         cap: String,
         /// Issuer's signing key path (defaults to the conventional
         /// location next to the pile).
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    /// Reject an exact asserted request. Rejection is a positive fact and does
+    /// not revoke any credential that was also issued for the request.
+    Reject {
+        /// Path to the local pile file.
+        #[arg(long)]
+        pile: PathBuf,
+        /// Full canonical RequestObserved event handle (64 hex chars), from
+        /// `team list-pending`.
+        #[arg(long)]
+        request_event: String,
+        /// Policy author's existing signing key path (defaults to the
+        /// conventional location next to the pile). Never generated here.
         #[arg(long)]
         key: Option<PathBuf>,
     },
@@ -225,7 +244,7 @@ pub fn run(cmd: Command) -> Result<()> {
             legacy_pins,
         } => run_invite(pile, team_root, cap, key, invitee, scope, legacy_pins),
         Command::List { pile } => run_list(pile),
-        Command::ListPending { pile } => run_list_pending(pile),
+        Command::ListPending { pile, author } => run_list_pending(pile, author),
         Command::ListIssued { pile } => run_list_issued(pile),
         Command::Retract { pile, entry } => run_retract(pile, entry),
         Command::RequestJoin {
@@ -236,11 +255,16 @@ pub fn run(cmd: Command) -> Result<()> {
         } => run_request_join(pile, admin, scope, key),
         Command::Approve {
             pile,
-            entry,
+            request_event,
             team_root,
             cap,
             key,
-        } => run_approve(pile, entry, team_root, cap, key),
+        } => run_approve(pile, request_event, team_root, cap, key),
+        Command::Reject {
+            pile,
+            request_event,
+            key,
+        } => run_reject(pile, request_event, key),
         Command::Show {
             pile,
             cap,
@@ -303,6 +327,14 @@ fn load_or_generate_signing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> R
     triblespace_net::identity::load_or_create_key(&path, &parent)
 }
 
+fn load_existing_signing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
+    let parent = pile_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    triblespace_net::identity::load_existing_key(&path, &parent)
+}
+
 fn fresh_signing_key() -> Result<SigningKey> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| anyhow!("generate key: {e}"))?;
@@ -325,6 +357,76 @@ fn parse_handle_hex(s: &str) -> Result<Inline<Handle<SimpleArchive>>> {
         .try_into()
         .map_err(|_| anyhow!("handle must be 32 bytes"))?;
     Ok(Inline::new(raw))
+}
+
+fn policy_ledger_authors(pile: &mut PileBlake3) -> Result<Vec<VerifyingKey>> {
+    let snapshot = pile
+        .pin_assertion_snapshot()
+        .map_err(|error| anyhow!("read pin assertions: {error:?}"))?;
+    let pin = triblespace_net::policy_ledger::PolicyLedgerDescriptor::pin_handle();
+    let authors = snapshot
+        .iter()
+        .filter(|assertion| assertion.identity().pin() == pin)
+        .map(|assertion| assertion.identity().author().to_bytes())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|raw| VerifyingKey::from_bytes(&raw).expect("assertion authors are verified keys"))
+        .collect();
+    Ok(authors)
+}
+
+fn resolve_complete_policy_ledger(
+    pile: &mut PileBlake3,
+    author: VerifyingKey,
+) -> Result<triblespace_net::policy_ledger::PolicyLedgerView> {
+    let snapshot = pile
+        .pin_assertion_snapshot()
+        .map_err(|error| anyhow!("read pin assertions: {error:?}"))?;
+    let reader = pile
+        .reader()
+        .map_err(|error| anyhow!("open policy-ledger reader: {error:?}"))?;
+    match triblespace_net::policy_ledger::resolve_policy_ledger(&snapshot, author, |handle| {
+        reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+            .ok()
+    }) {
+        triblespace_net::policy_ledger::PolicyLedgerResolution::Complete(view) => Ok(view),
+        triblespace_net::policy_ledger::PolicyLedgerResolution::Incomplete { missing } => bail!(
+            "policy ledger for {} is incomplete; missing content: {}",
+            hex::encode(author.to_bytes()),
+            missing
+                .iter()
+                .map(|handle| hex::encode(handle.raw))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        triblespace_net::policy_ledger::PolicyLedgerResolution::Invalid { diagnostics } => bail!(
+            "policy ledger for {} is invalid: {diagnostics:?}",
+            hex::encode(author.to_bytes())
+        ),
+    }
+}
+
+fn request_by_event<'a>(
+    view: &'a triblespace_net::policy_ledger::PolicyLedgerView,
+    request_event: Inline<Handle<SimpleArchive>>,
+) -> Result<(
+    triblespace_net::policy_ledger::RequestIdentity,
+    &'a triblespace_net::policy_ledger::RequestView,
+)> {
+    view.requests()
+        .iter()
+        .find_map(|(&request, state)| {
+            (triblespace_net::policy_ledger::PolicyEvent::RequestObserved(request).handle()
+                == request_event)
+                .then_some((request, state))
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "RequestObserved event {} is not present in this author's complete policy view",
+                hex::encode(request_event.raw)
+            )
+        })
 }
 
 fn now_plus_30_days() -> Inline<triblespace_core::inline::encodings::time::NsTAIInterval> {
@@ -1192,36 +1294,71 @@ fn run_show(
 
 // ── Descriptive-caps subcommands (decide#4b59ce27) ─────────────────────
 
-/// Print the pending join requests recorded on the local pending-
-/// requests branch. Each line shows the entry id (for `team approve`),
-/// requester pubkey, partial-cap handle, received-at instant, and
-/// status tag.
-fn run_list_pending(pile_path: PathBuf) -> Result<()> {
-    let pending = with_pile(&pile_path, |pile| {
-        Ok(triblespace_net::policy::list_pending_requests(pile))
+/// Print every independent positive fact for each exact request in one
+/// author's asserted policy ledger. No key is read or created while selecting
+/// the author.
+fn run_list_pending(pile_path: PathBuf, author_hex: Option<String>) -> Result<()> {
+    let resolved = with_pile(&pile_path, |pile| {
+        let author = match author_hex.as_deref() {
+            Some(author) => parse_pubkey_hex(author)?,
+            None => match policy_ledger_authors(pile)?.as_slice() {
+                [] => return Ok(None),
+                [author] => *author,
+                authors => {
+                    let candidates = authors
+                        .iter()
+                        .map(|author| format!("  {}", hex::encode(author.to_bytes())))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    bail!(
+                        "multiple policy-ledger authors are present; rerun with --author and one of:\n{candidates}"
+                    );
+                }
+            },
+        };
+        Ok(Some((
+            author,
+            resolve_complete_policy_ledger(pile, author)?,
+        )))
     })?;
 
-    if pending.is_empty() {
-        println!("(no pending requests)");
+    let Some((author, view)) = resolved else {
+        println!("(no policy requests)");
+        return Ok(());
+    };
+    if view.requests().is_empty() {
+        println!(
+            "(no policy requests for author {})",
+            hex::encode(author.to_bytes())
+        );
         return Ok(());
     }
-    println!("pending requests:  {}", pending.len());
-    for p in &pending {
-        let id_bytes: [u8; 16] = p.id.into();
-        let status_label = if p.status == triblespace_net::policy::STATUS_PENDING {
-            "PENDING"
-        } else if p.status == triblespace_net::policy::STATUS_APPROVED {
-            "APPROVED"
-        } else if p.status == triblespace_net::policy::STATUS_REJECTED {
-            "REJECTED"
+
+    println!("policy author:  {}", hex::encode(author.to_bytes()));
+    println!("requests:       {}", view.requests().len());
+    for (&request, facts) in view.requests() {
+        let request_event =
+            triblespace_net::policy_ledger::PolicyEvent::RequestObserved(request).handle();
+        println!("  request-event: {}", hex::encode(request_event.raw));
+        println!(
+            "    requester:    {}",
+            hex::encode(request.requester().to_bytes())
+        );
+        println!(
+            "    partial:      {}",
+            hex::encode(request.partial_cap().raw)
+        );
+        println!("    observed:     {}", facts.observed());
+        println!("    rejected:     {}", facts.rejected());
+        println!("    pending:      {}", facts.is_pending());
+        if facts.issued_signatures().is_empty() {
+            println!("    issued-sigs:  []");
         } else {
-            "unknown"
-        };
-        println!("  entry:        {}", hex::encode(id_bytes));
-        println!("    requester:  {}", hex::encode(p.requester.to_bytes()));
-        println!("    partial:    {}", hex::encode(p.partial_cap.raw));
-        println!("    received:   {}", format_expiry(&p.received_at));
-        println!("    status:     {status_label}");
+            println!("    issued-sigs:");
+            for signature in facts.issued_signatures() {
+                println!("      - {}", hex::encode(signature.raw));
+            }
+        }
         println!();
     }
     Ok(())
@@ -1400,7 +1537,7 @@ fn run_request_join(
 
     match status {
         triblespace_net::handshake::STATUS_OK => {
-            println!("ACK — admin received your request and queued it.");
+            println!("ACK — admin durably observed your exact request.");
             println!(
                 "The exact request remains recorded locally until its first cap is activated."
             );
@@ -1455,164 +1592,129 @@ fn clear_rejected_join_expectation(
     }
 }
 
+enum ApprovalOutcome {
+    AlreadyIssued {
+        signatures: Vec<Inline<Handle<SimpleArchive>>>,
+        rejected: bool,
+    },
+    Issued {
+        signature: Inline<Handle<SimpleArchive>>,
+        expiry: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
+        event: Inline<Handle<SimpleArchive>>,
+    },
+}
+
 fn run_approve(
     pile_path: PathBuf,
-    entry_hex: String,
+    request_event_hex: String,
     team_root_hex: String,
     cap_hex: String,
     key: Option<PathBuf>,
 ) -> Result<()> {
-    use triblespace_core::blob::TryFromBlob;
-    use triblespace_core::macros::pattern;
-    use triblespace_core::query::find;
-    use triblespace_core::repo::BlobStoreGet;
+    let request_event = parse_handle_hex(&request_event_hex)
+        .map_err(|error| anyhow!("invalid --request-event: {error:#}"))?;
+    let issuer_key = load_existing_signing_key(key, &pile_path)?;
 
-    let entry_bytes: [u8; 16] = hex::decode(entry_hex.trim())
-        .map_err(|e| anyhow!("decode entry hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("entry id must be 16 bytes (32 hex chars)"))?;
-    let entry_id =
-        Id::new(entry_bytes).ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
-
-    let team_root = parse_pubkey_hex(&team_root_hex)?;
-    let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
-
-    let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
-
-    let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
-        // Look up the pending request entry. Read the partial cap
-        // blob, its subject pubkey, scope_root, and expiry — those
-        // are what the requester proposed. We pass them through to
-        // build_capability (along with our parent cap+sig and
-        // signing key).
-        let pending = triblespace_net::policy::list_pending_requests(pile);
-        let request = pending
+    let outcome = with_pile(&pile_path, |pile| {
+        let view = resolve_complete_policy_ledger(pile, issuer_key.verifying_key())?;
+        let (request, facts) = request_by_event(&view, request_event)?;
+        let signatures = facts
+            .issued_signatures()
             .iter()
-            .find(|p| p.id == entry_id)
-            .ok_or_else(|| anyhow!("pending request {entry_hex} not found"))?;
+            .copied()
+            .collect::<Vec<_>>();
+        let rejected = facts.rejected();
+        let pending = facts.is_pending();
 
-        if request.status != triblespace_net::policy::STATUS_PENDING {
-            bail!("request {entry_hex} is not PENDING (current status: another state)");
+        // Issuance is a positive set-valued fact. Any existing signature makes
+        // approval an idempotent success; adding a sibling would manufacture a
+        // competing credential rather than repair durability.
+        if !signatures.is_empty() {
+            return Ok(ApprovalOutcome::AlreadyIssued {
+                signatures,
+                rejected,
+            });
         }
+        if rejected {
+            bail!(
+                "request {} was rejected and has no issued credential; refusing approval",
+                hex::encode(request_event.raw)
+            );
+        }
+        if !pending {
+            bail!(
+                "request {} is not pending in the complete policy view",
+                hex::encode(request_event.raw)
+            );
+        }
+        drop(view);
 
-        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        let team_root = parse_pubkey_hex(&team_root_hex)?;
+        let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
+
+        let reader = pile
+            .reader()
+            .map_err(|error| anyhow!("pile reader: {error:?}"))?;
         let partial_cap_blob: Blob<SimpleArchive> = reader
-            .get(request.partial_cap)
-            .map_err(|e| anyhow!("fetch partial cap blob: {e:?}"))?;
-        let partial_set: TribleSet = TryFromBlob::try_from_blob(partial_cap_blob)
-            .map_err(|e| anyhow!("parse partial cap blob: {e:?}"))?;
-
-        let mut iter = find!(
-            (
-                e: Id,
-                subject: VerifyingKey,
-                issuer: VerifyingKey,
-                scope_root: Id,
-                expiry: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
-            ),
-            pattern!(&partial_set, [{
-                ?e @
-                capability::cap_subject: ?subject,
-                capability::cap_issuer: ?issuer,
-                capability::cap_scope_root: ?scope_root,
-                triblespace_core::metadata::expires_at: ?expiry,
-            }])
-        );
-        let (_cap_id, subject, requested_issuer, scope_root, requested_expiry) =
-            match (iter.next(), iter.next()) {
-                (Some(row), None) => row,
-                _ => bail!("partial cap blob malformed (no unique subject/issuer/scope/expiry)"),
-            };
-
-        if subject != request.requester {
+            .get::<Blob<SimpleArchive>, SimpleArchive>(request.partial_cap())
+            .map_err(|error| anyhow!("fetch requested partial capability: {error:?}"))?;
+        let claim = capability::decode_operational_capability(partial_cap_blob)
+            .map_err(|error| anyhow!("decode requested capability: {error:?}"))?;
+        if claim.subject != request.requester() {
             bail!(
-                "partial cap subject {} doesn't match requester {} — refusing to sign",
-                hex::encode(subject.to_bytes()),
-                hex::encode(request.requester.to_bytes()),
+                "request claim subject {} does not match requester {}",
+                hex::encode(claim.subject.to_bytes()),
+                hex::encode(request.requester().to_bytes())
             );
         }
-        if requested_issuer != issuer_key.verifying_key() {
+        if claim.issuer != issuer_key.verifying_key() {
             bail!(
-                "partial cap requested issuer {} but this signer is {} — refusing to sign",
-                hex::encode(requested_issuer.to_bytes()),
-                hex::encode(issuer_key.verifying_key().to_bytes()),
+                "request claim issuer {} does not match policy author {}",
+                hex::encode(claim.issuer.to_bytes()),
+                hex::encode(issuer_key.verifying_key().to_bytes())
             );
         }
 
-        // Extract scope_facts (all tribles hanging off scope_root in the
-        // partial cap). build_capability takes scope_facts so we preserve
-        // whatever the requester wrote there.
         let mut scope_facts = TribleSet::new();
-        for t in partial_set.iter() {
-            if *t.e() == scope_root {
-                scope_facts.insert(t);
+        for trible in claim.cap_set.iter() {
+            if *trible.e() == claim.scope_root {
+                scope_facts.insert(trible);
             }
         }
 
-        // Fetch our issuer cap+sig (the parent for the new cap). The
-        // sig blob carries `sig_signs: <cap_handle>` pointing at the cap,
-        // so one read gives us both via the reader we already have.
-        let parent_sig_blob: Blob<SimpleArchive> = reader
-            .get(issuer_cap_sig_handle)
-            .map_err(|e| anyhow!("fetch issuer sig blob: {e:?}"))?;
-        let parent_sig_set: TribleSet = TryFromBlob::try_from_blob(parent_sig_blob.clone())
-            .map_err(|e| anyhow!("parse issuer sig blob: {e:?}"))?;
-        let mut sig_signs_iter = find!(
-            (e: Id, h: Inline<Handle<SimpleArchive>>),
-            pattern!(&parent_sig_set, [{ ?e @ capability::sig_signs: ?h }])
-        );
-        let (_e, parent_cap_handle) = match (sig_signs_iter.next(), sig_signs_iter.next()) {
-            (Some(row), None) => row,
-            _ => bail!("issuer sig blob malformed (no unique sig_signs)"),
-        };
-        let parent_cap_blob: Blob<SimpleArchive> = reader
-            .get(parent_cap_handle)
-            .map_err(|e| anyhow!("fetch issuer cap blob: {e:?}"))?;
-        // Verify the issuer's chain before signing — refuse to delegate
-        // off an invalid chain.
-        let snap_reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        let snap_reader = pile
+            .reader()
+            .map_err(|error| anyhow!("pile reader: {error:?}"))?;
         let parent_verified = capability::verify_chain(
             team_root,
             issuer_cap_sig_handle,
             issuer_key.verifying_key(),
-            |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+            |handle: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
                 snap_reader
-                    .get::<Blob<SimpleArchive>, SimpleArchive>(h)
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
                     .ok()
             },
         )
-        .map_err(|e| anyhow!("issuer's cap chain does not verify: {e:?}"))?;
+        .map_err(|error| anyhow!("issuer's capability chain does not verify: {error:?}"))?;
+        let expiry = cap_expiry_at_most(claim.expiry, parent_verified.expires_at())?;
+        let (parent_cap_blob, parent_sig_blob) = fetch_cap_blob_pair(pile, issuer_cap_sig_handle)?;
 
-        let expiry = cap_expiry_at_most(requested_expiry, parent_verified.expires_at())?;
-
-        // Sign the cap. Note: build_capability sets cap_issuer to the
-        // issuer's verifying key automatically (overrides whatever the
-        // partial cap declared); that's correct — the requester's
-        // declared cap_issuer was just a placeholder telling us "this is
-        // for the K_A path".
         let (cap_blob, sig_blob) = capability::build_capability(
             &issuer_key,
-            subject,
+            claim.subject,
             (parent_cap_blob, parent_sig_blob),
-            scope_root,
+            claim.scope_root,
             scope_facts,
             expiry,
         )
-        .map_err(|e| anyhow!("build cap: {e:?}"))?;
+        .map_err(|error| anyhow!("build capability: {error:?}"))?;
+        let cap_handle = cap_blob.get_handle();
+        let sig_handle = sig_blob.get_handle();
 
-        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-        let request_id = request.id;
-
-        // Refuse an over-broad or otherwise invalid request before writing
-        // either orphan blobs or a durable renewal entry. The completed chain
-        // is checked with the just-built leaf pair overlaid on the existing
-        // pile reader; parent proof remains content-addressed and unchanged.
-        let _verified_child = capability::verify_chain(
+        capability::verify_chain(
             team_root,
             sig_handle,
-            subject,
+            claim.subject,
             |handle: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
                 if handle == sig_handle {
                     Some(sig_blob.clone())
@@ -1625,59 +1727,191 @@ fn run_approve(
                 }
             },
         )
-        .map_err(|e| anyhow!("issued capability chain does not verify: {e:?}"))?;
-
-        // Persist cap+sig blobs, record on the renewal-policy pin,
-        // mark the request approved — purely local writes, no
-        // network. The running `pile net sync` daemon's
-        // `redispatch_undelivered` loop picks the new policy entry up
-        // on its next tick (every 100ms) and dispatches
-        // OP_DELIVER_CAP over its already-up iroh endpoint. We don't
-        // dispatch from the CLI for three reasons:
-        //
-        // 1. The subject is commonly offline at approve-time — the
-        //    whole point of an async request/approve flow is that
-        //    the requester and admin needn't be online
-        //    simultaneously. The daemon's re-dispatch loop has to
-        //    exist for that case to work; once it exists, an extra
-        //    "try once and hope" from the CLI is redundant.
-        // 2. The CLI's dispatcher (`one_shot_deliver_cap`) used to
-        //    spin up a fresh iroh endpoint with the issuer's signing
-        //    key — *same* pubkey as the daemon's long-lived endpoint.
-        //    N0's relay server treats that as "another endpoint
-        //    connected with the same id" and the duplicate-identity
-        //    warns spam the log.
-        // 3. The block-on dispatch had no timeout: a 30-day-fresh
-        //    cap to an offline subject hung the CLI forever instead
-        //    of returning with "daemon will retry."
+        .map_err(|error| anyhow!("issued capability chain does not verify: {error:?}"))?;
         drop(reader);
         drop(snap_reader);
-        store_blob(pile, cap_blob)?;
-        store_blob(pile, sig_blob)?;
 
-        let policy_entry = triblespace_net::policy::record_policy_entry(
-            pile, subject, scope_root, expiry, cap_handle, sig_handle,
+        let grant = triblespace_net::policy_ledger::GrantIdentity::new(
+            team_root,
+            claim.subject,
+            claim.scope_root,
         );
-
-        let _ = triblespace_net::policy::set_request_status(
+        let receipt = triblespace_net::policy_ledger::issue_grant(
             pile,
-            request_id,
-            triblespace_net::policy::STATUS_APPROVED,
-        );
+            &issuer_key,
+            grant,
+            sig_blob,
+            Some(request_event),
+            [cap_blob],
+        )
+        .map_err(|error| anyhow!("publish GrantIssued event: {error}"))?;
 
-        Ok((sig_handle, expiry, policy_entry))
+        Ok(ApprovalOutcome::Issued {
+            signature: sig_handle,
+            expiry,
+            event: receipt.event(),
+        })
     })?;
 
-    println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
-    println!("expires:           {}", format_expiry(&expiry));
-    if let Some(eid) = policy_entry {
-        let eid_bytes: [u8; 16] = eid.into();
-        println!("renewal entry:     {}", hex::encode(eid_bytes));
+    match outcome {
+        ApprovalOutcome::AlreadyIssued {
+            signatures,
+            rejected,
+        } => {
+            println!("request already has issued credential signatures:");
+            for signature in signatures {
+                println!("  {}", hex::encode(signature.raw));
+            }
+            println!("no sibling credential was issued");
+            if rejected {
+                eprintln!(
+                    "warning: this request also has a rejection fact; rejection does not revoke an issued credential"
+                );
+            }
+        }
+        ApprovalOutcome::Issued {
+            signature,
+            expiry,
+            event,
+        } => {
+            println!("issued cap (sig):  {}", hex::encode(signature.raw));
+            println!("expires:           {}", format_expiry(&expiry));
+            println!("GrantIssued event: {}", hex::encode(event.raw));
+            println!("the running sync daemon will redispatch this asserted current credential");
+        }
     }
-    println!(
-        "  request marked APPROVED; the running sync daemon will deliver via \
-         OP_DELIVER_CAP on its next tick (visible in `team list-issued` when \
-         the subject's daemon auths back with the new cap)"
-    );
     Ok(())
+}
+
+fn run_reject(pile_path: PathBuf, request_event_hex: String, key: Option<PathBuf>) -> Result<()> {
+    let request_event = parse_handle_hex(&request_event_hex)
+        .map_err(|error| anyhow!("invalid --request-event: {error:#}"))?;
+    let author = load_existing_signing_key(key, &pile_path)?;
+
+    enum RejectOutcome {
+        Published(Inline<Handle<SimpleArchive>>),
+        AlreadyRejected { issued: bool },
+    }
+
+    let outcome = with_pile(&pile_path, |pile| {
+        let view = resolve_complete_policy_ledger(pile, author.verifying_key())?;
+        let (request, facts) = request_by_event(&view, request_event)?;
+        let rejected = facts.rejected();
+        let issued = !facts.issued_signatures().is_empty();
+        let pending = facts.is_pending();
+
+        if rejected {
+            return Ok(RejectOutcome::AlreadyRejected { issued });
+        }
+        if issued {
+            bail!(
+                "request {} already has an issued credential; refusing a late rejection because it would not revoke that credential",
+                hex::encode(request_event.raw)
+            );
+        }
+        if !pending {
+            bail!(
+                "request {} is not pending in the complete policy view",
+                hex::encode(request_event.raw)
+            );
+        }
+        drop(view);
+
+        let receipt = triblespace_net::policy_ledger::reject_request(pile, &author, request)
+            .map_err(|error| anyhow!("publish RequestRejected event: {error}"))?;
+        Ok(RejectOutcome::Published(receipt.event()))
+    })?;
+
+    match outcome {
+        RejectOutcome::Published(event) => {
+            println!("RequestRejected event: {}", hex::encode(event.raw));
+        }
+        RejectOutcome::AlreadyRejected { issued } => {
+            println!("request is already rejected; no duplicate fact was appended");
+            if issued {
+                eprintln!(
+                    "warning: this request also has issued credentials; rejection does not revoke them"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triblespace_core::blob::IntoBlob;
+    use triblespace_core::id::ExclusiveId;
+    use triblespace_core::inline::TryToInline;
+    use triblespace_core::macros::entity;
+
+    #[test]
+    fn asserted_request_selection_and_rejection_survive_pile_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.pile");
+        std::fs::File::create(&path).unwrap();
+        let author = SigningKey::from_bytes(&[0x71; 32]);
+        let requester = SigningKey::from_bytes(&[0x72; 32]).verifying_key();
+        let scope_root = *triblespace_core::id::ufoid();
+        let now = triblespace_net::clock::epoch_now();
+        let expiry = (now, now + hifitime::Duration::from_hours(1.0))
+            .try_to_inline()
+            .unwrap();
+        let mut partial_set: TribleSet = entity! {
+            capability::cap_subject: requester,
+            capability::cap_issuer: author.verifying_key(),
+            capability::cap_scope_root: scope_root,
+            triblespace_core::metadata::expires_at: expiry,
+        }
+        .into();
+        partial_set += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&scope_root) @
+            triblespace_core::metadata::tag: capability::PERM_READ,
+        });
+        let partial: Blob<SimpleArchive> = partial_set.to_blob();
+        let request =
+            triblespace_net::policy_ledger::RequestIdentity::new(requester, partial.get_handle());
+        let request_event =
+            triblespace_net::policy_ledger::PolicyEvent::RequestObserved(request).handle();
+
+        with_pile(&path, |pile| {
+            let outcome =
+                triblespace_net::policy_ledger::observe_request(pile, &author, requester, partial)
+                    .map_err(|error| anyhow!("observe request: {error}"))?;
+            assert!(matches!(
+                outcome,
+                triblespace_net::policy_ledger::ObserveRequestOutcome::Observed(_)
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        with_pile(&path, |pile| {
+            assert_eq!(
+                policy_ledger_authors(pile)?.as_slice(),
+                &[author.verifying_key()]
+            );
+            assert!(!dir.path().join("self.key").exists());
+            let view = resolve_complete_policy_ledger(pile, author.verifying_key())?;
+            let (selected, facts) = request_by_event(&view, request_event)?;
+            assert_eq!(selected, request);
+            assert!(facts.is_pending());
+            drop(view);
+            triblespace_net::policy_ledger::reject_request(pile, &author, selected)
+                .map_err(|error| anyhow!("reject request: {error}"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        with_pile(&path, |pile| {
+            let view = resolve_complete_policy_ledger(pile, author.verifying_key())?;
+            let (_, facts) = request_by_event(&view, request_event)?;
+            assert!(facts.observed());
+            assert!(facts.rejected());
+            assert!(!facts.is_pending());
+            Ok(())
+        })
+        .unwrap();
+    }
 }

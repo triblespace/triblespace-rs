@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- **Join-request disposition now uses the asserted issuer-policy ledger.**
+  `team list-pending [--author PUBKEY_HEX]` displays independent observed,
+  rejected, derived-pending, and complete issued-signature facts, auto-detecting
+  a sole valid assertion author without reading a key. `team approve` replaces
+  the truncated `--entry` selector with the full canonical `--request-event`
+  handle, and `team reject` applies the same exact selector. Both mutation
+  commands refuse to generate a missing author key, require a complete ledger,
+  and append only the corresponding provenance-bearing positive event; the
+  legacy incoming-request pin/status and approval renewal-policy dual write are
+  removed with no compatibility alias.
 - **The dead remote mutable-pin CLI is removed.** `trible store pin list` is
   deleted together with the object-store CAS namespace it inspected; `store`
   now contains only content-addressed blob operations.

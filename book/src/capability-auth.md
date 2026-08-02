@@ -115,15 +115,24 @@ trible team request-join --pile PATH --admin HEX
     Send an OP_REQUEST_CAP to an admin's running daemon asking to
     be issued a capability. The exact partial request is stored in the
     requester's pile before network I/O, so a first delivery must match
-    deliberate local intent. The admin sees the request on their
-    pending-requests pin (`team list-pending`); after `team approve`
-    the freshly-signed cap arrives via the auth-handshake ALPN.
+    deliberate local intent. The admin sees its durable
+    `RequestObserved` assertion with `team list-pending`; after
+    `team approve` the daemon redispatches the asserted credential via
+    the auth-handshake ALPN.
 
-trible team approve --pile PATH --entry HEX --team-root HEX
+trible team approve --pile PATH --request-event EVENT_HEX --team-root HEX
                     --cap HEX [--key PATH]
-    Approve a pending request, sign the cap, dispatch it back to
-    the requester, and add a renewal-policy entry so the local
-    daemon keeps the cap renewed.
+    Approve one exact canonical RequestObserved event (a full 32-byte
+    handle) by signing the cap and asserting a provenance-bearing
+    GrantIssued event. An existing issued-signature set is an
+    idempotent success and never creates a sibling credential. The
+    signing key must already exist; this command never generates it.
+
+trible team reject --pile PATH --request-event EVENT_HEX [--key PATH]
+    Assert RequestRejected for one exact request. Exact replay is a
+    no-op. A late rejection of an issued-only request is refused;
+    rejection alongside an existing issuance is reported as an
+    independent fact and does not revoke the credential.
 
 trible team retract --pile PATH --entry HEX
     Stop auto-renewing one (subject, scope) entry. The peer's
@@ -136,8 +145,11 @@ trible team list --pile PATH
     Audit summary: per-cap detail line (issuer → subject, scope,
     expiry — sorted soonest-expiry-first).
 
-trible team list-pending --pile PATH
-    Incoming join requests awaiting approval.
+trible team list-pending --pile PATH [--author PUBKEY_HEX]
+    Show observed, rejected, pending, and every issued-signature fact
+    for each exact request. Without --author, one policy author is
+    detected from valid assertions without reading or creating a key;
+    multiple candidates must be selected explicitly.
 
 trible team list-issued --pile PATH
     Renewal-policy entries this node is keeping renewed.
@@ -296,8 +308,9 @@ stream is one-shot:
 | `OP_FETCH_CAPABILITY_BLOB`       | 0x03 | Fetch one exact verified proof member  |
 
 Request, delivery, and delivery-confirmation event queues are separately
-bounded. For `OP_REQUEST_CAP`, `STATUS_OK` is sent only after the exact pending
-request has crossed the receiver's storage flush boundary. `STATUS_REJECTED`
+bounded. For `OP_REQUEST_CAP`, `STATUS_OK` is sent only after the exact request
+closure and its `RequestObserved` assertion have crossed the receiver's storage
+flush boundary. `STATUS_REJECTED`
 means the request definitely did not enter durable policy, either because of a
 stable policy refusal or a failure before policy-loop admission. A persistence
 error after admission instead yields `STATUS_INDETERMINATE`: append APIs cannot
@@ -320,7 +333,7 @@ partial capability before sending it. A first delivered credential must match
 that local issuer, subject, scope ceiling, and expiry ceiling. The expectation
 is retained after an ambiguous network outcome and consumed only after the
 selected credential becomes active. First activation is a recoverable journaled
-transition: the exact pending-request head is claimed as `Activating` only after
+transition: the exact outbound-request head is claimed as `Activating` only after
 the complete proof bundle is durable, then the team credential is installed and
 flushed, and finally that exact activation head is cleared. A concurrent newer
 request cannot be deleted or authorize a stale selection; startup can finish an

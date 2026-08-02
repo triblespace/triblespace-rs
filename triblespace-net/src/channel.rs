@@ -31,11 +31,10 @@ pub enum NetCommand {
     /// command, so no connection authenticated with the predecessor remains
     /// reusable after credential activation.
     UpdateSelfCap(RawHash),
-    /// Dispatch a freshly-signed cap+sig pair to `subject` via the
-    /// auth-handshake ALPN. Used by the renewal daemon (push-based
-    /// renewal) and by the `team approve` subcommand (response to a
-    /// pending request). The network thread opens a connection to
-    /// the subject's pubkey, sends `OP_DELIVER_CAP`, and closes.
+    /// Dispatch a selected cap+sig pair to `subject` via the auth-handshake
+    /// ALPN. Asserted-policy redispatch uses this for newly approved and
+    /// renewed credentials. The network thread opens a connection to the
+    /// subject's pubkey, sends `OP_DELIVER_CAP`, and closes.
     ///
     /// Delivery is best-effort fire-and-forget at this layer. Positive
     /// evidence arrives later, when the subject authenticates against our
@@ -59,8 +58,8 @@ pub enum NetEvent {
     /// blob carries the subject they're requesting for (must match
     /// `requester` — verified at connection time via iroh's TLS),
     /// the scope they're asking for, and their preferred expiry
-    /// interval. The local renewal-policy branch decides whether
-    /// to auto-approve, queue for human review, or reject.
+    /// interval. The asserted issuer-policy writer validates and durably
+    /// observes it for exact-handle human disposition, or refuses it.
     CapRequest {
         requester: PublisherKey,
         partial_cap_bytes: Bytes,
