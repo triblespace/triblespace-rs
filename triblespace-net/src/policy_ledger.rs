@@ -33,14 +33,22 @@ use triblespace_core::repo::capability::{
     verify_chain_details_allow_expired,
 };
 use triblespace_core::repo::pin_assertion::{
-    PinAssertion, PinAssertionSnapshot, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle,
+    PinAssertion, PinAssertionId, PinAssertionKeyCollision, PinAssertionSnapshot,
+    PinAssertionStore, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle,
 };
 use triblespace_core::repo::strong_pin::StrongPinDescriptor;
+use triblespace_core::repo::{BlobStore, BlobStoreGet, StorageFlush};
 use triblespace_core::trible::{Fragment, TribleSet};
 
-use crate::policy::{policy_scope, policy_subject, request_partial_cap, request_requester};
-
 triblespace_core::prelude::attributes! {
+    /// Public key whose request or grant is being described.
+    "3583BC29C2155717639FA7E9314CC8B9" as pub request_requester: triblespace_core::prelude::inlineencodings::ED25519PublicKey;
+    /// Exact finite capability claim supplied by a requester.
+    "42903FA16A2913144A48072F575BB304" as pub request_partial_cap: Handle<SimpleArchive>;
+    /// Subject whose credential this grant maintains.
+    "384D8A994AF026BBD1329CAD7041E3B8" as pub policy_subject: triblespace_core::prelude::inlineencodings::ED25519PublicKey;
+    /// Stable scope-root identity of this grant.
+    "D67D3CB1562B27504892BF0ACB55EA8B" as pub policy_scope: triblespace_core::prelude::inlineencodings::GenId;
     /// Team root whose founder anchor terminates a grant's verified proof.
     "CF48B211C9FCF5FAFA1AF2A35AC93799" as pub policy_team_root: triblespace_core::prelude::inlineencodings::ED25519PublicKey;
     /// Exact canonical signature/proof blob issued for a grant. The signature
@@ -68,6 +76,16 @@ pub const EVENT_CREDENTIAL_AUTHENTICATED: Id =
     triblespace_core::id::id_hex!("333A14195FBDE41C755394621D4D875F");
 pub const EVENT_GRANT_DISABLED: Id =
     triblespace_core::id::id_hex!("B97B48D5DC12E304303357B6C2126E82");
+
+/// Local admission threshold for requests simultaneously pending in one
+/// author's operational policy view.
+///
+/// Historical observed, rejected, and issued request facts remain in the
+/// monotone ledger but do not consume this threshold. Producers must serialize
+/// observation writes for one author when they require a hard bound: generic
+/// asserted-pin append is deliberately not a distributed transaction, and the
+/// reducer preserves concurrently admitted facts rather than discarding them.
+pub const MAX_PENDING_REQUESTS: usize = 1024;
 
 /// Fixed inner descriptor for one author's complete issuer-policy event set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -428,6 +446,620 @@ pub fn event_handle(value: ValueHandle) -> Inline<Handle<SimpleArchive>> {
     Inline::new(value.raw())
 }
 
+type PolicyStorageError = Box<dyn Error + Send + Sync>;
+
+/// Durable receipt for one policy event publication.
+///
+/// This deliberately does not return the prospective reduced view: another
+/// writer may append a concurrent positive fact immediately afterwards, so an
+/// operational caller must take a fresh snapshot before acting on current
+/// policy. Successful return means the complete referenced blob closure was
+/// flushed before the assertion crossed its own durable append boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicyEventReceipt {
+    event: Inline<Handle<SimpleArchive>>,
+    assertion: PinAssertionId,
+}
+
+/// Ordinary, non-storage reason an authenticated capability request was not
+/// admitted into the policy ledger.
+#[derive(Debug)]
+pub enum ObserveRequestRefusal {
+    InvalidClaim(VerifyError),
+    SubjectMismatch { declared: VerifyingKey },
+    IssuerMismatch { declared: VerifyingKey },
+    OutstandingRequest { existing: RequestIdentity },
+    Capacity,
+}
+
+impl fmt::Display for ObserveRequestRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidClaim(error) => {
+                write!(f, "invalid operational capability claim: {error:?}")
+            }
+            Self::SubjectMismatch { declared } => write!(
+                f,
+                "request claim names a different subject {}",
+                hex::encode(declared.to_bytes())
+            ),
+            Self::IssuerMismatch { declared } => write!(
+                f,
+                "request claim names a different issuer {}",
+                hex::encode(declared.to_bytes())
+            ),
+            Self::OutstandingRequest { existing } => write!(
+                f,
+                "requester already has pending request {:?}",
+                existing.partial_cap()
+            ),
+            Self::Capacity => write!(
+                f,
+                "policy already has {MAX_PENDING_REQUESTS} pending requests"
+            ),
+        }
+    }
+}
+
+/// Result of attempting to durably observe one authenticated request.
+#[derive(Debug)]
+pub enum ObserveRequestOutcome {
+    Observed(PolicyEventReceipt),
+    Refused(ObserveRequestRefusal),
+}
+
+enum PolicyEventPublication<R> {
+    Published(PolicyEventReceipt),
+    Refused(R),
+}
+
+impl PolicyEventReceipt {
+    pub const fn event(&self) -> Inline<Handle<SimpleArchive>> {
+        self.event
+    }
+
+    pub const fn assertion(&self) -> PinAssertionId {
+        self.assertion
+    }
+}
+
+/// Failure to validate or durably publish one policy event.
+#[derive(Debug)]
+pub enum PolicyLedgerWriteError {
+    Snapshot(PolicyStorageError),
+    SnapshotCollision(PinAssertionKeyCollision),
+    Reader(PolicyStorageError),
+    Read {
+        handle: Inline<Handle<SimpleArchive>>,
+        source: PolicyStorageError,
+    },
+    Invalid {
+        diagnostics: Vec<PolicyLedgerDiagnostic>,
+    },
+    PostconditionFailed {
+        event: Inline<Handle<SimpleArchive>>,
+    },
+    Put {
+        stage: &'static str,
+        source: PolicyStorageError,
+    },
+    PutHandleMismatch {
+        stage: &'static str,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    VerifyStored {
+        stage: &'static str,
+        source: PolicyStorageError,
+    },
+    StoredContentMismatch {
+        stage: &'static str,
+        handle: [u8; 32],
+    },
+    Flush(PolicyStorageError),
+    Append(PolicyStorageError),
+}
+
+impl fmt::Display for PolicyLedgerWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Snapshot(error) => write!(f, "failed to snapshot policy assertions: {error}"),
+            Self::SnapshotCollision(error) => {
+                write!(f, "failed to overlay prospective policy assertion: {error}")
+            }
+            Self::Reader(error) => write!(f, "failed to open policy blob reader: {error}"),
+            Self::Read { handle, source } => {
+                write!(f, "failed to read policy blob {handle:?}: {source}")
+            }
+            Self::Invalid { diagnostics } => write!(
+                f,
+                "prospective policy ledger is invalid ({} diagnostics)",
+                diagnostics.len()
+            ),
+            Self::PostconditionFailed { event } => write!(
+                f,
+                "prospective policy ledger omitted candidate event {event:?}"
+            ),
+            Self::Put { stage, source } => {
+                write!(f, "failed to store policy {stage}: {source}")
+            }
+            Self::PutHandleMismatch {
+                stage,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "policy {stage} stored under the wrong handle: expected {}, got {}",
+                hex::encode_upper(expected),
+                hex::encode_upper(actual)
+            ),
+            Self::VerifyStored { stage, source } => {
+                write!(f, "failed to verify stored policy {stage}: {source}")
+            }
+            Self::StoredContentMismatch { stage, handle } => write!(
+                f,
+                "stored policy {stage} has wrong bytes under handle {}",
+                hex::encode_upper(handle)
+            ),
+            Self::Flush(error) => write!(f, "failed to flush policy closure: {error}"),
+            Self::Append(error) => write!(f, "failed to append policy assertion: {error}"),
+        }
+    }
+}
+
+impl Error for PolicyLedgerWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Snapshot(error)
+            | Self::Reader(error)
+            | Self::Flush(error)
+            | Self::Append(error) => Some(error.as_ref()),
+            Self::Read { source, .. }
+            | Self::Put { source, .. }
+            | Self::VerifyStored { source, .. } => Some(source.as_ref()),
+            Self::SnapshotCollision(error) => Some(error),
+            Self::Invalid { .. }
+            | Self::PostconditionFailed { .. }
+            | Self::PutHandleMismatch { .. }
+            | Self::StoredContentMismatch { .. } => None,
+        }
+    }
+}
+
+/// Validate one event against the complete prospective author ledger, then
+/// publish it with closure-before-assertion crash ordering.
+///
+/// `closure` contains newly created `SimpleArchive` blobs referenced directly
+/// or transitively by the event (for example a request claim, capability, and
+/// signature proof). Existing dependencies may be omitted: the prospective
+/// reducer reads them through a pinned store reader. No blob is written until
+/// the candidate assertion has reduced to [`PolicyLedgerResolution::Complete`].
+/// The write order is closure, event, inner descriptor, strong descriptor,
+/// flush, then the assertion's durable append. There is intentionally no flush
+/// after `append_pin_assertion`; durability on return is that trait's contract.
+pub fn append_validated_policy_event<S, I>(
+    store: &mut S,
+    author: &SigningKey,
+    event: PolicyEvent,
+    closure: I,
+) -> Result<PolicyEventReceipt, PolicyLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+    I: IntoIterator<Item = Blob<SimpleArchive>>,
+{
+    match append_validated_policy_event_if(store, author, event, closure, |_, _| {
+        Ok::<bool, std::convert::Infallible>(true)
+    })? {
+        PolicyEventPublication::Published(receipt) => Ok(receipt),
+        PolicyEventPublication::Refused(never) => match never {},
+    }
+}
+
+/// Shared prospective-validation and publication mechanism. `admit` observes
+/// the complete prospective view before any mutation. `Ok(true)` admits,
+/// `Ok(false)` reports a violated event postcondition, and `Err(reason)` turns
+/// a locally valid event into an ordinary typed refusal.
+fn append_validated_policy_event_if<S, I, P, R>(
+    store: &mut S,
+    author: &SigningKey,
+    event: PolicyEvent,
+    closure: I,
+    admit: P,
+) -> Result<PolicyEventPublication<R>, PolicyLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+    I: IntoIterator<Item = Blob<SimpleArchive>>,
+    P: FnOnce(&PolicyLedgerView, bool) -> Result<bool, R>,
+{
+    let event_blob = event.to_blob();
+    let event_handle = event_blob.get_handle();
+    let assertion = sign_policy_event(author, event);
+
+    // Normalize every supplied blob from bytes rather than trusting a cached
+    // handle. This mirrors the reducer's public fetch-boundary check.
+    let mut overlay = BTreeMap::new();
+    for blob in closure {
+        let blob = Blob::new(blob.bytes);
+        overlay.insert(blob.get_handle(), blob);
+    }
+    overlay.insert(event_handle, event_blob.clone());
+    let inner = PolicyLedgerDescriptor::blob();
+    let inner_handle = inner.get_handle();
+    let outer = PolicyLedgerDescriptor::strong_blob();
+    let outer_handle = outer.get_handle();
+
+    let mut snapshot = store
+        .pin_assertion_snapshot()
+        .map_err(|error| PolicyLedgerWriteError::Snapshot(Box::new(error)))?;
+    let already_asserted = snapshot
+        .for_pin(&PolicyLedgerDescriptor::pin_identity(
+            author.verifying_key(),
+        ))
+        .contains(&assertion);
+    snapshot
+        .insert(assertion)
+        .map_err(PolicyLedgerWriteError::SnapshotCollision)?;
+    let reader = store
+        .reader()
+        .map_err(|error| PolicyLedgerWriteError::Reader(Box::new(error)))?;
+
+    // BlobStoreGet deliberately has no portable NotFound discriminator. At a
+    // write boundary every raw read error is therefore preserved as a storage
+    // error rather than guessed to be semantic absence.
+    let mut read_error = None;
+    let resolution = resolve_policy_ledger(&snapshot, author.verifying_key(), |handle| {
+        if let Some(blob) = overlay.get(&handle) {
+            return Some(blob.clone());
+        }
+        if read_error.is_some() {
+            return None;
+        }
+        match reader.get::<Blob<SimpleArchive>, SimpleArchive>(handle) {
+            Ok(blob) => Some(blob),
+            Err(error) => {
+                read_error = Some((handle, Box::new(error) as PolicyStorageError));
+                None
+            }
+        }
+    });
+    // An exact retry can skip rewriting only when the store already contains
+    // the exact bytes of every supplied closure member and both retention
+    // descriptors. Assertions may legitimately replicate before their
+    // content, so the prospective overlay alone proves nothing about storage.
+    let closure_present = already_asserted
+        && overlay
+            .values()
+            .all(|expected| verify_stored_blob(&reader, "closure member", expected).is_ok())
+        && verify_stored_blob(&reader, "inner descriptor", &inner).is_ok()
+        && verify_stored_blob(&reader, "strong descriptor", &outer).is_ok();
+    // End the immutable store phase explicitly before any publication write.
+    // Some backends own their reader outright today, but this keeps the
+    // validation/read and mutation phases distinct in the generic protocol.
+    drop(reader);
+    if let Some((handle, source)) = read_error {
+        return Err(PolicyLedgerWriteError::Read { handle, source });
+    }
+    let view = match resolution {
+        PolicyLedgerResolution::Complete(view) if view.event_handles().contains(&event_handle) => {
+            view
+        }
+        PolicyLedgerResolution::Complete(_) => {
+            return Err(PolicyLedgerWriteError::PostconditionFailed {
+                event: event_handle,
+            });
+        }
+        PolicyLedgerResolution::Incomplete { .. } => {
+            unreachable!("the storage writer records every callback absence as a read error")
+        }
+        PolicyLedgerResolution::Invalid { diagnostics } => {
+            return Err(PolicyLedgerWriteError::Invalid { diagnostics });
+        }
+    };
+    match admit(&view, already_asserted) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(PolicyLedgerWriteError::PostconditionFailed {
+                event: event_handle,
+            });
+        }
+        Err(reason) => return Ok(PolicyEventPublication::Refused(reason)),
+    }
+    if closure_present {
+        // Visibility through a reader does not prove crash durability. Flush
+        // even on an exact retry; only the already-durable assertion append is
+        // safely elided through the available generic traits.
+        store
+            .flush()
+            .map_err(|error| PolicyLedgerWriteError::Flush(Box::new(error)))?;
+        return Ok(PolicyEventPublication::Published(PolicyEventReceipt {
+            event: event_handle,
+            assertion: assertion.id(),
+        }));
+    }
+
+    for (handle, blob) in &overlay {
+        if *handle == event_handle {
+            continue;
+        }
+        let actual = store
+            .put::<SimpleArchive, _>(blob.clone())
+            .map_err(|error| PolicyLedgerWriteError::Put {
+                stage: "closure blob",
+                source: Box::new(error),
+            })?;
+        require_stored_handle("closure blob", handle.raw, actual.raw)?;
+    }
+
+    let actual_event =
+        store
+            .put::<SimpleArchive, _>(event_blob)
+            .map_err(|error| PolicyLedgerWriteError::Put {
+                stage: "event blob",
+                source: Box::new(error),
+            })?;
+    require_stored_handle("event blob", event_handle.raw, actual_event.raw)?;
+
+    let actual_inner = store
+        .put::<PolicyLedgerDescriptor, _>(inner.clone())
+        .map_err(|error| PolicyLedgerWriteError::Put {
+            stage: "inner descriptor",
+            source: Box::new(error),
+        })?;
+    require_stored_handle("inner descriptor", inner_handle.raw, actual_inner.raw)?;
+
+    let actual_outer = store
+        .put::<StrongPinDescriptor, _>(outer.clone())
+        .map_err(|error| PolicyLedgerWriteError::Put {
+            stage: "strong descriptor",
+            source: Box::new(error),
+        })?;
+    require_stored_handle("strong descriptor", outer_handle.raw, actual_outer.raw)?;
+
+    // A backend returning the requested handle from `put` is not sufficient:
+    // cached handles can lie, and an idempotent insert may retain corrupt bytes
+    // already stored under that key. Re-read every member before crossing the
+    // durability boundary, while an absent/corrupt candidate still cannot gain
+    // a new assertion.
+    let verification_reader = store
+        .reader()
+        .map_err(|error| PolicyLedgerWriteError::Reader(Box::new(error)))?;
+    for blob in overlay.values() {
+        let stage = if blob.get_handle() == event_handle {
+            "event blob"
+        } else {
+            "closure blob"
+        };
+        verify_stored_blob(&verification_reader, stage, blob)?;
+    }
+    verify_stored_blob(&verification_reader, "inner descriptor", &inner)?;
+    verify_stored_blob(&verification_reader, "strong descriptor", &outer)?;
+    drop(verification_reader);
+
+    store
+        .flush()
+        .map_err(|error| PolicyLedgerWriteError::Flush(Box::new(error)))?;
+    if !already_asserted {
+        store
+            .append_pin_assertion(assertion)
+            .map_err(|error| PolicyLedgerWriteError::Append(Box::new(error)))?;
+    }
+
+    Ok(PolicyEventPublication::Published(PolicyEventReceipt {
+        event: event_handle,
+        assertion: assertion.id(),
+    }))
+}
+
+/// Durably observe one exact authenticated request.
+///
+/// Malformed claims and local admission-policy failures are ordinary typed
+/// refusals and mutate nothing. Calls for the same author must be serialized
+/// when the one-outstanding and capacity checks are required as hard local
+/// limits; concurrent asserted-pin writers intentionally union their facts.
+pub fn observe_request<S>(
+    store: &mut S,
+    author: &SigningKey,
+    requester: VerifyingKey,
+    partial_cap: Blob<SimpleArchive>,
+) -> Result<ObserveRequestOutcome, PolicyLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+{
+    let partial_cap = Blob::new(partial_cap.bytes);
+    let claim = match decode_operational_capability(partial_cap.clone()) {
+        Ok(claim) => claim,
+        Err(error) => {
+            return Ok(ObserveRequestOutcome::Refused(
+                ObserveRequestRefusal::InvalidClaim(error),
+            ));
+        }
+    };
+    if claim.subject != requester {
+        return Ok(ObserveRequestOutcome::Refused(
+            ObserveRequestRefusal::SubjectMismatch {
+                declared: claim.subject,
+            },
+        ));
+    }
+    if claim.issuer != author.verifying_key() {
+        return Ok(ObserveRequestOutcome::Refused(
+            ObserveRequestRefusal::IssuerMismatch {
+                declared: claim.issuer,
+            },
+        ));
+    }
+
+    let request = RequestIdentity::new(requester, partial_cap.get_handle());
+    let publication = append_validated_policy_event_if(
+        store,
+        author,
+        PolicyEvent::RequestObserved(request),
+        [partial_cap],
+        |view, already_asserted| {
+            let Some(candidate) = view.requests().get(&request) else {
+                return Ok(false);
+            };
+
+            // Reassertion is an idempotent durability repair even if a later
+            // positive fact has already disposed of the request. Likewise, a
+            // rejection or provenance-bearing issuance may arrive before the
+            // observed assertion under monotone replication.
+            if already_asserted || candidate.rejected() || !candidate.issued_signatures().is_empty()
+            {
+                return Ok(true);
+            }
+            if !candidate.is_pending() {
+                return Ok(false);
+            }
+
+            if let Some((&existing, _)) = view.requests().iter().find(|(identity, state)| {
+                **identity != request && identity.requester() == requester && state.is_pending()
+            }) {
+                return Err(ObserveRequestRefusal::OutstandingRequest { existing });
+            }
+            let pending = view
+                .requests()
+                .values()
+                .filter(|state| state.is_pending())
+                .count();
+            if pending > MAX_PENDING_REQUESTS {
+                return Err(ObserveRequestRefusal::Capacity);
+            }
+            Ok(true)
+        },
+    )?;
+    Ok(match publication {
+        PolicyEventPublication::Published(receipt) => ObserveRequestOutcome::Observed(receipt),
+        PolicyEventPublication::Refused(reason) => ObserveRequestOutcome::Refused(reason),
+    })
+}
+
+/// Durably reject one exact request identity.
+pub fn reject_request<S>(
+    store: &mut S,
+    author: &SigningKey,
+    request: RequestIdentity,
+) -> Result<PolicyEventReceipt, PolicyLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+{
+    append_validated_policy_event(
+        store,
+        author,
+        PolicyEvent::RequestRejected(request),
+        std::iter::empty(),
+    )
+}
+
+/// Durably issue one credential, optionally citing exact request provenance.
+///
+/// The signature blob is mandatory and supplies the event's exact signature
+/// handle. `closure` carries the new cap and any other proof members not
+/// already present in the store.
+pub fn issue_grant<S, I>(
+    store: &mut S,
+    author: &SigningKey,
+    grant: GrantIdentity,
+    signature: Blob<SimpleArchive>,
+    request: Option<Inline<Handle<SimpleArchive>>>,
+    closure: I,
+) -> Result<PolicyEventReceipt, PolicyLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+    I: IntoIterator<Item = Blob<SimpleArchive>>,
+{
+    let signature = Blob::new(signature.bytes);
+    let sig = signature.get_handle();
+    append_validated_policy_event(
+        store,
+        author,
+        PolicyEvent::GrantIssued {
+            grant,
+            sig,
+            request,
+        },
+        std::iter::once(signature).chain(closure),
+    )
+}
+
+/// Durably record authentication with one exact issued signature.
+pub fn authenticate_credential<S>(
+    store: &mut S,
+    author: &SigningKey,
+    grant: GrantIdentity,
+    sig: Inline<Handle<SimpleArchive>>,
+) -> Result<PolicyEventReceipt, PolicyLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+{
+    append_validated_policy_event(
+        store,
+        author,
+        PolicyEvent::CredentialAuthenticated { grant, sig },
+        std::iter::empty(),
+    )
+}
+
+/// Durably and terminally disable automatic work for one exact grant.
+pub fn disable_grant<S>(
+    store: &mut S,
+    author: &SigningKey,
+    grant: GrantIdentity,
+) -> Result<PolicyEventReceipt, PolicyLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+{
+    append_validated_policy_event(
+        store,
+        author,
+        PolicyEvent::GrantDisabled(grant),
+        std::iter::empty(),
+    )
+}
+
+fn require_stored_handle(
+    stage: &'static str,
+    expected: [u8; 32],
+    actual: [u8; 32],
+) -> Result<(), PolicyLedgerWriteError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(PolicyLedgerWriteError::PutHandleMismatch {
+            stage,
+            expected,
+            actual,
+        })
+    }
+}
+
+fn verify_stored_blob<R, S>(
+    reader: &R,
+    stage: &'static str,
+    expected: &Blob<S>,
+) -> Result<(), PolicyLedgerWriteError>
+where
+    R: BlobStoreGet,
+    S: BlobEncoding + 'static,
+    Handle<S>: triblespace_core::inline::InlineEncoding,
+{
+    let handle = expected.get_handle();
+    let stored =
+        reader
+            .get::<Blob<S>, S>(handle)
+            .map_err(|error| PolicyLedgerWriteError::VerifyStored {
+                stage,
+                source: Box::new(error),
+            })?;
+    if stored.bytes != expected.bytes {
+        return Err(PolicyLedgerWriteError::StoredContentMismatch {
+            stage,
+            handle: handle.raw,
+        });
+    }
+    Ok(())
+}
+
 /// Typed result of reducing one author's complete policy assertion set.
 ///
 /// Only Complete exposes an operational view. Missing content and known-invalid
@@ -493,6 +1125,7 @@ pub enum InvalidIssuanceReason {
 #[derive(Debug)]
 pub struct PolicyLedgerView {
     author: VerifyingKey,
+    event_handles: BTreeSet<Inline<Handle<SimpleArchive>>>,
     requests: BTreeMap<RequestIdentity, RequestView>,
     grants: BTreeMap<GrantIdentity, GrantView>,
 }
@@ -500,6 +1133,11 @@ pub struct PolicyLedgerView {
 impl PolicyLedgerView {
     pub fn author(&self) -> VerifyingKey {
         self.author
+    }
+
+    /// Exact canonical values admitted from this author's assertion set.
+    pub fn event_handles(&self) -> &BTreeSet<Inline<Handle<SimpleArchive>>> {
+        &self.event_handles
     }
 
     pub fn requests(&self) -> &BTreeMap<RequestIdentity, RequestView> {
@@ -655,7 +1293,7 @@ where
     let mut diagnostics = Vec::new();
     let mut asserted_events = Vec::new();
 
-    for handle in asserted_handles {
+    for &handle in &asserted_handles {
         match read_event(
             handle,
             &mut cache,
@@ -964,6 +1602,7 @@ where
 
     PolicyLedgerResolution::Complete(PolicyLedgerView {
         author,
+        event_handles: asserted_handles,
         requests,
         grants,
     })
@@ -1061,13 +1700,124 @@ fn compare_issuances(left: &ValidIssuance, right: &ValidIssuance) -> std::cmp::O
 mod tests {
     use super::*;
     use hifitime::Duration;
+    use std::convert::Infallible;
     use triblespace_core::inline::TryToInline;
+    use triblespace_core::repo::BlobStorePut;
     use triblespace_core::repo::capability::{
         self, PERM_ADMIN, PERM_READ, PERM_WRITE, build_capability, build_founder_anchor,
     };
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::pile::Pile;
+
+    #[derive(Debug)]
+    struct InjectedFailure(&'static str);
+
+    impl fmt::Display for InjectedFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "injected {} failure", self.0)
+        }
+    }
+
+    impl Error for InjectedFailure {}
+
+    #[derive(Debug)]
+    enum RecordingAssertionError {
+        Collision(PinAssertionKeyCollision),
+        Injected(InjectedFailure),
+    }
+
+    impl fmt::Display for RecordingAssertionError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Collision(error) => error.fmt(f),
+                Self::Injected(error) => error.fmt(f),
+            }
+        }
+    }
+
+    impl Error for RecordingAssertionError {}
+
+    impl From<PinAssertionKeyCollision> for RecordingAssertionError {
+        fn from(value: PinAssertionKeyCollision) -> Self {
+            Self::Collision(value)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingStore {
+        inner: MemoryRepo,
+        operations: Vec<&'static str>,
+        put_handles: Vec<[u8; 32]>,
+        fail_flush: bool,
+        fail_append: bool,
+    }
+
+    impl triblespace_core::repo::BlobStorePut for RecordingStore {
+        type PutError = Infallible;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: triblespace_core::inline::InlineEncoding,
+        {
+            let handle = self.inner.put(item)?;
+            self.operations.push("put");
+            self.put_handles.push(handle.raw);
+            Ok(handle)
+        }
+    }
+
+    impl BlobStore for RecordingStore {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.operations.push("reader");
+            self.inner.reader()
+        }
+    }
+
+    impl PinAssertionStore for RecordingStore {
+        type Error = RecordingAssertionError;
+
+        fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+            self.operations.push("snapshot");
+            self.inner.pin_assertion_snapshot().map_err(Into::into)
+        }
+
+        fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+            self.operations.push("append");
+            if self.fail_append {
+                return Err(RecordingAssertionError::Injected(InjectedFailure("append")));
+            }
+            self.inner
+                .append_pin_assertion(assertion)
+                .map_err(Into::into)
+        }
+    }
+
+    impl StorageFlush for RecordingStore {
+        type Error = InjectedFailure;
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("flush");
+            if self.fail_flush {
+                Err(InjectedFailure("flush"))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
+    }
+
+    fn indexed_key(index: u64) -> SigningKey {
+        let mut bytes = [0xA5; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        SigningKey::from_bytes(&bytes)
     }
 
     fn handle(byte: u8) -> Inline<Handle<SimpleArchive>> {
@@ -1220,6 +1970,445 @@ mod tests {
             outer.get_handle().raw,
             PolicyLedgerDescriptor::pin_handle().raw()
         );
+    }
+
+    #[test]
+    fn observe_request_refuses_invalid_claims_before_touching_storage() {
+        let fixture = LedgerFixture::new();
+        let mut store = RecordingStore::default();
+        let malformed = Blob::new(Bytes::from_source(b"not a capability".to_vec()));
+
+        let outcome = observe_request(
+            &mut store,
+            &fixture.author,
+            fixture.subject.verifying_key(),
+            malformed,
+        )
+        .expect("invalid remote input is an ordinary refusal");
+        assert!(matches!(
+            outcome,
+            ObserveRequestOutcome::Refused(ObserveRequestRefusal::InvalidClaim(_))
+        ));
+        assert!(store.operations.is_empty());
+        assert_eq!(store.inner.blobs.len(), 0);
+        assert!(store.inner.pin_assertion_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn observe_request_refuses_a_wrong_issuer_before_touching_storage() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+        let wrong_author = key(72);
+        let mut store = RecordingStore::default();
+
+        let outcome = observe_request(
+            &mut store,
+            &wrong_author,
+            fixture.subject.verifying_key(),
+            partial_cap,
+        )
+        .expect("wrong issuer is an ordinary refusal");
+        assert!(matches!(
+            outcome,
+            ObserveRequestOutcome::Refused(ObserveRequestRefusal::IssuerMismatch { declared })
+                if declared == fixture.author.verifying_key()
+        ));
+        assert!(store.operations.is_empty());
+        assert_eq!(store.inner.blobs.len(), 0);
+    }
+
+    #[test]
+    fn observe_request_allows_one_pending_requester_then_reopens_after_disposition() {
+        let mut fixture = LedgerFixture::new();
+        let requester = fixture.subject.verifying_key();
+        let first = fixture.request(requester, PERM_READ);
+        let first_cap = fixture.blobs.get(&first.partial_cap()).unwrap().clone();
+        let second = fixture.request(requester, PERM_WRITE);
+        let second_cap = fixture.blobs.get(&second.partial_cap()).unwrap().clone();
+        let mut store = RecordingStore::default();
+
+        assert!(matches!(
+            observe_request(&mut store, &fixture.author, requester, first_cap)
+                .expect("first observation"),
+            ObserveRequestOutcome::Observed(_)
+        ));
+        let before_blobs = store.inner.blobs.len();
+        store.operations.clear();
+        store.put_handles.clear();
+        let refused = observe_request(&mut store, &fixture.author, requester, second_cap.clone())
+            .expect("admission refusal is not a storage error");
+        assert!(matches!(
+            refused,
+            ObserveRequestOutcome::Refused(ObserveRequestRefusal::OutstandingRequest {
+                existing
+            }) if existing == first
+        ));
+        assert_eq!(store.operations, ["snapshot", "reader"]);
+        assert!(store.put_handles.is_empty());
+        assert_eq!(store.inner.blobs.len(), before_blobs);
+
+        reject_request(&mut store, &fixture.author, first).expect("dispose first request");
+        let reopened = observe_request(&mut store, &fixture.author, requester, second_cap)
+            .expect("fresh request after disposition");
+        assert!(matches!(reopened, ObserveRequestOutcome::Observed(_)));
+
+        let snapshot = store.inner.pin_assertion_snapshot().unwrap();
+        let reader = store.inner.reader().unwrap();
+        let PolicyLedgerResolution::Complete(view) =
+            resolve_policy_ledger(&snapshot, fixture.author.verifying_key(), |handle| {
+                reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+            })
+        else {
+            panic!("admitted requests must leave a complete ledger");
+        };
+        assert!(view.requests().get(&first).unwrap().rejected());
+        assert!(view.requests().get(&second).unwrap().is_pending());
+    }
+
+    #[test]
+    fn observe_request_refuses_when_the_pending_view_is_at_capacity() {
+        let mut fixture = LedgerFixture::new();
+        let mut store = RecordingStore::default();
+        for index in 0..MAX_PENDING_REQUESTS as u64 {
+            let requester = indexed_key(1_000 + index).verifying_key();
+            let request = fixture.request(requester, PERM_READ);
+            let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+            let event = PolicyEvent::RequestObserved(request);
+            store
+                .inner
+                .put::<SimpleArchive, _>(partial_cap)
+                .expect("seed request claim");
+            store
+                .inner
+                .put::<SimpleArchive, _>(event.to_blob())
+                .expect("seed request event");
+            store
+                .inner
+                .append_pin_assertion(sign_policy_event(&fixture.author, event))
+                .expect("seed request assertion");
+        }
+
+        let requester = indexed_key(99_999).verifying_key();
+        let request = fixture.request(requester, PERM_WRITE);
+        let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+        let before_blobs = store.inner.blobs.len();
+        let before_assertions = store.inner.pin_assertion_snapshot().unwrap().len();
+        store.operations.clear();
+
+        let outcome = observe_request(&mut store, &fixture.author, requester, partial_cap)
+            .expect("capacity is an ordinary refusal");
+        assert!(matches!(
+            outcome,
+            ObserveRequestOutcome::Refused(ObserveRequestRefusal::Capacity)
+        ));
+        assert_eq!(store.operations, ["snapshot", "reader"]);
+        assert_eq!(store.inner.blobs.len(), before_blobs);
+        assert_eq!(
+            store.inner.pin_assertion_snapshot().unwrap().len(),
+            before_assertions
+        );
+    }
+
+    #[test]
+    fn validated_writer_flushes_complete_closure_before_durable_assertion() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+        let event = PolicyEvent::RequestObserved(request);
+        let mut store = RecordingStore::default();
+
+        let receipt =
+            append_validated_policy_event(&mut store, &fixture.author, event, [partial_cap])
+                .expect("valid prospective event publishes");
+        assert_eq!(receipt.event(), event.handle());
+        assert_eq!(
+            receipt.assertion(),
+            sign_policy_event(&fixture.author, event).id()
+        );
+        assert_eq!(
+            store.operations,
+            [
+                "snapshot", "reader", "put", "put", "put", "put", "reader", "flush", "append"
+            ]
+        );
+        assert_eq!(
+            store.put_handles,
+            [
+                request.partial_cap().raw,
+                event.handle().raw,
+                PolicyLedgerDescriptor::descriptor_handle().raw,
+                PolicyLedgerDescriptor::strong_blob().get_handle().raw,
+            ]
+        );
+
+        let snapshot = store.inner.pin_assertion_snapshot().unwrap();
+        let reader = store.inner.reader().unwrap();
+        let PolicyLedgerResolution::Complete(view) =
+            resolve_policy_ledger(&snapshot, fixture.author.verifying_key(), |handle| {
+                reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+            })
+        else {
+            panic!("durably published closure must resolve after the write");
+        };
+        assert!(view.event_handles().contains(&event.handle()));
+        assert!(view.requests().get(&request).unwrap().observed());
+    }
+
+    #[test]
+    fn validated_writer_mutates_nothing_for_an_invalid_candidate() {
+        let mut fixture = LedgerFixture::new();
+        let actual = fixture.request(key(71).verifying_key(), PERM_READ);
+        let partial_cap = fixture.blobs.get(&actual.partial_cap()).unwrap().clone();
+        let lied = RequestIdentity::new(fixture.subject.verifying_key(), actual.partial_cap());
+        let mut store = RecordingStore::default();
+
+        let error = append_validated_policy_event(
+            &mut store,
+            &fixture.author,
+            PolicyEvent::RequestObserved(lied),
+            [partial_cap],
+        )
+        .unwrap_err();
+        assert!(matches!(error, PolicyLedgerWriteError::Invalid { .. }));
+        assert_eq!(store.operations, ["snapshot", "reader"]);
+        assert_eq!(store.inner.blobs.len(), 0);
+        assert!(store.inner.pin_assertion_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn validated_writer_never_appends_before_flush_and_leaves_only_safe_orphans_on_failure() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+        let event = PolicyEvent::RequestObserved(request);
+
+        let mut flush_failure = RecordingStore {
+            fail_flush: true,
+            ..RecordingStore::default()
+        };
+        let error = append_validated_policy_event(
+            &mut flush_failure,
+            &fixture.author,
+            event,
+            [partial_cap.clone()],
+        )
+        .unwrap_err();
+        assert!(matches!(error, PolicyLedgerWriteError::Flush(_)));
+        assert_eq!(
+            flush_failure.operations,
+            [
+                "snapshot", "reader", "put", "put", "put", "put", "reader", "flush"
+            ]
+        );
+        assert_eq!(flush_failure.inner.blobs.len(), 4);
+        assert!(
+            flush_failure
+                .inner
+                .pin_assertion_snapshot()
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut append_failure = RecordingStore {
+            fail_append: true,
+            ..RecordingStore::default()
+        };
+        let error = append_validated_policy_event(
+            &mut append_failure,
+            &fixture.author,
+            event,
+            [partial_cap],
+        )
+        .unwrap_err();
+        assert!(matches!(error, PolicyLedgerWriteError::Append(_)));
+        assert_eq!(
+            append_failure.operations,
+            [
+                "snapshot", "reader", "put", "put", "put", "put", "reader", "flush", "append"
+            ]
+        );
+        assert_eq!(append_failure.inner.blobs.len(), 4);
+        assert!(
+            append_failure
+                .inner
+                .pin_assertion_snapshot()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn validated_writer_republication_is_idempotent() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+        let event = PolicyEvent::RequestObserved(request);
+        let mut store = RecordingStore::default();
+
+        let first = append_validated_policy_event(
+            &mut store,
+            &fixture.author,
+            event,
+            [partial_cap.clone()],
+        )
+        .expect("first publication succeeds");
+        assert_eq!(store.inner.blobs.len(), 4);
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+
+        store.operations.clear();
+        store.put_handles.clear();
+        let second =
+            append_validated_policy_event(&mut store, &fixture.author, event, [partial_cap])
+                .expect("exact republication succeeds");
+
+        assert_eq!(second, first);
+        assert_eq!(store.inner.blobs.len(), 4);
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+        assert_eq!(store.operations, ["snapshot", "reader", "flush"]);
+        assert!(store.put_handles.is_empty());
+    }
+
+    #[test]
+    fn validated_writer_repairs_an_assertion_whose_content_has_not_arrived() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+        let event = PolicyEvent::RequestObserved(request);
+        let assertion = sign_policy_event(&fixture.author, event);
+        let mut store = RecordingStore::default();
+        store
+            .inner
+            .append_pin_assertion(assertion)
+            .expect("seed assertion without its closure");
+
+        let receipt =
+            append_validated_policy_event(&mut store, &fixture.author, event, [partial_cap])
+                .expect("exact retry repairs missing content");
+        assert_eq!(receipt.assertion(), assertion.id());
+        assert_eq!(
+            store.operations,
+            [
+                "snapshot", "reader", "put", "put", "put", "put", "reader", "flush"
+            ]
+        );
+        assert_eq!(store.inner.blobs.len(), 4);
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+
+        let snapshot = store.inner.pin_assertion_snapshot().unwrap();
+        let reader = store.inner.reader().unwrap();
+        assert!(matches!(
+            resolve_policy_ledger(&snapshot, fixture.author.verifying_key(), |handle| {
+                reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+            }),
+            PolicyLedgerResolution::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn validated_writer_does_not_trust_cached_handles_on_duplicate_presence_check() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+        let event = PolicyEvent::RequestObserved(request);
+        let mut store = RecordingStore::default();
+        append_validated_policy_event(&mut store, &fixture.author, event, [partial_cap.clone()])
+            .expect("seed valid publication");
+
+        let poisoned = Blob::<UnknownBlob>::with_handle(
+            Bytes::from_source(b"wrong bytes under the event handle".to_vec()),
+            Inline::new(event.handle().raw),
+        );
+        let existing = store.inner.blobs.reader().unwrap();
+        store.inner.blobs = existing
+            .iter()
+            .map(|(handle, blob)| {
+                if handle.raw == event.handle().raw {
+                    (handle, poisoned.clone())
+                } else {
+                    (handle, blob)
+                }
+            })
+            .collect();
+        store.operations.clear();
+        store.put_handles.clear();
+
+        let error =
+            append_validated_policy_event(&mut store, &fixture.author, event, [partial_cap])
+                .expect_err("a backend retaining poisoned content must fail closed");
+        assert!(matches!(
+            error,
+            PolicyLedgerWriteError::StoredContentMismatch {
+                stage: "event blob",
+                ..
+            }
+        ));
+        assert_eq!(
+            store.operations,
+            ["snapshot", "reader", "put", "put", "put", "put", "reader"]
+        );
+        assert_eq!(store.inner.pin_assertion_snapshot().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validated_writer_is_complete_after_pile_reopen_without_post_append_flush() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let partial_cap = fixture.blobs.get(&request.partial_cap()).unwrap().clone();
+        let event = PolicyEvent::RequestObserved(request);
+        let dir = tempfile::tempdir().expect("temporary pile directory");
+        let path = dir.path().join("policy-ledger.pile");
+        std::fs::File::create(&path).expect("create empty pile");
+
+        {
+            let mut pile = Pile::open(&path).expect("open policy pile");
+            let ObserveRequestOutcome::Observed(receipt) = observe_request(
+                &mut pile,
+                &fixture.author,
+                fixture.subject.verifying_key(),
+                partial_cap,
+            )
+            .expect("durably publish observed request") else {
+                panic!("valid request must be observed");
+            };
+            assert_eq!(receipt.event(), event.handle());
+            // Deliberately drop without another flush: the writer's one blob
+            // flush precedes the assertion, whose append is durable itself.
+        }
+
+        let mut reopened = Pile::open(&path).expect("reopen policy pile");
+        let snapshot = reopened
+            .pin_assertion_snapshot()
+            .expect("replay durable assertion");
+        assert_eq!(snapshot.len(), 1);
+        let reader = reopened.reader().expect("open replay reader");
+        reader
+            .get::<Blob<PolicyLedgerDescriptor>, PolicyLedgerDescriptor>(
+                PolicyLedgerDescriptor::descriptor_handle(),
+            )
+            .expect("replay inner policy descriptor");
+        reader
+            .get::<Blob<StrongPinDescriptor>, StrongPinDescriptor>(
+                PolicyLedgerDescriptor::strong_blob().get_handle(),
+            )
+            .expect("replay strong policy descriptor");
+        let PolicyLedgerResolution::Complete(view) =
+            resolve_policy_ledger(&snapshot, fixture.author.verifying_key(), |handle| {
+                reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+            })
+        else {
+            panic!("one-flush publication must replay as a complete ledger");
+        };
+        assert!(view.event_handles().contains(&event.handle()));
+        assert!(view.requests().get(&request).unwrap().observed());
     }
 
     #[test]

@@ -26,7 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies capability proofs and request provenance by exact content handle,
   exposes rejection alongside already-issued effects, detects conflicting
   scope facts, and selects coherent sibling credentials by effective chain
-  expiry with a signature-handle tie break.
+  expiry with a signature-handle tie break. Policy mutations now prospectively
+  reduce the complete author ledger before writing anything, flush the exact
+  content closure before durably appending its assertion, and return an
+  idempotent receipt. Operation-order tests pin that one-way crash protocol;
+  real-Pile reopen coverage verifies the resulting ledger and both retention
+  descriptors replay as complete content.
 - **Branches are a typed adapter over generic asserted pins.** A canonical
   64-byte V2 `BranchPinDescriptor` blob contains its kind marker, canonical
   alignment padding, and LongString name handle. Its content handle is wrapped
