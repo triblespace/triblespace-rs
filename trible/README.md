@@ -100,7 +100,7 @@ authority. `identity` and `status` are local diagnostic commands. See the
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
 - `pile net status [--key PATH]` — print the auth configuration this node would present on `OP_AUTH`: node id, team root, self_cap, and where each value comes from (env var vs fallback). For debugging stuck-auth scenarios.
-- `pile net sync <PILE> [--peers ID,...] [--key PATH]` — announce local blobs and service durable weak-pin wants over the team network. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP`; the team root falls back to the node's own pubkey for a team-of-one, while a missing cap leaves the node recovery/server-only. `--no-lazy` disables want reconciliation. Signed-assertion replication still requires a dedicated protocol and admission policy.
+- `pile net sync <PILE> [--peers ID,...] [--key PATH]` — announce local blobs and service this peer author's durable signed wants over the team network. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP`; the team root falls back to the node's own pubkey for a team-of-one, while a missing cap leaves the node recovery/server-only. `--no-lazy` disables want reconciliation. Generic assertion replication still requires a dedicated protocol and admission policy.
 
 ### Capability auth
 

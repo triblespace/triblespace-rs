@@ -3,7 +3,7 @@
 The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/triblespace-net)
 crate wraps a store in an [iroh](https://www.iroh.computer/) peer. It provides
 content discovery and transfer, capability-authenticated direct reads, and a
-lazy reconciler for durable weak-pin wants.
+lazy reconciler for durable signed asserted wants.
 
 This is intentionally **blob sync, not asserted-pin sync**. The old scalar
 mutable-HEAD gossip/tracking bridge and `OP_CHILDREN` traversal RPC are gone.
@@ -43,6 +43,13 @@ publication and frontier resolution therefore continue to work through a
 on one peer is not encoded, announced, fetched, verified, or admitted on
 another peer by the current network protocol.
 
+Wants are another typed view over the same assertion set. Every author uses the
+fixed `WantPinDescriptor`, while the author key keeps principals distinct. The
+asserted value is the exact wanted blob handle and the label is fixed canonical
+padding, not an ordering relation. Consequently, each author's wants form a
+grow-only set: duplicate assertions collapse, satisfaction merely makes a want
+inert, and there is no unpin or tombstone.
+
 ## What Works Today
 
 The current stack moves content in three complementary steps:
@@ -53,17 +60,21 @@ The current stack moves content in three complementary steps:
   capability with mandatory first-stream `OP_AUTH`, and requests one known hash
   with `OP_GET_BLOB`. The receiver verifies the content hash before accepting
   the bytes.
-- **Lazy demand and retention.** A missing blob is recorded and flushed as a
-  durable weak-pin want before a fetch begins. The reconciler retries provider
-  lookup and transfer; an unavailable blob remains pending rather than losing
-  the demand. `--no-lazy` disables this reconciler.
+- **Lazy demand and retention.** A missing blob is recorded as a durable
+  assertion before a fetch begins. `Lazy` and `Peer` own a signing key, so both
+  appending and reading wants are scoped to that configured author. Assertion
+  append is already durable; it needs no second flush. The reconciler retries
+  provider lookup and transfer for that same author's wants; an unavailable
+  blob remains pending rather than losing the demand. `--no-lazy` disables this
+  reconciler.
 
 Pile-sync v5 (`/triblespace/pile-sync/5`) has no branch enumeration, HEAD,
 child-list, or remote-write operation. It serves only `OP_AUTH` and
 `OP_GET_BLOB`. In particular, the network does not infer a transitive closure
 from arbitrary blob bytes. Higher layers request the exact content handles
 their typed data names, and a missing dependency becomes another explicit
-weak-pin want.
+asserted want. Raw `Pile` and `Yard` reads remain observational: only a wrapper
+that owns an authoring key records demand.
 
 One `GET_BLOB` response is limited to 256 MiB at both endpoints. The server
 checks the shared store view before making an owned response copy, and the
@@ -106,7 +117,7 @@ is necessary but not sufficient.
 ## Operational Guidance During Migration
 
 - Use `Peer<S>` for DHT announcement, authenticated blob movement, durable
-  demand recording, and lazy retrieval.
+  author-scoped demand recording, and lazy retrieval.
 - Use exact typed branch descriptors over generic asserted pins for local
   repository state.
 - Do not advertise current `pile net sync` behavior as asserted-pin or branch

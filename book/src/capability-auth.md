@@ -442,8 +442,9 @@ let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
 ```
 
 There is no gossip/direction switch: scalar HEAD replication has been removed,
-while lazy weak-want reconciliation is controlled independently (for the CLI,
-with `--no-lazy`). There is no `Default` impl: every peer construction site
+while lazy author-scoped asserted-want reconciliation is controlled
+independently (for the CLI, with `--no-lazy`). There is no `Default` impl:
+every peer construction site
 must specify a team root because auth is mandatory. The CLI's single-user
 team-of-one fallback sets `team_root = signing_key.verifying_key()`
 and `self_cap = [0u8; 32]`; this is a server-only sentinel, not a synthesized

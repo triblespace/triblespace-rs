@@ -232,12 +232,12 @@ prioritized for efficient zero-copy access.
   while leaving the append-only Pile records in place. Add a future physical
   compaction/rewrite path when Yard needs to reclaim disk space, preserving
   live readers while replacing generation files.
-- Yard compact currently leaves a retained weak-pinned blob in the oldest
-  generation if the blob had already tenured before it was weak-pinned. Decide
-  whether weak-pinning old content should promote it back to young storage or
-  make collection evict it despite weak budget retention; see the ignored
-  `weak_pin_on_already_tenured_blob_stays_old_after_compact_bug` regression in
-  `repo::yard` tests.
+- Define retirement or service-selection semantics for asserted wants that
+  exceed a finite `YardConfig::want_budget`. Grow-only wants deliberately
+  survive satisfaction and eviction, so collection can evict an unbudgeted
+  blob and reconciliation can fetch it again indefinitely. The current API has
+  neither typed physical forgetting for selected wants nor a policy for which
+  authored wants the reconciler should decline to service.
 - The packed device confirm path assumes `UNIT_POS_PLANE` relates linearly to
   the cube-local invocation index — condition (c) on
   `membership_confirm_ballot_kernel`. It is true on Metal and CUDA and is what

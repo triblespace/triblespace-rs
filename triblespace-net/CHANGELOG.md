@@ -9,12 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Lazy fetch demand is now a signed asserted-want G-set scoped to the peer's
+  own author key. Direct and transparent read misses append the want durably
+  before fetching, and `Reconciler` ignores foreign-authored wants so imported
+  assertions cannot amplify this peer's network work.
 - **The network surface now matches the asserted-pin boundary.** Scalar mutable-
   HEAD gossip, local tracking materialization, publisher-hint state, legacy
   direction modes, and `OP_CHILDREN` are deleted. Pile-sync v5
   (`/triblespace/pile-sync/5`) accepts mandatory first-stream `OP_AUTH` followed
-  only by scope-gated `OP_GET_BLOB`. DHT content announcements and lazy
-  weak-want fetching remain. Generic `PinAssertion` envelopes and their typed
+  only by scope-gated `OP_GET_BLOB`. DHT content announcements and lazy,
+  author-scoped asserted-want fetching remain. Generic `PinAssertion`
+  envelopes and their typed
   descriptor blobs are explicitly not replicated yet; `Peer` merely forwards
   the wrapped store's `PinAssertionStore` and partial-DAG traits for local
   repository use.

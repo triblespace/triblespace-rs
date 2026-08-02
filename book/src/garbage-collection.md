@@ -38,11 +38,13 @@ contain a 32-byte sequence. Commit targets, in contrast, are traversed
 recursively, retaining parents, content, metadata, messages, attachments, and
 any other locally present referenced blobs.
 
-`Yard` also has demand-born weak pins for cache wants. They may veto legacy
-strong-pin reachability, but they do not veto an assertion root or anything in
-its closure. A common arrival order is assertion, failed read (which creates a
-weak want), then fetched commit; the later collection must retain that commit,
-not interpret its old want marker as permission to erase published history.
+`Yard` also derives soft cache roots from signed asserted wants. It recognizes
+the fixed `WantPinDescriptor`, unions authentic values across all authors,
+orders those exact handles canonically, discards values that are not locally
+present, and retains up to `YardConfig::want_budget`. These soft roots retain
+only the named blobs; they never veto or weaken a branch hard root or its
+closure. Satisfaction, budget eviction, and local absence do not erase the
+underlying assertions—the want view is a grow-only set.
 
 ## Conservative Reachability
 
@@ -72,10 +74,14 @@ eligible for forgetting.
    `BranchPinDescriptor`, retain the descriptor and name directly and add the
    assertion's commit value to the hard root set. Preserve unknown assertion
    records without treating their values as branch roots.
-3. Recursively walk the discovered commits and content blobs. Each blob is
+3. Independently project authentic `WantPinDescriptor` values across every
+   author. Retain up to the configured budget of canonically ordered, locally
+   present exact values as soft cache roots; do not traverse them as branch
+   structure.
+4. Recursively walk the discovered commits and content blobs. Each blob is
    scanned in 32-byte steps; any chunk whose lookup succeeds is enqueued instead
    of deserialising the archive.
-4. Stream the discovered handles into whatever operation you need. The
+5. Stream the discovered handles into whatever operation you need. The
    [`reachable`](https://docs.rs/triblespace/latest/triblespace/repo/fn.reachable.html)
    helper returns an iterator of handles, so you can retain them, transfer
    them into another store, or collect them into whichever structure your
@@ -180,6 +186,17 @@ helper converts its value column into the conservative stream of
   admitted witnesses of unknown kinds—into the temporary Pile before the atomic
   rename. Re-appending assertions afterwards creates a crash window in which
   accepted grow-only state has vanished.
+- **Treat wants as durable intent, not mutable cache state.** Reading a raw
+  `Pile` or `Yard` never creates a want. An authoring wrapper records one on a
+  miss, while successful retrieval and later eviction leave the assertion
+  intact.
+- **Pair finite budgets with an explicit service policy.** Grow-only wants
+  deliberately persist. If one author has more serviceable wants than
+  `want_budget`, collection can evict an unbudgeted blob and reconciliation can
+  fetch it again. The current implementation does not yet define a typed
+  physical-forgetting operation for selected wants or a service-selection
+  policy. Until one exists, the budget alone cannot prevent this
+  collect/reconcile oscillation.
 
 ## Future Work
 

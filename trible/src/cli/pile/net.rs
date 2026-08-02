@@ -96,7 +96,7 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Announce local blobs and service durable weak-pin wants over the team
+    /// Announce local blobs and service this node's signed asserted wants over the team
     /// network. This does not replicate generic pin assertions or descriptors.
     /// The team root is read from `TRIBLE_TEAM_ROOT`, falling back to this
     /// node's own pubkey for single-user / team-of-one workflows.
@@ -121,8 +121,8 @@ pub enum Command {
         #[arg(long, value_name = "SECS")]
         quiescent_for: Option<u64>,
         /// Disable the lazy want-reconcile tick. By default sync also
-        /// services durable weak-pin *wants*: weak-pin records appended
-        /// to the pile (by faculties or any other process) are noticed
+        /// services durable asserted wants authored by this node's key. Wants
+        /// appended by faculties or other processes sharing that key are noticed
         /// each tick and the missing blobs fetched from the swarm
         /// (fetch-on-want). Content-lazy is the doctrine; this flag is
         /// the escape hatch.
@@ -263,11 +263,11 @@ fn run_sync(
     if let Some(q) = quiescent_for {
         eprintln!("quiescent stop: {q}s without events");
     }
-    // Lazy content sync: service durable weak-pin wants.
+    // Lazy content sync: service this node's durable asserted wants.
     let lazy = !no_lazy;
     if lazy {
         eprintln!(
-            "lazy: servicing weak-pin wants every {reconcile_interval}s (--no-lazy to disable)"
+            "lazy: servicing authored wants every {reconcile_interval}s (--no-lazy to disable)"
         );
     } else {
         eprintln!("lazy: disabled (--no-lazy)");
@@ -280,7 +280,7 @@ fn run_sync(
 
     // Want-reconcile state. The Reconciler (triblespace-net) owns the
     // per-want retry bookkeeping (exponential backoff, capped at 60s);
-    // the wants themselves live durably in the pile as weak pins. The
+    // the wants themselves live durably in the generic assertion G-set. The
     // tick is async (the swarm fetch awaits the host), so we drive it
     // on a small current-thread runtime — the fetch's internal DHT
     // deadline uses tokio timers, which need a runtime context.
@@ -344,13 +344,12 @@ fn run_sync(
         // successor.
         let _renewed = peer.renewal_tick(hifitime::Duration::from_seconds(3600.0));
 
-        // Want-reconcile tick: a weak pin IS a durable want-marker —
-        // "I would like this blob; fetch it if absent; evictable."
-        // Each pass re-reads the pile (weak-pin records appended by
-        // OTHER processes since the last pass become visible), diffs
-        // the want set against the blobs present, and swarm-fetches
-        // the missing ones, landing them under their existing weak
-        // pin. Failed fetches retry with per-want exponential backoff
+        // Want-reconcile tick: each signed assertion says "I would like this
+        // blob; fetch it if absent; retain it only as budgeted cache data."
+        // Each pass re-reads the pile (assertions appended by other processes
+        // sharing this node's author key become visible), diffs this author's
+        // want set against the blobs present, and swarm-fetches the missing
+        // ones. Failed fetches retry with per-want exponential backoff
         // inside the Reconciler; a want nobody serves stays pending —
         // normal, never an error, never dropped. Strong pins/branches
         // are untouched.
@@ -379,7 +378,7 @@ fn run_sync(
     if lazy {
         eprintln!(
             "wants: {wants_fetched_total} fetched this run; {wants_pending} still pending \
-             (pending is normal — the wants stay on record as weak pins in the pile \
+             (pending is normal — the signed wants stay on record in the pile \
              and are serviced whenever a holder becomes reachable)"
         );
     }

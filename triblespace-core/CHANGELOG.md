@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Lazy demand is now an author-scoped `PinAssertion` G-set rather than mutable
+  weak-pin state. `Lazy::new(store, SigningKey)` requires the author capability,
+  `WantStore` exposes only that author's wants, and a miss crosses the durable
+  assertion-append boundary without a second flush. Raw Pile and Yard reads are
+  observational; old weak pin/unpin records remain decodable for forensics but
+  are ignored semantically and are not migrated automatically. Yard retains a
+  canonical budgeted subset through `YardConfig::want_budget` (renamed from
+  `weak_budget`), and soft wants never veto hard reachability.
 - Generic `PinAssertionStore` provides one grow-only signed envelope for every
   pin kind. Its full-width `(author, descriptor)` identity, value, and opaque
   label are kind-neutral; `BranchPinDescriptor` and `BranchRank` supply the

@@ -67,7 +67,7 @@ const MAGIC_MARKER_PIN: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 const MAGIC_MARKER_PIN_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
 /// V3 record markers — the uniform 256-byte-header format (minted 2026-06-29 via
 /// `trible genid`). Every V3 record (blob, legacy pin cell, generic asserted
-/// pin, or weak marker) has a FIXED 256-byte header
+/// pin, or accepted legacy weak marker) has a FIXED 256-byte header
 /// and is padded to a 256-byte multiple. Consequences:
 ///   * blob data starts at a constant `record_start + V3_HEADER_LEN` — reads are
 ///     position-INDEPENDENT (no offset-derived pad), so a record survives
@@ -85,15 +85,10 @@ const MAGIC_MARKER_PIN_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205671
 /// record is marker + canonical 192-byte signed assertion + 48 bytes of
 /// required-zero reserve, exactly one V3 unit.
 const MAGIC_MARKER_PIN_ASSERTION_V3: RawId = hex!("DEE2A5635561AE0AF36550AD07C1EBEB");
-/// Weak-pin marker pair (minted 2026-07-01 via `trible genid`). Retention is
-/// one strength axis resolved last-writer-wins by log position:
-/// `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin`; the mutable-pin record IS
-/// `pin`, and its tombstone IS `unpin`; these two are the soft siblings. A
-/// weak pin is per-blob and anonymous (keyed by blob handle, no pin id): "I want this
-/// blob; fetch it if absent; evictable under pressure." It is simultaneously
-/// the demand/want-signal (a sync daemon's work queue), the cache-retention
-/// marker, and the eviction target. `weak-unpin` retracts it. Because the
-/// records are durable pile records, reopening a pile reloads the weak set.
+/// Legacy weak-pin marker pair (minted 2026-07-01 via `trible genid`). Current
+/// replay retains these record boundaries for migration and forensics but does
+/// not fold their physical order into semantic state. New wants use signed,
+/// grow-only assertions through [`super::want`]; no new weak-unpin is written.
 const MAGIC_MARKER_WEAK_PIN_V3: RawId = hex!("8F3EEFEDECD491F63F6EAAA5FD6F3D5E");
 const MAGIC_MARKER_WEAK_UNPIN_V3: RawId = hex!("2D76662DFF0187EC36A8C90B12BB8B0D");
 
@@ -375,8 +370,7 @@ impl PinAssertionHeaderV3 {
     }
 }
 
-/// V3 weak-pin marker — fixed 256 bytes. Keyed by blob handle (no branch id);
-/// see the docs on [`MAGIC_MARKER_WEAK_PIN_V3`] for the retention lattice.
+/// Legacy V3 weak-pin marker — fixed 256 bytes.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct WeakPinHeaderV3 {
@@ -386,6 +380,7 @@ struct WeakPinHeaderV3 {
 }
 
 impl WeakPinHeaderV3 {
+    #[cfg(test)]
     fn new(handle: Inline<Handle<UnknownBlob>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_WEAK_PIN_V3,
@@ -395,8 +390,7 @@ impl WeakPinHeaderV3 {
     }
 }
 
-/// V3 weak-unpin marker — fixed 256 bytes. Retracts a prior weak pin on the
-/// same handle (last-writer-wins by log position).
+/// Legacy V3 weak-unpin marker — fixed 256 bytes.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct WeakUnpinHeaderV3 {
@@ -406,6 +400,7 @@ struct WeakUnpinHeaderV3 {
 }
 
 impl WeakUnpinHeaderV3 {
+    #[cfg(test)]
     fn new(handle: Inline<Handle<UnknownBlob>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_WEAK_UNPIN_V3,
@@ -483,12 +478,12 @@ pub enum PileRecordContent {
         /// Blake3 id of the exact canonical witness bytes.
         id: PinAssertionId,
     },
-    /// A weak-pin marker for a blob handle.
+    /// A legacy weak-pin marker retained for migration and forensics.
     WeakPin {
         /// The pinned blob handle.
         handle: Inline<Handle<UnknownBlob>>,
     },
-    /// A weak-unpin marker retracting a prior weak pin.
+    /// A legacy weak-unpin marker retained for migration and forensics.
     WeakUnpin {
         /// The unpinned blob handle.
         handle: Inline<Handle<UnknownBlob>>,
@@ -779,7 +774,7 @@ fn indexed_blob_record(
 /// Iterator over the raw records of a pile file, in log order.
 ///
 /// This is the record-level view of the append-only log: every blob, historical
-/// mutable-pin update/tombstone, generic pin assertion, and
+/// mutable-pin update/tombstone, generic pin assertion, and accepted legacy
 /// weak-pin marker ever appended, including records that later ones supersede.
 /// It shares its decoder with the [`Pile`] replay path, so both V1 and V3
 /// records are understood; tools that need history or forensics (reflogs,
@@ -863,12 +858,12 @@ enum Applied {
     Pin { id: Id, hash: Inline<Hash<Blake3>> },
     PinTombstone { id: Id },
     PinAssertion { id: PinAssertionId },
-    WeakPin { handle: Inline<Handle<UnknownBlob>> },
-    WeakUnpin { handle: Inline<Handle<UnknownBlob>> },
+    WeakPin,
+    WeakUnpin,
 }
 
 #[derive(Debug)]
-/// A grow-only collection of blobs, pin records, and signed pin assertions
+/// A grow-only collection of blobs, legacy pin records, and signed pin assertions
 /// backed by a single file on disk.
 ///
 /// Mutable local-pin updates do not verify that referenced blobs exist in the
@@ -889,10 +884,6 @@ pub struct Pile {
     validations: ValidationCache,
     pins: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     pin_assertions: PinAssertionSnapshot,
-    /// LWW-resolved weak-pin set: weak-pin records insert the handle,
-    /// weak-unpin records remove it; log-order application makes the last
-    /// record for a handle win by construction.
-    weak_pins: PATCH<32, IdentitySchema>,
     /// Length of the file that has been validated and applied.
     ///
     /// Offsets below this value are guaranteed valid; corruption detection
@@ -1141,8 +1132,7 @@ impl From<ReadError> for InsertError {
     }
 }
 
-/// Error returned when appending a pin-head update or weak-pin marker
-/// record to a [`Pile`].
+/// Error returned when appending a mutable legacy pin-head record to a [`Pile`].
 pub enum PileWriteError {
     /// Underlying I/O failure.
     IoError(std::io::Error),
@@ -1314,7 +1304,6 @@ impl Pile {
             validations: ValidationCache::default(),
             pins: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             pin_assertions: PinAssertionSnapshot::new(),
-            weak_pins: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
         })
     }
@@ -1444,14 +1433,8 @@ impl Pile {
                     })?;
                 Applied::PinAssertion { id }
             }
-            DecodedPileRecordContent::WeakPin { handle } => {
-                self.weak_pins.insert(&Entry::new(&handle.raw));
-                Applied::WeakPin { handle }
-            }
-            DecodedPileRecordContent::WeakUnpin { handle } => {
-                self.weak_pins.remove(&handle.raw);
-                Applied::WeakUnpin { handle }
-            }
+            DecodedPileRecordContent::WeakPin { .. } => Applied::WeakPin,
+            DecodedPileRecordContent::WeakUnpin { .. } => Applied::WeakUnpin,
         };
         self.applied_length = next_applied_length;
         Ok(Some(applied))
@@ -1540,7 +1523,6 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.validations);
             std::ptr::drop_in_place(&mut this.pins);
             std::ptr::drop_in_place(&mut this.pin_assertions);
-            std::ptr::drop_in_place(&mut this.weak_pins);
         }
 
         res
@@ -1563,9 +1545,9 @@ impl crate::repo::StorageClose for Pile {
     }
 }
 
-// Generic durability hook: appended records (blobs, mutable-pin updates,
-// weak-pin markers) are not crash-durable until flushed — see the
-// inherent [`Pile::flush`].
+// Generic durability hook: appended blobs and mutable legacy-pin updates are
+// not crash-durable until flushed — see the inherent [`Pile::flush`]. Generic
+// pin assertions cross their own durability barrier before returning.
 impl crate::repo::StorageFlush for Pile {
     type Error = FlushError;
 
@@ -1580,7 +1562,6 @@ use super::BlobStoreList;
 use super::BlobStorePut;
 use super::PinStore;
 use super::PushResult;
-use super::WeakPinStore;
 
 /// Iterator returned by [`PileReader::iter`].
 ///
@@ -1790,8 +1771,8 @@ impl Pile {
                     Some(Applied::Pin { .. }) => {}
                     Some(Applied::PinTombstone { .. }) => {}
                     Some(Applied::PinAssertion { .. }) => {}
-                    Some(Applied::WeakPin { .. }) => {}
-                    Some(Applied::WeakUnpin { .. }) => {}
+                    Some(Applied::WeakPin) => {}
+                    Some(Applied::WeakUnpin) => {}
                     None => {
                         return Err(InsertError::IoError(std::io::Error::other(
                             "blob missing after write",
@@ -1990,114 +1971,6 @@ impl PinAssertionStore for Pile {
     }
 }
 
-/// Iterator over the LWW-resolved weak-pinned handles stored in the pile,
-/// using the PATCH's ordered key iterator (byte order, deterministic).
-pub struct PileWeakPinIter {
-    inner: crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, ()>,
-}
-
-impl Iterator for PileWeakPinIter {
-    type Item = Result<Inline<Handle<UnknownBlob>>, PileWriteError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let raw = self.inner.next()?;
-        Some(Ok(Inline::<Handle<UnknownBlob>>::new(raw)))
-    }
-}
-
-impl Pile {
-    /// Shared weak-marker append. Mirrors [`PinStore::update`]'s write path:
-    /// exclusive lock, refresh, no-op short-circuit when the LWW state already
-    /// matches, a single fixed 256-byte header write (keeping a pure-V3 pile
-    /// 256-aligned), and an `apply_next` read-back while still holding the
-    /// lock. Like mutable-pin updates, the record is **not durable** until
-    /// [`Pile::flush`] is called.
-    fn write_weak_marker(
-        &mut self,
-        handle: Inline<Handle<UnknownBlob>>,
-        pin: bool,
-    ) -> Result<(), PileWriteError> {
-        self.file.lock()?;
-        let res = (|| {
-            self.refresh_locked().map_err(PileWriteError::from)?;
-
-            // No-op short-circuit: the weak set is logically a per-handle
-            // LWW cell; re-asserting the current state carries no
-            // information and would just churn the append-only file.
-            let current = self.weak_pins.get(&handle.raw).is_some();
-            if current == pin {
-                return Ok(());
-            }
-
-            self.dirty = true;
-            let write_res = if pin {
-                let header = WeakPinHeaderV3::new(handle);
-                self.file.write(header.as_bytes())
-            } else {
-                let header = WeakUnpinHeaderV3::new(handle);
-                self.file.write(header.as_bytes())
-            };
-            let written = write_res.map_err(PileWriteError::IoError)?;
-            if written != V3_HEADER_LEN {
-                return Err(PileWriteError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write weak-pin header",
-                )));
-            }
-            match self.apply_next().map_err(PileWriteError::from)? {
-                Some(Applied::WeakPin { handle: h }) if pin && h == handle => Ok(()),
-                Some(Applied::WeakUnpin { handle: h }) if !pin && h == handle => Ok(()),
-                Some(_) => Err(PileWriteError::IoError(std::io::Error::other(
-                    "unexpected record after weak-pin write",
-                ))),
-                None => Err(PileWriteError::IoError(std::io::Error::other(
-                    "weak-pin marker missing after write",
-                ))),
-            }
-        })();
-        let unlock_res = self.file.unlock();
-        res?;
-        unlock_res?;
-        Ok(())
-    }
-}
-
-impl WeakPinStore for Pile {
-    type WeakPinError = PileWriteError;
-    type WeakListIter<'a> = PileWeakPinIter;
-
-    /// Appends a weak-pin record for `handle`. Durable across reopen (the
-    /// record is replayed by the scan), subject to the same flush rules as
-    /// mutable-pin updates: call [`Pile::flush`] to make it crash-durable.
-    fn pin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.write_weak_marker(handle.transmute(), true)
-    }
-
-    /// Appends a weak-unpin record for `handle`, retracting any prior weak
-    /// pin (last-writer-wins by log position).
-    fn unpin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.write_weak_marker(handle.transmute(), false)
-    }
-
-    fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError> {
-        // Ensure newly appended records are applied before enumerating so
-        // external writers are visible to callers (mirrors `pins`).
-        self.refresh()?;
-        let cloned = self.weak_pins.clone();
-        Ok(PileWeakPinIter {
-            inner: cloned.into_iter_ordered(),
-        })
-    }
-}
-
 impl crate::repo::BlobStoreMeta for PileReader {
     type MetaError = Infallible;
 
@@ -2178,6 +2051,20 @@ mod tests {
             .unwrap();
         file.sync_all().unwrap();
         record_offset
+    }
+
+    fn append_legacy_weak_pin(path: &Path, handle: Inline<Handle<UnknownBlob>>) {
+        let header = WeakPinHeaderV3::new(handle);
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn append_legacy_weak_unpin(path: &Path, handle: Inline<Handle<UnknownBlob>>) {
+        let header = WeakUnpinHeaderV3::new(handle);
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        file.sync_all().unwrap();
     }
 
     #[test]
@@ -3077,17 +2964,6 @@ mod tests {
             .unwrap();
         assert!(!writer.dirty);
 
-        writer.pin_weak(handle).unwrap();
-        assert!(writer.dirty);
-        writer.flush().unwrap();
-        assert!(!writer.dirty);
-        writer.pin_weak(handle).unwrap();
-        assert!(!writer.dirty);
-        writer.unpin_weak(handle).unwrap();
-        assert!(writer.dirty);
-        writer.flush().unwrap();
-        assert!(!writer.dirty);
-
         observer.close().unwrap();
         writer.close().unwrap();
     }
@@ -3648,94 +3524,6 @@ mod tests {
         pile.close().unwrap();
     }
 
-    /// Durable weak pins: a weak-pin record survives close + reopen — the
-    /// scan rebuilds the LWW-resolved weak set from the on-disk markers.
-    #[test]
-    fn weak_pin_survives_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-
-        // A weak pin is a want — the blob need not exist in the pile.
-        let wanted: Inline<Handle<UnknownBlob>> =
-            Blob::<UnknownBlob>::new(Bytes::from_source(vec![7u8; 21])).get_handle();
-
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.pin_weak(wanted).unwrap();
-        let pinned: HashSet<_> = pile.weak_pins().unwrap().map(|r| r.unwrap()).collect();
-        assert!(pinned.contains(&wanted));
-        pile.close().unwrap();
-
-        let mut reopened: Pile = Pile::open(&path).unwrap();
-        reopened.amputate().unwrap();
-        let pinned: HashSet<_> = reopened.weak_pins().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(pinned.len(), 1);
-        assert!(
-            pinned.contains(&wanted),
-            "weak pin lost across reopen — restart amnesia"
-        );
-        reopened.close().unwrap();
-    }
-
-    /// LWW by log position: the last marker for a handle wins, both live and
-    /// across a fresh scan of the on-disk record sequence.
-    #[test]
-    fn weak_pin_lww_last_writer_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-
-        let a: Inline<Handle<UnknownBlob>> =
-            Blob::<UnknownBlob>::new(Bytes::from_source(vec![1u8; 9])).get_handle();
-        let b: Inline<Handle<UnknownBlob>> =
-            Blob::<UnknownBlob>::new(Bytes::from_source(vec![2u8; 9])).get_handle();
-
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        // a: pin, unpin, pin — three real records; last writer says pinned.
-        pile.pin_weak(a).unwrap();
-        pile.unpin_weak(a).unwrap();
-        pile.pin_weak(a).unwrap();
-        // b: pin then unpin — last writer says unpinned.
-        pile.pin_weak(b).unwrap();
-        pile.unpin_weak(b).unwrap();
-
-        let pinned: HashSet<_> = pile.weak_pins().unwrap().map(|r| r.unwrap()).collect();
-        assert!(pinned.contains(&a));
-        assert!(!pinned.contains(&b));
-        pile.close().unwrap();
-
-        // The same resolution must fall out of a fresh log replay.
-        let mut reopened: Pile = Pile::open(&path).unwrap();
-        reopened.amputate().unwrap();
-        let pinned: HashSet<_> = reopened.weak_pins().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(pinned.len(), 1);
-        assert!(pinned.contains(&a));
-        assert!(!pinned.contains(&b));
-        reopened.close().unwrap();
-    }
-
-    /// Re-asserting the current weak state is a no-op append (mirrors the
-    /// pin-update no-op rule): the LWW cell carries no new information.
-    #[test]
-    fn weak_pin_noop_does_not_grow_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "pile.pile");
-
-        let h: Inline<Handle<UnknownBlob>> =
-            Blob::<UnknownBlob>::new(Bytes::from_source(vec![3u8; 5])).get_handle();
-
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        // Unpinning a never-pinned handle records nothing.
-        pile.unpin_weak(h).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-
-        pile.pin_weak(h).unwrap();
-        let len_after_pin = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(len_after_pin, V3_HEADER_LEN as u64);
-
-        pile.pin_weak(h).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_after_pin);
-        pile.close().unwrap();
-    }
-
     /// Mixed pile: a legacy V1 blob and every current V3 record family
     /// interleaved — the scan walks them cleanly and each independent index
     /// resolves correctly.
@@ -3772,16 +3560,20 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
 
-        // Interleave every current V3 state family with blobs and one legacy
-        // V1 record.
-        pile.pin_weak(want).unwrap();
+        // Interleave current state families and accepted legacy marker records
+        // with blobs and one V1 record. Production code no longer writes or
+        // indexes the weak marker pair; these raw fixtures exercise migration
+        // and forensic decoding only.
+        append_legacy_weak_pin(&path, want);
+        pile.refresh().unwrap();
         pile.append_pin_assertion(generic_assertion).unwrap();
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
         pile.update(pin_id, None, Some(h1.transmute())).unwrap();
-        pile.pin_weak(retracted).unwrap();
-        pile.unpin_weak(retracted).unwrap();
+        append_legacy_weak_pin(&path, retracted);
+        append_legacy_weak_unpin(&path, retracted);
+        pile.refresh().unwrap();
         let d2 = vec![2u8; 77];
         let b2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d2.clone()));
         let h2 = pile.put::<UnknownBlob, _>(b2).unwrap();
@@ -3810,10 +3602,6 @@ mod tests {
             vec![generic_assertion]
         );
 
-        let pinned: HashSet<_> = pile.weak_pins().unwrap().map(|r| r.unwrap()).collect();
-        assert_eq!(pinned.len(), 1);
-        assert!(pinned.contains(&want));
-        assert!(!pinned.contains(&retracted));
         pile.close().unwrap();
     }
 
@@ -3854,8 +3642,9 @@ mod tests {
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
         pile.update(pin_id, None, Some(h1.transmute())).unwrap();
-        pile.pin_weak(want).unwrap();
-        pile.unpin_weak(want).unwrap();
+        append_legacy_weak_pin(&path, want);
+        append_legacy_weak_unpin(&path, want);
+        pile.refresh().unwrap();
         pile.update(pin_id, Some(h1.transmute()), None).unwrap();
         pile.close().unwrap();
 

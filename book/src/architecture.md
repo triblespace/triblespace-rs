@@ -152,6 +152,17 @@ branch state. Partial frontiers expose only a candidate-root
 descriptor: they cannot be checked out or license a new authored merge
 assertion until ancestry is complete.
 
+`WantPinDescriptor` is a second typed adapter over the same generic ledger.
+Every author uses one fixed descriptor and asserts exact blob handles as
+values, so author identity separates independent grow-only want sets without a
+kind-specific store. `WantStore` deliberately scopes both writes and reads to
+the configured author. `Lazy` and `Peer` own that author's signing key and
+append a durable assertion when a wrapped read misses; raw `Pile` and `Yard`
+reads remain observational. The reconciler services only its own author's
+wants, while `Yard` may union authentic wants from every author as bounded soft
+cache roots. Satisfaction and eviction never retract an assertion, and wants
+never weaken branch hard roots.
+
 Mutable [`PinStore`](https://docs.rs/triblespace/latest/triblespace/repo/trait.PinStore.html)
 entries still exist while retention and policy consumers migrate. They are
 legacy scalar cells, not asserted pins or branch authority. A copied pile can

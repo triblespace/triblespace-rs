@@ -10,10 +10,9 @@
 //! layer is the production code path).
 //!
 //! A content blob lives only in pile A. After both nodes have joined, A
-//! announces that immutable blob to the DHT. B durably records a weak-pin
+//! announces that immutable blob to the DHT. B durably appends an authored
 //! want for its hash; `Reconciler::tick` fetches and verifies the bytes and
-//! lands them in pile B under the still-recorded weak pin. Branch replication
-//! is deliberately outside this test.
+//! lands them in pile B. Branch replication is deliberately outside this test.
 //!
 //! Piles are created under `std::env::temp_dir()` — set `TMPDIR` to
 //! redirect.
@@ -37,7 +36,8 @@ use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, StorageFlush, WeakPinStore};
+use triblespace_core::repo::want::WantStore;
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, StorageFlush};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::clock;
 use triblespace_net::host;
@@ -199,10 +199,10 @@ async fn two_nodes(network: &TestNetwork, ka: &SigningKey, kb: &SigningKey) -> T
     }
 }
 
-/// A content blob lives only in pile A. B records a durable weak-pin want;
+/// A content blob lives only in pile A. B records a durable authored want;
 /// the reconciler obtains it through content-addressed blob transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn weak_pin_want_fetches_from_holder_over_iroh() {
+async fn asserted_want_fetches_from_holder_over_iroh() {
     init_tracing();
     let network = TestNetwork::new();
     let ka = key(0xA1);
@@ -244,17 +244,13 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
         assert!(held.is_err(), "precondition: B must not hold A's payload");
     }
 
-    // The durable want: weak-pin the hash in pile B and flush — the
-    // marker survives a process exit; the Reconciler is the daemon
-    // that services the queue.
-    {
-        let peer_b = repo_b.storage_mut();
-        let mut store = peer_b.store();
-        store
-            .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
-            .expect("record weak-pin want");
-        store.flush().expect("flush want");
-    }
+    // The durable want is signed by B and durably appended before reconcile.
+    // `append_pin_assertion` itself is the persistence boundary, so no extra
+    // flush belongs here.
+    repo_b
+        .storage_mut()
+        .assert_want(Inline::<Handle<UnknownBlob>>::new(hash))
+        .expect("record authored want");
 
     // Service the want. Each tick diffs wants against presence and
     // drives the swarm fetch for the missing ones.
@@ -275,7 +271,7 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
     }
     assert!(
         fetched,
-        "Reconciler must fetch the weak-pin want from A over the iroh transport"
+        "Reconciler must fetch the authored want from A over the iroh transport"
     );
 
     // The payload landed in pile B…
@@ -290,19 +286,11 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
             "landed bytes verify against the requested hash"
         );
     }
-    // …and the weak pin that expressed the want is still on record —
-    // it is now the retention marker for the fetched blob.
-    {
-        let peer_b = repo_b.storage_mut();
-        let mut store = peer_b.store();
-        let still_pinned = store
-            .weak_pins()
-            .expect("weak pins")
-            .filter_map(Result::ok)
-            .any(|h| h.raw == hash);
-        assert!(
-            still_pinned,
-            "the weak pin stays on record as the retention marker"
-        );
-    }
+    // …and B's grow-only want remains on record, now inert because the bytes
+    // are locally present.
+    let wants = repo_b.storage_mut().wants().expect("authored wants");
+    assert!(
+        wants.contains(&Inline::<Handle<UnknownBlob>>::new(hash)),
+        "the authored want stays on record"
+    );
 }

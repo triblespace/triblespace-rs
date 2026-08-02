@@ -29,8 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   generic assertions remain unavailable until a backend can meet coherent
   snapshot and durable-append contracts.
 - **Legacy mutable-HEAD transport is gone.** `pile net sync` announces content
-  and services durable lazy-fetch wants; it neither exchanges scalar HEADs nor
-  materializes tracking pins. Assertion replication and foreign-author
+  and services only signed lazy-fetch wants authored by its node key; it neither
+  exchanges scalar HEADs nor materializes tracking pins. Assertion replication and foreign-author
   admission remain an explicit future protocol boundary.
 - **Bounded network sync now fails loud and closes durably.** `pile net sync`
   validates the complete pile before starting transport and consumes the

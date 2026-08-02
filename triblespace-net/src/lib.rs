@@ -2,8 +2,9 @@
 //!
 //! The main type is [`Peer<S>`](peer::Peer): a store wrapper that owns an
 //! iroh network thread internally and exposes the standard storage traits
-//! (`BlobStore + BlobStorePut + PinStore`). Blob writes are announced through
-//! the DHT; missing weak-pinned blobs are fetched lazily by content hash.
+//! (`BlobStore + BlobStorePut + PinStore + PinAssertionStore`). Blob writes are
+//! announced through the DHT; missing handles asserted as wanted by this peer
+//! are fetched lazily by content hash.
 //! Generic pin assertions and their descriptor blobs remain local: this crate
 //! does not yet replicate them. Branch semantics are a typed adapter above that
 //! envelope, not a separate network operation.

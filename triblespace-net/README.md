@@ -5,7 +5,7 @@ Network transport for TribleSpace piles over
 
 - DHT content announcements and hash-verified blob transfer;
 - capability-authenticated, scope-gated `GET_BLOB`;
-- durable weak-pin wants for lazy fetching; and
+- durable, peer-authored asserted wants for lazy fetching; and
 - the capability request, delivery, renewal, and proof-bootstrap channel.
 
 The network does **not** replicate generic asserted pins yet. Appending a
@@ -73,8 +73,9 @@ See the book's [Distributed Sync](../book/src/distributed-sync.md) and
 [Capability Auth](../book/src/capability-auth.md) chapters for the exact current
 boundary and team setup. The CLI surface is
 `trible pile net {identity,status,sync}`. `sync` announces local content and
-services durable weak-pin wants; `--no-lazy` disables the reconciler. It does
-not synthesize or exchange branch state.
+services only the local peer author's durable wants; foreign assertions cannot
+create fetch work. `--no-lazy` disables the reconciler. It does not synthesize
+or exchange branch state.
 
 Pile-sync protocol v5 (`/triblespace/pile-sync/5`) deliberately has only two
 operations: mandatory first-stream `OP_AUTH`, followed by scope-gated
@@ -113,6 +114,6 @@ each operation authorizes only after its complete frame has arrived.
 - `protocol` — authenticated v5 blob wire format
 - `handshake` — v2 request, delivery, and exact proof-bootstrap protocol
 - `policy` — local pending requests, renewal state, and active credentials
-- `reconcile` — durable weak-want servicing
+- `reconcile` — author-scoped asserted-want servicing
 - `identity` — node signing-key handling
 - `host` / `channel` — network thread and its bounded event bridge

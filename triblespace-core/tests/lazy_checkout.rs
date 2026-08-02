@@ -5,7 +5,8 @@
 //! closure that is only partially present fails with
 //! `WantGetError::NotYet` (bubbled through
 //! `WorkspaceCheckoutError::Storage`) while the miss has already
-//! enqueued a durable weak-pin want for the absent blob — exactly what
+//! signed and durably appended an author-scoped asserted want for the absent
+//! blob — exactly what
 //! a sync daemon needs to service the demand before a retry. (An async
 //! consumer would instead suspend on the reader's `AsyncBlobStoreGet`
 //! until the blob lands.)
@@ -16,6 +17,7 @@ use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::prelude::*;
 use triblespace_core::repo::lazy::WantGetError;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::want::WantStore;
 use triblespace_core::repo::WorkspaceCheckoutError;
 
 mod test_ns {
@@ -66,7 +68,7 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     // Branch-assertion replication is deliberately outside this test: phase-3
     // Repository is an own-key authoring boundary, while this contract concerns
     // only a workspace reading a known commit through a lazy blob store.
-    let lazy = Lazy::new(replica);
+    let lazy = Lazy::new(replica, key.clone());
     let mut repo_b = Repository::new(lazy, key, TribleSet::new()).expect("replica repo");
     let mut ws_b = repo_b.create_workspace("main").expect("workspace");
     ws_b.set_head(head, head_rank).unwrap();
@@ -81,12 +83,7 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     drop(ws_b);
 
     // The miss enqueued a durable want for exactly the withheld blob.
-    let wants: Vec<_> = repo_b
-        .storage_mut()
-        .weak_pins()
-        .expect("weak pins")
-        .map(Result::unwrap)
-        .collect();
+    let wants = repo_b.storage_mut().wants().expect("asserted wants");
     assert!(
         wants.iter().any(|h| h.raw == content_handle.raw),
         "the absent content blob must be enqueued as a want: {wants:?}"

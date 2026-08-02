@@ -1,7 +1,7 @@
 # Pile Format
 
-The on-disk pile keeps blobs, generic signed pin assertions, and local pins in one
-append-only file. The
+The on-disk pile keeps blobs, generic signed pin assertions, and local scalar
+pins in one append-only file. The
 write-ahead log *is* the database: all indices are reconstructed from the bytes
 already stored on disk. This design avoids background compaction, manifest
 management, or auxiliary metadata while still providing a durable
@@ -17,11 +17,12 @@ memory map never exposes half-written records.
 
 ## Record model: uniform 256-byte records (V3)
 
-Every record the pile writes today — blob, local pin head, local pin
-tombstone, generic asserted pin, weak-pin marker, weak-unpin marker
-— uses the **V3** layout: a fixed **256-byte header**, followed (for blobs) by
-the payload, padded so the whole record is a **256-byte multiple**. This
-uniformity is load-bearing:
+Every record the pile writes today—blob, local pin head, local pin tombstone,
+or generic asserted pin—uses the **V3** layout: a fixed **256-byte header**,
+followed (for blobs) by the payload, padded so the whole record is a
+**256-byte multiple**. The reader also recognizes retired weak-pin and
+weak-unpin V3 markers for migration and forensics, but no live API writes or
+indexes them. This uniformity is load-bearing:
 
 - **Position independence.** Blob data starts at the constant
   `record_start + 256`; there is no offset-derived padding. A record means
@@ -310,7 +311,15 @@ equal values, verifies a surviving witness, and reports absent, tip-pending,
 partial, or complete state. Unknown descriptor kinds remain preserved without
 being interpreted as branches.
 
-## Weak-Pin Records (want / retention markers)
+For fetch wants, every author uses the same fixed `WantPinDescriptor` handle;
+the author key in the generic identity keeps their sets distinct. The value is
+the exact wanted blob handle and the label is fixed canonical padding rather
+than an ordering relation. Each author's typed view is therefore a grow-only
+set with no replacement, unpin, or tombstone. `Lazy` and `Peer` append these
+assertions with their configured signing key. Raw `Pile` reads are
+observational and never mint demand merely because a blob is absent.
+
+## Retired Weak-Pin Records
 
 ```text
             ┌────16 byte───┐┌────────────32 byte───────────┐┌────────────208 byte──────────┐
@@ -319,15 +328,17 @@ being interpreted as branches.
  (256 B)  └ └──────────────┘└──────────────────────────────┘└──────────────────────────────┘
 ```
 
-A weak-pin marker (and its weak-unpin counterpart, same layout with a
-different marker) is keyed by **blob handle** — per-blob and anonymous, no pin
-id. Together with local pin records they make retention one strength axis,
-resolved last-writer-wins by log position:
-`pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin` (the pin-head record *is* `pin`, the
-tombstone *is* `unpin`). A weak pin is simultaneously the demand-born
-want-signal ("I want this blob; fetch it if absent"), the cache-retention
-marker for a fetched blob, and the eviction target under pressure. Because the
-markers are durable records, reopening a pile reloads the weak set.
+Older V3 writers emitted anonymous weak-pin and weak-unpin markers keyed only
+by a blob handle. Current readers still decode and expose those raw records
+through `PileRecords` so a migration or forensic rewrite can preserve the
+physical log exactly. Replay does not fold them into semantic state, there is
+no live weak-pin index, and current code never writes either marker.
+
+Do not infer demand or retention from their historical last-writer-wins order.
+Current wants are signed generic assertions under `WantPinDescriptor`, with an
+author-scoped identity and grow-only set semantics. Migrating an old weak
+marker therefore requires an explicit choice of author; a weak-unpin marker has
+no asserted-want tombstone counterpart.
 
 ## Legacy V1 records
 
@@ -335,7 +346,7 @@ Piles written before V3 contain 64-byte-aligned records: a 64-byte blob header
 (marker, timestamp, length, hash) followed by a payload padded to a 64-byte
 boundary, and 64-byte pin-head / tombstone records. The reader recognises the V1
 markers and reads these records byte-identical; they are never rewritten. V1
-had no weak-pin records.
+had no weak-pin records; the retired markers above existed only in V3.
 
 ## Recovery
 

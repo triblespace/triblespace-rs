@@ -174,32 +174,42 @@ pub fn wants_in_snapshot(
         .collect()
 }
 
-/// Ergonomic typed operations for any generic asserted-pin store.
-pub trait WantStoreExt: PinAssertionStore {
-    /// Durably assert one wanted handle. Duplicate assertion is success.
-    fn assert_want<S>(
-        &mut self,
-        key: &SigningKey,
-        handle: Inline<Handle<S>>,
-    ) -> Result<(), Self::Error>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.append_pin_assertion(sign_want(key, handle))
-    }
-
-    /// Read one author's resolved want G-set from a coherent snapshot.
-    fn wants_for(
-        &mut self,
-        author: VerifyingKey,
-    ) -> Result<BTreeSet<Inline<Handle<UnknownBlob>>>, Self::Error> {
-        self.pin_assertion_snapshot()
-            .map(|snapshot| wants_in_snapshot(&snapshot, author))
-    }
+/// Project the union of every author's wanted handles from a coherent generic
+/// snapshot.
+///
+/// This is the storage-policy view used by garbage collection: any authentic
+/// want retains the named blob regardless of which author asserted it. Normal
+/// consumers should use [`wants_in_snapshot`] or [`WantStore::wants`] instead,
+/// so one principal never mistakes another principal's demand for its own.
+pub fn all_wants_in_snapshot(
+    snapshot: &PinAssertionSnapshot,
+) -> BTreeSet<Inline<Handle<UnknownBlob>>> {
+    let pin = WantPinDescriptor::pin_handle();
+    snapshot
+        .iter()
+        .filter(|assertion| assertion.identity().pin() == pin)
+        .map(|assertion| handle_from_value(assertion.value()))
+        .collect()
 }
 
-impl<T: PinAssertionStore + ?Sized> WantStoreExt for T {}
+/// Author-scoped durable operations over the generic asserted-want G-set.
+///
+/// An implementation owns or otherwise has a configured signing identity.
+/// Both methods are scoped to that one author, so callers cannot accidentally
+/// switch principals by passing a key per operation. Use
+/// [`all_wants_in_snapshot`] only for global storage policy such as GC.
+pub trait WantStore: PinAssertionStore {
+    /// Durably assert one wanted handle as the configured author. Duplicate
+    /// assertion is success.
+    fn assert_want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::Error>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding;
+
+    /// Read the configured author's exact wanted-handle set from one coherent
+    /// snapshot.
+    fn wants(&mut self) -> Result<BTreeSet<Inline<Handle<UnknownBlob>>>, Self::Error>;
+}
 
 #[cfg(test)]
 mod tests {
@@ -260,6 +270,7 @@ mod tests {
         let second_wants = wants_in_snapshot(&snapshot, second.verifying_key());
         assert_eq!(first_wants, second_wants);
         assert_eq!(first_wants.len(), 1);
+        assert_eq!(all_wants_in_snapshot(&snapshot), first_wants);
     }
 
     #[test]
@@ -282,34 +293,76 @@ mod tests {
         assert!(wants.contains(&handle_from_value(value_from_handle(wanted))));
     }
 
-    #[derive(Default)]
-    struct MemoryPins(PinAssertionSnapshot);
+    struct MemoryPins {
+        key: SigningKey,
+        assertions: PinAssertionSnapshot,
+    }
+
+    impl MemoryPins {
+        fn new(key: SigningKey) -> Self {
+            Self {
+                key,
+                assertions: PinAssertionSnapshot::new(),
+            }
+        }
+    }
 
     impl PinAssertionStore for MemoryPins {
         type Error = Infallible;
 
         fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
-            Ok(self.0.clone())
+            Ok(self.assertions.clone())
         }
 
         fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
-            self.0
+            self.assertions
                 .insert(assertion)
                 .expect("cryptographic key collision in test");
             Ok(())
         }
     }
 
+    impl WantStore for MemoryPins {
+        fn assert_want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::Error>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            let assertion = sign_want(&self.key, handle);
+            self.append_pin_assertion(assertion)
+        }
+
+        fn wants(&mut self) -> Result<BTreeSet<Inline<Handle<UnknownBlob>>>, Self::Error> {
+            let author = self.key.verifying_key();
+            self.pin_assertion_snapshot()
+                .map(|snapshot| wants_in_snapshot(&snapshot, author))
+        }
+    }
+
     #[test]
-    fn store_extension_is_append_only_and_author_scoped() {
+    fn authored_store_is_append_only_and_author_scoped() {
         let first = key(1);
         let second = key(2);
-        let mut store = MemoryPins::default();
-        store.assert_want(&first, handle(5)).unwrap();
-        store.assert_want(&first, handle(6)).unwrap();
-        store.assert_want(&second, handle(7)).unwrap();
+        let mut store = MemoryPins::new(first);
+        store.assert_want(handle(5)).unwrap();
+        store.assert_want(handle(6)).unwrap();
+        store
+            .append_pin_assertion(sign_want(&second, handle(7)))
+            .unwrap();
+        store
+            .append_pin_assertion(PinAssertion::sign(
+                &second,
+                PinHandle::from_raw([99; 32]),
+                value_from_handle(handle(8)),
+                SubsumptionLabel::from_raw([0; 32]),
+            ))
+            .unwrap();
 
-        assert_eq!(store.wants_for(first.verifying_key()).unwrap().len(), 2);
-        assert_eq!(store.wants_for(second.verifying_key()).unwrap().len(), 1);
+        assert_eq!(store.wants().unwrap().len(), 2);
+        assert_eq!(
+            all_wants_in_snapshot(&store.pin_assertion_snapshot().unwrap()).len(),
+            3,
+            "global GC view unions authors but ignores other pin kinds"
+        );
     }
 }

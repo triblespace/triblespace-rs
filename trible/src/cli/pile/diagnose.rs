@@ -455,7 +455,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                 PileRecordContent::WeakPin { handle } | PileRecordContent::WeakUnpin { handle } => {
                     if handle.raw == needle {
                         weak_marker_matches += 1;
-                        println!("weak-pin marker match at byte {}", record.offset);
+                        println!("legacy weak-pin marker match at byte {}", record.offset);
                     }
                 }
             }
@@ -465,7 +465,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
         println!("  blob headers:   {blob_header_matches}");
         println!("  legacy pin refs:{pin_header_matches}");
         println!("  assertion refs: {assertion_field_matches}");
-        println!("  weak markers:   {weak_marker_matches}");
+        println!("  legacy weak:    {weak_marker_matches}");
         println!("  payload refs:   {payload_matches}");
         Ok(())
     })

@@ -87,12 +87,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: signed asserted wants replace anonymous weak pins.** The fixed
+  `WantPinDescriptor` gives each author one grow-only set of exact wanted blob
+  values through the generic `PinAssertionStore`; `WantStore` scopes reads and
+  writes to the configured author. `Lazy` and `Peer` sign durable wants on
+  misses, raw `Pile`/`Yard` reads remain observational, and reconciliation
+  services only its own author's set. Yard unions authentic wants across
+  authors as canonically ordered exact-value soft roots under
+  `YardConfig::want_budget`; wants never veto hard roots, and satisfaction or
+  eviction never erases an assertion. Historical weak-pin/unpin records remain
+  decodable only for migration and forensics, with no live index or writer and
+  no automatic conversion into authored wants. `Lazy::new` now takes
+  `(store, SigningKey)`, and `YardConfig::weak_budget` is renamed to
+  `want_budget`.
 - **Storage composition now carries asserted-pin authority explicitly.** Async
   adapters expose generic assertion snapshots and partial commit-DAG lookup;
   `HybridStore` composes a blob store with a separate `PinAssertionStore`; and
-  the lazy wrapper preserves asserted-pin storage while keeping commit-DAG ancestry
-  lookup strictly local. Optimistic pre-verification ancestry misses never
-  become weak-pin/network wants; only demand returned after the resolver has
+  the lazy wrapper preserves asserted-pin storage while keeping commit-DAG
+  ancestry lookup strictly local. Optimistic pre-verification ancestry misses
+  never become fetch wants; only demand returned after the resolver has
   verified its surviving claim may cross into fetch policy. The blocking async
   adapter lowers this trait only for a `SyncAsAsync` store which already
   satisfies the local contract; a remote `ObjectStoreReader` cannot masquerade
@@ -105,9 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutable-HEAD gossip/tracking bridge, publisher-hint state, direction modes,
   and `OP_CHILDREN` are deleted. Pile-sync v5 exposes only mandatory
   first-stream `OP_AUTH` and scope-gated `OP_GET_BLOB`; DHT content
-  announcements and durable weak-want fetching remain. `Peer` forwards local
-  assertion, durability, and partial-DAG capabilities, but generic envelope
-  replication and foreign-author/kind admission remain an explicit later protocol.
+  announcements and author-scoped asserted-want fetching remain. `Peer`
+  forwards local assertion, durability, and partial-DAG capabilities, but
+  generic envelope replication and foreign-author/kind admission remain an
+  explicit later protocol.
   Auth-handshake v2 provides bounded request, delivery, and exact proof-member
   operations. Proof locators are not secrets: the server fully verifies its
   local named chain and returns only a member touched by that verification.
@@ -163,9 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grow-only assertion store across all generations and preserves unknown kinds
   without treating their opaque values as roots. When a locally present
   descriptor decodes as `BranchPinDescriptor`, every valid assertion's
-  descriptor, name, commit, and locally present closure become hard roots even
-  if weak want markers predate blob arrival. Reclaim copies each segment's exact
-  assertion set before the atomic rename.
+  descriptor, name, commit, and locally present closure become hard roots.
+  Authentic asserted-want values are separate bounded soft roots and can never
+  weaken that closure. Reclaim copies each segment's exact assertion set before
+  the atomic rename.
 - **Breaking: `Repository` publishes own-key branch pins through the generic envelope.**
   `create_workspace(name)` now begins an unpublished branch without writing an
   empty state; its first changed `push` makes the name and canonical descriptor
