@@ -475,11 +475,13 @@ where
         Ok(())
     }
 
-    /// Persist an incoming join request: store the partial-cap blob,
-    /// then add a pending-request entity to the local pending-requests
-    /// branch. The entity id becomes the value `team approve <id>`
-    /// consumes; the partial-cap blob is recoverable from the entity's
-    /// `request_partial_cap` handle.
+    /// Validate and durably observe an incoming join request in this
+    /// issuer's asserted policy ledger.
+    ///
+    /// Ordinary input/admission refusals return `Ok(false)`. Storage failures
+    /// propagate so [`refresh`](Self::refresh) can fail-stop. `Ok(true)` is
+    /// returned only after the request closure was flushed and its assertion
+    /// durably appended, which is the receipt the host maps to `STATUS_OK`.
     fn absorb_cap_request(
         &mut self,
         requester: PublisherKey,
@@ -487,9 +489,6 @@ where
     ) -> Result<bool, PeerRefreshError> {
         use triblespace_core::blob::Blob;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::inline::TryToInline;
-        use triblespace_core::macros::{find, pattern};
-        use triblespace_core::trible::TribleSet;
 
         // Reconstitute the requester pubkey from bytes. If the bytes
         // aren't a valid ed25519 pubkey, drop on the floor — only
@@ -503,69 +502,32 @@ where
             return Ok(false);
         };
 
-        // Parse before persistence and bind the declared cap subject to the
-        // authenticated transport identity. The host performs the same cheap
-        // gate before enqueueing; repeating it at the durable boundary keeps
-        // this invariant true for every future event producer as well.
         let blob: Blob<SimpleArchive> = Blob::new(partial_cap_bytes);
-        let Ok(partial_cap): Result<TribleSet, _> = TryFromBlob::try_from_blob(blob.clone()) else {
-            tracing::warn!(
-                requester = %hex::encode(&requester[..4]),
-                "CapRequest: malformed partial capability; dropping"
-            );
-            return Ok(false);
-        };
-        let subjects: Vec<(Id, ed25519_dalek::VerifyingKey)> = find!(
-            (cap: Id, subject: ed25519_dalek::VerifyingKey),
-            pattern!(&partial_cap, [{
-                ?cap @ triblespace_core::repo::capability::cap_subject: ?subject
-            }])
-        )
-        .collect();
-        if subjects.len() != 1 || subjects[0].1 != requester_pubkey {
-            tracing::warn!(
-                requester = %hex::encode(&requester[..4]),
-                declared_subjects = subjects.len(),
-                "CapRequest: partial capability subject does not uniquely match requester; dropping"
-            );
-            return Ok(false);
-        }
-
-        // Point-interval at "now" — pending-requests timeline is
-        // just "this arrived at T".
-        let now = crate::clock::epoch_now();
-        let received_at = (now, now).try_to_inline().expect("point interval");
         let mut store = self.store.lock().expect("store mutex");
 
-        match crate::policy::record_pending_request_checked(
+        match crate::policy_ledger::observe_request(
             &mut *store,
+            &self.signing_key,
             requester_pubkey,
             blob,
-            received_at,
         ) {
-            Ok(Some(req_id)) => {
-                store.flush().map_err(|error| {
-                    PeerRefreshError::new("flush pending capability request", error)
-                })?;
-                let req_id_bytes: [u8; 16] = req_id.into();
+            Ok(crate::policy_ledger::ObserveRequestOutcome::Observed(receipt)) => {
                 tracing::info!(
                     requester = %hex::encode(&requester[..4]),
-                    request_id = %hex::encode(req_id_bytes),
-                    "CapRequest durably recorded as pending"
+                    request_event = %hex::encode(receipt.event().raw),
+                    "CapRequest durably observed in policy ledger"
                 );
                 Ok(true)
             }
-            Ok(None) => {
+            Ok(crate::policy_ledger::ObserveRequestOutcome::Refused(reason)) => {
                 tracing::warn!(
                     requester = %hex::encode(&requester[..4]),
-                    "CapRequest: pending-request policy refused the request"
+                    reason = %reason,
+                    "CapRequest: policy refused the request"
                 );
                 Ok(false)
             }
-            Err(error) => Err(PeerRefreshError::new(
-                "record pending capability request",
-                error,
-            )),
+            Err(error) => Err(PeerRefreshError::new("observe capability request", error)),
         }
     }
 
@@ -2577,13 +2539,29 @@ mod tests {
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::trible::TribleSet;
 
-    fn partial_cap_bytes(subject: ed25519_dalek::VerifyingKey) -> Bytes {
+    fn partial_cap_bytes(
+        subject: ed25519_dalek::VerifyingKey,
+        issuer: ed25519_dalek::VerifyingKey,
+    ) -> Bytes {
         let cap_id = genid();
-        let cap: TribleSet = entity! {
+        let scope_root = genid();
+        let now = crate::clock::epoch_now();
+        let expiry = (now, now + hifitime::Duration::from_days(1.0))
+            .try_to_inline()
+            .expect("request expiry interval");
+        let mut cap: TribleSet = entity! {
             ExclusiveId::force_ref(&cap_id) @
             triblespace_core::repo::capability::cap_subject: subject,
+            triblespace_core::repo::capability::cap_issuer: issuer,
+            triblespace_core::repo::capability::cap_scope_root: *scope_root,
+            triblespace_core::metadata::expires_at: expiry,
         }
         .into();
+        cap += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&scope_root) @
+            triblespace_core::metadata::tag:
+                triblespace_core::repo::capability::PERM_READ,
+        });
         let blob: Blob<SimpleArchive> = cap.to_blob();
         blob.bytes
     }
@@ -2604,10 +2582,19 @@ mod tests {
     #[error("injected flush failure")]
     struct InjectedFlushError;
 
+    #[derive(Debug, thiserror::Error)]
+    enum InjectedAssertionError {
+        #[error("injected assertion append failure")]
+        Injected,
+        #[error(transparent)]
+        Inner(#[from] triblespace_core::repo::pin_assertion::PinAssertionKeyCollision),
+    }
+
     struct FlushProbe {
         inner: MemoryRepo,
         flushes: Arc<AtomicUsize>,
         fail_flush: bool,
+        fail_append: bool,
     }
 
     impl triblespace_core::repo::BlobStorePut for FlushProbe {
@@ -2660,14 +2647,22 @@ mod tests {
     }
 
     impl PinAssertionStore for FlushProbe {
-        type Error = <MemoryRepo as PinAssertionStore>::Error;
+        type Error = InjectedAssertionError;
 
         fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
-            self.inner.pin_assertion_snapshot()
+            self.inner
+                .pin_assertion_snapshot()
+                .map_err(InjectedAssertionError::from)
         }
 
         fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
-            self.inner.append_pin_assertion(assertion)
+            if self.fail_append {
+                Err(InjectedAssertionError::Injected)
+            } else {
+                self.inner
+                    .append_pin_assertion(assertion)
+                    .map_err(InjectedAssertionError::from)
+            }
         }
     }
 
@@ -2962,12 +2957,14 @@ mod tests {
             sender,
             receiver,
         );
+        let partial_cap_bytes = partial_cap_bytes(requester, signing_key.verifying_key());
+        let partial_cap_handle = Blob::<SimpleArchive>::new(partial_cap_bytes.clone()).get_handle();
         let (completion, mut receipt) = tokio::sync::oneshot::channel();
         wiring
             .evt_tx
             .send(NetEvent::CapRequest {
                 requester: requester.to_bytes(),
-                partial_cap_bytes: partial_cap_bytes(requester),
+                partial_cap_bytes,
                 admission: cap_request_admission(),
                 completion,
             })
@@ -2986,14 +2983,43 @@ mod tests {
         assert_eq!(
             receipt.try_recv(),
             Ok(true),
-            "only the post-flush receipt can license STATUS_OK"
+            "only the durable policy assertion receipt can license STATUS_OK"
         );
-        // Deliberately do not call close(): process death would only drop the
-        // file handle. Reopening after that boundary proves the positive
-        // receipt was downstream of Pile's crash-durability flush.
+        // Deliberately do not call close(). A successful reopen validates that
+        // the positive receipt followed the explicit flush and that the exact
+        // closure plus assertion are replayable; this does not simulate power loss.
         drop(peer.into_store());
         let mut reopened = Pile::open(&path).expect("reopen flushed pile");
-        assert_eq!(crate::policy::list_pending_requests(&mut reopened).len(), 1);
+        let snapshot = reopened
+            .pin_assertion_snapshot()
+            .expect("replay policy assertion");
+        assert_eq!(snapshot.len(), 1);
+        let reader = reopened.reader().expect("open replay reader");
+        let request = crate::policy_ledger::RequestIdentity::new(requester, partial_cap_handle);
+        let crate::policy_ledger::PolicyLedgerResolution::Complete(view) =
+            crate::policy_ledger::resolve_policy_ledger(
+                &snapshot,
+                signing_key.verifying_key(),
+                |handle| {
+                    reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                },
+            )
+        else {
+            panic!("durably acknowledged request must reopen as a complete policy ledger");
+        };
+        let request_view = view
+            .requests()
+            .get(&request)
+            .expect("exact request is present after reopen");
+        assert!(request_view.observed());
+        assert!(request_view.is_pending());
+        assert!(
+            view.event_handles()
+                .contains(&crate::policy_ledger::PolicyEvent::RequestObserved(request).handle())
+        );
+        drop(reader);
         reopened.close().expect("close reopened pile");
     }
 
@@ -3010,6 +3036,7 @@ mod tests {
                 inner: MemoryRepo::default(),
                 flushes: Arc::clone(&flushes),
                 fail_flush: true,
+                fail_append: false,
             },
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3021,7 +3048,7 @@ mod tests {
             .evt_tx
             .send(NetEvent::CapRequest {
                 requester: requester.to_bytes(),
-                partial_cap_bytes: partial_cap_bytes(requester),
+                partial_cap_bytes: partial_cap_bytes(requester, signing_key.verifying_key()),
                 admission: cap_request_admission(),
                 completion,
             })
@@ -3029,7 +3056,8 @@ mod tests {
 
         let error = peer.refresh().expect_err("flush failure must propagate");
 
-        assert_eq!(error.operation(), "flush pending capability request");
+        assert_eq!(error.operation(), "observe capability request");
+        assert!(error.detail().contains("failed to flush policy closure"));
         assert_eq!(flushes.load(Ordering::SeqCst), 1);
         assert_eq!(
             receipt.try_recv(),
@@ -3041,6 +3069,55 @@ mod tests {
                 .expect_err("persistence failure stays sticky"),
             error
         );
+        let mut store = peer.store.lock().expect("store mutex");
+        assert!(store.pin_assertion_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cap_request_assertion_failure_is_not_acknowledged_and_is_fail_stop() {
+        let signing_key = SigningKey::from_bytes(&[0x75; 32]);
+        let requester = SigningKey::from_bytes(&[0x76; 32]).verifying_key();
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut peer = Peer::with_wiring(
+            FlushProbe {
+                inner: MemoryRepo::default(),
+                flushes: Arc::clone(&flushes),
+                fail_flush: false,
+                fail_append: true,
+            },
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+        let (completion, mut receipt) = tokio::sync::oneshot::channel();
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: requester.to_bytes(),
+                partial_cap_bytes: partial_cap_bytes(requester, signing_key.verifying_key()),
+                admission: cap_request_admission(),
+                completion,
+            })
+            .expect("event channel open");
+
+        let error = peer
+            .refresh()
+            .expect_err("assertion append failure must propagate");
+
+        assert_eq!(error.operation(), "observe capability request");
+        assert!(error.detail().contains("failed to append policy assertion"));
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(receipt.try_recv(), Ok(false));
+        assert_eq!(
+            peer.refresh().expect_err("assertion failure stays sticky"),
+            error
+        );
+        let mut store = peer.store.lock().expect("store mutex");
+        assert!(store.pin_assertion_snapshot().unwrap().is_empty());
     }
 
     #[test]
@@ -3058,7 +3135,7 @@ mod tests {
             sender,
             receiver,
         );
-        let bytes = partial_cap_bytes(different_subject);
+        let bytes = partial_cap_bytes(different_subject, signing_key.verifying_key());
         let handle = Blob::<SimpleArchive>::new(bytes.clone()).get_handle();
         let (completion, mut receipt) = tokio::sync::oneshot::channel();
         wiring
@@ -3075,13 +3152,172 @@ mod tests {
         assert_eq!(receipt.try_recv(), Ok(false));
 
         let mut store = peer.store.lock().expect("store mutex");
-        assert!(crate::policy::list_pending_requests(&mut *store).is_empty());
+        assert!(store.pin_assertion_snapshot().unwrap().is_empty());
         let reader = store.reader().expect("memory reader");
         assert!(
             reader
                 .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
                 .is_err(),
             "a mismatched request must be rejected before blob persistence"
+        );
+    }
+
+    #[test]
+    fn cap_request_issuer_mismatch_is_refused_without_poisoning_peer() {
+        let signing_key = SigningKey::from_bytes(&[0x13; 32]);
+        let requester = SigningKey::from_bytes(&[0x14; 32]).verifying_key();
+        let wrong_issuer = SigningKey::from_bytes(&[0x15; 32]).verifying_key();
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+
+        let refused_bytes = partial_cap_bytes(requester, wrong_issuer);
+        let refused_handle = Blob::<SimpleArchive>::new(refused_bytes.clone()).get_handle();
+        let (completion, mut refused_receipt) = tokio::sync::oneshot::channel();
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: requester.to_bytes(),
+                partial_cap_bytes: refused_bytes,
+                admission: cap_request_admission(),
+                completion,
+            })
+            .expect("event channel open");
+
+        peer.refresh()
+            .expect("issuer mismatch is an ordinary refusal");
+        assert_eq!(refused_receipt.try_recv(), Ok(false));
+
+        let accepted_bytes = partial_cap_bytes(requester, signing_key.verifying_key());
+        let (completion, mut accepted_receipt) = tokio::sync::oneshot::channel();
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: requester.to_bytes(),
+                partial_cap_bytes: accepted_bytes,
+                admission: cap_request_admission(),
+                completion,
+            })
+            .expect("event channel open");
+
+        peer.refresh()
+            .expect("a later valid request proves the Peer was not poisoned");
+        assert_eq!(accepted_receipt.try_recv(), Ok(true));
+
+        let mut store = peer.store.lock().expect("store mutex");
+        assert_eq!(store.pin_assertion_snapshot().unwrap().len(), 1);
+        let reader = store.reader().expect("memory reader");
+        assert!(
+            reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(refused_handle)
+                .is_err(),
+            "refused claim must not become a closure orphan"
+        );
+    }
+
+    #[test]
+    fn cap_request_exact_replay_is_acknowledged_without_duplicate_assertion() {
+        let signing_key = SigningKey::from_bytes(&[0x16; 32]);
+        let requester = SigningKey::from_bytes(&[0x17; 32]).verifying_key();
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+        let bytes = partial_cap_bytes(requester, signing_key.verifying_key());
+
+        for attempt in 0..2 {
+            let (completion, mut receipt) = tokio::sync::oneshot::channel();
+            wiring
+                .evt_tx
+                .send(NetEvent::CapRequest {
+                    requester: requester.to_bytes(),
+                    partial_cap_bytes: bytes.clone(),
+                    admission: cap_request_admission(),
+                    completion,
+                })
+                .expect("event channel open");
+            peer.refresh().expect("exact request replay is idempotent");
+            assert_eq!(
+                receipt.try_recv(),
+                Ok(true),
+                "attempt {attempt} must receive the durable positive receipt"
+            );
+        }
+
+        let mut store = peer.store.lock().expect("store mutex");
+        assert_eq!(store.pin_assertion_snapshot().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cap_request_admission_refusal_is_negative_without_poisoning_peer() {
+        let signing_key = SigningKey::from_bytes(&[0x18; 32]);
+        let requester = SigningKey::from_bytes(&[0x19; 32]).verifying_key();
+        let other_requester = SigningKey::from_bytes(&[0x1A; 32]).verifying_key();
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+
+        let first = partial_cap_bytes(requester, signing_key.verifying_key());
+        let second = partial_cap_bytes(requester, signing_key.verifying_key());
+        let second_handle = Blob::<SimpleArchive>::new(second.clone()).get_handle();
+        for (bytes, expected) in [(first, true), (second, false)] {
+            let (completion, mut receipt) = tokio::sync::oneshot::channel();
+            wiring
+                .evt_tx
+                .send(NetEvent::CapRequest {
+                    requester: requester.to_bytes(),
+                    partial_cap_bytes: bytes,
+                    admission: cap_request_admission(),
+                    completion,
+                })
+                .expect("event channel open");
+            peer.refresh()
+                .expect("ordinary admission refusal must not fail-stop");
+            assert_eq!(receipt.try_recv(), Ok(expected));
+        }
+
+        let (completion, mut later_receipt) = tokio::sync::oneshot::channel();
+        wiring
+            .evt_tx
+            .send(NetEvent::CapRequest {
+                requester: other_requester.to_bytes(),
+                partial_cap_bytes: partial_cap_bytes(other_requester, signing_key.verifying_key()),
+                admission: cap_request_admission(),
+                completion,
+            })
+            .expect("event channel open");
+        peer.refresh()
+            .expect("a different requester remains admissible after refusal");
+        assert_eq!(later_receipt.try_recv(), Ok(true));
+
+        let mut store = peer.store.lock().expect("store mutex");
+        assert_eq!(store.pin_assertion_snapshot().unwrap().len(), 2);
+        let reader = store.reader().expect("memory reader");
+        assert!(
+            reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(second_handle)
+                .is_err(),
+            "refused alternate request must not be stored"
         );
     }
 

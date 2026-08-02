@@ -29,9 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expiry with a signature-handle tie break. Policy mutations now prospectively
   reduce the complete author ledger before writing anything, flush the exact
   content closure before durably appending its assertion, and return an
-  idempotent receipt. Operation-order tests pin that one-way crash protocol;
-  real-Pile reopen coverage verifies the resulting ledger and both retention
-  descriptors replay as complete content.
+  idempotent receipt. Incoming join requests now use that path end to end:
+  protocol success follows the durable receipt, ordinary policy refusals stay
+  non-fatal, and storage failures fail-stop the peer. Operation-order tests pin
+  that one-way crash protocol; real-Pile reopen coverage verifies the resulting
+  ledger and both retention descriptors replay as complete content.
 - **Branches are a typed adapter over generic asserted pins.** A canonical
   64-byte V2 `BranchPinDescriptor` blob contains its kind marker, canonical
   alignment padding, and LongString name handle. Its content handle is wrapped
