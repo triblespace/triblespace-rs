@@ -4,31 +4,33 @@
 //! team. Capabilities are signed delegations chained from a single
 //! team root keypair; possessing a leaf capability handle authorises
 //! a peer to connect to the team's mesh under the cap's scope.
-//! Eviction is per-issuer non-renewal — there is no team-root
-//! broadcast revocation primitive in the descriptive-caps model.
+//! Grant disablement is an issuer-authored policy fact: it stops local
+//! redispatch and renewal, while the already-issued chain remains valid until
+//! its natural expiry. There is no team-root broadcast revocation primitive
+//! in the descriptive-caps model.
 //!
 //! All commands accept the relevant team artefacts via CLI flags or
 //! environment variables (`TRIBLE_TEAM_ROOT`, `TRIBLE_TEAM_CAP`).
 //! The local pile stores the issued cap blobs so they're retrievable
 //! for verification when peers connect.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::capability;
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::pin_assertion::PinAssertionStore;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::BlobStore;
 use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::repo::BlobStorePut;
+use triblespace_core::repo::capability;
+use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::pin_assertion::PinAssertionStore;
 use triblespace_core::trible::TribleSet;
 
 type PileBlake3 = Pile;
@@ -97,27 +99,30 @@ pub enum Command {
         #[arg(long)]
         author: Option<String>,
     },
-    /// List the renewal-policy entries on the local pile: caps this
-    /// node has issued (or auto-approved) that the daemon is
-    /// keeping renewed. Retracted entries are included with a
-    /// retraction marker.
+    /// List every exact grant in an author's complete asserted policy ledger.
     ListIssued {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
+        /// Policy assertion author (hex). When omitted, exactly one author is
+        /// auto-detected from valid assertions without reading a key file.
+        #[arg(long)]
+        author: Option<String>,
     },
-    /// Stop auto-renewing a specific (subject, scope) entry. The
-    /// corresponding peer's cap chain dies at its next natural
-    /// expiry — no revocation blob propagates anywhere. Pure local
-    /// decision, takes effect on the next daemon tick.
+    /// Disable one exact asserted grant. The selected credential remains
+    /// historical evidence, but is no longer usable or renewable.
     Retract {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
-        /// The renewal-policy entry id to retract (hex, from
-        /// `team list-issued`).
+        /// Full canonical GrantDisabled selector (64 hex chars), from
+        /// `team list-issued`.
         #[arg(long)]
-        entry: String,
+        grant_event: String,
+        /// Policy author's existing signing key path (defaults to the
+        /// conventional location next to the pile). Never generated here.
+        #[arg(long)]
+        key: Option<PathBuf>,
     },
     /// Send an `OP_REQUEST_CAP` to a team admin asking to be issued
     /// a capability. The admin's running daemon records a durable
@@ -245,8 +250,12 @@ pub fn run(cmd: Command) -> Result<()> {
         } => run_invite(pile, team_root, cap, key, invitee, scope, legacy_pins),
         Command::List { pile } => run_list(pile),
         Command::ListPending { pile, author } => run_list_pending(pile, author),
-        Command::ListIssued { pile } => run_list_issued(pile),
-        Command::Retract { pile, entry } => run_retract(pile, entry),
+        Command::ListIssued { pile, author } => run_list_issued(pile, author),
+        Command::Retract {
+            pile,
+            grant_event,
+            key,
+        } => run_retract(pile, grant_event, key),
         Command::RequestJoin {
             pile,
             admin,
@@ -407,6 +416,42 @@ fn resolve_complete_policy_ledger(
     }
 }
 
+/// Publication proves that an event became durable, not that its credential
+/// won deterministic selection or remained live while it was being built.
+/// Commands which immediately expose a freshly issued credential therefore
+/// re-resolve and require that exact pair to be the usable current winner.
+fn require_exact_usable_grant(
+    pile: &mut PileBlake3,
+    author: VerifyingKey,
+    grant: triblespace_net::policy_ledger::GrantIdentity,
+    expected_cap: Inline<Handle<SimpleArchive>>,
+    expected_sig: Inline<Handle<SimpleArchive>>,
+    operation: &str,
+) -> Result<()> {
+    let view = resolve_complete_policy_ledger(pile, author).map_err(|error| {
+        anyhow!(
+            "{operation} was durably published, but its fresh policy view could not be resolved: {error:#}"
+        )
+    })?;
+    let selected = view
+        .grants()
+        .get(&grant)
+        .and_then(|state| state.usable_at(triblespace_net::clock::epoch_now()))
+        .ok_or_else(|| {
+            anyhow!(
+                "{operation} was durably published, but its grant has no selected usable credential"
+            )
+        })?;
+    if selected.cap() != expected_cap || selected.sig() != expected_sig {
+        bail!(
+            "{operation} was durably published, but another credential won selection: cap={}, sig={}",
+            hex::encode(selected.cap().raw),
+            hex::encode(selected.sig().raw)
+        );
+    }
+    Ok(())
+}
+
 fn request_by_event<'a>(
     view: &'a triblespace_net::policy_ledger::PolicyLedgerView,
     request_event: Inline<Handle<SimpleArchive>>,
@@ -474,6 +519,11 @@ fn format_expiry(
         }
         Err(_) => "<malformed>".to_string(),
     }
+}
+
+fn format_epoch(epoch: hifitime::Epoch) -> String {
+    let (y, mo, d, h, mi, s, _ns) = epoch.to_gregorian_utc();
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
 }
 
 fn store_blob(pile: &mut PileBlake3, blob: Blob<SimpleArchive>) -> Result<()> {
@@ -572,11 +622,11 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
     let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
-    with_pile(&pile_path, |pile| {
+    let grant_event = with_pile(&pile_path, |pile| {
         store_blob(pile, anchor_cap_blob)?;
         store_blob(pile, anchor_sig_blob)?;
-        store_blob(pile, cap_blob)?;
-        store_blob(pile, sig_blob)?;
+        store_blob(pile, cap_blob.clone())?;
+        store_blob(pile, sig_blob.clone())?;
 
         triblespace_net::policy::pin_team_credential(
             pile,
@@ -589,18 +639,41 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
         )
         .ok_or_else(|| anyhow!("pin founder credential"))?;
 
-        let policy_entry = triblespace_net::policy::record_policy_entry(
-            pile,
+        // Team creation is the sole local-materialization-before-authority
+        // exception. Retain the operational pair and standalone founder
+        // anchor durably before publishing GrantIssued. A crash in between
+        // leaves an inert orphan pin; it can never make an unasserted
+        // credential operational policy.
+        pile.flush()
+            .map_err(|error| anyhow!("flush founder credential bootstrap: {error:?}"))?;
+
+        let grant = triblespace_net::policy_ledger::GrantIdentity::new(
+            team_root_pubkey,
             founder_key.verifying_key(),
             scope_root,
-            expiry,
+        );
+        let receipt = triblespace_net::policy_ledger::issue_grant(
+            pile,
+            &founder_key,
+            grant,
+            sig_blob,
+            None,
+            [cap_blob],
+        )
+        .map_err(|error| anyhow!("publish founder GrantIssued event: {error}"))?;
+
+        // Publication is not selection. Re-resolve fresh durable truth and
+        // require this exact, still-usable bootstrap credential to win before
+        // returning the team root secret to the operator.
+        require_exact_usable_grant(
+            pile,
+            founder_key.verifying_key(),
+            grant,
             cap_handle,
             sig_handle,
-        )
-        .ok_or_else(|| anyhow!("record founder renewal policy"))?;
-        triblespace_net::policy::mark_policy_delivered(pile, policy_entry)
-            .ok_or_else(|| anyhow!("mark founder credential locally delivered"))?;
-        Ok(())
+            "founder GrantIssued",
+        )?;
+        Ok(receipt.event())
     })?;
 
     println!(
@@ -617,6 +690,7 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     println!("founder cap blob:  {}", hex::encode(cap_handle.raw));
     println!("founder cap (sig): {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
+    println!("GrantIssued event: {}", hex::encode(grant_event.raw));
     println!();
     println!("Set these in your environment to use the team:");
     println!(
@@ -637,7 +711,7 @@ fn run_invite(
     scope: ScopeArg,
     legacy_pins_hex: Vec<String>,
 ) -> Result<()> {
-    let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
+    let issuer_key = load_existing_signing_key(key, &pile_path)?;
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
     let invitee = parse_pubkey_hex(&invitee_hex)?;
@@ -653,7 +727,7 @@ fn run_invite(
         })
         .collect::<Result<_>>()?;
 
-    let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
+    let (sig_handle, expiry, grant_event) = with_pile(&pile_path, |pile| {
         // Verify the issuer's cap chain first — we don't sign
         // delegations off invalid/expired caps. This also confirms
         // the cap blobs are present locally so `fetch_cap_blob_pair`
@@ -739,37 +813,34 @@ fn run_invite(
         .map_err(|e| anyhow!("issued capability chain does not verify: {e:?}"))?;
         drop(verification_reader);
 
-        store_blob(pile, cap_blob)?;
-        store_blob(pile, sig_blob)?;
+        let grant =
+            triblespace_net::policy_ledger::GrantIdentity::new(team_root, invitee, scope_root);
+        let receipt = triblespace_net::policy_ledger::issue_grant(
+            pile,
+            &issuer_key,
+            grant,
+            sig_blob,
+            None,
+            [cap_blob],
+        )
+        .map_err(|error| anyhow!("publish GrantIssued event: {error}"))?;
 
-        // Record on the renewal-policy pin so the running `pile net
-        // sync` daemon's renewal_tick takes over from here: once this
-        // cap nears expiry, the daemon signs a successor and
-        // dispatches via OP_DELIVER_CAP. The invitee experiences the
-        // issuance and every subsequent renewal as the same
-        // OP_DELIVER_CAP event — the first delivery and the daemon's
-        // later renewals are indistinguishable on B's side.
-        let policy_entry = triblespace_net::policy::record_policy_entry(
-            pile, invitee, scope_root, expiry, cap_handle, sig_handle,
-        );
+        require_exact_usable_grant(
+            pile,
+            issuer_key.verifying_key(),
+            grant,
+            cap_handle,
+            sig_handle,
+            "invitee GrantIssued",
+        )?;
 
-        Ok((sig_handle, expiry, policy_entry))
+        Ok((sig_handle, expiry, receipt.event()))
     })?;
 
     println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
-    if let Some(entry_id) = policy_entry {
-        let entry_bytes: [u8; 16] = entry_id.into();
-        println!("renewal entry:     {}", hex::encode(entry_bytes));
-        println!(
-            "  the running sync daemon will auto-renew this cap until you `team retract {}`",
-            hex::encode(entry_bytes)
-        );
-    } else {
-        println!(
-            "(warning: failed to record renewal-policy entry; auto-renewal won't happen for this cap)"
-        );
-    }
+    println!("GrantIssued event: {}", hex::encode(grant_event.raw));
+    println!("the running sync daemon will redispatch and renew this asserted grant");
     println!();
     println!("Share with the invitee:");
     println!("  TRIBLE_TEAM_ROOT={}", hex::encode(team_root.to_bytes()));
@@ -1364,81 +1435,139 @@ fn run_list_pending(pile_path: PathBuf, author_hex: Option<String>) -> Result<()
     Ok(())
 }
 
-/// Print the renewal-policy entries on the local pile: caps this node
-/// is currently auto-renewing, plus any that have been retracted.
-fn run_list_issued(pile_path: PathBuf) -> Result<()> {
-    let entries = with_pile(&pile_path, |pile| {
-        Ok(triblespace_net::policy::list_renewal_policy(pile))
+/// Print every exact grant in one author's complete asserted policy view.
+/// Author selection is intentionally identical to `list-pending`: omission
+/// is safe only when the pile contains exactly one policy-ledger author.
+fn run_list_issued(pile_path: PathBuf, author_hex: Option<String>) -> Result<()> {
+    let resolved = with_pile(&pile_path, |pile| {
+        let author = match author_hex.as_deref() {
+            Some(author) => parse_pubkey_hex(author)?,
+            None => match policy_ledger_authors(pile)?.as_slice() {
+                [] => return Ok(None),
+                [author] => *author,
+                authors => {
+                    let candidates = authors
+                        .iter()
+                        .map(|author| format!("  {}", hex::encode(author.to_bytes())))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    bail!(
+                        "multiple policy-ledger authors are present; rerun with --author and one of:\n{candidates}"
+                    );
+                }
+            },
+        };
+        Ok(Some((
+            author,
+            resolve_complete_policy_ledger(pile, author)?,
+        )))
     })?;
 
-    if entries.is_empty() {
-        println!("(no renewal-policy entries)");
+    let Some((author, view)) = resolved else {
+        println!("(no asserted grants)");
+        return Ok(());
+    };
+    if view.grants().is_empty() {
+        println!(
+            "(no asserted grants for author {})",
+            hex::encode(author.to_bytes())
+        );
         return Ok(());
     }
-    println!("renewal-policy entries:  {}", entries.len());
-    for e in &entries {
-        let id_bytes: [u8; 16] = e.id.into();
-        let scope_bytes: [u8; 16] = e.scope.into();
-        let status = if e.retracted_at.is_some() {
-            "RETRACTED"
-        } else {
-            "ACTIVE"
-        };
-        println!("  entry:      {}  [{status}]", hex::encode(id_bytes));
-        println!("    subject:  {}", hex::encode(e.subject.to_bytes()));
-        println!("    scope:    {}", hex::encode(scope_bytes));
+
+    let now = triblespace_net::clock::epoch_now();
+    println!("policy author:  {}", hex::encode(author.to_bytes()));
+    println!("grants:         {}", view.grants().len());
+    for (&grant, state) in view.grants() {
+        let scope: [u8; 16] = grant.scope_root().into();
+        let selector = triblespace_net::policy_ledger::PolicyEvent::GrantDisabled(grant).handle();
+        println!("  grant-event:  {}", hex::encode(selector.raw));
         println!(
-            "    effective expiry: {}",
-            format_expiry(&e.effective_expiry)
+            "    team-root:  {}",
+            hex::encode(grant.team_root().to_bytes())
         );
-        println!("    cap:      {}", hex::encode(e.latest_cap.raw));
-        println!("    sig:      {}", hex::encode(e.latest_sig.raw));
-        if let Some(r) = &e.retracted_at {
-            println!("    retracted: {}", format_expiry(r));
+        println!(
+            "    subject:    {}",
+            hex::encode(grant.subject().to_bytes())
+        );
+        println!("    scope:      {}", hex::encode(scope));
+        println!("    disabled:   {}", state.disabled());
+        match state.historical_issuance() {
+            triblespace_net::policy_ledger::GrantIssuanceResolution::Unissued => {
+                println!("    issuance:   Unissued");
+            }
+            triblespace_net::policy_ledger::GrantIssuanceResolution::Conflicted { signatures } => {
+                println!("    issuance:   Conflicted");
+                println!("    conflict-sigs:");
+                for signature in signatures {
+                    println!("      - {}", hex::encode(signature.raw));
+                }
+            }
+            triblespace_net::policy_ledger::GrantIssuanceResolution::Current(current) => {
+                println!("    issuance:   Current");
+                println!("    cap:        {}", hex::encode(current.cap().raw));
+                println!("    sig:        {}", hex::encode(current.sig().raw));
+                println!(
+                    "    effective-expiry: {}",
+                    format_epoch(current.effective_expiry())
+                );
+                println!("    authenticated: {}", current.authenticated());
+            }
         }
-        match &e.delivered_at {
-            Some(d) => println!("    delivered: {}", format_expiry(d)),
-            None => println!("    delivered: (not yet)"),
-        }
+        println!("    usable-now: {}", state.usable_at(now).is_some());
         println!();
     }
     Ok(())
 }
 
-/// Mark a renewal-policy entry as retracted. The next daemon tick
-/// will skip it; the corresponding subject's chain dies at its
-/// current cap's natural expiry.
-fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
-    let entry_bytes: [u8; 16] = hex::decode(entry_hex.trim())
-        .map_err(|e| anyhow!("decode entry hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("entry id must be 16 bytes (32 hex chars)"))?;
-    let entry_id =
-        Id::new(entry_bytes).ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
+/// Publish a terminal positive Disable fact selected by the full canonical
+/// event handle printed by `list-issued`. Exact retries remain idempotent in
+/// the asserted writer and return the same event handle.
+fn run_retract(pile_path: PathBuf, grant_event_hex: String, key: Option<PathBuf>) -> Result<()> {
+    let selector = parse_handle_hex(&grant_event_hex)
+        .map_err(|error| anyhow!("invalid --grant-event: {error:#}"))?;
+    let author = load_existing_signing_key(key, &pile_path)?;
 
-    let outcome = with_pile(&pile_path, |pile| {
-        Ok(triblespace_net::policy::retract_policy_entry(
-            pile, entry_id,
-        ))
+    let (event, already_disabled) = with_pile(&pile_path, |pile| {
+        disable_grant_by_selector(pile, &author, selector)
     })?;
 
-    match outcome {
-        Some(()) => {
-            println!(
-                "retracted entry {}",
-                hex::encode(<[u8; 16]>::from(entry_id))
-            );
-            println!(
-                "(the subject's cap chain will die at its current cap's expiry; no revocation propagates)"
-            );
-            Ok(())
-        }
-        None => bail!(
-            "retract failed: entry {} not found, or the renewal-policy pin is missing/locked",
-            hex::encode(<[u8; 16]>::from(entry_id))
-        ),
+    println!("GrantDisabled event: {}", hex::encode(event.raw));
+    if already_disabled {
+        println!("grant was already disabled; exact retry appended no duplicate fact");
+    } else {
+        println!("grant disabled; its credential remains historical but is no longer usable");
     }
+    Ok(())
+}
+
+fn disable_grant_by_selector(
+    pile: &mut PileBlake3,
+    author: &SigningKey,
+    selector: Inline<Handle<SimpleArchive>>,
+) -> Result<(Inline<Handle<SimpleArchive>>, bool)> {
+    let view = resolve_complete_policy_ledger(pile, author.verifying_key())?;
+    let mut matches = view.grants().iter().filter_map(|(&grant, state)| {
+        (triblespace_net::policy_ledger::PolicyEvent::GrantDisabled(grant).handle() == selector)
+            .then_some((grant, state.disabled()))
+    });
+    let (grant, already_disabled) = matches.next().ok_or_else(|| {
+        anyhow!(
+            "GrantDisabled selector {} does not match any grant in this author's complete policy view",
+            hex::encode(selector.raw)
+        )
+    })?;
+    if matches.next().is_some() {
+        bail!(
+            "GrantDisabled selector {} ambiguously matches multiple grants",
+            hex::encode(selector.raw)
+        );
+    }
+    drop(view);
+
+    let receipt = triblespace_net::policy_ledger::disable_grant(pile, author, grant)
+        .map_err(|error| anyhow!("publish GrantDisabled event: {error}"))?;
+    Ok((receipt.event(), already_disabled))
 }
 
 // ── Approve / Request-Join (one-shot iroh-endpoint subcommands) ───────
@@ -1910,6 +2039,131 @@ mod tests {
             assert!(facts.observed());
             assert!(facts.rejected());
             assert!(!facts.is_pending());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn grant_disable_selector_is_exact_and_retraction_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.pile");
+        std::fs::File::create(&path).unwrap();
+        let team_root = SigningKey::from_bytes(&[0x81; 32]);
+        let author = SigningKey::from_bytes(&[0x82; 32]);
+        let other = SigningKey::from_bytes(&[0x83; 32]);
+        let scope_root = *triblespace_core::id::ufoid();
+        let other_scope = *triblespace_core::id::ufoid();
+        let scope_facts = TribleSet::from(entity! {
+            ExclusiveId::force_ref(&scope_root) @
+            triblespace_core::metadata::tag: capability::PERM_ADMIN,
+        });
+        let (anchor_cap, anchor_sig) = capability::build_founder_anchor(
+            &team_root,
+            author.verifying_key(),
+            scope_root,
+            scope_facts.clone(),
+        )
+        .unwrap();
+        let now = triblespace_net::clock::epoch_now();
+        let expiry = (now, now + hifitime::Duration::from_hours(1.0))
+            .try_to_inline()
+            .unwrap();
+        let (cap, sig) = capability::build_capability(
+            &author,
+            author.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope_facts,
+            expiry,
+        )
+        .unwrap();
+        let cap_handle = cap.get_handle();
+        let sig_handle = sig.get_handle();
+        let grant = triblespace_net::policy_ledger::GrantIdentity::new(
+            team_root.verifying_key(),
+            author.verifying_key(),
+            scope_root,
+        );
+        let selector = triblespace_net::policy_ledger::PolicyEvent::GrantDisabled(grant).handle();
+        let selector_hex = hex::encode(selector.raw);
+        assert_eq!(selector_hex.len(), 64);
+        assert_eq!(parse_handle_hex(&selector_hex).unwrap(), selector);
+        assert_ne!(
+            triblespace_net::policy_ledger::PolicyEvent::GrantDisabled(
+                triblespace_net::policy_ledger::GrantIdentity::new(
+                    other.verifying_key(),
+                    author.verifying_key(),
+                    scope_root,
+                )
+            )
+            .handle(),
+            selector
+        );
+        assert_ne!(
+            triblespace_net::policy_ledger::PolicyEvent::GrantDisabled(
+                triblespace_net::policy_ledger::GrantIdentity::new(
+                    team_root.verifying_key(),
+                    other.verifying_key(),
+                    scope_root,
+                )
+            )
+            .handle(),
+            selector
+        );
+        assert_ne!(
+            triblespace_net::policy_ledger::PolicyEvent::GrantDisabled(
+                triblespace_net::policy_ledger::GrantIdentity::new(
+                    team_root.verifying_key(),
+                    author.verifying_key(),
+                    other_scope,
+                )
+            )
+            .handle(),
+            selector
+        );
+
+        with_pile(&path, |pile| {
+            triblespace_net::policy_ledger::issue_grant(
+                pile,
+                &author,
+                grant,
+                sig,
+                None,
+                [anchor_cap, anchor_sig, cap],
+            )
+            .map_err(|error| anyhow!("issue grant: {error}"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        with_pile(&path, |pile| {
+            let (event, already_disabled) = disable_grant_by_selector(pile, &author, selector)?;
+            assert_eq!(event, selector);
+            assert!(!already_disabled);
+            Ok(())
+        })
+        .unwrap();
+        with_pile(&path, |pile| {
+            let (event, already_disabled) = disable_grant_by_selector(pile, &author, selector)?;
+            assert_eq!(event, selector);
+            assert!(already_disabled);
+
+            let view = resolve_complete_policy_ledger(pile, author.verifying_key())?;
+            let state = view.grants().get(&grant).expect("exact grant");
+            assert!(state.disabled());
+            let triblespace_net::policy_ledger::GrantIssuanceResolution::Current(current) =
+                state.historical_issuance()
+            else {
+                panic!("disabled grant must retain historical issuance");
+            };
+            assert_eq!(current.cap(), cap_handle);
+            assert_eq!(current.sig(), sig_handle);
+            assert!(
+                state
+                    .usable_at(triblespace_net::clock::epoch_now())
+                    .is_none()
+            );
             Ok(())
         })
         .unwrap();

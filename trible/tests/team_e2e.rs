@@ -5,9 +5,9 @@
 //! expected on-pile artefacts. The actual network protocol (auth
 //! handshake on connection establishment) is exercised by the
 //! capability lib tests in `triblespace-core::repo::capability`; this
-//! test covers the CLI surface that callers actually use. Eviction
-//! is per-issuer non-renewal (`team retract` / not auto-renewing) and
-//! is exercised by the daemon-side tests.
+//! test covers the CLI surface that callers actually use. `team retract`
+//! publishes an exact issuer-authored disable fact; it does not broadcast a
+//! revocation of the already-issued capability chain.
 
 use assert_cmd::Command;
 use tempfile::tempdir;
@@ -40,6 +40,35 @@ fn parse_invite_output(stdout: &str) -> String {
         }
     }
     panic!("no `issued cap (sig):` line in output");
+}
+
+fn disable_selector_for_subject(stdout: &str, subject: &str) -> String {
+    let mut selector = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("grant-event:") {
+            selector = Some(value.trim().to_string());
+        } else if line
+            .strip_prefix("subject:")
+            .is_some_and(|value| value.trim() == subject)
+        {
+            return selector.take().expect("grant selector precedes subject");
+        }
+    }
+    panic!("no asserted grant for subject {subject} in:\n{stdout}");
+}
+
+fn grant_block_for_subject<'a>(stdout: &'a str, subject: &str) -> &'a str {
+    stdout
+        .split("\n\n")
+        .find(|block| {
+            block.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("subject:")
+                    .is_some_and(|value| value.trim() == subject)
+            })
+        })
+        .unwrap_or_else(|| panic!("no asserted grant for subject {subject} in:\n{stdout}"))
 }
 
 #[test]
@@ -160,12 +189,98 @@ fn team_full_lifecycle() {
         "post-invite lists both PERM_ADMIN (founder) and PERM_READ (invitee); got:\n{list2_out}"
     );
 
-    // No revoke step — eviction in the descriptive-caps model is
-    // per-issuer non-renewal (`team retract`), not a broadcast
-    // revocation blob. The retraction daemon path is exercised in
-    // the capability lib tests.
+    // The issuer ledger is directly inspectable without reading a key file.
+    // Its full canonical disable-event handle composes into `retract`.
+    let issued = Command::cargo_bin("trible")
+        .unwrap()
+        .args(["team", "list-issued", "--pile", pile_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let issued_out = String::from_utf8(issued.get_output().stdout.clone()).unwrap();
+    assert!(
+        issued_out.contains("grants:         2"),
+        "got:\n{issued_out}"
+    );
+    let invitee_selector = disable_selector_for_subject(&issued_out, &invitee_pubkey);
+    assert_eq!(invitee_selector.len(), 64, "selector is a full handle");
+
+    // Retraction is never allowed to mint a replacement author key.
+    let missing_key = dir.path().join("missing-author.key");
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "retract",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--grant-event",
+            &invitee_selector,
+            "--key",
+            missing_key.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    assert!(
+        !missing_key.exists(),
+        "retract must not create an author key"
+    );
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "retract",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--grant-event",
+            &invitee_selector,
+            "--key",
+            founder_key_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let after_retract = Command::cargo_bin("trible")
+        .unwrap()
+        .args(["team", "list-issued", "--pile", pile_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let after_retract_out = String::from_utf8(after_retract.get_output().stdout.clone()).unwrap();
+    let invitee_block = grant_block_for_subject(&after_retract_out, &invitee_pubkey);
+    assert!(
+        invitee_block.contains("disabled:   true"),
+        "{invitee_block}"
+    );
+    assert!(
+        invitee_block.contains("issuance:   Current"),
+        "{invitee_block}"
+    );
+    assert!(
+        invitee_block.contains("usable-now: false"),
+        "{invitee_block}"
+    );
+
+    let repeated = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "retract",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--grant-event",
+            &invitee_selector,
+            "--key",
+            founder_key_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let repeated_out = String::from_utf8(repeated.get_output().stdout.clone()).unwrap();
+    assert!(
+        repeated_out.contains("already disabled"),
+        "exact retry should be idempotent; got:\n{repeated_out}"
+    );
+
     let _ = &team_root_secret;
-    let _ = &invitee_pubkey;
 }
 
 #[test]
