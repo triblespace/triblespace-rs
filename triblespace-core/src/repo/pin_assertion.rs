@@ -55,6 +55,10 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::OnceLock;
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use ed25519::signature::Signer;
 use ed25519::Signature;
@@ -62,6 +66,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hex_literal::hex;
 
 use crate::inline::encodings::hash::Blake3;
+use crate::patch::{Entry, IdentitySchema, PATCH};
 
 /// Number of semantic bytes in a canonical asserted-pin record.
 pub const PIN_ASSERTION_LEN: usize = 192;
@@ -205,6 +210,15 @@ impl PinAssertion {
         }
     }
 
+    /// Decode the fixed semantic bytes and verify their signature strictly.
+    ///
+    /// Persisted replay has a separate crate-private structural path so it can
+    /// defer public-key work. Raw bytes entering through the public API become
+    /// usable claims only through this verified constructor.
+    pub fn decode_verified(bytes: [u8; PIN_ASSERTION_LEN]) -> Result<Self, PinAssertionError> {
+        UnverifiedPinAssertion::decode_structural(bytes)?.verify_strict()
+    }
+
     pub fn encode(&self) -> [u8; PIN_ASSERTION_LEN] {
         let mut bytes = [0u8; PIN_ASSERTION_LEN];
         bytes[AUTHOR_RANGE].copy_from_slice(&self.identity.author);
@@ -244,7 +258,7 @@ impl PinAssertion {
 /// [`PinAssertion`] remaining the only verified currency — not in withholding
 /// the accessors, which would make the demand-driven design unimplementable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnverifiedPinAssertion {
+pub(crate) struct UnverifiedPinAssertion {
     identity: PinIdentity,
     value: ValueHandle,
     label: SubsumptionLabel,
@@ -255,27 +269,24 @@ impl UnverifiedPinAssertion {
     /// Decode without Ed25519 verification. A malformed author key stays a
     /// *structural* error: bad framing means later offsets are untrustworthy,
     /// whereas a bad signature is a datum this layer may carry.
-    pub fn decode_structural(
+    pub(crate) fn decode_structural(
         bytes: [u8; PIN_ASSERTION_LEN],
     ) -> Result<Self, PinAssertionError> {
         let author_bytes: [u8; 32] = bytes[AUTHOR_RANGE].try_into().unwrap();
         let author = VerifyingKey::from_bytes(&author_bytes)
             .map_err(|_| PinAssertionError::InvalidAuthorKey)?;
         Ok(Self {
-            identity: PinIdentity::new(
-                author,
-                PinHandle(bytes[PIN_RANGE].try_into().unwrap()),
-            ),
+            identity: PinIdentity::new(author, PinHandle(bytes[PIN_RANGE].try_into().unwrap())),
             value: ValueHandle(bytes[VALUE_RANGE].try_into().unwrap()),
             label: SubsumptionLabel(bytes[LABEL_RANGE].try_into().unwrap()),
             signature: bytes[SIGNATURE_RANGE].try_into().unwrap(),
         })
     }
 
-    pub fn claimed_identity(self) -> PinIdentity {
+    pub(crate) fn claimed_identity(self) -> PinIdentity {
         self.identity
     }
-    pub fn claimed_value(self) -> ValueHandle {
+    pub(crate) fn claimed_value(self) -> ValueHandle {
         self.value
     }
     /// The label is claimed like everything else.
@@ -291,11 +302,11 @@ impl UnverifiedPinAssertion {
     ///
     /// The label is inside the signature, so nobody but the author can set it,
     /// and the damage is confined to that author's own register.
-    pub fn claimed_label(self) -> SubsumptionLabel {
+    pub(crate) fn claimed_label(self) -> SubsumptionLabel {
         self.label
     }
 
-    pub fn encode(self) -> [u8; PIN_ASSERTION_LEN] {
+    pub(crate) fn encode(self) -> [u8; PIN_ASSERTION_LEN] {
         let mut bytes = [0u8; PIN_ASSERTION_LEN];
         bytes[AUTHOR_RANGE].copy_from_slice(&self.identity.author);
         bytes[PIN_RANGE].copy_from_slice(&self.identity.pin.0);
@@ -305,11 +316,14 @@ impl UnverifiedPinAssertion {
         bytes
     }
 
-    pub fn id(self) -> PinAssertionId {
+    pub(crate) fn id(self) -> PinAssertionId {
         PinAssertionId(Blake3::digest(&self.encode()))
     }
 
-    pub fn verify_strict(self) -> Result<PinAssertion, PinAssertionError> {
+    pub(crate) fn verify_strict(self) -> Result<PinAssertion, PinAssertionError> {
+        #[cfg(test)]
+        SIGNATURE_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+
         let author = self.identity.author();
         let signature = Signature::from_bytes(&self.signature);
         let message = signed_message(
@@ -339,6 +353,21 @@ impl From<PinAssertion> for UnverifiedPinAssertion {
             signature: a.signature,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SIGNATURE_VERIFICATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_signature_verification_count() {
+    SIGNATURE_VERIFICATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn signature_verification_count() -> usize {
+    SIGNATURE_VERIFICATIONS.with(Cell::get)
 }
 
 fn signed_message(
@@ -377,6 +406,270 @@ impl fmt::Display for PinAssertionError {
 
 impl Error for PinAssertionError {}
 
+/// A practically impossible mismatch between a 64-byte snapshot key and its
+/// exact canonical witness.
+///
+/// PATCH equality and hashing deliberately concern keys only, so the wrapper
+/// still compares values before accepting a duplicate or union. The identity
+/// prefix is a full Blake3 digest and the suffix is the assertion's full
+/// Blake3 content id; this error therefore represents a cryptographic
+/// collision rather than an ordinary conflict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinAssertionKeyCollision;
+
+impl fmt::Display for PinAssertionKeyCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "two different pin assertions have the same snapshot key")
+    }
+}
+
+impl Error for PinAssertionKeyCollision {}
+
+/// Opaque grow-only snapshot of asserted-pin witnesses.
+///
+/// The inner PATCH is private so callers cannot forge a mismatched key, remove
+/// a claim, or introduce arrival-order semantics. Replay may insert a
+/// structurally decoded witness without checking its signature; public
+/// iteration and typed views verify lazily and memoize both success and
+/// failure. Descriptor and value content remain opaque and need not be present
+/// locally.
+#[derive(Clone, Debug, Default)]
+pub struct PinAssertionSnapshot {
+    assertions: PATCH<PIN_INDEX_KEY_LEN, IdentitySchema, PinAssertionWitness>,
+}
+
+/// One structurally valid persisted witness and its memoized semantic result.
+///
+/// This remains crate-private: only a verified [`PinAssertion`] may cross the
+/// public assertion boundary. Typed resolvers may inspect claimed fields while
+/// building an optimistic view, but must authenticate every surviving claim
+/// before exposing it.
+#[derive(Clone, Debug)]
+pub(crate) struct PinAssertionWitness {
+    unverified: UnverifiedPinAssertion,
+    verified: OnceLock<Result<Box<PinAssertion>, PinAssertionError>>,
+}
+
+impl PartialEq for PinAssertionWitness {
+    fn eq(&self, other: &Self) -> bool {
+        self.unverified == other.unverified
+    }
+}
+
+impl Eq for PinAssertionWitness {}
+
+impl PinAssertionWitness {
+    fn from_verified(assertion: PinAssertion) -> Self {
+        Self {
+            unverified: assertion.into(),
+            verified: OnceLock::from(Ok(Box::new(assertion))),
+        }
+    }
+
+    fn from_unverified(unverified: UnverifiedPinAssertion) -> Self {
+        Self {
+            unverified,
+            verified: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn id(&self) -> PinAssertionId {
+        self.unverified.id()
+    }
+
+    pub(crate) fn claimed_value(&self) -> ValueHandle {
+        self.unverified.claimed_value()
+    }
+
+    pub(crate) fn claimed_label(&self) -> SubsumptionLabel {
+        self.unverified.claimed_label()
+    }
+
+    pub(crate) fn verified(&self) -> Result<&PinAssertion, PinAssertionError> {
+        match self
+            .verified
+            .get_or_init(|| self.unverified.verify_strict().map(Box::new))
+        {
+            Ok(assertion) => Ok(assertion.as_ref()),
+            Err(error) => Err(*error),
+        }
+    }
+}
+
+impl PartialEq for PinAssertionSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        if self.assertions.len() != other.assertions.len() {
+            return false;
+        }
+        self.assertions
+            .iter_ordered()
+            .all(|key| self.assertions.get(key) == other.assertions.get(key))
+    }
+}
+
+impl Eq for PinAssertionSnapshot {}
+
+impl PinAssertionSnapshot {
+    /// Create an empty asserted-pin snapshot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert one verified assertion. Re-insertion is an idempotent success.
+    pub fn insert(&mut self, assertion: PinAssertion) -> Result<(), PinAssertionKeyCollision> {
+        self.insert_witness(PinAssertionWitness::from_verified(assertion))
+    }
+
+    /// Insert one structurally decoded persisted witness without verifying its
+    /// signature. This path is reserved for exact replay.
+    pub(crate) fn insert_unverified(
+        &mut self,
+        assertion: UnverifiedPinAssertion,
+    ) -> Result<(), PinAssertionKeyCollision> {
+        self.insert_witness(PinAssertionWitness::from_unverified(assertion))
+    }
+
+    fn insert_witness(
+        &mut self,
+        witness: PinAssertionWitness,
+    ) -> Result<(), PinAssertionKeyCollision> {
+        let key = witness_index_key(&witness.unverified);
+        if let Some(existing) = self.assertions.get(&key) {
+            if existing != &witness {
+                return Err(PinAssertionKeyCollision);
+            }
+            return Ok(());
+        }
+        self.assertions.insert(&Entry::with_value(&key, witness));
+        Ok(())
+    }
+
+    /// Check exact membership while still surfacing an index-key collision.
+    pub(crate) fn contains(
+        &self,
+        assertion: &PinAssertion,
+    ) -> Result<bool, PinAssertionKeyCollision> {
+        let witness = PinAssertionWitness::from_verified(*assertion);
+        match self.assertions.get(&assertion.index_key()) {
+            Some(existing) if existing == &witness => Ok(true),
+            Some(_) => Err(PinAssertionKeyCollision),
+            None => Ok(false),
+        }
+    }
+
+    /// Union another grow-only snapshot into this one.
+    pub fn union(&mut self, other: Self) -> Result<(), PinAssertionKeyCollision> {
+        for key in other.assertions.iter_ordered() {
+            let witness = other
+                .assertions
+                .get(key)
+                .expect("a key yielded by PATCH resolves in the same snapshot");
+            if let Some(existing) = self.assertions.get(key) {
+                if existing != witness {
+                    return Err(PinAssertionKeyCollision);
+                }
+            }
+        }
+        self.assertions.union(other.assertions);
+        Ok(())
+    }
+
+    /// Number of distinct canonical assertion witnesses.
+    pub fn len(&self) -> usize {
+        self.assertions.len() as usize
+    }
+
+    /// Whether this snapshot contains no witnesses.
+    pub fn is_empty(&self) -> bool {
+        self.assertions.is_empty()
+    }
+
+    /// Iterate every valid assertion in canonical snapshot-key order.
+    ///
+    /// Invalid signatures remain stored but are omitted from the public view.
+    /// Each verification result is memoized in its witness.
+    pub fn iter(&self) -> impl Iterator<Item = &PinAssertion> {
+        self.assertions.iter_ordered().filter_map(|key| {
+            let witness = self
+                .assertions
+                .get(key)
+                .expect("a key yielded by PATCH resolves in the same snapshot");
+            witness.verified().ok()
+        })
+    }
+
+    /// Return every valid assertion for one exact `(author, descriptor)` pair.
+    ///
+    /// The full identity digest narrows the prefix scan. The complete identity
+    /// is then compared so even a forced digest collision cannot merge pins.
+    pub fn for_pin(&self, identity: &PinIdentity) -> Vec<PinAssertion> {
+        self.witnesses_for_pin(identity)
+            .into_iter()
+            .filter_map(|witness| witness.verified().ok().copied())
+            .collect()
+    }
+
+    /// Return structural witnesses for one exact identity. Typed resolvers use
+    /// this to build an optimistic view and authenticate only surviving claims.
+    pub(crate) fn witnesses_for_pin(&self, identity: &PinIdentity) -> Vec<&PinAssertionWitness> {
+        let digest = identity.digest();
+        let mut assertions = Vec::new();
+        self.assertions
+            .infixes::<32, 32, _>(&digest, |assertion_id| {
+                let mut key = [0u8; PIN_INDEX_KEY_LEN];
+                key[..32].copy_from_slice(&digest);
+                key[32..].copy_from_slice(assertion_id);
+                let assertion = self
+                    .assertions
+                    .get(&key)
+                    .expect("a suffix yielded by PATCH resolves in the same snapshot");
+                if assertion.unverified.claimed_identity() == *identity {
+                    assertions.push(assertion);
+                }
+            });
+        assertions
+    }
+
+    #[cfg(test)]
+    fn insert_with_identity_digest_for_test(&mut self, digest: [u8; 32], assertion: PinAssertion) {
+        let witness = PinAssertionWitness::from_verified(assertion);
+        let mut key = [0u8; PIN_INDEX_KEY_LEN];
+        key[..32].copy_from_slice(&digest);
+        key[32..].copy_from_slice(&assertion.id().raw());
+        self.assertions.insert(&Entry::with_value(&key, witness));
+    }
+}
+
+fn witness_index_key(assertion: &UnverifiedPinAssertion) -> [u8; PIN_INDEX_KEY_LEN] {
+    let mut key = [0u8; PIN_INDEX_KEY_LEN];
+    key[..32].copy_from_slice(&assertion.claimed_identity().digest());
+    key[32..].copy_from_slice(&assertion.id().raw());
+    key
+}
+
+/// Storage surface for the shared grow-only asserted-pin layer.
+///
+/// Duplicate append is success. There is deliberately no update, delete,
+/// tombstone, compare-and-swap, scalar-head, or kind-specific operation.
+/// Implementations preserve every accepted assertion even when its descriptor
+/// is absent or its kind is unknown.
+///
+/// Signature verification identifies an author; it is not authorization. A
+/// replication ingest boundary must restrict accepted authors and pin kinds
+/// before calling [`Self::append_pin_assertion`], or an attacker can consume
+/// unbounded durable storage with perfectly valid signatures. Overload must be
+/// an explicit refusal—never silent eviction of an assertion already accepted.
+pub trait PinAssertionStore {
+    /// Storage or validation error.
+    type Error: Error + fmt::Debug + Send + Sync + 'static;
+
+    /// Return one coherent snapshot of all persisted assertion witnesses.
+    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error>;
+
+    /// Durably append one verified assertion. Duplicate append is success.
+    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +688,14 @@ mod tests {
         SubsumptionLabel::from_raw([b; 32])
     }
 
+    fn snapshot(assertions: &[PinAssertion]) -> PinAssertionSnapshot {
+        let mut snapshot = PinAssertionSnapshot::new();
+        for assertion in assertions {
+            snapshot.insert(*assertion).unwrap();
+        }
+        snapshot
+    }
+
     #[test]
     fn record_is_192_bytes_and_fits_a_256_byte_v3_record() {
         assert_eq!(PIN_ASSERTION_LEN, 32 + 32 + 32 + 32 + 64);
@@ -408,21 +709,14 @@ mod tests {
     fn every_one_of_the_192_bytes_is_authenticated_including_the_label() {
         let a = PinAssertion::sign(&key(7), pin(11), val(19), label(3));
         let encoded = a.encode();
-        assert_eq!(
-            UnverifiedPinAssertion::decode_structural(encoded)
-                .unwrap()
-                .verify_strict()
-                .unwrap(),
-            a
-        );
+        assert_eq!(PinAssertion::decode_verified(encoded).unwrap(), a);
         for i in 0..PIN_ASSERTION_LEN {
             let mut bad = encoded;
             bad[i] ^= 1;
-            let rejected = match UnverifiedPinAssertion::decode_structural(bad) {
-                Err(_) => true,
-                Ok(u) => u.verify_strict().is_err(),
-            };
-            assert!(rejected, "byte {i} was not authenticated");
+            assert!(
+                PinAssertion::decode_verified(bad).is_err(),
+                "byte {i} was not authenticated"
+            );
         }
     }
 
@@ -431,10 +725,7 @@ mod tests {
         let a = PinAssertion::sign(&key(7), pin(11), val(19), label(1));
         let mut forged = a.encode();
         forged[LABEL_RANGE].copy_from_slice(&label(9).raw());
-        assert!(UnverifiedPinAssertion::decode_structural(forged)
-            .unwrap()
-            .verify_strict()
-            .is_err());
+        assert!(PinAssertion::decode_verified(forged).is_err());
     }
 
     /// The label exposes ordering and nothing else. A resolver that has proven
@@ -454,12 +745,19 @@ mod tests {
     #[test]
     fn a_constant_label_ties_and_a_tie_would_license_a_skip() {
         let flat = SubsumptionLabel::from_raw([0u8; 32]);
-        assert!(flat >= flat, "ties satisfy >=, which is why no sentinel exists");
+        assert!(
+            flat >= flat,
+            "ties satisfy >=, which is why no sentinel exists"
+        );
         // Equal labels rule out STRICT ancestry only between distinct values,
         // so identical values must be grouped before any comparison is made.
         let a = PinAssertion::sign(&key(7), pin(1), val(2), flat);
         let b = PinAssertion::sign(&key(7), pin(1), val(2), flat);
-        assert_eq!(a.id(), b.id(), "identical values dedupe rather than compare");
+        assert_eq!(
+            a.id(),
+            b.id(),
+            "identical values dedupe rather than compare"
+        );
     }
 
     #[test]
@@ -491,5 +789,125 @@ mod tests {
         assert_eq!(a.encode(), b.encode());
         assert_eq!(a.id(), b.id());
         assert_eq!(a.index_key(), b.index_key());
+    }
+
+    #[test]
+    fn snapshot_insertion_is_idempotent_and_checks_the_full_witness() {
+        let a = PinAssertion::sign(&key(1), pin(2), val(3), label(4));
+        let mut assertions = PinAssertionSnapshot::new();
+
+        assertions.insert(a).unwrap();
+        assertions.insert(a).unwrap();
+
+        assert_eq!(assertions.len(), 1);
+        assert!(assertions.contains(&a).unwrap());
+
+        // The public API cannot construct this state. Force it here to prove
+        // that a matching PATCH key is not silently treated as equal when its
+        // attached canonical witness differs.
+        let b = PinAssertion::sign(&key(5), pin(6), val(7), label(8));
+        let mut forged = PinAssertionSnapshot::new();
+        forged.assertions.insert(&Entry::with_value(
+            &a.index_key(),
+            PinAssertionWitness::from_verified(b),
+        ));
+        assert_eq!(forged.insert(a), Err(PinAssertionKeyCollision));
+        assert_eq!(forged.contains(&a), Err(PinAssertionKeyCollision));
+    }
+
+    #[test]
+    fn snapshot_union_is_commutative_associative_and_idempotent() {
+        let a = PinAssertion::sign(&key(1), pin(1), val(1), label(1));
+        let b = PinAssertion::sign(&key(2), pin(2), val(2), label(2));
+        let c = PinAssertion::sign(&key(3), pin(3), val(3), label(3));
+
+        let mut ab = snapshot(&[a]);
+        ab.union(snapshot(&[b])).unwrap();
+        let mut ba = snapshot(&[b]);
+        ba.union(snapshot(&[a])).unwrap();
+        assert_eq!(ab, ba, "union must be commutative");
+
+        let mut a_bc = snapshot(&[b]);
+        a_bc.union(snapshot(&[c])).unwrap();
+        let mut left = snapshot(&[a]);
+        left.union(a_bc).unwrap();
+
+        let mut ab_c = snapshot(&[a]);
+        ab_c.union(snapshot(&[b])).unwrap();
+        ab_c.union(snapshot(&[c])).unwrap();
+        assert_eq!(left, ab_c, "union must be associative");
+
+        let before = left.clone();
+        left.union(before.clone()).unwrap();
+        assert_eq!(left, before, "union must be idempotent");
+    }
+
+    #[test]
+    fn exact_pin_selection_uses_author_and_descriptor() {
+        let wanted_a = PinAssertion::sign(&key(1), pin(9), val(1), label(1));
+        let wanted_b = PinAssertion::sign(&key(1), pin(9), val(2), label(2));
+        let other_author = PinAssertion::sign(&key(2), pin(9), val(3), label(3));
+        let other_descriptor = PinAssertion::sign(&key(1), pin(8), val(4), label(4));
+        let assertions = snapshot(&[wanted_a, wanted_b, other_author, other_descriptor]);
+
+        let identity = PinIdentity::new(key(1).verifying_key(), pin(9));
+        let mut selected = assertions
+            .for_pin(&identity)
+            .into_iter()
+            .map(|assertion| assertion.id())
+            .collect::<Vec<_>>();
+        selected.sort();
+        let mut expected = vec![wanted_a.id(), wanted_b.id()];
+        expected.sort();
+
+        assert_eq!(selected, expected);
+        assert_eq!(assertions.iter().count(), 4);
+    }
+
+    #[test]
+    fn pin_index_uses_full_identity_digest_and_rechecks_exact_identity() {
+        let wanted = PinAssertion::sign(&key(1), pin(9), val(1), label(1));
+        let foreign = PinAssertion::sign(&key(2), pin(9), val(2), label(2));
+        let identity = *wanted.identity();
+        let key = wanted.index_key();
+        assert_eq!(&key[..32], &identity.digest());
+        assert_eq!(&key[32..], &wanted.id().raw());
+
+        let mut assertions = snapshot(&[wanted]);
+        assertions.insert_with_identity_digest_for_test(identity.digest(), foreign);
+
+        assert_eq!(assertions.for_pin(&identity), vec![wanted]);
+        assert_eq!(assertions.len(), 2, "the foreign witness is preserved");
+    }
+
+    #[test]
+    fn invalid_persisted_signature_is_hidden_and_verified_only_once() {
+        let valid = PinAssertion::sign(&key(7), pin(11), val(19), label(4));
+        let identity = *valid.identity();
+        let mut encoded = valid.encode();
+        encoded[SIGNATURE_RANGE.start] ^= 1;
+        let invalid = UnverifiedPinAssertion::decode_structural(encoded).unwrap();
+
+        reset_signature_verification_count();
+        let mut assertions = PinAssertionSnapshot::new();
+        assertions.insert_unverified(invalid).unwrap();
+        assert_eq!(signature_verification_count(), 0, "replay stays lazy");
+        assert_eq!(assertions.len(), 1, "the exact witness is preserved");
+        let witnesses = assertions.witnesses_for_pin(&identity);
+        assert_eq!(witnesses.len(), 1);
+        assert_eq!(witnesses[0].id(), invalid.id());
+        assert_eq!(witnesses[0].claimed_value(), valid.value());
+        assert_eq!(witnesses[0].claimed_label(), valid.label());
+        assert_eq!(signature_verification_count(), 0, "claimed reads stay lazy");
+
+        assert_eq!(assertions.iter().count(), 0);
+        assert_eq!(signature_verification_count(), 1);
+        assert!(assertions.for_pin(&identity).is_empty());
+        assert_eq!(assertions.iter().count(), 0);
+        assert_eq!(
+            signature_verification_count(),
+            1,
+            "both failure and success must be memoized"
+        );
     }
 }
