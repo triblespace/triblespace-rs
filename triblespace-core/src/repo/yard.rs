@@ -1622,6 +1622,43 @@ mod tests {
     }
 
     #[test]
+    fn strong_descriptor_never_promotes_an_opaque_label_handle() {
+        let (_dir, mut yard) = yard_with(
+            1,
+            YardConfig {
+                want_budget: 0,
+                ..YardConfig::default()
+            },
+        );
+        let inner = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"typed descriptor".to_vec()))
+            .unwrap();
+        yard.put::<StrongPinDescriptor, _>(StrongPinDescriptor::blob(inner))
+            .unwrap();
+        let value = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"hard range core".to_vec()))
+            .unwrap();
+        let label = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"unowned artifact node".to_vec()))
+            .unwrap();
+        let assertion = PinAssertion::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            StrongPinDescriptor::pin_handle(inner),
+            ValueHandle::from_raw(value.raw),
+            SubsumptionLabel::from_raw(label.raw),
+        );
+        yard.append_pin_assertion(assertion).unwrap();
+
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+        assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(value).is_ok());
+        assert!(matches!(
+            reader.get::<Blob<UnknownBlob>, UnknownBlob>(label),
+            Err(YardGetError::NotFound)
+        ));
+    }
+
+    #[test]
     fn weak_pin_on_strong_outer_cuts_the_whole_asserted_closure() {
         let (_dir, mut yard) = yard_with(
             1,
