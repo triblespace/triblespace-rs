@@ -26,7 +26,8 @@ use hex_literal::hex;
 
 use super::branch_pin::{BranchIdentity, BranchPinDescriptor};
 use super::pin_assertion::{
-    PinAssertion, PinAssertionSnapshot, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle,
+    PinAssertion, PinAssertionId, PinAssertionSnapshot, PinAssertionStore, PinHandle, PinIdentity,
+    SubsumptionLabel, ValueHandle,
 };
 use super::strong_pin::StrongPinDescriptor;
 use crate::blob::encodings::longstring::LongString;
@@ -38,6 +39,7 @@ use crate::inline::encodings::hash::{Blake3, Handle};
 use crate::inline::Inline;
 use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};
+use crate::repo::{BlobStorePut, StorageFlush};
 use crate::trible::Fragment;
 
 /// Canonical byte length of a V1 rollup-pin descriptor.
@@ -272,6 +274,112 @@ pub fn sign_rollup_record(
     )
 }
 
+/// Failure while publishing one durable rollup alternative.
+///
+/// Descriptor uploads are distinguished because either may fail before the
+/// durability barrier. Once the barrier succeeds, the assertion append is the
+/// only remaining fallible operation and is itself durable on success.
+#[derive(Debug)]
+pub enum PublishRollupRecordError<PutError, FlushError, AssertionError> {
+    /// Storing the typed inner [`RollupPinDescriptor`] failed.
+    RollupDescriptorPut(PutError),
+    /// Storing the outer [`StrongPinDescriptor`] failed.
+    StrongDescriptorPut(PutError),
+    /// Making both descriptors durable failed.
+    StorageFlush(FlushError),
+    /// Durably appending the signed rollup assertion failed.
+    AssertionStore(AssertionError),
+}
+
+impl<PutError, FlushError, AssertionError> fmt::Display
+    for PublishRollupRecordError<PutError, FlushError, AssertionError>
+where
+    PutError: fmt::Display,
+    FlushError: fmt::Display,
+    AssertionError: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RollupDescriptorPut(error) => {
+                write!(f, "failed to store rollup pin descriptor: {error}")
+            }
+            Self::StrongDescriptorPut(error) => {
+                write!(f, "failed to store strong pin descriptor: {error}")
+            }
+            Self::StorageFlush(error) => {
+                write!(f, "failed to make rollup descriptors durable: {error}")
+            }
+            Self::AssertionStore(error) => {
+                write!(f, "failed to append rollup assertion: {error}")
+            }
+        }
+    }
+}
+
+impl<PutError, FlushError, AssertionError> Error
+    for PublishRollupRecordError<PutError, FlushError, AssertionError>
+where
+    PutError: Error + 'static,
+    FlushError: Error + 'static,
+    AssertionError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RollupDescriptorPut(error) | Self::StrongDescriptorPut(error) => Some(error),
+            Self::StorageFlush(error) => Some(error),
+            Self::AssertionStore(error) => Some(error),
+        }
+    }
+}
+
+/// Publish one rollup alternative after its pin descriptors are durable.
+///
+/// The range core and artifact node must already have been stored by the
+/// caller. Publication stages the deterministic typed descriptor and its
+/// strong-retention wrapper, crosses one durability barrier, then appends the
+/// single signed `(range core, artifact node)` assertion. It writes no weak pin
+/// and maintains no repair or replacement state.
+pub fn publish_rollup_record<Storage>(
+    storage: &mut Storage,
+    key: &SigningKey,
+    source_name: Inline<Handle<LongString>>,
+    recipe: Id,
+    record: RollupRecord,
+) -> Result<
+    PinAssertionId,
+    PublishRollupRecordError<
+        <Storage as BlobStorePut>::PutError,
+        <Storage as StorageFlush>::Error,
+        <Storage as PinAssertionStore>::Error,
+    >,
+>
+where
+    Storage: BlobStorePut + StorageFlush + PinAssertionStore,
+{
+    storage
+        .put::<RollupPinDescriptor, _>(RollupPinDescriptor::blob(source_name, recipe))
+        .map_err(PublishRollupRecordError::RollupDescriptorPut)?;
+    storage
+        .put::<StrongPinDescriptor, _>(RollupPinDescriptor::strong_blob(source_name, recipe))
+        .map_err(PublishRollupRecordError::StrongDescriptorPut)?;
+    storage
+        .flush()
+        .map_err(PublishRollupRecordError::StorageFlush)?;
+
+    let assertion = sign_rollup_record(
+        key,
+        source_name,
+        recipe,
+        record.range_record(),
+        record.node(),
+    );
+    let assertion_id = assertion.id();
+    storage
+        .append_pin_assertion(assertion)
+        .map_err(PublishRollupRecordError::AssertionStore)?;
+    Ok(assertion_id)
+}
+
 /// Project one source branch and recipe's exact rollup-alternative set.
 ///
 /// Exact duplicate pairs are deduplicated. The same range core paired with two
@@ -300,7 +408,81 @@ pub fn rollup_records_in_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use std::any::TypeId;
+    use std::convert::Infallible;
+
     use super::*;
+    use crate::blob::IntoBlob;
+    use crate::inline::InlineEncoding;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PublishEvent {
+        PutRollupDescriptor([u8; 32]),
+        PutStrongDescriptor([u8; 32]),
+        Flush,
+        AppendAssertion(PinAssertion),
+    }
+
+    struct PublishProbe {
+        events: Vec<PublishEvent>,
+        assertions: PinAssertionSnapshot,
+    }
+
+    impl PublishProbe {
+        fn new() -> Self {
+            Self {
+                events: Vec::new(),
+                assertions: PinAssertionSnapshot::new(),
+            }
+        }
+    }
+
+    impl BlobStorePut for PublishProbe {
+        type PutError = Infallible;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            let handle = item.to_blob().get_handle();
+            let event = if TypeId::of::<S>() == TypeId::of::<RollupPinDescriptor>() {
+                PublishEvent::PutRollupDescriptor(handle.raw)
+            } else if TypeId::of::<S>() == TypeId::of::<StrongPinDescriptor>() {
+                PublishEvent::PutStrongDescriptor(handle.raw)
+            } else {
+                panic!("publication wrote an unexpected blob encoding")
+            };
+            self.events.push(event);
+            Ok(handle)
+        }
+    }
+
+    impl StorageFlush for PublishProbe {
+        type Error = Infallible;
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.events.push(PublishEvent::Flush);
+            Ok(())
+        }
+    }
+
+    impl PinAssertionStore for PublishProbe {
+        type Error = Infallible;
+
+        fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+            Ok(self.assertions.clone())
+        }
+
+        fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+            self.events.push(PublishEvent::AppendAssertion(assertion));
+            self.assertions
+                .insert(assertion)
+                .expect("one valid test assertion cannot collide");
+            Ok(())
+        }
+    }
 
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
@@ -316,6 +498,47 @@ mod tests {
 
     fn record(byte: u8) -> Inline<Handle<SimpleArchive>> {
         Inline::new([byte; 32])
+    }
+
+    #[test]
+    fn publication_flushes_both_descriptors_before_the_projectable_assertion() {
+        let author = key(1);
+        let source_name = name(3);
+        let source = BranchIdentity::new(author.verifying_key(), source_name);
+        let recipe_id = recipe(5);
+        let rollup = RollupRecord::new(record(7), record(11));
+        let expected_assertion = sign_rollup_record(
+            &author,
+            source_name,
+            recipe_id,
+            rollup.range_record(),
+            rollup.node(),
+        );
+        let mut probe = PublishProbe::new();
+
+        let assertion_id =
+            publish_rollup_record(&mut probe, &author, source_name, recipe_id, rollup).unwrap();
+
+        assert_eq!(assertion_id, expected_assertion.id());
+        assert_eq!(
+            probe.events,
+            vec![
+                PublishEvent::PutRollupDescriptor(
+                    RollupPinDescriptor::descriptor_handle(source_name, recipe_id).raw,
+                ),
+                PublishEvent::PutStrongDescriptor(
+                    RollupPinDescriptor::strong_blob(source_name, recipe_id)
+                        .get_handle()
+                        .raw,
+                ),
+                PublishEvent::Flush,
+                PublishEvent::AppendAssertion(expected_assertion),
+            ]
+        );
+        assert_eq!(
+            rollup_records_in_snapshot(&probe.assertions, &source, recipe_id),
+            BTreeSet::from([rollup])
+        );
     }
 
     #[test]
