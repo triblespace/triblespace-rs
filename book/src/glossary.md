@@ -38,8 +38,11 @@ authenticates an author but is not by itself an admission policy.
 
 ### Branch Pin
 The typed branch adapter over an [asserted pin](#asserted-pin). A canonical
-`BranchPinDescriptor` blob contains a branch-kind marker and the
-content-addressed branch-name handle; its own handle is the generic pin handle.
+V2 `BranchPinDescriptor` blob contains a branch-kind marker, canonical padding,
+and the aligned content-addressed branch-name handle. A
+`StrongPinDescriptor` wraps its exact handle, and the outer handle is the
+generic pin handle. The outer descriptor contributes only hard-retention
+semantics; the branch adapter still owns value and label meaning.
 The asserted value is a commit and the label is a `BranchRank`, built
 inductively so every descendant is strictly greater than its parents. Rank can
 skip an impossible ancestry comparison but can never prove domination.
@@ -157,7 +160,7 @@ is a subset of the parent's; the verifier enforces this via `scope_subsumes`
 during chain walk. The current `scope_branch` value belongs to the legacy HEAD
 transport; exact asserted-pin ingest still needs an `(author key, descriptor
 handle)` scope representation, with branch presentation recovered through a
-canonical `BranchPinDescriptor`.
+canonical strong wrapper and `BranchPinDescriptor`.
 
 ### Team Root
 The single immutable keypair that anchors a triblespace network's

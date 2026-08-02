@@ -10,6 +10,7 @@ use triblespace_core::repo::branch_pin::{
 };
 use triblespace_core::repo::pile::{Pile, PileRecordContent, PileRecords};
 use triblespace_core::repo::pin_assertion::PinAssertionStore;
+use triblespace_core::repo::strong_pin::StrongPinDescriptor;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, Repository};
 use triblespace_core::trible::TribleSet;
 
@@ -56,6 +57,8 @@ fn generic_branch_list_show_log_and_local_forget_compose() {
     let name = name_blob.get_handle();
     pile.put::<LongString, _>(name_blob).unwrap();
     pile.put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(name))
+        .unwrap();
+    pile.put::<StrongPinDescriptor, _>(BranchPinDescriptor::strong_blob(name))
         .unwrap();
     pile.flush().unwrap();
     for signing_key in [&first_key, &second_key] {

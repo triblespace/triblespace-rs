@@ -303,8 +303,8 @@ ingest-layer decision over authors and pin kinds; signature verification alone
 does not choose what a deployment trusts.
 
 The envelope is deliberately kind-neutral. For branches, the pin handle is the
-content handle of a 48-byte `BranchPinDescriptor` blob containing its 16-byte
-kind marker and 32-byte name handle. The value is a commit handle and the label
+content handle of a 48-byte `StrongPinDescriptor` wrapping the exact handle of
+a 64-byte aligned V2 `BranchPinDescriptor`. The value is a commit handle and the label
 is a full-width big-endian `BranchRank`. Rank order can suppress an impossible
 strict-ancestry walk but never proves domination. The branch resolver groups
 equal values, verifies a surviving witness, and reports absent, tip-pending,

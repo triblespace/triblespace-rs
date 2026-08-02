@@ -46,6 +46,10 @@ frontier-widest = []
 # bench.sh never enables it; build the control arm by hand. See the note
 # at `queries::run` for what the resulting gap does and does not measure.
 frontier-w1 = ["frontier"]
+# Asserted branch pins use a generic StrongPinDescriptor wrapper. Older
+# subjects stored BranchPinDescriptor directly as the generic pin handle, so
+# discovery is selected by bench.sh's source capability probe.
+strong-pin-wrapper = []
 # F10 straddles `triblespace-gpu`'s `DEFAULT_MIN_CONFIRM_BATCH` and READS
 # the constant out of the subject rather than copying it, so the fixture
 # can only compile against a subject that ships the gpu crate (the

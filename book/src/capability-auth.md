@@ -339,8 +339,8 @@ name an exact asserted pin `(author key, descriptor handle)` and must not be
 used as authorization for generic assertion ingest. An assertion-replication
 protocol therefore needs a new exact-identity scope schema (or an explicit,
 intentionally broader policy). A branch-specific UI may recover its name by
-loading the canonical `BranchPinDescriptor`; the name itself is not the generic
-identity.
+loading the canonical outer `StrongPinDescriptor` and then its wrapped
+`BranchPinDescriptor`; the name itself is not the generic identity.
 
 For the current read-only RPC, a branch-restricted capability limits blob
 access by reachability from matching mutable-pin roots in the server's local

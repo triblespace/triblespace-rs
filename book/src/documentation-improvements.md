@@ -44,8 +44,9 @@ bytes received from a peer. A hands-on example should distinguish
 cryptographic validity from authorization: signature verification admits no
 foreign assertion or descriptor kind by itself, and the remote ingest boundary
 must still enforce exact identity, kind, and resource policies. Branch handling
-then separately loads `BranchPinDescriptor` and interprets the opaque label as
-`BranchRank`; the generic layer must not do either.
+then separately unwraps `StrongPinDescriptor`, loads `BranchPinDescriptor`, and
+interprets the opaque label as `BranchRank`; the generic layer must not do
+either.
 
 ### Repository migration helpers
 `repo::transfer` rewrites whichever handles you feed it and returns the old and

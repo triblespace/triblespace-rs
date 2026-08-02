@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Hard retention is now an explicit `StrongPinDescriptor` decorator rather
+  than a branch-special case in Yard. The canonical V1 wrapper contains an
+  exact inner descriptor handle; authentic assertions sharing its outer pin
+  retain the outer plus the locally present closure of the inner descriptor
+  and every distinct value. `BranchPinDescriptor` is a clean-break aligned V2
+  inner descriptor, and repository publication flushes both descriptor layers
+  before appending the newly bound assertion.
 - Removed the scalar `IndexHome` catalog and its `PinStore` dependency.
   Derived-index snapshots are exact, immutable `SimpleArchive` values stored
   and loaded by content handle. Standalone loading rejects arbitrary empty

@@ -97,7 +97,6 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
-use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::import::ntriples::uri_to_id_pure;
@@ -106,10 +105,10 @@ use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
 use triblespace_core::prelude::*;
 use triblespace_core::repo::branch_frontier::{BranchResolution, ResolvedHead};
-use triblespace_core::repo::branch_pin::{BranchIdentity, BranchPinDescriptor};
+use triblespace_core::repo::branch_pin::{load_branch_pin, BranchIdentity};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::pin_assertion::PinAssertionStore;
-use triblespace_core::repo::{self, BlobStoreMeta, Repository};
+use triblespace_core::repo::{self, Repository};
 
 // GPU comparison arm. The whole arm is behind `feature = "gpu"` so it
 // VANISHES when the feature is off (early commits predate the crate, and the
@@ -799,22 +798,12 @@ fn asserted_branch(pile: &mut Pile, branch: Option<&str>) -> (String, CommitHand
     let mut reader = pile.reader().expect("pile reader");
     let mut identities = Vec::new();
     for assertion in snapshot.iter() {
-        let descriptor =
-            Inline::<Handle<BranchPinDescriptor>>::new(assertion.identity().pin().raw());
-        if reader
-            .metadata(descriptor)
-            .expect("inspect asserted-pin descriptor")
-            .is_none()
-        {
-            continue;
-        }
-        let Ok(name) = reader.get::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
-        else {
-            // Generic pins are branch identities only when their locally
-            // present descriptor has the exact canonical branch shape.
+        let Ok(decoded) = load_branch_pin(&reader, assertion.identity().pin()) else {
+            // Only exact strong wrappers around canonical branch descriptors
+            // enter branch discovery.
             continue;
         };
-        let identity = BranchIdentity::new(assertion.identity().author(), name);
+        let identity = BranchIdentity::new(assertion.identity().author(), decoded.name);
         if identity.pin_identity() == *assertion.identity() {
             identities.push(identity);
         }

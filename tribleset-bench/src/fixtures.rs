@@ -34,6 +34,7 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
+#[cfg(not(feature = "strong-pin-wrapper"))]
 use subject::core::blob::encodings::longstring::LongString;
 use subject::core::blob::encodings::simplearchive::SimpleArchive;
 use subject::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
@@ -59,10 +60,15 @@ use subject::core::query::Candidates;
 #[cfg(feature = "frontier")]
 use subject::core::query::Frontier;
 use subject::core::repo::branch_frontier::{BranchResolution, ResolvedHead};
+#[cfg(feature = "strong-pin-wrapper")]
+use subject::core::repo::branch_pin::{load_branch_pin, BranchIdentity};
+#[cfg(not(feature = "strong-pin-wrapper"))]
 use subject::core::repo::branch_pin::{BranchIdentity, BranchPinDescriptor};
 use subject::core::repo::pile::Pile;
 use subject::core::repo::pin_assertion::PinAssertionStore;
-use subject::core::repo::{self, BlobStoreMeta, Repository};
+#[cfg(not(feature = "strong-pin-wrapper"))]
+use subject::core::repo::BlobStoreMeta;
+use subject::core::repo::{self, Repository};
 
 // ---------------------------------------------------------------------------
 // Crash isolation
@@ -378,19 +384,29 @@ fn asserted_branch(pile: &mut Pile, branch: Option<&str>) -> (String, CommitHand
     let mut reader = pile.reader().expect("pile reader");
     let mut identities = Vec::new();
     for assertion in snapshot.iter() {
-        let descriptor =
-            Inline::<Handle<BranchPinDescriptor>>::new(assertion.identity().pin().raw());
-        if reader
-            .metadata(descriptor)
-            .expect("inspect asserted-pin descriptor")
-            .is_none()
-        {
-            continue;
-        }
-        let Ok(name) = reader.get::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
+        #[cfg(feature = "strong-pin-wrapper")]
+        let Some(name) = load_branch_pin(&reader, assertion.identity().pin())
+            .ok()
+            .map(|decoded| decoded.name)
         else {
-            // Generic pins are branch identities only when their locally
-            // present descriptor has the exact canonical branch shape.
+            continue;
+        };
+        #[cfg(not(feature = "strong-pin-wrapper"))]
+        let Some(name) = ({
+            let descriptor =
+                Inline::<Handle<BranchPinDescriptor>>::new(assertion.identity().pin().raw());
+            if reader
+                .metadata(descriptor)
+                .expect("inspect asserted-pin descriptor")
+                .is_none()
+            {
+                None
+            } else {
+                reader
+                    .get::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
+                    .ok()
+            }
+        }) else {
             continue;
         };
         let identity = BranchIdentity::new(assertion.identity().author(), name);

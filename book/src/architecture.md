@@ -115,14 +115,19 @@ an opaque value handle and an opaque 32-byte subsumption label. The storage
 layer does not know whether a pin names a branch, a want set, or a future pin
 kind; it preserves unknown kinds without inventing semantics for them.
 
-A branch is the first typed adapter over that primitive. Its canonical
+A branch is a typed adapter over that primitive. Its canonical inner
 [`BranchPinDescriptor`](https://docs.rs/triblespace/latest/triblespace/repo/branch_pin/struct.BranchPinDescriptor.html)
-blob contains a kind marker plus the content-addressed branch-name handle. The
-descriptor's own content handle is the generic pin handle, while the
+blob contains a kind marker, canonical alignment padding, and the
+content-addressed branch-name handle. A generic
+[`StrongPinDescriptor`](https://docs.rs/triblespace/latest/triblespace/repo/strong_pin/struct.StrongPinDescriptor.html)
+wraps the inner descriptor's handle; the outer descriptor's content handle is
+the generic pin handle. The wrapper confers only hard-retention semantics, not
+branch resolution, labels, signing, or authorization. The
 human-facing [`BranchIdentity`](https://docs.rs/triblespace/latest/triblespace/repo/branch_pin/struct.BranchIdentity.html)
 remains the complete pair `(author key, name handle)`. Repositories stage both
-the descriptor and its name before publishing, so branch enumeration can
-recover the typed identity without treating arbitrary descriptors as branches.
+descriptor layers—and the name when locally available—before publishing, so
+branch enumeration can recover the typed identity without treating arbitrary
+strong pins as branches.
 
 For this kind, the generic value is a commit handle and the label is a
 [`BranchRank`](https://docs.rs/triblespace/latest/triblespace/repo/branch_pin/struct.BranchRank.html):
@@ -228,12 +233,12 @@ reconciliation into another immutable commit and asserted branch-pin value.
 +---------------------------------------------------+
 ```
 
-`Repository::resolve` snapshots generic assertions, selects the exact
-`BranchPinDescriptor` identity, and classifies its commit frontier.
+`Repository::resolve` snapshots generic assertions, selects the exact outer
+strong branch-pin identity, and classifies its commit frontier.
 `Repository::pull` opens only a complete frontier as a writable
 workspace; if it is divergent, the workspace starts from the derived flat
 merge. Workspace methods stage blobs and commits locally. `Repository::push`
-first copies and flushes every staged blob—including the branch descriptor—,
+first copies and flushes every staged blob—including both descriptor layers—,
 validates the proposed commit, then durably appends one generic assertion with
 the commit value and authenticated branch rank. There is deliberately no
 compare-and-set race and no hidden conflict winner.

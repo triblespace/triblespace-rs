@@ -16,7 +16,10 @@ The main types are:
 - **`BranchIdentity`** — the exact `(author key, name handle)` pair identifying
   a branch. The name is a content-addressed `LongString` blob.
 - **`BranchPinDescriptor`** — the canonical typed blob containing the branch
-  kind marker and name handle. Its content handle is the generic pin handle.
+  kind marker, canonical padding, and aligned name handle.
+- **`StrongPinDescriptor`** — the generic retention-only outer descriptor
+  wrapping the exact branch descriptor handle. Its content handle is the
+  generic pin handle.
 - **`BranchRank`** — the branch kind's authenticated, causally monotone
   256-bit label carried through workspace provenance.
 - **`PinAssertion`** — the generic signed envelope over an author, descriptor
@@ -77,9 +80,10 @@ BranchIdentity = (author verifying key, branch-name handle)
 
 `BranchIdentity` is `Copy`, so callers can retain it as the stable selector used
 by `resolve` and `pull`. Internally, `BranchPinDescriptor` deterministically
-turns its name into a typed descriptor blob; the full 32-byte handle of that
-blob, paired with the author key, is the generic asserted-pin identity. No
-truncated branch id participates in selection or equality.
+turns its name into a typed inner descriptor blob, and `StrongPinDescriptor`
+wraps that exact handle. The full 32-byte handle of the outer blob, paired with
+the author key, is the generic asserted-pin identity. No truncated branch id
+participates in selection or equality.
 
 Create a new line of work with `create_workspace`, commit into it, and publish
 the commit with `push`:
@@ -100,9 +104,9 @@ assert!(matches!(
 let mut reopened = repo.pull(main)?;
 ```
 
-Creating the workspace stages the branch-name blob and canonical
-`BranchPinDescriptor` locally. It does not write an assertion or create an
-empty branch. Pushing a workspace whose head has not changed returns
+Creating the workspace stages the branch-name blob and both canonical
+descriptor layers locally. It does not write an assertion or create an empty
+branch. Pushing a workspace whose head has not changed returns
 `PublishOutcome::NoChange`; empty branches therefore remain unrepresentable.
 The first changed push makes the staged blobs durable and adds the first
 generic assertion carrying the commit value and root rank.
@@ -188,10 +192,10 @@ asserted because additional ancestry could later prove a candidate dominated.
 `Repository::push` has one publication point and no compare-and-swap loop. For
 a changed workspace it performs these steps in order:
 
-1. Reconstruct and stage the canonical `BranchPinDescriptor` from the exact
-   workspace identity.
+1. Reconstruct and stage the canonical inner `BranchPinDescriptor` and outer
+   `StrongPinDescriptor` from the exact workspace identity.
 2. Upload every staged blob.
-3. Flush the storage so those blobs and the descriptor are durable.
+3. Flush the storage so the staged blobs and both descriptors are durable.
 4. Read the proposed head metadata from the durable snapshot.
 5. Verify that the head has one of the canonical authored-commit or flat
    authorless-merge shapes.

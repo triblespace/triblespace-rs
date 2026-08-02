@@ -34,8 +34,10 @@ use anybytes::Bytes;
 use hex_literal::hex;
 
 use super::pin_assertion::{PinAssertion, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle};
+use super::strong_pin::{StrongPinDescriptor, StrongPinDescriptorError};
+use super::BlobStoreGet;
 use super::CommitHandle;
-use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::{longstring::LongString, UnknownBlob};
 use crate::blob::{Blob, BlobEncoding, TryFromBlob};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -49,7 +51,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 /// The exact human-facing identity of one branch: `(author key, name handle)`.
 ///
 /// The generic asserted-pin layer indexes the corresponding
-/// `(author key, descriptor handle)` pair. This typed descriptor deliberately
+/// `(author key, outer descriptor handle)` pair. The typed inner descriptor deliberately
 /// keeps the name handle because it is what users select and what repositories
 /// stage as presentation content. Neither the name nor any truncated digest is
 /// a branch selector by itself.
@@ -156,36 +158,37 @@ impl fmt::Display for BranchIdentityParseError {
 
 impl Error for BranchIdentityParseError {}
 
-/// Canonical byte length of a V1 branch-pin descriptor.
-pub const BRANCH_PIN_DESCRIPTOR_LEN: usize = 16 + 32;
+/// Canonical byte length of a V2 branch-pin descriptor.
+pub const BRANCH_PIN_DESCRIPTOR_LEN: usize = 16 + 16 + 32;
 
-/// Kind/schema marker for the V1 branch-pin descriptor.
+/// Kind/schema marker for the V2 branch-pin descriptor.
 ///
 /// Minted with `trible genid` on 2026-08-02. Keeping the kind inside the
 /// content-addressed descriptor prevents a branch name handle from aliasing a
 /// different pin kind that happens to use the same 32-byte value.
-pub const BRANCH_PIN_DESCRIPTOR_V1: [u8; 16] = hex!("58DD2D159FA741F73DD0CE5A0E2F161F");
+pub const BRANCH_PIN_DESCRIPTOR_V2: [u8; 16] = hex!("3EB94D2C4719C1A771F31E87749D5909");
 
-/// Blob encoding for the exact identity descriptor of a branch pin.
+/// Blob encoding for the exact inner identity descriptor of a branch pin.
 ///
-/// The bytes are `kind marker [16] | LongString name handle [32]`. The generic
-/// assertion layer sees only their Blake3 handle; this typed adapter can derive
-/// that handle from a known name without loading the descriptor, while branch
-/// enumeration can decode the blob when it is present.
+/// The bytes are `kind marker [16] | zero padding [16] | LongString name
+/// handle [32]`. Aligning the handle on a 32-byte boundary makes conservative
+/// generic closure discovery retain a locally present name without teaching
+/// the retention layer about branches. The generic assertion pin is a
+/// [`StrongPinDescriptor`] wrapping this descriptor's exact content handle.
 pub struct BranchPinDescriptor;
 
 impl BlobEncoding for BranchPinDescriptor {}
 
 impl MetaDescribe for BranchPinDescriptor {
     fn describe() -> Fragment {
-        // The schema id is also the canonical in-band V1 kind marker. A format
+        // The schema id is also the canonical in-band V2 kind marker. A format
         // change therefore mints a new schema id instead of growing a hidden
         // version switch inside this descriptor.
-        let id: Id = id_hex!("58DD2D159FA741F73DD0CE5A0E2F161F");
+        let id: Id = id_hex!("3EB94D2C4719C1A771F31E87749D5909");
         entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: "branch-pin-descriptor-v1",
-                metadata::description: "Canonical descriptor for an asserted branch pin: a V1 kind marker followed by the LongString handle of the branch name. Its content handle namespaces branch identities away from every other pin kind.",
+                metadata::name: "branch-pin-descriptor-v2",
+                metadata::description: "Canonical inner descriptor for an asserted branch pin: a V2 kind marker, sixteen zero padding bytes, and the aligned LongString handle of the branch name. A StrongPinDescriptor wraps its content handle to confer generic hard-retention semantics.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -195,8 +198,8 @@ impl BranchPinDescriptor {
     /// Encode one branch name into its canonical typed descriptor bytes.
     pub fn encode(name: Inline<Handle<LongString>>) -> [u8; BRANCH_PIN_DESCRIPTOR_LEN] {
         let mut raw = [0u8; BRANCH_PIN_DESCRIPTOR_LEN];
-        raw[..16].copy_from_slice(&BRANCH_PIN_DESCRIPTOR_V1);
-        raw[16..].copy_from_slice(&name.raw);
+        raw[..16].copy_from_slice(&BRANCH_PIN_DESCRIPTOR_V2);
+        raw[32..].copy_from_slice(&name.raw);
         raw
     }
 
@@ -205,10 +208,24 @@ impl BranchPinDescriptor {
         Blob::new(Bytes::from_source(Self::encode(name).to_vec()))
     }
 
-    /// Derive the generic pin handle without requiring descriptor content to be
-    /// present in a store.
+    /// Derive this inner descriptor's exact content handle.
+    pub fn descriptor_handle(name: Inline<Handle<LongString>>) -> Inline<Handle<Self>> {
+        Inline::new(Blake3::digest(&Self::encode(name)))
+    }
+
+    /// Reinterpret a decoded generic inner handle as a branch descriptor.
+    pub fn from_unknown_handle(handle: Inline<Handle<UnknownBlob>>) -> Inline<Handle<Self>> {
+        Inline::new(handle.raw)
+    }
+
+    /// Build the outer strong-retention descriptor staged before publication.
+    pub fn strong_blob(name: Inline<Handle<LongString>>) -> Blob<StrongPinDescriptor> {
+        StrongPinDescriptor::blob(Self::descriptor_handle(name))
+    }
+
+    /// Derive the generic outer pin handle without loading either descriptor.
     pub fn pin_handle(name: Inline<Handle<LongString>>) -> PinHandle {
-        PinHandle::from_raw(Blake3::digest(&Self::encode(name)))
+        StrongPinDescriptor::pin_handle(Self::descriptor_handle(name))
     }
 
     /// Derive the generic exact identity for this author's named branch.
@@ -230,20 +247,25 @@ impl TryFromBlob<BranchPinDescriptor> for Inline<Handle<LongString>> {
                 actual: bytes.len(),
             });
         }
-        if bytes[..16] != BRANCH_PIN_DESCRIPTOR_V1 {
+        if bytes[..16] != BRANCH_PIN_DESCRIPTOR_V2 {
             return Err(BranchPinDescriptorError::WrongKind);
         }
-        Ok(Inline::new(bytes[16..].try_into().expect("length checked")))
+        if bytes[16..32].iter().any(|byte| *byte != 0) {
+            return Err(BranchPinDescriptorError::NonZeroReserved);
+        }
+        Ok(Inline::new(bytes[32..].try_into().expect("length checked")))
     }
 }
 
-/// A branch-pin descriptor was not the one exact canonical V1 shape.
+/// A branch-pin descriptor was not the one exact canonical V2 shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BranchPinDescriptorError {
-    /// The descriptor was not exactly 48 bytes.
+    /// The descriptor was not exactly 64 bytes.
     WrongLength { actual: usize },
-    /// The descriptor did not carry the branch V1 kind marker.
+    /// The descriptor did not carry the branch V2 kind marker.
     WrongKind,
+    /// Reserved alignment bytes were not all canonical zeroes.
+    NonZeroReserved,
 }
 
 impl fmt::Display for BranchPinDescriptorError {
@@ -253,12 +275,86 @@ impl fmt::Display for BranchPinDescriptorError {
                 f,
                 "branch pin descriptor is {actual} bytes, expected {BRANCH_PIN_DESCRIPTOR_LEN}"
             ),
-            Self::WrongKind => write!(f, "pin descriptor is not a V1 branch descriptor"),
+            Self::WrongKind => write!(f, "pin descriptor is not a V2 branch descriptor"),
+            Self::NonZeroReserved => {
+                write!(f, "branch pin descriptor has non-zero reserved bytes")
+            }
         }
     }
 }
 
 impl Error for BranchPinDescriptorError {}
+
+/// A canonical strong branch descriptor loaded from one generic pin handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedBranchPin {
+    /// Exact outer descriptor named by the generic pin envelope.
+    pub strong: Inline<Handle<StrongPinDescriptor>>,
+    /// Exact wrapped branch descriptor.
+    pub branch: Inline<Handle<BranchPinDescriptor>>,
+    /// Exact content-addressed branch-name handle.
+    pub name: Inline<Handle<LongString>>,
+}
+
+/// Failure while unwrapping a generic strong pin as a branch descriptor.
+#[derive(Debug)]
+pub enum LoadBranchPinError<StrongError, BranchError> {
+    /// The outer descriptor was missing, malformed, or unreadable.
+    Strong(StrongError),
+    /// The wrapped descriptor was missing, malformed, or not a branch.
+    Branch(BranchError),
+}
+
+impl<StrongError: fmt::Display, BranchError: fmt::Display> fmt::Display
+    for LoadBranchPinError<StrongError, BranchError>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Strong(err) => write!(f, "could not load strong pin descriptor: {err}"),
+            Self::Branch(err) => write!(f, "could not load branch pin descriptor: {err}"),
+        }
+    }
+}
+
+impl<StrongError, BranchError> Error for LoadBranchPinError<StrongError, BranchError>
+where
+    StrongError: Error + 'static,
+    BranchError: Error + 'static,
+{
+}
+
+/// Unwrap a generic strong pin and decode its branch name in one typed path.
+///
+/// Callers use this for discovery only. Exact branch resolution already knows
+/// the author's name handle and therefore does not depend on descriptor
+/// availability.
+pub fn load_branch_pin<R>(
+    reader: &R,
+    pin: PinHandle,
+) -> Result<
+    DecodedBranchPin,
+    LoadBranchPinError<
+        R::GetError<StrongPinDescriptorError>,
+        R::GetError<BranchPinDescriptorError>,
+    >,
+>
+where
+    R: BlobStoreGet,
+{
+    let strong = StrongPinDescriptor::descriptor_handle(pin);
+    let inner = reader
+        .get::<Inline<Handle<UnknownBlob>>, StrongPinDescriptor>(strong)
+        .map_err(LoadBranchPinError::Strong)?;
+    let branch = BranchPinDescriptor::from_unknown_handle(inner);
+    let name = reader
+        .get::<Inline<Handle<LongString>>, BranchPinDescriptor>(branch)
+        .map_err(LoadBranchPinError::Branch)?;
+    Ok(DecodedBranchPin {
+        strong,
+        branch,
+        name,
+    })
+}
 
 /// Reinterpret a generic assertion value as a branch commit handle after its
 /// pin identity has been established as a canonical branch descriptor.
@@ -275,7 +371,7 @@ pub(crate) fn value_from_commit(commit: CommitHandle) -> ValueHandle {
 ///
 /// The caller carries `rank` through the workspace's asserted provenance;
 /// publication never walks remote history merely to derive the label. It
-/// stages [`BranchPinDescriptor::blob`] before durably appending the record.
+/// stages both descriptor layers before durably appending the record.
 pub fn sign_branch_assertion(
     key: &SigningKey,
     name: Inline<Handle<LongString>>,
@@ -368,14 +464,19 @@ mod tests {
     fn descriptor_is_canonical_typed_content_and_roundtrips() {
         let name = name(7);
         let blob = BranchPinDescriptor::blob(name);
+        let inner = blob.get_handle();
+        let outer = BranchPinDescriptor::strong_blob(name);
         assert_eq!(blob.bytes.len(), BRANCH_PIN_DESCRIPTOR_LEN);
-        assert_eq!(&blob.bytes[..16], &BRANCH_PIN_DESCRIPTOR_V1);
-        assert_eq!(&blob.bytes[16..], &name.raw);
+        assert_eq!(&blob.bytes[..16], &BRANCH_PIN_DESCRIPTOR_V2);
+        assert_eq!(&blob.bytes[16..32], &[0u8; 16]);
+        assert_eq!(&blob.bytes[32..], &name.raw);
+        assert_eq!(BranchPinDescriptor::descriptor_handle(name), inner);
         assert_eq!(
             BranchPinDescriptor::pin_handle(name).raw(),
-            blob.get_handle().raw,
-            "the generic pin identity is the descriptor's exact content handle"
+            outer.get_handle().raw,
+            "the generic pin identity is the strong wrapper's content handle"
         );
+        assert_ne!(outer.get_handle().raw, inner.raw);
         let decoded: Inline<Handle<LongString>> = blob.try_from_blob().unwrap();
         assert_eq!(decoded, name);
     }
@@ -393,6 +494,40 @@ mod tests {
             .try_from_blob::<Inline<Handle<LongString>>>()
             .unwrap_err();
         assert_eq!(err, BranchPinDescriptorError::WrongLength { actual: 47 });
+
+        let err = Blob::<BranchPinDescriptor>::new(Bytes::from_source(vec![0u8; 48]))
+            .try_from_blob::<Inline<Handle<LongString>>>()
+            .unwrap_err();
+        assert_eq!(err, BranchPinDescriptorError::WrongLength { actual: 48 });
+
+        let mut noncanonical_padding = BranchPinDescriptor::encode(name(3));
+        noncanonical_padding[16] = 1;
+        let err =
+            Blob::<BranchPinDescriptor>::new(Bytes::from_source(noncanonical_padding.to_vec()))
+                .try_from_blob::<Inline<Handle<LongString>>>()
+                .unwrap_err();
+        assert_eq!(err, BranchPinDescriptorError::NonZeroReserved);
+    }
+
+    #[test]
+    fn aligned_descriptor_discovers_only_the_present_name_child() {
+        use crate::blob::MemoryBlobStore;
+        use crate::repo::{BlobChildren, BlobStore, BlobStorePut};
+
+        let mut store = MemoryBlobStore::new();
+        let name = store
+            .put::<LongString, _>("aligned-name".to_owned())
+            .unwrap();
+        let descriptor = store
+            .put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(name))
+            .unwrap();
+        let reader = store.reader().unwrap();
+
+        assert_eq!(
+            reader.children(descriptor.transmute()),
+            vec![name.transmute()],
+            "the marker-plus-padding candidate is rejected by existence lookup"
+        );
     }
 
     #[test]
@@ -476,6 +611,20 @@ mod tests {
         );
         assert_eq!(assertion.value(), value_from_commit(commit));
         assert_eq!(assertion.label(), rank.label());
+
+        let inner = BranchPinDescriptor::descriptor_handle(name);
+        let unwrapped = PinAssertion::sign(
+            &key,
+            PinHandle::from_raw(inner.raw),
+            value_from_commit(commit),
+            rank.label(),
+        );
+        assert_ne!(assertion.identity(), unwrapped.identity());
+        assert_ne!(
+            &assertion.encode()[128..],
+            &unwrapped.encode()[128..],
+            "wrapping changes the authenticated identity and signature"
+        );
     }
 
     #[test]

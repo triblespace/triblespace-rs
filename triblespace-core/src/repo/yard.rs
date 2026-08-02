@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 
 use anybytes::Bytes;
 
-use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::id::{Id, RawId};
@@ -25,11 +24,11 @@ use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use crate::prelude::blobencodings::SimpleArchive;
 
-use super::branch_pin::{commit_from_value, BranchPinDescriptor};
 use super::pile::{
     GetBlobError, InsertError, Pile, PilePinAssertionError, PileReader, PileWriteError, ReadError,
 };
 use super::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
+use super::strong_pin::StrongPinDescriptor;
 use super::want::{selected_wants_in_snapshot, WantCachePolicy, WantCachePolicySource};
 use super::{
     reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
@@ -549,8 +548,9 @@ impl Yard {
 
     /// Keep set for state that may never be silently evicted.
     ///
-    /// Legacy scalar pins remain hard compatibility roots. Recognized branch
-    /// assertions likewise retain their locally present commit closure. Wants
+    /// Legacy scalar pins remain hard compatibility roots. Assertions whose
+    /// locally present outer descriptor is a canonical strong wrapper retain
+    /// the wrapped descriptor and every asserted value's local closure. Wants
     /// are handled separately as budgeted soft roots and never veto a hard
     /// edge.
     fn durable_keep_set(
@@ -559,7 +559,7 @@ impl Yard {
         pin_assertions: &PinAssertionSnapshot,
     ) -> HandleSet {
         let mut keep = self.strong_keep_set(reader);
-        keep.union(branch_pin_keep_set(reader, pin_assertions));
+        keep.union(strong_pin_keep_set(reader, pin_assertions));
         keep
     }
 
@@ -961,36 +961,44 @@ fn asserted_want_keep_set(
     keep
 }
 
-/// Project the built-in branch kind out of the generic asserted-pin set and
-/// retain its locally present commit closure.
+/// Project generic strong-retention wrappers out of the asserted-pin set.
 ///
-/// Generic storage remains kind-agnostic: wants and unknown pin kinds do not
-/// accidentally become permanent strong roots. Yard recognizes a branch only
-/// when the pin's locally present content-addressed descriptor decodes as the
-/// canonical [`BranchPinDescriptor`]. Local publication flushes that descriptor
-/// before appending the assertion, so an authored branch cannot lose its
-/// retention semantics across a crash. Replication may deliver the assertion
-/// first; until the descriptor arrives the assertion is preserved but opaque.
-fn branch_pin_keep_set(reader: &YardReader, assertions: &PinAssertionSnapshot) -> HandleSet {
-    let mut queue = std::collections::VecDeque::new();
+/// The wrapper is the complete generic policy boundary. Yard neither knows nor
+/// guesses the inner kind: once a locally present outer descriptor decodes
+/// exactly, the outer itself is retained and the wrapped descriptor plus every
+/// distinct authentic assertion value becomes a conservative local-closure
+/// root. Missing or malformed outers are neutral while their assertion records
+/// remain durable. Publication flushes dependency blobs before the assertion,
+/// while replication may safely deliver them in either order.
+fn strong_pin_keep_set(reader: &YardReader, assertions: &PinAssertionSnapshot) -> HandleSet {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    let mut values_by_pin = BTreeMap::<_, BTreeSet<_>>::new();
+    for assertion in assertions.iter() {
+        values_by_pin
+            .entry(assertion.identity().pin())
+            .or_default()
+            .insert(assertion.value());
+    }
+
+    let mut queue = VecDeque::new();
     let mut keep = HandleSet::new();
 
-    for assertion in assertions.iter() {
-        let descriptor =
-            Inline::<Handle<BranchPinDescriptor>>::new(assertion.identity().pin().raw());
-        let Some(Ok(name)) =
-            reader.get_local::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
+    for (pin, values) in values_by_pin {
+        let outer = StrongPinDescriptor::descriptor_handle(pin);
+        let Some(Ok(inner)) =
+            reader.get_local::<Inline<Handle<UnknownBlob>>, StrongPinDescriptor>(outer)
         else {
             continue;
         };
 
-        let descriptor: Inline<Handle<UnknownBlob>> = descriptor.transmute();
-        keep.insert(&Entry::new(&descriptor.raw));
-        let name: Inline<Handle<UnknownBlob>> = name.transmute();
-        keep.insert(&Entry::new(&name.raw));
-
-        let target: Inline<Handle<UnknownBlob>> = commit_from_value(assertion.value()).transmute();
-        queue.push_back(target);
+        keep.insert(&Entry::new(&outer.raw));
+        queue.push_back(inner);
+        queue.extend(
+            values
+                .into_iter()
+                .map(|value| Inline::<Handle<UnknownBlob>>::new(value.raw())),
+        );
     }
 
     while let Some(handle) = queue.pop_front() {
@@ -1230,12 +1238,16 @@ impl Error for YardReclaimError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::encodings::longstring::LongString;
     use crate::blob::encodings::rawbytes::RawBytes;
+    use crate::repo::branch_pin::BranchPinDescriptor;
     use crate::repo::commit;
     use crate::repo::pin_assertion::{
         PinHandle, SubsumptionLabel, UnverifiedPinAssertion, ValueHandle,
     };
+    use crate::repo::strong_pin::StrongPinDescriptor;
     use crate::repo::want::{all_wants_in_snapshot, sign_want, wants_in_snapshot};
+    use crate::repo::StorageFlush;
     use ed25519_dalek::SigningKey;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -1279,6 +1291,23 @@ mod tests {
         Handle<S>: InlineEncoding,
     {
         yard.append_pin_assertion(sign_want(key, handle)).unwrap();
+    }
+
+    fn append_strong(
+        yard: &mut Yard,
+        key: &SigningKey,
+        inner: Inline<Handle<UnknownBlob>>,
+        value: Inline<Handle<UnknownBlob>>,
+        label: u8,
+    ) -> PinAssertion {
+        let assertion = PinAssertion::sign(
+            key,
+            StrongPinDescriptor::pin_handle(inner),
+            ValueHandle::from_raw(value.raw),
+            SubsumptionLabel::from_raw([label; 32]),
+        );
+        yard.append_pin_assertion(assertion).unwrap();
+        assertion
     }
 
     fn get_raw(
@@ -1345,7 +1374,29 @@ mod tests {
     #[test]
     fn reclaim_preserves_structural_pin_witnesses_without_promoting_them() {
         let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
-        let mut bytes = pin_assertion(19).encode();
+        let child = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"forged child".to_vec()))
+            .unwrap();
+        let mut inner_bytes = vec![0u8; 64];
+        inner_bytes[32..].copy_from_slice(&child.raw);
+        let inner = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(inner_bytes))
+            .unwrap();
+        let mut value_bytes = vec![1u8; 64];
+        value_bytes[32..].copy_from_slice(&child.raw);
+        let value = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(value_bytes))
+            .unwrap();
+        let outer = yard
+            .put::<StrongPinDescriptor, _>(StrongPinDescriptor::blob(inner))
+            .unwrap();
+        let mut bytes = PinAssertion::sign(
+            &SigningKey::from_bytes(&[19; 32]),
+            PinHandle::from_raw(outer.raw),
+            ValueHandle::from_raw(value.raw),
+            SubsumptionLabel::from_raw([19; 32]),
+        )
+        .encode();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         let invalid = UnverifiedPinAssertion::decode_structural(bytes).unwrap();
@@ -1358,6 +1409,15 @@ mod tests {
         let before = yard.pin_assertion_snapshot().unwrap();
         assert_eq!(before.len(), 1);
         assert_eq!(before.iter().count(), 0);
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+        for handle in [outer.transmute(), inner, value, child] {
+            assert!(matches!(
+                reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
+                Err(YardGetError::NotFound)
+            ));
+        }
+        drop(reader);
         yard.reclaim().unwrap();
         assert_eq!(yard.pin_assertion_snapshot().unwrap(), before);
         yard.close().unwrap();
@@ -1462,6 +1522,167 @@ mod tests {
             vec![assertion],
             "opaque replicated state survives independently of blob retention policy"
         );
+    }
+
+    #[test]
+    fn strong_descriptor_retains_unknown_inner_and_all_authentic_value_closures() {
+        let (_dir, mut yard) = yard_with(
+            1,
+            YardConfig {
+                want_budget: 0,
+                ..YardConfig::default()
+            },
+        );
+        let first_child = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"first child".to_vec()))
+            .unwrap();
+        let second_child = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"second child".to_vec()))
+            .unwrap();
+
+        let mut inner_bytes = vec![0x31; 64];
+        inner_bytes[32..].copy_from_slice(&first_child.raw);
+        let inner = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(inner_bytes))
+            .unwrap();
+        let outer = yard
+            .put::<StrongPinDescriptor, _>(StrongPinDescriptor::blob(inner))
+            .unwrap();
+
+        let mut first_value_bytes = vec![0x41; 64];
+        first_value_bytes[32..].copy_from_slice(&first_child.raw);
+        let first_value = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(first_value_bytes))
+            .unwrap();
+        let mut second_value_bytes = vec![0x51; 64];
+        second_value_bytes[32..].copy_from_slice(&second_child.raw);
+        let second_value = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(second_value_bytes))
+            .unwrap();
+
+        append_strong(
+            &mut yard,
+            &SigningKey::from_bytes(&[7; 32]),
+            inner,
+            first_value,
+            1,
+        );
+        append_strong(
+            &mut yard,
+            &SigningKey::from_bytes(&[8; 32]),
+            inner,
+            second_value,
+            2,
+        );
+        let dead = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"unrooted".to_vec()))
+            .unwrap();
+
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+        let decoded_inner: Inline<Handle<UnknownBlob>> = reader.get(outer).unwrap();
+        assert_eq!(decoded_inner, inner);
+        for handle in [inner, first_value, second_value, first_child, second_child] {
+            assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle).is_ok());
+        }
+        assert!(matches!(
+            reader.get::<Blob<UnknownBlob>, UnknownBlob>(dead),
+            Err(YardGetError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn missing_or_malformed_strong_outer_is_neutral_until_exact_outer_arrives() {
+        let (_dir, mut yard) = yard_with(
+            1,
+            YardConfig {
+                want_budget: 0,
+                ..YardConfig::default()
+            },
+        );
+        let key = SigningKey::from_bytes(&[9; 32]);
+
+        let child_blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"late child".to_vec()));
+        let child = child_blob.get_handle();
+        let mut inner_bytes = vec![0x61; 64];
+        inner_bytes[32..].copy_from_slice(&child.raw);
+        let inner_blob = Blob::<UnknownBlob>::new(Bytes::from_source(inner_bytes));
+        let inner = inner_blob.get_handle();
+        let outer_blob = StrongPinDescriptor::blob(inner);
+        let outer = outer_blob.get_handle();
+        let mut value_bytes = vec![0x71; 64];
+        value_bytes[32..].copy_from_slice(&child.raw);
+        let value_blob = Blob::<UnknownBlob>::new(Bytes::from_source(value_bytes));
+        let value = value_blob.get_handle();
+
+        // Assertion first: the value is locally present, but an absent outer
+        // descriptor cannot confer retention semantics.
+        append_strong(&mut yard, &key, inner, value, 3);
+        yard.put::<UnknownBlob, _>(value_blob.clone()).unwrap();
+        yard.put::<UnknownBlob, _>(child_blob.clone()).unwrap();
+
+        let mut malformed_bytes = StrongPinDescriptor::encode(inner);
+        malformed_bytes[0] ^= 1;
+        let malformed_blob =
+            Blob::<StrongPinDescriptor>::new(Bytes::from_source(malformed_bytes.to_vec()));
+        let malformed = malformed_blob.get_handle();
+        let malformed_value_blob =
+            Blob::<UnknownBlob>::new(Bytes::from_source(b"malformed value".to_vec()));
+        let malformed_value = malformed_value_blob.get_handle();
+        yard.put::<StrongPinDescriptor, _>(malformed_blob.clone())
+            .unwrap();
+        yard.put::<UnknownBlob, _>(malformed_value_blob.clone())
+            .unwrap();
+        let malformed_assertion = PinAssertion::sign(
+            &key,
+            PinHandle::from_raw(malformed.raw),
+            ValueHandle::from_raw(malformed_value.raw),
+            SubsumptionLabel::from_raw([4; 32]),
+        );
+        yard.append_pin_assertion(malformed_assertion).unwrap();
+
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+        for handle in [value, child, malformed_value] {
+            assert!(matches!(
+                reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
+                Err(YardGetError::NotFound)
+            ));
+        }
+        assert!(matches!(
+            reader.get::<Blob<StrongPinDescriptor>, StrongPinDescriptor>(malformed),
+            Err(YardGetError::NotFound)
+        ));
+        drop(reader);
+
+        // Exact descriptor arrival activates the already durable assertion.
+        yard.put::<UnknownBlob, _>(child_blob).unwrap();
+        yard.put::<UnknownBlob, _>(inner_blob).unwrap();
+        yard.put::<UnknownBlob, _>(value_blob).unwrap();
+        assert_eq!(
+            yard.put::<StrongPinDescriptor, _>(outer_blob).unwrap(),
+            outer
+        );
+        // Reintroducing malformed content still grants no root.
+        yard.put::<StrongPinDescriptor, _>(malformed_blob).unwrap();
+        yard.put::<UnknownBlob, _>(malformed_value_blob).unwrap();
+
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+        let decoded: Inline<Handle<UnknownBlob>> = reader.get(outer).unwrap();
+        assert_eq!(decoded, inner);
+        for handle in [inner, value, child] {
+            assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle).is_ok());
+        }
+        assert!(matches!(
+            reader.get::<Blob<StrongPinDescriptor>, StrongPinDescriptor>(malformed),
+            Err(YardGetError::NotFound)
+        ));
+        assert!(matches!(
+            reader.get::<Blob<UnknownBlob>, UnknownBlob>(malformed_value),
+            Err(YardGetError::NotFound)
+        ));
+        assert_eq!(yard.pin_assertion_snapshot().unwrap().iter().count(), 2);
     }
 
     #[test]
@@ -1583,10 +1804,25 @@ mod tests {
         let name = name_blob.get_handle();
         let descriptor_blob = BranchPinDescriptor::blob(name);
         let descriptor = descriptor_blob.get_handle();
+        let strong_blob = BranchPinDescriptor::strong_blob(name);
+        let strong = strong_blob.get_handle();
 
-        // Assertions and wants may arrive before their referenced blobs. A
-        // zero soft budget must not weaken the accepted branch assertion's
-        // descriptor, name, target, or target closure.
+        // Stage and flush the complete locally authored dependency chain before
+        // publishing the assertion. A zero soft budget must not weaken any
+        // member of the resulting strong closure.
+        assert_eq!(yard.put::<LongString, _>(name_blob).unwrap(), name);
+        assert_eq!(
+            yard.put::<BranchPinDescriptor, _>(descriptor_blob).unwrap(),
+            descriptor
+        );
+        assert_eq!(
+            yard.put::<StrongPinDescriptor, _>(strong_blob).unwrap(),
+            strong
+        );
+        assert_eq!(yard.put::<SimpleArchive, _>(content_blob).unwrap(), content);
+        assert_eq!(yard.put::<SimpleArchive, _>(parent_blob).unwrap(), parent);
+        assert_eq!(yard.put::<SimpleArchive, _>(target_blob).unwrap(), target);
+        yard.flush().unwrap();
         yard.append_pin_assertion(sign_branch_assertion(
             &key,
             name,
@@ -1594,20 +1830,12 @@ mod tests {
             BranchRank::ROOT.successor().unwrap(),
         ))
         .unwrap();
+        append_want(&mut yard, &key, strong);
         append_want(&mut yard, &key, descriptor);
         append_want(&mut yard, &key, name);
         append_want(&mut yard, &key, target);
         append_want(&mut yard, &key, parent);
         append_want(&mut yard, &key, content);
-
-        assert_eq!(
-            yard.put::<BranchPinDescriptor, _>(descriptor_blob).unwrap(),
-            descriptor
-        );
-        assert_eq!(yard.put::<LongString, _>(name_blob).unwrap(), name);
-        assert_eq!(yard.put::<SimpleArchive, _>(content_blob).unwrap(), content);
-        assert_eq!(yard.put::<SimpleArchive, _>(parent_blob).unwrap(), parent);
-        assert_eq!(yard.put::<SimpleArchive, _>(target_blob).unwrap(), target);
         let dead = yard
             .put::<RawBytes, _>(raw_blob(b"unasserted orphan"))
             .unwrap();
@@ -1615,6 +1843,10 @@ mod tests {
         yard.collect().unwrap();
         let reader = yard.reader().unwrap();
 
+        let decoded_descriptor: Inline<Handle<UnknownBlob>> = reader.get(strong).unwrap();
+        assert_eq!(decoded_descriptor.raw, descriptor.raw);
+        let decoded_name: Inline<Handle<LongString>> = reader.get(descriptor).unwrap();
+        assert_eq!(decoded_name, name);
         let restored_name: anybytes::View<str> = reader.get(name).unwrap();
         assert_eq!(&*restored_name, "weak-before-arrival");
         assert!(reader.get::<TribleSet, SimpleArchive>(target).is_ok());
@@ -1643,6 +1875,8 @@ mod tests {
         let mut repo = Repository::new(yard, key.clone(), TribleSet::new()).unwrap();
         let identity = repo.branch_identity("main");
         let name = identity.name();
+        let descriptor = BranchPinDescriptor::descriptor_handle(name);
+        let strong = BranchPinDescriptor::strong_blob(name).get_handle();
         let mut workspace = repo.create_workspace("main").unwrap();
         workspace.commit(TribleSet::new(), "first").unwrap();
         let head = workspace.head().unwrap();
@@ -1670,6 +1904,10 @@ mod tests {
             "physical rewrites must preserve the grow-only assertion set"
         );
         let reader = reopened.reader().unwrap();
+        let decoded_descriptor: Inline<Handle<UnknownBlob>> = reader.get(strong).unwrap();
+        assert_eq!(decoded_descriptor.raw, descriptor.raw);
+        let decoded_name: Inline<Handle<LongString>> = reader.get(descriptor).unwrap();
+        assert_eq!(decoded_name, name);
         let restored_name: anybytes::View<str> = reader.get(name).unwrap();
         assert_eq!(&*restored_name, "main");
         assert!(matches!(
@@ -1714,6 +1952,33 @@ mod tests {
 
         assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(parent).is_ok());
         assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(child).is_ok());
+    }
+
+    #[test]
+    fn asserted_want_retains_only_its_exact_value_not_its_local_closure() {
+        let (_dir, mut yard) = yard_with(
+            1,
+            YardConfig {
+                want_budget: 1,
+                ..YardConfig::default()
+            },
+        );
+        let key = SigningKey::from_bytes(&[10; 32]);
+        let child = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"soft child".to_vec()))
+            .unwrap();
+        let parent = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(child.raw.to_vec()))
+            .unwrap();
+        append_want(&mut yard, &key, parent);
+
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+        assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(parent).is_ok());
+        assert!(matches!(
+            reader.get::<Blob<UnknownBlob>, UnknownBlob>(child),
+            Err(YardGetError::NotFound)
+        ));
     }
 
     #[test]

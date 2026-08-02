@@ -20,8 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values lazily while memoizing both outcomes. Signature validity identifies an
   author but remains separate from foreign-author and pin-kind admission.
 - **Branches are a typed adapter over generic asserted pins.** A canonical
-  48-byte `BranchPinDescriptor` blob contains its kind marker and LongString
-  name handle; the descriptor's own content handle is the generic pin handle.
+  64-byte V2 `BranchPinDescriptor` blob contains its kind marker, canonical
+  alignment padding, and LongString name handle. Its content handle is wrapped
+  by a 48-byte `StrongPinDescriptor`, whose handle is the generic pin handle.
+  The generic wrapper makes hard retention a descriptor property: Yard keeps
+  its exact outer blob plus the locally present closure of the inner descriptor
+  and every distinct authentic asserted value, without learning branch
+  semantics. Missing or malformed wrappers remain retention-neutral while the
+  assertion ledger survives intact.
   Its asserted value is a commit and its label is a full-width big-endian
   `BranchRank`, constructed inductively as zero for a root and one greater than
   the greatest parent for a child or merge. Rank order only suppresses
