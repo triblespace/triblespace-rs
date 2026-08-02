@@ -51,10 +51,9 @@ pub mod async_store;
 pub mod branch;
 /// Immutable, signed branch assertions and their grow-only snapshots.
 pub mod branch_assertion;
-pub mod branch_pin;
-pub mod pin_assertion;
 /// Partial-ancestry resolution of branch assertion frontiers.
 pub mod branch_frontier;
+pub mod branch_pin;
 /// Capability-based authorization for triblespace networks.
 pub mod capability;
 /// Commit metadata construction and signature verification.
@@ -73,6 +72,7 @@ pub mod memoryrepo;
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
+pub mod pin_assertion;
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 
