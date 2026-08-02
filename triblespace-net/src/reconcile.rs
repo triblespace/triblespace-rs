@@ -134,7 +134,7 @@ impl Reconciler {
     ///    weak-pin records appended by OTHER processes since the last
     ///    tick become visible here.
     /// 2. Diff against presence: take a reader (which also runs
-    ///    [`Peer::refresh`] — freshly-gossiped blobs count as present)
+    ///    [`Peer::refresh`] — freshly-fetched blobs count as present)
     ///    and keep the wants whose blob the local snapshot can't serve.
     /// 3. For each missing want not gated by its backoff timer, drive
     ///    the Peer's swarm fetch and land the verified bytes in the
@@ -166,7 +166,7 @@ impl Reconciler {
         stats.wants = wants.len();
 
         // ── Presence: which wants the local snapshot already serves ───
-        // Peer::reader() runs refresh() (drains gossip, announces
+        // Peer::reader() runs refresh() (absorbs control events and announces
         // external writes) and hands back a frozen local snapshot; the
         // sync get on it is local-only by design.
         let reader = match peer.reader() {
@@ -185,7 +185,7 @@ impl Reconciler {
         stats.missing = missing.len();
 
         // Drop bookkeeping for wants no longer outstanding — satisfied
-        // out-of-band (gossip landed the blob) or weak-unpinned.
+        // out-of-band (a fetch landed the blob) or weak-unpinned.
         let missing_set: HashSet<RawHash> = missing.iter().copied().collect();
         self.states.retain(|hash, _| {
             let keep = missing_set.contains(hash);

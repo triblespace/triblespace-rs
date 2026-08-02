@@ -3,7 +3,7 @@
 //! This test proves the transport path: two `Peer<Pile>`s — real pile files
 //! on disk — run the full production
 //! stack (`transport::iroh::bind_with_endpoint`: embedded DHT node,
-//! protocol router, iroh-gossip topic mesh, OP_AUTH with cap-chain
+//! protocol router, DHT discovery, OP_AUTH with cap-chain
 //! verification) over real iroh QUIC endpoints wired through
 //! `iroh::test_utils` `TestNetwork` (an in-memory packet transport —
 //! no relays, no DNS, no OS sockets — everything above the packet
@@ -41,22 +41,33 @@ use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, StorageFlus
 use triblespace_core::trible::TribleSet;
 use triblespace_net::clock;
 use triblespace_net::host;
-use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::reconcile::Reconciler;
 
 fn key(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
 }
 
-/// Sign a PERM_ADMIN root cap for `subject` — the out-of-band
-/// provisioning a team admin would do. Same as the sim suite's helper.
+/// Build the root-signed founder anchor plus the founder's finite
+/// operational PERM_ADMIN credential.
 fn admin_cap(
     root: &SigningKey,
     subject: &SigningKey,
-) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
+) -> (
+    (Blob<SimpleArchive>, Blob<SimpleArchive>),
+    (Blob<SimpleArchive>, Blob<SimpleArchive>),
+) {
     use triblespace_core::id::{ExclusiveId, ufoid};
     use triblespace_core::macros::entity;
 
+    let anchor_scope = *ufoid();
+    let anchor_facts = TribleSet::from(entity! {
+        ExclusiveId::force_ref(&anchor_scope) @
+        triblespace_core::metadata::tag: PERM_ADMIN,
+    });
+    let anchor =
+        capability::build_founder_anchor(root, subject.verifying_key(), anchor_scope, anchor_facts)
+            .expect("build founder anchor");
     let scope_root = *ufoid();
     let scope_facts = TribleSet::from(entity! {
         ExclusiveId::force_ref(&scope_root) @
@@ -66,15 +77,16 @@ fn admin_cap(
     let expiry: Inline<NsTAIInterval> = (now, now + hifitime::Duration::from_days(30.0))
         .try_to_inline()
         .expect("interval");
-    capability::build_capability(
-        root,
+    let cap = capability::build_capability(
+        subject,
         subject.verifying_key(),
-        None,
+        anchor.clone(),
         scope_root,
         scope_facts,
         expiry,
     )
-    .expect("build cap")
+    .expect("build finite founder credential");
+    (anchor, cap)
 }
 
 /// A fresh pile file in a temp dir, seeded with the given cap+sig
@@ -117,8 +129,8 @@ async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
 }
 
 /// Bring one node up over the TestNetwork: bind the endpoint, wire the
-/// full production transport stack (`bind_with_endpoint`: DHT node,
-/// protocol router, gossip topic), spawn the host loop as a tokio
+/// full production transport stack (`bind_with_endpoint`: DHT node and
+/// protocol router), spawn the host loop as a tokio
 /// task, and wrap the pile in a `Peer`.
 async fn bring_up(
     network: &TestNetwork,
@@ -133,22 +145,13 @@ async fn bring_up(
     let ep = test_endpoint(network, secret).await;
     let config = PeerConfig {
         peers: bootstrap,
-        gossip: true,
         team_root,
         self_cap,
-        direction: SyncDirection::Bidirectional,
     };
     let harness = triblespace_net::transport::iroh::bind_with_endpoint(ep, &config).await;
     let (sender, receiver, wiring) = host::wire(id);
     tokio::spawn(host::run_host(harness, config, wiring));
-    Peer::with_wiring(
-        store,
-        signing_key.clone(),
-        SyncDirection::Bidirectional,
-        team_root,
-        sender,
-        receiver,
-    )
+    Peer::with_wiring(store, signing_key.clone(), team_root, sender, receiver)
 }
 
 fn init_tracing() {
@@ -163,7 +166,7 @@ fn init_tracing() {
 
 /// The shared two-node bring-up: team root + two admin caps, two piles
 /// (both seeded with both chains), A up first with no bootstrap, B up
-/// second bootstrapping its gossip mesh + DHT off A.
+/// second bootstrapping its DHT off A.
 struct TwoNodes {
     repo_a: Repository<Peer<Pile>>,
     repo_b: Repository<Peer<Pile>>,
@@ -173,11 +176,11 @@ struct TwoNodes {
 async fn two_nodes(network: &TestNetwork, ka: &SigningKey, kb: &SigningKey) -> TwoNodes {
     let root = key(0xF0);
     let team_root = root.verifying_key();
-    let cap_a = admin_cap(&root, ka);
-    let cap_b = admin_cap(&root, kb);
+    let (anchor_a, cap_a) = admin_cap(&root, ka);
+    let (anchor_b, cap_b) = admin_cap(&root, kb);
     let self_cap_a = (&cap_a.1).get_handle().raw;
     let self_cap_b = (&cap_b.1).get_handle().raw;
-    let caps = [cap_a, cap_b];
+    let caps = [anchor_a, cap_a, anchor_b, cap_b];
 
     let dir = tempfile::tempdir().expect("temp dir for piles");
     let pile_a = fresh_pile(dir.path(), "a.pile", &caps);

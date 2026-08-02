@@ -655,7 +655,6 @@ impl From<TryFromSliceError> for UpdatePinErr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo::branch_frontier::PartialCommitDag;
     use futures::executor::block_on;
     use object_store::memory::InMemory;
 
@@ -689,9 +688,9 @@ mod tests {
             StoredCommitError::Read(GetBlobErr::Conversion(_))
         ));
 
-        // The sync edge adapter preserves the same absence semantics used by
-        // Repository's frontier resolver.
-        let mut blocking = crate::repo::async_store::Blocking::new(reader).unwrap();
-        assert_eq!(blocking.parents(missing).unwrap(), ParentLookup::Missing);
+        // This remote lookup intentionally remains async. `Blocking` does not
+        // make a networked DAG satisfy the resolver's local-only
+        // `PartialCommitDag` contract: forged pre-verification claims must not
+        // be able to trigger object-store GETs through a synchronous facade.
     }
 }

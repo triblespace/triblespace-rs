@@ -208,10 +208,10 @@ impl Yard {
     /// truncated**. Repair is an explicit opt-in via [`Yard::amputate`]
     /// (mirroring [`Pile::refresh`] vs [`Pile::amputate`]).
     ///
-    /// The weak-pin state is rebuilt from the durable weak-pin markers found
-    /// in the generation piles (old to young, so the young generation's
-    /// markers override older ones), fixing the restart amnesia the previous
-    /// in-memory-only weak state had.
+    /// Strong-pin state is loaded exclusively from the young generation: it
+    /// is the authoritative mutable-pin ledger, so a tombstone there can
+    /// never expose a stale value from an older generation. Weak-pin state is
+    /// rebuilt from the durable weak-pin markers found in every generation.
     pub fn open<P>(
         paths: impl IntoIterator<Item = P>,
         config: YardConfig,
@@ -275,6 +275,29 @@ impl Yard {
         if generations.is_empty() {
             return Err(YardOpenError::NoGenerations);
         }
+        // Mutable strong-pin state belongs exclusively to the young pile.
+        // Older generations may retain stale pin records from an earlier
+        // layout or interrupted migration; folding them together would let a
+        // young tombstone resurrect an obsolete head.
+        let young_path = generations[0].active_mut().path.clone();
+        let durable_pins = generations[0]
+            .active_mut()
+            .pile_mut()
+            .pin_snapshot()
+            .map_err(|err| YardOpenError::Pile {
+                path: young_path,
+                err,
+            })?;
+        let mut strong_pins = StrongPins::new();
+        for raw in &durable_pins {
+            let head = durable_pins
+                .get(raw)
+                .copied()
+                .expect("key from PATCH iterator must resolve in the same PATCH")
+                .transmute();
+            strong_pins.replace(&Entry::with_value(raw, head));
+        }
+
         // Reload the durable weak pins. Iterate old -> young so a young
         // marker (re-)pins last and wins the LRU recency slot; each pile's
         // own set is already LWW-resolved by its log order. (In practice
@@ -290,7 +313,7 @@ impl Yard {
         Ok(Self {
             generations,
             config,
-            strong_pins: StrongPins::new(),
+            strong_pins,
             weak_state: Arc::new(Mutex::new(weak_state)),
         })
     }
@@ -318,20 +341,38 @@ impl Yard {
     }
 
     /// Strongly pin a blob as the current head for `pin`.
-    pub fn pin_strong<S>(&mut self, pin: Id, handle: Inline<Handle<S>>)
+    pub fn pin_strong<S>(
+        &mut self,
+        pin: Id,
+        handle: Inline<Handle<S>>,
+    ) -> Result<(), PileWriteError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
-        let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
-        let raw: RawId = pin.into();
-        self.strong_pins.replace(&Entry::with_value(&raw, handle));
+        let new: Inline<Handle<SimpleArchive>> = handle.transmute();
+        loop {
+            let old = self.head(pin).expect("yard head lookup is infallible");
+            match self.update(pin, old, Some(new))? {
+                PushResult::Success() => return Ok(()),
+                // `update` synchronizes the in-memory snapshot to the young
+                // pile on conflict. Retrying makes this convenience method an
+                // unconditional set even if another Pile handle appended in
+                // between opening the yard and this call.
+                PushResult::Conflict(_) => {}
+            }
+        }
     }
 
     /// Remove a strong pin.
-    pub fn unpin_strong(&mut self, pin: Id) {
-        let raw: RawId = pin.into();
-        self.strong_pins.remove(&raw);
+    pub fn unpin_strong(&mut self, pin: Id) -> Result<(), PileWriteError> {
+        loop {
+            let old = self.head(pin).expect("yard head lookup is infallible");
+            match self.update(pin, old, None)? {
+                PushResult::Success() => return Ok(()),
+                PushResult::Conflict(_) => {}
+            }
+        }
     }
 
     /// Returns whether `handle` is resident (live) in any generation.
@@ -359,14 +400,28 @@ impl Yard {
         Ok(assertions)
     }
 
-    /// Re-append the surviving weak-pin markers to the young generation's
-    /// pile. A pile rewrite ([`reclaim_generation`]) transfers only live
-    /// blobs, so it drops the weak-pin marker records along with the dead
-    /// bytes; whenever the young pile is rewritten the current weak set must
-    /// be re-recorded (surviving pins re-recorded, evicted ones dropped —
-    /// eviction already removed them from the in-memory set).
-    fn rerecord_weak_markers(&mut self) -> Result<(), std::io::Error> {
-        let pins: Vec<Inline<Handle<UnknownBlob>>> = {
+    /// Re-append the authoritative mutable state to the young generation
+    /// after a pile rewrite. [`reclaim_generation`] transfers blobs and
+    /// assertions, not mutable pin records, so both surviving strong heads
+    /// and weak markers must be emitted again. Missing strong entries are
+    /// deliberately not reconstructed as tombstones: because only the young
+    /// pile is authoritative, absence in the rewritten ledger is the durable
+    /// deleted state and older generations are never consulted.
+    fn rerecord_young_pin_state(&mut self) -> Result<(), std::io::Error> {
+        let strong_pins: Vec<(Id, Inline<Handle<SimpleArchive>>)> = (&self.strong_pins)
+            .into_iter()
+            .map(|raw| {
+                let id = Id::new(*raw).expect("nil pin id in yard strong pins");
+                let head = self
+                    .strong_pins
+                    .get(raw)
+                    .copied()
+                    .expect("key from PATCH iterator must resolve in the same PATCH")
+                    .transmute();
+                (id, head)
+            })
+            .collect();
+        let weak_pins: Vec<Inline<Handle<UnknownBlob>>> = {
             let weak_state = self.weak_state.lock().expect("weak pin mutex poisoned");
             (&weak_state.pins)
                 .into_iter()
@@ -374,7 +429,17 @@ impl Yard {
                 .collect()
         };
         let pile = self.generations[0].active_mut().pile_mut();
-        for handle in pins {
+        for (id, head) in strong_pins {
+            match pile.update(id, None, Some(head)).map_err(pile_write_io)? {
+                PushResult::Success() => {}
+                PushResult::Conflict(current) => {
+                    return Err(std::io::Error::other(format!(
+                        "rewritten young pile unexpectedly retained pin {id:?} at {current:?}"
+                    )));
+                }
+            }
+        }
+        for handle in weak_pins {
             pile.pin_weak(handle).map_err(|err| match err {
                 PileWriteError::IoError(io) => io,
             })?;
@@ -484,11 +549,11 @@ impl Yard {
         for level in dumped {
             self.reclaim_segment(level, 0)
                 .map_err(YardCollectError::Reclaim)?;
-            // The rewrite dropped the young pile's weak-pin markers along
-            // with its dead bytes; re-record the surviving weak set.
+            // The rewrite dropped the young pile's mutable pin records along
+            // with its dead bytes; re-record the complete authoritative state.
             if level == 0 {
-                self.rerecord_weak_markers()
-                    .map_err(YardCollectError::WeakMarkers)?;
+                self.rerecord_young_pin_state()
+                    .map_err(YardCollectError::PinState)?;
             }
         }
 
@@ -509,12 +574,11 @@ impl Yard {
             for index in 0..self.generations[level].segments.len() {
                 self.reclaim_segment(level, index)?;
             }
-            // The rewrite dropped the young pile's weak-pin markers along
-            // with its dead bytes; re-record the surviving weak set so the
-            // pins stay durable (evicted ones are simply not re-recorded).
+            // The rewrite dropped the young pile's mutable pin records along
+            // with its dead bytes; re-record the complete authoritative state.
             if level == 0 {
-                self.rerecord_weak_markers()
-                    .map_err(YardReclaimError::WeakMarkers)?;
+                self.rerecord_young_pin_state()
+                    .map_err(YardReclaimError::PinState)?;
             }
         }
         Ok(())
@@ -651,7 +715,7 @@ impl BranchAssertionStore for Yard {
 impl PinStore for Yard {
     type PinsError = Infallible;
     type HeadError = Infallible;
-    type UpdateError = Infallible;
+    type UpdateError = PileWriteError;
 
     type ListIter<'a> = std::vec::IntoIter<Result<Id, Infallible>>;
 
@@ -684,11 +748,30 @@ impl PinStore for Yard {
         if current != old {
             return Ok(PushResult::Conflict(current));
         }
-        match new {
-            Some(new) => self.pin_strong(id, new),
-            None => self.unpin_strong(id),
+        if current == new {
+            return Ok(PushResult::Success());
         }
-        Ok(PushResult::Success())
+
+        // The young Pile is the durable source of truth. Append and replay
+        // its record first; only publish the new in-memory snapshot after the
+        // write succeeds. A failed write therefore cannot expose state that a
+        // reopen would forget.
+        let persisted = self.generations[0]
+            .active_mut()
+            .pile_mut()
+            .update(id, old, new)?;
+        let (persisted_head, outcome) = match persisted {
+            PushResult::Success() => (new, PushResult::Success()),
+            PushResult::Conflict(actual) => (actual, PushResult::Conflict(actual)),
+        };
+        match persisted_head {
+            Some(head) => {
+                self.strong_pins
+                    .replace(&Entry::with_value(&raw, head.transmute()));
+            }
+            None => self.strong_pins.remove(&raw),
+        }
+        Ok(outcome)
     }
 }
 
@@ -1051,8 +1134,12 @@ impl Iterator for YardListIter {
 }
 
 fn update_err_io(err: PileWriteError) -> YardOpenError {
+    YardOpenError::Io(pile_write_io(err))
+}
+
+fn pile_write_io(err: PileWriteError) -> std::io::Error {
     match err {
-        PileWriteError::IoError(io) => YardOpenError::Io(io),
+        PileWriteError::IoError(io) => io,
     }
 }
 
@@ -1237,7 +1324,7 @@ pub enum YardCollectError {
     Transfer(TransferError<Infallible, YardGetError<Infallible>, InsertError>),
     Flush(super::pile::FlushError),
     Reclaim(YardReclaimError),
-    WeakMarkers(std::io::Error),
+    PinState(std::io::Error),
 }
 
 impl fmt::Display for YardCollectError {
@@ -1250,8 +1337,8 @@ impl fmt::Display for YardCollectError {
             Self::Reclaim(err) => {
                 write!(f, "failed to recycle compacted yard generation: {err}")
             }
-            Self::WeakMarkers(err) => {
-                write!(f, "failed to re-record weak-pin markers: {err}")
+            Self::PinState(err) => {
+                write!(f, "failed to re-record young-generation pin state: {err}")
             }
         }
     }
@@ -1281,7 +1368,7 @@ pub enum YardReclaimError {
     Assertions(PileAssertionError),
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     Close(super::pile::FlushError),
-    WeakMarkers(std::io::Error),
+    PinState(std::io::Error),
     /// A generation rewrite failed (`primary`) and the subsequent
     /// fail-loud reopen of the generation file also failed (`err`). The
     /// segment is left closed; nothing was truncated.
@@ -1303,8 +1390,8 @@ impl fmt::Display for YardReclaimError {
             Self::Assertions(err) => write!(f, "failed to preserve yard assertions: {err}"),
             Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
-            Self::WeakMarkers(err) => {
-                write!(f, "failed to re-record weak-pin markers: {err}")
+            Self::PinState(err) => {
+                write!(f, "failed to re-record young-generation pin state: {err}")
             }
             Self::Reopen { path, primary, err } => write!(
                 f,
@@ -1394,7 +1481,7 @@ mod tests {
         yard.pin_weak(weak).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"weak")).unwrap();
 
-        yard.pin_strong(pin_id(1), strong);
+        yard.pin_strong(pin_id(1), strong).unwrap();
         yard.collect().unwrap();
         let reader = yard.reader().unwrap();
 
@@ -1545,7 +1632,7 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(child.raw.to_vec()))
             .unwrap();
 
-        yard.pin_strong(pin_id(2), parent);
+        yard.pin_strong(pin_id(2), parent).unwrap();
         yard.collect().unwrap();
         let reader = yard.reader().unwrap();
 
@@ -1565,7 +1652,7 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(absent.raw.to_vec()))
             .unwrap();
 
-        yard.pin_strong(pin_id(3), parent);
+        yard.pin_strong(pin_id(3), parent).unwrap();
         yard.pin_weak(absent).unwrap();
 
         yard.collect().unwrap();
@@ -1594,7 +1681,7 @@ mod tests {
         let weak = Blob::<RawBytes>::new(raw_blob(b"cache")).get_handle();
         yard.pin_weak(weak).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cache")).unwrap();
-        yard.pin_strong(pin_id(4), strong);
+        yard.pin_strong(pin_id(4), strong).unwrap();
 
         yard.compact().unwrap();
 
@@ -1625,7 +1712,7 @@ mod tests {
         let strong = yard
             .put::<RawBytes, _>(Bytes::from_source(vec![b'S'; 512]))
             .unwrap();
-        yard.pin_strong(pin_id(7), strong);
+        yard.pin_strong(pin_id(7), strong).unwrap();
         // Dead bytes physically present in gen 0, so there is genuinely
         // something for the merge to reclaim.
         let _dead = yard
@@ -1654,7 +1741,7 @@ mod tests {
         let old = yard.put::<RawBytes, _>(raw_blob(b"old")).unwrap();
         let pin = pin_id(5);
 
-        yard.pin_strong(pin, old);
+        yard.pin_strong(pin, old).unwrap();
         yard.collect().unwrap();
         assert_eq!(
             get_raw(&yard.reader().unwrap(), old).unwrap(),
@@ -1662,7 +1749,7 @@ mod tests {
         );
 
         let new = yard.put::<RawBytes, _>(raw_blob(b"new")).unwrap();
-        yard.pin_strong(pin, new);
+        yard.pin_strong(pin, new).unwrap();
         yard.collect().unwrap();
         let reader = yard.reader().unwrap();
 
@@ -1686,7 +1773,7 @@ mod tests {
             .put::<RawBytes, _>(Bytes::from_source(vec![b'E'; 4096]))
             .unwrap();
 
-        yard.pin_strong(pin_id(6), live);
+        yard.pin_strong(pin_id(6), live).unwrap();
         yard.collect().unwrap();
         let before_size = fs::metadata(&paths[0]).unwrap().len();
         let before_count = pile_blob_count(&paths[0]);
@@ -1885,6 +1972,142 @@ mod tests {
             PushResult::Success()
         ));
         assert_eq!(yard.head(pin).unwrap(), None);
+    }
+
+    /// A Yard pin is not merely a process-local retention hint: its head and
+    /// complete locally-present closure survive restart, generation movement,
+    /// and both physical rewrite paths.
+    #[test]
+    fn strong_pin_and_reachable_closure_survive_reopen_compact_and_reclaim() {
+        let config = YardConfig {
+            weak_budget: 0,
+            strong_level_budget: 0,
+            fanout: 1,
+        };
+        let (_dir, paths, mut yard) = yard_with_paths(2, config);
+        let child = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"reachable child".to_vec()))
+            .unwrap();
+        let parent = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(child.raw.to_vec()))
+            .unwrap();
+        let pin = pin_id(10);
+        let parent_head: Inline<Handle<SimpleArchive>> = parent.transmute();
+
+        assert!(matches!(
+            yard.update(pin, None, Some(parent_head)).unwrap(),
+            PushResult::Success()
+        ));
+        yard.close().unwrap();
+
+        let mut reopened = Yard::open(paths.clone(), config).unwrap();
+        assert_eq!(reopened.head(pin).unwrap(), Some(parent_head));
+        reopened.compact().unwrap();
+        assert!(reopened.contains_in_generation(1, parent));
+        assert!(reopened.contains_in_generation(1, child));
+        reopened.reclaim().unwrap();
+        reopened.close().unwrap();
+
+        let mut final_open = Yard::open(paths, config).unwrap();
+        assert_eq!(final_open.head(pin).unwrap(), Some(parent_head));
+        final_open.collect().unwrap();
+        let reader = final_open.reader().unwrap();
+        assert_eq!(
+            reader
+                .get::<Bytes, UnknownBlob>(parent)
+                .expect("durable pin head was reclaimed"),
+            Bytes::from_source(child.raw.to_vec())
+        );
+        assert_eq!(
+            reader
+                .get::<Bytes, UnknownBlob>(child)
+                .expect("durable pin closure was reclaimed"),
+            Bytes::from_source(b"reachable child".to_vec())
+        );
+    }
+
+    /// Only the young generation's mutable-pin ledger is authoritative. A
+    /// young tombstone must continue to mask a stale older head even after a
+    /// compact rewrite drops the tombstone record itself.
+    #[test]
+    fn young_tombstone_cannot_resurrect_stale_older_pin_after_compact() {
+        let config = YardConfig {
+            weak_budget: 0,
+            strong_level_budget: 0,
+            fanout: 1,
+        };
+        let (_dir, paths, yard) = yard_with_paths(2, config);
+        yard.close().unwrap();
+
+        let stale_pin = pin_id(11);
+        let stale;
+        {
+            let mut old = Pile::open(&paths[1]).unwrap();
+            old.refresh().unwrap();
+            stale = old
+                .put::<UnknownBlob, _>(Bytes::from_source(b"stale older root".to_vec()))
+                .unwrap();
+            assert!(matches!(
+                old.update(stale_pin, None, Some(stale.transmute()))
+                    .unwrap(),
+                PushResult::Success()
+            ));
+            old.close().unwrap();
+        }
+        {
+            let mut young = Pile::open(&paths[0]).unwrap();
+            young.refresh().unwrap();
+            let stale_head = Some(stale.transmute());
+            assert!(matches!(
+                young.update(stale_pin, None, stale_head).unwrap(),
+                PushResult::Success()
+            ));
+            assert!(matches!(
+                young.update(stale_pin, stale_head, None).unwrap(),
+                PushResult::Success()
+            ));
+            young.close().unwrap();
+        }
+
+        let mut yard = Yard::open(paths.clone(), config).unwrap();
+        assert_eq!(yard.head(stale_pin).unwrap(), None);
+
+        // Keep a different strong root so compact must recycle the young
+        // pile. Its rewrite deliberately emits only the current map, not a
+        // tombstone for the deleted stale pin.
+        let survivor = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"survivor".to_vec()))
+            .unwrap();
+        let survivor_pin = pin_id(12);
+        yard.pin_strong(survivor_pin, survivor).unwrap();
+        yard.compact().unwrap();
+        yard.close().unwrap();
+
+        // Prove the stale older record still physically exists; correctness
+        // comes from the young-authority rule rather than accidental cleanup.
+        {
+            let mut old = Pile::open(&paths[1]).unwrap();
+            old.refresh().unwrap();
+            assert_eq!(old.head(stale_pin).unwrap(), Some(stale.transmute()));
+            old.close().unwrap();
+        }
+
+        let mut reopened = Yard::open(paths, config).unwrap();
+        assert_eq!(reopened.head(stale_pin).unwrap(), None);
+        assert_eq!(
+            reopened.head(survivor_pin).unwrap(),
+            Some(survivor.transmute())
+        );
+        reopened.collect().unwrap();
+        let reader = reopened.reader().unwrap();
+        assert!(matches!(
+            reader.get::<Bytes, UnknownBlob>(stale),
+            Err(YardGetError::NotFound)
+        ));
+        assert_eq!(
+            reader.get::<Bytes, UnknownBlob>(survivor).unwrap(),
+            Bytes::from_source(b"survivor".to_vec())
+        );
     }
 
     mod dst {
@@ -2316,10 +2539,10 @@ mod tests {
                         if !model.handles.is_empty() {
                             let pin = pin_id(rng.index(PIN_COUNT));
                             let raw = model.handles[rng.index(model.handles.len())];
-                            yard.pin_strong(pin, unknown(raw));
+                            yard.pin_strong(pin, unknown(raw)).unwrap();
                         }
                     }
-                    3 => yard.unpin_strong(pin_id(rng.index(PIN_COUNT))),
+                    3 => yard.unpin_strong(pin_id(rng.index(PIN_COUNT))).unwrap(),
                     4 => {
                         let raw = choose_weak_target(&yard, &mut rng, &mut model, weak_pin_mode);
                         yard.pin_weak(unknown(raw)).unwrap();
@@ -2426,7 +2649,7 @@ mod tests {
                 .put::<UnknownBlob, _>(Bytes::from_source(b"tenured then weak".to_vec()))
                 .unwrap();
 
-            yard.pin_strong(pin_id(0), tenured);
+            yard.pin_strong(pin_id(0), tenured).unwrap();
             yard.compact().unwrap();
             assert!(yard.contains_in_generation(2, tenured));
 

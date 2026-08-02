@@ -15,24 +15,20 @@
 //! Operations:
 //!   AUTH       cap_handle:32 → resp:u8                (0x00 = OK, 0x01 = REJECTED)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
-//!   CHILDREN   parent:32 → hash* nil                  (nil = end)
 //!   (protocol is read-only — no remote writes)
 //!
-//! Legacy scalar-HEAD observations are gossip-driven, not ALPN-driven.
-//! `CHILDREN` is an untrusted batching hint for store-relative conservative
-//! references: clients bind every hint to content-verified parent bytes and
-//! independently hash-verify every fetched child. Earlier protocol versions
-//! also had `OP_LIST` and `OP_HEAD`; both are retired.
+//! Earlier protocol versions also had `OP_LIST`, `OP_CHILDREN`, and `OP_HEAD`;
+//! all three are retired.
 //! None of these legacy surfaces replicate StrongPin branch authority: there
 //! is not yet a wire operation for signed branch assertions or their exact
 //! `(author key, name handle)` identity.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/4";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/5";
 
 // Operation types — first byte on each stream.
 // 0x01 was OP_LIST, retired with peer-local scalar branch discovery.
 pub const OP_GET_BLOB: u8 = 0x02;
-pub const OP_CHILDREN: u8 = 0x03;
+// 0x03 was OP_CHILDREN, retired with legacy mutable-HEAD replication.
 // 0x04 was OP_HEAD, retired alongside OP_LIST.
 /// First stream on every connection. Body: cap_handle:32. Response: u8
 /// status (`AUTH_OK` or `AUTH_REJECTED`). Connection state caches the
@@ -50,10 +46,6 @@ pub const AUTH_OK: u8 = 0x00;
 /// The connection should be closed by the client.
 pub const AUTH_REJECTED: u8 = 0x01;
 
-/// Terminates a variable-length child-hint response. The all-zero value cannot
-/// be a valid BLAKE3 content handle.
-pub const NIL_HASH: RawHash = [0u8; 32];
-
 /// Largest blob accepted from one `GET_BLOB` response.
 ///
 /// The limit is checked against the declared wire length before allocating the
@@ -62,13 +54,7 @@ pub const NIL_HASH: RawHash = [0u8; 32];
 /// by this protocol version.
 pub const MAX_GET_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
-/// Largest number of hashes accepted from one untrusted `CHILDREN` response.
-/// This independently bounds response growth even when a parent contains many
-/// aligned 32-byte words.
-pub const MAX_CHILD_HINTS: usize = 65_536;
-
 pub type RawHash = [u8; 32];
-pub type RawPinId = [u8; 16];
 
 // ── Send/Recv helpers ────────────────────────────────────────────────
 //
@@ -172,36 +158,6 @@ async fn recv_blob_response<R: AsyncRead + Unpin>(
     Ok(Some(data))
 }
 
-/// CHILDREN: get untrusted store-relative child hints for a parent blob.
-/// Nil hash terminates. Callers must bind each hint to verified parent bytes
-/// and hash-verify fetched children; this response is not a completeness proof.
-pub async fn op_children<C: Conn>(conn: &C, parent: &RawHash) -> Result<Vec<RawHash>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, OP_CHILDREN).await?;
-    send_hash(&mut send, parent).await?;
-    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
-
-    recv_children_response(&mut recv, MAX_CHILD_HINTS).await
-}
-
-async fn recv_children_response<R: AsyncRead + Unpin>(
-    recv: &mut R,
-    max_children: usize,
-) -> Result<Vec<RawHash>> {
-    let mut children = Vec::new();
-    loop {
-        let hash = recv_hash(recv).await?;
-        if hash == NIL_HASH {
-            break;
-        }
-        if children.len() >= max_children {
-            return Err(anyhow!("CHILDREN response exceeds limit {max_children}"));
-        }
-        children.push(hash);
-    }
-    Ok(children)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,18 +171,5 @@ mod tests {
 
         let error = recv_blob_response(&mut reader, 8).await.unwrap_err();
         assert!(error.to_string().contains("exceeds limit 8"));
-    }
-
-    #[tokio::test]
-    async fn child_response_is_bounded_before_an_extra_push() {
-        let (mut writer, mut reader) = tokio::io::duplex(128);
-        tokio::spawn(async move {
-            for byte in 1..=3 {
-                send_hash(&mut writer, &[byte; 32]).await.unwrap();
-            }
-        });
-
-        let error = recv_children_response(&mut reader, 2).await.unwrap_err();
-        assert!(error.to_string().contains("exceeds limit 2"));
     }
 }

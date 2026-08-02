@@ -1,7 +1,7 @@
 //! `trible pile pin …` — generic operations on the pin storage
 //! primitive. Pins are atomically-updatable handles to SimpleArchive blobs.
-//! They remain useful for replica-local tracking mirrors and policy state, but
-//! they are not StrongPin branch authority.
+//! They remain useful for local retention and policy state, but they are not
+//! StrongPin branch authority.
 //!
 //! Signed branches live under `trible pile branch …` and are selected by their
 //! full `(author key, name handle)` identity. This lower-level surface sees
@@ -23,7 +23,7 @@ use triblespace_core::trible::TribleSet;
 #[derive(Parser)]
 pub enum Command {
     /// List every local/legacy pin in a pile, classified by role (LEGACY-BRANCH /
-    /// TRACKING / POLICY / UNNAMED / UNREADABLE). Signed StrongPin branches are
+    /// POLICY / UNNAMED / UNREADABLE). Signed StrongPin branches are
     /// separate state inspected with `pile branch list`.
     List {
         /// Path to the pile file to inspect.
@@ -39,13 +39,13 @@ pub enum Command {
         pin: String,
     },
     /// Tombstone a pin by writing a None head via CAS. Any role
-    /// (legacy branch / tracking / policy / unnamed) — the storage
+    /// (legacy branch / policy / unnamed) — the storage
     /// primitive doesn't discriminate. The pin's reachable blobs may
     /// become unreachable; physical reclamation requires a separate
     /// retention rewrite.
     ///
     /// StrongPin branches cannot be deleted through this command. This is the
-    /// raw local path for stale tracking pins or incorrect policy entries.
+    /// raw local path for incorrect policy or retention entries.
     Delete {
         /// Path to the pile file to modify.
         path: PathBuf,
@@ -66,9 +66,6 @@ pub fn run(cmd: Command) -> Result<()> {
 enum Role {
     /// A pin carrying `metadata::name` — a legacy mutable branch head.
     Branch(String),
-    /// A pin carrying `tracking_remote_pin` — mirrors a remote
-    /// peer's branch head.
-    Tracking,
     /// A pin carrying `local_only_pin` — renewal policy, pending
     /// requests, per-team-cap holding, etc.
     LocalOnly,
@@ -88,7 +85,6 @@ impl Role {
     fn label(&self) -> &'static str {
         match self {
             Role::Branch(_) => "LEGACY-BRANCH",
-            Role::Tracking => "TRACKING",
             Role::LocalOnly => "POLICY",
             Role::Unnamed => "UNNAMED",
             Role::Unreadable(_) => "UNREADABLE",
@@ -104,9 +100,9 @@ impl Role {
 }
 
 fn classify(meta: &TribleSet, pin_id: Id) -> Role {
-    // Branch and tracking markers belong to the unique metadata entity for
-    // this pin. Carried annotations may use the same attributes and must not
-    // change the pin's role.
+    // Branch markers belong to the unique metadata entity for this pin.
+    // Carried annotations may use the same attributes and must not change the
+    // pin's role.
     if let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, pin_id) {
         let mut name_iter = find!(
             h: Inline<Handle<triblespace_core::blob::encodings::longstring::LongString>>,
@@ -117,14 +113,6 @@ fn classify(meta: &TribleSet, pin_id: Id) -> Role {
             // LongString would require another blob fetch, so expose its exact
             // handle instead of implying a relationship to StrongPin state.
             return Role::Branch(format!("name-handle=blake3:{}", hex::encode(name.raw)));
-        }
-
-        let mut tracking_iter = find!(
-            v: Id,
-            pattern!(meta, [{ branch_entity @ triblespace_net::tracking::tracking_remote_pin: ?v }])
-        );
-        if tracking_iter.next().is_some() {
-            return Role::Tracking;
         }
     }
 

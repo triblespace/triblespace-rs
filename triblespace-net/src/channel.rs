@@ -1,9 +1,7 @@
 //! Channel types bridging the async network thread and the sync store layer.
 //!
 //! `NetCommand`: outgoing effects sent from a [`Peer`](crate::peer::Peer)
-//! into the network thread. All fire-and-forget — there are no RPC
-//! variants because legacy scalar-HEAD observation is gossip-driven, not
-//! peer-targeted. Signed assertions are outside this channel today.
+//! into the network thread. All fire-and-forget.
 //! `NetEvent`: incoming data sent back from the network thread to be
 //! applied into the wrapped store.
 //!
@@ -15,31 +13,24 @@
 
 use anybytes::Bytes;
 
-use crate::protocol::{RawHash, RawPinId};
+use crate::protocol::RawHash;
 
 /// A 32-byte endpoint/publisher hint carried by legacy transport.
 pub type PublisherKey = [u8; 32];
 
 /// Commands sent to the network thread.
 ///
-/// The surface is minimal by design — legacy mutable-HEAD observation is
-/// gossip-driven (HEAD frames flood the team topic; the network
-/// thread autonomously walks content-bound, store-relative hints via the DHT-routed
-/// `OP_GET_BLOB` + `OP_CHILDREN` path). No peer-targeted RPCs.
+/// The surface is minimal by design.
 pub enum NetCommand {
     /// Announce a blob hash to the DHT (fire-and-forget). Local
     /// puts trigger this; new providers improve the swarm's
     /// content-distribution fan-out.
     Announce(RawHash),
-    /// Gossip a legacy mutable-pin HEAD change (fire-and-forget). Eligible
-    /// local pin updates trigger this; subscribers on the team topic
-    /// receive the flood message and run a bounded hint walk to catch up.
-    GossipLegacyHead {
-        /// Publisher-scoped id of the legacy mutable pin.
-        pin: RawPinId,
-        /// Hash of the legacy pin-metadata blob carried by the HEAD frame.
-        metadata_head: RawHash,
-    },
+    /// Replace the capability presented on every future outbound pile-sync
+    /// connection. The host evicts all pooled connections when applying this
+    /// command, so no connection authenticated with the predecessor remains
+    /// reusable after credential activation.
+    UpdateSelfCap(RawHash),
     /// Dispatch a freshly-signed cap+sig pair to `subject` via the
     /// auth-handshake ALPN. Used by the renewal daemon (push-based
     /// renewal) and by the `team approve` subcommand (response to a
@@ -66,18 +57,6 @@ pub enum NetCommand {
 /// Events received from the network thread.
 #[derive(Debug)]
 pub enum NetEvent {
-    /// A blob was fetched from the network.
-    Blob(Bytes),
-    /// A legacy remote HEAD observation was learned via gossip and fetched.
-    /// `publisher` is the frame's routing/namespace hint, not authenticated
-    /// StrongPin provenance.
-    LegacyHead {
-        /// Publisher-scoped id of the observed legacy mutable pin.
-        pin: RawPinId,
-        /// Hash of the fetched legacy pin-metadata blob.
-        metadata_head: RawHash,
-        publisher: PublisherKey,
-    },
     /// A peer asked us to issue them a capability. The partial cap
     /// blob carries the subject they're requesting for (must match
     /// `requester` — verified at connection time via iroh's TLS),
@@ -87,6 +66,11 @@ pub enum NetEvent {
     CapRequest {
         requester: PublisherKey,
         partial_cap_bytes: Bytes,
+        /// Admission token for the bounded pre-policy request queue. Keeping
+        /// the permit in the event means capacity is released automatically
+        /// when the Peer consumes or drops this request; no acknowledgement
+        /// channel or separate queue ledger is needed.
+        admission: tokio::sync::OwnedSemaphorePermit,
     },
     /// A peer issued us a capability — either in response to a prior
     /// `CapRequest` we made, or as an unsolicited renewal push. The
@@ -96,6 +80,17 @@ pub enum NetEvent {
         issuer: PublisherKey,
         cap_bytes: Bytes,
         sig_bytes: Bytes,
+        /// Every non-leaf member of the complete bounded proof closure used
+        /// during verification, including members already present in the
+        /// host snapshot. The complete bundle is one event so a snapshot
+        /// rotation cannot separate the active leaf from its proof.
+        proof_blobs: Vec<Bytes>,
+        /// Inclusive upper bound of the verified authority's lifetime: the
+        /// earliest deadline in the entire delegation chain, not merely the
+        /// leaf capability's declared expiry.
+        authority_expires_at: hifitime::Epoch,
+        /// Bounds verified deliveries waiting for synchronous persistence.
+        admission: tokio::sync::OwnedSemaphorePermit,
     },
     /// `subject` successfully authenticated against our pile-sync
     /// `OP_AUTH` stream by presenting signature handle `sig_handle`.
@@ -114,5 +109,9 @@ pub enum NetEvent {
     CapDeliveryConfirmed {
         subject: PublisherKey,
         sig_handle: RawHash,
+        /// Best-effort notification queue admission. Dropping a confirmation
+        /// is safe: the issuer simply keeps the renewal entry eligible for a
+        /// later redispatch/auth confirmation.
+        admission: tokio::sync::OwnedSemaphorePermit,
     },
 }

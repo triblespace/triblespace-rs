@@ -13,23 +13,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity is now expressible as the intrinsic two-fact `(author key, name
   handle)` descriptor, while one canonical 160-byte Ed25519 assertion carries
   exactly that descriptor and a commit. Public assertion values are
-  verified-only; their opaque PATCH snapshot derives every 48-byte
-  `BranchId || AssertionId` key from the value and exposes no replacement,
-  deletion, CAS, or scalar-head operation. A partial-DAG resolver distinguishes
+  verified-only; pile replay retains structurally decoded witnesses behind an
+  opaque PATCH snapshot and derives every 48-byte `BranchId || AssertionId`
+  key from the value without verifying every historical signature on open.
+  Resolution groups equal `(exact identity, commit)` claims, verifies a
+  surviving witness before exposing any tip or demand, drops an all-invalid
+  claim and recomputes domination, and memoizes both valid and invalid results.
+  The snapshot exposes no replacement, deletion, CAS, or scalar-head
+  operation. A partial-DAG resolver distinguishes
   an unreadable target (`TipPending`) from readable candidates with unknown
   ancestry (`Partial`) and the true maximal antichain (`Complete`). Partial
   frontiers expose only a candidate-root descriptor and cannot be
   checked out or license an asserted merge; complete divergence builds one
   deterministic flat authorless merge.
-  Generated acyclic-DAG tests pin delivery-order independence and
-  `Max(Max(A) ∪ B) = Max(A ∪ B)`.
+  Generated acyclic-DAG tests pin resolution-order independence for one fixed
+  replica snapshot and `Max(Max(A) ∪ B) = Max(A ∪ B)`; this does not claim a
+  network delivery protocol or convergence between replicas with different
+  assertion sets.
 - **Pile stores branch assertions as one canonical fixed record.** The new V3
-  record is exactly 256 bytes: its marker, the verified 160-byte signed
-  assertion, and 80 mandatory zero bytes. Replay verifies signatures eagerly,
-  rejects noncanonical padding, and folds assertions into the opaque
+  record is exactly 256 bytes: its marker, the canonical 160-byte signed
+  assertion, and 80 mandatory zero bytes. Replay structurally decodes records
+  with zero signature checks, rejects noncanonical padding, and folds witnesses into the opaque
   `BranchId || AssertionId` PATCH without physical-order semantics. Duplicate
   append is idempotent, concatenated piles union cleanly, and the assertion
-  store crosses `sync_all` before reporting durable success. Legacy CAS branch
+  store crosses `sync_all` before reporting durable success. The explicit
+  forensic record iterator verifies on access and reports a bad signature only
+  as an `InvalidBranchAssertion` id, never as an authenticated claim. Legacy CAS branch
   records remain readable but are not dual-authored by the assertion-native
   path; legacy pile rewrites fail closed rather than silently omit assertions.
 - **Demand-curve receipts render as explicit performance fingerprints.** The
@@ -82,23 +91,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Storage composition now carries assertion authority explicitly.** Async
   adapters expose signed-assertion snapshots and partial commit-DAG lookup;
   `HybridStore` composes a blob store with a separate assertion store; and the
-  lazy wrapper preserves assertion storage while recording genuinely missing
-  commit metadata as durable wants. `ObjectStoreRemote` is intentionally only
+  lazy wrapper preserves assertion storage while keeping commit-DAG ancestry
+  lookup strictly local. Optimistic pre-verification ancestry misses never
+  become weak-pin/network wants; only demand returned after the resolver has
+  verified its surviving claim may cross into fetch policy. The blocking async
+  adapter lowers this trait only for a `SyncAsAsync` store which already
+  satisfies the local contract; a remote `ObjectStoreReader` cannot masquerade
+  as a synchronous resolver DAG. `ObjectStoreRemote` is intentionally only
   a blob plus replica-local-pin backend: its CAS namespace moves from
   `branches/` to `pins/`, reads verify content hashes, and it does not pretend
   generic LIST or file-backend PUT semantics satisfy StrongPin snapshot and
   durability contracts.
-- **Network tracking is an explicit legacy-to-local bridge.** `Peer` forwards
-  local assertion, durability, and partial-DAG capabilities, while mutable
-  tracking pins may feed an explicit caller-controlled merge and locally
-  authored assertion. The default sync loop only records those observations:
-  it never launders an unauthenticated scalar HEAD into local authorship.
-  Legacy hint walks now stream hash-verified partial progress while bounding
-  generations, retries, provider fan-out, concurrency, time, and response
-  growth; store-relative `OP_CHILDREN` hints are never treated as proof of a
-  global closure.
-  Signed assertion replication remains a separate protocol and foreign-author
-  admission milestone.
+- **Network transport now stops cleanly at the StrongPin boundary.** The scalar
+  mutable-HEAD gossip/tracking bridge, publisher-hint state, direction modes,
+  and `OP_CHILDREN` are deleted. Pile-sync v5 exposes only mandatory
+  first-stream `OP_AUTH` and scope-gated `OP_GET_BLOB`; DHT content
+  announcements and durable weak-want fetching remain. `Peer` forwards local
+  assertion, durability, and partial-DAG capabilities, but signed assertion
+  replication and foreign-author admission remain an explicit later protocol.
+  Auth-handshake v2 provides bounded request, delivery, and exact proof-member
+  operations. Proof locators are not secrets: the server fully verifies its
+  local named chain and returns only a member touched by that verification.
+  Cold auth proof stays connection-local, while a delivered leaf pair and
+  parent bundle cross the bounded event bridge together and become active only
+  after complete selected persistence. Capability verification now enforces
+  exact missing handles, leaf-inclusive depth, delegation subject-to-issuer
+  splices, canonical sig-proof shape, scope-limited admin delegation, and the
+  earliest chain expiry during live use. Request/delivery/confirmation queues,
+  connections, and streams are bounded; one subject gets one live inbound
+  connection, including while admitted stream tails drain; idle authority has
+  its own monotonic expiry deadline; complete operation frames are checked at
+  the use boundary; snapshot rebuild failure clears the serving view; and ACK
+  means queue admission rather than durable policy acceptance. `team
+  request-join` now requires `--pile` so outbound join intent is durable;
+  initial delivery must match it and crosses a recoverable
+  pending-to-activating journal before the credential pin changes. Interrupted
+  activation is completed on restart, while later credential selection is
+  monotone in issuer, scope, and effective expiry.
+- **Team roots now sign one explicit `FounderAnchor`, never an artificial
+  long-lived operational cap.** The tagged anchor binds root to founder and
+  maximum scope without `expires_at`; it is valid only as a proof terminator
+  and is rejected as an auth leaf. Every operational credential remains finite,
+  and founder rotations are constant-depth siblings beneath the retained
+  anchor. `build_capability` now requires a parent and
+  `build_founder_anchor` is the sole root constructor. The durable team-cap pin
+  is authoritative over process configuration and atomically retains the live
+  cap/sig pair plus founder rotation authority. An expired but otherwise exact
+  pinned proof starts only recovery services: it cannot perform outbound auth
+  or ordinary authorized work until a fresh sibling or authorized renewal is
+  durably selected. The public recovery verifier preserves every cryptographic,
+  shape, delegation, scope, interval, and depth check while omitting only the
+  wall-clock liveness requirement; malformed or unauthorized pinned state still
+  fails startup loudly.
+  Founder renewal first reconciles the verified active `(subject, scope)` with
+  its unique non-retracted self-policy entry, repairing a crash on either side
+  of the credential/policy boundary without selecting a narrower local entry.
+  It schedules from the verified chain-effective deadline and uses the local
+  delivery marker as a durable proof-snapshot/outbound-auth publication
+  journal.
 - **The command-line branch model is now exact and assertion-native.**
   `trible pile branch` accepts only full `(Ed25519 author, Blake3 name-handle)`
   descriptors, publishes one already-present canonical commit per `assert`,
@@ -1661,20 +1711,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Implemented by the `object_store` backend (`ObjectStoreReader`),
   `Lazy<S>`/`LazyReader` (the waiting read), and `triblespace-net`'s
   `PeerReader` (the transparent local-then-swarm async get).
-- **Live two-pile sync proven over the real iroh transport** (the v0.47.0
-  release gate). `tests/iroh_two_pile_sync.rs` runs two `Peer<Pile>`s over
-  real iroh endpoints (`iroh::test_utils` `TestNetwork` packet layer;
-  everything above it — DHT node, protocol router, OP_AUTH, gossip topic,
-  host loop — is the production stack via
-  `transport::iroh::bind_with_endpoint`): a commit on pile A gossips its
-  HEAD and B's "main" converges to A's head commit (eager), and a
-  never-committed blob held only by A is fetched by B's `Reconciler` from
-  a durable weak-pin want (lazy). `examples/two_pile_sync_demo.rs` proves
-  the same two properties as two OS processes over real UDP/QUIC on
-  loopback (relay-free, `MemoryLookup` direct addressing). To enable the
-  composition, the host wiring (`host::wire` / `host::run_host`) is now
-  public unconditionally rather than behind the `sim` feature —
-  `bind_with_endpoint` was already public for exactly this use.
+- **Live lazy blob convergence is exercised over the real iroh transport.**
+  `tests/iroh_two_pile_sync.rs` runs two `Peer<Pile>`s over real iroh endpoints
+  (`iroh::test_utils`'s `TestNetwork` packet layer) while the production DHT,
+  pile-sync v5 auth/blob protocol, and host loop remain intact. A blob held only
+  by one peer is discovered and fetched by the other's `Reconciler` from a
+  durable weak-pin want. The test deliberately makes no branch-convergence
+  claim; signed assertion replication is not implemented.
 
 - **`Lazy<S>` — the no-network-by-construction lazy reader.**
   New `triblespace_core::repo::lazy` module (exported from the prelude):
@@ -1722,13 +1765,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Reconciler::with_fetch_budget`). Expiry is plain Unavailable — a recorded
   want stays recorded, so an expired budget defers the fetch, never loses
   the demand.
-- **Publisher-first shortcut for read-miss fetches.** The host keeps a small
-  gossip-known publisher registry (most-recent-first, capped at 8), noted on
-  every HEAD frame arrival; on-demand fetches try those publishers directly
-  before falling back to the DHT lookup. Previously the on-demand path always
-  paid the DHT round-trip — and on a dark DHT failed outright even with a
-  reachable publisher one gossip hop away.
-
 - **Durable weak pins.** Two new V3 pile record kinds — weak-pin and
   weak-unpin markers (fixed 256-byte headers, keyed by blob handle, no branch
   id) — make the soft half of the retention lattice
@@ -1756,9 +1792,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under their existing weak pin. A want nobody serves stays pending — normal,
   never an error, never dropped — and is retried with per-want exponential
   backoff (1s doubling to a 60s cap), logged once per state change rather than
-  per retry. Strong pins/branches are untouched. Enabled by default
-  (content-lazy is the doctrine), including under `--read-only` (a leecher
-  that only services wants is a legit workflow); `--no-lazy` disables it,
+  per retry. Strong pins and assertions are untouched. Enabled by default
+  (content-lazy is the doctrine); `--no-lazy` disables it,
   `--reconcile-interval <secs>` tunes the cadence (default 1s). The sync
   output gains want counters (seen / fetched / still-pending) and
   `--quiescent-for` counts a serviced want as activity (pending wants do NOT

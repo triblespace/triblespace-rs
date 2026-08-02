@@ -2,13 +2,12 @@
 //! network, as traits.
 //!
 //! This module exists so the *entire* protocol stack above it — the
-//! host loop, OP_AUTH / OP_CHILDREN / OP_GET_BLOB / OP_DELIVER_CAP
-//! handlers, the legacy content-hint walk, cap verification,
-//! gossip-driven head tracking, the renewal daemon's redispatch — can
+//! host loop, OP_AUTH / OP_GET_BLOB / OP_DELIVER_CAP handlers,
+//! capability verification, and the renewal daemon's redispatch — can
 //! run unmodified against either:
 //!
-//! - [`crate::transport::iroh`]: the production adapter (iroh QUIC,
-//!   iroh-gossip PlumTree, the embedded Kademlia DHT node), or
+//! - [`crate::transport::iroh`]: the production adapter (iroh QUIC and
+//!   the embedded Kademlia DHT node), or
 //! - a deterministic in-memory simulator (discrete-event router with
 //!   seeded delays, drops, partitions, and crashes) for
 //!   FoundationDB/TigerBeetle-style simulation testing.
@@ -18,7 +17,7 @@
 //! auth semantics, scope checks) lives above; anything that decides how
 //! bytes move (QUIC, relays, NAT traversal, mesh membership, DHT
 //! routing) lives below. The week-of-2026-06-04 bug hunt found every
-//! protocol bug *above* this line (snapshot/gossip ordering,
+//! protocol bug *above* this line (snapshot publication ordering,
 //! dialer-equals-issuer, sig-vs-cap handle confusion), which is why the
 //! host loop must run inside the simulator rather than being mocked
 //! out at the `NetCommand`/`NetEvent` channel boundary.
@@ -76,43 +75,16 @@ pub trait Conn: Clone + Send + Sync + 'static {
     fn close(&self, code: u32, reason: &[u8]);
 }
 
-/// Events surfaced by the gossip mesh for the team topic.
-#[derive(Debug, Clone)]
-pub enum GossipEvent {
-    /// A broadcast frame arrived. `delivered_from` is the mesh
-    /// neighbor that relayed it (NOT necessarily the original
-    /// publisher — the publisher's id rides inside the frame).
-    Received {
-        bytes: Vec<u8>,
-        delivered_from: PeerId,
-    },
-    /// A peer joined our active mesh view.
-    NeighborUp(PeerId),
-    /// A peer left our active mesh view.
-    NeighborDown(PeerId),
-}
-
-/// The broadcast half of the gossip topic.
-pub trait GossipSink: Clone + Send + Sync + 'static {
-    /// Flood a frame to the topic. Delivery is best-effort epidemic
-    /// broadcast; duplicates are deduped by the mesh layer.
-    fn broadcast(
-        &self,
-        frame: Vec<u8>,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
-}
-
 /// The network capabilities the protocol consumes. One instance per
 /// node; `Clone` is shallow.
 ///
 /// Deliberately *not* part of the trait: endpoint construction,
-/// relay/discovery configuration, gossip topic join, and protocol
-/// (ALPN) registration. Those are adapter-construction concerns —
+/// relay/discovery configuration, and protocol (ALPN) registration.
+/// Those are adapter-construction concerns —
 /// see [`Harness`] for the bundle a constructor hands to the host
 /// loop.
 pub trait Transport: Clone + Send + Sync + 'static {
     type Conn: Conn;
-    type Gossip: GossipSink;
 
     /// Our own identity (= the pubkey of the signing key the node
     /// runs as).
@@ -146,19 +118,15 @@ pub struct Incoming<C> {
 }
 
 /// Everything a transport constructor hands the host loop: the
-/// dial/discovery capabilities, the inbound-connection stream, and
-/// (when the node participates in gossip) the topic's broadcast half
-/// plus its event stream.
+/// dial/discovery capabilities and the inbound-connection stream.
 ///
 /// Both halves of every channel are owned here rather than living in
 /// trait methods so that adapter construction — which for iroh has to
-/// register ALPN handlers and join the gossip topic *before* the
-/// router spawns — happens in one place, and the host loop receives a
-/// ready-to-run bundle.
+/// register ALPN handlers before the router spawns — happens in one
+/// place, and the host loop receives a ready-to-run bundle.
 pub struct Harness<T: Transport> {
     pub transport: T,
     pub incoming: mpsc::Receiver<Incoming<T::Conn>>,
-    pub gossip: Option<(T::Gossip, mpsc::Receiver<GossipEvent>)>,
 }
 
 pub mod iroh;

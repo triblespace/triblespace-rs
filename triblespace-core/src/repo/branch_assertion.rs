@@ -13,9 +13,10 @@
 //! author key [32] | name handle [32] | commit handle [32] | signature [64]
 //! ```
 //!
-//! Public [`BranchAssertion`] values have already passed
-//! strict signature verification. Raw bytes can enter the semantic layer only
-//! through [`BranchAssertion::decode_verified`].
+//! Public [`BranchAssertion`] values have already passed strict signature
+//! verification. Persisted snapshots retain a private structural witness and
+//! verify only claims that branch resolution may expose; raw bytes become a
+//! public assertion only through [`BranchAssertion::decode_verified`].
 //!
 //! [`BranchId`]: crate::repo::branch_assertion::BranchId
 //! [`BranchAssertion`]: crate::repo::branch_assertion::BranchAssertion
@@ -24,6 +25,10 @@
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::OnceLock;
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use ed25519::signature::Signer;
 use ed25519::Signature;
@@ -234,23 +239,7 @@ impl BranchAssertion {
     /// padding and record markers are intentionally outside this semantic
     /// codec and are checked by the pile decoder.
     pub fn decode_verified(bytes: [u8; BRANCH_ASSERTION_LEN]) -> Result<Self, AssertionError> {
-        let author_bytes: [u8; 32] = bytes[AUTHOR_RANGE].try_into().unwrap();
-        let author = VerifyingKey::from_bytes(&author_bytes)
-            .map_err(|_| AssertionError::InvalidAuthorKey)?;
-        let name_raw: [u8; 32] = bytes[NAME_RANGE].try_into().unwrap();
-        let commit_raw: [u8; 32] = bytes[COMMIT_RANGE].try_into().unwrap();
-        let signature_bytes: [u8; 64] = bytes[SIGNATURE_RANGE].try_into().unwrap();
-        let signature = Signature::from_bytes(&signature_bytes);
-        let message = signed_message(&author_bytes, &name_raw, &commit_raw);
-        author
-            .verify_strict(&message, &signature)
-            .map_err(|_| AssertionError::InvalidSignature)?;
-
-        Ok(Self {
-            identity: BranchIdentity::new(author, Inline::new(name_raw)),
-            commit: Inline::new(commit_raw),
-            signature: signature_bytes,
-        })
+        UnverifiedBranchAssertion::decode_structural(bytes)?.verify_strict()
     }
 
     /// Encode this verified assertion into its canonical 160 semantic bytes.
@@ -283,6 +272,111 @@ impl BranchAssertion {
     }
 }
 
+/// Structurally decoded canonical assertion bytes whose signature has not yet
+/// been checked.
+///
+/// This type is deliberately crate-visible only. It may live in a persisted
+/// snapshot, but none of its claimed identity/commit accessors are public API;
+/// a [`BranchAssertion`] is the sole verified value that can leave the
+/// repository layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnverifiedBranchAssertion {
+    identity: BranchIdentity,
+    commit: CommitHandle,
+    signature: [u8; 64],
+}
+
+impl UnverifiedBranchAssertion {
+    /// Decode fixed semantic fields without performing Ed25519 verification.
+    /// A malformed author key remains a structural error.
+    pub(crate) fn decode_structural(
+        bytes: [u8; BRANCH_ASSERTION_LEN],
+    ) -> Result<Self, AssertionError> {
+        let author_bytes: [u8; 32] = bytes[AUTHOR_RANGE].try_into().unwrap();
+        let author = VerifyingKey::from_bytes(&author_bytes)
+            .map_err(|_| AssertionError::InvalidAuthorKey)?;
+        let name_raw: [u8; 32] = bytes[NAME_RANGE].try_into().unwrap();
+        let commit_raw: [u8; 32] = bytes[COMMIT_RANGE].try_into().unwrap();
+        let signature: [u8; 64] = bytes[SIGNATURE_RANGE].try_into().unwrap();
+        Ok(Self {
+            identity: BranchIdentity::new(author, Inline::new(name_raw)),
+            commit: Inline::new(commit_raw),
+            signature,
+        })
+    }
+
+    pub(crate) fn encode(self) -> [u8; BRANCH_ASSERTION_LEN] {
+        let mut bytes = [0u8; BRANCH_ASSERTION_LEN];
+        bytes[AUTHOR_RANGE].copy_from_slice(&self.identity.author);
+        bytes[NAME_RANGE].copy_from_slice(&self.identity.name.raw);
+        bytes[COMMIT_RANGE].copy_from_slice(&self.commit.raw);
+        bytes[SIGNATURE_RANGE].copy_from_slice(&self.signature);
+        bytes
+    }
+
+    pub(crate) fn identity(self) -> BranchIdentity {
+        self.identity
+    }
+
+    pub(crate) fn commit(self) -> CommitHandle {
+        self.commit
+    }
+
+    pub(crate) fn id(self) -> AssertionId {
+        AssertionId(Blake3::digest(&self.encode()))
+    }
+
+    fn index_key(self) -> [u8; ASSERTION_INDEX_KEY_LEN] {
+        index_key(self.identity.id(), self.id())
+    }
+
+    pub(crate) fn verify_strict(self) -> Result<BranchAssertion, AssertionError> {
+        #[cfg(test)]
+        SIGNATURE_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+
+        let author = self.identity.author();
+        let signature = Signature::from_bytes(&self.signature);
+        let message = signed_message(
+            &self.identity.author,
+            &self.identity.name.raw,
+            &self.commit.raw,
+        );
+        author
+            .verify_strict(&message, &signature)
+            .map_err(|_| AssertionError::InvalidSignature)?;
+        Ok(BranchAssertion {
+            identity: self.identity,
+            commit: self.commit,
+            signature: self.signature,
+        })
+    }
+}
+
+impl From<BranchAssertion> for UnverifiedBranchAssertion {
+    fn from(assertion: BranchAssertion) -> Self {
+        Self {
+            identity: assertion.identity,
+            commit: assertion.commit,
+            signature: assertion.signature,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SIGNATURE_VERIFICATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_signature_verification_count() {
+    SIGNATURE_VERIFICATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn signature_verification_count() -> usize {
+    SIGNATURE_VERIFICATIONS.with(Cell::get)
+}
+
 fn signed_message(
     author: &[u8; 32],
     name: &[u8; 32],
@@ -303,7 +397,7 @@ fn index_key(branch: BranchId, assertion: AssertionId) -> [u8; ASSERTION_INDEX_K
     key
 }
 
-/// Why raw assertion bytes were not admitted to replicated state.
+/// Why raw assertion bytes could not become a verified public assertion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssertionError {
     /// The claimed Ed25519 public key is not a valid verifying key.
@@ -339,19 +433,77 @@ impl fmt::Display for AssertionKeyCollision {
 
 impl Error for AssertionKeyCollision {}
 
-/// Opaque grow-only snapshot of verified branch assertions.
+/// Opaque grow-only snapshot of branch-assertion witnesses.
 ///
 /// The inner PATCH is deliberately private: every safe insertion derives its
-/// key from the verified value, and there is no remove, replace, difference,
-/// or scalar-head operation.
+/// key from the exact canonical bytes, and there is no remove, replace,
+/// difference, or scalar-head operation. Public iteration yields only
+/// successfully verified [`BranchAssertion`] values. Pile replay uses the
+/// crate-private structural insertion path so loading a log does no public-key
+/// work.
 #[derive(Clone, Debug, Default)]
 pub struct BranchAssertionSnapshot {
-    assertions: PATCH<ASSERTION_INDEX_KEY_LEN, IdentitySchema, BranchAssertion>,
+    assertions: PATCH<ASSERTION_INDEX_KEY_LEN, IdentitySchema, AssertionWitness>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AssertionWitness {
+    unverified: UnverifiedBranchAssertion,
+    // Keep the cold persisted representation small. Only witnesses that reach
+    // a semantic view allocate the verified public value.
+    verified: OnceLock<Result<Box<BranchAssertion>, AssertionError>>,
+}
+
+impl PartialEq for AssertionWitness {
+    fn eq(&self, other: &Self) -> bool {
+        self.unverified == other.unverified
+    }
+}
+
+impl Eq for AssertionWitness {}
+
+impl AssertionWitness {
+    fn from_verified(assertion: BranchAssertion) -> Self {
+        Self {
+            unverified: assertion.into(),
+            verified: OnceLock::from(Ok(Box::new(assertion))),
+        }
+    }
+
+    fn from_unverified(unverified: UnverifiedBranchAssertion) -> Self {
+        Self {
+            unverified,
+            verified: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn id(&self) -> AssertionId {
+        self.unverified.id()
+    }
+
+    pub(crate) fn commit(&self) -> CommitHandle {
+        self.unverified.commit()
+    }
+
+    pub(crate) fn verified(&self) -> Result<&BranchAssertion, AssertionError> {
+        match self
+            .verified
+            .get_or_init(|| self.unverified.verify_strict().map(Box::new))
+        {
+            Ok(assertion) => Ok(assertion.as_ref()),
+            Err(err) => Err(*err),
+        }
+    }
 }
 
 impl PartialEq for BranchAssertionSnapshot {
     fn eq(&self, other: &Self) -> bool {
-        self.assertions == other.assertions
+        if self.assertions.len() != other.assertions.len() {
+            return false;
+        }
+        self.assertions
+            .iter_ordered()
+            .all(|key| self.assertions.get(key) == other.assertions.get(key))
     }
 }
 
@@ -366,14 +518,28 @@ impl BranchAssertionSnapshot {
     /// Insert one verified assertion. Re-inserting the same assertion is an
     /// idempotent success.
     pub fn insert(&mut self, assertion: BranchAssertion) -> Result<(), AssertionKeyCollision> {
-        let key = assertion.index_key();
+        let witness = AssertionWitness::from_verified(assertion);
+        self.insert_witness(witness)
+    }
+
+    /// Insert one structurally decoded persisted witness without verifying its
+    /// signature. This is reserved for exact pile replay.
+    pub(crate) fn insert_unverified(
+        &mut self,
+        assertion: UnverifiedBranchAssertion,
+    ) -> Result<(), AssertionKeyCollision> {
+        self.insert_witness(AssertionWitness::from_unverified(assertion))
+    }
+
+    fn insert_witness(&mut self, witness: AssertionWitness) -> Result<(), AssertionKeyCollision> {
+        let key = witness.unverified.index_key();
         if let Some(existing) = self.assertions.get(&key) {
-            if existing != &assertion {
+            if existing != &witness {
                 return Err(AssertionKeyCollision);
             }
             return Ok(());
         }
-        self.assertions.insert(&Entry::with_value(&key, assertion));
+        self.assertions.insert(&Entry::with_value(&key, witness));
         Ok(())
     }
 
@@ -382,8 +548,9 @@ impl BranchAssertionSnapshot {
         &self,
         assertion: &BranchAssertion,
     ) -> Result<bool, AssertionKeyCollision> {
+        let witness = AssertionWitness::from_verified(*assertion);
         match self.assertions.get(&assertion.index_key()) {
-            Some(existing) if existing == assertion => Ok(true),
+            Some(existing) if existing == &witness => Ok(true),
             Some(_) => Err(AssertionKeyCollision),
             None => Ok(false),
         }
@@ -391,10 +558,13 @@ impl BranchAssertionSnapshot {
 
     /// Union another grow-only snapshot into this one.
     pub fn union(&mut self, other: Self) -> Result<(), AssertionKeyCollision> {
-        for assertion in other.iter() {
-            let key = assertion.index_key();
+        for key in other.assertions.iter_ordered() {
+            let witness = other
+                .assertions
+                .get(key)
+                .expect("a key yielded by PATCH resolves in the same snapshot");
             if let Some(existing) = self.assertions.get(&key) {
-                if existing != assertion {
+                if existing != witness {
                     return Err(AssertionKeyCollision);
                 }
             }
@@ -403,7 +573,7 @@ impl BranchAssertionSnapshot {
         Ok(())
     }
 
-    /// Number of distinct verified assertions.
+    /// Number of distinct stored canonical assertion witnesses.
     pub fn len(&self) -> usize {
         self.assertions.len() as usize
     }
@@ -413,12 +583,18 @@ impl BranchAssertionSnapshot {
         self.assertions.is_empty()
     }
 
-    /// Iterate every assertion in canonical index-key order.
+    /// Iterate every valid assertion in canonical index-key order.
+    ///
+    /// This explicit semantic view verifies witnesses lazily and permanently
+    /// memoizes both success and failure. Invalid signatures are omitted; no
+    /// unverified claim can escape as a [`BranchAssertion`].
     pub fn iter(&self) -> impl Iterator<Item = &BranchAssertion> {
-        self.assertions.iter_ordered().map(|key| {
-            self.assertions
+        self.assertions.iter_ordered().filter_map(|key| {
+            let witness = self
+                .assertions
                 .get(key)
-                .expect("a key yielded by PATCH resolves in the same snapshot")
+                .expect("a key yielded by PATCH resolves in the same snapshot");
+            witness.verified().ok()
         })
     }
 
@@ -427,6 +603,16 @@ impl BranchAssertionSnapshot {
     /// The 16-byte BranchId narrows the prefix scan; the full descriptor check
     /// prevents a truncated-id collision from merging two branches.
     pub fn for_branch(&self, identity: &BranchIdentity) -> Vec<BranchAssertion> {
+        self.witnesses_for_branch(identity)
+            .into_iter()
+            .filter_map(|witness| witness.verified().ok().copied())
+            .collect()
+    }
+
+    /// Return every structural witness for the exact descriptor. The resolver
+    /// is the sole consumer: it verifies only optimistic-frontier claims before
+    /// exposing any tip or demand.
+    pub(crate) fn witnesses_for_branch(&self, identity: &BranchIdentity) -> Vec<&AssertionWitness> {
         let branch = identity.id();
         let mut assertions = Vec::new();
         self.assertions
@@ -438,8 +624,8 @@ impl BranchAssertionSnapshot {
                     .assertions
                     .get(&key)
                     .expect("a suffix yielded by PATCH resolves in the same snapshot");
-                if assertion.identity() == identity {
-                    assertions.push(assertion.clone());
+                if assertion.unverified.identity() == *identity {
+                    assertions.push(assertion);
                 }
             });
         assertions
@@ -448,7 +634,10 @@ impl BranchAssertionSnapshot {
     #[cfg(test)]
     fn insert_with_branch_prefix_for_test(&mut self, branch: BranchId, assertion: BranchAssertion) {
         let key = index_key(branch, assertion.id());
-        self.assertions.insert(&Entry::with_value(&key, assertion));
+        self.assertions.insert(&Entry::with_value(
+            &key,
+            AssertionWitness::from_verified(assertion),
+        ));
     }
 }
 
@@ -470,7 +659,8 @@ pub trait BranchAssertionStore {
     /// Storage error.
     type Error: Error + fmt::Debug + Send + Sync + 'static;
 
-    /// Return one coherent snapshot of all verified assertions.
+    /// Return one coherent snapshot of all persisted assertion witnesses.
+    /// Public views and branch resolution never expose an unverified claim.
     fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error>;
 
     /// Durably append one verified assertion. A duplicate is an idempotent

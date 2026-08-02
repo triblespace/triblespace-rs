@@ -57,9 +57,13 @@ use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
+#[cfg(test)]
+use crate::repo::branch_assertion::{
+    reset_signature_verification_count, signature_verification_count,
+};
 use crate::repo::branch_assertion::{
     AssertionId, AssertionKeyCollision, BranchAssertion, BranchAssertionSnapshot,
-    BranchAssertionStore, BRANCH_ASSERTION_LEN,
+    BranchAssertionStore, UnverifiedBranchAssertion, BRANCH_ASSERTION_LEN,
 };
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
@@ -475,6 +479,13 @@ pub enum PileRecordContent {
         /// The canonical signed assertion carried by this record.
         assertion: BranchAssertion,
     },
+    /// A structurally valid branch-assertion record whose signature is
+    /// invalid. Only its content id is exposed; its unauthenticated identity
+    /// and commit claim never leave replay storage.
+    InvalidBranchAssertion {
+        /// Blake3 id of the exact canonical witness bytes.
+        id: AssertionId,
+    },
     /// A weak-pin marker for a blob handle.
     WeakPin {
         /// The pinned blob handle.
@@ -487,13 +498,48 @@ pub enum PileRecordContent {
     },
 }
 
+/// Structurally decoded replay record. Unlike the public forensic record, its
+/// assertion payload has not performed Ed25519 verification.
+#[derive(Debug, Clone, Copy)]
+struct DecodedPileRecord {
+    offset: usize,
+    len: usize,
+    content: DecodedPileRecordContent,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DecodedPileRecordContent {
+    Blob {
+        timestamp: u64,
+        hash: Inline<Hash<Blake3>>,
+        data_offset: usize,
+        data_len: usize,
+    },
+    Pin {
+        pin_id: Id,
+        head: Inline<Handle<SimpleArchive>>,
+    },
+    PinTombstone {
+        pin_id: Id,
+    },
+    BranchAssertion {
+        assertion: UnverifiedBranchAssertion,
+    },
+    WeakPin {
+        handle: Inline<Handle<UnknownBlob>>,
+    },
+    WeakUnpin {
+        handle: Inline<Handle<UnknownBlob>>,
+    },
+}
+
 /// Decodes the record starting at the beginning of `bytes`, which is the pile
 /// file's content from `offset` onward. This is the single source of truth for
 /// record parsing: [`Pile::refresh`]/[`Pile::amputate`] replay records through
 /// it, and [`PileRecords`] exposes it for raw inspection. An unknown magic
 /// marker or a truncated record yields [`ReadError::CorruptPile`] pointing at
 /// `offset` — never a silent stop.
-fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
+fn decode_record(bytes: &[u8], offset: usize) -> Result<DecodedPileRecord, ReadError> {
     let corrupt = || ReadError::CorruptPile {
         valid_length: offset,
     };
@@ -513,10 +559,10 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             if bytes.len() < len {
                 return Err(corrupt());
             }
-            Ok(PileRecord {
+            Ok(DecodedPileRecord {
                 offset,
                 len,
-                content: PileRecordContent::Blob {
+                content: DecodedPileRecordContent::Blob {
                     timestamp: header.timestamp,
                     hash: Inline::new(header.hash),
                     data_offset: offset + BLOB_HEADER_LEN,
@@ -527,10 +573,10 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
         MAGIC_MARKER_BRANCH => {
             let (header, _) = BranchHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             let pin_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
-            Ok(PileRecord {
+            Ok(DecodedPileRecord {
                 offset,
                 len: std::mem::size_of::<BranchHeader>(),
-                content: PileRecordContent::Pin {
+                content: DecodedPileRecordContent::Pin {
                     pin_id,
                     head: Inline::<Hash<Blake3>>::new(header.hash).into(),
                 },
@@ -540,10 +586,10 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             let (header, _) =
                 BranchTombstoneHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             let pin_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
-            Ok(PileRecord {
+            Ok(DecodedPileRecord {
                 offset,
                 len: std::mem::size_of::<BranchTombstoneHeader>(),
-                content: PileRecordContent::PinTombstone { pin_id },
+                content: DecodedPileRecordContent::PinTombstone { pin_id },
             })
         }
         MAGIC_MARKER_BLOB_V3 => {
@@ -560,10 +606,10 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             if bytes.len() < len {
                 return Err(corrupt());
             }
-            Ok(PileRecord {
+            Ok(DecodedPileRecord {
                 offset,
                 len,
-                content: PileRecordContent::Blob {
+                content: DecodedPileRecordContent::Blob {
                     timestamp: header.timestamp,
                     hash: Inline::new(header.hash),
                     data_offset: offset + V3_HEADER_LEN,
@@ -574,10 +620,10 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
         MAGIC_MARKER_BRANCH_V3 => {
             let (header, _) = BranchHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             let pin_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
-            Ok(PileRecord {
+            Ok(DecodedPileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::Pin {
+                content: DecodedPileRecordContent::Pin {
                     pin_id,
                     head: Inline::<Hash<Blake3>>::new(header.hash).into(),
                 },
@@ -587,10 +633,10 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             let (header, _) =
                 BranchTombstoneHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             let pin_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
-            Ok(PileRecord {
+            Ok(DecodedPileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::PinTombstone { pin_id },
+                content: DecodedPileRecordContent::PinTombstone { pin_id },
             })
         }
         MAGIC_MARKER_BRANCH_ASSERTION_V3 => {
@@ -599,21 +645,21 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             if header.reserved.iter().any(|byte| *byte != 0) {
                 return Err(corrupt());
             }
-            let assertion =
-                BranchAssertion::decode_verified(header.assertion).map_err(|_| corrupt())?;
-            Ok(PileRecord {
+            let assertion = UnverifiedBranchAssertion::decode_structural(header.assertion)
+                .map_err(|_| corrupt())?;
+            Ok(DecodedPileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::BranchAssertion { assertion },
+                content: DecodedPileRecordContent::BranchAssertion { assertion },
             })
         }
         MAGIC_MARKER_WEAK_PIN_V3 => {
             let (header, _) =
                 WeakPinHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            Ok(PileRecord {
+            Ok(DecodedPileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::WeakPin {
+                content: DecodedPileRecordContent::WeakPin {
                     handle: Inline::new(header.handle),
                 },
             })
@@ -621,15 +667,51 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
         MAGIC_MARKER_WEAK_UNPIN_V3 => {
             let (header, _) =
                 WeakUnpinHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            Ok(PileRecord {
+            Ok(DecodedPileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::WeakUnpin {
+                content: DecodedPileRecordContent::WeakUnpin {
                     handle: Inline::new(header.handle),
                 },
             })
         }
         _ => Err(corrupt()),
+    }
+}
+
+/// Convert the structural replay record into the public forensic view. The
+/// normal Pile replay path deliberately does not call this function; asking to
+/// iterate raw records remains an explicit strict-verification operation.
+fn verify_record(record: DecodedPileRecord) -> PileRecord {
+    let content = match record.content {
+        DecodedPileRecordContent::Blob {
+            timestamp,
+            hash,
+            data_offset,
+            data_len,
+        } => PileRecordContent::Blob {
+            timestamp,
+            hash,
+            data_offset,
+            data_len,
+        },
+        DecodedPileRecordContent::Pin { pin_id, head } => PileRecordContent::Pin { pin_id, head },
+        DecodedPileRecordContent::PinTombstone { pin_id } => {
+            PileRecordContent::PinTombstone { pin_id }
+        }
+        DecodedPileRecordContent::BranchAssertion { assertion } => {
+            match assertion.verify_strict() {
+                Ok(assertion) => PileRecordContent::BranchAssertion { assertion },
+                Err(_) => PileRecordContent::InvalidBranchAssertion { id: assertion.id() },
+            }
+        }
+        DecodedPileRecordContent::WeakPin { handle } => PileRecordContent::WeakPin { handle },
+        DecodedPileRecordContent::WeakUnpin { handle } => PileRecordContent::WeakUnpin { handle },
+    };
+    PileRecord {
+        offset: record.offset,
+        len: record.len,
+        content,
     }
 }
 
@@ -672,7 +754,7 @@ fn indexed_blob_record(
     };
     let record = decode_record(record_bytes, entry.record_offset)
         .expect("indexed blob record changed below the accepted pile prefix");
-    let PileRecordContent::Blob {
+    let DecodedPileRecordContent::Blob {
         timestamp,
         hash,
         data_offset,
@@ -721,8 +803,10 @@ pub struct PileRecords {
 
 impl PileRecords {
     /// Opens the pile file at `path` read-only and returns an iterator over
-    /// its records. No index is built and blob payloads are not hashed; signed
-    /// branch assertions are nevertheless verified before being yielded.
+    /// its records. No index is built and blob payloads are not hashed. Valid
+    /// branch assertions are yielded as verified [`BranchAssertion`] values;
+    /// invalid signatures yield only
+    /// [`PileRecordContent::InvalidBranchAssertion`], never their claims.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = File::open(path)?;
         Self::from_file(&file)
@@ -765,7 +849,7 @@ impl Iterator for PileRecords {
         if self.failed || self.offset >= self.bytes.len() {
             return None;
         }
-        match decode_record(&self.bytes[self.offset..], self.offset) {
+        match decode_record(&self.bytes[self.offset..], self.offset).map(verify_record) {
             Ok(record) => {
                 self.offset += record.len;
                 Some(Ok(record))
@@ -1112,7 +1196,8 @@ pub enum PileAssertionError {
     ReadError(ReadError),
     /// Appending or durably flushing the assertion failed.
     IoError(std::io::Error),
-    /// Two different verified assertions produced the same 48-byte index key.
+    /// Two different canonical assertion witnesses produced the same 48-byte
+    /// index key.
     KeyCollision(AssertionKeyCollision),
 }
 
@@ -1318,7 +1403,7 @@ impl Pile {
         let record = decode_record(slice, start_offset)?;
         let next_applied_length = start_offset + record.len;
         let applied = match record.content {
-            PileRecordContent::Blob { hash, .. } => {
+            DecodedPileRecordContent::Blob { hash, .. } => {
                 let candidate = IndexEntry::new(start_offset);
                 match self.blobs.get(&hash.raw).copied() {
                     None => {
@@ -1343,7 +1428,7 @@ impl Pile {
                 }
                 Applied::Blob { hash }
             }
-            PileRecordContent::Pin { pin_id, head } => {
+            DecodedPileRecordContent::Pin { pin_id, head } => {
                 let entry = Entry::with_value(&pin_id.into(), head);
                 // Replace existing mapping (if any) with the new head.
                 self.pins.replace(&entry);
@@ -1352,24 +1437,24 @@ impl Pile {
                     hash: head.into(),
                 }
             }
-            PileRecordContent::PinTombstone { pin_id } => {
+            DecodedPileRecordContent::PinTombstone { pin_id } => {
                 self.pins.remove(&pin_id.into());
                 Applied::PinTombstone { id: pin_id }
             }
-            PileRecordContent::BranchAssertion { assertion } => {
+            DecodedPileRecordContent::BranchAssertion { assertion } => {
                 let id = assertion.id();
-                self.assertions
-                    .insert(assertion)
-                    .map_err(|_| ReadError::CorruptPile {
+                self.assertions.insert_unverified(assertion).map_err(|_| {
+                    ReadError::CorruptPile {
                         valid_length: start_offset,
-                    })?;
+                    }
+                })?;
                 Applied::BranchAssertion { id }
             }
-            PileRecordContent::WeakPin { handle } => {
+            DecodedPileRecordContent::WeakPin { handle } => {
                 self.weak_pins.insert(&Entry::new(&handle.raw));
                 Applied::WeakPin { handle }
             }
-            PileRecordContent::WeakUnpin { handle } => {
+            DecodedPileRecordContent::WeakUnpin { handle } => {
                 self.weak_pins.remove(&handle.raw);
                 Applied::WeakUnpin { handle }
             }
@@ -1791,13 +1876,11 @@ impl PinStore for Pile {
                 return Ok(PushResult::Conflict(current_hash));
             }
 
-            // No-op short-circuit: if the requested head is already
-            // what we have, return success without appending a record.
-            // The pin table is logically a (id → head) map; a write
-            // where new == current carries no information and would
-            // just churn the append-only file. Steady-state gossip
-            // rebroadcasts of unchanged heads (e.g. tracking-pin
-            // re-publication at 30s ticks) hit this path heavily.
+            // No-op short-circuit: if the requested head is already what we
+            // have, return success without appending a record. The pin table
+            // is logically a (id → head) map; a write where new == current
+            // carries no information and would only churn the append-only
+            // file.
             if current_hash == new {
                 return Ok(PushResult::Success());
             }
@@ -2211,27 +2294,71 @@ mod tests {
     }
 
     #[test]
-    fn branch_assertion_record_rejects_bad_signatures_and_nonzero_padding() {
+    fn branch_assertion_replay_defers_bad_signatures_but_rejects_nonzero_padding() {
         let dir = tempfile::tempdir().unwrap();
         let assertion = branch_assertion(7, 11, 19);
         let canonical = BranchAssertionHeaderV3::new(assertion);
 
-        for (name, corrupt_at) in [
-            ("signature.pile", 16 + 96),
-            ("reserved.pile", V3_HEADER_LEN - 1),
-        ] {
-            let path = fresh_empty_pile_path(&dir, name);
-            let mut bytes = canonical.as_bytes().to_vec();
-            bytes[corrupt_at] ^= 1;
-            std::fs::write(&path, bytes).unwrap();
+        let signature_path = fresh_empty_pile_path(&dir, "signature.pile");
+        let mut invalid_signature = canonical.as_bytes().to_vec();
+        invalid_signature[16 + 96] ^= 1;
+        std::fs::write(&signature_path, invalid_signature).unwrap();
 
-            let mut pile = Pile::open(&path).unwrap();
-            assert!(matches!(
-                pile.refresh(),
-                Err(ReadError::CorruptPile { valid_length: 0 })
-            ));
-            pile.close().unwrap();
+        reset_signature_verification_count();
+        let mut pile = Pile::open(&signature_path).unwrap();
+        pile.refresh().unwrap();
+        assert_eq!(signature_verification_count(), 0);
+        let snapshot = pile.assertion_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 1, "the exact persisted witness is retained");
+        assert_eq!(snapshot.iter().count(), 0, "invalid claims never escape");
+        assert_eq!(signature_verification_count(), 1);
+        pile.close().unwrap();
+
+        // The forensic view preserves the structural record boundary but does
+        // not expose its unauthenticated identity or commit claim.
+        assert!(matches!(
+            PileRecords::open(&signature_path).unwrap().next(),
+            Some(Ok(PileRecord {
+                content: PileRecordContent::InvalidBranchAssertion { .. },
+                ..
+            }))
+        ));
+
+        let reserved_path = fresh_empty_pile_path(&dir, "reserved.pile");
+        let mut invalid_padding = canonical.as_bytes().to_vec();
+        invalid_padding[V3_HEADER_LEN - 1] ^= 1;
+        std::fs::write(&reserved_path, invalid_padding).unwrap();
+        let mut pile = Pile::open(&reserved_path).unwrap();
+        assert!(matches!(
+            pile.refresh(),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn replaying_many_assertions_performs_zero_signature_verifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "many-assertions.pile");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        for commit in 0..=127 {
+            let assertion = branch_assertion(7, 11, commit);
+            file.write_all(BranchAssertionHeaderV3::new(assertion).as_bytes())
+                .unwrap();
         }
+        file.sync_all().unwrap();
+        drop(file);
+
+        reset_signature_verification_count();
+        let mut pile = Pile::open(&path).unwrap();
+        pile.refresh().unwrap();
+        assert_eq!(pile.assertions.len(), 128);
+        assert_eq!(
+            signature_verification_count(),
+            0,
+            "structural pile replay must not perform signature equations"
+        );
+        pile.close().unwrap();
     }
 
     #[test]

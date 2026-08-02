@@ -35,7 +35,7 @@ use crate::transport::Conn;
 /// ALPN for the auth handshake. Distinct from `PILE_SYNC_ALPN` —
 /// connections here are open to any pubkey-bearing peer; identity is
 /// inferred from iroh's TLS layer, not via a separate `OP_AUTH` step.
-pub const AUTH_HANDSHAKE_ALPN: &[u8] = b"/triblespace/auth-handshake/1";
+pub const AUTH_HANDSHAKE_ALPN: &[u8] = b"/triblespace/auth-handshake/2";
 
 /// Subject → issuer. Body: u32 length + partial cap blob bytes
 /// (subject prepares it, issuer fills in chain linkage at sign time).
@@ -46,8 +46,17 @@ pub const OP_REQUEST_CAP: u8 = 0x01;
 /// len + sig bytes. Response: 1-byte status.
 pub const OP_DELIVER_CAP: u8 = 0x02;
 
-/// Status: request received and queued (sender should expect a later
-/// `OP_DELIVER_CAP` push from the issuer, or no response if denied).
+/// Fetch one exact blob from a capability proof. This is the narrow bootstrap
+/// escape hatch for a verifier that does not yet hold the presented chain:
+/// the server responds only when `requested` is one of the handles touched
+/// while locally verifying `leaf_sig` for `subject` back to its team root.
+/// It is not an unauthenticated general-purpose blob read.
+pub const OP_FETCH_CAPABILITY_BLOB: u8 = 0x03;
+
+/// Status: request accepted into the bounded local policy-processing queue.
+/// This is not a durability acknowledgement; the sender should expect a later
+/// `OP_DELIVER_CAP` push from the issuer, or no response if policy/storage
+/// processing subsequently declines it.
 pub const STATUS_OK: u8 = 0x00;
 /// Status: request rejected (e.g. issuer is not an admin of the
 /// requested team; sender's pubkey is not eligible). Sender shouldn't
@@ -130,6 +139,41 @@ pub async fn send_deliver_cap<C: Conn>(conn: &C, cap_bytes: &[u8], sig_bytes: &[
     Ok(status[0])
 }
 
+/// Ask a peer for one exact member of a capability proof. The leaf signature
+/// is a content locator, not an access-control secret or bearer credential:
+/// normal OP_AUTH still binds the verified leaf subject to the transport
+/// identity.
+pub async fn fetch_capability_blob<C: Conn>(
+    conn: &C,
+    leaf_sig: &[u8; 32],
+    subject: &[u8; 32],
+    requested: &[u8; 32],
+) -> Result<Option<Vec<u8>>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send.write_all(&[OP_FETCH_CAPABILITY_BLOB])
+        .await
+        .map_err(|e| anyhow!("send op: {e}"))?;
+    send.write_all(leaf_sig)
+        .await
+        .map_err(|e| anyhow!("send leaf sig: {e}"))?;
+    send.write_all(subject)
+        .await
+        .map_err(|e| anyhow!("send subject: {e}"))?;
+    send.write_all(requested)
+        .await
+        .map_err(|e| anyhow!("send requested handle: {e}"))?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
+
+    let mut status = [0u8; 1];
+    recv.read_exact(&mut status)
+        .await
+        .map_err(|e| anyhow!("recv status: {e}"))?;
+    if status[0] != STATUS_OK {
+        return Ok(None);
+    }
+    Ok(Some(read_length_prefixed(&mut recv).await?.to_vec()))
+}
+
 // ── Server-side: parse incoming streams ───────────────────────────────
 
 /// Payload of a single incoming op, parsed but not yet acted on.
@@ -145,6 +189,11 @@ pub enum IncomingOp {
     Deliver {
         cap_bytes: anybytes::Bytes,
         sig_bytes: anybytes::Bytes,
+    },
+    FetchCapabilityBlob {
+        leaf_sig: [u8; 32],
+        subject: [u8; 32],
+        requested: [u8; 32],
     },
 }
 
@@ -167,6 +216,25 @@ pub async fn read_incoming<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<
             Ok(Some(IncomingOp::Deliver {
                 cap_bytes,
                 sig_bytes,
+            }))
+        }
+        OP_FETCH_CAPABILITY_BLOB => {
+            let mut leaf_sig = [0u8; 32];
+            let mut subject = [0u8; 32];
+            let mut requested = [0u8; 32];
+            recv.read_exact(&mut leaf_sig)
+                .await
+                .map_err(|e| anyhow!("recv leaf sig: {e}"))?;
+            recv.read_exact(&mut subject)
+                .await
+                .map_err(|e| anyhow!("recv subject: {e}"))?;
+            recv.read_exact(&mut requested)
+                .await
+                .map_err(|e| anyhow!("recv requested handle: {e}"))?;
+            Ok(Some(IncomingOp::FetchCapabilityBlob {
+                leaf_sig,
+                subject,
+                requested,
             }))
         }
         _ => Ok(None),
@@ -200,6 +268,29 @@ pub async fn respond<W: AsyncWrite + Unpin>(send: &mut W, status: u8) -> Result<
     send.write_all(&[status])
         .await
         .map_err(|e| anyhow!("send status: {e}"))?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
+    Ok(())
+}
+
+/// Respond to [`OP_FETCH_CAPABILITY_BLOB`]. A successful payload is bounded
+/// before its length is written; `None` uses the ordinary rejected status and
+/// reveals no distinction between an absent, malformed, or unrelated handle.
+pub async fn respond_capability_blob<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    bytes: Option<&[u8]>,
+) -> Result<()> {
+    let Some(bytes) = bytes.filter(|bytes| bytes.len() <= MAX_BLOB_BYTES as usize) else {
+        return respond(send, STATUS_REJECTED).await;
+    };
+    send.write_all(&[STATUS_OK])
+        .await
+        .map_err(|e| anyhow!("send status: {e}"))?;
+    send.write_all(&(bytes.len() as u32).to_be_bytes())
+        .await
+        .map_err(|e| anyhow!("send len: {e}"))?;
+    send.write_all(bytes)
+        .await
+        .map_err(|e| anyhow!("send body: {e}"))?;
     send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
     Ok(())
 }

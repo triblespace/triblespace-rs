@@ -32,10 +32,11 @@ type PileBlake3 = Pile;
 
 #[derive(Parser)]
 pub enum Command {
-    /// Create a new team. Generates a fresh team root keypair, signs
-    /// the founder's self-cap with admin scope, and stores it in the
-    /// pile. Prints the team root pubkey, the team root SECRET (which
-    /// you MUST store offline), and the founder's cap handle.
+    /// Create a new team. Generates a fresh team root keypair, uses it once to
+    /// sign a non-expiring founder anchor, then issues and stores a finite
+    /// founder operational cap beneath that anchor. Prints the team root
+    /// pubkey, the team root SECRET (which you MUST store offline), and the
+    /// founder's operational cap handle.
     Create {
         /// Path to the local pile file.
         #[arg(long)]
@@ -119,22 +120,21 @@ pub enum Command {
     /// arrives via the auth-handshake ALPN and the daemon pins it
     /// on the team-cap pin.
     RequestJoin {
+        /// Path to the requester's local pile. The requested partial
+        /// capability is recorded here before it is sent, so a later
+        /// first-cap delivery can be matched to deliberate local intent.
+        #[arg(long)]
+        pile: PathBuf,
         /// Admin's pubkey (hex).
         #[arg(long)]
         admin: String,
         /// Scope to request. The admin may grant a subset.
         #[arg(long, value_enum, default_value = "read")]
         scope: ScopeArg,
-        /// Path to the requester's signing key. Defaults to a key
-        /// next to the pile if `--pile` is given; required
-        /// otherwise.
+        /// Path to the requester's signing key. Defaults to the
+        /// conventional key next to the pile.
         #[arg(long)]
         key: Option<PathBuf>,
-        /// Optional pile path for storing the key alongside (or
-        /// loading it from). Not used for state — request-join
-        /// doesn't write to the pile.
-        #[arg(long)]
-        pile: Option<PathBuf>,
     },
     /// Approve a pending join request by signing a cap for the
     /// requester and dispatching it via the auth-handshake ALPN.
@@ -229,11 +229,11 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::ListIssued { pile } => run_list_issued(pile),
         Command::Retract { pile, entry } => run_retract(pile, entry),
         Command::RequestJoin {
+            pile,
             admin,
             scope,
             key,
-            pile,
-        } => run_request_join(admin, scope, key, pile),
+        } => run_request_join(pile, admin, scope, key),
         Command::Approve {
             pile,
             entry,
@@ -334,6 +334,29 @@ fn now_plus_30_days() -> Inline<triblespace_core::inline::encodings::time::NsTAI
     (now, later).try_to_inline().expect("valid interval")
 }
 
+/// Keep a requested capability lifetime inside the authority that signs it.
+///
+/// `verify_chain` reports the earliest upper bound in the complete parent
+/// chain. Clipping the child here makes the leaf interval itself describe its
+/// effective lifetime, which is what the local renewal ledger records.
+fn cap_expiry_at_most(
+    requested: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
+    parent_expires_at: hifitime::Epoch,
+) -> Result<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>> {
+    use triblespace_core::inline::{TryFromInline, TryToInline};
+
+    let (lower, requested_upper) =
+        <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(&requested)
+            .map_err(|e| anyhow!("requested capability expiry is malformed: {e:?}"))?;
+    let effective_upper = requested_upper.min(parent_expires_at);
+    if lower > effective_upper {
+        bail!("parent authority expires before the requested capability interval begins");
+    }
+    (lower, effective_upper)
+        .try_to_inline()
+        .map_err(|e| anyhow!("effective capability expiry is malformed: {e:?}"))
+}
+
 /// Format the upper bound of an `NsTAIInterval` value as a
 /// human-readable UTC timestamp for diagnostic output. Used by
 /// `team create` / `team invite` to surface when the freshly-issued
@@ -406,8 +429,8 @@ fn print_warning_box(lines: &[&str]) {
 fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     let founder_key = load_or_generate_signing_key(key, &pile_path)?;
 
-    // Generate the team root keypair. Used exactly once, here, to sign
-    // the founder's self-cap, then never again.
+    // Generate the team root keypair. Used exactly once, here, to sign the
+    // founder anchor, then never again.
     let team_root = fresh_signing_key()?;
     let team_root_pubkey = team_root.verifying_key();
 
@@ -420,23 +443,61 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
         triblespace_core::metadata::tag: capability::PERM_ADMIN,
     });
 
-    let expiry = now_plus_30_days();
-    let (cap_blob, sig_blob) = capability::build_capability(
+    // The offline root signs exactly one non-expiring constitutional anchor.
+    // The founder key then issues the finite operational credential used for
+    // authentication and ordinary delegation. Future founder rotations are
+    // siblings under the retained anchor, so no live daemon needs the root.
+    let (anchor_cap_blob, anchor_sig_blob) = capability::build_founder_anchor(
         &team_root,
         founder_key.verifying_key(),
-        None,
+        scope_root,
+        scope_facts.clone(),
+    )
+    .map_err(|e| anyhow!("build founder anchor: {e:?}"))?;
+
+    let expiry = now_plus_30_days();
+    let (cap_blob, sig_blob) = capability::build_capability(
+        &founder_key,
+        founder_key.verifying_key(),
+        (anchor_cap_blob.clone(), anchor_sig_blob.clone()),
         scope_root,
         scope_facts,
         expiry,
     )
-    .map_err(|e| anyhow!("build founder cap: {e:?}"))?;
+    .map_err(|e| anyhow!("build founder operational cap: {e:?}"))?;
 
+    let anchor_sig_handle: Inline<Handle<SimpleArchive>> = (&anchor_sig_blob).get_handle();
     let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
     let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
     with_pile(&pile_path, |pile| {
+        store_blob(pile, anchor_cap_blob)?;
+        store_blob(pile, anchor_sig_blob)?;
         store_blob(pile, cap_blob)?;
         store_blob(pile, sig_blob)?;
+
+        triblespace_net::policy::pin_team_credential(
+            pile,
+            team_root_pubkey,
+            triblespace_net::policy::TeamCredential {
+                cap: cap_handle,
+                sig: sig_handle,
+                founder_anchor_sig: Some(anchor_sig_handle),
+            },
+        )
+        .ok_or_else(|| anyhow!("pin founder credential"))?;
+
+        let policy_entry = triblespace_net::policy::record_policy_entry(
+            pile,
+            founder_key.verifying_key(),
+            scope_root,
+            expiry,
+            cap_handle,
+            sig_handle,
+        )
+        .ok_or_else(|| anyhow!("record founder renewal policy"))?;
+        triblespace_net::policy::mark_policy_delivered(pile, policy_entry)
+            .ok_or_else(|| anyhow!("mark founder credential locally delivered"))?;
         Ok(())
     })?;
 
@@ -450,6 +511,7 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
         "Anyone with this key can issue founder-equivalent capabilities.",
     ]);
     println!("team root SECRET:  {}", hex::encode(team_root.to_bytes()));
+    println!("founder anchor sig: {}", hex::encode(anchor_sig_handle.raw));
     println!("founder cap blob:  {}", hex::encode(cap_handle.raw));
     println!("founder cap (sig): {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
@@ -499,7 +561,7 @@ fn run_invite(
             use triblespace_core::repo::BlobStore;
             pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?
         };
-        let _ = capability::verify_chain(
+        let parent_verified = capability::verify_chain(
             team_root,
             issuer_cap_sig_handle,
             issuer_pubkey,
@@ -535,11 +597,11 @@ fn run_invite(
             });
         }
 
-        let expiry = now_plus_30_days();
+        let expiry = cap_expiry_at_most(now_plus_30_days(), parent_verified.expires_at())?;
         let (cap_blob, sig_blob) = capability::build_capability(
             &issuer_key,
             invitee,
-            Some((parent_cap_blob, parent_sig_blob)),
+            (parent_cap_blob, parent_sig_blob),
             scope_root,
             scope_facts,
             expiry,
@@ -548,6 +610,32 @@ fn run_invite(
 
         let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+
+        // The builder is deliberately structural: it does not decide whether
+        // the requested scope is a valid attenuation of the parent. Verify the
+        // completed child before either its blobs or a renewal entry become
+        // durable, so an over-broad invitation fails at issuance rather than
+        // becoming an endlessly redispatched invalid policy entry.
+        let verification_reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        let _verified_child = capability::verify_chain(
+            team_root,
+            sig_handle,
+            invitee,
+            |handle: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+                use triblespace_core::repo::BlobStoreGet;
+                if handle == sig_handle {
+                    Some(sig_blob.clone())
+                } else if handle == cap_handle {
+                    Some(cap_blob.clone())
+                } else {
+                    verification_reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                }
+            },
+        )
+        .map_err(|e| anyhow!("issued capability chain does not verify: {e:?}"))?;
+        drop(verification_reader);
 
         store_blob(pile, cap_blob)?;
         store_blob(pile, sig_blob)?;
@@ -806,15 +894,17 @@ fn run_show(
                 triblespace_core::repo::signed_by: ?signer,
             }])
         );
-        let (mut current_outer_id, mut current_cap_handle, mut current_signer) =
-            match (leaf_iter.next(), leaf_iter.next()) {
-                (Some(row), None) => row,
-                _ => {
-                    return Err(anyhow!(
-                "malformed sig blob — expected exactly one outer entity with (sig_signs, signed_by)"
-            ))
-                }
-            };
+        let (mut current_outer_id, mut current_cap_handle, mut current_signer) = match (
+            leaf_iter.next(),
+            leaf_iter.next(),
+        ) {
+            (Some(row), None) => row,
+            _ => {
+                return Err(anyhow!(
+                    "malformed sig blob — expected exactly one outer entity with (sig_signs, signed_by)"
+                ));
+            }
+        };
         let mut depth = 0usize;
         const MAX_DEPTH: usize = 32;
 
@@ -838,20 +928,55 @@ fn run_show(
                     subject: VerifyingKey,
                     issuer: VerifyingKey,
                     root: Id,
-                    exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>
                 ),
                 pattern!(&cap_set, [{
                     ?e @
                     capability::cap_subject: ?subject,
                     capability::cap_issuer: ?issuer,
                     capability::cap_scope_root: ?root,
-                    triblespace_core::metadata::expires_at: ?exp,
                 }])
             );
-            let (_, subject, issuer, scope_root, expiry) = match (cap_iter.next(), cap_iter.next()) {
-            (Some(row), None) => row,
-            _ => return Err(anyhow!("malformed cap blob — expected exactly one (subject, issuer, scope_root, expires_at) tuple")),
-        };
+            let (cap_entity, subject, issuer, scope_root) = match (cap_iter.next(), cap_iter.next())
+            {
+                (Some(row), None) => row,
+                _ => {
+                    return Err(anyhow!(
+                        "malformed cap blob — expected exactly one (subject, issuer, scope_root) tuple"
+                    ));
+                }
+            };
+
+            let mut expiries = find!(
+                expiry: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
+                pattern!(&cap_set, [{
+                    cap_entity @ triblespace_core::metadata::expires_at: ?expiry
+                }])
+            );
+            let expiry = match (expiries.next(), expiries.next()) {
+                (Some(expiry), None) => Some(expiry),
+                (None, None) => None,
+                _ => return Err(anyhow!("malformed cap blob — conflicting expiry values")),
+            };
+            let is_founder_anchor = find!(
+                tag: Id,
+                pattern!(&cap_set, [{
+                    cap_entity @ triblespace_core::metadata::tag: ?tag
+                }])
+            )
+            .any(|tag| tag == capability::KIND_FOUNDER_ANCHOR);
+            match (is_founder_anchor, expiry.is_some()) {
+                (true, true) => {
+                    return Err(anyhow!(
+                        "malformed cap blob — founder anchor must not carry an expiry"
+                    ));
+                }
+                (false, false) => {
+                    return Err(anyhow!(
+                        "malformed cap blob — operational capability is missing its expiry"
+                    ));
+                }
+                _ => {}
+            }
 
             // Permissions hung off the scope root.
             let perms: Vec<Id> = find!(
@@ -896,10 +1021,24 @@ fn run_show(
             };
 
             println!("level {depth}:");
+            println!(
+                "  kind:     {}",
+                if is_founder_anchor {
+                    "founder anchor (rotation authority; not an auth credential)"
+                } else {
+                    "finite operational capability"
+                }
+            );
             println!("  issuer:   {}", hex::encode(issuer.to_bytes()));
             println!("  subject:  {}", hex::encode(subject.to_bytes()));
             println!("  scope:    {perm_str}{pin_str}");
-            println!("  expires:  {}", format_expiry(&expiry));
+            println!(
+                "  expires:  {}",
+                expiry
+                    .as_ref()
+                    .map(format_expiry)
+                    .unwrap_or_else(|| "never (founder anchor)".to_string())
+            );
             println!("  cap blob: {}", hex::encode(cap_handle.raw));
             println!("  signer matches cap_issuer: {signer_matches_issuer}");
 
@@ -1111,7 +1250,10 @@ fn run_list_issued(pile_path: PathBuf) -> Result<()> {
         println!("  entry:      {}  [{status}]", hex::encode(id_bytes));
         println!("    subject:  {}", hex::encode(e.subject.to_bytes()));
         println!("    scope:    {}", hex::encode(scope_bytes));
-        println!("    issued:   {}", format_expiry(&e.issued_at));
+        println!(
+            "    effective expiry: {}",
+            format_expiry(&e.effective_expiry)
+        );
         println!("    cap:      {}", hex::encode(e.latest_cap.raw));
         println!("    sig:      {}", hex::encode(e.latest_sig.raw));
         if let Some(r) = &e.retracted_at {
@@ -1150,7 +1292,9 @@ fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
                 "retracted entry {}",
                 hex::encode(<[u8; 16]>::from(entry_id))
             );
-            println!("(the subject's cap chain will die at its current cap's expiry; no revocation propagates)");
+            println!(
+                "(the subject's cap chain will die at its current cap's expiry; no revocation propagates)"
+            );
             Ok(())
         }
         None => bail!(
@@ -1175,10 +1319,10 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 fn run_request_join(
+    pile_path: PathBuf,
     admin_hex: String,
     scope: ScopeArg,
     key: Option<PathBuf>,
-    pile_for_key: Option<PathBuf>,
 ) -> Result<()> {
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::id::ExclusiveId;
@@ -1186,19 +1330,9 @@ fn run_request_join(
 
     let admin_pubkey = parse_pubkey_hex(&admin_hex)?;
 
-    // Load (or generate) the requester's signing key. If `--pile` is
-    // given, reuse the conventional sibling-of-pile location; else
-    // require `--key` explicitly so the keypair is intentional.
-    let signing_key = match (key, pile_for_key) {
-        (None, None) => bail!(
-            "team request-join needs either --key <path> or --pile <path> \
-             (for the conventional alongside-the-pile location)"
-        ),
-        (k, pile_opt) => {
-            let pile_path = pile_opt.unwrap_or_else(|| PathBuf::from("."));
-            load_or_generate_signing_key(k, &pile_path)?
-        }
-    };
+    // The requester's identity and the durable delivery expectation
+    // deliberately share the same pile location.
+    let signing_key = load_or_generate_signing_key(key, &pile_path)?;
     let requester_pubkey = signing_key.verifying_key();
 
     // Build the partial cap blob (declares: who we are, what we want,
@@ -1222,6 +1356,17 @@ fn run_request_join(
     let mut cap_set = TribleSet::from(cap_fragment);
     cap_set += scope_facts;
     let partial_cap: Blob<SimpleArchive> = cap_set.to_blob();
+    let partial_handle: Inline<Handle<SimpleArchive>> = partial_cap.get_handle();
+
+    // Persist intent before any network I/O. A valid capability chain is not
+    // enough to select this node's first credential: the eventual delivery
+    // must match this exact partial request. Refuse to send if that durable
+    // write did not succeed, otherwise an ACK could leave us unable to accept
+    // the capability we just asked for.
+    with_pile(&pile_path, |pile| {
+        triblespace_net::policy::record_outbound_cap_request(pile, partial_cap.clone())
+            .ok_or_else(|| anyhow!("record outbound capability request on local pile"))
+    })?;
 
     println!(
         "sending OP_REQUEST_CAP to admin {} (scope={:?})…",
@@ -1238,21 +1383,72 @@ fn run_request_join(
             &partial_cap.bytes,
         )
         .await
-    })?;
+    });
+
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            // Delivery may have reached the admin even when its ACK did not
+            // reach us. Retaining the exact expectation is the conservative
+            // choice: it permits only the capability we deliberately asked
+            // for, while clearing it could strand an accepted request.
+            return Err(anyhow!(
+                "send capability request: {error:#}; the durable local expectation was retained because delivery outcome is unknown"
+            ));
+        }
+    };
 
     match status {
         triblespace_net::handshake::STATUS_OK => {
             println!("ACK — admin received your request and queued it.");
+            println!(
+                "The exact request remains recorded locally until its first cap is activated."
+            );
             println!("They'll see it under `team list-pending`.");
             println!("Once approved, your cap arrives via the auth-handshake ALPN;");
             println!("a running `pile net sync` daemon will pin it on the team-cap pin.");
             Ok(())
         }
-        triblespace_net::handshake::STATUS_REJECTED => bail!("admin rejected the request"),
-        triblespace_net::handshake::STATUS_MALFORMED => {
-            bail!("admin rejected the request as malformed (version mismatch or bad payload)")
-        }
-        other => bail!("admin returned unknown status code {other:#x}"),
+        triblespace_net::handshake::STATUS_REJECTED => clear_rejected_join_expectation(
+            &pile_path,
+            partial_handle,
+            "admin rejected the request",
+        ),
+        triblespace_net::handshake::STATUS_MALFORMED => clear_rejected_join_expectation(
+            &pile_path,
+            partial_handle,
+            "admin rejected the request as malformed (version mismatch or bad payload)",
+        ),
+        // An unknown response is not a trustworthy assertion that the request
+        // was rejected. Keep the expectation for the same reason as a lost
+        // ACK: accepting a later delivery remains bounded to the exact local
+        // request, while deleting it could make an accepted request unusable.
+        other => bail!(
+            "admin returned unknown status code {other:#x}; the durable local expectation was retained because delivery outcome is unknown"
+        ),
+    }
+}
+
+/// Clear an expectation only when the intended admin explicitly says it did
+/// not accept the request. If clearing fails, surface that fact rather than
+/// pretending the local state agrees with the remote outcome.
+fn clear_rejected_join_expectation(
+    pile_path: &PathBuf,
+    expected: Inline<Handle<SimpleArchive>>,
+    rejection: &str,
+) -> Result<()> {
+    let clear = with_pile(pile_path, |pile| {
+        triblespace_net::policy::clear_outbound_cap_request_if(pile, expected)
+            .ok_or_else(|| anyhow!("clear rejected outbound capability request"))
+    });
+    match clear {
+        Ok(true) => bail!("{rejection}; the durable local expectation was cleared"),
+        Ok(false) => bail!(
+            "{rejection}; this request no longer owns the durable local expectation, so the newer intent was preserved"
+        ),
+        Err(error) => bail!(
+            "{rejection}; additionally the durable local expectation could not be cleared: {error:#}"
+        ),
     }
 }
 
@@ -1308,26 +1504,36 @@ fn run_approve(
             (
                 e: Id,
                 subject: VerifyingKey,
+                issuer: VerifyingKey,
                 scope_root: Id,
                 expiry: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
             ),
             pattern!(&partial_set, [{
                 ?e @
                 capability::cap_subject: ?subject,
+                capability::cap_issuer: ?issuer,
                 capability::cap_scope_root: ?scope_root,
                 triblespace_core::metadata::expires_at: ?expiry,
             }])
         );
-        let (_cap_id, subject, scope_root, expiry) = match (iter.next(), iter.next()) {
-            (Some(row), None) => row,
-            _ => bail!("partial cap blob malformed (no unique subject/scope/expiry)"),
-        };
+        let (_cap_id, subject, requested_issuer, scope_root, requested_expiry) =
+            match (iter.next(), iter.next()) {
+                (Some(row), None) => row,
+                _ => bail!("partial cap blob malformed (no unique subject/issuer/scope/expiry)"),
+            };
 
         if subject != request.requester {
             bail!(
                 "partial cap subject {} doesn't match requester {} — refusing to sign",
                 hex::encode(subject.to_bytes()),
                 hex::encode(request.requester.to_bytes()),
+            );
+        }
+        if requested_issuer != issuer_key.verifying_key() {
+            bail!(
+                "partial cap requested issuer {} but this signer is {} — refusing to sign",
+                hex::encode(requested_issuer.to_bytes()),
+                hex::encode(issuer_key.verifying_key().to_bytes()),
             );
         }
 
@@ -1363,7 +1569,7 @@ fn run_approve(
         // Verify the issuer's chain before signing — refuse to delegate
         // off an invalid chain.
         let snap_reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-        let _ = capability::verify_chain(
+        let parent_verified = capability::verify_chain(
             team_root,
             issuer_cap_sig_handle,
             issuer_key.verifying_key(),
@@ -1375,6 +1581,8 @@ fn run_approve(
         )
         .map_err(|e| anyhow!("issuer's cap chain does not verify: {e:?}"))?;
 
+        let expiry = cap_expiry_at_most(requested_expiry, parent_verified.expires_at())?;
+
         // Sign the cap. Note: build_capability sets cap_issuer to the
         // issuer's verifying key automatically (overrides whatever the
         // partial cap declared); that's correct — the requester's
@@ -1383,7 +1591,7 @@ fn run_approve(
         let (cap_blob, sig_blob) = capability::build_capability(
             &issuer_key,
             subject,
-            Some((parent_cap_blob, parent_sig_blob)),
+            (parent_cap_blob, parent_sig_blob),
             scope_root,
             scope_facts,
             expiry,
@@ -1393,6 +1601,28 @@ fn run_approve(
         let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
         let request_id = request.id;
+
+        // Refuse an over-broad or otherwise invalid request before writing
+        // either orphan blobs or a durable renewal entry. The completed chain
+        // is checked with the just-built leaf pair overlaid on the existing
+        // pile reader; parent proof remains content-addressed and unchanged.
+        let _verified_child = capability::verify_chain(
+            team_root,
+            sig_handle,
+            subject,
+            |handle: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+                if handle == sig_handle {
+                    Some(sig_blob.clone())
+                } else if handle == cap_handle {
+                    Some(cap_blob.clone())
+                } else {
+                    snap_reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                }
+            },
+        )
+        .map_err(|e| anyhow!("issued capability chain does not verify: {e:?}"))?;
 
         // Persist cap+sig blobs, record on the renewal-policy pin,
         // mark the request approved — purely local writes, no

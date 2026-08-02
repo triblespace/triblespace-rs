@@ -99,26 +99,28 @@ Signing key format
 
 ### Distributed pile sync
 
-Built on `triblespace-net` (iroh QUIC + DHT + gossip). Direct blob RPC
-connections authenticate through capability chains rooted at a team's pubkey;
-the legacy gossip frame itself is only a transport observation, not
-authenticated branch authorship. `identity` and `status` are local diagnostic
-commands. See the *Capability auth* section below for team setup.
+Built on `triblespace-net` (iroh QUIC + DHT). Direct blob RPC connections
+authenticate through capability chains rooted at a team's pubkey. Branch
+assertions are deliberately not transported yet: synchronization announces
+content and services durable lazy-fetch wants without synthesizing branch
+authority. `identity` and `status` are local diagnostic commands. See the
+*Capability auth* section below for team setup.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
 - `pile net status [--key PATH]` — print the auth configuration this node would present on `OP_AUTH`: node id, team root, self_cap, and where each value comes from (env var vs fallback). For debugging stuck-auth scenarios.
-- `pile net sync <PILE> [--peers ID,...] [--key PATH]` — long-running blob and legacy mutable-HEAD sync on the team's gossip mesh. The mesh is identified by the team root pubkey directly (no separate topic argument): every team has exactly one mesh, derived from its identity. Incoming HEAD observations remain local tracking pins and are never converted automatically into locally signed assertions. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` env vars; falls back to the node's own pubkey for single-user / team-of-one workflows. Signed-assertion replication still requires a dedicated protocol and admission policy.
+- `pile net sync <PILE> [--peers ID,...] [--key PATH]` — announce local blobs and service durable weak-pin wants over the team network. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP`; the team root falls back to the node's own pubkey for a team-of-one, while a missing cap leaves the node recovery/server-only. `--no-lazy` disables want reconciliation. Signed-assertion replication still requires a dedicated protocol and admission policy.
 
 ### Capability auth
 
-Chain-of-trust capability system for distributed pile sync. A team
-has one immutable root keypair (used once at creation, then archived)
-that signs the founder's capability; every other capability chains
-off the founder's via delegation. See
+Chain-of-trust capability system for distributed pile sync. A team has one
+immutable root keypair, used once at creation and then archived, which signs a
+non-expiring founder anchor. The founder's finite operational credential and
+future rotations are siblings beneath that anchor; ordinary capabilities
+continue by delegation. See
 [`book/src/capability-auth.md`](../book/src/capability-auth.md) for
 the full design.
 
-- `team create --pile PATH [--key KEY_PATH]` — mint a new team root keypair, sign the founder's self-cap with admin scope, and write both into the pile. Prints the team root pubkey (publish to peers), team root SECRET (archive offline), founder cap handles, and the cap's expiry timestamp.
+- `team create --pile PATH [--key KEY_PATH]` — mint a team root, sign one non-expiring founder anchor, issue a finite founder operational cap beneath it, and durably pin the complete credential. Prints the public team root, root secret to archive offline, anchor and operational handles, and operational expiry.
 - `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--legacy-pin HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--legacy-pin` (repeatable) restricts the current blob RPC to reachability from mutable local-pin roots; it does not select an exact StrongPin branch.
 - `team request-join --admin HEX --scope (read|write|admin) [--key PATH] [--pile PATH]` — send an `OP_REQUEST_CAP` to an admin asking to be issued a capability via the running auth-handshake daemon.
 - `team approve --pile PATH --entry HEX --team-root HEX --cap HEX [--key PATH]` — approve a pending join request, sign the cap, dispatch it via the auth-handshake ALPN, and add a renewal-policy entry so the cap stays renewed.
@@ -126,7 +128,7 @@ the full design.
 - `team list --pile PATH` — audit the pile: per-cap details (issuer → subject, scope, expiry — sorted soonest-expiry-first).
 - `team list-pending --pile PATH` — incoming join requests awaiting approval.
 - `team list-issued --pile PATH` — renewal-policy entries this node is keeping renewed.
-- `team show --pile PATH --cap HEX [--verify HEX] [--expected-subject HEX]` — walk one chain end-to-end and print each level with subject, issuer, scope, expiry, blob handles, and a signer-matches-issuer check. Bounded by MAX_DEPTH=32; the diagnostic deep-dive that complements `team list`'s summary view.
+- `team show --pile PATH --cap HEX [--verify HEX] [--expected-subject HEX]` — walk one chain end-to-end and print each level with subject, issuer, scope, expiry, cap handle, proof position, and a signer-matches-issuer check. Bounded by MAX_DEPTH=32; the diagnostic deep-dive that complements `team list`'s summary view.
 
 ### Work with remote stores
 
@@ -140,7 +142,7 @@ the full design.
 
 #### Mutable legacy pins
 
-- `store pin list <URL>` — list every mutable legacy pin id at an object-store URL. This is an unclassified storage view and can include old content-branch heads as well as local policy or tracking pins.
+- `store pin list <URL>` — list every replica-local mutable pin id at an object-store URL. This is an unclassified storage view and can include old content-branch heads as well as local policy or retention pins.
 
 `ObjectStoreRemote` intentionally exposes only blobs and replica-local pins.
 It does not claim the coherent snapshot and durable-append contracts required

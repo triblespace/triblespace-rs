@@ -86,10 +86,9 @@ impl PinStore for MemoryRepo {
     type ListIter<'a> = std::vec::IntoIter<Result<Id, Self::PinsError>>;
 
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        // Sorted (not HashMap order): pin iteration order feeds
-        // gossip-publish order and snapshot construction; HashMap's
-        // per-instance seed would make every run reorder them, which
-        // breaks deterministic simulation replay. Pile's PATCH-backed
+        // Sorted (not HashMap order): pin iteration feeds serving-snapshot and
+        // policy construction; HashMap's per-instance seed would reorder each
+        // run and break deterministic simulation replay. Pile's PATCH-backed
         // pins() is already byte-ordered for the same reason.
         let mut ids: Vec<Id> = self.pins.keys().cloned().collect();
         ids.sort();

@@ -10,7 +10,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::{EndpointAddr, EndpointId};
 
 use triblespace_net::identity::load_or_create_key;
-use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace_net::peer::{Peer, PeerConfig};
 
 use triblespace_core::repo::pile::Pile;
 
@@ -96,8 +96,8 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Move blobs and legacy mutable-HEAD observations over the team's gossip
-    /// mesh. This does not replicate or synthesize signed branch assertions.
+    /// Announce local blobs and service durable weak-pin wants over the team
+    /// network. This does not replicate signed branch assertions.
     /// The team root is read from `TRIBLE_TEAM_ROOT`, falling back to this
     /// node's own pubkey for single-user / team-of-one workflows.
     Sync {
@@ -106,22 +106,13 @@ pub enum Command {
         peers: Vec<String>,
         #[arg(long)]
         key: Option<PathBuf>,
-        /// Don't publish local legacy HEADs — fetch only. Useful for
-        /// follower / leecher workflows where we're catching up.
-        #[arg(long, conflicts_with = "write_only")]
-        read_only: bool,
-        /// Don't react to incoming legacy HEADs — publish only. Useful for
-        /// pure-publisher workflows (importers, archives) where the
-        /// local pile has nothing to learn from the swarm.
-        #[arg(long, conflicts_with = "read_only")]
-        write_only: bool,
         /// Stop after at most N seconds. Without this flag (and without
         /// `--quiescent-for`), sync runs until interrupted with Ctrl-C —
         /// "done" isn't a knowable state in a team swarm (two-generals).
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
         /// Stop after N seconds without any network event (no incoming
-        /// HEAD, no incoming blob) and without any want being serviced
+        /// incoming blob and without any want being serviced
         /// by the lazy reconcile. Best-effort "we appear to have
         /// caught up" signal — useful for bounded sync in scripts where
         /// you accept the two-generals caveat. Wants that stay pending
@@ -151,31 +142,19 @@ pub fn run(cmd: Command) -> Result<()> {
             pile,
             peers,
             key,
-            read_only,
-            write_only,
             duration,
             quiescent_for,
             no_lazy,
             reconcile_interval,
-        } => {
-            let direction = if read_only {
-                SyncDirection::ReadOnly
-            } else if write_only {
-                SyncDirection::WriteOnly
-            } else {
-                SyncDirection::Bidirectional
-            };
-            run_sync(
-                pile,
-                peers,
-                key,
-                direction,
-                duration,
-                quiescent_for,
-                no_lazy,
-                reconcile_interval,
-            )
-        }
+        } => run_sync(
+            pile,
+            peers,
+            key,
+            duration,
+            quiescent_for,
+            no_lazy,
+            reconcile_interval,
+        ),
     }
 }
 
@@ -234,7 +213,6 @@ fn run_sync(
     pile_path: PathBuf,
     peer_strs: Vec<String>,
     key_path: Option<PathBuf>,
-    direction: SyncDirection,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
     no_lazy: bool,
@@ -263,10 +241,8 @@ fn run_sync(
     ctrlc::set_handler(move || stop_for_signal.store(true, Ordering::Release))
         .map_err(|error| anyhow!("install Ctrl-C handler: {error}"))?;
 
-    // A single pile handle wrapped in a Peer. Reads drain incoming blob and
-    // legacy HEAD observations into local transport state; external mutable
-    // pins are announced through the legacy protocol. Signed branch assertions
-    // are deliberately neither synthesized from HEADs nor replicated here.
+    // A single pile handle wrapped in a Peer. Local blobs are announced to the
+    // DHT; signed branch assertions remain local.
     let pile = open_pile(&pile_path)?;
     let team_root = team_root_from_env(&key)?;
     let self_cap = self_cap_from_env()?;
@@ -275,49 +251,28 @@ fn run_sync(
         key.clone(),
         PeerConfig {
             peers,
-            gossip: true,
             team_root,
             self_cap,
-            direction,
         },
     );
     eprintln!("node: {}", peer.id());
-    eprintln!(
-        "team_root: {}  (gossip topic)",
-        hex::encode(team_root.to_bytes())
-    );
-    let dir_label = match direction {
-        SyncDirection::Bidirectional => "bidirectional",
-        SyncDirection::ReadOnly => "read-only (no publish)",
-        SyncDirection::WriteOnly => "write-only (ignore incoming legacy HEADs)",
-    };
-    eprintln!("direction: {dir_label}");
+    eprintln!("team_root: {}", hex::encode(team_root.to_bytes()));
     if let Some(d) = duration {
         eprintln!("stop after: {d}s");
     }
     if let Some(q) = quiescent_for {
         eprintln!("quiescent stop: {q}s without events");
     }
-    // Lazy content sync: service durable weak-pin wants. Fetching is a
-    // read-side work, so WriteOnly suppresses it; it stays on under
-    // ReadOnly — a leecher that only services wants is a legit workflow.
-    let lazy = !no_lazy && direction != SyncDirection::WriteOnly;
+    // Lazy content sync: service durable weak-pin wants.
+    let lazy = !no_lazy;
     if lazy {
         eprintln!(
             "lazy: servicing weak-pin wants every {reconcile_interval}s (--no-lazy to disable)"
         );
-    } else if no_lazy {
-        eprintln!("lazy: disabled (--no-lazy)");
     } else {
-        eprintln!("lazy: disabled under --write-only (servicing wants is read-side work)");
+        eprintln!("lazy: disabled (--no-lazy)");
     }
-    eprintln!(
-        "legacy HEAD/blob sync active; signed assertions are not replicated. (Ctrl-C to stop)\n"
-    );
-
-    // Initial broadcast so peers connecting later can learn our state.
-    // republish_legacy_heads itself is direction-aware (no-op in ReadOnly).
-    peer.republish_legacy_heads();
+    eprintln!("content sync active; signed assertions are not replicated. (Ctrl-C to stop)\n");
 
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
@@ -345,9 +300,7 @@ fn run_sync(
             eprintln!("\nCtrl-C received; closing the pile cleanly");
             break;
         }
-        // Bounded run-time. The host_loop also does periodic re-broadcasts
-        // (30s) of its own cache, so the CLI no longer needs to drive a
-        // legacy-head republish tick.
+        // Bounded run-time.
         if let Some(limit) = duration_limit {
             if started.elapsed() >= limit {
                 eprintln!(
@@ -372,9 +325,6 @@ fn run_sync(
         }
 
         // Drain the network event channel and refresh the served snapshot.
-        // Legacy HEAD observations remain mutable local tracking pins. Turning
-        // one into a signed local assertion requires a separate, explicit
-        // admission/authorship decision and never happens in this sync loop.
         if let Err(error) = peer.refresh() {
             eprintln!("network ingestion stopped: {error}");
             ingest_error = Some(error);
@@ -392,9 +342,7 @@ fn run_sync(
         // chains — entries become due well before the cap actually
         // expires, giving the daemon multiple chances to land the
         // successor.
-        if direction != SyncDirection::ReadOnly {
-            let _renewed = peer.renewal_tick(hifitime::Duration::from_seconds(3600.0));
-        }
+        let _renewed = peer.renewal_tick(hifitime::Duration::from_seconds(3600.0));
 
         // Want-reconcile tick: a weak pin IS a durable want-marker —
         // "I would like this blob; fetch it if absent; evictable."

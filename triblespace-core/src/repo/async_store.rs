@@ -140,9 +140,9 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
 ///
 /// Pins are transport/retention state local to one replica. They are not
 /// StrongPin branch authority and must never be exposed as a scalar branch
-/// head. A tracking pin may feed an explicit local merge-and-publish action,
-/// but shared branch state itself lives exclusively in
-/// [`AsyncBranchAssertionStore`].
+/// head. Shared branch state lives exclusively in
+/// [`AsyncBranchAssertionStore`]; callers may use pins for local policy,
+/// retention, or durable fetch intent.
 pub trait AsyncPinStore {
     /// Error type for listing pins.
     type PinsError: Error + Debug + Send + Sync + 'static;
@@ -198,7 +198,11 @@ pub trait AsyncBranchAssertionStore {
 ///
 /// Remote readers need an awaitable commit lookup in order to distinguish a
 /// genuinely absent commit from corrupt metadata or a backend failure without
-/// hiding network I/O behind a synchronous method.
+/// hiding network I/O behind a synchronous method. Because this trait permits
+/// remote I/O, an arbitrary implementation cannot be lowered into the
+/// resolver's strictly local [`PartialCommitDag`] boundary. Only
+/// [`SyncAsAsync`] values whose inner store already implements that local
+/// contract round-trip through [`Blocking`].
 pub trait AsyncPartialCommitDag {
     /// Non-absence lookup failure.
     type Error;
@@ -647,11 +651,14 @@ impl<A: AsyncBranchAssertionStore> BranchAssertionStore for Blocking<A> {
 }
 
 #[cfg(feature = "object-store")]
-impl<A: AsyncPartialCommitDag> PartialCommitDag for Blocking<A> {
-    type Error = A::Error;
+impl<S> PartialCommitDag for Blocking<SyncAsAsync<S>>
+where
+    S: PartialCommitDag,
+{
+    type Error = S::Error;
 
     fn parents(&mut self, commit: CommitHandle) -> Result<ParentLookup, Self::Error> {
-        self.rt.block_on(self.inner.parents(commit))
+        self.inner.0.parents(commit)
     }
 }
 

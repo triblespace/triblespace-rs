@@ -17,9 +17,11 @@ use rand::rngs::OsRng;
 use tokio::sync::mpsc;
 
 use triblespace_net::handshake::{
-    AUTH_HANDSHAKE_ALPN, IncomingOp, STATUS_OK, read_incoming, respond, send_deliver_cap,
-    send_request_cap,
+    AUTH_HANDSHAKE_ALPN, IncomingOp, STATUS_OK, fetch_capability_blob, read_incoming, respond,
+    respond_capability_blob, send_deliver_cap, send_request_cap,
 };
+
+const PROOF_PAYLOAD: &[u8] = b"exact-capability-proof-member";
 
 /// Minimal protocol handler: parses incoming streams and forwards
 /// decoded ops to a channel. Sufficient for protocol-level tests —
@@ -53,8 +55,13 @@ impl iroh::protocol::ProtocolHandler for EventForwardingHandler {
                 Err(_) => break,
             };
             if let Ok(Some(op)) = read_incoming(&mut recv).await {
+                let is_proof_fetch = matches!(&op, IncomingOp::FetchCapabilityBlob { .. });
                 let _ = events.send(op);
-                let _ = respond(&mut send, STATUS_OK).await;
+                if is_proof_fetch {
+                    let _ = respond_capability_blob(&mut send, Some(PROOF_PAYLOAD)).await;
+                } else {
+                    let _ = respond(&mut send, STATUS_OK).await;
+                }
             }
         }
         Ok(())
@@ -139,6 +146,9 @@ async fn op_request_cap_round_trips() {
             );
         }
         IncomingOp::Deliver { .. } => panic!("got Deliver, expected Request"),
+        IncomingOp::FetchCapabilityBlob { .. } => {
+            panic!("got FetchCapabilityBlob, expected Request")
+        }
     }
 }
 
@@ -191,5 +201,65 @@ async fn op_deliver_cap_round_trips() {
             assert_eq!(&s[..], &sig_bytes[..], "sig payload survives the wire");
         }
         IncomingOp::Request { .. } => panic!("got Request, expected Deliver"),
+        IncomingOp::FetchCapabilityBlob { .. } => {
+            panic!("got FetchCapabilityBlob, expected Deliver")
+        }
+    }
+}
+
+#[tokio::test]
+async fn op_fetch_capability_blob_round_trips_exact_handles() {
+    let network = TestNetwork::new();
+
+    let server_key = SigningKey::generate(&mut OsRng);
+    let requester_key = SigningKey::generate(&mut OsRng);
+    let server_secret = to_iroh_secret(&server_key);
+    let requester_secret = to_iroh_secret(&requester_key);
+    let server_id = EndpointId::from(server_secret.public());
+    let server_ep = test_endpoint(&network, server_secret).await;
+    let requester_ep = test_endpoint(&network, requester_secret).await;
+
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<IncomingOp>();
+    let handler = EventForwardingHandler { events: events_tx };
+    let _router = Router::builder(server_ep.clone())
+        .accept(AUTH_HANDSHAKE_ALPN, handler)
+        .spawn();
+
+    let leaf_sig = [1; 32];
+    let subject = [2; 32];
+    let requested = [3; 32];
+    let conn = requester_ep
+        .connect(custom_addr(server_id), AUTH_HANDSHAKE_ALPN)
+        .await
+        .expect("connect");
+    let payload = fetch_capability_blob(
+        &triblespace_net::transport::iroh::IrohConn(conn.clone()),
+        &leaf_sig,
+        &subject,
+        &requested,
+    )
+    .await
+    .expect("fetch")
+    .expect("server returns proof member");
+    assert_eq!(payload, PROOF_PAYLOAD);
+    conn.close(0u32.into(), b"ok");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
+        .await
+        .expect("event arrives within 2s")
+        .expect("channel still open");
+    match event {
+        IncomingOp::FetchCapabilityBlob {
+            leaf_sig: got_leaf,
+            subject: got_subject,
+            requested: got_requested,
+        } => {
+            assert_eq!(got_leaf, leaf_sig);
+            assert_eq!(got_subject, subject);
+            assert_eq!(got_requested, requested);
+        }
+        IncomingOp::Request { .. } | IncomingOp::Deliver { .. } => {
+            panic!("got a different handshake operation")
+        }
     }
 }

@@ -14,8 +14,8 @@
 //!
 //! - [`mono_now`](crate::clock::mono_now) → [`Mono`](crate::clock::Mono): monotonic nanoseconds since an arbitrary
 //!   per-process origin. Replaces `std::time::Instant` for durations
-//!   and timeouts (redispatch cooldowns, quiescence tracking, the
-//!   gossip rebroadcast period). `Mono` is plain data (`u64` ns) so it
+//!   and timeouts (redispatch cooldowns, quiescence tracking, and lazy-fetch
+//!   retry backoff). `Mono` is plain data (`u64` ns) so it
 //!   can cross thread and serialization boundaries freely, which
 //!   `Instant` cannot.
 //! - [`epoch_now`](crate::clock::epoch_now) → `hifitime::Epoch`: wall-clock TAI time. Used

@@ -5,7 +5,8 @@
 #![allow(dead_code)]
 #![cfg(feature = "sim")]
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
@@ -20,7 +21,7 @@ use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
-use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
+use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::transport::sim::SimNet;
 
 /// One virtual clock per test process (install_virtual is
@@ -54,8 +55,15 @@ pub fn pk(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
-/// Sign a PERM_ADMIN root cap for `subject` and return (cap, sig)
-/// blobs — the out-of-band provisioning a team admin would do.
+fn admin_proof_registry() -> &'static Mutex<HashMap<[u8; 32], Vec<Blob<SimpleArchive>>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<[u8; 32], Vec<Blob<SimpleArchive>>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Build a finite PERM_ADMIN credential for `subject` below its explicit
+/// root-signed founder anchor. The returned pair is the operational leaf used
+/// by existing scenarios; [`store_with_caps`] transparently seeds the anchor
+/// cap registered for that leaf so verification sees the complete proof.
 pub fn admin_cap(
     root: &SigningKey,
     subject: &SigningKey,
@@ -64,6 +72,14 @@ pub fn admin_cap(
     use triblespace_core::id::ufoid;
     use triblespace_core::macros::entity;
 
+    let anchor_scope = *ufoid();
+    let anchor_facts = TribleSet::from(entity! {
+        ExclusiveId::force_ref(&anchor_scope) @
+        triblespace_core::metadata::tag: PERM_ADMIN,
+    });
+    let anchor =
+        capability::build_founder_anchor(root, subject.verifying_key(), anchor_scope, anchor_facts)
+            .expect("build founder anchor");
     let scope_root = *ufoid();
     let scope_facts = TribleSet::from(entity! {
         ExclusiveId::force_ref(&scope_root) @
@@ -73,15 +89,20 @@ pub fn admin_cap(
     let expiry: Inline<NsTAIInterval> = (now, now + hifitime::Duration::from_days(30.0))
         .try_to_inline()
         .expect("interval");
-    capability::build_capability(
-        root,
+    let credential = capability::build_capability(
+        subject,
         subject.verifying_key(),
-        None,
+        anchor.clone(),
         scope_root,
         scope_facts,
         expiry,
     )
-    .expect("build cap")
+    .expect("build finite founder credential");
+    admin_proof_registry()
+        .lock()
+        .unwrap()
+        .insert(credential.1.get_handle().raw, vec![anchor.0]);
+    credential
 }
 
 /// A paused, single-thread tokio runtime + LocalSet runner — the
@@ -111,38 +132,27 @@ where
 
 /// Bring one node up on `net`: join the sim mesh, wire the host loop
 /// as a local task, return the `Peer<MemoryRepo>`. `store` is the
-/// node's pre-seeded local store (caps already inserted). `gossip`
-/// controls team-topic participation.
+/// node's pre-seeded local store (caps already inserted).
 pub fn bring_up(
     net: &SimNet,
     signing_key: &SigningKey,
     store: MemoryRepo,
     team_root: ed25519_dalek::VerifyingKey,
     self_cap: [u8; 32],
-    gossip: bool,
 ) -> Peer<MemoryRepo> {
     let id = pk(signing_key);
-    let harness = net.join(id, gossip);
+    let harness = net.join(id);
     let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&id).expect("endpoint id"));
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
             peers: Vec::new(),
-            gossip,
             team_root,
             self_cap,
-            direction: SyncDirection::Bidirectional,
         },
         wiring,
     ));
-    Peer::with_wiring(
-        store,
-        signing_key.clone(),
-        SyncDirection::Bidirectional,
-        team_root,
-        sender,
-        receiver,
-    )
+    Peer::with_wiring(store, signing_key.clone(), team_root, sender, receiver)
 }
 
 /// A MemoryRepo seeded with the given cap+sig blobs (so OP_AUTH
@@ -150,6 +160,16 @@ pub fn bring_up(
 pub fn store_with_caps(caps: &[(Blob<SimpleArchive>, Blob<SimpleArchive>)]) -> MemoryRepo {
     let mut store = MemoryRepo::default();
     for (cap, sig) in caps {
+        if let Some(proof) = admin_proof_registry()
+            .lock()
+            .unwrap()
+            .get(&sig.get_handle().raw)
+            .cloned()
+        {
+            for blob in proof {
+                store.put::<SimpleArchive, _>(blob).unwrap();
+            }
+        }
         store.put::<SimpleArchive, _>(cap.clone()).unwrap();
         store.put::<SimpleArchive, _>(sig.clone()).unwrap();
     }

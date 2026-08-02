@@ -17,7 +17,6 @@ iroh-blobs = { version = "0.103", default-features = false, features = ["rpc"] }
 # on the well-supported path).
 iroh-mdns-address-lookup = "0.4"
 url = "2"
-iroh-gossip = { version = "0.101", features = ["net"] }
 irpc = "0.17.0"
 irpc-iroh = "0.17.0"
 anyhow = "1"

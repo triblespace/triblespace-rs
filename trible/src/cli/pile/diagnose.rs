@@ -305,10 +305,21 @@ fn branch_history(pile_path: &Path, filter: Option<BranchIdentity>) -> Result<()
     with_locked_records(pile_path, |records: &mut PileRecords| {
         let mut seen = HashSet::<AssertionId>::new();
         let mut count = 0usize;
+        let mut invalid = 0usize;
         for record in records {
             let record = record?;
-            let PileRecordContent::BranchAssertion { assertion } = record.content else {
-                continue;
+            let assertion = match record.content {
+                PileRecordContent::BranchAssertion { assertion } => assertion,
+                PileRecordContent::InvalidBranchAssertion { id } => {
+                    println!(
+                        "offset={} assertion={} invalid-signature=yes (claim hidden)",
+                        record.offset,
+                        assertion_text(id),
+                    );
+                    invalid += 1;
+                    continue;
+                }
+                _ => continue,
             };
             if filter
                 .map(|wanted| assertion.identity() != &wanted)
@@ -329,6 +340,7 @@ fn branch_history(pile_path: &Path, filter: Option<BranchIdentity>) -> Result<()
             count += 1;
         }
         println!("Assertion records: {count}");
+        println!("Invalid-signature records: {invalid}");
         Ok(())
     })
 }
@@ -402,6 +414,15 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                         assertion_field_matches += 1;
                         println!(
                             "branch assertion commit-handle match at byte {}",
+                            record.offset
+                        );
+                    }
+                }
+                PileRecordContent::InvalidBranchAssertion { id } => {
+                    if id.raw() == needle {
+                        assertion_field_matches += 1;
+                        println!(
+                            "invalid branch assertion record-id match at byte {} (claim hidden)",
                             record.offset
                         );
                     }

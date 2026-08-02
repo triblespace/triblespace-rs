@@ -149,42 +149,6 @@ where
     }
 }
 
-/// Error from lazy commit-parent lookup.
-///
-/// An inner reader error is kept intact so corruption, malformed metadata, and
-/// backend failures cannot be mistaken for fetchable absence. The second arm
-/// is specifically the failure to make a genuine inner-store absence into a
-/// durable want.
-#[derive(Debug)]
-pub enum LazyCommitDagError<E, W> {
-    /// The wrapped reader failed while classifying or decoding the commit.
-    Inner(E),
-    /// The wrapped reader reported absence, but recording that demand failed.
-    WantRecord(W),
-}
-
-impl<E: std::error::Error, W: std::error::Error> std::fmt::Display for LazyCommitDagError<E, W> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Inner(error) => write!(f, "commit-parent lookup failed: {error}"),
-            Self::WantRecord(error) => write!(f, "missing commit want was not recorded: {error}"),
-        }
-    }
-}
-
-impl<E, W> std::error::Error for LazyCommitDagError<E, W>
-where
-    E: std::error::Error + 'static,
-    W: std::error::Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Inner(error) => Some(error),
-            Self::WantRecord(error) => Some(error),
-        }
-    }
-}
-
 /// Error from a [`LazyReader`]'s **sync probe** ([`BlobStoreGet`]).
 #[derive(Debug)]
 pub enum WantGetError<E, W> {
@@ -334,25 +298,27 @@ impl WantSignal {
             return; // already running
         }
         let weak = Arc::downgrade(this);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(WANT_RECHECK_CADENCE);
-            let Some(signal) = weak.upgrade() else { break };
-            let drained: Vec<Waker> =
-                std::mem::take(&mut *signal.wakers.lock().expect("wakers mutex"));
-            if drained.is_empty() {
-                // Nobody is parked: retire. Re-check for a registration
-                // that raced the retirement and take the ticker back if
-                // one slipped in (unless a fresh ticker already spawned).
-                signal.ticker_alive.store(false, Ordering::Release);
-                if signal.wakers.lock().expect("wakers mutex").is_empty()
-                    || signal.ticker_alive.swap(true, Ordering::AcqRel)
-                {
-                    break;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(WANT_RECHECK_CADENCE);
+                let Some(signal) = weak.upgrade() else { break };
+                let drained: Vec<Waker> =
+                    std::mem::take(&mut *signal.wakers.lock().expect("wakers mutex"));
+                if drained.is_empty() {
+                    // Nobody is parked: retire. Re-check for a registration
+                    // that raced the retirement and take the ticker back if
+                    // one slipped in (unless a fresh ticker already spawned).
+                    signal.ticker_alive.store(false, Ordering::Release);
+                    if signal.wakers.lock().expect("wakers mutex").is_empty()
+                        || signal.ticker_alive.swap(true, Ordering::AcqRel)
+                    {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            for waker in drained {
-                waker.wake();
+                for waker in drained {
+                    waker.wake();
+                }
             }
         });
     }
@@ -890,40 +856,23 @@ where
     }
 }
 
-/// Commit-parent lookup over the lazy read surface.
+/// Local-only commit-parent lookup over the lazy read surface.
 ///
-/// The wrapped reader remains responsible for distinguishing genuine absence
-/// from malformed metadata, corrupt bytes, and backend failure. Only its
-/// [`ParentLookup::Missing`] result is converted into lazy demand: the commit
-/// handle is weak-pinned and flushed before `Missing` is exposed. Thus every
-/// missing handle returned to branch resolution is durably on record, while
-/// every non-absence failure survives unchanged in
-/// [`LazyCommitDagError::Inner`].
+/// Branch resolution may explore optimistic ancestry before it has verified
+/// the assertion which named a commit. Turning a local miss into a weak-pin
+/// here would therefore let an unverified remote claim create network demand.
+/// Missing parents remain purely descriptive; only the resolver's verified
+/// [`super::BranchResolution`] demand is allowed to cross into fetch policy.
+/// Corruption and backend failures are forwarded unchanged.
 impl<S> PartialCommitDag for LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
     S::Reader: PartialCommitDag,
 {
-    type Error = LazyCommitDagError<<S::Reader as PartialCommitDag>::Error, WantRecordErrorOf<S>>;
+    type Error = <S::Reader as PartialCommitDag>::Error;
 
     fn parents(&mut self, commit: super::CommitHandle) -> Result<ParentLookup, Self::Error> {
-        match self
-            .local
-            .parents(commit)
-            .map_err(LazyCommitDagError::Inner)?
-        {
-            ParentLookup::Present(parents) => Ok(ParentLookup::Present(parents)),
-            ParentLookup::Missing => {
-                let mut store = self.store.lock().expect("store mutex");
-                store
-                    .pin_weak(commit)
-                    .map_err(|error| LazyCommitDagError::WantRecord(WantRecordError::Pin(error)))?;
-                store.flush().map_err(|error| {
-                    LazyCommitDagError::WantRecord(WantRecordError::Flush(error))
-                })?;
-                Ok(ParentLookup::Missing)
-            }
-        }
+        self.local.parents(commit)
     }
 }
 
@@ -1158,10 +1107,10 @@ mod tests {
         );
     }
 
-    /// Commit-DAG absence is the only inner outcome that becomes lazy
-    /// `Missing`, and it is exposed only after its want has been recorded.
-    /// Present-but-noncanonical commit metadata remains a metadata error;
-    /// present-but-undecodable archive bytes remain a read error.
+    /// Commit-DAG lookup is local and descriptive: absence remains `Missing`
+    /// without recording a want. Present-but-noncanonical commit metadata
+    /// remains a metadata error; present-but-undecodable archive bytes remain
+    /// a read error.
     #[test]
     fn commit_dag_distinguishes_absence_metadata_and_decode_failure() {
         let mut lazy = Lazy::new(MemoryRepo::default());
@@ -1180,38 +1129,30 @@ mod tests {
         assert_eq!(reader.parents(missing).unwrap(), ParentLookup::Missing);
         assert!(matches!(
             reader.parents(malformed_shape),
-            Err(LazyCommitDagError::Inner(StoredCommitError::Metadata(
-                CommitMetadataError::Malformed
-            )))
+            Err(StoredCommitError::Metadata(CommitMetadataError::Malformed))
         ));
         assert!(matches!(
             reader.parents(malformed_archive),
-            Err(LazyCommitDagError::Inner(StoredCommitError::Read(_)))
+            Err(StoredCommitError::Read(_))
         ));
         drop(reader);
 
         let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
-        assert_eq!(
-            wants,
-            vec![missing.transmute()],
-            "only genuine absence records a want"
+        assert!(
+            wants.is_empty(),
+            "optimistic ancestry must not record wants"
         );
     }
 
-    /// An inner absence is not advertised as `Missing` when the durable-want
-    /// precondition fails.
+    /// Parent lookup never touches weak-pin policy, even when that layer would
+    /// reject a write. Verified branch resolution owns demand admission.
     #[test]
-    fn commit_dag_want_record_failure_is_not_missing() {
+    fn commit_dag_missing_does_not_consult_want_store() {
         let mut lazy = Lazy::new(FailingPins::default());
         let missing = Inline::<Handle<SimpleArchive>>::new([37; 32]);
         let mut reader = BlobStore::reader(&mut lazy).unwrap();
 
-        assert!(matches!(
-            reader.parents(missing),
-            Err(LazyCommitDagError::WantRecord(WantRecordError::Pin(
-                PinRefused
-            )))
-        ));
+        assert_eq!(reader.parents(missing).unwrap(), ParentLookup::Missing);
     }
 
     // ── Async waiting read ───────────────────────────────────────────

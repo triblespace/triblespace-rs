@@ -377,20 +377,15 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// pile's compaction sweep treats every pin head as a reachability
 /// root: blobs reachable from a pin survive; the rest are reclaimed.
 ///
-/// Pins back several specialized local or legacy use patterns,
-/// distinguished at higher layers via metadata markers:
-/// - A **tracking pin** mirrors a legacy remote HEAD observation and carries
-///   `tracking_remote_pin` + `remote_name`.
-/// - A **local-only pin** (renewal policy, pending requests,
-///   per-team cap holdings) carries `local_only_pin: <kind>` and is
-///   excluded from gossip publication.
-/// - Older stores may contain mutable content-branch heads. They remain
-///   readable as legacy pins but are not StrongPin branch authority.
+/// Pins back specialized replica-local uses distinguished at higher layers by
+/// metadata markers: renewal policy, pending requests, credential holdings,
+/// retention roots, and durable fetch wants. Older stores may also contain
+/// mutable content-branch heads; those remain readable only as legacy local
+/// pins and are not StrongPin branch authority.
 ///
 /// `PinStore` itself doesn't know about these distinctions — it just
 /// provides the primitive: enumerate ids, read the current head, CAS
-/// an update. The two-level taxonomy lives at higher layers
-/// (decide#6de2dd95).
+/// an update. Their role-specific schemas live at higher layers.
 ///
 /// This trait is the stateful counterpart to [`BlobStore`]: blob
 /// stores are content-addressed and orderless; pin stores track a

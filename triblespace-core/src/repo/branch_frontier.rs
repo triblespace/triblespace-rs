@@ -9,16 +9,26 @@
 //! candidate-root descriptor, but missing ancestry prevents checkout and only a
 //! complete frontier may license an authored merge assertion.
 //!
+//! Persisted assertion signatures are verified lazily. Resolution may perform
+//! optimistic ancestry reads for structural claims, but only against the local
+//! [`PartialCommitDag`]: those reads MUST NOT initiate network work. Every
+//! optimistic frontier claim is authenticated before its target is checked for
+//! presence and before any [`TipPendingFrontier`] or [`PartialFrontier`] demand
+//! is returned. A forged dominator is discarded and the frontier is recomputed
+//! from scratch, allowing a buried real claim to reappear.
+//!
 //! [`BranchResolution::TipPending`]: crate::repo::branch_frontier::BranchResolution::TipPending
 //! [`BranchResolution::Partial`]: crate::repo::branch_frontier::BranchResolution::Partial
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{Blob, IntoBlob};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
-use crate::repo::branch_assertion::{BranchAssertionSnapshot, BranchIdentity};
+use crate::repo::branch_assertion::{
+    AssertionId, AssertionWitness, BranchAssertionSnapshot, BranchIdentity,
+};
 use crate::repo::commit::merge_metadata;
 use crate::repo::CommitHandle;
 
@@ -31,11 +41,17 @@ pub enum ParentLookup {
     Missing,
 }
 
-/// A commit DAG whose content-addressed metadata may be partially available.
+/// A local commit DAG whose content-addressed metadata may be partially
+/// available.
 ///
 /// Implementations must return [`ParentLookup::Missing`] only for genuine
 /// absence. Corrupt bytes, malformed commit metadata, and backend failures are
 /// errors; turning them into `Missing` would make corruption look self-healing.
+/// This interface is also the resolver's pre-authentication read boundary:
+/// `parents` MUST inspect only already-local state and MUST NOT enqueue a fetch,
+/// emit a want, or otherwise create externally visible demand. Replication
+/// admission must bound the number of stored assertion witnesses independently
+/// of this fold.
 pub trait PartialCommitDag {
     /// Non-absence lookup failure.
     type Error;
@@ -150,24 +166,130 @@ pub enum ResolvedHead {
 ///
 /// The result is invariant under assertion insertion and physical log order.
 /// BranchId is used only by the snapshot's prefix scan; the snapshot rechecks
-/// the complete descriptor before returning assertions.
+/// the complete descriptor before returning witnesses. Persisted witnesses are
+/// authenticated only when their semantic `(identity, commit)` claim reaches
+/// the optimistic frontier. One valid witness licenses a claim; if every
+/// witness for a frontier claim is invalid, that claim is removed and
+/// domination is recomputed from the remaining claims. Thus every returned tip
+/// has a verified witness in this call, and invalid claims never create fetch
+/// demand.
 pub fn resolve_branch<D: PartialCommitDag>(
     snapshot: &BranchAssertionSnapshot,
     identity: &BranchIdentity,
     dag: &mut D,
 ) -> Result<BranchResolution, D::Error> {
-    let assertions = snapshot.for_branch(identity);
-    if assertions.is_empty() {
+    let witnesses = snapshot.witnesses_for_branch(identity);
+    if witnesses.is_empty() {
         return Ok(BranchResolution::Absent);
     }
 
-    let mut tips: Vec<_> = assertions
-        .into_iter()
-        .map(|assertion| assertion.commit())
-        .collect();
-    canonicalize(&mut tips);
-
+    let mut claims: BTreeMap<CommitHandle, Vec<&AssertionWitness>> = BTreeMap::new();
+    for witness in witnesses {
+        claims.entry(witness.commit()).or_default().push(witness);
+    }
+    let initial_distinct_claims = claims.len();
     let mut view = PartialDagView::new(dag);
+    let mut verification = HashMap::<AssertionId, bool>::new();
+    let mut rounds = 0usize;
+
+    loop {
+        // Each nonterminal retry removes at least one distinct claim. The
+        // extra round is the final resolution (including all-invalid Absent).
+        rounds += 1;
+        debug_assert!(rounds <= initial_distinct_claims + 1);
+        if claims.is_empty() {
+            return Ok(BranchResolution::Absent);
+        }
+
+        let tips: Vec<_> = claims.keys().copied().collect();
+        let optimistic = optimistic_frontier(&tips, &mut view)?;
+
+        let invalid_frontier: Vec<_> = optimistic
+            .tips
+            .iter()
+            .copied()
+            .filter(|commit| {
+                !claim_has_valid_witness(
+                    claims
+                        .get(commit)
+                        .expect("an optimistic tip belongs to the active claim set"),
+                    &mut verification,
+                )
+            })
+            .collect();
+        if !invalid_frontier.is_empty() {
+            for commit in invalid_frontier {
+                claims.remove(&commit);
+            }
+            // A forged descendant may have hidden a real ancestor. Never
+            // reuse the prior domination result: fold the surviving claims
+            // again (the local parent-read cache is safe to retain).
+            continue;
+        }
+
+        debug_assert!(optimistic.tips.iter().all(|tip| {
+            claims
+                .get(tip)
+                .expect("frontier tip remains active")
+                .iter()
+                .any(|witness| verification.get(&witness.id()) == Some(&true))
+        }));
+
+        // Only now may absence become externally visible demand. No target or
+        // missing-ancestry handle returned below originates solely from an
+        // unauthenticated surviving tip.
+        let mut missing_tips = HashSet::new();
+        for tip in &optimistic.tips {
+            if view.parents(*tip)? == ParentLookup::Missing {
+                missing_tips.insert(*tip);
+            }
+        }
+        let mut missing_tips: Vec<_> = missing_tips.into_iter().collect();
+        canonicalize(&mut missing_tips);
+
+        if !missing_tips.is_empty() {
+            return Ok(BranchResolution::TipPending(TipPendingFrontier {
+                tips: optimistic.tips,
+                missing_tips,
+            }));
+        }
+        if optimistic.unresolved_pair {
+            return Ok(BranchResolution::Partial(PartialFrontier {
+                tips: optimistic.tips,
+                missing_ancestry: optimistic.missing_ancestry,
+            }));
+        }
+        return Ok(BranchResolution::Complete(CompleteFrontier {
+            tips: optimistic.tips,
+        }));
+    }
+}
+
+fn claim_has_valid_witness(
+    witnesses: &[&AssertionWitness],
+    memo: &mut HashMap<AssertionId, bool>,
+) -> bool {
+    witnesses.iter().any(|witness| {
+        let id = witness.id();
+        if let Some(valid) = memo.get(&id) {
+            return *valid;
+        }
+        let valid = witness.verified().is_ok();
+        memo.insert(id, valid);
+        valid
+    })
+}
+
+struct OptimisticFrontier {
+    tips: Vec<CommitHandle>,
+    unresolved_pair: bool,
+    missing_ancestry: Vec<CommitHandle>,
+}
+
+fn optimistic_frontier<D: PartialCommitDag>(
+    tips: &[CommitHandle],
+    view: &mut PartialDagView<'_, D>,
+) -> Result<OptimisticFrontier, D::Error> {
     let mut dominated = vec![false; tips.len()];
     let mut unknown_pairs = Vec::new();
 
@@ -198,48 +320,26 @@ pub fn resolve_branch<D: PartialCommitDag>(
         .iter()
         .any(|(left, right, _)| !dominated[*left] && !dominated[*right]);
     let mut frontier: Vec<_> = tips
-        .into_iter()
+        .iter()
+        .copied()
         .enumerate()
         .filter_map(|(index, commit)| (!dominated[index]).then_some(commit))
         .collect();
     canonicalize(&mut frontier);
 
-    // A branch claim may arrive before its commit metadata. Check each
-    // surviving TIP exactly once so Complete never claims an unchecked target.
-    // Do not walk its entire closure: deeper history is read only when a
-    // pairwise comparison actually needs it, and payload content is never read.
-    let mut missing_tips = HashSet::new();
-    for tip in &frontier {
-        if view.parents(*tip)? == ParentLookup::Missing {
-            missing_tips.insert(*tip);
-        }
-    }
     let mut missing_ancestry = HashSet::new();
     for (left, right, pair_missing) in unknown_pairs {
         if !dominated[left] && !dominated[right] {
             missing_ancestry.extend(pair_missing);
         }
     }
-    let mut missing_tips: Vec<_> = missing_tips.into_iter().collect();
-    canonicalize(&mut missing_tips);
     let mut missing_ancestry: Vec<_> = missing_ancestry.into_iter().collect();
     canonicalize(&mut missing_ancestry);
-
-    if !missing_tips.is_empty() {
-        Ok(BranchResolution::TipPending(TipPendingFrontier {
-            tips: frontier,
-            missing_tips,
-        }))
-    } else if unresolved_pair {
-        Ok(BranchResolution::Partial(PartialFrontier {
-            tips: frontier,
-            missing_ancestry,
-        }))
-    } else {
-        Ok(BranchResolution::Complete(CompleteFrontier {
-            tips: frontier,
-        }))
-    }
+    Ok(OptimisticFrontier {
+        tips: frontier,
+        unresolved_pair,
+        missing_ancestry,
+    })
 }
 
 fn resolved_head(tips: &[CommitHandle]) -> ResolvedHead {
@@ -338,7 +438,10 @@ mod tests {
 
     use super::*;
     use crate::blob::encodings::longstring::LongString;
-    use crate::repo::branch_assertion::BranchAssertion;
+    use crate::repo::branch_assertion::{
+        reset_signature_verification_count, signature_verification_count, BranchAssertion,
+        UnverifiedBranchAssertion,
+    };
 
     #[derive(Clone, Default)]
     struct TestDag {
@@ -376,6 +479,27 @@ mod tests {
             snapshot
                 .insert(BranchAssertion::sign(&key, name(3), commit))
                 .unwrap();
+        }
+        snapshot
+    }
+
+    fn structural_witness(
+        commit: CommitHandle,
+        corrupt_signature_byte: Option<usize>,
+    ) -> UnverifiedBranchAssertion {
+        let mut bytes = BranchAssertion::sign(&key(), name(3), commit).encode();
+        if let Some(index) = corrupt_signature_byte {
+            bytes[96 + index % 64] ^= 1;
+        }
+        UnverifiedBranchAssertion::decode_structural(bytes).unwrap()
+    }
+
+    fn structural_snapshot(
+        witnesses: impl IntoIterator<Item = UnverifiedBranchAssertion>,
+    ) -> BranchAssertionSnapshot {
+        let mut snapshot = BranchAssertionSnapshot::new();
+        for witness in witnesses {
+            snapshot.insert_unverified(witness).unwrap();
         }
         snapshot
     }
@@ -551,6 +675,110 @@ mod tests {
         assert_eq!(
             resolve_branch(&snapshot([commit(4)]), &identity(), &mut FailingDag).unwrap_err(),
             "backend failure"
+        );
+    }
+
+    #[test]
+    fn all_invalid_witnesses_resolve_absent_without_dag_reads_or_demand() {
+        struct ForbiddenDag;
+
+        impl PartialCommitDag for ForbiddenDag {
+            type Error = Infallible;
+
+            fn parents(&mut self, _: CommitHandle) -> Result<ParentLookup, Self::Error> {
+                panic!("an unauthenticated singleton created local or fetch demand")
+            }
+        }
+
+        let tip = commit(9);
+        let assertions = structural_snapshot([
+            structural_witness(tip, Some(0)),
+            structural_witness(tip, Some(1)),
+        ]);
+        reset_signature_verification_count();
+        assert_eq!(
+            resolve_branch(&assertions, &identity(), &mut ForbiddenDag).unwrap(),
+            BranchResolution::Absent
+        );
+        assert_eq!(signature_verification_count(), 2);
+    }
+
+    #[test]
+    fn forged_dominator_drops_and_promotes_the_buried_real_tip() {
+        let (real, forged) = (commit(1), commit(2));
+        let assertions = structural_snapshot([
+            structural_witness(real, None),
+            structural_witness(forged, Some(7)),
+        ]);
+        let mut dag = TestDag::default();
+        present(&mut dag, real, &[]);
+        present(&mut dag, forged, &[real]);
+
+        reset_signature_verification_count();
+        assert_eq!(
+            resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
+            BranchResolution::Complete(CompleteFrontier { tips: vec![real] })
+        );
+        assert_eq!(
+            signature_verification_count(),
+            2,
+            "each successive optimistic frontier is checked once"
+        );
+    }
+
+    #[test]
+    fn one_valid_witness_licenses_a_claim_among_invalid_siblings() {
+        let tip = commit(4);
+        let assertions = structural_snapshot([
+            structural_witness(tip, Some(3)),
+            structural_witness(tip, None),
+            structural_witness(tip, Some(19)),
+        ]);
+        let mut dag = TestDag::default();
+        present(&mut dag, tip, &[]);
+
+        reset_signature_verification_count();
+        assert_eq!(
+            resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
+            BranchResolution::Complete(CompleteFrontier { tips: vec![tip] })
+        );
+        assert!((1..=3).contains(&signature_verification_count()));
+        assert_eq!(
+            assertions.for_branch(&identity()).len(),
+            1,
+            "the two invalid siblings never escape the snapshot as public assertions"
+        );
+    }
+
+    #[test]
+    fn resolution_verifies_frontier_scale_not_snapshot_scale() {
+        let commits: Vec<_> = (1..=64).map(commit).collect();
+        let assertions = structural_snapshot(
+            commits
+                .iter()
+                .copied()
+                .map(|commit| structural_witness(commit, None)),
+        );
+        let mut dag = TestDag::default();
+        for (index, commit) in commits.iter().copied().enumerate() {
+            let parents = index
+                .checked_sub(1)
+                .map(|parent| vec![commits[parent]])
+                .unwrap_or_default();
+            present(&mut dag, commit, &parents);
+        }
+
+        reset_signature_verification_count();
+        assert_eq!(
+            resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
+            BranchResolution::Complete(CompleteFrontier {
+                tips: vec![*commits.last().unwrap()],
+            })
+        );
+        assert_eq!(
+            signature_verification_count(),
+            1,
+            "a 64-claim linear history has a one-claim optimistic frontier"
         );
     }
 
@@ -781,6 +1009,76 @@ mod tests {
             if matches!(&refined_resolution, BranchResolution::Complete(_)) {
                 prop_assert_eq!(&refined_resolution, &full_resolution);
             }
+        }
+
+        #[test]
+        fn lazy_verification_matches_the_valid_claim_fold_in_any_insertion_order(
+            node_count in 1usize..9,
+            parent_masks in prop::collection::vec(any::<u16>(), 8),
+            assertion_mask in 1u16..=u16::MAX,
+            invalid_mask in any::<u16>(),
+            missing_mask in any::<u16>(),
+        ) {
+            let commits: Vec<_> = (0..node_count)
+                .map(|index| commit(index as u8 + 1))
+                .collect();
+            let mut dag = TestDag::default();
+            for index in 0..node_count {
+                let lower = if index == 0 { 0 } else { (1u16 << index) - 1 };
+                let parents: Vec<_> = (0..index)
+                    .filter(|parent| parent_masks[index] & (1u16 << parent) & lower != 0)
+                    .map(|parent| commits[parent])
+                    .collect();
+                if missing_mask & (1u16 << index) == 0 {
+                    present(&mut dag, commits[index], &parents);
+                }
+            }
+
+            let selected: Vec<_> = commits
+                .iter()
+                .enumerate()
+                .filter_map(|(index, commit)| {
+                    (assertion_mask & (1u16 << index) != 0).then_some((index, *commit))
+                })
+                .collect();
+            prop_assume!(!selected.is_empty());
+
+            let witnesses: Vec<_> = selected
+                .iter()
+                .map(|(index, commit)| {
+                    structural_witness(
+                        *commit,
+                        (invalid_mask & (1u16 << index) != 0).then_some(*index),
+                    )
+                })
+                .collect();
+            let forward = structural_snapshot(witnesses.iter().copied());
+            let reverse = structural_snapshot(witnesses.iter().rev().copied());
+            prop_assert_eq!(&forward, &reverse);
+
+            let valid_commits: Vec<_> = selected
+                .iter()
+                .filter_map(|(index, commit)| {
+                    (invalid_mask & (1u16 << index) == 0).then_some(*commit)
+                })
+                .collect();
+            let expected_snapshot = snapshot(valid_commits.clone());
+
+            reset_signature_verification_count();
+            let left = resolve_branch(&forward, &identity(), &mut dag.clone()).unwrap();
+            prop_assert!(signature_verification_count() <= witnesses.len());
+            prop_assert!(candidate_tips(&left)
+                .iter()
+                .all(|tip| valid_commits.contains(tip)));
+
+            reset_signature_verification_count();
+            let right = resolve_branch(&reverse, &identity(), &mut dag.clone()).unwrap();
+            prop_assert!(signature_verification_count() <= witnesses.len());
+
+            let eager_valid =
+                resolve_branch(&expected_snapshot, &identity(), &mut dag.clone()).unwrap();
+            prop_assert_eq!(&left, &right);
+            prop_assert_eq!(left, eager_valid);
         }
     }
 }

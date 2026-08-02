@@ -26,11 +26,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `store branch` surface is replaced by `store pin list`; direct object-store
   StrongPin assertions remain unavailable until a backend can meet coherent
   snapshot and durable-append contracts.
-- **Legacy network observations are no longer auto-authored.** `pile net sync`
-  may retain scalar HEAD gossip as publisher-scoped local tracking pins, but it
-  never converts those unauthenticated observations into locally signed branch
-  assertions. Assertion replication and foreign-author admission remain an
-  explicit future protocol boundary.
+- **Legacy mutable-HEAD transport is gone.** `pile net sync` announces content
+  and services durable lazy-fetch wants; it neither exchanges scalar HEADs nor
+  materializes tracking pins. Assertion replication and foreign-author
+  admission remain an explicit future protocol boundary.
 - **Bounded network sync now fails loud and closes durably.** `pile net sync`
   validates the complete pile before starting transport and consumes the
   `Peer<Pile>` through `Pile::close` on every normal return, surfacing a corrupt

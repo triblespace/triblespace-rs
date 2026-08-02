@@ -3,13 +3,14 @@
 //! Implements a chain-of-trust capability system where:
 //!
 //! - A team has a single immutable root keypair (the "team root"), generated
-//!   once at team creation and used to sign exactly one capability — the
-//!   founder's. The team root never operates online; it's the constitutional
-//!   document for the team's identity.
-//! - All other capabilities chain off the founder's via delegation. Any holder
-//!   of a capability can sign a sub-capability for someone else, as long as
-//!   the sub-cap's scope is a subset of their own. Verification walks the
-//!   chain back to the team root.
+//!   once at team creation and used to sign exactly one non-expiring founder
+//!   anchor. The anchor is not an operational credential; the team root never
+//!   operates online, and this signed link is the constitutional document for
+//!   the team's identity.
+//! - Every operational capability is finite and chains through that anchor.
+//!   Any holder of a capability can sign a sub-capability for someone else, as
+//!   long as the sub-cap's scope is a subset of their own. Verification walks
+//!   the chain back to the team root.
 //! - Each capability link is two blobs: a `cap` blob (the claim) and a `sig`
 //!   blob (the issuer's signature over the cap blob's bytes). For chains of
 //!   length > 1, each non-root cap embeds its parent's signature inline as a
@@ -67,8 +68,8 @@ triblespace_core_macros::attributes! {
     "1A7DD2026BEFBE55A354CE10839CFDD6" as pub cap_scope_root: GenId;
     // Note: chain references (cap_parent, embedded parent sig) live in
     // the sig blob, not the cap blob. A cap blob is a pure declaration
-    // of (subject, issuer, scope, expiry) — independent of which
-    // authority chain endorses it. See sig_parent_cap below.
+    // of (subject, issuer, scope, lifetime kind) — independent of
+    // which authority chain endorses it. See sig_parent_cap below.
 
     // ── Scope ─────────────────────────────────────────────────────────
     /// Optional restriction of a permission to a specific branch.
@@ -107,6 +108,13 @@ pub const KIND_CAPABILITY: Id = id_hex!("B8D76786ACD20F344A4E5CBFC0F75772");
 /// Tag identifying a blob as a capability signature.
 #[allow(dead_code)]
 pub const KIND_CAPABILITY_SIG: Id = id_hex!("E6BB52CE6E02D51C3676ECE1EEA9094F");
+/// Tag identifying the one non-expiring capability declaration that anchors a
+/// team's founder authority.
+///
+/// Minted with `trible genid` on 2026-08-02. Unlike an operational
+/// capability, a founder anchor carries no `expires_at`; verification accepts
+/// it only as the root-signed terminator of a delegation proof.
+pub const KIND_FOUNDER_ANCHOR: Id = id_hex!("56EF664DF4FCB4F52F2C486E9F6C55DB");
 
 // ── Builder ──────────────────────────────────────────────────────────
 
@@ -142,24 +150,25 @@ pub enum BuildError {
 /// Build a capability link.
 ///
 /// Returns the pair `(cap_blob, sig_blob)`:
-/// - `cap_blob` carries the claim (subject pubkey, scope, expiry, parent
-///   pointer, embedded parent signature). Its content-addressed handle is
-///   what the sig blob attests to.
-/// - `sig_blob` carries the issuer's signature over `cap_blob.bytes` plus
-///   the issuer's pubkey, alongside a `sig_signs` handle pointing at the
-///   cap blob.
+/// - `cap_blob` carries the claim (subject pubkey, issuer pubkey, scope,
+///   and expiry). Its content-addressed handle is what the sig blob
+///   attests to.
+/// - `sig_blob` carries the issuer's signature over `cap_blob.bytes`
+///   plus the issuer's pubkey, alongside a `sig_signs` handle pointing
+///   at the cap blob. For delegated capabilities it also carries the
+///   parent cap handle and recursively embedded parent proof.
 ///
-/// `parent = None` constructs a root-issued capability: the issuer is
-/// expected to be the team root keypair, and the resulting cap has no
-/// `cap_parent` and no embedded parent signature. Verification terminates
-/// at this link when the issuer pubkey matches the team root.
+/// `parent` is required: the only valid root constructor is
+/// [`build_founder_anchor`], so an unparented operational capability is
+/// unrepresentable through this public builder.
 ///
-/// `parent = Some((parent_cap, parent_sig))` constructs a delegated
-/// capability: the parent's signature is embedded inline in the new cap
-/// blob (via [`sig_embedded_parent_proof`] pointing at a sub-entity carrying
-/// `signed_by` + `signature_r` + `signature_s` reusing the existing
-/// commit-signature attribute conventions) so verifiers can walk one level
-/// up the chain without a separate fetch for the parent's signature.
+/// The parent's signature is embedded inline in the new sig
+/// blob (via [`sig_embedded_parent_proof`] pointing at a sub-entity
+/// carrying `signed_by` + `signature_r` + `signature_s` reusing the
+/// existing commit-signature attribute conventions) so verifiers can
+/// walk one level up the chain without a separate fetch for the parent's
+/// signature. Verification also requires the parent cap's subject to be
+/// this child cap's issuer.
 ///
 /// `scope_facts` should be a TribleSet anchored at `scope_root` describing
 /// the capability's scope (permission tags via [`crate::metadata::tag`],
@@ -169,10 +178,8 @@ pub enum BuildError {
 ///
 /// # Example
 ///
-/// Mint a length-1 capability — team root signs the founder's cap
-/// directly. The returned `(cap_blob, sig_blob)` pair is what callers
-/// persist into the pile; the founder presents the sig blob's handle
-/// at connection time.
+/// Mint a finite founder credential beneath the root's non-expiring anchor.
+/// The founder presents the finite sig blob's handle at connection time.
 ///
 /// ```rust
 /// use ed25519_dalek::SigningKey;
@@ -180,7 +187,9 @@ pub enum BuildError {
 /// use triblespace_core::macros::entity;
 /// use triblespace_core::trible::TribleSet;
 /// use triblespace_core::inline::TryToInline;
-/// use triblespace_core::repo::capability::{build_capability, PERM_READ};
+/// use triblespace_core::repo::capability::{
+///     build_capability, build_founder_anchor, PERM_READ,
+/// };
 /// use rand::rngs::OsRng;
 ///
 /// let team_root = SigningKey::generate(&mut OsRng);
@@ -199,10 +208,17 @@ pub enum BuildError {
 ///     .try_to_inline()
 ///     .unwrap();
 ///
-/// let (cap_blob, sig_blob) = build_capability(
+/// let (anchor_cap, anchor_sig) = build_founder_anchor(
 ///     &team_root,
 ///     founder.verifying_key(),
-///     None, // no parent — direct child of the team root
+///     *scope_root,
+///     scope_facts.clone(),
+/// )
+/// .expect("anchor builds");
+/// let (cap_blob, sig_blob) = build_capability(
+///     &founder,
+///     founder.verifying_key(),
+///     (anchor_cap, anchor_sig),
 ///     *scope_root,
 ///     scope_facts,
 ///     expiry,
@@ -217,7 +233,7 @@ pub enum BuildError {
 pub fn build_capability(
     issuer: &SigningKey,
     subject: VerifyingKey,
-    parent: Option<(Blob<SimpleArchive>, Blob<SimpleArchive>)>,
+    parent: (Blob<SimpleArchive>, Blob<SimpleArchive>),
     scope_root: crate::id::Id,
     scope_facts: TribleSet,
     expiry: Inline<NsTAIInterval>,
@@ -237,6 +253,45 @@ pub fn build_capability(
     let mut cap_set = TribleSet::from(cap_fragment);
     cap_set += scope_facts;
 
+    build_signed_claim(issuer, cap_set, Some(parent))
+}
+
+/// Build the team's single, explicit founder anchor.
+///
+/// The returned blobs use the same ordinary claim/signature representation as
+/// delegated capabilities, but the claim is distinguished by
+/// [`KIND_FOUNDER_ANCHOR`] on its capability entity and deliberately has no
+/// expiry interval. The anchor binds the offline team-root signer to the
+/// founder key and `scope_facts`; it is not itself an operational credential.
+/// [`verify_chain`] therefore rejects its signature handle as a leaf and only
+/// accepts it as the final parent of a finite capability issued by `founder`.
+pub fn build_founder_anchor(
+    team_root: &SigningKey,
+    founder: VerifyingKey,
+    scope_root: crate::id::Id,
+    scope_facts: TribleSet,
+) -> Result<(Blob<SimpleArchive>, Blob<SimpleArchive>), BuildError> {
+    let cap_fragment = entity! {
+        cap_subject: issuer_subject_value(founder),
+        cap_issuer: issuer_subject_value(team_root.verifying_key()),
+        cap_scope_root: scope_root,
+        crate::metadata::tag: KIND_FOUNDER_ANCHOR,
+    };
+
+    let mut cap_set = TribleSet::from(cap_fragment);
+    cap_set += scope_facts;
+
+    build_signed_claim(team_root, cap_set, None)
+}
+
+/// Sign a capability claim and, for delegated claims, fold the parent's exact
+/// proof into the new signature blob.
+fn build_signed_claim(
+    issuer: &SigningKey,
+    cap_set: TribleSet,
+    parent: Option<(Blob<SimpleArchive>, Blob<SimpleArchive>)>,
+) -> Result<(Blob<SimpleArchive>, Blob<SimpleArchive>), BuildError> {
+    let issuer_pubkey = issuer.verifying_key();
     let cap_blob: Blob<SimpleArchive> = cap_set.to_blob();
     let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
 
@@ -342,7 +397,8 @@ fn collect_scope_facts(
 /// Check whether a parent scope authorises a child scope.
 ///
 /// Rules:
-/// - If parent grants `PERM_ADMIN`, parent subsumes every child scope.
+/// - If parent grants `PERM_ADMIN`, it subsumes every *known permission* in
+///   the child, but never bypasses branch restrictions or unknown-tag checks.
 /// - Otherwise: every permission tag in the child must be in the
 ///   parent's set (with `PERM_WRITE` implying `PERM_READ` for upgrade
 ///   compatibility, but an explicit `PERM_READ`-only parent does *not*
@@ -363,11 +419,17 @@ pub fn scope_subsumes(
     let (parent_perms, parent_branches) = collect_scope_facts(parent_set, parent_scope_root);
     let (child_perms, child_branches) = collect_scope_facts(child_set, child_scope_root);
 
-    if parent_perms.contains(&PERM_ADMIN) {
-        return true;
-    }
+    let parent_is_admin = parent_perms.contains(&PERM_ADMIN);
 
     for perm in &child_perms {
+        if *perm != PERM_READ && *perm != PERM_WRITE && *perm != PERM_ADMIN {
+            // Unknown permissions never become valid merely because an admin
+            // signed them; fail closed at every delegation level.
+            return false;
+        }
+        if parent_is_admin {
+            continue;
+        }
         if *perm == PERM_READ {
             if !parent_perms.contains(&PERM_READ) && !parent_perms.contains(&PERM_WRITE) {
                 return false;
@@ -379,9 +441,6 @@ pub fn scope_subsumes(
         } else if *perm == PERM_ADMIN {
             // Parent isn't admin (already checked), so the child can't
             // claim admin either.
-            return false;
-        } else {
-            // Unknown permission — fail closed.
             return false;
         }
     }
@@ -408,15 +467,33 @@ use ed25519_dalek::Verifier;
 use hifitime::Epoch;
 use std::collections::HashSet;
 
+/// The parsed declaration carried by a founder-anchor capability blob.
+///
+/// This type describes the explicit, non-expiring constitutional link from a
+/// team's offline root key to its founder key. It becomes trusted only after
+/// [`verify_chain`] has checked that its issuer and signature both equal the
+/// configured team root and that it terminates (rather than leads) the proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FounderAnchor {
+    /// Entity containing the anchor declaration in the capability blob.
+    pub entity: crate::id::Id,
+    /// Founder key authorized to issue the first finite capability.
+    pub subject: VerifyingKey,
+    /// Declared issuer; a verified anchor requires this to be the team root.
+    pub issuer: VerifyingKey,
+    /// Root of the maximum scope the founder may delegate.
+    pub scope_root: crate::id::Id,
+}
+
 /// Errors returned by [`verify_chain`].
 #[derive(Debug)]
 pub enum VerifyError {
     /// The leaf or some intermediate sig/cap blob could not be parsed
     /// as a valid SimpleArchive.
     ParseBlob(UnarchiveError),
-    /// Fetching a referenced blob (cap or sig) from the caller-supplied
-    /// fetch function failed.
-    Fetch,
+    /// The caller-supplied fetch function could not retrieve the named
+    /// signature or capability blob.
+    MissingBlob(Inline<Handle<SimpleArchive>>),
     /// A signature failed to verify against the expected pubkey + cap
     /// blob bytes.
     BadSignature,
@@ -426,22 +503,29 @@ pub enum VerifyError {
     /// A cap's `cap_issuer` did not match the accompanying sig's
     /// `signed_by`.
     IssuerMismatch,
+    /// A parent cap authorizes a different subject than the issuer of
+    /// the child cap, so it cannot delegate authority to that child.
+    DelegationMismatch,
     /// A cap or one of its parent caps has expired.
     Expired,
     /// A child cap's scope was not a subset of its parent's scope.
     /// (Enforcement deferred to the scope-subsumption module — for now
     /// this variant is reserved for future use.)
     ScopeNotSubset,
-    /// A cap blob is missing required attributes (e.g. cap_subject,
-    /// cap_issuer, cap_scope_root, expires_at) or has multiple
-    /// conflicting values.
+    /// A cap blob is missing required attributes, has conflicting values, or
+    /// mixes the finite-expiry and founder-anchor declaration shapes.
     MalformedCap,
+    /// A founder anchor was presented as the operational leaf credential.
+    FounderAnchorAsLeaf,
+    /// A proof reached a root-signed finite capability rather than the
+    /// explicit founder anchor required to terminate every valid chain.
+    FounderAnchorRequired,
+    /// A syntactically well-formed founder anchor was not both declared and
+    /// signed by the configured team root.
+    InvalidFounderAnchor,
     /// A sig blob is missing required attributes or has multiple
     /// conflicting values.
     MalformedSig,
-    /// The leaf sig blob refers to a cap blob whose handle the verifier
-    /// could not retrieve.
-    LeafCapMissing,
     /// A non-root sig-blob entity (one whose signer differs from the
     /// team root) is missing either `sig_parent_cap` or
     /// `sig_embedded_parent_proof`.
@@ -472,6 +556,8 @@ impl From<UnarchiveError> for VerifyError {
 ///   equivalent permission" (write/admin imply read)
 /// - [`grants_read_on`](Self::grants_read_on) — combines the two:
 ///   read-permission AND (unrestricted OR branch-in-scope)
+/// - [`expires_at`](Self::expires_at) — the inclusive upper bound of the
+///   verified authority's lifetime (the earliest deadline in the chain)
 ///
 /// # Example
 ///
@@ -507,6 +593,8 @@ impl From<UnarchiveError> for VerifyError {
 ///     subject: SigningKey::generate(&mut OsRng).verifying_key(),
 ///     scope_root: *scope_root,
 ///     cap_set,
+///     expires_at: hifitime::Epoch::now().unwrap()
+///         + hifitime::Duration::from_days(1.0),
 /// };
 ///
 /// // permissions() exposes the raw tag set.
@@ -535,9 +623,32 @@ pub struct VerifiedCapability {
     /// The leaf cap's full TribleSet (caller can extract its scope by
     /// querying tribles anchored at `scope_root`).
     pub cap_set: TribleSet,
+    /// Inclusive upper bound of this authority's lifetime. This is the
+    /// earliest expiry in the verified delegation chain, so a child can never
+    /// remain live after one of its parents expires.
+    pub expires_at: Epoch,
 }
 
 impl VerifiedCapability {
+    /// Return the inclusive upper bound of this verified authority's lifetime.
+    pub fn expires_at(&self) -> Epoch {
+        self.expires_at
+    }
+
+    /// Return whether this authority is expired at `now`.
+    ///
+    /// Capability intervals have inclusive bounds, so the authority remains
+    /// valid exactly at `expires_at` and expires immediately afterwards.
+    pub fn is_expired_at(&self, now: Epoch) -> bool {
+        self.expires_at < now
+    }
+
+    /// Return whether this authority is expired according to the project's
+    /// virtualizable epoch clock.
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(crate::clock::epoch_now())
+    }
+
     /// Returns the set of permissions tagged on this cap's scope root
     /// (a subset of `{`[`PERM_READ`]`,`[`PERM_WRITE`]`,`[`PERM_ADMIN`]`}`).
     pub fn permissions(&self) -> HashSet<crate::id::Id> {
@@ -580,9 +691,10 @@ impl VerifiedCapability {
     }
 }
 
-/// Maximum chain depth the verifier will walk before giving up. Real
-/// chains are 1-3 deep typically; this is a sanity bound to refuse
-/// adversarial deep chains.
+/// Maximum number of capability levels in a chain, including the leaf.
+/// Real chains are 1-3 levels typically; this is a sanity bound to
+/// refuse adversarial deep chains. If the capability at this depth is
+/// not root-issued, verification rejects before fetching another parent.
 pub const MAX_CHAIN_DEPTH: usize = 32;
 
 /// Verify a single signature blob's claim against a cap blob's bytes.
@@ -592,27 +704,51 @@ pub const MAX_CHAIN_DEPTH: usize = 32;
 // works against an arbitrary entity inside a sig blob (outer leaf or
 // embedded sub-entity), which is what the new chain walk needs.
 
-/// Extract a cap blob's declared attributes: subject, issuer, scope
-/// root, expiry. Cap blobs are pure declarations now — chain
-/// references live in the sig blob, so this is just a four-field
-/// projection.
+/// Extract and classify a cap blob's declaration.
+///
+/// Finite operational capabilities have exactly one expiry and no type tag on
+/// the declaration entity. Founder anchors instead have exactly the one
+/// [`KIND_FOUNDER_ANCHOR`] tag and no expiry. Every mixed or unknown shape
+/// fails closed.
 fn extract_cap_fields(cap_set: &TribleSet) -> Result<CapFields, VerifyError> {
     let mut iter = find!(
         (cap: crate::id::Id,
          subject: VerifyingKey,
          issuer: VerifyingKey,
-         scope_root: crate::id::Id,
-         expiry: Inline<NsTAIInterval>),
+         scope_root: crate::id::Id),
         pattern!(cap_set, [{
             ?cap @
             cap_subject: ?subject,
             cap_issuer: ?issuer,
             cap_scope_root: ?scope_root,
-            crate::metadata::expires_at: ?expiry,
         }])
     );
-    let (cap_id, subject, issuer, scope_root, expiry) = match (iter.next(), iter.next()) {
+    let (cap_id, subject, issuer, scope_root) = match (iter.next(), iter.next()) {
         (Some(row), None) => row,
+        _ => return Err(VerifyError::MalformedCap),
+    };
+
+    let expiries: Vec<Inline<NsTAIInterval>> = find!(
+        (expiry: Inline<NsTAIInterval>),
+        pattern!(cap_set, [{ cap_id @ crate::metadata::expires_at: ?expiry }])
+    )
+    .map(|(expiry,)| expiry)
+    .collect();
+    let tags: Vec<crate::id::Id> = find!(
+        (kind: crate::id::Id),
+        pattern!(cap_set, [{ cap_id @ crate::metadata::tag: ?kind }])
+    )
+    .map(|(kind,)| kind)
+    .collect();
+
+    let kind = match (tags.as_slice(), expiries.as_slice()) {
+        ([], [expiry]) => CapKind::Operational { expiry: *expiry },
+        ([kind], []) if *kind == KIND_FOUNDER_ANCHOR => CapKind::FounderAnchor(FounderAnchor {
+            entity: cap_id,
+            subject,
+            issuer,
+            scope_root,
+        }),
         _ => return Err(VerifyError::MalformedCap),
     };
 
@@ -621,8 +757,14 @@ fn extract_cap_fields(cap_set: &TribleSet) -> Result<CapFields, VerifyError> {
         subject,
         issuer,
         scope_root,
-        expiry,
+        kind,
     })
+}
+
+#[derive(Debug, Clone)]
+enum CapKind {
+    Operational { expiry: Inline<NsTAIInterval> },
+    FounderAnchor(FounderAnchor),
 }
 
 #[derive(Debug, Clone)]
@@ -632,17 +774,18 @@ struct CapFields {
     subject: VerifyingKey,
     issuer: VerifyingKey,
     scope_root: crate::id::Id,
-    expiry: Inline<NsTAIInterval>,
+    kind: CapKind,
 }
 
 /// Verify that a leaf signature blob plus its referenced cap blob form
 /// a valid capability chain rooted at `team_root`, authorising the
 /// `expected_subject` to act with the leaf cap's scope.
 ///
-/// `fetch_blob` is called to retrieve any cap blob referenced by a
-/// `cap_parent` handle during chain walk. The leaf sig and leaf cap
-/// blobs are also looked up via `fetch_blob`, given the
-/// `leaf_sig_handle`.
+/// `fetch_blob` is called first for the leaf sig, then for its leaf cap,
+/// and then for each parent cap referenced by `sig_parent_cap` during
+/// the chain walk. Parent signatures are embedded in the leaf sig blob
+/// and are never fetched separately. A failed lookup returns
+/// [`VerifyError::MissingBlob`] with the exact handle that was requested.
 ///
 /// Eviction in the descriptive-caps model is per-issuer non-renewal
 /// (the issuer's local retraction-policy pin), not a broadcast
@@ -654,8 +797,8 @@ struct CapFields {
 ///
 /// # Example
 ///
-/// End-to-end auth flow: team root mints a length-1 cap for a
-/// member, then verifies it.
+/// End-to-end auth flow: the team root anchors its founder, the founder mints
+/// a finite operational credential, and the verifier checks that chain.
 ///
 /// ```rust
 /// use ed25519_dalek::SigningKey;
@@ -669,14 +812,13 @@ struct CapFields {
 /// use triblespace_core::inline::Inline;
 /// use triblespace_core::inline::encodings::hash::Handle;
 /// use triblespace_core::repo::capability::{
-///     build_capability, verify_chain, PERM_READ,
+///     build_capability, build_founder_anchor, verify_chain, PERM_READ,
 /// };
 /// use rand::rngs::OsRng;
 ///
-/// // Team root mints itself; in a real deployment this happens
-/// // once at team creation and the secret is archived offline.
+/// // The root signs the founder anchor once, then returns offline.
 /// let team_root = SigningKey::generate(&mut OsRng);
-/// let member = SigningKey::generate(&mut OsRng);
+/// let founder = SigningKey::generate(&mut OsRng);
 ///
 /// // Scope: a single anchor entity tagged with PERM_READ.
 /// let scope_root = ufoid();
@@ -692,11 +834,19 @@ struct CapFields {
 ///     .try_to_inline()
 ///     .unwrap();
 ///
-/// // Length-1 chain: team root signs the member's cap directly.
-/// let (cap_blob, sig_blob) = build_capability(
+/// let (anchor_cap, anchor_sig) = build_founder_anchor(
 ///     &team_root,
-///     member.verifying_key(),
-///     None, // No parent — directly off the root.
+///     founder.verifying_key(),
+///     *scope_root,
+///     scope_facts.clone(),
+/// )
+/// .unwrap();
+///
+/// // The online founder credential is finite and names the anchor as parent.
+/// let (cap_blob, sig_blob) = build_capability(
+///     &founder,
+///     founder.verifying_key(),
+///     (anchor_cap.clone(), anchor_sig.clone()),
 ///     *scope_root,
 ///     scope_facts,
 ///     expiry,
@@ -710,22 +860,53 @@ struct CapFields {
 /// // The verifier needs both blobs available via the fetch closure.
 /// let cap_handle: Inline<Handle<SimpleArchive>> =
 ///     (&cap_blob).get_handle();
+/// let anchor_cap_handle: Inline<Handle<SimpleArchive>> =
+///     (&anchor_cap).get_handle();
 /// let mut blobs: HashMap<[u8; 32], Blob<SimpleArchive>> = HashMap::new();
+/// blobs.insert(anchor_cap_handle.raw, anchor_cap);
 /// blobs.insert(cap_handle.raw, cap_blob);
 /// blobs.insert(leaf_sig_handle.raw, sig_blob);
 ///
 /// let verified = verify_chain(
 ///     team_root.verifying_key(),
 ///     leaf_sig_handle,
-///     member.verifying_key(),
+///     founder.verifying_key(),
 ///     |h| blobs.get(&h.raw).cloned(),
 /// )
 /// .expect("chain valid");
 ///
-/// assert_eq!(verified.subject, member.verifying_key());
+/// assert_eq!(verified.subject, founder.verifying_key());
 /// assert!(verified.grants_read());
 /// ```
 pub fn verify_chain<F>(
+    team_root: VerifyingKey,
+    leaf_sig_handle: Inline<Handle<SimpleArchive>>,
+    expected_subject: VerifyingKey,
+    fetch_blob: F,
+) -> Result<VerifiedCapability, VerifyError>
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    let verified =
+        verify_chain_allow_expired(team_root, leaf_sig_handle, expected_subject, fetch_blob)?;
+    if verified.is_expired() {
+        Err(VerifyError::Expired)
+    } else {
+        Ok(verified)
+    }
+}
+
+/// Verify the complete capability proof without requiring its effective
+/// expiry to be live at the current wall-clock time.
+///
+/// This is the narrow recovery seam for startup code that must distinguish an
+/// otherwise-valid expired credential from corrupt or unauthorized state. It
+/// still verifies every signature, exact proof shape, delegation splice,
+/// scope-subsumption relation, founder anchor, depth bound, and interval
+/// encoding, and returns the earliest finite operational expiry in the chain.
+/// It must not be used to authorize ordinary network operations; use
+/// [`verify_chain`] for that.
+pub fn verify_chain_allow_expired<F>(
     team_root: VerifyingKey,
     leaf_sig_handle: Inline<Handle<SimpleArchive>>,
     expected_subject: VerifyingKey,
@@ -734,20 +915,12 @@ pub fn verify_chain<F>(
 where
     F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
-    // Through the clock seam: simulated runs check expiry against
-    // virtual time, so cap-lifetime scenarios (renewal windows,
-    // expiry-during-partition) are deterministically scriptable.
-    let now: Epoch = crate::clock::epoch_now();
-
-    // Helper: a cap is valid until the *upper bound* of its expiry
-    // interval. We compare that upper bound against `now`.
-    let is_expired = |expiry: &Inline<NsTAIInterval>| -> bool {
-        match <(Epoch, Epoch)>::try_from_inline(expiry) {
-            Ok((_lower, upper)) => upper < now,
-            // A malformed/inverted interval is treated as expired so
-            // adversarial caps can't fall through.
-            Err(_) => true,
-        }
+    // A cap is valid through the inclusive upper bound of its expiry
+    // interval. Malformed/inverted intervals fail closed as Expired.
+    let expiry_upper = |expiry: &Inline<NsTAIInterval>| -> Result<Epoch, VerifyError> {
+        <(Epoch, Epoch)>::try_from_inline(expiry)
+            .map(|(_lower, upper)| upper)
+            .map_err(|_| VerifyError::Expired)
     };
 
     // ── Leaf step ────────────────────────────────────────────────────
@@ -757,7 +930,8 @@ where
     // extends beyond a single hop — the recursive chain proof
     // (sig_parent_cap + sig_embedded_parent_proof, each linking to the
     // next level's signer/signature/parent).
-    let leaf_sig_blob = fetch_blob(leaf_sig_handle).ok_or(VerifyError::Fetch)?;
+    let leaf_sig_blob =
+        fetch_blob(leaf_sig_handle).ok_or(VerifyError::MissingBlob(leaf_sig_handle))?;
     let sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)?;
 
     // Find the leaf outer entity — the one carrying sig_signs.
@@ -772,7 +946,8 @@ where
         };
 
     // Fetch + decode the leaf cap.
-    let leaf_cap_blob = fetch_blob(leaf_cap_handle).ok_or(VerifyError::LeafCapMissing)?;
+    let leaf_cap_blob =
+        fetch_blob(leaf_cap_handle).ok_or(VerifyError::MissingBlob(leaf_cap_handle))?;
     let leaf_cap_set: TribleSet = TryFromBlob::try_from_blob(leaf_cap_blob.clone())?;
     let leaf_fields = extract_cap_fields(&leaf_cap_set)?;
 
@@ -780,14 +955,16 @@ where
     if leaf_fields.subject != expected_subject {
         return Err(VerifyError::SubjectMismatch);
     }
-    if is_expired(&leaf_fields.expiry) {
-        return Err(VerifyError::Expired);
-    }
+    let leaf_expiry = match &leaf_fields.kind {
+        CapKind::Operational { expiry } => expiry,
+        CapKind::FounderAnchor(_) => return Err(VerifyError::FounderAnchorAsLeaf),
+    };
+    let leaf_expires_at = expiry_upper(leaf_expiry)?;
 
     // Verify the outer signature attests to the leaf cap's bytes,
     // signed by the leaf's claimed issuer.
-    let outer_signer = extract_and_verify_sig_at(&sig_set, current_outer_id, &leaf_cap_blob)?;
-    if outer_signer != leaf_fields.issuer {
+    let mut current_proof = extract_and_verify_sig_at(&sig_set, current_outer_id, &leaf_cap_blob)?;
+    if current_proof.signer != leaf_fields.issuer {
         return Err(VerifyError::IssuerMismatch);
     }
 
@@ -800,23 +977,51 @@ where
     //     blob (== current cap's issuer).
     //   - `current_cap_set`: the decoded cap whose signature we've
     //     verified.
-    let mut current_signer = outer_signer;
+    let mut current_signer = current_proof.signer;
+    let mut current_cap_handle = leaf_cap_handle;
     let mut current_cap_set = leaf_cap_set.clone();
     let mut current_fields = leaf_fields.clone();
-    let mut depth = 0usize;
+    let mut authority_expires_at = leaf_expires_at;
+    // `(entity, has_parent_link)` in the single traversed proof chain. The
+    // final exact-shape check rejects any unrelated entity or attribute that
+    // would otherwise create infinitely many content-distinct handles for the
+    // same signed caps.
+    let leaf_outer_id = current_outer_id;
+    let mut proof_shape = vec![(current_outer_id, false)];
+    // The already-fetched leaf is the first capability level.
+    let mut depth = 1usize;
 
     loop {
-        // Termination: the issuer of the current cap is the team root.
+        // The configured root may sign only the explicit founder anchor. A
+        // finite root-signed cap would quietly restore the old "root as an
+        // online issuer" model, so it is not a valid terminator.
         if current_signer == team_root {
+            match &current_fields.kind {
+                CapKind::FounderAnchor(anchor) if anchor.issuer == team_root => {}
+                CapKind::FounderAnchor(_) => return Err(VerifyError::InvalidFounderAnchor),
+                CapKind::Operational { .. } => return Err(VerifyError::FounderAnchorRequired),
+            }
+            if canonical_sig_entity_id(&current_proof, current_cap_handle) != current_outer_id {
+                return Err(VerifyError::MalformedSig);
+            }
+            validate_sig_proof_shape(&sig_set, leaf_outer_id, &proof_shape)?;
             return Ok(VerifiedCapability {
                 subject: leaf_fields.subject,
                 scope_root: leaf_fields.scope_root,
                 cap_set: leaf_cap_set,
+                expires_at: authority_expires_at,
             });
         }
 
-        depth += 1;
-        if depth > MAX_CHAIN_DEPTH {
+        // Founder anchors are constitutional terminators, never ordinary
+        // delegating intermediates signed by another member.
+        if matches!(current_fields.kind, CapKind::FounderAnchor(_)) {
+            return Err(VerifyError::InvalidFounderAnchor);
+        }
+
+        // The current cap needs a parent, but fetching one would exceed
+        // the total-level bound (the leaf counts as level one).
+        if depth >= MAX_CHAIN_DEPTH {
             return Err(VerifyError::ChainTooDeep);
         }
 
@@ -834,20 +1039,47 @@ where
             (Some(row), None) => row,
             _ => return Err(VerifyError::NonRootMissingParent),
         };
+        if canonical_sig_entity_id(&current_proof, current_cap_handle) != current_outer_id {
+            return Err(VerifyError::MalformedSig);
+        }
+        proof_shape
+            .last_mut()
+            .expect("current proof entity is recorded")
+            .1 = true;
 
         // Fetch + decode the parent cap.
-        let parent_cap_blob = fetch_blob(parent_cap_handle).ok_or(VerifyError::Fetch)?;
+        let parent_cap_blob =
+            fetch_blob(parent_cap_handle).ok_or(VerifyError::MissingBlob(parent_cap_handle))?;
         let parent_cap_set: TribleSet = TryFromBlob::try_from_blob(parent_cap_blob.clone())?;
         let parent_fields = extract_cap_fields(&parent_cap_set)?;
 
         // Verify the parent proof's sig attests to the parent cap's
         // bytes, signed by some authority.
-        let parent_signer = extract_and_verify_sig_at(&sig_set, parent_proof_id, &parent_cap_blob)?;
-        if parent_signer != parent_fields.issuer {
-            return Err(VerifyError::IssuerMismatch);
+        let parent_proof = extract_and_verify_sig_at(&sig_set, parent_proof_id, &parent_cap_blob)?;
+        let parent_signer = parent_proof.signer;
+        match &parent_fields.kind {
+            CapKind::FounderAnchor(anchor) => {
+                if parent_signer != team_root
+                    || parent_fields.issuer != team_root
+                    || anchor.issuer != team_root
+                {
+                    return Err(VerifyError::InvalidFounderAnchor);
+                }
+            }
+            CapKind::Operational { .. } => {
+                if parent_signer != parent_fields.issuer {
+                    return Err(VerifyError::IssuerMismatch);
+                }
+            }
         }
-        if is_expired(&parent_fields.expiry) {
-            return Err(VerifyError::Expired);
+        if parent_fields.subject != current_fields.issuer {
+            return Err(VerifyError::DelegationMismatch);
+        }
+        if let CapKind::Operational { expiry } = &parent_fields.kind {
+            let parent_expires_at = expiry_upper(expiry)?;
+            if parent_expires_at < authority_expires_at {
+                authority_expires_at = parent_expires_at;
+            }
         }
         // Each child link's scope must be a subset of its parent's.
         if !scope_subsumes(
@@ -861,20 +1093,94 @@ where
 
         // Step.
         current_outer_id = parent_proof_id;
+        current_proof = parent_proof;
+        current_cap_handle = parent_cap_handle;
+        proof_shape.push((parent_proof_id, false));
         current_signer = parent_signer;
         current_cap_set = parent_cap_set;
         current_fields = parent_fields;
+        depth += 1;
     }
+}
+
+/// The signature proof's entity identifiers are themselves part of the
+/// canonical container. Each id is derived when its standalone signature
+/// entity contains only `sig_signs`, `signed_by`, `signature_r`, and
+/// `signature_s`; parent links are attached afterwards under that forced id.
+/// Embedded proof entities omit `sig_signs` physically, so reconstruct exactly
+/// those original four facts at every level. The separately validated linear
+/// links then make the whole proof shape unique; merely renaming proof entities
+/// cannot mint an equivalent credential handle.
+fn canonical_sig_entity_id(
+    proof: &VerifiedSigProof,
+    signed_cap: Inline<Handle<SimpleArchive>>,
+) -> crate::id::Id {
+    let signature = Signature::from_components(proof.r, proof.s);
+    let fragment = entity! {
+        sig_signs: signed_cap,
+        crate::repo::signed_by: proof.signer,
+        crate::repo::signature_r: signature,
+        crate::repo::signature_s: signature,
+    };
+    fragment
+        .root()
+        .expect("canonical signature entity exports exactly one intrinsic id")
+}
+
+/// Require the signature container to be exactly the one linear proof chain
+/// consumed above. Cap blobs deliberately admit scope facts; sig blobs do not
+/// carry extensible application data, so accepting unrelated facts here would
+/// make the credential handle malleable without a new signature.
+fn validate_sig_proof_shape(
+    sig_set: &TribleSet,
+    leaf_outer_id: crate::id::Id,
+    proof_shape: &[(crate::id::Id, bool)],
+) -> Result<(), VerifyError> {
+    for (entity, has_parent) in proof_shape {
+        let expected =
+            if *entity == leaf_outer_id { 4 } else { 3 } + if *has_parent { 2 } else { 0 };
+        let mut actual = 0usize;
+        for fact in sig_set.iter().filter(|fact| fact.e() == entity) {
+            actual += 1;
+            let attribute = *fact.a();
+            let base = attribute == crate::repo::signed_by.id()
+                || attribute == crate::repo::signature_r.id()
+                || attribute == crate::repo::signature_s.id()
+                || (*entity == leaf_outer_id && attribute == sig_signs.id());
+            let parent = *has_parent
+                && (attribute == sig_parent_cap.id()
+                    || attribute == sig_embedded_parent_proof.id());
+            if !base && !parent {
+                return Err(VerifyError::MalformedSig);
+            }
+        }
+        if actual != expected {
+            return Err(VerifyError::MalformedSig);
+        }
+    }
+    if sig_set
+        .iter()
+        .any(|fact| !proof_shape.iter().any(|(entity, _)| fact.e() == entity))
+    {
+        return Err(VerifyError::MalformedSig);
+    }
+    Ok(())
 }
 
 /// Extract a `(signed_by, signature_r, signature_s)` from a specific
 /// entity inside a sig blob's TribleSet, verify it's a valid signature
 /// over `signed_blob.bytes`, and return the signer.
+struct VerifiedSigProof {
+    signer: VerifyingKey,
+    r: ed25519::ComponentBytes,
+    s: ed25519::ComponentBytes,
+}
+
 fn extract_and_verify_sig_at(
     sig_set: &TribleSet,
     entity: crate::id::Id,
     signed_blob: &Blob<SimpleArchive>,
-) -> Result<VerifyingKey, VerifyError> {
+) -> Result<VerifiedSigProof, VerifyError> {
     let mut iter = find!(
         (signer: VerifyingKey, r, s),
         pattern!(sig_set, [{
@@ -892,7 +1198,7 @@ fn extract_and_verify_sig_at(
     signer
         .verify(&signed_blob.bytes, &signature)
         .map_err(|_| VerifyError::BadSignature)?;
-    Ok(signer)
+    Ok(VerifiedSigProof { signer, r, s })
 }
 
 #[cfg(test)]
@@ -934,6 +1240,63 @@ mod tests {
         (*scope_root, facts)
     }
 
+    fn scope_with(perms: &[Id], branches: &[Id]) -> (Id, TribleSet) {
+        let root = crate::id::ufoid();
+        let mut facts = TribleSet::new();
+        for permission in perms {
+            facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&root) @
+                crate::metadata::tag: *permission,
+            });
+        }
+        for branch in branches {
+            facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&root) @
+                scope_branch: *branch,
+            });
+        }
+        (*root, facts)
+    }
+
+    fn anchor_for(
+        team_root: &SigningKey,
+        founder: &SigningKey,
+    ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
+        let (scope_root, scope_facts) = scope_with(&[PERM_ADMIN], &[]);
+        build_founder_anchor(team_root, founder.verifying_key(), scope_root, scope_facts)
+            .expect("build founder anchor")
+    }
+
+    #[test]
+    fn restricted_admin_never_bypasses_branch_or_known_permission_checks() {
+        let branch_a = *crate::id::ufoid();
+        let branch_b = *crate::id::ufoid();
+        let unknown_permission = *crate::id::ufoid();
+        let (parent_root, parent) = scope_with(&[PERM_ADMIN], &[branch_a]);
+
+        let (same_root, same) = scope_with(&[PERM_WRITE], &[branch_a]);
+        assert!(scope_subsumes(&parent, parent_root, &same, same_root));
+
+        let (unrestricted_root, unrestricted) = scope_with(&[PERM_READ], &[]);
+        assert!(!scope_subsumes(
+            &parent,
+            parent_root,
+            &unrestricted,
+            unrestricted_root
+        ));
+
+        let (other_root, other) = scope_with(&[PERM_READ], &[branch_b]);
+        assert!(!scope_subsumes(&parent, parent_root, &other, other_root));
+
+        let (unknown_root, unknown) = scope_with(&[unknown_permission], &[branch_a]);
+        assert!(!scope_subsumes(
+            &parent,
+            parent_root,
+            &unknown,
+            unknown_root
+        ));
+    }
+
     /// Build a fetch_blob closure backed by an in-memory map.
     fn fetch_from(
         blobs: &[Blob<SimpleArchive>],
@@ -951,33 +1314,349 @@ mod tests {
     // ── Length-1 chain ────────────────────────────────────────────────
 
     #[test]
-    fn length_one_chain_round_trips() {
+    fn founder_anchor_is_not_an_operational_leaf() {
         let team_root = key();
-        let (scope_root, scope_facts) = empty_scope();
+        let founder = key();
+        let (cap_blob, sig_blob) = anchor_for(&team_root, &founder);
+        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+        let blobs = [cap_blob, sig_blob];
 
-        let (cap_blob, sig_blob) = build_capability(
-            &team_root,
+        let err = verify_chain(
             team_root.verifying_key(),
-            None,
+            sig_handle,
+            founder.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect_err("the constitutional anchor is not an auth credential");
+
+        assert!(matches!(err, VerifyError::FounderAnchorAsLeaf));
+    }
+
+    #[test]
+    fn finite_founder_self_cap_verifies_under_anchor() {
+        let team_root = key();
+        let founder = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (scope_root, scope_facts) = empty_scope();
+        let (cap, sig) = build_capability(
+            &founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope_facts,
+            interval(3600.0),
+        )
+        .expect("build finite founder credential");
+        let sig_handle = sig.get_handle();
+        let blobs = [anchor_cap, anchor_sig, cap, sig];
+
+        let verified = verify_chain(
+            team_root.verifying_key(),
+            sig_handle,
+            founder.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("finite founder credential verifies");
+
+        assert_eq!(verified.subject, founder.verifying_key());
+        assert_eq!(verified.scope_root, scope_root);
+    }
+
+    #[test]
+    fn root_signed_finite_cap_cannot_replace_founder_anchor() {
+        let team_root = key();
+        let founder = key();
+        let (scope_root, scope_facts) = empty_scope();
+        let mut cap_set = TribleSet::from(entity! {
+            cap_subject: issuer_subject_value(founder.verifying_key()),
+            cap_issuer: issuer_subject_value(team_root.verifying_key()),
+            cap_scope_root: scope_root,
+            crate::metadata::expires_at: interval(3600.0),
+        });
+        cap_set += scope_facts;
+        let (cap, sig) = build_signed_claim(&team_root, cap_set, None)
+            .expect("build structurally valid but unanchored cap");
+        let sig_handle = sig.get_handle();
+        let blobs = [cap, sig];
+
+        assert!(matches!(
+            verify_chain(
+                team_root.verifying_key(),
+                sig_handle,
+                founder.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::FounderAnchorRequired)
+        ));
+    }
+
+    #[test]
+    fn founder_rotation_uses_anchor_siblings_at_constant_depth() {
+        let team_root = key();
+        let founder = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let now = crate::clock::epoch_now();
+        let first_upper = now + hifitime::Duration::from_seconds(60.0);
+        let second_upper = now + hifitime::Duration::from_seconds(7200.0);
+
+        let (first_scope, first_facts) = empty_scope();
+        let (first_cap, first_sig) = build_capability(
+            &founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            first_scope,
+            first_facts,
+            (now, first_upper).try_to_inline().unwrap(),
+        )
+        .expect("build first operational sibling");
+        let (second_scope, second_facts) = empty_scope();
+        let (second_cap, second_sig) = build_capability(
+            &founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            second_scope,
+            second_facts,
+            (now, second_upper).try_to_inline().unwrap(),
+        )
+        .expect("build rotated operational sibling");
+
+        let first_handle = first_sig.get_handle();
+        let first_blobs = [
+            anchor_cap.clone(),
+            anchor_sig.clone(),
+            first_cap,
+            first_sig.clone(),
+        ];
+        let first = verify_chain(
+            team_root.verifying_key(),
+            first_handle,
+            founder.verifying_key(),
+            fetch_from(&first_blobs),
+        )
+        .expect("first sibling verifies");
+
+        // Deliberately omit the predecessor: rotation is a new sibling under
+        // the same anchor, not an ever-growing renewal chain.
+        let second_handle = second_sig.get_handle();
+        let second_blobs = [anchor_cap, anchor_sig, second_cap, second_sig.clone()];
+        let second = verify_chain(
+            team_root.verifying_key(),
+            second_handle,
+            founder.verifying_key(),
+            fetch_from(&second_blobs),
+        )
+        .expect("rotated sibling verifies without predecessor");
+
+        assert_eq!(first.expires_at(), first_upper);
+        assert_eq!(second.expires_at(), second_upper);
+        for proof in [&first_sig, &second_sig] {
+            let set: TribleSet = TryFromBlob::try_from_blob(proof.clone()).unwrap();
+            let levels = find!(
+                (entity: Id, signer: VerifyingKey),
+                pattern!(&set, [{ ?entity @ crate::repo::signed_by: ?signer }])
+            )
+            .count();
+            assert_eq!(levels, 2, "each sibling remains anchor + finite leaf");
+        }
+    }
+
+    fn verify_with_anchor_parent(
+        team_root: &SigningKey,
+        founder: &SigningKey,
+        anchor_cap: Blob<SimpleArchive>,
+        anchor_sig: Blob<SimpleArchive>,
+    ) -> Result<VerifiedCapability, VerifyError> {
+        let (scope_root, scope_facts) = empty_scope();
+        let (leaf_cap, leaf_sig) = build_capability(
+            founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope_facts,
+            interval(3600.0),
+        )
+        .expect("build child of candidate anchor");
+        let leaf_handle = leaf_sig.get_handle();
+        let blobs = [anchor_cap, anchor_sig, leaf_cap, leaf_sig];
+        verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            founder.verifying_key(),
+            fetch_from(&blobs),
+        )
+    }
+
+    #[test]
+    fn nonroot_and_malformed_founder_anchors_fail_closed() {
+        let team_root = key();
+        let founder = key();
+        let nonroot = key();
+
+        let (scope_root, scope_facts) = scope_with(&[PERM_ADMIN], &[]);
+        let (nonroot_cap, nonroot_sig) =
+            build_founder_anchor(&nonroot, founder.verifying_key(), scope_root, scope_facts)
+                .expect("build nonroot candidate");
+        assert!(matches!(
+            verify_with_anchor_parent(&team_root, &founder, nonroot_cap, nonroot_sig),
+            Err(VerifyError::InvalidFounderAnchor)
+        ));
+
+        // Even a real root signature cannot rescue an anchor whose declaration
+        // names another issuer.
+        let (scope_root, scope_facts) = scope_with(&[PERM_ADMIN], &[]);
+        let mut bad_issuer_set = TribleSet::from(entity! {
+            cap_subject: issuer_subject_value(founder.verifying_key()),
+            cap_issuer: issuer_subject_value(nonroot.verifying_key()),
+            cap_scope_root: scope_root,
+            crate::metadata::tag: KIND_FOUNDER_ANCHOR,
+        });
+        bad_issuer_set += scope_facts;
+        let (bad_issuer_cap, bad_issuer_sig) =
+            build_signed_claim(&team_root, bad_issuer_set, None).unwrap();
+        assert!(matches!(
+            verify_with_anchor_parent(&team_root, &founder, bad_issuer_cap, bad_issuer_sig),
+            Err(VerifyError::InvalidFounderAnchor)
+        ));
+
+        let (valid_cap, _valid_sig) = anchor_for(&team_root, &founder);
+        let mut mixed_set: TribleSet = TryFromBlob::try_from_blob(valid_cap).unwrap();
+        let anchor_entity = find!(
+            (entity: Id, subject: VerifyingKey),
+            pattern!(&mixed_set, [{ ?entity @ cap_subject: ?subject }])
+        )
+        .map(|(entity, _)| entity)
+        .next()
+        .unwrap();
+        mixed_set += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&anchor_entity) @
+            crate::metadata::expires_at: interval(3600.0),
+        });
+        let (mixed_cap, mixed_sig) = build_signed_claim(&team_root, mixed_set, None).unwrap();
+        assert!(matches!(
+            verify_with_anchor_parent(&team_root, &founder, mixed_cap, mixed_sig),
+            Err(VerifyError::MalformedCap)
+        ));
+
+        let (valid_cap, _valid_sig) = anchor_for(&team_root, &founder);
+        let mut extra_tag_set: TribleSet = TryFromBlob::try_from_blob(valid_cap).unwrap();
+        let anchor_entity = find!(
+            (entity: Id, subject: VerifyingKey),
+            pattern!(&extra_tag_set, [{ ?entity @ cap_subject: ?subject }])
+        )
+        .map(|(entity, _)| entity)
+        .next()
+        .unwrap();
+        extra_tag_set += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&anchor_entity) @
+            crate::metadata::tag: PERM_ADMIN,
+        });
+        let (extra_tag_cap, extra_tag_sig) =
+            build_signed_claim(&team_root, extra_tag_set, None).unwrap();
+        assert!(matches!(
+            verify_with_anchor_parent(&team_root, &founder, extra_tag_cap, extra_tag_sig),
+            Err(VerifyError::MalformedCap)
+        ));
+    }
+
+    #[test]
+    fn signature_proof_rejects_unsigned_extra_facts() {
+        let team_root = key();
+        let founder = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (scope_root, scope_facts) = empty_scope();
+        let (cap_blob, sig_blob) = build_capability(
+            &founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
             scope_root,
             scope_facts,
             interval(3600.0),
         )
         .expect("build");
 
-        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-        let blobs = [cap_blob.clone(), sig_blob.clone()];
+        let mut sig_set: TribleSet = TryFromBlob::try_from_blob(sig_blob).expect("parse sig");
+        let unrelated = crate::id::ufoid();
+        sig_set += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&unrelated) @
+            crate::metadata::tag: PERM_READ,
+        });
+        let malleated_sig: Blob<SimpleArchive> = sig_set.to_blob();
+        let malleated_handle = malleated_sig.get_handle();
+        let blobs = [anchor_cap, anchor_sig, cap_blob, malleated_sig];
 
-        let verified = verify_chain(
-            team_root.verifying_key(),
-            sig_handle,
-            team_root.verifying_key(),
-            fetch_from(&blobs),
+        assert!(matches!(
+            verify_chain(
+                team_root.verifying_key(),
+                malleated_handle,
+                founder.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::MalformedSig)
+        ));
+    }
+
+    #[test]
+    fn signature_proof_rejects_renamed_intrinsic_entities() {
+        let team_root = key();
+        let founder = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (scope_root, scope_facts) = empty_scope();
+        let (cap_blob, sig_blob) = build_capability(
+            &founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope_facts,
+            interval(3600.0),
         )
-        .expect("verify");
+        .expect("build");
 
-        assert_eq!(verified.subject, team_root.verifying_key());
-        assert_eq!(verified.scope_root, scope_root);
+        let original_handle = sig_blob.get_handle();
+        let original_blobs = [
+            anchor_cap.clone(),
+            anchor_sig.clone(),
+            cap_blob.clone(),
+            sig_blob.clone(),
+        ];
+        verify_chain(
+            team_root.verifying_key(),
+            original_handle,
+            founder.verifying_key(),
+            fetch_from(&original_blobs),
+        )
+        .expect("the canonical proof verifies before entity renaming");
+
+        let sig_set: TribleSet = TryFromBlob::try_from_blob(sig_blob).expect("parse sig");
+        let leaf_entity = find!(
+            (entity: Id, cap: Inline<Handle<SimpleArchive>>),
+            pattern!(&sig_set, [{ ?entity @ sig_signs: ?cap }])
+        )
+        .map(|(entity, _cap)| entity)
+        .next()
+        .expect("leaf proof entity");
+        let renamed = *crate::id::ufoid();
+        let mut renamed_set = TribleSet::new();
+        for fact in sig_set.iter() {
+            let mut raw = fact.data;
+            if *fact.e() == leaf_entity {
+                raw[..crate::id::ID_LEN].copy_from_slice(&renamed[..]);
+            }
+            let renamed_fact = crate::trible::Trible::force_raw(raw).expect("valid renamed fact");
+            renamed_set.insert(&renamed_fact);
+        }
+        let malleated_sig: Blob<SimpleArchive> = renamed_set.to_blob();
+        let malleated_handle = malleated_sig.get_handle();
+        let blobs = [anchor_cap, anchor_sig, cap_blob, malleated_sig];
+
+        assert!(matches!(
+            verify_chain(
+                team_root.verifying_key(),
+                malleated_handle,
+                founder.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::MalformedSig)
+        ));
     }
 
     // ── Length-N chain ────────────────────────────────────────────────
@@ -993,24 +1672,15 @@ mod tests {
         let a = key();
         let b = key();
 
-        // Level 1: team_root → A (subject = A)
-        let (scope1_root, scope1_facts) = empty_scope();
-        let (cap_a, sig_a) = build_capability(
-            &team_root,
-            a.verifying_key(),
-            None,
-            scope1_root,
-            scope1_facts,
-            interval(3600.0),
-        )
-        .expect("build level-1");
+        // Level 1: the root's non-expiring founder anchor for A.
+        let (cap_a, sig_a) = anchor_for(&team_root, &a);
 
         // Level 2: A → B (subject = B)
         let (scope2_root, scope2_facts) = empty_scope();
         let (cap_b, sig_b) = build_capability(
             &a,
             b.verifying_key(),
-            Some((cap_a.clone(), sig_a.clone())),
+            (cap_a.clone(), sig_a.clone()),
             scope2_root,
             scope2_facts,
             interval(3600.0),
@@ -1020,6 +1690,59 @@ mod tests {
         let leaf_sig_handle: Inline<Handle<SimpleArchive>> = (&sig_b).get_handle();
         let blobs = vec![cap_a, sig_a, cap_b, sig_b];
         (team_root, a, b, blobs, leaf_sig_handle)
+    }
+
+    fn chain_with_level_count(
+        levels: usize,
+    ) -> (
+        SigningKey,
+        VerifyingKey,
+        Vec<Blob<SimpleArchive>>,
+        Inline<Handle<SimpleArchive>>,
+        Inline<Handle<SimpleArchive>>,
+    ) {
+        assert!(
+            levels >= 2,
+            "a valid chain needs an anchor and a finite leaf"
+        );
+
+        let team_root = key();
+        let subjects: Vec<SigningKey> = (0..levels).map(|_| key()).collect();
+        let mut blobs = Vec::with_capacity(levels * 2);
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &subjects[0]);
+        let root_cap_handle = anchor_cap.get_handle();
+        blobs.push(anchor_cap.clone());
+        blobs.push(anchor_sig.clone());
+        let mut parent = (anchor_cap, anchor_sig);
+
+        for level in 1..levels {
+            let (scope_root, scope_facts) = empty_scope();
+            let (cap, sig) = build_capability(
+                &subjects[level - 1],
+                subjects[level].verifying_key(),
+                parent,
+                scope_root,
+                scope_facts,
+                interval(3600.0),
+            )
+            .expect("build capability level");
+
+            blobs.push(cap.clone());
+            blobs.push(sig.clone());
+            parent = (cap, sig);
+        }
+
+        let leaf_sig_handle = parent.1.get_handle();
+        (
+            team_root,
+            subjects
+                .last()
+                .expect("at least one subject")
+                .verifying_key(),
+            blobs,
+            leaf_sig_handle,
+            root_cap_handle,
+        )
     }
 
     #[test]
@@ -1035,6 +1758,207 @@ mod tests {
         .expect("verify");
 
         assert_eq!(verified.subject, b.verifying_key());
+    }
+
+    #[test]
+    fn verified_authority_expires_at_earliest_chain_deadline() {
+        let team_root = key();
+        let founder = key();
+        let intermediary = key();
+        let member = key();
+        let now = crate::clock::epoch_now();
+        let parent_expires_at = now + hifitime::Duration::from_seconds(60.0);
+        let leaf_expires_at = now + hifitime::Duration::from_seconds(3600.0);
+
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (parent_scope, parent_facts) = empty_scope();
+        let (parent_cap, parent_sig) = build_capability(
+            &founder,
+            intermediary.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            parent_scope,
+            parent_facts,
+            (now, parent_expires_at).try_to_inline().unwrap(),
+        )
+        .expect("build parent");
+        let (leaf_scope, leaf_facts) = empty_scope();
+        let (leaf_cap, leaf_sig) = build_capability(
+            &intermediary,
+            member.verifying_key(),
+            (parent_cap.clone(), parent_sig.clone()),
+            leaf_scope,
+            leaf_facts,
+            (now, leaf_expires_at).try_to_inline().unwrap(),
+        )
+        .expect("build leaf");
+        let leaf_sig_handle = leaf_sig.get_handle();
+        let blobs = [
+            anchor_cap, anchor_sig, parent_cap, parent_sig, leaf_cap, leaf_sig,
+        ];
+
+        let verified = verify_chain(
+            team_root.verifying_key(),
+            leaf_sig_handle,
+            member.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("verify delegated chain");
+
+        assert_eq!(verified.expires_at(), parent_expires_at);
+        assert!(!verified.is_expired_at(parent_expires_at));
+        assert!(
+            verified.is_expired_at(parent_expires_at + hifitime::Duration::from_nanoseconds(1.0))
+        );
+    }
+
+    #[test]
+    fn chain_depth_bound_counts_leaf_and_stops_before_extra_fetch() {
+        let (team_root, subject, blobs, leaf_sig_handle, _root_cap_handle) =
+            chain_with_level_count(MAX_CHAIN_DEPTH);
+        verify_chain(
+            team_root.verifying_key(),
+            leaf_sig_handle,
+            subject,
+            fetch_from(&blobs),
+        )
+        .expect("a chain exactly at the level bound must verify");
+
+        let (team_root, subject, blobs, leaf_sig_handle, root_cap_handle) =
+            chain_with_level_count(MAX_CHAIN_DEPTH + 1);
+        let mut fetch = fetch_from(&blobs);
+        let mut requested = Vec::new();
+        let err = verify_chain(
+            team_root.verifying_key(),
+            leaf_sig_handle,
+            subject,
+            |handle| {
+                requested.push(handle);
+                fetch(handle)
+            },
+        )
+        .expect_err("a chain one level over the bound must be rejected");
+
+        assert!(matches!(err, VerifyError::ChainTooDeep));
+        assert_eq!(
+            requested.len(),
+            MAX_CHAIN_DEPTH + 1,
+            "one leaf sig plus exactly MAX_CHAIN_DEPTH cap lookups"
+        );
+        assert!(
+            !requested.contains(&root_cap_handle),
+            "the out-of-bound parent cap must not be fetched"
+        );
+    }
+
+    #[test]
+    fn missing_blob_reports_each_requested_handle_in_order() {
+        let (team_root, _a, b, blobs, leaf_sig_handle) = three_level_chain();
+        let parent_cap_handle: Inline<Handle<SimpleArchive>> = (&blobs[0]).get_handle();
+        let embedded_parent_sig_handle: Inline<Handle<SimpleArchive>> = (&blobs[1]).get_handle();
+        let leaf_cap_handle: Inline<Handle<SimpleArchive>> = (&blobs[2]).get_handle();
+        let leaf_sig_blob = blobs[3].clone();
+        let leaf_cap_blob = blobs[2].clone();
+
+        let mut requested = Vec::new();
+        let err = verify_chain(
+            team_root.verifying_key(),
+            leaf_sig_handle,
+            b.verifying_key(),
+            |handle| {
+                requested.push(handle);
+                None
+            },
+        )
+        .expect_err("missing leaf sig must be reported");
+        match err {
+            VerifyError::MissingBlob(handle) => assert_eq!(handle, leaf_sig_handle),
+            other => panic!("expected MissingBlob for leaf sig, got {other:?}"),
+        }
+        assert_eq!(requested, [leaf_sig_handle]);
+
+        requested.clear();
+        let err = verify_chain(
+            team_root.verifying_key(),
+            leaf_sig_handle,
+            b.verifying_key(),
+            |handle| {
+                requested.push(handle);
+                (handle == leaf_sig_handle).then(|| leaf_sig_blob.clone())
+            },
+        )
+        .expect_err("missing leaf cap must be reported");
+        match err {
+            VerifyError::MissingBlob(handle) => assert_eq!(handle, leaf_cap_handle),
+            other => panic!("expected MissingBlob for leaf cap, got {other:?}"),
+        }
+        assert_eq!(requested, [leaf_sig_handle, leaf_cap_handle]);
+
+        requested.clear();
+        let err = verify_chain(
+            team_root.verifying_key(),
+            leaf_sig_handle,
+            b.verifying_key(),
+            |handle| {
+                requested.push(handle);
+                if handle == leaf_sig_handle {
+                    Some(leaf_sig_blob.clone())
+                } else if handle == leaf_cap_handle {
+                    Some(leaf_cap_blob.clone())
+                } else {
+                    None
+                }
+            },
+        )
+        .expect_err("missing parent cap must be reported");
+        match err {
+            VerifyError::MissingBlob(handle) => assert_eq!(handle, parent_cap_handle),
+            other => panic!("expected MissingBlob for parent cap, got {other:?}"),
+        }
+        assert_eq!(
+            requested,
+            [leaf_sig_handle, leaf_cap_handle, parent_cap_handle]
+        );
+        assert!(
+            !requested.contains(&embedded_parent_sig_handle),
+            "the embedded parent signature must never be fetched"
+        );
+    }
+
+    #[test]
+    fn rejects_spliced_delegation_chain() {
+        let team_root = key();
+        let alice = key();
+        let mallory = key();
+        let bob = key();
+
+        // The root authorizes Alice through the founder anchor.
+        let (alice_cap, alice_sig) = anchor_for(&team_root, &alice);
+
+        // Mallory splices Alice's valid proof into a leaf for Bob.
+        // Every signature and issuer field is internally valid, but
+        // the parent authorizes Alice rather than Mallory.
+        let (bob_scope_root, bob_scope_facts) = empty_scope();
+        let (bob_cap, bob_sig) = build_capability(
+            &mallory,
+            bob.verifying_key(),
+            (alice_cap.clone(), alice_sig.clone()),
+            bob_scope_root,
+            bob_scope_facts,
+            interval(3600.0),
+        )
+        .expect("build spliced Bob capability");
+
+        let bob_sig_handle: Inline<Handle<SimpleArchive>> = (&bob_sig).get_handle();
+        let blobs = [alice_cap, alice_sig, bob_cap, bob_sig];
+        let err = verify_chain(
+            team_root.verifying_key(),
+            bob_sig_handle,
+            bob.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect_err("a signer not authorized by the parent must be rejected");
+
+        assert!(matches!(err, VerifyError::DelegationMismatch));
     }
 
     #[test]
@@ -1058,10 +1982,6 @@ mod tests {
         let (_real_team_root, _a, b, blobs, leaf_sig_handle) = three_level_chain();
         let wrong_root = key();
 
-        // With a wrong team root, the chain walk never finds a sig
-        // signed by it — climbs to the actual root, finds no
-        // sig_parent_cap there, errors with NonRootMissingParent
-        // (current_signer != wrong_team_root && no parent linkage).
         let err = verify_chain(
             wrong_root.verifying_key(),
             leaf_sig_handle,
@@ -1070,18 +1990,20 @@ mod tests {
         )
         .expect_err("must reject wrong team root");
 
-        assert!(matches!(err, VerifyError::NonRootMissingParent));
+        assert!(matches!(err, VerifyError::InvalidFounderAnchor));
     }
 
     #[test]
     fn rejects_expired_leaf() {
         let team_root = key();
+        let founder = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
         let (scope_root, scope_facts) = empty_scope();
 
         let (cap_blob, sig_blob) = build_capability(
-            &team_root,
-            team_root.verifying_key(),
-            None,
+            &founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
             scope_root,
             scope_facts,
             expired_interval(),
@@ -1089,32 +2011,89 @@ mod tests {
         .expect("build");
 
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-        let blobs = [cap_blob, sig_blob];
+        let blobs = [anchor_cap, anchor_sig, cap_blob, sig_blob];
 
         let err = verify_chain(
             team_root.verifying_key(),
             sig_handle,
-            team_root.verifying_key(),
+            founder.verifying_key(),
             fetch_from(&blobs),
         )
         .expect_err("must reject expired");
 
         assert!(matches!(err, VerifyError::Expired));
+
+        let recovered = verify_chain_allow_expired(
+            team_root.verifying_key(),
+            sig_handle,
+            founder.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("the explicit recovery API accepts an otherwise-valid proof");
+        assert!(recovered.is_expired());
+
+        // Expiry recovery does not soften cryptographic verification. Replace
+        // only the leaf signature components while retaining a canonical proof
+        // container and the same expired cap.
+        let sig_set: TribleSet = TryFromBlob::try_from_blob(blobs[3].clone()).unwrap();
+        let leaf_entity = find!(
+            (entity: Id, cap: Inline<Handle<SimpleArchive>>),
+            pattern!(&sig_set, [{ ?entity @ sig_signs: ?cap }])
+        )
+        .map(|(entity, _)| entity)
+        .next()
+        .unwrap();
+        let mut tampered_set = TribleSet::new();
+        for fact in sig_set.iter() {
+            if *fact.e() == leaf_entity
+                && (*fact.a() == crate::repo::signature_r.id()
+                    || *fact.a() == crate::repo::signature_s.id())
+            {
+                continue;
+            }
+            tampered_set.insert(fact);
+        }
+        let bogus_signature = key().sign(b"not the expired capability");
+        tampered_set += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&leaf_entity) @
+            crate::repo::signature_r: bogus_signature,
+            crate::repo::signature_s: bogus_signature,
+        });
+        let tampered_sig: Blob<SimpleArchive> = tampered_set.to_blob();
+        let tampered_handle = tampered_sig.get_handle();
+        let tampered_blobs = [
+            blobs[0].clone(),
+            blobs[1].clone(),
+            blobs[2].clone(),
+            tampered_sig,
+        ];
+        assert!(matches!(
+            verify_chain_allow_expired(
+                team_root.verifying_key(),
+                tampered_handle,
+                founder.verifying_key(),
+                fetch_from(&tampered_blobs),
+            ),
+            Err(VerifyError::BadSignature)
+        ));
     }
 
     #[test]
     fn rejects_expired_intermediate() {
-        // Length-2 chain where team_root's cap to A has expired,
-        // but A's cap to B has not. verify must reject.
+        // The anchor itself does not expire, but an expired finite A -> B
+        // capability cannot authorize B's still-live capability for C.
         let team_root = key();
         let a = key();
         let b = key();
+        let c = key();
+
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &a);
 
         let (scope1_root, scope1_facts) = empty_scope();
         let (cap_a, sig_a) = build_capability(
-            &team_root,
-            a.verifying_key(),
-            None,
+            &a,
+            b.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
             scope1_root,
             scope1_facts,
             expired_interval(),
@@ -1123,9 +2102,9 @@ mod tests {
 
         let (scope2_root, scope2_facts) = empty_scope();
         let (cap_b, sig_b) = build_capability(
-            &a,
-            b.verifying_key(),
-            Some((cap_a.clone(), sig_a.clone())),
+            &b,
+            c.verifying_key(),
+            (cap_a.clone(), sig_a.clone()),
             scope2_root,
             scope2_facts,
             interval(3600.0),
@@ -1133,12 +2112,12 @@ mod tests {
         .expect("build level-2");
 
         let leaf_sig_handle: Inline<Handle<SimpleArchive>> = (&sig_b).get_handle();
-        let blobs = [cap_a, sig_a, cap_b, sig_b];
+        let blobs = [anchor_cap, anchor_sig, cap_a, sig_a, cap_b, sig_b];
 
         let err = verify_chain(
             team_root.verifying_key(),
             leaf_sig_handle,
-            b.verifying_key(),
+            c.verifying_key(),
             fetch_from(&blobs),
         )
         .expect_err("must reject expired intermediate");

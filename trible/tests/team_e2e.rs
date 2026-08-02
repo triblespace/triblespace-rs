@@ -345,11 +345,10 @@ fn invite_with_legacy_pin_restriction_renders_in_list() {
 
 #[test]
 fn show_walks_chain_end_to_end() {
-    // Build a length-2 chain (founder + invitee), then run
+    // Build a length-3 chain (invitee + finite founder + founder anchor), then run
     // `team show` on the leaf invitee cap. The walk should
-    // produce two `level N:` blocks — depth 0 with the leaf
-    // sig blob and PERM_READ scope, depth 1 with PERM_ADMIN
-    // and the "(embedded in level above)" sig label.
+    // expose both finite operational links and the non-expiring root-signed
+    // anchor which terminates the proof.
     let dir = tempdir().expect("tempdir");
     let pile_path = dir.path().join("team.pile");
     std::fs::File::create(&pile_path).expect("create pile file");
@@ -371,9 +370,11 @@ fn show_walks_chain_end_to_end() {
     let (team_root_pubkey, _, founder_cap_sig) =
         parse_create_output(std::str::from_utf8(&create.get_output().stdout).unwrap());
 
-    // Run show on the founder cap — should be length-1 (root).
+    // The founder's operational credential is finite and chains to the
+    // explicit non-expiring founder anchor.
     let show_root = Command::cargo_bin("trible")
         .unwrap()
+        .env_remove("TRIBLE_TEAM_ROOT")
         .args([
             "team",
             "show",
@@ -390,12 +391,14 @@ fn show_walks_chain_end_to_end() {
         "founder show emits level 0 with PERM_ADMIN; got:\n{root_out}"
     );
     assert!(
-        root_out.contains("root link"),
-        "founder show identifies the link as root (no cap_parent); got:\n{root_out}"
+        root_out.contains("level 1:")
+            && root_out.contains("founder anchor (rotation authority; not an auth credential)")
+            && root_out.contains("root link"),
+        "founder show walks through the explicit root-signed anchor; got:\n{root_out}"
     );
     assert!(
-        !root_out.contains("level 1:"),
-        "founder show is length-1 — no level 1 expected; got:\n{root_out}"
+        !root_out.contains("level 2:"),
+        "founder proof has exactly one operational link plus its anchor; got:\n{root_out}"
     );
 
     // Issue an invitee cap and walk that chain.
@@ -441,6 +444,7 @@ fn show_walks_chain_end_to_end() {
 
     let show_chain = Command::cargo_bin("trible")
         .unwrap()
+        .env_remove("TRIBLE_TEAM_ROOT")
         .args([
             "team",
             "show",
@@ -452,10 +456,12 @@ fn show_walks_chain_end_to_end() {
         .assert()
         .success();
     let chain_out = String::from_utf8(show_chain.get_output().stdout.clone()).unwrap();
-    // Both levels.
+    // All three levels.
     assert!(
-        chain_out.contains("level 0:") && chain_out.contains("level 1:"),
-        "invitee show walks two levels; got:\n{chain_out}"
+        chain_out.contains("level 0:")
+            && chain_out.contains("level 1:")
+            && chain_out.contains("level 2:"),
+        "invitee show walks two finite links plus the founder anchor; got:\n{chain_out}"
     );
     // Level 0 is the invitee cap (PERM_READ), level 1 is the
     // founder cap (PERM_ADMIN).
@@ -463,23 +469,23 @@ fn show_walks_chain_end_to_end() {
         chain_out.contains("PERM_READ") && chain_out.contains("PERM_ADMIN"),
         "invitee show shows both PERM_READ and PERM_ADMIN; got:\n{chain_out}"
     );
-    // Level 1's sig is embedded in the leaf sig blob now (sig-blob
-    // chain proof), and the chain still bottoms out at root.
+    // Parent proofs are embedded in the leaf sig blob and the chain still
+    // bottoms out at the explicit root-signed founder anchor.
     assert!(
         chain_out.contains("embedded proof") || chain_out.contains("chained from parent"),
-        "level 1 marks its sig as embedded; got:\n{chain_out}"
+        "parent links are rendered as embedded proofs; got:\n{chain_out}"
     );
-    // Level 1 should also be flagged as root.
     assert!(
-        chain_out.contains("root link"),
-        "chain bottoms out at root link; got:\n{chain_out}"
+        chain_out.contains("founder anchor (rotation authority; not an auth credential)")
+            && chain_out.contains("root link"),
+        "chain bottoms out at the explicit founder-anchor root link; got:\n{chain_out}"
     );
     // signer-matches-issuer ✓ should appear at every level —
-    // 2 occurrences for the length-2 chain.
+    // 3 occurrences for the length-3 chain.
     let check_count = chain_out.matches("signer matches cap_issuer: ✓").count();
     assert_eq!(
-        check_count, 2,
-        "signer ✓ appears at each level (length-2 → 2 ticks); got:\n{chain_out}"
+        check_count, 3,
+        "signer ✓ appears at each level (length-3 → 3 ticks); got:\n{chain_out}"
     );
 }
 

@@ -105,8 +105,8 @@ fn fetch_blob_pulls_from_the_holder() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         // A announces its blobs to the DHT via refresh's diff-and-announce;
         // settle the mesh (neighbor-up + announce).
@@ -128,6 +128,70 @@ fn fetch_blob_pulls_from_the_holder() {
             blake3::hash(&got).as_bytes(),
             &hash,
             "fetched bytes must hash to the requested content id"
+        );
+    });
+}
+
+/// A serving peer may be cold for the connecting peer's credential. It must
+/// authenticate the connection by fetching that exact sig+cap pair back from
+/// the dialer, using its own already-known credential for the reverse
+/// connection, rather than requiring every peer to preseed every member cap.
+#[test]
+fn cold_server_authenticates_without_persisting_remote_proof() {
+    let _g = sim_guard();
+    run_paused(0xC01D_A071, async {
+        let net = SimNet::new(0xC01D_A071, SimConfig::default());
+        let root = key(0xF4);
+        let holder_key = key(0xA4);
+        let client_key = key(0xB4);
+        let team_root = root.verifying_key();
+        let holder_cap = admin_cap(&root, &holder_key);
+        let client_cap = admin_cap(&root, &client_key);
+
+        let (blob, hash) = content_blob(0x44);
+        // The holder deliberately lacks the client's cap chain. The client
+        // knows both credentials so it can authenticate the reverse exact-load
+        // connection from the holder.
+        let mut holder_store = store_with_caps(&[holder_cap.clone()]);
+        holder_store.put::<SimpleArchive, _>(blob).unwrap();
+        let client_store = store_with_caps(&[holder_cap.clone(), client_cap.clone()]);
+
+        let mut holder = bring_up(
+            &net,
+            &holder_key,
+            holder_store,
+            team_root,
+            self_cap_of(&holder_cap.1),
+        );
+        let client = bring_up(
+            &net,
+            &client_key,
+            client_store,
+            team_root,
+            self_cap_of(&client_cap.1),
+        );
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            holder.refresh().unwrap();
+        }
+
+        let got = drive_future(client.fetch_blob(hash), || holder.refresh().unwrap(), 160)
+            .await
+            .flatten()
+            .expect("cold holder must complete client auth and serve the blob");
+        assert_eq!(blake3::hash(&got).as_bytes(), &hash);
+
+        // Remote OP_AUTH proofs are deliberately connection-local: otherwise
+        // a valid subject could grow the server's durable store by presenting
+        // an unbounded sequence of self-delegated credentials.
+        holder.refresh().unwrap();
+        let reader = holder.reader().unwrap();
+        let client_sig = self_cap_of(&client_cap.1);
+        assert!(
+            BlobStoreGet::get::<TribleSet, SimpleArchive>(&reader, Inline::new(client_sig))
+                .is_err(),
+            "a verified remote auth proof must not become durable local state"
         );
     });
 }
@@ -156,9 +220,9 @@ fn lazy_read_lands_weak_pinned_in_store() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
         // B is a lazy node: no eager content.
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -247,8 +311,8 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         }
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -353,8 +417,8 @@ fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -421,8 +485,8 @@ fn transparent_async_get_fetches_through_reader() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -490,14 +554,14 @@ fn fetch_blob_unavailable_is_clean() {
         let cap_a = admin_cap(&root, &ka);
 
         let store_a = store_with_caps(&[cap_a.clone()]);
-        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
 
         let (_blob, hash) = content_blob(0x99);
         // The DHT fallback has a 3s internal timeout; give the sim
         // enough virtual steps to cross it, then expect a None reply.
         // No-op on_step: the inline fetch borrows `peer_a`, and stepping
         // alone advances virtual time across the timeout (no refresh
-        // needed — there's nothing to gossip to here anyway).
+        // needed — there are no other peers to refresh here anyway).
         let reply = drive_future(peer_a.fetch_blob(hash), || {}, 400)
             .await
             .flatten();
@@ -506,157 +570,6 @@ fn fetch_blob_unavailable_is_clean() {
             "unavailable fetch must resolve to None, got {:?} bytes",
             reply.map(|b| b.len())
         );
-    });
-}
-
-/// Publisher-first shortcut for read-miss fetches. Gossip already told
-/// B who publishes, so the on-demand fetch must consult that knowledge
-/// instead of always paying the DHT lookup. Proven under a BLACK-HOLE
-/// DHT: previously the on-demand path passed our own id as publisher,
-/// so the publisher-first path never fired — this fetch
-/// resolved Unavailable despite a reachable publisher one gossip hop
-/// away. Now the gossip-known publisher serves it directly, no DHT.
-#[test]
-fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
-    use triblespace_core::blob::encodings::longstring::LongString;
-    use triblespace_core::id::Id;
-
-    let _g = sim_guard();
-    run_paused(0x60B1_0001, async {
-        let net = SimNet::new(
-            0x60B1_0001,
-            SimConfig {
-                dht: DhtMode::Blackhole,
-                ..SimConfig::default()
-            },
-        );
-        let root = key(0xF0);
-        let ka = key(0xA0);
-        let kb = key(0xB0);
-        let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
-
-        // A holds a legacy mutable pin with the old metadata schema (so it
-        // gossips a HEAD — that's how B learns A is a publisher) plus an ORPHAN
-        // content blob outside the hinted subgraph, so the eager tracking walk
-        // cannot land the fetch target at B behind the test's back.
-        let (orphan_blob, orphan_hash) = content_blob(0x32);
-        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
-        let branch_id = Id::new([0x77; 16]).unwrap();
-        let branch_name: Inline<Handle<LongString>> = store_a
-            .put("main".to_owned().to_blob())
-            .expect("store legacy pin name");
-        let branch_blob =
-            triblespace_core::repo::branch::branch_unsigned(branch_id, branch_name, None).to_blob();
-        store_a
-            .put::<SimpleArchive, _>(branch_blob.clone())
-            .unwrap();
-        store_a
-            .put::<SimpleArchive, _>(orphan_blob.clone())
-            .unwrap();
-        store_a
-            .update(branch_id, None, Some(branch_blob.get_handle()))
-            .unwrap();
-        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
-
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
-
-        // Settle: A's refresh gossips the legacy HEAD; B's host notes A
-        // as a known publisher when the frame arrives.
-        for _ in 0..60u32 {
-            SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh().unwrap();
-        }
-        assert!(
-            peer_b.try_local(orphan_hash).is_none(),
-            "precondition: the orphan blob never rode the eager walk to B"
-        );
-
-        // The DHT is dark, so the ONLY way this fetch can succeed is
-        // the gossip-known-publisher shortcut.
-        let got = drive_future(
-            peer_b.fetch_blob(orphan_hash),
-            || peer_a.refresh().unwrap(),
-            200,
-        )
-        .await
-        .flatten()
-        .expect("gossip-known publisher must serve the read-miss fetch without the DHT");
-        assert_eq!(blake3::hash(&got).as_bytes(), &orphan_hash);
-    });
-}
-
-/// A gossip routing hint is not authoritative availability. If the hinted
-/// publisher does not hold an unrelated requested blob, its clean miss must
-/// fall through to the DHT instead of suppressing an honest holder.
-#[test]
-fn lazy_fetch_falls_through_stale_gossip_publisher() {
-    use triblespace_core::blob::encodings::longstring::LongString;
-    use triblespace_core::id::Id;
-
-    let _g = sim_guard();
-    run_paused(0x57A1_E001, async {
-        let net = SimNet::new(0x57A1_E001, SimConfig::default());
-        let root = key(0xE0);
-        let ka = key(0xA0);
-        let kb = key(0xB0);
-        let kc = key(0xC0);
-        let team_root = root.verifying_key();
-        let cap_a = admin_cap(&root, &ka);
-        let cap_b = admin_cap(&root, &kb);
-        let cap_c = admin_cap(&root, &kc);
-        let all = [cap_a.clone(), cap_b.clone(), cap_c.clone()];
-
-        // A gossips a real legacy pin, making it B's most recent routing hint,
-        // but deliberately does not hold the target blob.
-        let mut store_a = store_with_caps(&all);
-        let branch_id = Id::new([0x67; 16]).unwrap();
-        let branch_name: Inline<Handle<LongString>> = store_a
-            .put("stale-hint".to_owned().to_blob())
-            .expect("store legacy pin name");
-        let branch_blob =
-            triblespace_core::repo::branch::branch_unsigned(branch_id, branch_name, None).to_blob();
-        store_a
-            .put::<SimpleArchive, _>(branch_blob.clone())
-            .unwrap();
-        store_a
-            .update(branch_id, None, Some(branch_blob.get_handle()))
-            .unwrap();
-
-        let (target_blob, target_hash) = content_blob(0x68);
-        let mut store_c = store_with_caps(&all);
-        store_c
-            .put::<SimpleArchive, _>(target_blob.clone())
-            .unwrap();
-        let store_b = store_with_caps(&all);
-
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
-        // C advertises content through the DHT but does not contribute a gossip
-        // publisher hint, keeping A first in B's on-demand route.
-        let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1), false);
-
-        for _ in 0..60u32 {
-            SimNet::step(&vclock(), Duration::from_millis(20)).await;
-            peer_a.refresh().unwrap();
-            peer_c.refresh().unwrap();
-        }
-        assert!(peer_b.try_local(target_hash).is_none());
-
-        let got = drive_future(
-            peer_b.fetch_blob(target_hash),
-            || {
-                peer_a.refresh().unwrap();
-                peer_c.refresh().unwrap();
-            },
-            400,
-        )
-        .await
-        .flatten()
-        .expect("stale publisher miss must fall through to the DHT holder");
-        assert_eq!(blake3::hash(&got).as_bytes(), &target_hash);
     });
 }
 
@@ -683,7 +596,7 @@ fn fetch_deadline_bounds_unavailable_resolution() {
         let cap_a = admin_cap(&root, &ka);
 
         let store_a = store_with_caps(&[cap_a.clone()]);
-        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
         let _ = net; // keep the sim alive for the fetch
 
         let (_blob, hash) = content_blob(0x9A);
@@ -727,8 +640,8 @@ fn lazy_read_unavailable_under_partition_then_heals() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -786,8 +699,8 @@ fn lazy_read_unavailable_under_crash_then_revives() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -832,8 +745,8 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -903,8 +816,8 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
             store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
             let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-            let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-            let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+            let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+            let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
             for _ in 0..40u32 {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -990,9 +903,9 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
         store_c.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&all);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1));
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..50u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1040,8 +953,8 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1090,8 +1003,8 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1177,8 +1090,8 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1271,9 +1184,8 @@ fn lazy_fetch_succeeds_across_many_seeds() {
 /// record for a blob the node doesn't hold; the sync daemon's reconcile
 /// tick notices the want, fetches the blob from whoever holds it, and
 /// lands it under the existing weak pin. Strong pins are never touched,
-/// on either side. B runs WITHOUT gossip so the only path the content
-/// can take is the reconcile-driven swarm fetch — no eager branch sync
-/// can satisfy the want behind the test's back.
+/// on either side. The only path the content can take is the
+/// reconcile-driven DHT fetch.
 #[test]
 fn reconcile_tick_services_out_of_band_want() {
     use triblespace_core::id::Id;
@@ -1300,9 +1212,9 @@ fn reconcile_tick_services_out_of_band_want() {
             .unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        // B: no gossip — a pure leecher; only the want-reconcile fetches.
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), false);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        // B is a pure leecher; only the want-reconcile fetches.
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -1397,7 +1309,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let cap_a = admin_cap(&root, &ka);
 
         let store_a = store_with_caps(&[cap_a.clone()]);
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
 
         // A want for content nobody holds (an arbitrary content id).
         let hash = *blake3::hash(b"nobody holds this blob").as_bytes();
@@ -1451,24 +1363,4 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         assert_eq!(weak, vec![Inline::<Handle<UnknownBlob>>::new(hash)]);
         assert!(peer_a.try_local(hash).is_none());
     });
-}
-
-/// The content layer is decoupled from the gossip layer. Under **total
-/// gossip loss** the branch-sync/announce mesh is dark — but the lazy
-/// read uses the DHT (a global provider record) plus a direct authed
-/// dial, neither of which is gossip, so it must still succeed. A
-/// regression that accidentally routed content discovery through gossip
-/// would fail here.
-#[test]
-fn lazy_fetch_is_independent_of_gossip_liveness() {
-    let _g = sim_guard();
-    let config = SimConfig {
-        gossip_drop_prob: 1.0,
-        ..SimConfig::default()
-    };
-    let (got, steps) = run_lazy_fetch(0x6055_1055, config);
-    assert!(
-        got.is_some(),
-        "lazy fetch must succeed despite total gossip loss (gave up after {steps} steps)"
-    );
 }

@@ -9,41 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `Peer` forwards the wrapped store's signed-assertion, flush, and partial
-  commit-DAG capabilities so local StrongPin repository work remains usable
-  through the network wrapper. Legacy tracking pins can feed an explicit
-  caller-controlled local merge and authored assertion, but the sync loop does
-  not adopt them automatically and scalar HEAD gossip is not presented as
-  signed assertion replication. Tracking identity is scoped by both remote id
-  and publisher hint so two publishers cannot overwrite one local observation.
-- Legacy HEAD hint walks are generation-gated per `(remote pin, publisher)`:
-  an older success cannot regress a newer observation, and an older failure
-  cannot resurrect its retry. Exact rebroadcasts coalesce without renewing
-  their fixed lease; retry keys, attempts, concurrent walks, provider fan-out,
-  wall time, fetched blobs, and fetched bytes are all bounded.
-- Publisher hints are attempted first but fall through to distinct DHT
-  providers. `OP_CHILDREN` is an untrusted store-relative batching hint, not a
-  global-closure proof: accepted hashes must occur in verified parent bytes,
-  fetched children are hash-checked, total response failure retries, and an
-  unavailable individual hint remains non-authoritative. Verified blobs stream
-  into the local event ledger immediately, so an interrupted bounded slice
-  leaves monotone progress while its HEAD remains completion/generation-gated.
-- `GET_BLOB` rejects a declared response above the protocol's explicit 256 MiB
-  transport ceiling before allocating, while `CHILDREN` accepts at most 65,536
-  hashes. These are network resource bounds, not TribleSpace blob-format
-  invariants; larger local blobs remain valid.
-- Network ingestion is fail-stop on persistence errors. A failed fetched-blob
-  write becomes a sticky `PeerRefreshError`; no later tracking HEAD event is
-  applied past it, and bounded CLI sync reports the error after closing the
-  underlying pile.
-- Protocol v4 now enforces `OP_AUTH` as the literal first stream on a
-  connection and rejects later re-authentication. `WriteOnly` peers discard
-  incoming blobs and legacy HEADs while still processing capability control
-  events, and only positively identified legacy pin-metadata blobs are
-  eligible for HEAD gossip; generic local pins never become transport roots.
-- Tracking metadata no longer copies the unauthenticated remote `updated_at`
-  annotation. Remote ordering is determined by locally observed generations,
-  not a publisher-carried timestamp.
+- **The network surface now matches the StrongPin boundary.** Scalar mutable-
+  HEAD gossip, local tracking materialization, publisher-hint state, legacy
+  direction modes, and `OP_CHILDREN` are deleted. Pile-sync v5
+  (`/triblespace/pile-sync/5`) accepts mandatory first-stream `OP_AUTH` followed
+  only by scope-gated `OP_GET_BLOB`. DHT content announcements and lazy
+  weak-want fetching remain. Signed `BranchAssertion` replication is explicitly
+  not implemented yet; `Peer` merely forwards the wrapped store's assertion and
+  partial-DAG traits for local repository use.
+- **Capability verification is exact and live.** Parent chain links and the
+  embedded recursive proof live in the sig blob, while cap blobs remain pure
+  declarations. `MissingBlob` carries the exact typed handle, the 32-level
+  limit includes the leaf, every parent subject must match its child issuer,
+  every proof entity has its canonical intrinsic four-fact id, the sig proof
+  has one exact linear shape, scope subsumption also constrains restricted
+  admins, and verified authority expires at the earliest deadline in the
+  chain. Every post-auth operation rechecks that effective expiry after its
+  complete request frame.
+- **Founder authority is an explicit non-expiring anchor, not a maximum-expiry
+  operational cap.** The root signs one tagged root-to-founder
+  `FounderAnchor`, which is accepted only as the proof terminator and never as
+  an `OP_AUTH` leaf. Founder operational renewals are finite siblings under the
+  retained anchor, keeping rotation at constant depth. The durable team-cap pin
+  is authoritative and atomically keeps the current operational pair plus
+  founder rotation authority. An expired but otherwise exact pinned chain may
+  start recovery-only services, with outbound auth and ordinary authorized work
+  disabled until a fresh sibling or authorized renewal is selected; malformed,
+  wrong-root, bad-signature, and wrong-subject state still fails startup.
+- **Auth-handshake v2 has three bounded one-shot operations:** capability
+  request, capability delivery, and exact proof-member fetch. Proof locators
+  are public content locators rather than secrets; a server returns a member
+  only after fully verifying its local copy of the named leaf chain and proving
+  the requested handle was touched. Cold `OP_AUTH` proof members remain
+  connection-local. A delivered leaf pair and verified parent bundle enter the
+  bounded policy queue as one event and become active only after the complete
+  selected bundle is stored.
+- **Capability policy is bounded and locally selected.** Request, delivery, and
+  confirmation queues have independent limits. The pending map holds at most
+  1,024 requesters and one outstanding `Pending` payload per requester until
+  local approval or rejection. `team request-join` now requires `--pile` and
+  durably records the outbound partial request before sending. Initial delivery
+  must match that intent. Its exact request head enters a durable `Activating`
+  journal only after the proof bundle is flushed; credential activation is
+  flushed before that journal is cleared, and startup completes interrupted
+  transitions without consuming a concurrent replacement request. Later
+  selection is monotone in issuer, scope, and effective expiry, with expiry
+  rechecked when the queued event is applied. Founder renewal reconciles its
+  verified active `(subject, scope)` to the unique non-retracted self-policy
+  before issuing, records the chain-effective deadline, and completes the
+  local delivery marker only after coherent proof serving and outbound-auth
+  publication. Wire `STATUS_OK` acknowledges queue admission, not durable
+  policy acceptance.
+- **Serving resources fail closed.** Unauthenticated work, authenticated
+  connections, and post-auth streams are globally bounded; each subject may
+  hold at most one live inbound pile-sync connection, including while admitted
+  stream tails drain. A monotonic connection-lifetime deadline releases idle
+  expired authority. `GET_BLOB` enforces its 256 MiB transport ceiling at both
+  endpoints. A failed snapshot rebuild clears the old serving view rather than
+  retaining stale authorization state.
 
 ## [0.41.4] - 2026-05-17
 
