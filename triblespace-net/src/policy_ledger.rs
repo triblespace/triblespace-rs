@@ -999,7 +999,10 @@ where
         missing.insert(handle);
         return None;
     };
-    let actual = blob.get_handle();
+    // This callback is a public trust boundary. Do not trust `Blob`'s cached
+    // handle: `Blob::with_handle` exists for already-verified store reads and
+    // a custom fetcher can otherwise pair arbitrary bytes with `handle`.
+    let actual: Inline<Handle<SimpleArchive>> = Inline::new(Blake3::digest(&blob.bytes));
     if actual != handle {
         diagnostics.push(PolicyLedgerDiagnostic::HandleMismatch {
             expected: handle,
@@ -1475,12 +1478,12 @@ mod tests {
 
         let result =
             resolve_policy_ledger(&snapshot, fixture.author.verifying_key(), |requested| {
-                let actual = if requested == claimed_sig {
-                    real_sig
+                if requested == claimed_sig {
+                    let real = fixture.blobs.get(&real_sig).unwrap();
+                    Some(Blob::with_handle(real.bytes.clone(), claimed_sig))
                 } else {
-                    requested
-                };
-                fixture.blobs.get(&actual).cloned()
+                    fixture.blobs.get(&requested).cloned()
+                }
             });
         let PolicyLedgerResolution::Invalid { diagnostics } = result else {
             panic!("content returned under the wrong handle must fail closed");
