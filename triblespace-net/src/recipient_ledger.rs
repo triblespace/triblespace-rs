@@ -22,6 +22,12 @@
 //! the caller-supplied trust anchor. A delivery must check that root; it must
 //! never teach or replace the requested authority domain.
 //!
+//! Recipient decisions follow the [durable ordering law](wiki:1506AFC4A33E0D5AB64CC59E22610F2D): `IntentDeclared`,
+//! `CredentialAccepted`, and `FounderGrantSelected` all license future network
+//! or host effects, so their durable publication precedes those effects. An
+//! acceptance also witnesses delivery, but its licensing role governs. The
+//! publication receipt is never authority; callers fresh-resolve before acting.
+//!
 //! The descriptor, attribute, and event-kind ids in this module were freshly
 //! minted with `trible genid` on 2026-08-02. The descriptor marker is
 //! `F61842DC6DE1737A423C682D96894D41`; the new `effect_parent` attribute is
@@ -57,7 +63,9 @@ use triblespace_core::repo::{BlobStore, BlobStoreGet, StorageFlush};
 use triblespace_core::trible::{Fragment, TribleSet};
 
 use crate::policy_ledger::{
-    policy_credential_sig, policy_scope, policy_team_root, request_partial_cap,
+    GrantIdentity, GrantIssuanceResolution, PolicyLedgerDiagnostic, PolicyLedgerResolution,
+    PolicyLedgerView, policy_credential_sig, policy_scope, policy_team_root, request_partial_cap,
+    resolve_policy_ledger,
 };
 
 triblespace_core::prelude::attributes! {
@@ -443,6 +451,68 @@ impl RecipientEventReceipt {
     }
 }
 
+/// Typed result of one semantic recipient-ledger write attempt.
+#[derive(Debug)]
+pub enum RecipientWriteOutcome<R> {
+    Published(RecipientEventReceipt),
+    Refused(R),
+}
+
+/// Ordinary semantic reason a request intent was not declared.
+#[derive(Debug)]
+pub enum DeclareIntentRefusal {
+    InvalidClaim(Box<VerifyError>),
+    SubjectMismatch { declared: VerifyingKey },
+    AcceptedIntent { event: RecipientEventHandle },
+    AcceptanceRace { intent: RecipientEventHandle },
+    FrontierChanged,
+}
+
+/// Ordinary semantic reason an intent was not canceled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelIntentRefusal {
+    UnknownIntent,
+    WrongKind { actual: RecipientEventKind },
+    NotCurrentFrontier,
+    AcceptedIntent,
+    AcceptanceRace,
+    FrontierChanged,
+}
+
+/// Ordinary semantic reason a delivered credential was not accepted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AcceptCredentialRefusal {
+    NoPendingIntent,
+    AmbiguousPendingIntents { count: usize },
+    Expired { expires_at: Epoch },
+    IntentRace { intent: RecipientEventHandle },
+    CredentialFrontierChanged,
+}
+
+/// Ordinary semantic reason a founder grant was not selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectFounderGrantRefusal {
+    PolicyGrantMissing { grant: GrantIdentity },
+    PolicyGrantDisabled { grant: GrantIdentity },
+    PolicyGrantUnissued { grant: GrantIdentity },
+    PolicyGrantConflicted { grant: GrantIdentity },
+    FrontierChanged,
+}
+
+enum RecipientEventPublication<R> {
+    Published(RecipientEventReceipt),
+    Refused(R),
+}
+
+impl<R> From<RecipientEventPublication<R>> for RecipientWriteOutcome<R> {
+    fn from(value: RecipientEventPublication<R>) -> Self {
+        match value {
+            RecipientEventPublication::Published(receipt) => Self::Published(receipt),
+            RecipientEventPublication::Refused(reason) => Self::Refused(reason),
+        }
+    }
+}
+
 /// Failure to validate or durably publish one recipient event.
 #[derive(Debug)]
 pub enum RecipientLedgerWriteError {
@@ -453,12 +523,22 @@ pub enum RecipientLedgerWriteError {
         handle: Inline<Handle<SimpleArchive>>,
         source: RecipientStorageError,
     },
+    PolicyRead {
+        handle: Inline<Handle<SimpleArchive>>,
+        source: RecipientStorageError,
+    },
     Incomplete {
         missing: Vec<Inline<Handle<SimpleArchive>>>,
         unknown_parents: Vec<RecipientEventHandle>,
     },
     Invalid {
         diagnostics: Vec<RecipientLedgerDiagnostic>,
+    },
+    PolicyIncomplete {
+        missing: Vec<Inline<Handle<SimpleArchive>>>,
+    },
+    PolicyInvalid {
+        diagnostics: Vec<PolicyLedgerDiagnostic>,
     },
     PostconditionFailed {
         event: RecipientEventHandle,
@@ -500,6 +580,9 @@ impl fmt::Display for RecipientLedgerWriteError {
             Self::Read { handle, source } => {
                 write!(f, "failed to read recipient blob {handle:?}: {source}")
             }
+            Self::PolicyRead { handle, source } => {
+                write!(f, "failed to read policy blob {handle:?}: {source}")
+            }
             Self::Incomplete {
                 missing,
                 unknown_parents,
@@ -512,6 +595,16 @@ impl fmt::Display for RecipientLedgerWriteError {
             Self::Invalid { diagnostics } => write!(
                 f,
                 "prospective recipient ledger is invalid ({} diagnostics)",
+                diagnostics.len()
+            ),
+            Self::PolicyIncomplete { missing } => write!(
+                f,
+                "founder policy ledger is incomplete ({} missing blobs)",
+                missing.len()
+            ),
+            Self::PolicyInvalid { diagnostics } => write!(
+                f,
+                "founder policy ledger is invalid ({} diagnostics)",
                 diagnostics.len()
             ),
             Self::PostconditionFailed { event } => write!(
@@ -553,11 +646,14 @@ impl Error for RecipientLedgerWriteError {
             | Self::Flush(error)
             | Self::Append(error) => Some(error.as_ref()),
             Self::Read { source, .. }
+            | Self::PolicyRead { source, .. }
             | Self::Put { source, .. }
             | Self::VerifyStored { source, .. } => Some(source.as_ref()),
             Self::SnapshotCollision(error) => Some(error),
             Self::Incomplete { .. }
             | Self::Invalid { .. }
+            | Self::PolicyIncomplete { .. }
+            | Self::PolicyInvalid { .. }
             | Self::PostconditionFailed { .. }
             | Self::PutHandleMismatch { .. }
             | Self::StoredContentMismatch { .. } => None,
@@ -592,6 +688,32 @@ where
     S: BlobStore + StorageFlush + PinAssertionStore,
     I: IntoIterator<Item = Blob<SimpleArchive>>,
 {
+    match append_validated_recipient_event_if(store, author, event, closure, |_| {
+        Ok::<(), std::convert::Infallible>(())
+    })? {
+        RecipientEventPublication::Published(receipt) => Ok(receipt),
+        RecipientEventPublication::Refused(never) => match never {},
+    }
+}
+
+/// Shared prospective validation and durable publication mechanism.
+///
+/// `admit` observes the complete prospective view before mutation. It is not
+/// called for an exact already-asserted replay, which is always admitted as a
+/// durability repair. `Ok(())` admits a new event, and `Err(reason)` is an
+/// ordinary typed semantic refusal.
+fn append_validated_recipient_event_if<S, I, P, R>(
+    store: &mut S,
+    author: &SigningKey,
+    event: RecipientEvent,
+    closure: I,
+    admit: P,
+) -> Result<RecipientEventPublication<R>, RecipientLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+    I: IntoIterator<Item = Blob<SimpleArchive>>,
+    P: FnOnce(&RecipientLedgerView) -> Result<(), R>,
+{
     let event_blob = RecipientEvent::to_blob(&event);
     let event_handle = event_blob.get_handle();
     let assertion = sign_recipient_event(author, &event);
@@ -622,25 +744,12 @@ where
         .reader()
         .map_err(|error| RecipientLedgerWriteError::Reader(Box::new(error)))?;
 
-    // BlobStoreGet exposes no portable NotFound discriminator. Preserve the
-    // first raw read failure instead of guessing that it means semantic
-    // absence; supplied overlay members remain available prospectively.
-    let mut read_error = None;
-    let resolution = resolve_recipient_ledger(&snapshot, author.verifying_key(), |handle| {
-        if let Some(blob) = overlay.get(&handle) {
-            return Some(blob.clone());
-        }
-        if read_error.is_some() {
-            return None;
-        }
-        match reader.get::<Blob<SimpleArchive>, SimpleArchive>(handle) {
-            Ok(blob) => Some(blob),
-            Err(error) => {
-                read_error = Some((handle, Box::new(error) as RecipientStorageError));
-                None
-            }
-        }
-    });
+    let view = resolve_complete_recipient_with_reader(
+        &snapshot,
+        author.verifying_key(),
+        &reader,
+        &overlay,
+    );
 
     // A replicated assertion may precede its content. Elide all puts only if
     // this exact assertion already exists and every supplied member plus both
@@ -653,28 +762,17 @@ where
         && verify_stored_recipient_blob(&reader, "strong descriptor", &outer).is_ok();
     drop(reader);
 
-    if let Some((handle, source)) = read_error {
-        return Err(RecipientLedgerWriteError::Read { handle, source });
+    let view = view?;
+    if !view.event_handles().contains(&event_handle) {
+        return Err(RecipientLedgerWriteError::PostconditionFailed {
+            event: event_handle,
+        });
     }
-    match resolution {
-        RecipientLedgerResolution::Complete(view)
-            if view.event_handles().contains(&event_handle) => {}
-        RecipientLedgerResolution::Complete(_) => {
-            return Err(RecipientLedgerWriteError::PostconditionFailed {
-                event: event_handle,
-            });
-        }
-        RecipientLedgerResolution::Incomplete {
-            missing,
-            unknown_parents,
-        } => {
-            return Err(RecipientLedgerWriteError::Incomplete {
-                missing,
-                unknown_parents,
-            });
-        }
-        RecipientLedgerResolution::Invalid { diagnostics } => {
-            return Err(RecipientLedgerWriteError::Invalid { diagnostics });
+
+    if !already_asserted {
+        match admit(&view) {
+            Ok(()) => {}
+            Err(reason) => return Ok(RecipientEventPublication::Refused(reason)),
         }
     }
 
@@ -684,10 +782,12 @@ where
         store
             .flush()
             .map_err(|error| RecipientLedgerWriteError::Flush(Box::new(error)))?;
-        return Ok(RecipientEventReceipt {
-            event: event_handle,
-            assertion: assertion.id(),
-        });
+        return Ok(RecipientEventPublication::Published(
+            RecipientEventReceipt {
+                event: event_handle,
+                assertion: assertion.id(),
+            },
+        ));
     }
 
     for (handle, blob) in &overlay {
@@ -751,10 +851,12 @@ where
             .map_err(|error| RecipientLedgerWriteError::Append(Box::new(error)))?;
     }
 
-    Ok(RecipientEventReceipt {
-        event: event_handle,
-        assertion: assertion.id(),
-    })
+    Ok(RecipientEventPublication::Published(
+        RecipientEventReceipt {
+            event: event_handle,
+            assertion: assertion.id(),
+        },
+    ))
 }
 
 fn require_recipient_stored_handle(
@@ -797,6 +899,512 @@ where
         });
     }
     Ok(())
+}
+
+fn resolve_complete_recipient_with_reader<R>(
+    snapshot: &PinAssertionSnapshot,
+    author: VerifyingKey,
+    reader: &R,
+    overlay: &BTreeMap<Inline<Handle<SimpleArchive>>, Blob<SimpleArchive>>,
+) -> Result<RecipientLedgerView, RecipientLedgerWriteError>
+where
+    R: BlobStoreGet,
+{
+    // BlobStoreGet exposes no portable NotFound discriminator. Preserve the
+    // first raw read failure instead of guessing semantic absence.
+    let mut read_error = None;
+    let resolution = resolve_recipient_ledger(snapshot, author, |handle| {
+        if let Some(blob) = overlay.get(&handle) {
+            return Some(blob.clone());
+        }
+        if read_error.is_some() {
+            return None;
+        }
+        match reader.get::<Blob<SimpleArchive>, SimpleArchive>(handle) {
+            Ok(blob) => Some(blob),
+            Err(error) => {
+                read_error = Some((handle, Box::new(error) as RecipientStorageError));
+                None
+            }
+        }
+    });
+    if let Some((handle, source)) = read_error {
+        return Err(RecipientLedgerWriteError::Read { handle, source });
+    }
+    match resolution {
+        RecipientLedgerResolution::Complete(view) => Ok(view),
+        RecipientLedgerResolution::Incomplete {
+            missing,
+            unknown_parents,
+        } => Err(RecipientLedgerWriteError::Incomplete {
+            missing,
+            unknown_parents,
+        }),
+        RecipientLedgerResolution::Invalid { diagnostics } => {
+            Err(RecipientLedgerWriteError::Invalid { diagnostics })
+        }
+    }
+}
+
+fn load_complete_recipient_view<S>(
+    store: &mut S,
+    author: VerifyingKey,
+    overlay: &BTreeMap<Inline<Handle<SimpleArchive>>, Blob<SimpleArchive>>,
+) -> Result<RecipientLedgerView, RecipientLedgerWriteError>
+where
+    S: BlobStore + PinAssertionStore,
+{
+    let snapshot = store
+        .pin_assertion_snapshot()
+        .map_err(|error| RecipientLedgerWriteError::Snapshot(Box::new(error)))?;
+    let reader = store
+        .reader()
+        .map_err(|error| RecipientLedgerWriteError::Reader(Box::new(error)))?;
+    let result = resolve_complete_recipient_with_reader(&snapshot, author, &reader, overlay);
+    drop(reader);
+    result
+}
+
+fn load_complete_policy_view<S>(
+    store: &mut S,
+    author: VerifyingKey,
+) -> Result<PolicyLedgerView, RecipientLedgerWriteError>
+where
+    S: BlobStore + PinAssertionStore,
+{
+    let snapshot = store
+        .pin_assertion_snapshot()
+        .map_err(|error| RecipientLedgerWriteError::Snapshot(Box::new(error)))?;
+    let reader = store
+        .reader()
+        .map_err(|error| RecipientLedgerWriteError::Reader(Box::new(error)))?;
+    let mut read_error = None;
+    let resolution = resolve_policy_ledger(&snapshot, author, |handle| {
+        if read_error.is_some() {
+            return None;
+        }
+        match reader.get::<Blob<SimpleArchive>, SimpleArchive>(handle) {
+            Ok(blob) => Some(blob),
+            Err(error) => {
+                read_error = Some((handle, Box::new(error) as RecipientStorageError));
+                None
+            }
+        }
+    });
+    drop(reader);
+    if let Some((handle, source)) = read_error {
+        return Err(RecipientLedgerWriteError::PolicyRead { handle, source });
+    }
+    match resolution {
+        PolicyLedgerResolution::Complete(view) => Ok(view),
+        PolicyLedgerResolution::Incomplete { missing } => {
+            Err(RecipientLedgerWriteError::PolicyIncomplete { missing })
+        }
+        PolicyLedgerResolution::Invalid { diagnostics } => {
+            Err(RecipientLedgerWriteError::PolicyInvalid { diagnostics })
+        }
+    }
+}
+
+/// Declare or replace this author's request intent for one team.
+///
+/// The returned receipt records a durable decision before any network request
+/// is sent. It is not an operational view; fresh-resolve the recipient ledger
+/// before taking a host or network effect. When the sole current frontier is
+/// the same pending declaration, exact asserted replay repairs its durability;
+/// an accepted current intent is refused instead.
+pub fn declare_intent<S>(
+    store: &mut S,
+    author: &SigningKey,
+    team_root: VerifyingKey,
+    partial_cap: Blob<SimpleArchive>,
+) -> Result<RecipientWriteOutcome<DeclareIntentRefusal>, RecipientLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+{
+    let partial_cap = Blob::new(partial_cap.bytes);
+    let partial_handle = partial_cap.get_handle();
+    let claim = match decode_operational_capability(partial_cap.clone()) {
+        Ok(claim) => claim,
+        Err(error) => {
+            return Ok(RecipientWriteOutcome::Refused(
+                DeclareIntentRefusal::InvalidClaim(Box::new(error)),
+            ));
+        }
+    };
+    if claim.subject != author.verifying_key() {
+        return Ok(RecipientWriteOutcome::Refused(
+            DeclareIntentRefusal::SubjectMismatch {
+                declared: claim.subject,
+            },
+        ));
+    }
+
+    let overlay = BTreeMap::from([(partial_handle, partial_cap.clone())]);
+    let base = load_complete_recipient_view(store, author.verifying_key(), &overlay)?;
+    let frontier = base.intent_frontier(team_root);
+    if let Some(accepted) = frontier.and_then(|frontier| {
+        frontier
+            .values()
+            .find(|entry| entry.disposition() == IntentDisposition::Accepted)
+    }) {
+        return Ok(RecipientWriteOutcome::Refused(
+            DeclareIntentRefusal::AcceptedIntent {
+                event: accepted.event(),
+            },
+        ));
+    }
+
+    if let Some(entry) = frontier
+        .filter(|frontier| frontier.len() == 1)
+        .and_then(|frontier| frontier.values().next())
+        .filter(|entry| {
+            entry.disposition() == IntentDisposition::Pending
+                && entry.partial_cap() == partial_handle
+        })
+    {
+        let event = base.event(entry.event()).cloned().ok_or(
+            RecipientLedgerWriteError::PostconditionFailed {
+                event: entry.event(),
+            },
+        )?;
+        return append_validated_recipient_event_if(store, author, event, [partial_cap], |_| {
+            Ok::<(), DeclareIntentRefusal>(())
+        })
+        .map(Into::into);
+    }
+
+    let supersedes = frontier
+        .into_iter()
+        .flat_map(|frontier| frontier.keys().copied())
+        .collect::<BTreeSet<_>>();
+    let base_contested = base.contested_intents().clone();
+    let event = RecipientEvent::IntentDeclared {
+        team_root,
+        partial_cap: partial_handle,
+        supersedes: supersedes.clone(),
+    };
+    let event_handle = event.handle();
+    append_validated_recipient_event_if(store, author, event, [partial_cap], move |view| {
+        if let Some(intent) = supersedes
+            .iter()
+            .find(|intent| {
+                view.contested_intents().contains(*intent) && !base_contested.contains(*intent)
+            })
+            .copied()
+        {
+            return Err(DeclareIntentRefusal::AcceptanceRace { intent });
+        }
+        let sole_pending = view
+            .intent_frontier(team_root)
+            .filter(|frontier| frontier.len() == 1)
+            .and_then(|frontier| frontier.get(&event_handle))
+            .is_some_and(|entry| entry.disposition() == IntentDisposition::Pending);
+        if sole_pending {
+            Ok(())
+        } else {
+            Err(DeclareIntentRefusal::FrontierChanged)
+        }
+    })
+    .map(Into::into)
+}
+
+/// Cancel one exact current pending intent.
+///
+/// Exact replay repairs durability regardless of the intent's later state.
+/// A new cancellation closes replacement and acceptance races in the complete
+/// prospective view before mutating storage.
+pub fn cancel_intent<S>(
+    store: &mut S,
+    author: &SigningKey,
+    intent: RecipientEventHandle,
+) -> Result<RecipientWriteOutcome<CancelIntentRefusal>, RecipientLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+{
+    let overlay = BTreeMap::new();
+    let event = RecipientEvent::IntentCanceled { intent };
+    let assertion = sign_recipient_event(author, &event);
+    let snapshot = store
+        .pin_assertion_snapshot()
+        .map_err(|error| RecipientLedgerWriteError::Snapshot(Box::new(error)))?;
+    if snapshot
+        .for_pin(&RecipientLedgerDescriptor::pin_identity(
+            author.verifying_key(),
+        ))
+        .contains(&assertion)
+    {
+        return append_validated_recipient_event_if(
+            store,
+            author,
+            event,
+            std::iter::empty(),
+            |_| Ok::<(), CancelIntentRefusal>(()),
+        )
+        .map(Into::into);
+    }
+    let reader = store
+        .reader()
+        .map_err(|error| RecipientLedgerWriteError::Reader(Box::new(error)))?;
+    let base = resolve_complete_recipient_with_reader(
+        &snapshot,
+        author.verifying_key(),
+        &reader,
+        &overlay,
+    );
+    drop(reader);
+    let base = base?;
+
+    let team_root = match base.event(intent) {
+        None => {
+            return Ok(RecipientWriteOutcome::Refused(
+                CancelIntentRefusal::UnknownIntent,
+            ));
+        }
+        Some(RecipientEvent::IntentDeclared { team_root, .. }) => *team_root,
+        Some(other) => {
+            return Ok(RecipientWriteOutcome::Refused(
+                CancelIntentRefusal::WrongKind {
+                    actual: other.kind(),
+                },
+            ));
+        }
+    };
+    let Some(entry) = base
+        .intent_frontier(team_root)
+        .and_then(|frontier| frontier.get(&intent))
+    else {
+        return Ok(RecipientWriteOutcome::Refused(
+            CancelIntentRefusal::NotCurrentFrontier,
+        ));
+    };
+    match entry.disposition() {
+        IntentDisposition::Pending => {}
+        IntentDisposition::Accepted => {
+            return Ok(RecipientWriteOutcome::Refused(
+                CancelIntentRefusal::AcceptedIntent,
+            ));
+        }
+        IntentDisposition::Canceled => {
+            return Ok(RecipientWriteOutcome::Refused(
+                CancelIntentRefusal::NotCurrentFrontier,
+            ));
+        }
+    }
+
+    append_validated_recipient_event_if(store, author, event, std::iter::empty(), move |view| {
+        if view.contested_intents().contains(&intent) {
+            return Err(CancelIntentRefusal::AcceptanceRace);
+        }
+        let canceled = view
+            .intent_frontier(team_root)
+            .and_then(|frontier| frontier.get(&intent))
+            .is_some_and(|entry| entry.disposition() == IntentDisposition::Canceled);
+        if canceled {
+            Ok(())
+        } else {
+            Err(CancelIntentRefusal::FrontierChanged)
+        }
+    })
+    .map(Into::into)
+}
+
+/// Accept a delivered credential as the next durable recipient decision.
+///
+/// A new acceptance is published before host activation because it licenses
+/// that future effect, even though it also witnesses delivery. Parents may be
+/// expired, but the new candidate must be live at `now`. Exact same-team
+/// signature replay repairs the original event and bypasses expiry and later
+/// disposition checks. Fresh-resolve after success before activating authority.
+pub fn accept_credential<S, I>(
+    store: &mut S,
+    author: &SigningKey,
+    team_root: VerifyingKey,
+    signature: Blob<SimpleArchive>,
+    closure: I,
+    now: Epoch,
+) -> Result<RecipientWriteOutcome<AcceptCredentialRefusal>, RecipientLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+    I: IntoIterator<Item = Blob<SimpleArchive>>,
+{
+    let signature = Blob::new(signature.bytes);
+    let signature_handle = signature.get_handle();
+    let mut overlay = BTreeMap::new();
+    for blob in closure {
+        let blob = Blob::new(blob.bytes);
+        overlay.insert(blob.get_handle(), blob);
+    }
+    overlay.insert(signature_handle, signature);
+
+    let base = load_complete_recipient_view(store, author.verifying_key(), &overlay)?;
+    let replay = base.event_handles().iter().find_map(|handle| {
+        let event = base.event(*handle)?;
+        matches!(
+            event,
+            RecipientEvent::CredentialAccepted {
+                team_root: event_team,
+                sig,
+                ..
+            } if *event_team == team_root && *sig == signature_handle
+        )
+        .then(|| event.clone())
+    });
+    if let Some(event) = replay {
+        return append_validated_recipient_event_if(
+            store,
+            author,
+            event,
+            overlay.into_values(),
+            |_| Ok::<(), AcceptCredentialRefusal>(()),
+        )
+        .map(Into::into);
+    }
+
+    let (basis, first_intent) = match base
+        .credential(team_root)
+        .and_then(RecipientCredentialResolution::frontier)
+    {
+        Some(frontier) if !frontier.is_empty() => (frontier.clone(), None),
+        _ => {
+            let pending = base.pending_intents_for(team_root);
+            let count = pending.map_or(0, BTreeMap::len);
+            if count == 0 {
+                return Ok(RecipientWriteOutcome::Refused(
+                    AcceptCredentialRefusal::NoPendingIntent,
+                ));
+            }
+            if count != 1 {
+                return Ok(RecipientWriteOutcome::Refused(
+                    AcceptCredentialRefusal::AmbiguousPendingIntents { count },
+                ));
+            }
+            let intent = *pending
+                .and_then(|pending| pending.keys().next())
+                .expect("one pending intent");
+            (BTreeSet::from([intent]), Some(intent))
+        }
+    };
+
+    let event = RecipientEvent::CredentialAccepted {
+        team_root,
+        sig: signature_handle,
+        basis,
+    };
+    let event_handle = event.handle();
+    append_validated_recipient_event_if(store, author, event, overlay.into_values(), move |view| {
+        if let Some(intent) = first_intent
+            && view.contested_intents().contains(&intent)
+        {
+            return Err(AcceptCredentialRefusal::IntentRace { intent });
+        }
+        let Some(RecipientCredentialResolution::Current {
+            credential,
+            frontier,
+        }) = view.credential(team_root)
+        else {
+            return Err(AcceptCredentialRefusal::CredentialFrontierChanged);
+        };
+        if frontier != &BTreeSet::from([event_handle]) || credential.sig() != signature_handle {
+            return Err(AcceptCredentialRefusal::CredentialFrontierChanged);
+        }
+        if !credential.usable_at(now) {
+            return Err(AcceptCredentialRefusal::Expired {
+                expires_at: credential.effective_expiry(),
+            });
+        }
+        Ok(())
+    })
+    .map(Into::into)
+}
+
+/// Select the exact founder grant that future recovery/materialization may use.
+///
+/// A new selection is a record-before-effect decision and requires a fresh
+/// complete local policy view containing the exact enabled historical Current
+/// grant. Expiry is deliberately allowed here because an expired founder grant
+/// remains a recovery/rotation seed; materialization re-resolves and applies
+/// its own liveness gate. Exact replay bypasses policy availability.
+pub fn select_founder_grant<S>(
+    store: &mut S,
+    author: &SigningKey,
+    team_root: VerifyingKey,
+    scope_root: Id,
+) -> Result<RecipientWriteOutcome<SelectFounderGrantRefusal>, RecipientLedgerWriteError>
+where
+    S: BlobStore + StorageFlush + PinAssertionStore,
+{
+    let overlay = BTreeMap::new();
+    let base = load_complete_recipient_view(store, author.verifying_key(), &overlay)?;
+    let frontier = match base.founder_grant(team_root) {
+        None | Some(FounderGrantResolution::Unselected) => BTreeSet::new(),
+        Some(FounderGrantResolution::Current(selection)) => {
+            if selection.scope_root() == scope_root && selection.frontier().len() == 1 {
+                let handle = *selection.frontier().iter().next().expect("one founder tip");
+                let event = base
+                    .event(handle)
+                    .cloned()
+                    .ok_or(RecipientLedgerWriteError::PostconditionFailed { event: handle })?;
+                return append_validated_recipient_event_if(
+                    store,
+                    author,
+                    event,
+                    std::iter::empty(),
+                    |_| Ok::<(), SelectFounderGrantRefusal>(()),
+                )
+                .map(Into::into);
+            }
+            selection.frontier().clone()
+        }
+        Some(FounderGrantResolution::Conflicted { frontier, .. }) => frontier.clone(),
+    };
+
+    let grant = GrantIdentity::new(team_root, author.verifying_key(), scope_root);
+    let policy = load_complete_policy_view(store, author.verifying_key())?;
+    let Some(policy_grant) = policy.grants().get(&grant) else {
+        return Ok(RecipientWriteOutcome::Refused(
+            SelectFounderGrantRefusal::PolicyGrantMissing { grant },
+        ));
+    };
+    if policy_grant.disabled() {
+        return Ok(RecipientWriteOutcome::Refused(
+            SelectFounderGrantRefusal::PolicyGrantDisabled { grant },
+        ));
+    }
+    match policy_grant.historical_issuance() {
+        GrantIssuanceResolution::Current(_) => {}
+        GrantIssuanceResolution::Unissued => {
+            return Ok(RecipientWriteOutcome::Refused(
+                SelectFounderGrantRefusal::PolicyGrantUnissued { grant },
+            ));
+        }
+        GrantIssuanceResolution::Conflicted { .. } => {
+            return Ok(RecipientWriteOutcome::Refused(
+                SelectFounderGrantRefusal::PolicyGrantConflicted { grant },
+            ));
+        }
+    }
+
+    let event = RecipientEvent::FounderGrantSelected {
+        team_root,
+        scope_root,
+        supersedes: frontier,
+    };
+    let event_handle = event.handle();
+    append_validated_recipient_event_if(store, author, event, std::iter::empty(), move |view| {
+        let selected = matches!(
+            view.founder_grant(team_root),
+            Some(FounderGrantResolution::Current(selection))
+                if selection.scope_root() == scope_root
+                    && selection.frontier() == &BTreeSet::from([event_handle])
+        );
+        if selected {
+            Ok(())
+        } else {
+            Err(SelectFounderGrantRefusal::FrontierChanged)
+        }
+    })
+    .map(Into::into)
 }
 
 /// Result of reducing one exact recipient author's asserted event set.
@@ -1121,6 +1729,11 @@ impl CurrentRecipientCredential {
 
     pub fn effective_expiry(&self) -> Epoch {
         self.capability.expires_at()
+    }
+
+    /// Whether this selected credential is live at the explicit decision time.
+    pub fn usable_at(&self, now: Epoch) -> bool {
+        !self.capability.is_expired_at(now)
     }
 }
 
@@ -2047,6 +2660,8 @@ mod tests {
         fail_flush: bool,
         fail_append: bool,
         lie_about_put_handle: bool,
+        snapshot_count: usize,
+        inject_on_snapshot: Option<(usize, PinAssertion)>,
     }
 
     impl BlobStorePut for RecordingStore {
@@ -2084,6 +2699,19 @@ mod tests {
 
         fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
             self.operations.push("snapshot");
+            self.snapshot_count += 1;
+            if self
+                .inject_on_snapshot
+                .is_some_and(|(at, _)| at == self.snapshot_count)
+            {
+                let (_, assertion) = self
+                    .inject_on_snapshot
+                    .take()
+                    .expect("snapshot injection was present");
+                self.inner
+                    .append_pin_assertion(assertion)
+                    .map_err(RecordingAssertionError::from)?;
+            }
             self.inner.pin_assertion_snapshot().map_err(Into::into)
         }
 
@@ -2233,6 +2861,56 @@ mod tests {
             (cap_handle, sig_handle)
         }
 
+        fn delivery(
+            &mut self,
+            permission: Id,
+            seconds: f64,
+        ) -> (Blob<SimpleArchive>, Vec<Blob<SimpleArchive>>) {
+            let (_, sig) = self.credential(permission, seconds);
+            let signature = self.blobs[&sig].clone();
+            let closure = self
+                .blobs
+                .iter()
+                .filter_map(|(handle, blob)| (*handle != sig).then_some(blob.clone()))
+                .collect();
+            (signature, closure)
+        }
+
+        fn self_grant_with_interval(
+            &self,
+            permission: Id,
+            starts_at: Epoch,
+            ends_at: Epoch,
+        ) -> (GrantIdentity, Blob<SimpleArchive>, Vec<Blob<SimpleArchive>>) {
+            let (anchor_cap, anchor_sig) = build_founder_anchor(
+                &self.root,
+                self.recipient.verifying_key(),
+                self.scope_root,
+                self.scope(PERM_ADMIN),
+            )
+            .expect("self founder anchor");
+            let (cap, sig) = build_capability(
+                &self.recipient,
+                self.recipient.verifying_key(),
+                (anchor_cap.clone(), anchor_sig),
+                self.scope_root,
+                self.scope(permission),
+                (starts_at, ends_at)
+                    .try_to_inline()
+                    .expect("valid self-grant interval"),
+            )
+            .expect("self grant");
+            (
+                GrantIdentity::new(
+                    self.root.verifying_key(),
+                    self.recipient.verifying_key(),
+                    self.scope_root,
+                ),
+                sig,
+                vec![cap, anchor_cap],
+            )
+        }
+
         fn store_event(&mut self, event: &RecipientEvent) -> RecipientEventHandle {
             let blob = event.to_blob();
             let handle = blob.get_handle();
@@ -2257,6 +2935,779 @@ mod tests {
                 self.blobs.get(&handle).cloned()
             })
         }
+    }
+
+    fn published<R: fmt::Debug>(outcome: RecipientWriteOutcome<R>) -> RecipientEventReceipt {
+        match outcome {
+            RecipientWriteOutcome::Published(receipt) => receipt,
+            RecipientWriteOutcome::Refused(reason) => panic!("unexpected refusal: {reason:?}"),
+        }
+    }
+
+    fn seed_blobs(store: &mut MemoryRepo, blobs: impl IntoIterator<Item = Blob<SimpleArchive>>) {
+        for blob in blobs {
+            store
+                .put::<SimpleArchive, _>(blob)
+                .expect("seed content blob");
+        }
+    }
+
+    #[test]
+    fn semantic_declare_and_cancel_publish_once_then_repair_exact_replay() {
+        let mut fixture = Fixture::new();
+        let partial_handle = fixture.partial_cap(PERM_READ, 1_000.0);
+        let partial_cap = fixture.blobs[&partial_handle].clone();
+        let mut store = MemoryRepo::default();
+
+        let declared = published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                partial_cap.clone(),
+            )
+            .expect("declare intent"),
+        );
+        let replayed = published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                partial_cap,
+            )
+            .expect("replay declaration"),
+        );
+        assert_eq!(replayed, declared);
+
+        let canceled = published(
+            cancel_intent(&mut store, &fixture.recipient, declared.event())
+                .expect("cancel pending intent"),
+        );
+        let existing = store.blobs.reader().unwrap();
+        store.blobs = existing
+            .iter()
+            .filter(|(handle, _)| handle.raw != canceled.event().raw)
+            .collect();
+        let replayed_cancel = published(
+            cancel_intent(&mut store, &fixture.recipient, declared.event())
+                .expect("replay repairs missing cancellation event"),
+        );
+        assert_eq!(replayed_cancel, canceled);
+
+        let view = load_complete_recipient_view(
+            &mut store,
+            fixture.recipient.verifying_key(),
+            &BTreeMap::new(),
+        )
+        .expect("complete recipient view");
+        assert!(matches!(
+            view.intent_frontier(fixture.root.verifying_key())
+                .and_then(|frontier| frontier.get(&declared.event())),
+            Some(entry) if entry.disposition() == IntentDisposition::Canceled
+        ));
+        assert_eq!(view.event_handles().len(), 2);
+    }
+
+    #[test]
+    fn semantic_accept_is_live_first_then_repairs_exact_replay_after_expiry() {
+        let mut fixture = Fixture::new();
+        let partial_handle = fixture.partial_cap(PERM_ADMIN, 1_000.0);
+        let partial_cap = fixture.blobs[&partial_handle].clone();
+        let mut store = MemoryRepo::default();
+        let intent = published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                partial_cap,
+            )
+            .expect("declare acceptance intent"),
+        );
+        let (signature, closure) = fixture.delivery(PERM_READ, 100.0);
+        let signature_handle = signature.get_handle().raw;
+
+        let accepted = published(
+            accept_credential(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                signature.clone(),
+                closure.clone(),
+                fixture.now,
+            )
+            .expect("accept live credential"),
+        );
+
+        // Remove one retention descriptor: the exact delivery replay must
+        // repair it even though the credential is expired at the retry time.
+        let inner_handle = RecipientLedgerDescriptor::descriptor_handle().raw;
+        let existing = store.blobs.reader().unwrap();
+        store.blobs = existing
+            .iter()
+            .filter(|(handle, _)| handle.raw != inner_handle && handle.raw != signature_handle)
+            .collect();
+        let replayed = published(
+            accept_credential(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                signature,
+                closure,
+                fixture.now + Duration::from_seconds(200.0),
+            )
+            .expect("expired exact replay repairs"),
+        );
+        assert_eq!(replayed, accepted);
+        store
+            .reader()
+            .unwrap()
+            .get::<Blob<RecipientLedgerDescriptor>, RecipientLedgerDescriptor>(
+                RecipientLedgerDescriptor::descriptor_handle(),
+            )
+            .expect("inner descriptor repaired");
+
+        let view = load_complete_recipient_view(
+            &mut store,
+            fixture.recipient.verifying_key(),
+            &BTreeMap::new(),
+        )
+        .expect("accepted view");
+        assert!(matches!(
+            view.event(accepted.event()),
+            Some(RecipientEvent::CredentialAccepted { basis, .. })
+                if basis == &BTreeSet::from([intent.event()])
+        ));
+
+        let replacement_handle = fixture.partial_cap(PERM_WRITE, 1_000.0);
+        assert!(matches!(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.blobs[&replacement_handle].clone(),
+            )
+            .expect("accepted request refusal"),
+            RecipientWriteOutcome::Refused(DeclareIntentRefusal::AcceptedIntent { .. })
+        ));
+        assert!(matches!(
+            cancel_intent(&mut store, &fixture.recipient, intent.event())
+                .expect("accepted cancel refusal"),
+            RecipientWriteOutcome::Refused(CancelIntentRefusal::AcceptedIntent)
+        ));
+    }
+
+    #[test]
+    fn semantic_accept_refuses_a_new_expired_delivery() {
+        let mut fixture = Fixture::new();
+        let partial_handle = fixture.partial_cap(PERM_ADMIN, 1_000.0);
+        let mut store = MemoryRepo::default();
+        published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.blobs[&partial_handle].clone(),
+            )
+            .expect("declare intent"),
+        );
+        let (signature, closure) = fixture.delivery(PERM_READ, 100.0);
+
+        assert!(matches!(
+            accept_credential(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                signature,
+                closure,
+                fixture.now + Duration::from_seconds(101.0),
+            )
+            .expect("typed expired refusal"),
+            RecipientWriteOutcome::Refused(AcceptCredentialRefusal::Expired { .. })
+        ));
+        let view = load_complete_recipient_view(
+            &mut store,
+            fixture.recipient.verifying_key(),
+            &BTreeMap::new(),
+        )
+        .expect("intent remains complete");
+        assert!(view.credential(fixture.root.verifying_key()).is_none());
+    }
+
+    #[test]
+    fn semantic_accept_joins_the_complete_visible_credential_frontier() {
+        let mut fixture = Fixture::new();
+        let partial_handle = fixture.partial_cap(PERM_ADMIN, 1_000.0);
+        let mut store = MemoryRepo::default();
+        published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.blobs[&partial_handle].clone(),
+            )
+            .expect("declare intent"),
+        );
+        let (initial_sig, initial_closure) = fixture.delivery(PERM_READ, 100.0);
+        let initial = published(
+            accept_credential(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                initial_sig,
+                initial_closure,
+                fixture.now,
+            )
+            .expect("initial acceptance"),
+        );
+
+        let (weaker_sig, weaker_closure) = fixture.delivery(PERM_READ, 150.0);
+        let weaker_event = RecipientEvent::CredentialAccepted {
+            team_root: fixture.root.verifying_key(),
+            sig: weaker_sig.get_handle(),
+            basis: BTreeSet::from([initial.event()]),
+        };
+        let weaker = append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            weaker_event,
+            std::iter::once(weaker_sig).chain(weaker_closure),
+        )
+        .expect("publish weaker sibling");
+        let (stronger_sig, stronger_closure) = fixture.delivery(PERM_WRITE, 200.0);
+        let stronger_event = RecipientEvent::CredentialAccepted {
+            team_root: fixture.root.verifying_key(),
+            sig: stronger_sig.get_handle(),
+            basis: BTreeSet::from([initial.event()]),
+        };
+        let stronger = append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            stronger_event,
+            std::iter::once(stronger_sig).chain(stronger_closure),
+        )
+        .expect("publish stronger sibling");
+
+        let (healing_sig, healing_closure) = fixture.delivery(PERM_WRITE, 300.0);
+        let healing_sig_handle = healing_sig.get_handle();
+        let healed = published(
+            accept_credential(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                healing_sig,
+                healing_closure,
+                fixture.now,
+            )
+            .expect("join complete credential frontier"),
+        );
+        let view = load_complete_recipient_view(
+            &mut store,
+            fixture.recipient.verifying_key(),
+            &BTreeMap::new(),
+        )
+        .expect("healed credential view");
+        assert!(matches!(
+            view.event(healed.event()),
+            Some(RecipientEvent::CredentialAccepted { basis, .. })
+                if basis == &BTreeSet::from([weaker.event(), stronger.event()])
+        ));
+        assert!(matches!(
+            view.credential(fixture.root.verifying_key()),
+            Some(RecipientCredentialResolution::Current { credential, frontier })
+                if credential.sig() == healing_sig_handle
+                    && frontier == &BTreeSet::from([healed.event()])
+        ));
+    }
+
+    #[test]
+    fn semantic_cancel_and_replace_refuse_new_acceptance_races_but_old_race_heals() {
+        let mut fixture = Fixture::new();
+        let partial_handle = fixture.partial_cap(PERM_ADMIN, 1_000.0);
+        let partial_cap = fixture.blobs[&partial_handle].clone();
+        let mut store = RecordingStore::default();
+        let intent = published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                partial_cap.clone(),
+            )
+            .expect("declare raced intent"),
+        );
+        let (racing_sig, racing_closure) = fixture.delivery(PERM_READ, 100.0);
+        let racing_acceptance = RecipientEvent::CredentialAccepted {
+            team_root: fixture.root.verifying_key(),
+            sig: racing_sig.get_handle(),
+            basis: BTreeSet::from([intent.event()]),
+        };
+        seed_blobs(
+            &mut store.inner,
+            std::iter::once(racing_sig)
+                .chain(racing_closure)
+                .chain(std::iter::once(RecipientEvent::to_blob(&racing_acceptance))),
+        );
+        store.snapshot_count = 0;
+        store.inject_on_snapshot = Some((
+            2,
+            sign_recipient_event(&fixture.recipient, &racing_acceptance),
+        ));
+
+        assert!(matches!(
+            cancel_intent(&mut store, &fixture.recipient, intent.event())
+                .expect("typed cancel race refusal"),
+            RecipientWriteOutcome::Refused(CancelIntentRefusal::AcceptanceRace)
+        ));
+
+        // Once the merged race is already visible, a fresh declaration may
+        // supersede the contested canceled root and establish a healing basis.
+        append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            RecipientEvent::IntentCanceled {
+                intent: intent.event(),
+            },
+            std::iter::empty(),
+        )
+        .expect("record merged cancellation");
+        let healed_intent = published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                partial_cap,
+            )
+            .expect("pre-existing contested root may heal"),
+        );
+        assert_ne!(healed_intent.event(), intent.event());
+        let (fresh_sig, fresh_closure) = fixture.delivery(PERM_WRITE, 200.0);
+        let fresh_sig_handle = fresh_sig.get_handle();
+        let healed_acceptance = published(
+            accept_credential(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fresh_sig,
+                fresh_closure,
+                fixture.now,
+            )
+            .expect("accept fresh healing lineage"),
+        );
+        let view = load_complete_recipient_view(
+            &mut store,
+            fixture.recipient.verifying_key(),
+            &BTreeMap::new(),
+        )
+        .expect("healed race view");
+        assert_eq!(view.contested_intents(), &BTreeSet::from([intent.event()]));
+        assert!(matches!(
+            view.event(healed_acceptance.event()),
+            Some(RecipientEvent::CredentialAccepted { basis, sig, .. })
+                if basis == &BTreeSet::from([healed_intent.event()])
+                    && *sig == fresh_sig_handle
+        ));
+
+        let mut fixture = Fixture::new();
+        let first_partial = fixture.partial_cap(PERM_ADMIN, 1_000.0);
+        let mut store = RecordingStore::default();
+        let intent = published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.blobs[&first_partial].clone(),
+            )
+            .expect("declare replacement base"),
+        );
+        let (racing_sig, racing_closure) = fixture.delivery(PERM_READ, 100.0);
+        let racing_acceptance = RecipientEvent::CredentialAccepted {
+            team_root: fixture.root.verifying_key(),
+            sig: racing_sig.get_handle(),
+            basis: BTreeSet::from([intent.event()]),
+        };
+        seed_blobs(
+            &mut store.inner,
+            std::iter::once(racing_sig)
+                .chain(racing_closure)
+                .chain(std::iter::once(RecipientEvent::to_blob(&racing_acceptance))),
+        );
+        store.snapshot_count = 0;
+        store.inject_on_snapshot = Some((
+            2,
+            sign_recipient_event(&fixture.recipient, &racing_acceptance),
+        ));
+        let replacement_partial = fixture.partial_cap(PERM_WRITE, 1_000.0);
+        assert!(matches!(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.blobs[&replacement_partial].clone(),
+            )
+            .expect("typed replacement race refusal"),
+            RecipientWriteOutcome::Refused(DeclareIntentRefusal::AcceptanceRace {
+                intent: raced,
+            }) if raced == intent.event()
+        ));
+    }
+
+    #[test]
+    fn semantic_founder_merges_full_frontier_with_expired_seed_and_replays_without_policy() {
+        let fixture = Fixture::new();
+        let mut store = MemoryRepo::default();
+        let (grant, signature, closure) = fixture.self_grant_with_interval(
+            PERM_ADMIN,
+            fixture.now - Duration::from_seconds(200.0),
+            fixture.now - Duration::from_seconds(100.0),
+        );
+        crate::policy_ledger::issue_grant(
+            &mut store,
+            &fixture.recipient,
+            grant,
+            signature,
+            None,
+            closure,
+        )
+        .expect("issue expired historical founder seed");
+        let policy = load_complete_policy_view(&mut store, fixture.recipient.verifying_key())
+            .expect("complete founder policy");
+        assert!(matches!(
+            policy.grants().get(&grant).map(|grant| grant.historical_issuance()),
+            Some(GrantIssuanceResolution::Current(current))
+                if current.effective_expiry() < fixture.now
+        ));
+
+        let old_scope = *triblespace_core::id::ufoid();
+        let old = append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            RecipientEvent::FounderGrantSelected {
+                team_root: fixture.root.verifying_key(),
+                scope_root: old_scope,
+                supersedes: BTreeSet::new(),
+            },
+            std::iter::empty(),
+        )
+        .expect("publish old founder selector");
+        let first = append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            RecipientEvent::FounderGrantSelected {
+                team_root: fixture.root.verifying_key(),
+                scope_root: fixture.scope_root,
+                supersedes: BTreeSet::from([old.event()]),
+            },
+            std::iter::empty(),
+        )
+        .expect("publish first same-scope tip");
+        let second = append_validated_recipient_event(
+            &mut store,
+            &fixture.recipient,
+            RecipientEvent::FounderGrantSelected {
+                team_root: fixture.root.verifying_key(),
+                scope_root: fixture.scope_root,
+                supersedes: BTreeSet::new(),
+            },
+            std::iter::empty(),
+        )
+        .expect("publish second same-scope tip");
+
+        let selected = published(
+            select_founder_grant(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.scope_root,
+            )
+            .expect("expired historical current is a selectable recovery seed"),
+        );
+        let view = load_complete_recipient_view(
+            &mut store,
+            fixture.recipient.verifying_key(),
+            &BTreeMap::new(),
+        )
+        .expect("merged founder view");
+        assert!(matches!(
+            view.event(selected.event()),
+            Some(RecipientEvent::FounderGrantSelected { supersedes, .. })
+                if supersedes == &BTreeSet::from([first.event(), second.event()])
+        ));
+        assert!(matches!(
+            view.founder_grant(fixture.root.verifying_key()),
+            Some(FounderGrantResolution::Current(selection))
+                if selection.scope_root() == fixture.scope_root
+                    && selection.frontier() == &BTreeSet::from([selected.event()])
+        ));
+
+        // Poison only the policy ledger after the decision. The exact
+        // recipient event remains reconstructible and must repair/replay
+        // without consulting current policy availability.
+        let dangling = crate::policy_ledger::PolicyEvent::GrantDisabled(GrantIdentity::new(
+            fixture.root.verifying_key(),
+            fixture.recipient.verifying_key(),
+            *triblespace_core::id::ufoid(),
+        ));
+        store
+            .append_pin_assertion(crate::policy_ledger::sign_policy_event(
+                &fixture.recipient,
+                dangling,
+            ))
+            .expect("seed missing policy event content");
+        let replayed = published(
+            select_founder_grant(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.scope_root,
+            )
+            .expect("exact founder replay bypasses invalid policy availability"),
+        );
+        assert_eq!(replayed, selected);
+    }
+
+    #[test]
+    fn semantic_founder_refuses_missing_disabled_and_conflicted_policy() {
+        let fixture = Fixture::new();
+        let mut missing = MemoryRepo::default();
+        let grant = GrantIdentity::new(
+            fixture.root.verifying_key(),
+            fixture.recipient.verifying_key(),
+            fixture.scope_root,
+        );
+        assert!(matches!(
+            select_founder_grant(
+                &mut missing,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.scope_root,
+            )
+            .expect("typed missing-policy refusal"),
+            RecipientWriteOutcome::Refused(
+                SelectFounderGrantRefusal::PolicyGrantMissing { grant: found }
+            ) if found == grant
+        ));
+
+        let mut disabled = MemoryRepo::default();
+        let (grant, signature, closure) = fixture.self_grant_with_interval(
+            PERM_ADMIN,
+            fixture.now,
+            fixture.now + Duration::from_seconds(100.0),
+        );
+        crate::policy_ledger::issue_grant(
+            &mut disabled,
+            &fixture.recipient,
+            grant,
+            signature,
+            None,
+            closure,
+        )
+        .expect("issue founder policy grant");
+        crate::policy_ledger::disable_grant(&mut disabled, &fixture.recipient, grant)
+            .expect("disable founder policy grant");
+        assert!(matches!(
+            select_founder_grant(
+                &mut disabled,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.scope_root,
+            )
+            .expect("typed disabled-policy refusal"),
+            RecipientWriteOutcome::Refused(
+                SelectFounderGrantRefusal::PolicyGrantDisabled { grant: found }
+            ) if found == grant
+        ));
+
+        let mut conflicted = MemoryRepo::default();
+        for permission in [PERM_READ, PERM_WRITE] {
+            let (grant, signature, closure) = fixture.self_grant_with_interval(
+                permission,
+                fixture.now,
+                fixture.now + Duration::from_seconds(100.0),
+            );
+            crate::policy_ledger::issue_grant(
+                &mut conflicted,
+                &fixture.recipient,
+                grant,
+                signature,
+                None,
+                closure,
+            )
+            .expect("publish conflicting founder issuance");
+        }
+        assert!(matches!(
+            select_founder_grant(
+                &mut conflicted,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.scope_root,
+            )
+            .expect("typed conflicted-policy refusal"),
+            RecipientWriteOutcome::Refused(
+                SelectFounderGrantRefusal::PolicyGrantConflicted { grant: found }
+            ) if found == grant
+        ));
+    }
+
+    #[test]
+    fn semantic_accept_and_founder_refuse_unseen_frontier_tips() {
+        let mut fixture = Fixture::new();
+        let partial = fixture.partial_cap(PERM_ADMIN, 1_000.0);
+        let mut store = RecordingStore::default();
+        published(
+            declare_intent(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.blobs[&partial].clone(),
+            )
+            .expect("declare credential intent"),
+        );
+        let (initial_sig, initial_closure) = fixture.delivery(PERM_READ, 100.0);
+        let initial = published(
+            accept_credential(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                initial_sig,
+                initial_closure,
+                fixture.now,
+            )
+            .expect("initial credential"),
+        );
+        let (unseen_sig, unseen_closure) = fixture.delivery(PERM_READ, 150.0);
+        let unseen = RecipientEvent::CredentialAccepted {
+            team_root: fixture.root.verifying_key(),
+            sig: unseen_sig.get_handle(),
+            basis: BTreeSet::from([initial.event()]),
+        };
+        seed_blobs(
+            &mut store.inner,
+            std::iter::once(unseen_sig)
+                .chain(unseen_closure)
+                .chain(std::iter::once(RecipientEvent::to_blob(&unseen))),
+        );
+        store.snapshot_count = 0;
+        store.inject_on_snapshot = Some((2, sign_recipient_event(&fixture.recipient, &unseen)));
+        let (candidate_sig, candidate_closure) = fixture.delivery(PERM_WRITE, 200.0);
+        assert!(matches!(
+            accept_credential(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                candidate_sig,
+                candidate_closure,
+                fixture.now,
+            )
+            .expect("typed unseen-acceptance refusal"),
+            RecipientWriteOutcome::Refused(AcceptCredentialRefusal::CredentialFrontierChanged)
+        ));
+
+        let fixture = Fixture::new();
+        let mut store = RecordingStore::default();
+        let (grant, signature, closure) = fixture.self_grant_with_interval(
+            PERM_ADMIN,
+            fixture.now,
+            fixture.now + Duration::from_seconds(100.0),
+        );
+        crate::policy_ledger::issue_grant(
+            &mut store,
+            &fixture.recipient,
+            grant,
+            signature,
+            None,
+            closure,
+        )
+        .expect("issue founder policy");
+        let unseen = RecipientEvent::FounderGrantSelected {
+            team_root: fixture.root.verifying_key(),
+            scope_root: *triblespace_core::id::ufoid(),
+            supersedes: BTreeSet::new(),
+        };
+        seed_blobs(&mut store.inner, [RecipientEvent::to_blob(&unseen)]);
+        store.snapshot_count = 0;
+        // Recipient planning, policy planning, then prospective publication.
+        store.inject_on_snapshot = Some((3, sign_recipient_event(&fixture.recipient, &unseen)));
+        assert!(matches!(
+            select_founder_grant(
+                &mut store,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                fixture.scope_root,
+            )
+            .expect("typed unseen-founder refusal"),
+            RecipientWriteOutcome::Refused(SelectFounderGrantRefusal::FrontierChanged)
+        ));
+    }
+
+    #[test]
+    fn semantic_planners_return_typed_precondition_refusals() {
+        let mut fixture = Fixture::new();
+        let mut empty = MemoryRepo::default();
+        assert!(matches!(
+            declare_intent(
+                &mut empty,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                TribleSet::new().to_blob(),
+            )
+            .expect("typed malformed-claim refusal"),
+            RecipientWriteOutcome::Refused(DeclareIntentRefusal::InvalidClaim(_))
+        ));
+        let partial = fixture.partial_cap(PERM_READ, 1_000.0);
+        assert!(matches!(
+            declare_intent(
+                &mut empty,
+                &key(99),
+                fixture.root.verifying_key(),
+                fixture.blobs[&partial].clone(),
+            )
+            .expect("typed subject refusal"),
+            RecipientWriteOutcome::Refused(DeclareIntentRefusal::SubjectMismatch { .. })
+        ));
+        assert!(empty.pin_assertion_snapshot().unwrap().is_empty());
+
+        let (signature, closure) = fixture.delivery(PERM_READ, 100.0);
+        assert!(matches!(
+            accept_credential(
+                &mut empty,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                signature.clone(),
+                closure.clone(),
+                fixture.now,
+            )
+            .expect("typed missing-intent refusal"),
+            RecipientWriteOutcome::Refused(AcceptCredentialRefusal::NoPendingIntent)
+        ));
+
+        let first_partial = fixture.partial_cap(PERM_ADMIN, 1_000.0);
+        let second_partial = fixture.partial_cap(PERM_WRITE, 1_000.0);
+        for partial in [first_partial, second_partial] {
+            append_validated_recipient_event(
+                &mut empty,
+                &fixture.recipient,
+                RecipientEvent::IntentDeclared {
+                    team_root: fixture.root.verifying_key(),
+                    partial_cap: partial,
+                    supersedes: BTreeSet::new(),
+                },
+                [fixture.blobs[&partial].clone()],
+            )
+            .expect("publish concurrent pending intent");
+        }
+        assert!(matches!(
+            accept_credential(
+                &mut empty,
+                &fixture.recipient,
+                fixture.root.verifying_key(),
+                signature,
+                closure,
+                fixture.now,
+            )
+            .expect("typed ambiguous-intent refusal"),
+            RecipientWriteOutcome::Refused(AcceptCredentialRefusal::AmbiguousPendingIntents {
+                count: 2
+            })
+        ));
     }
 
     #[test]
