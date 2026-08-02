@@ -12,11 +12,13 @@
 //! canonical signed padding only; this kind has no ancestry relation and no
 //! operation may compare them.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
 use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
@@ -26,8 +28,12 @@ use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle};
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::repo::capability::{
+    VerifiedCapability, VerifyError, decode_operational_capability, scope_subsumes,
+    verify_chain_details_allow_expired,
+};
 use triblespace_core::repo::pin_assertion::{
-    PinAssertion, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle,
+    PinAssertion, PinAssertionSnapshot, PinHandle, PinIdentity, SubsumptionLabel, ValueHandle,
 };
 use triblespace_core::repo::strong_pin::StrongPinDescriptor;
 use triblespace_core::trible::{Fragment, TribleSet};
@@ -37,9 +43,8 @@ use crate::policy::{policy_scope, policy_subject, request_partial_cap, request_r
 triblespace_core::prelude::attributes! {
     /// Team root whose founder anchor terminates a grant's verified proof.
     "CF48B211C9FCF5FAFA1AF2A35AC93799" as pub policy_team_root: triblespace_core::prelude::inlineencodings::ED25519PublicKey;
-    /// Exact finite operational capability issued for a grant.
-    "3E5D5BF44F5198CC71176A628C06A5C7" as pub policy_credential_cap: Handle<SimpleArchive>;
-    /// Exact signature/proof blob accompanying `policy_credential_cap`.
+    /// Exact canonical signature/proof blob issued for a grant. The signature
+    /// itself names the finite operational capability it authenticates.
     "1898D3D13786EEDCCDA79008EC2F1205" as pub policy_credential_sig: Handle<SimpleArchive>;
     /// Optional exact `RequestObserved` event used as issuance provenance.
     "6C293DE1077C76992DA7BD5F436A5368" as pub policy_request_event: Handle<SimpleArchive>;
@@ -215,7 +220,6 @@ pub enum PolicyEvent {
     RequestRejected(RequestIdentity),
     GrantIssued {
         grant: GrantIdentity,
-        cap: Inline<Handle<SimpleArchive>>,
         sig: Inline<Handle<SimpleArchive>>,
         request: Option<Inline<Handle<SimpleArchive>>>,
     },
@@ -241,7 +245,6 @@ impl PolicyEvent {
             },
             Self::GrantIssued {
                 grant,
-                cap,
                 sig,
                 request,
             } => entity! {
@@ -249,7 +252,6 @@ impl PolicyEvent {
                 policy_team_root: grant.team_root(),
                 policy_subject: grant.subject(),
                 policy_scope: grant.scope_root(),
-                policy_credential_cap: cap,
                 policy_credential_sig: sig,
                 policy_request_event?: request,
             },
@@ -312,10 +314,6 @@ impl PolicyEvent {
             }
         } else if kind == EVENT_GRANT_ISSUED {
             let grant = decode_grant(&set, event)?;
-            let cap = one_value(find!(
-                cap: Inline<Handle<SimpleArchive>>,
-                pattern!(&set, [{ event @ policy_credential_cap: ?cap }])
-            ))?;
             let sig = one_value(find!(
                 sig: Inline<Handle<SimpleArchive>>,
                 pattern!(&set, [{ event @ policy_credential_sig: ?sig }])
@@ -326,7 +324,6 @@ impl PolicyEvent {
             ))?;
             Self::GrantIssued {
                 grant,
-                cap,
                 sig,
                 request,
             }
@@ -431,10 +428,640 @@ pub fn event_handle(value: ValueHandle) -> Inline<Handle<SimpleArchive>> {
     Inline::new(value.raw())
 }
 
+/// Typed result of reducing one author's complete policy assertion set.
+///
+/// Only Complete exposes an operational view. Missing content and known-invalid
+/// evidence are global fail-closed states for this deliberately coarse first
+/// ledger layout.
+#[derive(Debug)]
+pub enum PolicyLedgerResolution {
+    Complete(PolicyLedgerView),
+    Incomplete {
+        missing: Vec<Inline<Handle<SimpleArchive>>>,
+    },
+    Invalid {
+        diagnostics: Vec<PolicyLedgerDiagnostic>,
+    },
+}
+
+/// Deterministic diagnostic for one present but invalid policy effect.
+#[derive(Debug)]
+pub enum PolicyLedgerDiagnostic {
+    HandleMismatch {
+        expected: Inline<Handle<SimpleArchive>>,
+        actual: Inline<Handle<SimpleArchive>>,
+    },
+    InvalidEvent {
+        handle: Inline<Handle<SimpleArchive>>,
+        error: PolicyEventError,
+    },
+    ProvenanceIsNotRequest {
+        handle: Inline<Handle<SimpleArchive>>,
+    },
+    InvalidRequest {
+        event: Inline<Handle<SimpleArchive>>,
+        request: RequestIdentity,
+        reason: InvalidRequestReason,
+    },
+    InvalidIssuance {
+        event: Inline<Handle<SimpleArchive>>,
+        grant: GrantIdentity,
+        sig: Inline<Handle<SimpleArchive>>,
+        reason: InvalidIssuanceReason,
+    },
+}
+
+#[derive(Debug)]
+pub enum InvalidRequestReason {
+    Claim(VerifyError),
+    SubjectMismatch { claim: VerifyingKey },
+    IssuerMismatch { claim: VerifyingKey },
+}
+
+#[derive(Debug)]
+pub enum InvalidIssuanceReason {
+    Proof(VerifyError),
+    IssuerMismatch { proof: VerifyingKey },
+    ScopeMismatch { proof: Id },
+    RequesterMismatch { request: VerifyingKey },
+    RequestScopeMismatch { request: Id },
+    ExceedsRequestedScope,
+    ExceedsRequestedExpiry { requested: Epoch, issued: Epoch },
+}
+
+/// Complete deterministic projection of one author's policy effects.
+#[derive(Debug)]
+pub struct PolicyLedgerView {
+    author: VerifyingKey,
+    requests: BTreeMap<RequestIdentity, RequestView>,
+    grants: BTreeMap<GrantIdentity, GrantView>,
+}
+
+impl PolicyLedgerView {
+    pub fn author(&self) -> VerifyingKey {
+        self.author
+    }
+
+    pub fn requests(&self) -> &BTreeMap<RequestIdentity, RequestView> {
+        &self.requests
+    }
+
+    pub fn grants(&self) -> &BTreeMap<GrantIdentity, GrantView> {
+        &self.grants
+    }
+}
+
+/// Independent positive facts about one exact request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestView {
+    observed: bool,
+    rejected: bool,
+    issued_signatures: BTreeSet<Inline<Handle<SimpleArchive>>>,
+}
+
+impl RequestView {
+    pub const fn observed(&self) -> bool {
+        self.observed
+    }
+
+    pub const fn rejected(&self) -> bool {
+        self.rejected
+    }
+
+    pub fn issued_signatures(&self) -> &BTreeSet<Inline<Handle<SimpleArchive>>> {
+        &self.issued_signatures
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.observed && !self.rejected && self.issued_signatures.is_empty()
+    }
+}
+
+/// Derived state for one stable team, subject, and scope grant identity.
+#[derive(Debug)]
+pub struct GrantView {
+    disabled: bool,
+    issuance: GrantIssuanceResolution,
+}
+
+impl GrantView {
+    pub const fn disabled(&self) -> bool {
+        self.disabled
+    }
+
+    pub fn issuance(&self) -> &GrantIssuanceResolution {
+        &self.issuance
+    }
+
+    /// Return the selected credential only when this grant remains active.
+    ///
+    /// Disabled grants retain their historical issuance for inspection, but
+    /// must never be dispatched, installed, or renewed by operational callers.
+    pub fn active_current(&self) -> Option<&CurrentGrant> {
+        if self.disabled {
+            return None;
+        }
+        match &self.issuance {
+            GrantIssuanceResolution::Current(current) => Some(current),
+            GrantIssuanceResolution::Unissued | GrantIssuanceResolution::Conflicted { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum GrantIssuanceResolution {
+    Unissued,
+    Current(CurrentGrant),
+    Conflicted {
+        signatures: BTreeSet<Inline<Handle<SimpleArchive>>>,
+    },
+}
+
+/// Deterministically selected credential for one semantically coherent grant.
+#[derive(Clone, Debug)]
+pub struct CurrentGrant {
+    cap: Inline<Handle<SimpleArchive>>,
+    sig: Inline<Handle<SimpleArchive>>,
+    capability: VerifiedCapability,
+    authenticated: bool,
+}
+
+impl CurrentGrant {
+    pub const fn cap(&self) -> Inline<Handle<SimpleArchive>> {
+        self.cap
+    }
+
+    pub const fn sig(&self) -> Inline<Handle<SimpleArchive>> {
+        self.sig
+    }
+
+    pub fn capability(&self) -> &VerifiedCapability {
+        &self.capability
+    }
+
+    pub fn effective_expiry(&self) -> Epoch {
+        self.capability.expires_at()
+    }
+
+    pub const fn authenticated(&self) -> bool {
+        self.authenticated
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AssertedIssuance {
+    event: Inline<Handle<SimpleArchive>>,
+    grant: GrantIdentity,
+    sig: Inline<Handle<SimpleArchive>>,
+    request: Option<Inline<Handle<SimpleArchive>>>,
+}
+
+#[derive(Debug)]
+struct ValidIssuance {
+    cap: Inline<Handle<SimpleArchive>>,
+    sig: Inline<Handle<SimpleArchive>>,
+    request: Option<RequestIdentity>,
+    capability: VerifiedCapability,
+}
+
+#[derive(Default)]
+struct GrantAccumulator {
+    disabled: bool,
+    authentications: BTreeSet<Inline<Handle<SimpleArchive>>>,
+    issuances: Vec<ValidIssuance>,
+}
+
+/// Reduce one exact author's monotone policy assertion set.
+///
+/// The fetch callback is memoized for the duration of the fold, including
+/// negative lookups, so one resolution observes a coherent content boundary.
+pub fn resolve_policy_ledger<F>(
+    snapshot: &PinAssertionSnapshot,
+    author: VerifyingKey,
+    mut fetch_blob: F,
+) -> PolicyLedgerResolution
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    let identity = PolicyLedgerDescriptor::pin_identity(author);
+    let asserted_handles: BTreeSet<_> = snapshot
+        .for_pin(&identity)
+        .into_iter()
+        .map(|assertion| event_handle(assertion.value()))
+        .collect();
+
+    let mut cache = BTreeMap::new();
+    let mut missing = BTreeSet::new();
+    let mut diagnostics = Vec::new();
+    let mut asserted_events = Vec::new();
+
+    for handle in asserted_handles {
+        match read_event(
+            handle,
+            &mut cache,
+            &mut fetch_blob,
+            &mut missing,
+            &mut diagnostics,
+        ) {
+            Some(event) => asserted_events.push((handle, event)),
+            None => {}
+        }
+    }
+
+    let provenance_handles: BTreeSet<_> = asserted_events
+        .iter()
+        .filter_map(|(_, event)| match event {
+            PolicyEvent::GrantIssued {
+                request: Some(handle),
+                ..
+            } => Some(*handle),
+            _ => None,
+        })
+        .collect();
+
+    let mut request_events = BTreeMap::new();
+    for (handle, event) in &asserted_events {
+        if let PolicyEvent::RequestObserved(request) = event {
+            request_events.insert(*handle, *request);
+        }
+    }
+    for handle in provenance_handles {
+        if request_events.contains_key(&handle) {
+            continue;
+        }
+        if let Some(event) = read_event(
+            handle,
+            &mut cache,
+            &mut fetch_blob,
+            &mut missing,
+            &mut diagnostics,
+        ) {
+            match event {
+                PolicyEvent::RequestObserved(request) => {
+                    request_events.insert(handle, request);
+                }
+                _ => diagnostics.push(PolicyLedgerDiagnostic::ProvenanceIsNotRequest { handle }),
+            }
+        }
+    }
+
+    let mut request_claims = BTreeMap::new();
+    for (event, request) in &request_events {
+        let Some(blob) = read_blob(
+            request.partial_cap(),
+            &mut cache,
+            &mut fetch_blob,
+            &mut missing,
+            &mut diagnostics,
+        ) else {
+            continue;
+        };
+        match decode_operational_capability(blob) {
+            Err(error) => diagnostics.push(PolicyLedgerDiagnostic::InvalidRequest {
+                event: *event,
+                request: *request,
+                reason: InvalidRequestReason::Claim(error),
+            }),
+            Ok(claim) if claim.subject != request.requester() => {
+                diagnostics.push(PolicyLedgerDiagnostic::InvalidRequest {
+                    event: *event,
+                    request: *request,
+                    reason: InvalidRequestReason::SubjectMismatch {
+                        claim: claim.subject,
+                    },
+                });
+            }
+            Ok(claim) if claim.issuer != author => {
+                diagnostics.push(PolicyLedgerDiagnostic::InvalidRequest {
+                    event: *event,
+                    request: *request,
+                    reason: InvalidRequestReason::IssuerMismatch {
+                        claim: claim.issuer,
+                    },
+                });
+            }
+            Ok(claim) => {
+                request_claims.insert(*event, (*request, claim));
+            }
+        }
+    }
+
+    let mut asserted_issuances = Vec::new();
+    let mut disabled = BTreeSet::new();
+    let mut authentications =
+        BTreeMap::<GrantIdentity, BTreeSet<Inline<Handle<SimpleArchive>>>>::new();
+    let mut rejected = BTreeSet::new();
+
+    for (event_handle, event) in &asserted_events {
+        match *event {
+            PolicyEvent::RequestObserved(_) => {}
+            PolicyEvent::RequestRejected(request) => {
+                rejected.insert(request);
+            }
+            PolicyEvent::GrantIssued {
+                grant,
+                sig,
+                request,
+            } => asserted_issuances.push(AssertedIssuance {
+                event: *event_handle,
+                grant,
+                sig,
+                request,
+            }),
+            PolicyEvent::CredentialAuthenticated { grant, sig } => {
+                // Keep exact authentication as a latent positive fact. It is
+                // consulted only for a matching selected valid issuance below,
+                // so out-of-order replication is harmless and order-neutral.
+                authentications.entry(grant).or_default().insert(sig);
+            }
+            PolicyEvent::GrantDisabled(grant) => {
+                disabled.insert(grant);
+            }
+        }
+    }
+
+    let mut valid_issuances = Vec::new();
+    for issuance in asserted_issuances {
+        let verified = match verify_chain_details_allow_expired(
+            issuance.grant.team_root(),
+            issuance.sig,
+            issuance.grant.subject(),
+            |handle| {
+                read_blob(
+                    handle,
+                    &mut cache,
+                    &mut fetch_blob,
+                    &mut missing,
+                    &mut diagnostics,
+                )
+            },
+        ) {
+            Err(VerifyError::MissingBlob(handle)) => {
+                missing.insert(handle);
+                continue;
+            }
+            Err(error) => {
+                diagnostics.push(PolicyLedgerDiagnostic::InvalidIssuance {
+                    event: issuance.event,
+                    grant: issuance.grant,
+                    sig: issuance.sig,
+                    reason: InvalidIssuanceReason::Proof(error),
+                });
+                continue;
+            }
+            Ok(verified) => verified,
+        };
+
+        if verified.leaf_issuer != author {
+            diagnostics.push(PolicyLedgerDiagnostic::InvalidIssuance {
+                event: issuance.event,
+                grant: issuance.grant,
+                sig: issuance.sig,
+                reason: InvalidIssuanceReason::IssuerMismatch {
+                    proof: verified.leaf_issuer,
+                },
+            });
+            continue;
+        }
+        if verified.capability.scope_root != issuance.grant.scope_root() {
+            diagnostics.push(PolicyLedgerDiagnostic::InvalidIssuance {
+                event: issuance.event,
+                grant: issuance.grant,
+                sig: issuance.sig,
+                reason: InvalidIssuanceReason::ScopeMismatch {
+                    proof: verified.capability.scope_root,
+                },
+            });
+            continue;
+        }
+
+        let request = if let Some(request_handle) = issuance.request {
+            let Some((request, claim)) = request_claims.get(&request_handle) else {
+                continue;
+            };
+            let invalid_reason = if request.requester() != issuance.grant.subject() {
+                Some(InvalidIssuanceReason::RequesterMismatch {
+                    request: request.requester(),
+                })
+            } else if claim.scope_root != issuance.grant.scope_root() {
+                Some(InvalidIssuanceReason::RequestScopeMismatch {
+                    request: claim.scope_root,
+                })
+            } else if !scope_subsumes(
+                &claim.cap_set,
+                claim.scope_root,
+                &verified.capability.cap_set,
+                verified.capability.scope_root,
+            ) {
+                Some(InvalidIssuanceReason::ExceedsRequestedScope)
+            } else if verified.capability.expires_at() > claim.expires_at {
+                Some(InvalidIssuanceReason::ExceedsRequestedExpiry {
+                    requested: claim.expires_at,
+                    issued: verified.capability.expires_at(),
+                })
+            } else {
+                None
+            };
+            if let Some(reason) = invalid_reason {
+                diagnostics.push(PolicyLedgerDiagnostic::InvalidIssuance {
+                    event: issuance.event,
+                    grant: issuance.grant,
+                    sig: issuance.sig,
+                    reason,
+                });
+                continue;
+            }
+            Some(*request)
+        } else {
+            None
+        };
+
+        valid_issuances.push((
+            issuance.grant,
+            ValidIssuance {
+                cap: verified.leaf_cap,
+                sig: issuance.sig,
+                request,
+                capability: verified.capability,
+            },
+        ));
+    }
+
+    if !diagnostics.is_empty() {
+        return PolicyLedgerResolution::Invalid { diagnostics };
+    }
+    if !missing.is_empty() {
+        return PolicyLedgerResolution::Incomplete {
+            missing: missing.into_iter().collect(),
+        };
+    }
+
+    let mut requests = BTreeMap::<RequestIdentity, RequestView>::new();
+    for request in request_events.values() {
+        requests.entry(*request).or_default().observed = true;
+    }
+    for request in rejected {
+        requests.entry(request).or_default().rejected = true;
+    }
+
+    let mut grants = BTreeMap::<GrantIdentity, GrantAccumulator>::new();
+    for grant in disabled {
+        grants.entry(grant).or_default().disabled = true;
+    }
+    for (grant, signatures) in authentications {
+        grants.entry(grant).or_default().authentications = signatures;
+    }
+    for (grant, issuance) in valid_issuances {
+        if let Some(request) = issuance.request {
+            requests
+                .entry(request)
+                .or_default()
+                .issued_signatures
+                .insert(issuance.sig);
+        }
+        grants.entry(grant).or_default().issuances.push(issuance);
+    }
+
+    let grants = grants
+        .into_iter()
+        .map(|(grant, accumulator)| {
+            let valid_signatures = accumulator
+                .issuances
+                .iter()
+                .map(|issuance| issuance.sig)
+                .collect::<BTreeSet<_>>();
+            let issuance = if accumulator.issuances.is_empty() {
+                GrantIssuanceResolution::Unissued
+            } else if accumulator.issuances.iter().skip(1).any(|candidate| {
+                !same_scope_facts(&accumulator.issuances[0].capability, &candidate.capability)
+            }) {
+                GrantIssuanceResolution::Conflicted {
+                    signatures: valid_signatures,
+                }
+            } else {
+                let current = accumulator
+                    .issuances
+                    .into_iter()
+                    .max_by(compare_issuances)
+                    .expect("nonempty issuance set has a maximum");
+                let authenticated = accumulator.authentications.contains(&current.sig);
+                GrantIssuanceResolution::Current(CurrentGrant {
+                    cap: current.cap,
+                    sig: current.sig,
+                    capability: current.capability,
+                    authenticated,
+                })
+            };
+            (
+                grant,
+                GrantView {
+                    disabled: accumulator.disabled,
+                    issuance,
+                },
+            )
+        })
+        .collect();
+
+    PolicyLedgerResolution::Complete(PolicyLedgerView {
+        author,
+        requests,
+        grants,
+    })
+}
+
+fn cached_fetch<F>(
+    cache: &mut BTreeMap<Inline<Handle<SimpleArchive>>, Option<Blob<SimpleArchive>>>,
+    fetch_blob: &mut F,
+    handle: Inline<Handle<SimpleArchive>>,
+) -> Option<Blob<SimpleArchive>>
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    if let Some(blob) = cache.get(&handle) {
+        return blob.clone();
+    }
+    let blob = fetch_blob(handle);
+    cache.insert(handle, blob.clone());
+    blob
+}
+
+fn read_blob<F>(
+    handle: Inline<Handle<SimpleArchive>>,
+    cache: &mut BTreeMap<Inline<Handle<SimpleArchive>>, Option<Blob<SimpleArchive>>>,
+    fetch_blob: &mut F,
+    missing: &mut BTreeSet<Inline<Handle<SimpleArchive>>>,
+    diagnostics: &mut Vec<PolicyLedgerDiagnostic>,
+) -> Option<Blob<SimpleArchive>>
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    let Some(blob) = cached_fetch(cache, fetch_blob, handle) else {
+        missing.insert(handle);
+        return None;
+    };
+    let actual = blob.get_handle();
+    if actual != handle {
+        diagnostics.push(PolicyLedgerDiagnostic::HandleMismatch {
+            expected: handle,
+            actual,
+        });
+        return None;
+    }
+    Some(blob)
+}
+
+fn read_event<F>(
+    handle: Inline<Handle<SimpleArchive>>,
+    cache: &mut BTreeMap<Inline<Handle<SimpleArchive>>, Option<Blob<SimpleArchive>>>,
+    fetch_blob: &mut F,
+    missing: &mut BTreeSet<Inline<Handle<SimpleArchive>>>,
+    diagnostics: &mut Vec<PolicyLedgerDiagnostic>,
+) -> Option<PolicyEvent>
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    let blob = read_blob(handle, cache, fetch_blob, missing, diagnostics)?;
+    match PolicyEvent::decode(blob) {
+        Ok(event) => Some(event),
+        Err(error) => {
+            diagnostics.push(PolicyLedgerDiagnostic::InvalidEvent { handle, error });
+            None
+        }
+    }
+}
+
+fn same_scope_facts(left: &VerifiedCapability, right: &VerifiedCapability) -> bool {
+    left.scope_root == right.scope_root
+        && left
+            .cap_set
+            .iter()
+            .filter(|fact| fact.e() == &left.scope_root)
+            .eq(right
+                .cap_set
+                .iter()
+                .filter(|fact| fact.e() == &right.scope_root))
+}
+
+fn compare_issuances(left: &ValidIssuance, right: &ValidIssuance) -> std::cmp::Ordering {
+    let left_expiry = left.capability.expires_at();
+    let right_expiry = right.capability.expires_at();
+    if left_expiry < right_expiry {
+        std::cmp::Ordering::Less
+    } else if left_expiry > right_expiry {
+        std::cmp::Ordering::Greater
+    } else {
+        left.sig.cmp(&right.sig)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triblespace_core::repo::pin_assertion::PinAssertionSnapshot;
+    use hifitime::Duration;
+    use triblespace_core::inline::TryToInline;
+    use triblespace_core::repo::capability::{
+        self, PERM_ADMIN, PERM_READ, PERM_WRITE, build_capability, build_founder_anchor,
+    };
 
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
@@ -454,6 +1081,121 @@ mod tests {
             key(5).verifying_key(),
             triblespace_core::id::id_hex!("00112233445566778899AABBCCDDEEFF"),
         )
+    }
+
+    struct LedgerFixture {
+        root: SigningKey,
+        author: SigningKey,
+        subject: SigningKey,
+        scope_root: Id,
+        now: Epoch,
+        anchor_cap: Blob<SimpleArchive>,
+        anchor_sig: Blob<SimpleArchive>,
+        blobs: BTreeMap<Inline<Handle<SimpleArchive>>, Blob<SimpleArchive>>,
+    }
+
+    impl LedgerFixture {
+        fn new() -> Self {
+            let root = key(21);
+            let author = key(22);
+            let subject = key(23);
+            let scope_root = *triblespace_core::id::ufoid();
+            let parent_scope = TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @ metadata::tag: PERM_ADMIN,
+            });
+            let (anchor_cap, anchor_sig) =
+                build_founder_anchor(&root, author.verifying_key(), scope_root, parent_scope)
+                    .unwrap();
+            let mut blobs = BTreeMap::new();
+            blobs.insert(anchor_cap.get_handle(), anchor_cap.clone());
+            Self {
+                root,
+                author,
+                subject,
+                scope_root,
+                now: crate::clock::epoch_now(),
+                anchor_cap,
+                anchor_sig,
+                blobs,
+            }
+        }
+
+        fn interval(
+            &self,
+            seconds: f64,
+        ) -> Inline<triblespace_core::inline::encodings::time::NsTAIInterval> {
+            (self.now, self.now + Duration::from_seconds(seconds))
+                .try_to_inline()
+                .unwrap()
+        }
+
+        fn scope(&self, permission: Id) -> TribleSet {
+            TribleSet::from(entity! {
+                ExclusiveId::force_ref(&self.scope_root) @ metadata::tag: permission,
+            })
+        }
+
+        fn issue(
+            &mut self,
+            permission: Id,
+            seconds: f64,
+        ) -> (Inline<Handle<SimpleArchive>>, Inline<Handle<SimpleArchive>>) {
+            let (cap, sig) = build_capability(
+                &self.author,
+                self.subject.verifying_key(),
+                (self.anchor_cap.clone(), self.anchor_sig.clone()),
+                self.scope_root,
+                self.scope(permission),
+                self.interval(seconds),
+            )
+            .unwrap();
+            let cap_handle = cap.get_handle();
+            let sig_handle = sig.get_handle();
+            self.blobs.insert(cap_handle, cap);
+            self.blobs.insert(sig_handle, sig);
+            (cap_handle, sig_handle)
+        }
+
+        fn request(&mut self, subject: VerifyingKey, permission: Id) -> RequestIdentity {
+            let fragment = entity! {
+                capability::cap_subject: subject,
+                capability::cap_issuer: self.author.verifying_key(),
+                capability::cap_scope_root: self.scope_root,
+                metadata::expires_at: self.interval(1_000.0),
+            };
+            let mut set = TribleSet::from(fragment);
+            set += self.scope(permission);
+            let blob = set.to_blob();
+            let handle = blob.get_handle();
+            self.blobs.insert(handle, blob);
+            RequestIdentity::new(subject, handle)
+        }
+
+        fn store_event(&mut self, event: PolicyEvent) -> Inline<Handle<SimpleArchive>> {
+            let blob = event.to_blob();
+            let handle = blob.get_handle();
+            self.blobs.insert(handle, blob);
+            handle
+        }
+
+        fn assertion(&mut self, event: PolicyEvent) -> PinAssertion {
+            self.store_event(event);
+            sign_policy_event(&self.author, event)
+        }
+
+        fn resolve(&self, snapshot: &PinAssertionSnapshot) -> PolicyLedgerResolution {
+            resolve_policy_ledger(snapshot, self.author.verifying_key(), |handle| {
+                self.blobs.get(&handle).cloned()
+            })
+        }
+
+        fn grant(&self) -> GrantIdentity {
+            GrantIdentity::new(
+                self.root.verifying_key(),
+                self.subject.verifying_key(),
+                self.scope_root,
+            )
+        }
     }
 
     #[test]
@@ -485,7 +1227,6 @@ mod tests {
             PolicyEvent::RequestRejected(request()),
             PolicyEvent::GrantIssued {
                 grant: grant(),
-                cap: handle(6),
                 sig: handle(7),
                 request: Some(observed.handle()),
             },
@@ -521,6 +1262,261 @@ mod tests {
         assert!(matches!(
             PolicyEvent::decode(set.to_blob()),
             Err(PolicyEventError::Malformed | PolicyEventError::NonCanonical)
+        ));
+    }
+
+    #[test]
+    fn provenance_alone_observes_and_approves_the_exact_request() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let observed = PolicyEvent::RequestObserved(request);
+        let observed_handle = fixture.store_event(observed);
+        let (cap, sig) = fixture.issue(PERM_READ, 200.0);
+        let grant = fixture.grant();
+        let issued = fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig,
+            request: Some(observed_handle),
+        });
+        let authenticated = fixture.assertion(PolicyEvent::CredentialAuthenticated { grant, sig });
+        let disabled = fixture.assertion(PolicyEvent::GrantDisabled(grant));
+        let rejected = fixture.assertion(PolicyEvent::RequestRejected(request));
+        let mut snapshot = PinAssertionSnapshot::new();
+        for assertion in [disabled, issued, rejected, authenticated] {
+            snapshot.insert(assertion).unwrap();
+        }
+
+        let PolicyLedgerResolution::Complete(view) = fixture.resolve(&snapshot) else {
+            panic!("complete closure must produce an operational view");
+        };
+        let request_view = view.requests().get(&request).unwrap();
+        assert!(request_view.observed());
+        assert!(request_view.rejected());
+        assert_eq!(request_view.issued_signatures(), &BTreeSet::from([sig]));
+        assert!(!request_view.is_pending());
+
+        let grant_view = view.grants().get(&grant).unwrap();
+        assert!(grant_view.disabled());
+        assert!(grant_view.active_current().is_none());
+        let GrantIssuanceResolution::Current(current) = grant_view.issuance() else {
+            panic!("one valid issuance must be current");
+        };
+        assert_eq!(current.cap(), cap);
+        assert_eq!(current.sig(), sig);
+        assert!(current.authenticated());
+    }
+
+    #[test]
+    fn current_selection_is_order_independent_and_scope_conflict_stops_selection() {
+        let mut fixture = LedgerFixture::new();
+        let grant = fixture.grant();
+        let (_short_cap, short_sig) = fixture.issue(PERM_READ, 100.0);
+        let (long_cap, long_sig) = fixture.issue(PERM_READ, 300.0);
+        let short = fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig: short_sig,
+            request: None,
+        });
+        let long = fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig: long_sig,
+            request: None,
+        });
+
+        for assertions in [[short, long], [long, short]] {
+            let mut snapshot = PinAssertionSnapshot::new();
+            for assertion in assertions {
+                snapshot.insert(assertion).unwrap();
+            }
+            let PolicyLedgerResolution::Complete(view) = fixture.resolve(&snapshot) else {
+                panic!("complete closure must resolve");
+            };
+            let GrantIssuanceResolution::Current(current) =
+                view.grants().get(&grant).unwrap().issuance()
+            else {
+                panic!("equal-scope siblings must select a current credential");
+            };
+            assert_eq!(current.cap(), long_cap);
+            assert_eq!(current.sig(), long_sig);
+            assert!(!current.authenticated());
+            assert_eq!(
+                view.grants()
+                    .get(&grant)
+                    .unwrap()
+                    .active_current()
+                    .unwrap()
+                    .sig(),
+                long_sig
+            );
+        }
+
+        let (_write_cap, write_sig) = fixture.issue(PERM_WRITE, 400.0);
+        let write = fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig: write_sig,
+            request: None,
+        });
+        let mut conflicted = PinAssertionSnapshot::new();
+        for assertion in [short, long, write] {
+            conflicted.insert(assertion).unwrap();
+        }
+        let PolicyLedgerResolution::Complete(view) = fixture.resolve(&conflicted) else {
+            panic!("understood scope disagreement is a local conflict");
+        };
+        let GrantIssuanceResolution::Conflicted { signatures } =
+            view.grants().get(&grant).unwrap().issuance()
+        else {
+            panic!("different exact scope facts must not be hash-arbitrated");
+        };
+        assert_eq!(
+            signatures,
+            &BTreeSet::from([short_sig, long_sig, write_sig])
+        );
+    }
+
+    #[test]
+    fn missing_content_and_invalid_request_fail_the_whole_ledger_closed() {
+        let fixture = LedgerFixture::new();
+        let missing_event = PolicyEvent::RequestRejected(RequestIdentity::new(
+            fixture.subject.verifying_key(),
+            handle(31),
+        ));
+        let mut missing_snapshot = PinAssertionSnapshot::new();
+        missing_snapshot
+            .insert(sign_policy_event(&fixture.author, missing_event))
+            .unwrap();
+        let PolicyLedgerResolution::Incomplete { missing } = fixture.resolve(&missing_snapshot)
+        else {
+            panic!("an absent event value must suppress the whole view");
+        };
+        assert_eq!(missing, vec![missing_event.handle()]);
+
+        let mut invalid_fixture = LedgerFixture::new();
+        let wrong_subject = key(32).verifying_key();
+        let request = invalid_fixture.request(wrong_subject, PERM_READ);
+        let lied_about_requester = RequestIdentity::new(
+            invalid_fixture.subject.verifying_key(),
+            request.partial_cap(),
+        );
+        let assertion =
+            invalid_fixture.assertion(PolicyEvent::RequestObserved(lied_about_requester));
+        let mut invalid_snapshot = PinAssertionSnapshot::new();
+        invalid_snapshot.insert(assertion).unwrap();
+        let PolicyLedgerResolution::Invalid { diagnostics } =
+            invalid_fixture.resolve(&invalid_snapshot)
+        else {
+            panic!("a present identity-mismatched request must fail closed");
+        };
+        assert!(matches!(
+            diagnostics.as_slice(),
+            [PolicyLedgerDiagnostic::InvalidRequest {
+                reason: InvalidRequestReason::SubjectMismatch { .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn missing_and_invalid_grant_proofs_fail_the_whole_ledger_closed() {
+        let mut missing_fixture = LedgerFixture::new();
+        let grant = missing_fixture.grant();
+        let missing_sig = handle(41);
+        let assertion = missing_fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig: missing_sig,
+            request: None,
+        });
+        let mut snapshot = PinAssertionSnapshot::new();
+        snapshot.insert(assertion).unwrap();
+        let PolicyLedgerResolution::Incomplete { missing } = missing_fixture.resolve(&snapshot)
+        else {
+            panic!("an absent named proof must suppress the whole view");
+        };
+        assert_eq!(missing, vec![missing_sig]);
+
+        let mut invalid_fixture = LedgerFixture::new();
+        let grant = invalid_fixture.grant();
+        let invalid_sig_blob = PolicyEvent::GrantDisabled(grant).to_blob();
+        let invalid_sig = invalid_sig_blob.get_handle();
+        invalid_fixture.blobs.insert(invalid_sig, invalid_sig_blob);
+        let assertion = invalid_fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig: invalid_sig,
+            request: None,
+        });
+        let mut snapshot = PinAssertionSnapshot::new();
+        snapshot.insert(assertion).unwrap();
+        let PolicyLedgerResolution::Invalid { diagnostics } = invalid_fixture.resolve(&snapshot)
+        else {
+            panic!("a present malformed proof must be invalid, not unavailable");
+        };
+        assert!(matches!(
+            diagnostics.as_slice(),
+            [PolicyLedgerDiagnostic::InvalidIssuance {
+                reason: InvalidIssuanceReason::Proof(_),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn proof_fetch_rejects_valid_content_returned_for_the_wrong_handle() {
+        let mut fixture = LedgerFixture::new();
+        let grant = fixture.grant();
+        let (_cap, real_sig) = fixture.issue(PERM_READ, 200.0);
+        let claimed_sig = handle(42);
+        let assertion = fixture.assertion(PolicyEvent::GrantIssued {
+            grant,
+            sig: claimed_sig,
+            request: None,
+        });
+        let mut snapshot = PinAssertionSnapshot::new();
+        snapshot.insert(assertion).unwrap();
+
+        let result =
+            resolve_policy_ledger(&snapshot, fixture.author.verifying_key(), |requested| {
+                let actual = if requested == claimed_sig {
+                    real_sig
+                } else {
+                    requested
+                };
+                fixture.blobs.get(&actual).cloned()
+            });
+        let PolicyLedgerResolution::Invalid { diagnostics } = result else {
+            panic!("content returned under the wrong handle must fail closed");
+        };
+        assert!(matches!(
+            diagnostics.as_slice(),
+            [PolicyLedgerDiagnostic::HandleMismatch {
+                expected,
+                actual,
+            }] if *expected == claimed_sig && *actual == real_sig
+        ));
+    }
+
+    #[test]
+    fn provenance_cannot_turn_a_read_request_into_a_write_grant() {
+        let mut fixture = LedgerFixture::new();
+        let request = fixture.request(fixture.subject.verifying_key(), PERM_READ);
+        let request_handle = fixture.store_event(PolicyEvent::RequestObserved(request));
+        let (_cap, sig) = fixture.issue(PERM_WRITE, 200.0);
+        let assertion = fixture.assertion(PolicyEvent::GrantIssued {
+            grant: fixture.grant(),
+            sig,
+            request: Some(request_handle),
+        });
+        let mut snapshot = PinAssertionSnapshot::new();
+        snapshot.insert(assertion).unwrap();
+
+        let PolicyLedgerResolution::Invalid { diagnostics } = fixture.resolve(&snapshot) else {
+            panic!("an issuance broader than its cited request must fail closed");
+        };
+        assert!(matches!(
+            diagnostics.as_slice(),
+            [PolicyLedgerDiagnostic::InvalidIssuance {
+                reason: InvalidIssuanceReason::ExceedsRequestedScope,
+                ..
+            }]
         ));
     }
 

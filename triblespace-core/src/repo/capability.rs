@@ -781,6 +781,60 @@ fn extract_cap_fields(cap_set: &TribleSet) -> Result<CapFields, VerifyError> {
     })
 }
 
+/// Strictly parsed finite operational capability declaration before any
+/// signature or delegation proof is applied.
+///
+/// This is the narrow boundary for authenticated request intent. It applies
+/// the same unique declaration, finite-expiry, and founder-anchor distinction
+/// as [`verify_chain`], without pretending that an unsigned claim carries
+/// authority. Callers must separately bind `subject` and `issuer` to the
+/// authenticated parties that are allowed to make the request.
+#[derive(Debug, Clone)]
+pub struct OperationalCapability {
+    pub entity: crate::id::Id,
+    pub subject: VerifyingKey,
+    pub issuer: VerifyingKey,
+    pub scope_root: crate::id::Id,
+    pub cap_set: TribleSet,
+    pub expiry: Inline<NsTAIInterval>,
+    pub valid_from: Epoch,
+    pub expires_at: Epoch,
+}
+
+/// Parse one canonical archive as a finite operational capability claim.
+///
+/// The interval must decode successfully. Founder anchors and mixed/ambiguous
+/// declaration shapes are rejected through the ordinary verifier errors.
+pub fn decode_operational_capability(
+    blob: Blob<SimpleArchive>,
+) -> Result<OperationalCapability, VerifyError> {
+    let cap_set: TribleSet = TryFromBlob::try_from_blob(blob)?;
+    let fields = extract_cap_fields(&cap_set)?;
+    let CapKind::Operational { expiry } = fields.kind else {
+        return Err(VerifyError::FounderAnchorAsLeaf);
+    };
+    let (valid_from, expires_at) = decode_expiry_interval(&expiry)?;
+    Ok(OperationalCapability {
+        entity: fields.cap_id,
+        subject: fields.subject,
+        issuer: fields.issuer,
+        scope_root: fields.scope_root,
+        cap_set,
+        expiry,
+        valid_from,
+        expires_at,
+    })
+}
+
+fn decode_expiry_interval(expiry: &Inline<NsTAIInterval>) -> Result<(Epoch, Epoch), VerifyError> {
+    let (lower, upper) =
+        <(Epoch, Epoch)>::try_from_inline(expiry).map_err(|_| VerifyError::Expired)?;
+    if upper < lower {
+        return Err(VerifyError::Expired);
+    }
+    Ok((lower, upper))
+}
+
 #[derive(Debug, Clone)]
 enum CapKind {
     Operational { expiry: Inline<NsTAIInterval> },
@@ -789,7 +843,6 @@ enum CapKind {
 
 #[derive(Debug, Clone)]
 struct CapFields {
-    #[allow(dead_code)]
     cap_id: crate::id::Id,
     subject: VerifyingKey,
     issuer: VerifyingKey,
@@ -935,13 +988,38 @@ pub fn verify_chain_allow_expired<F>(
 where
     F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
-    Ok(verify_chain_inner(
-        Some(team_root),
+    Ok(verify_chain_details_allow_expired(
+        team_root,
         leaf_sig_handle,
         expected_subject,
         fetch_blob,
     )?
     .capability)
+}
+
+/// Verify a complete capability proof against a known team root while
+/// retaining the exact leaf identities discovered during the walk.
+///
+/// This has the same expired-tolerant verification semantics as
+/// [`verify_chain_allow_expired`], but returns the leaf capability handle and
+/// issuer alongside the verified capability. Typed replicated-state reducers
+/// use those fields to bind a signed effect to the exact proof it names rather
+/// than reparsing the proof through a second, weaker path.
+pub fn verify_chain_details_allow_expired<F>(
+    team_root: VerifyingKey,
+    leaf_sig_handle: Inline<Handle<SimpleArchive>>,
+    expected_subject: VerifyingKey,
+    fetch_blob: F,
+) -> Result<VerifiedCapabilityChain, VerifyError>
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    verify_chain_inner(
+        Some(team_root),
+        leaf_sig_handle,
+        expected_subject,
+        fetch_blob,
+    )
 }
 
 /// Verify a complete capability proof while discovering its team root.
@@ -979,9 +1057,7 @@ where
     // A cap is valid through the inclusive upper bound of its expiry
     // interval. Malformed/inverted intervals fail closed as Expired.
     let expiry_upper = |expiry: &Inline<NsTAIInterval>| -> Result<Epoch, VerifyError> {
-        <(Epoch, Epoch)>::try_from_inline(expiry)
-            .map(|(_lower, upper)| upper)
-            .map_err(|_| VerifyError::Expired)
+        decode_expiry_interval(expiry).map(|(_lower, upper)| upper)
     };
 
     // ── Leaf step ────────────────────────────────────────────────────
@@ -1475,6 +1551,138 @@ mod tests {
                 fetch_from(&blobs),
             ),
             Err(VerifyError::FounderAnchorRequired)
+        ));
+    }
+
+    #[test]
+    fn details_allow_expired_matches_projection_and_reports_leaf_identity() {
+        let team_root = key();
+        let founder = key();
+        let subject = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (scope_root, scope_facts) = empty_scope();
+        let (cap, sig) = build_capability(
+            &founder,
+            subject.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope_facts,
+            expired_interval(),
+        )
+        .expect("build expired finite capability");
+        let cap_handle = cap.get_handle();
+        let sig_handle = sig.get_handle();
+        let blobs = [anchor_cap, anchor_sig, cap, sig];
+
+        let details = verify_chain_details_allow_expired(
+            team_root.verifying_key(),
+            sig_handle,
+            subject.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("details wrapper accepts an otherwise-valid expired proof");
+        let projected = verify_chain_allow_expired(
+            team_root.verifying_key(),
+            sig_handle,
+            subject.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("legacy projection accepts the same expired proof");
+
+        assert_eq!(details.team_root, team_root.verifying_key());
+        assert_eq!(details.leaf_cap, cap_handle);
+        assert_eq!(details.leaf_issuer, founder.verifying_key());
+        assert_eq!(details.capability.subject, projected.subject);
+        assert_eq!(details.capability.scope_root, projected.scope_root);
+        assert_eq!(details.capability.cap_set, projected.cap_set);
+        assert_eq!(details.capability.expires_at(), projected.expires_at());
+        assert!(details.capability.is_expired());
+    }
+
+    #[test]
+    fn operational_capability_decode_preserves_claim_and_rejects_anchor() {
+        let team_root = key();
+        let founder = key();
+        let subject = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (scope_root, scope_facts) = empty_scope();
+        let expiry = interval(3600.0);
+        let (expected_lower, expected_upper) =
+            <(Epoch, Epoch)>::try_from_inline(&expiry).expect("decode test interval");
+        let (cap, _sig) = build_capability(
+            &founder,
+            subject.verifying_key(),
+            (anchor_cap.clone(), anchor_sig),
+            scope_root,
+            scope_facts,
+            expiry,
+        )
+        .expect("build finite capability claim");
+
+        let decoded = decode_operational_capability(cap.clone())
+            .expect("finite operational capability decodes");
+        let expected_set: TribleSet = TryFromBlob::try_from_blob(cap).expect("decode cap set");
+        let expected_entity = find!(
+            (entity: Id, subject: VerifyingKey),
+            pattern!(&expected_set, [{ ?entity @ cap_subject: ?subject }])
+        )
+        .map(|(entity, _)| entity)
+        .next()
+        .expect("capability declaration entity");
+
+        assert_eq!(decoded.entity, expected_entity);
+        assert_eq!(decoded.subject, subject.verifying_key());
+        assert_eq!(decoded.issuer, founder.verifying_key());
+        assert_eq!(decoded.scope_root, scope_root);
+        assert_eq!(decoded.cap_set, expected_set);
+        assert_eq!(decoded.expiry, expiry);
+        assert_eq!(decoded.valid_from, expected_lower);
+        assert_eq!(decoded.expires_at, expected_upper);
+        assert!(matches!(
+            decode_operational_capability(anchor_cap),
+            Err(VerifyError::FounderAnchorAsLeaf)
+        ));
+    }
+
+    #[test]
+    fn inverted_operational_interval_fails_parser_and_details_verifier() {
+        let team_root = key();
+        let founder = key();
+        let subject = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (scope_root, scope_facts) = empty_scope();
+        let valid = interval(3600.0);
+        let mut inverted_raw = valid.raw;
+        inverted_raw[..16].copy_from_slice(&valid.raw[16..]);
+        inverted_raw[16..].copy_from_slice(&valid.raw[..16]);
+        let inverted = Inline::<NsTAIInterval>::new(inverted_raw);
+        assert!(!inverted.is_valid(), "fixture must actually be inverted");
+
+        let (cap, sig) = build_capability(
+            &founder,
+            subject.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope_facts,
+            inverted,
+        )
+        .expect("the builder signs typed bytes; verification validates them");
+        let sig_handle = sig.get_handle();
+
+        assert!(matches!(
+            decode_operational_capability(cap.clone()),
+            Err(VerifyError::Expired)
+        ));
+
+        let blobs = [anchor_cap, anchor_sig, cap, sig];
+        assert!(matches!(
+            verify_chain_details_allow_expired(
+                team_root.verifying_key(),
+                sig_handle,
+                subject.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::Expired)
         ));
     }
 

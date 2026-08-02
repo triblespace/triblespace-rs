@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full `PinAssertionId`, preserves unknown kinds, and verifies public semantic
   values lazily while memoizing both outcomes. Signature validity identifies an
   author but remains separate from foreign-author and pin-kind admission.
+- **Issuer policy has a canonical asserted-event model and deterministic
+  reducer.** One author-scoped strong ledger represents observed and rejected
+  requests, issued and authenticated credentials, and terminal grant disables
+  as positive facts. Reduction fails closed on missing or invalid closure,
+  verifies capability proofs and request provenance by exact content handle,
+  exposes rejection alongside already-issued effects, detects conflicting
+  scope facts, and selects coherent sibling credentials by effective chain
+  expiry with a signature-handle tie break.
 - **Branches are a typed adapter over generic asserted pins.** A canonical
   64-byte V2 `BranchPinDescriptor` blob contains its kind marker, canonical
   alignment padding, and LongString name handle. Its content handle is wrapped
