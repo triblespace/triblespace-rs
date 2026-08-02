@@ -20,16 +20,27 @@
 //! `memcmp`s it and never learns what it means, which is what keeps replay
 //! kind-agnostic: a peer must preserve and merge a kind it cannot interpret.
 //!
-//! Exactly one inference is sound:
+//! Exactly one inference is sound, and **this type deliberately does not offer
+//! it**:
 //!
-//! > `label(A) >= label(B)` proves **A is not an ancestor of B**.
+//! > For a kind whose encoding is strictly increasing along causality *under
+//! > bytewise order*, `label(A) >= label(B)` proves **A is not a strict
+//! > ancestor of B**, so that traversal — and any fetch it required — may be
+//! > skipped.
 //!
-//! It holds only when the issuing kind's encoding is strictly increasing along
-//! causality *under bytewise order*. It buys skipped ancestry traversals, and a
-//! traversal skipped is a fetch avoided — which is the whole point, since
-//! ancestry needs the chain but a label is already in the record.
+//! The proof obligation belongs to the typed resolver that owns the encoding,
+//! not to the label. A method here would be a false affordance: the bytes alone
+//! prove nothing, and any kind could call it. So this type exposes only opaque
+//! storage and bytewise [`Ord`]; a resolver that can discharge monotonicity
+//! compares labels itself, and one that cannot simply never does.
 //!
-//! The converse is **not** sound. Label order never proves subsumption and must
+//! Two traps the boundary exists to prevent. A **constant** label ties every
+//! comparison, and under `>=` a tie *licenses a skip* — so a "neutral" sentinel
+//! would silently grant skips on every pair rather than none. And equal labels
+//! rule out strict ancestry only between **distinct** values, so identical
+//! values must be grouped before any comparison.
+//!
+//! The converse is never sound. Label order does not prove subsumption and must
 //! never drop a claim: two divergent commits can share a depth, and a deeper
 //! branch does not subsume a shallower divergent one. A kind whose label is not
 //! provably monotone (wall-clock expiry, replica-local generation counters)
@@ -88,11 +99,6 @@ pub struct ValueHandle([u8; 32]);
 pub struct SubsumptionLabel([u8; 32]);
 
 impl SubsumptionLabel {
-    /// A label carrying no ordering information. Every comparison ties, so a
-    /// kind with no dominance relation (a grow-only want set, say) gets no
-    /// skips and needs none.
-    pub const NONE: Self = Self([0u8; 32]);
-
     /// Encode a depth-like counter: big-endian in the leading 8 bytes, zero
     /// tail. Big-endian is required — little-endian would order bytewise in a
     /// way that disagrees with numeric order, silently breaking monotonicity.
@@ -114,16 +120,6 @@ impl SubsumptionLabel {
 
     pub const fn raw(self) -> [u8; 32] {
         self.0
-    }
-
-    /// Sound use of the label, and the only one.
-    ///
-    /// Returns true when `self >= other` proves the labelled assertion cannot
-    /// be an ancestor of `other`'s, so the traversal — and any fetch it would
-    /// have required — can be skipped. Callers must only invoke this for kinds
-    /// whose encoding is proven causally monotone.
-    pub fn proves_not_ancestor_of(self, other: Self) -> bool {
-        self >= other
     }
 }
 
@@ -464,15 +460,31 @@ mod tests {
         );
     }
 
+    /// The label exposes ordering and nothing else. A resolver that has proven
+    /// monotonicity for its own encoding reads `a >= b` as "a is not a strict
+    /// ancestor of b"; this type neither performs nor sanctions that step.
     #[test]
-    fn label_proves_non_ancestry_only_and_none_ties_every_comparison() {
+    fn label_exposes_only_bytewise_order() {
         let deep = SubsumptionLabel::from_depth(9);
         let shallow = SubsumptionLabel::from_depth(2);
-        assert!(deep.proves_not_ancestor_of(shallow));
-        assert!(!shallow.proves_not_ancestor_of(deep));
-        // A kind with no dominance relation ties everywhere: no skips, and none
-        // are needed.
-        assert!(SubsumptionLabel::NONE.proves_not_ancestor_of(SubsumptionLabel::NONE));
+        assert!(deep > shallow);
+        assert!(!(shallow > deep));
+        assert_eq!(deep.raw()[..8], 9u64.to_be_bytes());
+    }
+
+    /// A constant label ties every comparison, and a tie satisfies `>=`. Had
+    /// the type shipped a "neutral" sentinel with a `proves_not_ancestor_of`
+    /// helper, a non-monotone kind would have been granted skips on EVERY pair
+    /// while appearing to opt out of skipping entirely. Caught by liora-gpt.
+    #[test]
+    fn a_constant_label_ties_and_a_tie_would_license_a_skip() {
+        let flat = SubsumptionLabel::from_raw([0u8; 32]);
+        assert!(flat >= flat, "ties satisfy >=, which is why no sentinel exists");
+        // Equal labels rule out STRICT ancestry only between distinct values,
+        // so identical values must be grouped before any comparison is made.
+        let a = PinAssertion::sign(&key(7), pin(1), val(2), flat);
+        let b = PinAssertion::sign(&key(7), pin(1), val(2), flat);
+        assert_eq!(a.id(), b.id(), "identical values dedupe rather than compare");
     }
 
     #[test]
