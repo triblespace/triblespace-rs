@@ -203,23 +203,14 @@ prioritized for efficient zero-copy access.
   replace the exact git-revision pins in `triblespace-core` and
   `triblespace-search` before the next crates.io release. The git pin is an
   intentional integration bridge, not the final publishable dependency.
-- Index-home kind IDs currently identify the implementation but not the full
-  index recipe. Derive or persist recipe identity for configuration such as a
-  BM25 content attribute/tokenizer version and HNSW dimensions/metric so
-  incompatible segment families cannot share one manifest or coverage
-  certificate.
 - Define archive-message semantics when one entity carries multiple content
   handles. BM25 preserves the union of their term presence, while result
   materialisation currently selects one matching body; either make the schema
   cardinality explicit or make resolution deterministic and test it.
-- Make `IndexKind::build` fallible (or split out a fallible resolver-backed
-  build surface). BM25/HNSW kinds cannot currently report an unreadable source
-  handle through the trait; archive indexing prevalidates LongString content,
-  but generic callers can otherwise build a segment that silently omits it.
-- Extend commit-native index-home testing with an interrupted bootstrap over a
-  true merge DAG (multi-tip frontier plus CAS conflict), an actual commit above
-  the physical shard threshold proving all shards share one atomic coverage
-  advance, and explicit backward/divergent branch-head rejection.
+- Extend immutable manifest maintenance testing with an interrupted bootstrap
+  over a true merge DAG, an actual commit above the physical shard threshold
+  proving all shards share one atomic coverage advance, and explicit
+  backward/divergent source-frontier rejection.
 - Property-test BM25 max-union compaction across randomized segment
   permutations, repeated multi-level FANOUT merges, and high term frequencies
   near score-quantization saturation.

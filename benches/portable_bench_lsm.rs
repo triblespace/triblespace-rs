@@ -1,6 +1,6 @@
-//! Portable engine benchmark v2 — LSM (index-home) arm.
+//! Portable engine benchmark v2 — LSM range-manifest arm.
 //!
-//! A SEPARATE bench target on purpose: the index-home API
+//! A SEPARATE bench target on purpose: the range-manifest API
 //! (`append_range` / `SuccinctRollup` / `Manifest` / `UnionArchive`) is
 //! tip-era surface that does not exist at older sweep commits. Keeping it in
 //! its own `[[bench]]` gives it an INDEPENDENT compilation fate — at commits
@@ -727,7 +727,7 @@ fn main() {
         i += 1;
     }
 
-    println!("engine   : current (query), LSM index-home arm");
+    println!("engine   : current (query), LSM range-manifest arm");
     println!(
         "config   : rung={rung} iters={iters} warmup={warmup} build_iters={build_iters} build_warmup={build_warmup} chunks={n_chunks} range_min={range_min}"
     );
@@ -742,7 +742,7 @@ fn main() {
     // Per iteration: a fresh scratch store seeded with the commit metadata
     // (untimed), then the timed streaming loop — leaf build, artifact puts,
     // and carry merges all inside `append_range`. Guarded: at commits where
-    // the index-home surface panics (rather than failing to compile) this
+    // the range-manifest surface panics (rather than failing to compile) this
     // records a PANIC outcome instead of a dead bench.
     let kind = SuccinctRollup::new();
     let mut all: Vec<(String, Outcome)> = Vec::new();

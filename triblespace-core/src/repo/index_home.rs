@@ -1,8 +1,8 @@
-//! Range-native homes for immutable, typed derived-index artifacts.
+//! Range-native manifests for immutable, typed derived-index artifacts.
 //!
-//! An index recipe owns a lossless manifest embedded in the branch head.  Its
+//! An index recipe owns one lossless, content-addressed manifest snapshot. Its
 //! logical LSM records cover inclusive regions of the source commit DAG; each
-//! record may name zero or more physical artifacts.  Empty records are real
+//! record may name zero or more physical artifacts. Empty records are real
 //! coverage certificates, while unusually large commits can put several
 //! repeated typed artifact handles on one logical `[commit, commit]` leaf.
 
@@ -36,7 +36,7 @@ use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
     RangeValidationError, StoredCommitDag,
 };
-use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinStore};
+use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle};
 use crate::trible::{Fragment, TribleSet};
 
 pub use crate::repo::index_range::CommitRange;
@@ -250,6 +250,10 @@ pub enum ManifestError {
     Artifact(ArtifactError),
     /// The recipe sequence stream overflowed.
     SequenceOverflow,
+    /// A persisted blob contained facts outside this one exact manifest.
+    NotStandalone { recipe: Id },
+    /// A manifest was attached through a different runtime recipe instance.
+    RecipeMismatch { expected: Id, actual: Id },
 }
 
 impl fmt::Display for ManifestError {
@@ -283,6 +287,14 @@ impl fmt::Display for ManifestError {
             Self::Range(error) => error.fmt(f),
             Self::Artifact(error) => write!(f, "invalid typed index artifacts: {error}"),
             Self::SequenceOverflow => write!(f, "index manifest sequence overflow"),
+            Self::NotStandalone { recipe } => write!(
+                f,
+                "stored blob is not exactly the index manifest for recipe {recipe:x}"
+            ),
+            Self::RecipeMismatch { expected, actual } => write!(
+                f,
+                "index manifest recipe {actual:x} does not match runtime recipe {expected:x}"
+            ),
         }
     }
 }
@@ -330,8 +342,10 @@ impl<K: IndexKind> Manifest<K> {
         })
     }
 
-    /// Parse this recipe from a branch-head tribleset while retaining every
-    /// fact on its header and ranges. No legacy ontology is recognised.
+    /// Parse this recipe from a transient fact set while retaining every fact
+    /// on its header and ranges. An absent recipe starts empty so several
+    /// recipes can be maintained compositionally in memory; persisted values
+    /// should enter through [`load_manifest`] for standalone validation.
     pub fn from_tribles<R: BlobStoreGet>(
         set: &TribleSet,
         reader: &R,
@@ -559,54 +573,23 @@ fn entity_facts(set: &TribleSet, entity: Id) -> TribleSet {
 }
 
 fn replace_manifest_subjects<K: IndexKind>(
-    head_set: &mut TribleSet,
+    manifest_set: &mut TribleSet,
     retired: impl IntoIterator<Item = Id>,
     replacement: &Manifest<K>,
 ) {
     let retired: HashSet<_> = retired.into_iter().collect();
     let mut next = TribleSet::new();
-    for fact in head_set.iter().filter(|fact| !retired.contains(fact.e())) {
+    for fact in manifest_set
+        .iter()
+        .filter(|fact| !retired.contains(fact.e()))
+    {
         next.insert(fact);
     }
     next += replacement.to_tribles();
-    *head_set = next;
+    *manifest_set = next;
 }
 
-/// Carry every complete entity bearing `index_recipe` into a rebuilt branch
-/// head. Unknown attributes and unknown recipes are copied byte-for-byte;
-/// legacy `seg_kind`/`seg_blob` facts are neither recognised nor emitted.
-pub fn manifest_tribles(set: &TribleSet) -> TribleSet {
-    let entities: HashSet<Id> = find!(
-        entity: Id,
-        pattern!(set, [{ ?entity @ crate::repo::index_range::index_recipe: _?recipe }])
-    )
-    .collect();
-    let mut out = TribleSet::new();
-    for fact in set.iter().filter(|fact| entities.contains(fact.e())) {
-        out.insert(fact);
-    }
-    out
-}
-
-/// Remove one recipe's complete header/range entities without parsing any
-/// artifact blob. This is the corruption-repair escape hatch for soft state:
-/// missing or malformed accelerators can make typed parsing fail, but never
-/// prevent an operator from stripping and rebuilding the recipe manifest.
-pub fn strip_recipe_manifest(head_set: &mut TribleSet, recipe: Id) {
-    let mut entities: HashSet<Id> = find!(
-        entity: Id,
-        pattern!(&*head_set, [{ ?entity @ crate::repo::index_range::index_recipe: recipe }])
-    )
-    .collect();
-    entities.insert(recipe);
-    let mut next = TribleSet::new();
-    for fact in head_set.iter().filter(|fact| !entities.contains(fact.e())) {
-        next.insert(fact);
-    }
-    *head_set = next;
-}
-
-/// Index-home operation failure.
+/// Index-manifest operation failure.
 #[derive(Debug)]
 pub enum IndexError {
     /// Storage operation failed.
@@ -619,28 +602,18 @@ pub enum IndexError {
     Merge(ArtifactError),
     /// Victim ranges could not be compacted without filling a DAG hole.
     Range(ArtifactError),
-    /// The mutable branch pin advanced concurrently.
-    Conflict,
-    /// A present branch-metadata blob did not describe exactly one matching
-    /// branch entity with at most one source head.
-    InvalidSourceBranchMetadata,
-    /// The manifest does not certify the source head read with it.
+    /// The manifest does not certify the authoritative source head.
     StaleCoverage(CoverageMismatch),
 }
 
 impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Storage(error) => write!(f, "index-home storage error: {error}"),
+            Self::Storage(error) => write!(f, "index-manifest storage error: {error}"),
             Self::Manifest(error) => error.fmt(f),
             Self::Artifact(error) => write!(f, "index artifact error: {error}"),
             Self::Merge(error) => write!(f, "index merge error: {error}"),
             Self::Range(error) => write!(f, "index range error: {error}"),
-            Self::Conflict => write!(f, "index-home manifest pin advanced concurrently"),
-            Self::InvalidSourceBranchMetadata => write!(
-                f,
-                "index-home pin does not contain one valid source branch entity"
-            ),
             Self::StaleCoverage(error) => error.fmt(f),
         }
     }
@@ -655,41 +628,7 @@ impl Error for IndexError {
             | Self::Range(error) => Some(error.as_ref()),
             Self::Manifest(error) => Some(error),
             Self::StaleCoverage(error) => Some(error),
-            Self::Conflict | Self::InvalidSourceBranchMetadata => None,
         }
-    }
-}
-
-/// One branch-metadata read and the typed manifest parsed from those exact
-/// bytes.
-///
-/// Keeping the metadata pin, source commit head, and manifest together lets a
-/// consumer freshness-check an attached index without a second branch lookup.
-pub struct IndexSnapshot<K: IndexKind> {
-    metadata_head: Option<Inline<Handle<SimpleArchive>>>,
-    source_head: Option<CommitHandle>,
-    manifest: Manifest<K>,
-}
-
-impl<K: IndexKind> IndexSnapshot<K> {
-    /// Pin value naming the branch-metadata blob read for this snapshot.
-    pub fn metadata_head(&self) -> Option<Inline<Handle<SimpleArchive>>> {
-        self.metadata_head
-    }
-
-    /// Source commit head named by the same branch-metadata blob.
-    pub fn source_head(&self) -> Option<CommitHandle> {
-        self.source_head
-    }
-
-    /// Typed manifest parsed from the same branch-metadata blob.
-    pub fn manifest(&self) -> &Manifest<K> {
-        &self.manifest
-    }
-
-    /// Consume the snapshot and return its typed manifest.
-    pub fn into_manifest(self) -> Manifest<K> {
-        self.manifest
     }
 }
 
@@ -705,6 +644,69 @@ fn storage_error(error: impl Error + Send + Sync + 'static) -> IndexError {
 
 fn range_error(error: impl Error + Send + Sync + 'static) -> IndexError {
     IndexError::Range(Box::new(error))
+}
+
+/// Persist one exact, self-describing recipe manifest as an immutable blob.
+pub fn store_manifest<S: BlobStorePut, K: IndexKind>(
+    storage: &mut S,
+    manifest: &Manifest<K>,
+) -> Result<Inline<Handle<SimpleArchive>>, IndexError> {
+    storage
+        .put::<SimpleArchive, _>(manifest.to_tribles())
+        .map_err(storage_error)
+}
+
+/// Load one exact, self-describing recipe manifest.
+///
+/// The equality check rejects an arbitrary empty archive, unrelated subjects,
+/// branch wrappers, and blobs containing more than one recipe. Unknown facts
+/// on entities owned by this manifest remain losslessly valid. This is a
+/// structural check, not an O(history) cover audit: never fact-union whole
+/// snapshots of the same recipe, and call [`Manifest::audit_exact_cover`] on
+/// imported or otherwise untrusted values.
+pub fn load_manifest<R: BlobStoreGet, K: IndexKind>(
+    reader: &R,
+    kind: &K,
+    handle: Inline<Handle<SimpleArchive>>,
+) -> Result<Manifest<K>, IndexError> {
+    let input = reader
+        .get::<TribleSet, SimpleArchive>(handle)
+        .map_err(storage_error)?;
+    let manifest = Manifest::from_tribles(&input, reader, kind)?;
+    if input != manifest.to_tribles() {
+        return Err(ManifestError::NotStandalone {
+            recipe: manifest.recipe(),
+        }
+        .into());
+    }
+    Ok(manifest)
+}
+
+/// Attach every physical artifact in one already-loaded manifest.
+pub fn attach_manifest<R: BlobStoreGet, K: IndexKind>(
+    reader: &R,
+    kind: &K,
+    manifest: &Manifest<K>,
+) -> Result<Vec<K::Segment>, IndexError> {
+    let (expected, _) = recipe_descriptor(kind)?;
+    if expected != manifest.recipe {
+        return Err(ManifestError::RecipeMismatch {
+            expected,
+            actual: manifest.recipe,
+        }
+        .into());
+    }
+
+    let mut segments = Vec::new();
+    for range in &manifest.ranges {
+        for artifact in &range.artifacts {
+            segments.push(
+                kind.attach(reader, artifact)
+                    .map_err(IndexError::Artifact)?,
+            );
+        }
+    }
+    Ok(segments)
 }
 
 /// Persist one prepared physical artifact without touching the manifest.
@@ -761,17 +763,17 @@ fn make_entry<K: IndexKind>(
 ///
 /// Fanout counts range records, not physical shards. Every merge validates the
 /// exact convex union of its victim ranges against the commit DAG. Blob puts
-/// may leave unreachable CAS values on failure, but `head_set` is replaced
-/// only after the complete carry succeeds.
+/// may leave unreachable content-addressed values on failure, but
+/// `manifest_set` is replaced only after the complete carry succeeds.
 pub fn append_stored_range<S: BlobStore, K: IndexKind>(
     storage: &mut S,
     kind: &K,
     range: CommitRange,
     artifacts: Vec<K::StoredArtifact>,
-    head_set: &mut TribleSet,
+    manifest_set: &mut TribleSet,
 ) -> Result<(), IndexError> {
     let reader = storage.reader().map_err(storage_error)?;
-    let mut manifest = Manifest::from_tribles(head_set, &reader, kind)?;
+    let mut manifest = Manifest::from_tribles(manifest_set, &reader, kind)?;
     let retired: Vec<_> = manifest.subjects().collect();
     let pending_entity = RangeRecord::new(manifest.recipe, range.clone()).entity();
     if manifest
@@ -845,7 +847,7 @@ pub fn append_stored_range<S: BlobStore, K: IndexKind>(
         pending = (merged_range, stored, next_level);
     }
 
-    replace_manifest_subjects(head_set, retired, &manifest);
+    replace_manifest_subjects(manifest_set, retired, &manifest);
     Ok(())
 }
 
@@ -856,13 +858,13 @@ pub fn append_prepared_range<S: BlobStore, K: IndexKind>(
     kind: &K,
     range: CommitRange,
     artifacts: Vec<K::PreparedArtifact>,
-    head_set: &mut TribleSet,
+    manifest_set: &mut TribleSet,
 ) -> Result<(), IndexError> {
     let mut stored = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         stored.push(store_artifact(storage, kind, artifact)?);
     }
-    append_stored_range(storage, kind, range, stored, head_set)
+    append_stored_range(storage, kind, range, stored, manifest_set)
 }
 
 /// Build and append one logical source range.
@@ -871,55 +873,54 @@ pub fn append_range<S: BlobStore, K: IndexKind>(
     kind: &K,
     source: &TribleSet,
     range: CommitRange,
-    head_set: &mut TribleSet,
+    manifest_set: &mut TribleSet,
 ) -> Result<(), IndexError> {
     let prepared = kind.build(source).map_err(IndexError::Artifact)?;
-    append_prepared_range(storage, kind, range, prepared, head_set)
+    append_prepared_range(storage, kind, range, prepared, manifest_set)
 }
 
 /// Replace the maximal source frontier for one typed recipe while retaining
 /// every range and unknown recipe-owned fact.
 ///
-/// This hot-path primitive assumes the caller established monotonicity and
-/// appended exactly the incoming batch's disjoint ranges. Repository hooks do
-/// so through [`validate_monotone_batch`] and their internally constructed
-/// [`crate::repo::CommitBatch`]. Use [`set_index_head_audited`] for an
-/// untrusted/repaired range set.
+/// This hot-path primitive assumes the explicit maintenance workflow
+/// established monotonicity with [`validate_monotone_batch`] and appended
+/// exactly the incoming batch's disjoint ranges. Use
+/// [`set_index_head_audited`] for an untrusted or repaired range set.
 pub fn set_index_frontier<S: BlobStore, K: IndexKind>(
     storage: &mut S,
     kind: &K,
-    head_set: &mut TribleSet,
+    manifest_set: &mut TribleSet,
     frontier: Vec<CommitHandle>,
 ) -> Result<(), IndexError> {
     let reader = storage.reader().map_err(storage_error)?;
-    let mut replacement = Manifest::from_tribles(head_set, &reader, kind)?;
+    let mut replacement = Manifest::from_tribles(manifest_set, &reader, kind)?;
     let retired: Vec<_> = replacement.subjects().collect();
     replacement.set_frontier(frontier);
-    replace_manifest_subjects(head_set, retired, &replacement);
+    replace_manifest_subjects(manifest_set, retired, &replacement);
     Ok(())
 }
 
-/// Publish the common empty/singleton branch-head frontier.
+/// Set the common empty/singleton source frontier.
 pub fn set_index_head<S: BlobStore, K: IndexKind>(
     storage: &mut S,
     kind: &K,
-    head_set: &mut TribleSet,
+    manifest_set: &mut TribleSet,
     head: Option<CommitHandle>,
 ) -> Result<(), IndexError> {
-    set_index_frontier(storage, kind, head_set, head.into_iter().collect())
+    set_index_frontier(storage, kind, manifest_set, head.into_iter().collect())
 }
 
-/// Audit a complete untrusted/repaired cover before publishing its frontier.
-/// This deliberately walks commit history and is not used by the incremental
-/// hook hot path.
+/// Audit a complete untrusted or repaired cover before setting its frontier.
+/// This deliberately walks commit history and is not used by an incremental
+/// maintenance workflow's hot path.
 pub fn set_index_frontier_audited<S: BlobStore, K: IndexKind>(
     storage: &mut S,
     kind: &K,
-    head_set: &mut TribleSet,
+    manifest_set: &mut TribleSet,
     frontier: Vec<CommitHandle>,
 ) -> Result<(), IndexError> {
     let reader = storage.reader().map_err(storage_error)?;
-    let mut replacement = Manifest::from_tribles(head_set, &reader, kind)?;
+    let mut replacement = Manifest::from_tribles(manifest_set, &reader, kind)?;
     let retired: Vec<_> = replacement.subjects().collect();
     {
         let mut dag = StoredCommitDag::new(&reader);
@@ -931,112 +932,18 @@ pub fn set_index_frontier_audited<S: BlobStore, K: IndexKind>(
         validate_exact_frontier_cover(&mut dag, &ranges, &frontier).map_err(range_error)?;
     }
     replacement.set_frontier(frontier);
-    replace_manifest_subjects(head_set, retired, &replacement);
+    replace_manifest_subjects(manifest_set, retired, &replacement);
     Ok(())
 }
 
-/// Audit and publish the common empty/singleton branch-head frontier.
+/// Audit and set the common empty/singleton source frontier.
 pub fn set_index_head_audited<S: BlobStore, K: IndexKind>(
     storage: &mut S,
     kind: &K,
-    head_set: &mut TribleSet,
+    manifest_set: &mut TribleSet,
     head: Option<CommitHandle>,
 ) -> Result<(), IndexError> {
-    set_index_frontier_audited(storage, kind, head_set, head.into_iter().collect())
-}
-
-/// Read-only index-home surface for one `(source branch, recipe)`.
-pub struct IndexHome<'s, S, K> {
-    storage: &'s mut S,
-    kind: K,
-    branch: Id,
-}
-
-impl<'s, S, K> IndexHome<'s, S, K>
-where
-    S: BlobStore + PinStore,
-    K: IndexKind,
-{
-    /// Open the typed index manifest carried by `source_branch`.
-    pub fn new(storage: &'s mut S, source_branch: Id, kind: K) -> Self {
-        Self {
-            storage,
-            kind,
-            branch: source_branch,
-        }
-    }
-
-    /// Read one branch-metadata pin and parse its source head and typed
-    /// manifest from those exact bytes.
-    pub fn read_snapshot(&mut self) -> Result<IndexSnapshot<K>, IndexError> {
-        let metadata_head = self.storage.head(self.branch).map_err(storage_error)?;
-        let reader = self.storage.reader().map_err(storage_error)?;
-        let set = match metadata_head {
-            Some(head) => reader.get(head).map_err(storage_error)?,
-            None => TribleSet::new(),
-        };
-        let branch_entities: Vec<Id> = find!(
-            branch_meta: Id,
-            pattern!(&set, [{ ?branch_meta @ crate::repo::branch: self.branch }])
-        )
-        .collect();
-        let branch_meta = match (metadata_head, branch_entities.as_slice()) {
-            (None, []) => None,
-            (Some(_), [branch_meta]) => Some(*branch_meta),
-            _ => return Err(IndexError::InvalidSourceBranchMetadata),
-        };
-        let source_heads: Vec<CommitHandle> = if let Some(branch_meta) = branch_meta {
-            find!(
-                source_head: CommitHandle,
-                pattern!(&set, [{ branch_meta @ crate::repo::head: ?source_head }])
-            )
-            .collect()
-        } else {
-            Vec::new()
-        };
-        let source_head = match source_heads.as_slice() {
-            [] => None,
-            [head] => Some(*head),
-            _ => return Err(IndexError::InvalidSourceBranchMetadata),
-        };
-        let manifest =
-            Manifest::from_tribles(&set, &reader, &self.kind).map_err(IndexError::Manifest)?;
-        Ok(IndexSnapshot {
-            metadata_head,
-            source_head,
-            manifest,
-        })
-    }
-
-    /// Parse the current typed manifest.
-    pub fn read_manifest(&mut self) -> Result<Manifest<K>, IndexError> {
-        Ok(self.read_snapshot()?.into_manifest())
-    }
-
-    /// Attach every physical artifact in one already-read manifest snapshot.
-    pub fn attach_manifest(
-        &mut self,
-        manifest: &Manifest<K>,
-    ) -> Result<Vec<K::Segment>, IndexError> {
-        let reader = self.storage.reader().map_err(storage_error)?;
-        let mut segments = Vec::new();
-        for range in &manifest.ranges {
-            for artifact in &range.artifacts {
-                segments.push(
-                    self.kind
-                        .attach(&reader, artifact)
-                        .map_err(IndexError::Artifact)?,
-                );
-            }
-        }
-        Ok(segments)
-    }
-
-    /// Parse and attach the current manifest without a source checkout.
-    pub fn attach_all(&mut self) -> Result<Vec<K::Segment>, IndexError> {
-        let manifest = self.read_manifest()?;
-        self.attach_manifest(&manifest)
-    }
+    set_index_frontier_audited(storage, kind, manifest_set, head.into_iter().collect())
 }
 
 /// Prepared raw Succinct archive and detached source-bound Rank9 accelerator.

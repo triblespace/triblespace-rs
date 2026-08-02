@@ -401,7 +401,7 @@ pub fn select_range_record_facts(
     selected
 }
 
-/// Replace complete range entities in a branch-head tribleset.
+/// Replace complete range entities in a manifest fact set.
 ///
 /// Every fact whose subject is in `retired` is removed, including attributes
 /// unknown to this crate. Every other subject is preserved verbatim. Use this
@@ -409,19 +409,22 @@ pub fn select_range_record_facts(
 /// by it; use [`replace_range_attributes`] to change only one co-located typed
 /// representation.
 pub fn replace_range_records(
-    head: &mut TribleSet,
+    manifest_set: &mut TribleSet,
     retired: impl IntoIterator<Item = Id>,
     replacements: impl IntoIterator<Item = RangeRecord>,
 ) {
     let retired: HashSet<_> = retired.into_iter().collect();
     let mut next = TribleSet::new();
-    for trible in head.iter().filter(|trible| !retired.contains(trible.e())) {
+    for trible in manifest_set
+        .iter()
+        .filter(|trible| !retired.contains(trible.e()))
+    {
         next.insert(trible);
     }
     for record in replacements {
         next += record.to_tribles();
     }
-    *head = next;
+    *manifest_set = next;
 }
 
 /// Replace selected typed attributes without disturbing other artifacts or
@@ -432,20 +435,20 @@ pub fn replace_range_records(
 /// facts remain even when no typed handles are left: that core-only record is
 /// the canonical certificate for an empty filtered/contentless projection.
 pub fn replace_range_attributes(
-    head: &mut TribleSet,
+    manifest_set: &mut TribleSet,
     removals: impl IntoIterator<Item = (Id, Id)>,
     additions: TribleSet,
 ) {
     let removals: HashSet<_> = removals.into_iter().collect();
     let mut next = TribleSet::new();
-    for trible in head
+    for trible in manifest_set
         .iter()
         .filter(|trible| !removals.contains(&(*trible.e(), *trible.a())))
     {
         next.insert(trible);
     }
     next += additions;
-    *head = next;
+    *manifest_set = next;
 }
 
 /// Merge pairwise-disjoint victim ranges if and only if their union is one

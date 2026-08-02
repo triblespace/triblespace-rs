@@ -62,7 +62,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - Added stable typed artifact attributes plus intrinsic recipe descriptors.
   BM25 identity includes its source-content attribute. HNSW identity includes
   its source-embedding attribute, dimension, and deterministic seed, so
-  parameter-distinct recipes coexist safely in one branch manifest.
+  parameter-distinct recipes persist safely under independent immutable
+  manifest handles.
 - Empty projections now produce zero physical artifacts while retaining their
   logical range record. Repeated typed handle facts represent repeated physical
   artifacts on one logical range.

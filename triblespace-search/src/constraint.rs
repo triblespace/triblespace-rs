@@ -697,7 +697,7 @@ impl SimilarTo {
     /// neither `HNSWBuilder::insert` nor `FlatBuilder::insert` collapses a
     /// repeated handle — the index's handle table stores it once per
     /// insert. `candidates_above` then maps node → handle on all three
-    /// backends and hands the repeat straight through. (The index-home
+    /// backends and hands the repeat straight through. (The range-manifest
     /// rollups already know this: `HnswRollup::build` dedups by handle
     /// before inserting, "two entities can share one content-addressed
     /// vector", and `nearest_across` dedups across segments.) Nothing

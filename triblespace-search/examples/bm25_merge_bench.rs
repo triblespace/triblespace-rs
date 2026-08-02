@@ -1,7 +1,7 @@
 //! Phase-level smoke benchmark for succinct BM25 segment merging.
 //!
 //! This intentionally uses only public APIs so it exercises the same
-//! `Bm25Rollup::merge` path as index-home compaction. It is not a statistical
+//! `Bm25Rollup::merge` path as range-manifest compaction. It is not a statistical
 //! benchmark; run the release binary repeatedly (and under `/usr/bin/time -l`
 //! on macOS) when comparing merge implementations.
 //!

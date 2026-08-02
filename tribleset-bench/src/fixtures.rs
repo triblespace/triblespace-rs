@@ -411,10 +411,7 @@ fn asserted_branch(pile: &mut Pile, branch: Option<&str>) -> (String, CommitHand
 
     let candidates: Vec<_> = match branch {
         Some(want) => named.into_iter().filter(|(_, name)| name == want).collect(),
-        None => named
-            .into_iter()
-            .filter(|(_, name)| name != "manifest")
-            .collect(),
+        None => named,
     };
     let [(identity, branch_name)] = candidates.as_slice() else {
         let names: Vec<_> = candidates.iter().map(|(_, name)| name).collect();
@@ -424,7 +421,7 @@ fn asserted_branch(pile: &mut Pile, branch: Option<&str>) -> (String, CommitHand
                 candidates.len()
             ),
             None => panic!(
-                "cannot auto-pick a data branch ({} non-manifest exact identities: {names:?}) -- pass --branch",
+                "cannot auto-pick a data branch ({} exact identities: {names:?}) -- pass --branch",
                 candidates.len()
             ),
         }

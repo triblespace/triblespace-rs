@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed the scalar `IndexHome` catalog and its `PinStore` dependency.
+  Derived-index snapshots are exact, immutable `SimpleArchive` values stored
+  and loaded by content handle. Standalone loading rejects arbitrary empty
+  archives, branch wrappers, unrelated facts, and bundled recipes; attachment
+  rechecks the runtime recipe identity. Source freshness is now compared with
+  an authoritative head supplied by the caller rather than self-claimed branch
+  metadata inside the cache blob.
 - Removed `AsyncPinStore`, its adapter implementations, and
   `ObjectStoreRemote`'s legacy `pins/` CAS namespace. The remote backend now
   stores content-addressed blobs only; it does not pretend that object-store

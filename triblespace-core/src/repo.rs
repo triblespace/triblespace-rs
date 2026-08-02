@@ -385,10 +385,10 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 ///
 /// Legacy callers distinguish roles at higher layers with metadata markers:
 /// renewal and pending-request policy, credential holdings, branch-scoped
-/// serving state, retention roots, and derived-index catalog snapshots. Older
-/// stores may also contain mutable content-branch heads. None of these scalar
-/// cells are asserted-pin or branch authority, and pile copying means they
-/// cannot honestly be treated as semantically local.
+/// serving state, and retention roots. Older stores may also contain mutable
+/// content-branch heads. None of these scalar cells are asserted-pin or branch
+/// authority, and pile copying means they cannot honestly be treated as
+/// semantically local.
 ///
 /// `PinStore` itself doesn't know about these distinctions — it just
 /// provides the primitive: enumerate ids, read the current head, CAS

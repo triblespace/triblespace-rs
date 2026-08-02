@@ -500,7 +500,7 @@ fn width_for(n: usize) -> usize {
 /// Invert a stored BM25 posting score back to an integer term
 /// frequency (`>= 1`). Used by
 /// [`SuccinctBM25Index::reconstruct_docs`] to rebuild the source
-/// token multisets for an index-home segment merge.
+/// token multisets for a range-manifest segment merge.
 ///
 /// The build-time score is
 /// `idf * tf * (k1 + 1) / (tf + k1 * norm)`; solving for `tf` gives
@@ -977,7 +977,7 @@ impl SuccinctHNSWIndex {
 
     /// The content-addressed embedding handle of node `i`, or `None`
     /// if out of range. Lets callers enumerate a stored graph's nodes
-    /// (e.g. to union + rebuild several segments in an index-home
+    /// (e.g. to union + rebuild several segments in a range-manifest
     /// merge) without attaching a blob store.
     pub fn handle(&self, i: usize) -> Option<Inline<EmbHandle>> {
         self.handles.get(i).map(|raw| Inline::new(*raw))
@@ -1722,7 +1722,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
 
     /// Approximately reconstruct the per-document token multisets this
     /// index was built from. This remains useful for diagnostics and
-    /// compatibility tests; production index-home merges use
+    /// compatibility tests; production range-manifest merges use
     /// [`Self::merge_segments`] so they never materialize all token bags.
     ///
     /// Returns one `(doc_key, tokens)` row per document, `doc_key`

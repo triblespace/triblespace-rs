@@ -10,9 +10,9 @@ use triblespace_core::inline::Inline;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::{attributes, entity, pattern};
 use triblespace_core::repo::index_home::{
-    ArtifactError, CoverageMismatch, IndexError, IndexHome, IndexKind,
+    attach_manifest, ArtifactError, CoverageMismatch, IndexError, IndexKind, Manifest,
 };
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CommitHandle};
 use triblespace_core::trible::{Fragment, TribleSet};
 use triblespace_core::{find, id_hex};
 
@@ -375,26 +375,25 @@ impl PathRollup {
     /// direct-product summaries, and close once.
     ///
     /// This hot path trusts the manifest's certified frontier, as maintained
-    /// by an audited index publisher. It does not repeat the O(history)
+    /// by an audited derived-data workflow. It does not repeat the O(history)
     /// exact-cover audit on every attachment.
-    pub fn attach_exact<S>(
+    pub fn attach_exact<R>(
         &self,
-        storage: &mut S,
-        source_branch: Id,
+        reader: &R,
+        manifest: &Manifest<PathRollup>,
+        expected_source_head: Option<CommitHandle>,
     ) -> Result<Arc<PathIndex>, IndexError>
     where
-        S: BlobStore + PinStore,
+        R: BlobStoreGet,
     {
-        let mut home = IndexHome::new(storage, source_branch, self.clone());
-        let snapshot = home.read_snapshot()?;
-        if !snapshot.manifest().claims_head(snapshot.source_head()) {
+        if !manifest.claims_head(expected_source_head) {
             return Err(IndexError::StaleCoverage(CoverageMismatch {
-                recipe: snapshot.manifest().recipe(),
-                expected: snapshot.source_head(),
-                actual: snapshot.manifest().frontier().to_vec(),
+                recipe: manifest.recipe(),
+                expected: expected_source_head,
+                actual: manifest.frontier().to_vec(),
             }));
         }
-        let summaries = home.attach_manifest(snapshot.manifest())?;
+        let summaries = attach_manifest(reader, self, manifest)?;
         let summary = if summaries.is_empty() {
             PathSummary::from_edges(self.automaton.clone(), [])
         } else {
@@ -512,13 +511,12 @@ mod tests {
     use triblespace_core::id::ufoid;
     use triblespace_core::inline::RawInline;
     use triblespace_core::repo::index_home::{
-        append_range, set_index_head, CommitRange, Manifest, FANOUT,
+        append_range, load_manifest, set_index_head, store_manifest, CommitRange, Manifest,
+        ManifestError, FANOUT,
     };
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::Repository;
-    use triblespace_core::repo::{
-        self, BlobStore, BlobStorePut, CommitHandle, PinStore, PushResult,
-    };
+    use triblespace_core::repo::{self, BlobStore, BlobStorePut, CommitHandle};
 
     use crate::{GraphEdge, Transition};
 
@@ -575,26 +573,17 @@ mod tests {
         storage.put(commit.to_blob()).unwrap()
     }
 
-    fn publish_manifest(
+    fn persist_manifest(
         storage: &mut MemoryRepo,
-        branch_id: Id,
-        mut manifest: TribleSet,
-        source_head: Option<CommitHandle>,
-    ) -> Inline<Handle<SimpleArchive>> {
-        let branch_entity = ufoid();
-        manifest += entity! { &branch_entity @
-            repo::branch: branch_id,
-            repo::head?: source_head,
-        }
-        .into_facts();
-        let metadata_head = storage.put(manifest.to_blob()).unwrap();
-        assert!(matches!(
-            storage
-                .update(branch_id, None, Some(metadata_head))
-                .unwrap(),
-            PushResult::Success()
-        ));
-        metadata_head
+        rollup: &PathRollup,
+        facts: &TribleSet,
+    ) -> (Inline<Handle<SimpleArchive>>, Manifest<PathRollup>) {
+        let reader = storage.reader().unwrap();
+        let manifest = Manifest::from_tribles(facts, &reader, rollup).unwrap();
+        let handle = store_manifest(storage, &manifest).unwrap();
+        let reader = storage.reader().unwrap();
+        let loaded = load_manifest(&reader, rollup, handle).unwrap();
+        (handle, loaded)
     }
 
     #[test]
@@ -773,7 +762,7 @@ mod tests {
         let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
         let mut parent = None;
         let mut commits = Vec::new();
-        for index in 0..FANOUT {
+        for index in 0..(FANOUT - 1) {
             let source = edge_facts((index + 1) as u8, (index + 2) as u8);
             let commit = store_commit(&mut storage, &source, parent);
             append_range(
@@ -787,13 +776,48 @@ mod tests {
             commits.push(commit);
             parent = Some(commit);
         }
-        let reader = storage.reader().unwrap();
-        let compacted = Manifest::from_tribles(&manifest, &reader, &rollup).unwrap();
+        set_index_head(&mut storage, &rollup, &mut manifest, parent).unwrap();
+        let (before_handle, before) = persist_manifest(&mut storage, &rollup, &manifest);
+        assert_eq!(before.ranges().len(), FANOUT - 1);
+
+        let source = edge_facts(FANOUT as u8, (FANOUT + 1) as u8);
+        let commit = store_commit(&mut storage, &source, parent);
+        append_range(
+            &mut storage,
+            &rollup,
+            &source,
+            CommitRange::leaf(commit),
+            &mut manifest,
+        )
+        .unwrap();
+        commits.push(commit);
+        parent = Some(commit);
+        set_index_head(&mut storage, &rollup, &mut manifest, parent).unwrap();
+        let (after_handle, compacted) = persist_manifest(&mut storage, &rollup, &manifest);
+        assert_ne!(before_handle, after_handle);
         assert_eq!(compacted.ranges().len(), 1);
         assert_eq!(compacted.ranges()[0].level(), 1);
         assert_eq!(compacted.ranges()[0].range().start(), &[commits[0]]);
         assert_eq!(compacted.ranges()[0].range().end(), &[commits[FANOUT - 1]]);
         assert_eq!(compacted.ranges()[0].artifacts().len(), 1);
+        let reader = storage.reader().unwrap();
+        compacted.audit_exact_cover(&reader).unwrap();
+        assert_eq!(
+            load_manifest(&reader, &rollup, before_handle)
+                .unwrap()
+                .ranges()
+                .len(),
+            FANOUT - 1
+        );
+
+        let mut unsafe_union = before.to_tribles();
+        unsafe_union += compacted.to_tribles();
+        let unsafe_union_handle = storage
+            .put::<SimpleArchive, _>(unsafe_union.to_blob())
+            .unwrap();
+        let reader = storage.reader().unwrap();
+        let unsafe_union = load_manifest(&reader, &rollup, unsafe_union_handle).unwrap();
+        assert!(unsafe_union.audit_exact_cover(&reader).is_err());
 
         let empty = TribleSet::new();
         let empty_projection = store_commit(&mut storage, &empty, parent);
@@ -840,10 +864,12 @@ mod tests {
         )
         .unwrap();
         set_index_head(&mut storage, &rollup, &mut manifest, Some(second)).unwrap();
-        let branch_id = *ufoid();
-        publish_manifest(&mut storage, branch_id, manifest, Some(second));
+        let (_, manifest) = persist_manifest(&mut storage, &rollup, &manifest);
+        let reader = storage.reader().unwrap();
 
-        let index = rollup.attach_exact(&mut storage, branch_id).unwrap();
+        let index = rollup
+            .attach_exact(&reader, &manifest, Some(second))
+            .unwrap();
         assert!(index.contains(
             &RawInline::from(Id::new([1; 16]).unwrap()),
             &RawInline::from(Id::new([3; 16]).unwrap())
@@ -858,10 +884,10 @@ mod tests {
             Some(first),
         )
         .unwrap();
-        let stale_branch = *ufoid();
-        publish_manifest(&mut storage, stale_branch, stale_manifest, Some(second));
+        let (_, stale_manifest) = persist_manifest(&mut storage, &stale_rollup, &stale_manifest);
+        let reader = storage.reader().unwrap();
         assert!(matches!(
-            stale_rollup.attach_exact(&mut storage, stale_branch),
+            stale_rollup.attach_exact(&reader, &stale_manifest, Some(second)),
             Err(IndexError::StaleCoverage(_))
         ));
     }
@@ -878,7 +904,6 @@ mod tests {
         let mut left = repo.create_workspace("paths").unwrap();
         let mut right = repo.create_workspace("paths").unwrap();
         let identity = *left.identity();
-        let index_home_id = *ufoid();
         let left_source = edge_facts(1, 2);
         let right_source = edge_facts(2, 3);
         left.commit(left_source.clone(), "left edge")
@@ -926,27 +951,19 @@ mod tests {
         )
         .unwrap();
         set_index_head(repo.storage_mut(), &rollup, &mut manifest, Some(merge_head)).unwrap();
-        publish_manifest(
-            repo.storage_mut(),
-            index_home_id,
-            manifest,
-            Some(merge_head),
-        );
+        let (_, manifest) = persist_manifest(repo.storage_mut(), &rollup, &manifest);
+        let reader = repo.storage_mut().reader().unwrap();
 
         let index = rollup
-            .attach_exact(repo.storage_mut(), index_home_id)
+            .attach_exact(&reader, &manifest, Some(merge_head))
             .unwrap();
         assert!(index.contains(
             &RawInline::from(Id::new([1; 16]).unwrap()),
             &RawInline::from(Id::new([3; 16]).unwrap())
         ));
 
-        let mut home = IndexHome::new(repo.storage_mut(), index_home_id, rollup);
-        let snapshot = home.read_snapshot().unwrap();
-        assert_eq!(snapshot.source_head(), Some(merge_head));
-        assert_eq!(snapshot.manifest().ranges().len(), 3);
-        let merge_range = snapshot
-            .manifest()
+        assert_eq!(manifest.ranges().len(), 3);
+        let merge_range = manifest
             .ranges()
             .iter()
             .find(|range| range.range().start() == [merge_head])
@@ -956,73 +973,72 @@ mod tests {
     }
 
     #[test]
-    fn empty_cover_attaches_and_snapshot_ignores_unrelated_head_facts() {
+    fn exact_manifest_blob_enforces_standalone_and_runtime_recipe_boundaries() {
         let rollup = PathRollup::new(plus(9));
         let mut storage = MemoryRepo::default();
-        let manifest = Manifest::new(&rollup).unwrap().to_tribles();
-        let branch_id = *ufoid();
-        let metadata_head = publish_manifest(&mut storage, branch_id, manifest, None);
-        let empty = rollup.attach_exact(&mut storage, branch_id).unwrap();
+        let facts = Manifest::new(&rollup).unwrap().to_tribles();
+        let (manifest_handle, manifest) = persist_manifest(&mut storage, &rollup, &facts);
+        let reader = storage.reader().unwrap();
+        let empty = rollup.attach_exact(&reader, &manifest, None).unwrap();
         assert_eq!(empty.automaton(), rollup.automaton());
         assert_eq!(empty.vertex_count(), 0);
+        assert_eq!(
+            load_manifest(&reader, &rollup, manifest_handle)
+                .unwrap()
+                .to_tribles(),
+            facts
+        );
 
-        let source = edge_facts(1, 2);
-        let source_head = store_commit(&mut storage, &source, None);
-        let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
-        set_index_head(&mut storage, &rollup, &mut manifest, Some(source_head)).unwrap();
-        let branch = *ufoid();
-        let branch_entity = ufoid();
-        let unrelated = ufoid();
-        manifest += entity! { &branch_entity @
-            repo::branch: branch,
-            repo::head: source_head,
-        }
-        .into_facts();
-        manifest += entity! { &unrelated @ repo::head: metadata_head }.into_facts();
-        let head = storage.put(manifest.to_blob()).unwrap();
-        assert!(matches!(
-            storage.update(branch, None, Some(head)).unwrap(),
-            PushResult::Success()
-        ));
-        let mut home = IndexHome::new(&mut storage, branch, rollup.clone());
-        let snapshot = home.read_snapshot().unwrap();
-        assert_eq!(snapshot.metadata_head(), Some(head));
-        assert_eq!(snapshot.source_head(), Some(source_head));
-
-        let missing_branch = *ufoid();
-        let missing_head = storage
-            .put(Manifest::new(&rollup).unwrap().to_tribles().to_blob())
+        let arbitrary_empty = storage
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
+        let reader = storage.reader().unwrap();
         assert!(matches!(
-            storage
-                .update(missing_branch, None, Some(missing_head))
-                .unwrap(),
-            PushResult::Success()
-        ));
-        let mut missing_home = IndexHome::new(&mut storage, missing_branch, rollup.clone());
-        assert!(matches!(
-            missing_home.read_snapshot(),
-            Err(IndexError::InvalidSourceBranchMetadata)
+            load_manifest(&reader, &rollup, arbitrary_empty),
+            Err(IndexError::Manifest(ManifestError::NotStandalone { .. }))
         ));
 
-        let second_branch_entity = ufoid();
-        let mut ambiguous: TribleSet = storage.reader().unwrap().get(head).unwrap();
-        ambiguous += entity! { &second_branch_entity @
-            repo::branch: branch,
-            repo::head: metadata_head,
+        let wrapper = ufoid();
+        let mut wrapped = manifest.to_tribles();
+        wrapped += entity! { &wrapper @ repo::branch: *ufoid() }.into_facts();
+        let wrapped_handle = storage.put::<SimpleArchive, _>(wrapped.to_blob()).unwrap();
+        let reader = storage.reader().unwrap();
+        assert!(matches!(
+            load_manifest(&reader, &rollup, wrapped_handle),
+            Err(IndexError::Manifest(ManifestError::NotStandalone { .. }))
+        ));
+
+        let foreign = PathRollup::new(plus(8));
+        let mut bundled = manifest.to_tribles();
+        bundled += Manifest::new(&foreign).unwrap().to_tribles();
+        let bundled_handle = storage.put::<SimpleArchive, _>(bundled.to_blob()).unwrap();
+        let reader = storage.reader().unwrap();
+        assert!(matches!(
+            load_manifest(&reader, &rollup, bundled_handle),
+            Err(IndexError::Manifest(ManifestError::NotStandalone { .. }))
+        ));
+
+        let recipe = manifest.recipe();
+        let extension = *ufoid();
+        let mut extended = manifest.to_tribles();
+        extended += entity! { ExclusiveId::force_ref(&recipe) @
+            metadata::tag: extension,
         }
         .into_facts();
-        let ambiguous_head = storage.put(ambiguous.to_blob()).unwrap();
+        let extended_handle = storage
+            .put::<SimpleArchive, _>(extended.clone().to_blob())
+            .unwrap();
+        let reader = storage.reader().unwrap();
+        assert_eq!(
+            load_manifest(&reader, &rollup, extended_handle)
+                .unwrap()
+                .to_tribles(),
+            extended
+        );
+
         assert!(matches!(
-            storage
-                .update(branch, Some(head), Some(ambiguous_head))
-                .unwrap(),
-            PushResult::Success()
-        ));
-        let mut home = IndexHome::new(&mut storage, branch, rollup);
-        assert!(matches!(
-            home.read_snapshot(),
-            Err(IndexError::InvalidSourceBranchMetadata)
+            attach_manifest(&reader, &foreign, &manifest),
+            Err(IndexError::Manifest(ManifestError::RecipeMismatch { .. }))
         ));
     }
 

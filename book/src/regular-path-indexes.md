@@ -232,12 +232,14 @@ range still exists as a certified contentless record, but it has no
 
 A durable consumer must bind a manifest to the exact complete source frontier
 it covered, validate every summary's canonical bytes and automaton fingerprint,
-and reject stale coverage. Imported or manually assembled metadata should be
-checked with `Manifest::audit_exact_cover` against a blob reader before it is
-trusted, or rebuilt. See [Range-Native Derived Indexes](index-ranges.md) for the
-inclusive frontier and exact-cover rules. This audit belongs to the derived
-index workflow; source branch pins remain a small typed projection over the
-generic, index-neutral asserted-pin ledger.
+and reject stale coverage. `PathRollup::attach_exact` therefore takes an
+already-loaded immutable manifest plus the authoritative source head obtained
+from branch resolution; the cache blob cannot claim its own authority through
+wrapper metadata. Imported or manually assembled manifests should be checked
+with `Manifest::audit_exact_cover` against a blob reader before they are trusted,
+or rebuilt. See [Range-Native Derived Indexes](index-ranges.md) for the inclusive
+frontier and exact-cover rules. This audit belongs to the derived-index workflow;
+source branch assertions remain the independent source of truth.
 
 ## Cost model: sparse input, potentially dense answer
 

@@ -1,18 +1,17 @@
 use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::IntoBlob;
-use triblespace_core::id::{ufoid, ExclusiveId, Id};
-use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::macros::entity;
 use triblespace_core::metadata;
 use triblespace_core::query::{Binding, Query, Variable};
-use triblespace_core::repo::index_home::{append_range, set_index_head, CommitRange, Manifest};
+use triblespace_core::repo::index_home::{
+    append_range, load_manifest, set_index_head, store_manifest, CommitRange, Manifest,
+};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{self, BlobStorePut, PinStore, PushResult, Repository};
+use triblespace_core::repo::{BlobStore, Repository};
 use triblespace_core::trible::TribleSet;
 use triblespace_paths::{automaton_fingerprint, GraphEdge, PathExpr, PathIndex, PathRollup, Step};
 
@@ -93,7 +92,6 @@ fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
     )
     .unwrap();
     let mut workspace = repo.create_workspace("path-expr").unwrap();
-    let index_home_id = *ufoid();
 
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);
@@ -119,23 +117,14 @@ fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
         Some(source_head),
     )
     .unwrap();
-    let branch_entity = ufoid();
-    manifest += entity! { &branch_entity @
-        repo::branch: index_home_id,
-        repo::head: source_head,
-    }
-    .into_facts();
-    let metadata_head: Inline<Handle<SimpleArchive>> =
-        repo.storage_mut().put(manifest.to_blob()).unwrap();
-    assert!(matches!(
-        repo.storage_mut()
-            .update(index_home_id, None, Some(metadata_head))
-            .unwrap(),
-        PushResult::Success()
-    ));
+    let reader = repo.storage_mut().reader().unwrap();
+    let manifest = Manifest::from_tribles(&manifest, &reader, &rollup).unwrap();
+    let manifest_handle = store_manifest(repo.storage_mut(), &manifest).unwrap();
+    let reader = repo.storage_mut().reader().unwrap();
+    let manifest = load_manifest(&reader, &rollup, manifest_handle).unwrap();
 
     let index = rollup
-        .attach_exact(repo.storage_mut(), index_home_id)
+        .attach_exact(&reader, &manifest, Some(source_head))
         .unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));

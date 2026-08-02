@@ -27,14 +27,12 @@
 //! `SuccinctRollup`, whose source *is* the data — `HnswRollup` needs a
 //! blob reader to resolve those handles into the `[f32]` vectors the
 //! graph build compares. The reader is held on the kind (a cheap
-//! [`Clone`] snapshot of the same store the [`IndexHome`] writes
-//! segments into), so [`build`](IndexKind::build) and
+//! [`Clone`] snapshot of the same store that receives the immutable
+//! segments), so [`build`](IndexKind::build) and
 //! [`merge`](IndexKind::merge) can fetch vectors while
 //! [`attach`](IndexKind::attach) stays zero-copy (it decodes only the
 //! stored graph blob; embeddings are resolved lazily at query time by
 //! the attached view).
-//!
-//! [`IndexHome`]: triblespace_core::repo::index_home::IndexHome
 //!
 //! # Multi-segment query semantics
 //!
@@ -112,8 +110,8 @@ impl<R> HnswRollup<R> {
 
     /// Stable kind id — minted via `trible genid`
     /// (`78A4D957BB6EF35D4D56D76AD6013268`). Distinct from
-    /// `SuccinctRollup`'s so both kinds' manifests coexist in one
-    /// branch-head tribleset.
+    /// `SuccinctRollup`'s so both kinds have distinct immutable manifest
+    /// identities.
     pub const KIND_ID_HEX: &'static str = "78A4D957BB6EF35D4D56D76AD6013268";
 }
 
@@ -385,7 +383,9 @@ mod tests {
     use triblespace_core::id::{fucid, Id};
     use triblespace_core::inline::Inline;
     use triblespace_core::prelude::attributes;
-    use triblespace_core::repo::index_home::{append_stored_range, IndexKind, Manifest};
+    use triblespace_core::repo::index_home::{
+        append_stored_range, load_manifest, store_manifest, IndexKind, Manifest,
+    };
     use triblespace_core::repo::index_range::CommitRange;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{BlobStore, BlobStorePut};
@@ -596,13 +596,13 @@ mod tests {
         let prepared_right = kind.build(&right).unwrap().pop().unwrap();
         let stored_left = kind.put(&mut storage, prepared_left).unwrap();
         let stored_right = kind.put(&mut storage, prepared_right).unwrap();
-        let mut branch_set = TribleSet::new();
+        let mut manifest_set = TribleSet::new();
         append_stored_range(
             &mut storage,
             &kind,
             CommitRange::leaf(commit(1)),
             vec![stored_left],
-            &mut branch_set,
+            &mut manifest_set,
         )
         .unwrap();
         append_stored_range(
@@ -610,12 +610,12 @@ mod tests {
             &kind,
             CommitRange::leaf(commit(2)),
             vec![stored_right],
-            &mut branch_set,
+            &mut manifest_set,
         )
         .unwrap();
 
         let reader = storage.reader().unwrap();
-        let manifest = Manifest::from_tribles(&branch_set, &reader, &kind).unwrap();
+        let manifest = Manifest::from_tribles(&manifest_set, &reader, &kind).unwrap();
         let segments: Vec<_> = manifest
             .ranges()
             .iter()
@@ -805,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_distinct_hnsw_recipes_coexist_in_one_manifest_set() {
+    fn parameter_distinct_hnsw_recipes_have_independent_manifest_handles() {
         let mut storage = MemoryRepo::default();
         let (source_a, _) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let (source_b, _) = stage(&mut storage, alternate_emb.id(), *fucid(), vec![0.0, 1.0]);
@@ -816,14 +816,15 @@ mod tests {
         let artifact_b = kind_b.build(&source_b).unwrap().pop().unwrap();
         let stored_a = kind_a.put(&mut storage, artifact_a).unwrap();
         let stored_b = kind_b.put(&mut storage, artifact_b).unwrap();
-        let mut branch_set = TribleSet::new();
+        let mut facts_a = TribleSet::new();
+        let mut facts_b = TribleSet::new();
 
         append_stored_range(
             &mut storage,
             &kind_a,
             CommitRange::leaf(commit(1)),
             vec![stored_a],
-            &mut branch_set,
+            &mut facts_a,
         )
         .unwrap();
         append_stored_range(
@@ -831,13 +832,19 @@ mod tests {
             &kind_b,
             CommitRange::leaf(commit(1)),
             vec![stored_b],
-            &mut branch_set,
+            &mut facts_b,
         )
         .unwrap();
 
         let reader = storage.reader().unwrap();
-        let manifest_a = Manifest::from_tribles(&branch_set, &reader, &kind_a).unwrap();
-        let manifest_b = Manifest::from_tribles(&branch_set, &reader, &kind_b).unwrap();
+        let manifest_a = Manifest::from_tribles(&facts_a, &reader, &kind_a).unwrap();
+        let manifest_b = Manifest::from_tribles(&facts_b, &reader, &kind_b).unwrap();
+        let handle_a = store_manifest(&mut storage, &manifest_a).unwrap();
+        let handle_b = store_manifest(&mut storage, &manifest_b).unwrap();
+        assert_ne!(handle_a, handle_b);
+        let reader = storage.reader().unwrap();
+        let manifest_a = load_manifest(&reader, &kind_a, handle_a).unwrap();
+        let manifest_b = load_manifest(&reader, &kind_b, handle_b).unwrap();
         assert_ne!(manifest_a.recipe(), manifest_b.recipe());
         assert_eq!(manifest_a.ranges()[0].artifacts(), &[stored_a]);
         assert_eq!(manifest_b.ranges()[0].artifacts(), &[stored_b]);

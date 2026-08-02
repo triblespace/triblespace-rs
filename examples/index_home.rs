@@ -1,9 +1,9 @@
-//! Persist and attach a succinct range manifest explicitly.
+//! Persist and attach an immutable succinct range manifest explicitly.
 //!
 //! Source publication uses typed branch pins over generic assertions. Derived index
 //! maintenance is a separate operation: build a typed range artifact, certify
-//! the source frontier in a manifest, and publish that manifest to its index
-//! home. No hidden repository hook couples the two ledgers.
+//! the source frontier in a manifest, and retain that manifest's content handle.
+//! No hidden repository hook couples the two ledgers.
 //!
 //! Run with: `cargo run --example index_home`
 
@@ -11,9 +11,10 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::examples::literature;
 use triblespace::core::repo::index_home::{
-    append_range, set_index_head, CommitRange, IndexHome, Manifest, SuccinctRollup,
+    append_range, attach_manifest, load_manifest, set_index_head, store_manifest, CommitRange,
+    Manifest, SuccinctRollup,
 };
-use triblespace::core::repo::{self, PinStore, PushResult, Repository};
+use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
 
 fn main() {
@@ -26,9 +27,7 @@ fn main() {
     let mut repository = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .expect("create repo");
 
-    // Publish one source commit under the exact (author, name) identity. The
-    // derived manifest has its own independent index-home identity.
-    let index_home_id = *ufoid();
+    // Publish one source commit under the exact (author, name) identity.
     let mut workspace = repository
         .create_workspace("main")
         .expect("create workspace");
@@ -66,30 +65,24 @@ fn main() {
     )
     .expect("certify source frontier");
 
-    // IndexHome uses a small independently replaceable pin for the derived
-    // manifest. That pin is not branch publication and carries no source data.
-    let branch_entity = ufoid();
-    manifest += entity! { &branch_entity @
-        repo::branch: index_home_id,
-        repo::head: source_head,
-    }
-    .into_facts();
-    let manifest_head = repository
-        .storage_mut()
-        .put(manifest.to_blob())
-        .expect("store manifest");
-    assert!(matches!(
-        repository
-            .storage_mut()
-            .update(index_home_id, None, Some(manifest_head))
-            .expect("publish manifest"),
-        PushResult::Success()
-    ));
+    // Persist one immutable whole-manifest snapshot. The caller owns this
+    // content handle and may replace it with a later snapshot atomically in
+    // whatever application ledger already owns the derived-data workflow.
+    let reader = repository.storage_mut().reader().expect("open blob reader");
+    let manifest =
+        Manifest::from_tribles(&manifest, &reader, &rollup).expect("parse typed manifest");
+    let manifest_handle =
+        store_manifest(repository.storage_mut(), &manifest).expect("store manifest");
 
     // Query attached persisted segments without materializing the source
     // branch checkout again.
-    let mut home = IndexHome::new(repository.storage_mut(), index_home_id, rollup);
-    let segments = home.attach_all().expect("attach segments");
+    let reader = repository
+        .storage_mut()
+        .reader()
+        .expect("refresh blob reader");
+    let manifest = load_manifest(&reader, &rollup, manifest_handle).expect("load exact manifest");
+    assert!(manifest.claims_head(Some(source_head)));
+    let segments = attach_manifest(&reader, &rollup, &manifest).expect("attach segments");
     let union = SuccinctRollup::union(&segments);
     let mut names: Vec<String> = find!(
         (name: Inline<_>),

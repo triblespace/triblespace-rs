@@ -70,7 +70,7 @@ that is the canonical completed-empty projection. `replace_range_records`
 removes every fact under a retired entity and is used when compacting the
 complete recipe/range slot and all artifacts owned by it.
 
-## Typed index-home manifests
+## Typed immutable manifests
 
 `repo::index_home` gives the artifact-neutral range model a typed maintenance
 surface. An `IndexKind` supplies one deterministic, inline-only
@@ -81,11 +81,32 @@ the manifest header and carries a self-marker:
 recipe @ index_recipe: recipe
 ```
 
-The marker makes even an empty manifest discoverable during a generic branch
-metadata rebuild. All facts on a discovered recipe or range subject are copied
-verbatim, including attributes unknown to the current binary. Parsing checks
-the known control fields without reconstructing those real entities from a
-lossy Rust projection.
+The marker makes even an empty manifest a real, self-describing value. All facts
+on a discovered recipe or range subject are copied verbatim, including
+attributes unknown to the current binary. Parsing checks the known control
+fields without reconstructing those real entities from a lossy Rust projection.
+
+`store_manifest` persists exactly one recipe snapshot and returns its
+content-addressed `SimpleArchive` handle. The caller owns that handle; there is
+no mutable "current index home" inside the repository. `load_manifest` requires
+the stored facts to round-trip as exactly that one manifest, so an arbitrary
+empty archive, branch-wrapper metadata, unrelated entities, and several bundled
+recipes all fail closed. `attach_manifest` rechecks the deterministic recipe id
+because two runtime values of the same Rust kind may still differ in automaton,
+source attribute, dimension, tokenizer, or other configuration.
+
+Compaction creates a new whole-manifest handle. Old and new snapshots may both
+remain readable, but their internal facts must never be unioned: doing so would
+resurrect compacted victim ranges and produce an overlapping cover. Different
+recipes likewise use independent handles. A missing or unrooted handle is a
+cache miss and may be rebuilt; it is not missing source truth.
+
+Standalone loading is intentionally structural and does not walk commit
+history. A fact-union of old and compacted snapshots for the same recipe may
+therefore still parse; it is invalid by construction and the explicit
+`Manifest::audit_exact_cover` rejects its overlapping ranges. Consumers must
+keep whole-snapshot handles atomic and audit imported or otherwise untrusted
+manifest values before treating their cover as certified.
 
 The header's repeated `index_head*` values are the maximal antichain currently
 certified by the manifest. Empty history uses an empty frontier; a fully
@@ -97,7 +118,7 @@ Each logical range entity has exactly one `seg_level` and `seg_seq`, plus zero
 or more recipe-typed physical artifacts. Fanout and compaction count logical
 range records, not their physical shards. `store_artifact` can therefore persist
 independently prepared shards as they finish, while `append_stored_range`
-publishes all of their typed handles on one shared source range. The prepared
+records all of their typed handles on one shared source range. The prepared
 convenience stores the vector first and then performs the same logical append.
 
 The Succinct recipe emits both repeated attributes for every shard:

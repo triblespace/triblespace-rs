@@ -73,10 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and exposes them through the ordinary two-variable constraint protocol.
 - **Regular-path summaries persist as typed range-native artifacts.**
   `PathRollup` stores canonical automaton-fingerprinted direct-product summaries
-  in `IndexHome`, compacts them by set union, and globally closes the certified
-  live cover on attachment. A same-metadata `IndexSnapshot` pins the branch
-  metadata, source commit head, and manifest together so stale coverage fails
-  closed; full cover audits remain explicit repair/verification operations.
+  in immutable content-addressed manifests, compacts them by set union, and
+  globally closes the certified live cover on attachment. The caller supplies
+  the authoritative source head so stale coverage fails closed; full cover
+  audits remain explicit repair/verification operations.
 - **The book now teaches the stable standalone regular-path index.** A dedicated
   chapter leads with canonical `PathExpr` construction and Glushkov lowering,
   retains explicit epsilon-free automata as the low-level escape hatch, and
@@ -87,14 +87,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Derived-index catalogs are immutable cache values, not scalar publication
+  state.** `IndexHome`, `IndexSnapshot`, their branch-wrapper metadata, and the
+  `PinStore` dependency are removed. `store_manifest` returns one
+  content-addressed handle for an exact single-recipe snapshot;
+  `load_manifest` rejects unmarked empty archives, wrappers, unrelated facts, and
+  bundled recipes; and `attach_manifest` rechecks parameter-sensitive recipe
+  identity. Callers own manifest handles and compare the certified frontier
+  with a source head obtained from authoritative branch resolution. Pre- and
+  post-compaction snapshots may coexist but are never fact-unioned.
 - **The remote scalar-pin compatibility island is removed.**
   `AsyncPinStore`, its sync/async adapter implementations, the object-store
   `pins/` CAS namespace, and `trible store pin` are deleted. Remote object
   storage now exposes content-addressed blobs only; asserted state requires a
   backend that can provide a coherent assertion snapshot and durable append.
-  The still-live synchronous `PinStore` remains temporarily scoped to local
-  policy, retention, serving, and index consumers while those semantics are
-  migrated explicitly.
+  The still-live synchronous `PinStore` remains temporarily scoped to policy,
+  retention, and serving consumers while those semantics are migrated
+  explicitly.
 - **Breaking: signed asserted wants replace anonymous weak pins.** The fixed
   `WantPinDescriptor` gives each author one grow-only set of exact wanted blob
   values through the generic `PinAssertionStore`; `WantStore` scopes reads and

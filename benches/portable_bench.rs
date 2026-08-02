@@ -9,7 +9,7 @@
 //!   `or!`, `and!`, `temp!`, `value_range`, `Pile`, `Repository`,
 //!   `Workspace::checkout`, `SuccinctArchive` — every item verified present
 //!   at both 739fd05c (2026-07-03) and 6a6a94f1 (2026-07-24). Everything
-//!   that drifted this month lives outside this surface. The LSM index-home
+//!   that drifted this month lives outside this surface. The LSM range-manifest
 //!   path is deliberately NOT here — it lives in `portable_bench_lsm.rs`
 //!   with an independent compilation fate.
 //! * *Raw samples, never a bare mean.* Minima reproduce to 0.2–1.7%; means
@@ -832,10 +832,7 @@ fn asserted_branch(pile: &mut Pile, branch: Option<&str>) -> (String, CommitHand
 
     let candidates: Vec<_> = match branch {
         Some(want) => named.into_iter().filter(|(_, name)| name == want).collect(),
-        None => named
-            .into_iter()
-            .filter(|(_, name)| name != "manifest")
-            .collect(),
+        None => named,
     };
     let [(identity, branch_name)] = candidates.as_slice() else {
         let names: Vec<_> = candidates.iter().map(|(_, name)| name).collect();
@@ -845,7 +842,7 @@ fn asserted_branch(pile: &mut Pile, branch: Option<&str>) -> (String, CommitHand
                 candidates.len()
             ),
             None => panic!(
-                "cannot auto-pick a data branch ({} non-manifest exact identities: {names:?}) -- pass --branch",
+                "cannot auto-pick a data branch ({} exact identities: {names:?}) -- pass --branch",
                 candidates.len()
             ),
         }

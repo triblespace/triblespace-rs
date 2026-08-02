@@ -104,8 +104,8 @@ impl<R> Bm25Rollup<R> {
 
     /// Stable kind id — minted via `trible genid`
     /// (`11430BC8836BED33509173D454496A3C`). Distinct from
-    /// `SuccinctRollup`'s and `HnswRollup`'s so all three kinds'
-    /// manifests coexist in one branch-head tribleset.
+    /// `SuccinctRollup`'s and `HnswRollup`'s so all three kinds have
+    /// distinct immutable manifest identities.
     pub const KIND_ID_HEX: &'static str = "11430BC8836BED33509173D454496A3C";
 }
 
@@ -303,7 +303,9 @@ mod tests {
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::Inline;
     use triblespace_core::prelude::{attributes, entity};
-    use triblespace_core::repo::index_home::{append_stored_range, IndexKind, Manifest};
+    use triblespace_core::repo::index_home::{
+        append_stored_range, load_manifest, store_manifest, IndexKind, Manifest,
+    };
     use triblespace_core::repo::index_range::CommitRange;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{BlobStore, BlobStorePut};
@@ -701,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_distinct_bm25_recipes_coexist_in_one_manifest_set() {
+    fn parameter_distinct_bm25_recipes_have_independent_manifest_handles() {
         let mut storage = MemoryRepo::default();
         let document = *fucid();
         let source_a = stage(&mut storage, content.id(), document, "alpha");
@@ -713,14 +715,15 @@ mod tests {
         let artifact_b = kind_b.build(&source_b).unwrap().pop().unwrap();
         let stored_a = kind_a.put(&mut storage, artifact_a).unwrap();
         let stored_b = kind_b.put(&mut storage, artifact_b).unwrap();
-        let mut branch_set = TribleSet::new();
+        let mut facts_a = TribleSet::new();
+        let mut facts_b = TribleSet::new();
 
         append_stored_range(
             &mut storage,
             &kind_a,
             CommitRange::leaf(commit(1)),
             vec![stored_a],
-            &mut branch_set,
+            &mut facts_a,
         )
         .unwrap();
         append_stored_range(
@@ -728,13 +731,19 @@ mod tests {
             &kind_b,
             CommitRange::leaf(commit(1)),
             vec![stored_b],
-            &mut branch_set,
+            &mut facts_b,
         )
         .unwrap();
 
         let reader = storage.reader().unwrap();
-        let manifest_a = Manifest::from_tribles(&branch_set, &reader, &kind_a).unwrap();
-        let manifest_b = Manifest::from_tribles(&branch_set, &reader, &kind_b).unwrap();
+        let manifest_a = Manifest::from_tribles(&facts_a, &reader, &kind_a).unwrap();
+        let manifest_b = Manifest::from_tribles(&facts_b, &reader, &kind_b).unwrap();
+        let handle_a = store_manifest(&mut storage, &manifest_a).unwrap();
+        let handle_b = store_manifest(&mut storage, &manifest_b).unwrap();
+        assert_ne!(handle_a, handle_b);
+        let reader = storage.reader().unwrap();
+        let manifest_a = load_manifest(&reader, &kind_a, handle_a).unwrap();
+        let manifest_b = load_manifest(&reader, &kind_b, handle_b).unwrap();
         assert_ne!(manifest_a.recipe(), manifest_b.recipe());
         assert_eq!(manifest_a.ranges().len(), 1);
         assert_eq!(manifest_b.ranges().len(), 1);
