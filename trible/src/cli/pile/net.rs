@@ -59,25 +59,6 @@ fn team_root_from_env(key: &SigningKey) -> Result<VerifyingKey> {
     }
 }
 
-/// Read this node's own capability sig handle from the
-/// `TRIBLE_TEAM_CAP` env var. Falls back to all-zeros (which the
-/// remote will reject — that's the right signal that the env var
-/// needs to be set for this node to participate in a team mesh).
-fn self_cap_from_env() -> Result<[u8; 32]> {
-    match std::env::var("TRIBLE_TEAM_CAP") {
-        Ok(hex_str) => {
-            let bytes =
-                hex::decode(hex_str.trim()).map_err(|e| anyhow!("TRIBLE_TEAM_CAP decode: {e}"))?;
-            let raw: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("TRIBLE_TEAM_CAP must be 32 bytes"))?;
-            Ok(raw)
-        }
-        Err(_) => Ok([0u8; 32]),
-    }
-}
-
 // ── CLI ──────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -88,8 +69,9 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Show the auth configuration this node would use for sync operations:
-    /// node id, team root, and self_cap (if any).
+    /// Show the stable auth identity this node would use for sync operations:
+    /// node id and team root. The operational credential is derived from the
+    /// pile's recipient ledger when `sync` starts.
     /// Useful for debugging why a remote peer rejects auth.
     Status {
         /// Path to the node's signing key.
@@ -190,19 +172,6 @@ fn run_status(sk: Option<PathBuf>) -> Result<()> {
         }
     }
 
-    // self_cap: explicit env var or all-zeros sentinel.
-    match std::env::var("TRIBLE_TEAM_CAP") {
-        Ok(s) => {
-            let trimmed = s.trim();
-            println!("self_cap:  {trimmed}  (from TRIBLE_TEAM_CAP)");
-        }
-        Err(_) => {
-            println!(
-                "self_cap:  {}  (NOT SET — remote will reject OP_AUTH)",
-                "0".repeat(64),
-            );
-        }
-    }
     Ok(())
 }
 
@@ -245,16 +214,7 @@ fn run_sync(
     // DHT; generic pin assertions and descriptors remain local.
     let pile = open_pile(&pile_path)?;
     let team_root = team_root_from_env(&key)?;
-    let self_cap = self_cap_from_env()?;
-    let mut peer = Peer::new(
-        pile,
-        key.clone(),
-        PeerConfig {
-            peers,
-            team_root,
-            self_cap,
-        },
-    );
+    let mut peer = Peer::new(pile, key.clone(), PeerConfig { peers, team_root });
     eprintln!("node: {}", peer.id());
     eprintln!("team_root: {}", hex::encode(team_root.to_bytes()));
     if let Some(d) = duration {

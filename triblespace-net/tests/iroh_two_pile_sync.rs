@@ -42,6 +42,7 @@ use triblespace_core::trible::TribleSet;
 use triblespace_net::clock;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig};
+use triblespace_net::recipient_ledger::{RecipientWriteOutcome, accept_credential, declare_intent};
 use triblespace_net::reconcile::Reconciler;
 
 fn key(n: u8) -> SigningKey {
@@ -107,6 +108,37 @@ fn fresh_pile(
     pile
 }
 
+/// Publish one fixture credential as the node's durable recipient decision
+/// before the peer can cause any authenticated network effect.
+fn seed_recipient_credential(
+    pile: &mut Pile,
+    signing_key: &SigningKey,
+    team_root: ed25519_dalek::VerifyingKey,
+    anchor_cap: Blob<SimpleArchive>,
+    credential: &(Blob<SimpleArchive>, Blob<SimpleArchive>),
+) {
+    let declared = declare_intent(pile, signing_key, team_root, credential.0.clone())
+        .expect("publish fixture recipient intent");
+    assert!(
+        matches!(declared, RecipientWriteOutcome::Published(_)),
+        "fixture recipient intent must be accepted, got {declared:?}"
+    );
+
+    let accepted = accept_credential(
+        pile,
+        signing_key,
+        team_root,
+        credential.1.clone(),
+        [credential.0.clone(), anchor_cap],
+        clock::epoch_now(),
+    )
+    .expect("publish fixture recipient credential");
+    assert!(
+        matches!(accepted, RecipientWriteOutcome::Published(_)),
+        "fixture recipient credential must be accepted, got {accepted:?}"
+    );
+}
+
 /// Bind a real iroh endpoint whose only packet path is the shared
 /// `TestNetwork` (mirrors `auth_handshake_e2e::test_endpoint`), with
 /// the network's address-lookup service replacing the N0 discovery
@@ -137,7 +169,6 @@ async fn bring_up(
     signing_key: &SigningKey,
     store: Pile,
     team_root: ed25519_dalek::VerifyingKey,
-    self_cap: [u8; 32],
     bootstrap: Vec<EndpointAddr>,
 ) -> Peer<Pile> {
     let secret = triblespace_net::identity::iroh_secret(signing_key);
@@ -146,7 +177,6 @@ async fn bring_up(
     let config = PeerConfig {
         peers: bootstrap,
         team_root,
-        self_cap,
     };
     let harness = triblespace_net::transport::iroh::bind_with_endpoint(ep, &config).await;
     let (sender, receiver, wiring) = host::wire(id);
@@ -178,17 +208,22 @@ async fn two_nodes(network: &TestNetwork, ka: &SigningKey, kb: &SigningKey) -> T
     let team_root = root.verifying_key();
     let (anchor_a, cap_a) = admin_cap(&root, ka);
     let (anchor_b, cap_b) = admin_cap(&root, kb);
-    let self_cap_a = (&cap_a.1).get_handle().raw;
-    let self_cap_b = (&cap_b.1).get_handle().raw;
-    let caps = [anchor_a, cap_a, anchor_b, cap_b];
+    let caps = [
+        anchor_a.clone(),
+        cap_a.clone(),
+        anchor_b.clone(),
+        cap_b.clone(),
+    ];
 
     let dir = tempfile::tempdir().expect("temp dir for piles");
-    let pile_a = fresh_pile(dir.path(), "a.pile", &caps);
-    let pile_b = fresh_pile(dir.path(), "b.pile", &caps);
+    let mut pile_a = fresh_pile(dir.path(), "a.pile", &caps);
+    seed_recipient_credential(&mut pile_a, ka, team_root, anchor_a.0.clone(), &cap_a);
+    let mut pile_b = fresh_pile(dir.path(), "b.pile", &caps);
+    seed_recipient_credential(&mut pile_b, kb, team_root, anchor_b.0.clone(), &cap_b);
 
-    let peer_a = bring_up(network, ka, pile_a, team_root, self_cap_a, Vec::new()).await;
+    let peer_a = bring_up(network, ka, pile_a, team_root, Vec::new()).await;
     let a_id: EndpointAddr = peer_a.id().into();
-    let peer_b = bring_up(network, kb, pile_b, team_root, self_cap_b, vec![a_id]).await;
+    let peer_b = bring_up(network, kb, pile_b, team_root, vec![a_id]).await;
 
     let repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
     let repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");

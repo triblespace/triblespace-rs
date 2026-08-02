@@ -22,7 +22,15 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig};
+use triblespace_net::recipient_ledger::{RecipientWriteOutcome, accept_credential, declare_intent};
 use triblespace_net::transport::sim::SimNet;
+
+#[derive(Clone)]
+struct AdminCredentialFixture {
+    cap: Blob<SimpleArchive>,
+    sig: Blob<SimpleArchive>,
+    proof_caps: Vec<Blob<SimpleArchive>>,
+}
 
 /// One virtual clock per test process (install_virtual is
 /// once-per-process; each test binary is its own process).
@@ -55,8 +63,8 @@ pub fn pk(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
-fn admin_proof_registry() -> &'static Mutex<HashMap<[u8; 32], Vec<Blob<SimpleArchive>>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<[u8; 32], Vec<Blob<SimpleArchive>>>>> = OnceLock::new();
+fn admin_credential_registry() -> &'static Mutex<HashMap<[u8; 32], AdminCredentialFixture>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<[u8; 32], AdminCredentialFixture>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -98,11 +106,50 @@ pub fn admin_cap(
         expiry,
     )
     .expect("build finite founder credential");
-    admin_proof_registry()
-        .lock()
-        .unwrap()
-        .insert(credential.1.get_handle().raw, vec![anchor.0]);
+    admin_credential_registry().lock().unwrap().insert(
+        credential.1.get_handle().raw,
+        AdminCredentialFixture {
+            cap: credential.0.clone(),
+            sig: credential.1.clone(),
+            proof_caps: vec![anchor.0.clone()],
+        },
+    );
     credential
+}
+
+/// Publish one fixture credential as this node's durable recipient decision.
+/// The cap itself is always included in the persisted verification closure;
+/// `proof_caps` supplies its remaining parent capability blobs.
+pub fn seed_recipient_credential<I>(
+    store: &mut MemoryRepo,
+    signing_key: &SigningKey,
+    team_root: ed25519_dalek::VerifyingKey,
+    credential: &(Blob<SimpleArchive>, Blob<SimpleArchive>),
+    proof_caps: I,
+) where
+    I: IntoIterator<Item = Blob<SimpleArchive>>,
+{
+    let declared = declare_intent(store, signing_key, team_root, credential.0.clone())
+        .expect("publish fixture recipient intent");
+    assert!(
+        matches!(declared, RecipientWriteOutcome::Published(_)),
+        "fixture recipient intent must be accepted, got {declared:?}"
+    );
+
+    let closure = std::iter::once(credential.0.clone()).chain(proof_caps);
+    let accepted = accept_credential(
+        store,
+        signing_key,
+        team_root,
+        credential.1.clone(),
+        closure,
+        clock::epoch_now(),
+    )
+    .expect("publish fixture recipient credential");
+    assert!(
+        matches!(accepted, RecipientWriteOutcome::Published(_)),
+        "fixture recipient credential must be accepted, got {accepted:?}"
+    );
 }
 
 /// A paused, single-thread tokio runtime + LocalSet runner — the
@@ -136,9 +183,34 @@ where
 pub fn bring_up(
     net: &SimNet,
     signing_key: &SigningKey,
+    mut store: MemoryRepo,
+    team_root: ed25519_dalek::VerifyingKey,
+    credential_sig: [u8; 32],
+) -> Peer<MemoryRepo> {
+    let fixture = admin_credential_registry()
+        .lock()
+        .unwrap()
+        .get(&credential_sig)
+        .cloned()
+        .expect("fixture credential signature must have a registered proof closure");
+    seed_recipient_credential(
+        &mut store,
+        signing_key,
+        team_root,
+        &(fixture.cap, fixture.sig),
+        fixture.proof_caps,
+    );
+    bring_up_preseeded(net, signing_key, store, team_root)
+}
+
+/// Wire a peer whose recipient ledger has already been prepared by the test.
+/// This is the path for scenarios which need to compose recipient history
+/// explicitly before startup (for example an accepted predecessor).
+pub fn bring_up_preseeded(
+    net: &SimNet,
+    signing_key: &SigningKey,
     store: MemoryRepo,
     team_root: ed25519_dalek::VerifyingKey,
-    self_cap: [u8; 32],
 ) -> Peer<MemoryRepo> {
     let id = pk(signing_key);
     let harness = net.join(id);
@@ -148,7 +220,6 @@ pub fn bring_up(
         PeerConfig {
             peers: Vec::new(),
             team_root,
-            self_cap,
         },
         wiring,
     ));
@@ -160,13 +231,13 @@ pub fn bring_up(
 pub fn store_with_caps(caps: &[(Blob<SimpleArchive>, Blob<SimpleArchive>)]) -> MemoryRepo {
     let mut store = MemoryRepo::default();
     for (cap, sig) in caps {
-        if let Some(proof) = admin_proof_registry()
+        if let Some(fixture) = admin_credential_registry()
             .lock()
             .unwrap()
             .get(&sig.get_handle().raw)
             .cloned()
         {
-            for blob in proof {
+            for blob in fixture.proof_caps {
                 store.put::<SimpleArchive, _>(blob).unwrap();
             }
         }
@@ -176,8 +247,7 @@ pub fn store_with_caps(caps: &[(Blob<SimpleArchive>, Blob<SimpleArchive>)]) -> M
     store
 }
 
-/// Convenience: the `self_cap` handle (sig blob hash) for a (cap, sig)
-/// pair.
-pub fn self_cap_of(sig: &Blob<SimpleArchive>) -> [u8; 32] {
+/// Signature-blob handle used to select a registered credential fixture.
+pub fn credential_sig_handle(sig: &Blob<SimpleArchive>) -> [u8; 32] {
     sig.get_handle().raw
 }

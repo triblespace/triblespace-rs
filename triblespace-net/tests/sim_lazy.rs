@@ -104,8 +104,20 @@ fn fetch_blob_pulls_from_the_holder() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         // A announces its blobs to the DHT via refresh's diff-and-announce;
         // settle the mesh (neighbor-up + announce).
@@ -160,14 +172,14 @@ fn cold_server_authenticates_without_persisting_remote_proof() {
             &holder_key,
             holder_store,
             team_root,
-            self_cap_of(&holder_cap.1),
+            credential_sig_handle(&holder_cap.1),
         );
         let client = bring_up(
             &net,
             &client_key,
             client_store,
             team_root,
-            self_cap_of(&client_cap.1),
+            credential_sig_handle(&client_cap.1),
         );
 
         for _ in 0..40u32 {
@@ -186,7 +198,7 @@ fn cold_server_authenticates_without_persisting_remote_proof() {
         // an unbounded sequence of self-delegated credentials.
         holder.refresh().unwrap();
         let reader = holder.reader().unwrap();
-        let client_sig = self_cap_of(&client_cap.1);
+        let client_sig = credential_sig_handle(&client_cap.1);
         assert!(
             BlobStoreGet::get::<TribleSet, SimpleArchive>(&reader, Inline::new(client_sig))
                 .is_err(),
@@ -216,9 +228,21 @@ fn lazy_read_lands_with_asserted_want() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
         // B is a lazy node: no eager content.
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -302,8 +326,20 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         }
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -414,8 +450,20 @@ fn async_lazy_read_awaits_swarm_and_records_want() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -483,8 +531,20 @@ fn transparent_async_get_fetches_through_reader() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -552,7 +612,13 @@ fn fetch_blob_unavailable_is_clean() {
         let cap_a = admin_cap(&root, &ka);
 
         let store_a = store_with_caps(&[cap_a.clone()]);
-        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
 
         let (_blob, hash) = content_blob(0x99);
         // The DHT fallback has a 3s internal timeout; give the sim
@@ -594,7 +660,13 @@ fn fetch_deadline_bounds_unavailable_resolution() {
         let cap_a = admin_cap(&root, &ka);
 
         let store_a = store_with_caps(&[cap_a.clone()]);
-        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
         let _ = net; // keep the sim alive for the fetch
 
         let (_blob, hash) = content_blob(0x9A);
@@ -638,8 +710,20 @@ fn lazy_read_unavailable_under_partition_then_heals() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -697,8 +781,20 @@ fn lazy_read_unavailable_under_crash_then_revives() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -743,8 +839,20 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -814,8 +922,20 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
             store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
             let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-            let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-            let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+            let mut peer_a = bring_up(
+                &net,
+                &ka,
+                store_a,
+                team_root,
+                credential_sig_handle(&cap_a.1),
+            );
+            let peer_b = bring_up(
+                &net,
+                &kb,
+                store_b,
+                team_root,
+                credential_sig_handle(&cap_b.1),
+            );
 
             for _ in 0..40u32 {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -901,9 +1021,27 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
         store_c.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&all);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1));
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let mut peer_c = bring_up(
+            &net,
+            &kc,
+            store_c,
+            team_root,
+            credential_sig_handle(&cap_c.1),
+        );
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..50u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -951,8 +1089,20 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1001,8 +1151,20 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1088,8 +1250,20 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
-        let peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
+        let peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -1208,9 +1382,21 @@ fn reconcile_tick_services_authored_want() {
             .unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
         // B is a pure leecher; only the want-reconcile fetches.
-        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1));
+        let mut peer_b = bring_up(
+            &net,
+            &kb,
+            store_b,
+            team_root,
+            credential_sig_handle(&cap_b.1),
+        );
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -1291,8 +1477,15 @@ fn reconcile_ignores_foreign_authored_wants() {
         let team_root = root.verifying_key();
         let local_cap = admin_cap(&root, &local);
         let store = store_with_caps(&[local_cap.clone()]);
-        let mut peer = bring_up(&net, &local, store, team_root, self_cap_of(&local_cap.1));
+        let mut peer = bring_up(
+            &net,
+            &local,
+            store,
+            team_root,
+            credential_sig_handle(&local_cap.1),
+        );
         let hash = *blake3::hash(b"foreign author's missing blob").as_bytes();
+        let assertions_before = peer.store().pin_assertion_snapshot().unwrap().len();
 
         peer.store()
             .append_pin_assertion(sign_want(
@@ -1303,7 +1496,7 @@ fn reconcile_ignores_foreign_authored_wants() {
 
         assert_eq!(
             peer.store().pin_assertion_snapshot().unwrap().len(),
-            1,
+            assertions_before + 1,
             "foreign assertion remains in generic storage"
         );
         assert!(
@@ -1347,7 +1540,13 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let cap_a = admin_cap(&root, &ka);
 
         let store_a = store_with_caps(&[cap_a.clone()]);
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1));
+        let mut peer_a = bring_up(
+            &net,
+            &ka,
+            store_a,
+            team_root,
+            credential_sig_handle(&cap_a.1),
+        );
 
         // A want for content nobody holds (an arbitrary content id).
         let hash = *blake3::hash(b"nobody holds this blob").as_bytes();

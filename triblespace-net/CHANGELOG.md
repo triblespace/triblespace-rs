@@ -39,12 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operational cap.** The root signs one tagged root-to-founder
   `FounderAnchor`, which is accepted only as the proof terminator and never as
   an `OP_AUTH` leaf. Founder operational renewals are finite siblings under the
-  retained anchor, keeping rotation at constant depth. The durable team-cap pin
-  is authoritative and atomically keeps the current operational pair plus
-  founder rotation authority. An expired but otherwise exact pinned chain may
-  start recovery-only services, with outbound auth and ordinary authorized work
-  disabled until a fresh sibling or authorized renewal is selected; malformed,
-  wrong-root, bad-signature, and wrong-subject state still fails startup.
+  anchor, keeping rotation at constant depth. A `FounderGrantSelected`
+  recipient effect joins the local choice to its exact enabled policy grant;
+  there is no parallel scalar credential or anchor pin. An expired but exact
+  selected proof is never used for outbound auth, but may seed a reconstructed
+  direct-anchor sibling.
 - **Auth-handshake v2 has three bounded one-shot operations:** capability
   request, capability delivery, and exact proof-member fetch. Proof locators
   are public content locators rather than secrets; a server returns a member
@@ -52,21 +51,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the requested handle was touched. Cold `OP_AUTH` proof members remain
   connection-local. A delivered leaf pair and verified parent bundle enter the
   bounded policy queue as one event and become active only after the complete
-  selected bundle is stored.
+  bundle is stored, `CredentialAccepted` is durable, and a fresh Complete
+  projection plus coherent serving snapshot select it.
 - **Capability policy is bounded and locally selected.** Request, delivery, and
   confirmation queues have independent limits. A serialized policy writer
   admits at most 1,024 pending requests and one pending identity per requester
   in its prospective local view. These are resource guards rather than
   replicated invariants: independently admitted facts survive pile union even
-  when the merged view exceeds either limit. `team request-join` requires
-  `--pile` and
-  durably records the outbound partial request before sending. Initial delivery
-  must match that intent. Its exact request head enters a durable `Activating`
-  journal only after the proof bundle is flushed; credential activation is
-  flushed before that journal is cleared, and startup completes interrupted
-  transitions without consuming a concurrent replacement request. Later
-  selection is monotone in issuer, scope, and effective expiry, with expiry
-  rechecked when the queued event is applied. An `OP_REQUEST_CAP` `STATUS_OK`
+  when the merged view exceeds either limit. `team request-join` publishes an
+  exact team-scoped `IntentDeclared` effect before sending. Initial delivery
+  must match that intent; explicit rejection publishes `IntentCanceled` against
+  its exact event. Verified delivery flushes the proof closure before
+  `CredentialAccepted`. Later selection is monotone in issuer, scope, and
+  effective expiry, with expiry rechecked when the queued event is applied.
+  Startup and refresh reconcile the live host from the same durable projection,
+  replacing the former activation journal. An `OP_REQUEST_CAP` `STATUS_OK`
   now follows a flush of the exact request closure and durable append of its
   `RequestObserved` assertion. Explicit policy or pre-admission failures are rejected;
   a persistence error after admission returns `STATUS_INDETERMINATE`, because a
@@ -93,29 +92,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so an enabled grant can later replace it. `identity::load_existing_key` shares the
   normal identity path resolution while making no-create signing commands
   explicit.
-- **Renewal and disablement now close over the asserted grant ledger.** Every
-  tick fresh-resolves a Complete view for the local author's entire ledger;
-  incomplete or invalid evidence anywhere produces no renewal or self
-  materialization. The work set is exactly the retained founder pin's own
-  `(team, subject, scope)` grant plus remote-subject grants for the configured
-  team; foreign-team and unrelated local-subject grants are inert after
-  resolution. Scheduling uses enabled historical `Current` values,
+- **Renewal and disablement now close over asserted grant and recipient
+  ledgers.** Every tick fresh-resolves both at one coherent assertion boundary;
+  incomplete or invalid evidence defers the affected work. The work set is
+  exactly the selected founder `(team, subject, scope)` grant plus
+  remote-subject grants for the configured team; foreign-team and unrelated
+  local-subject grants are inert after resolution. Scheduling uses enabled
+  historical `Current` values,
   deliberately retaining expired currents as renewal seeds, while dispatch
   remains limited to live `usable_at(now)` winners. Ordinary successors are durably published
   as `GrantIssued` before the single post-production redispatch pass
   fresh-resolves and sends the selected unauthenticated current. Terminal
   `GrantDisabled` stops both renewal and dispatch without deleting historical
-  issuance. Founder rotation verifies the retained anchor and asserts a
-  direct-anchor sibling before a fresh resolution; materialization then moves
-  whichever usable winner was selected onto the team-credential pin, flushes
-  it, publishes a coherent serving snapshot, and updates outbound auth without
-  a self-directed delivery. The selected durable pin and process-local observed
-  host value form a level-triggered retry condition after flush, snapshot, or
-  publication failure; restart re-resolves policy before initializing the host
-  from the durable pin. Founder startup never manufactures missing policy from
-  that pin: the bootstrap
-  credential is usable only when a fresh Complete ledger selects its exact cap
-  and signature.
+  issuance. Founder rotation reconstructs the standalone anchor from the
+  selected historical proof and asserts a direct-anchor sibling before a fresh
+  joint resolution. It then publishes a coherent serving snapshot and updates
+  outbound auth without self-delivery. Durable selected truth and the
+  process-local host observation form a level-triggered retry condition after
+  flush, snapshot, or publication failure. `PeerConfig.self_cap` and the whole
+  scalar policy module are removed rather than retained as compatibility paths.
 - **Serving resources fail closed.** Unauthenticated work, authenticated
   connections, and post-auth streams are globally bounded; each subject may
   hold at most one live inbound pile-sync connection, including while admitted

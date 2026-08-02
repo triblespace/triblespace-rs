@@ -1,7 +1,7 @@
 //! `trible pile pin …` — generic operations on the pin storage
 //! primitive. Pins are atomically-updatable handles to SimpleArchive blobs.
-//! They remain temporarily for legacy retention and policy consumers, but they
-//! are not asserted-pin or branch authority.
+//! They remain temporarily for legacy retention, but they are not asserted-pin
+//! authority.
 //!
 //! Signed branches live under `trible pile branch …` and are selected by their
 //! full `(author key, name handle)` identity. This lower-level surface sees
@@ -23,7 +23,7 @@ use triblespace_core::trible::TribleSet;
 #[derive(Parser)]
 pub enum Command {
     /// List every local/legacy pin in a pile, classified by role (LEGACY-BRANCH /
-    /// POLICY / UNNAMED / UNREADABLE). Asserted branch pins are
+    /// UNNAMED / UNREADABLE). Asserted branch pins are
     /// separate state inspected with `pile branch list`.
     List {
         /// Path to the pile file to inspect.
@@ -39,13 +39,13 @@ pub enum Command {
         pin: String,
     },
     /// Tombstone a pin by writing a None head via CAS. Any role
-    /// (legacy branch / policy / unnamed) — the storage
+    /// (legacy branch / unnamed) — the storage
     /// primitive doesn't discriminate. The pin's reachable blobs may
     /// become unreachable; physical reclamation requires a separate
     /// retention rewrite.
     ///
     /// Asserted branch pins cannot be deleted through this command. This is the
-    /// legacy scalar path for incorrect policy or retention entries.
+    /// legacy scalar path for incorrect retention entries.
     Delete {
         /// Path to the pile file to modify.
         path: PathBuf,
@@ -66,10 +66,6 @@ pub fn run(cmd: Command) -> Result<()> {
 enum Role {
     /// A pin carrying `metadata::name` — a legacy mutable branch head.
     Branch(String),
-    /// A pin carrying `local_only_pin` — outbound request activation,
-    /// per-team credential holding, etc. Issuer grant policy uses asserted
-    /// pins instead of this scalar namespace.
-    LocalOnly,
     /// Pin head exists but matches none of the known role markers.
     /// Either an exotic use or a stale anonymous pin from older
     /// schema versions.
@@ -86,7 +82,6 @@ impl Role {
     fn label(&self) -> &'static str {
         match self {
             Role::Branch(_) => "LEGACY-BRANCH",
-            Role::LocalOnly => "POLICY",
             Role::Unnamed => "UNNAMED",
             Role::Unreadable(_) => "UNREADABLE",
         }
@@ -115,15 +110,6 @@ fn classify(meta: &TribleSet, pin_id: Id) -> Role {
             // handle instead of implying a relationship to asserted-pin state.
             return Role::Branch(format!("name-handle=blake3:{}", hex::encode(name.raw)));
         }
-    }
-
-    // Local-only pin: has local_only_pin marker.
-    let mut local_only_iter = find!(
-        v: Id,
-        pattern!(meta, [{ _?e @ triblespace_net::policy::local_only_pin: ?v }])
-    );
-    if local_only_iter.next().is_some() {
-        return Role::LocalOnly;
     }
 
     Role::Unnamed

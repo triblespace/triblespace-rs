@@ -1,9 +1,9 @@
 //! Positive identification of the legacy mutable-pin metadata schema.
 //!
-//! `PinStore` is also used for local retention and policy state. Those generic
-//! pins must never become branch-scoped serving roots merely because their ids
-//! happen to match a capability's scope. This predicate exists only for local
-//! scope evaluation; legacy mutable heads are no longer replicated.
+//! Generic pins must never become branch-scoped serving roots merely because
+//! their ids happen to match a capability's scope. This predicate positively
+//! recognizes the one legacy branch shape; legacy mutable heads are no longer
+//! replicated.
 
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -31,15 +31,6 @@ pub(crate) fn is_legacy_pin_metadata_set(
     let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(&meta, pin_id) else {
         return false;
     };
-    let is_local_only = find!(
-        kind: Id,
-        pattern!(meta, [{ _?marker @ crate::policy::local_only_pin: ?kind }])
-    )
-    .next()
-    .is_some();
-    if is_local_only {
-        return false;
-    }
     let mut names = find!(
         name: Inline<Handle<LongString>>,
         pattern!(meta, [{ branch_entity @ triblespace_core::metadata::name: ?name }])

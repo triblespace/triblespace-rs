@@ -60,6 +60,10 @@ use crate::channel::{NetEvent, PublisherKey};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::policy_ledger::GrantIdentity;
 use crate::protocol::RawHash;
+use crate::recipient_ledger::{
+    FounderGrantResolution, RecipientCredentialResolution, RecipientLedgerResolution,
+    accept_credential, resolve_recipient_ledger,
+};
 
 pub use crate::host::PeerConfig;
 
@@ -103,14 +107,11 @@ impl PeerRefreshError {
 ///
 /// Single-user team-of-one setup against a [`Pile`]: the user is
 /// their own team root, and the relay accepts only caps signed by
-/// (or chained from) their own key. The `self_cap = [0u8; 32]`
-/// sentinel will fail any remote `OP_AUTH` it sends — fine for
-/// solo workflows where the peer is purely a server.
-///
-/// Multi-user setups load `team_root` and `self_cap` from the
-/// `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` environment variables;
-/// see the [Capability Auth] book chapter for the full team
-/// lifecycle.
+/// (or chained from) their own key. Without a durable recipient-selected
+/// credential it remains server-only. Multi-user setups load `team_root`
+/// from `TRIBLE_TEAM_ROOT`; outbound authority is always derived from the
+/// pile rather than a bearer-handle environment variable. See the
+/// [Capability Auth] book chapter for the full team lifecycle.
 ///
 /// [`Pile`]: triblespace_core::repo::pile::Pile
 /// [Capability Auth]: https://docs.rs/triblespace/latest/triblespace/book/capability-auth/index.html
@@ -127,7 +128,6 @@ impl PeerRefreshError {
 /// let peer = Peer::new(pile, key.clone(), PeerConfig {
 ///     peers: vec![],                       // bootstrap nodes
 ///     team_root: key.verifying_key(),      // single-user fallback
-///     self_cap: [0u8; 32],
 /// });
 /// // From here `peer` forwards the wrapped store's blob, local-pin,
 /// // durability, and asserted-pin capabilities — wrap it in
@@ -177,10 +177,10 @@ where
     signing_key: SigningKey,
 
     /// AUTH credential currently believed to be installed in the live host.
-    /// `None` means caller-managed wiring did not tell Peer its initial value;
-    /// zero is represented explicitly as `Some([0; 32])`. Keeping this
-    /// process-local observation distinct from the durable pin lets a policy
-    /// view that becomes actionable later publish an unchanged pin, and lets a
+    /// `None` means the first durable reconciliation has not yet run; zero is
+    /// represented explicitly as `Some([0; 32])`. Keeping this
+    /// process-local observation distinct from the durable projection lets a
+    /// view that becomes actionable later publish an unchanged signature, and lets a
     /// view that becomes non-authorizing withdraw stale live authority.
     host_self_cap: Option<RawHash>,
 
@@ -203,6 +203,281 @@ fn publish_host_self_cap(sender: &NetSender, observed: &mut Option<RawHash>, sel
     *observed = Some(self_cap);
 }
 
+/// One fresh, complete recipient-side projection that may drive live AUTH.
+///
+/// Founder authority is policy-authored but recipient-selected. Ordinary
+/// authority is recipient-accepted. Keeping the two variants explicit makes
+/// renewal recover the founder anchor only for the former while the host sees
+/// the same signature-handle effect for either.
+#[derive(Clone, Debug)]
+enum RecipientOperationalAuthority {
+    Founder(crate::policy_ledger::CurrentGrant),
+    Accepted(crate::recipient_ledger::CurrentRecipientCredential),
+}
+
+impl RecipientOperationalAuthority {
+    fn cap(&self) -> Inline<Handle<SimpleArchive>> {
+        match self {
+            Self::Founder(credential) => credential.cap(),
+            Self::Accepted(credential) => credential.cap(),
+        }
+    }
+
+    fn sig(&self) -> Inline<Handle<SimpleArchive>> {
+        match self {
+            Self::Founder(credential) => credential.sig(),
+            Self::Accepted(credential) => credential.sig(),
+        }
+    }
+
+    fn capability(&self) -> &triblespace_core::repo::capability::VerifiedCapability {
+        match self {
+            Self::Founder(credential) => credential.capability(),
+            Self::Accepted(credential) => credential.capability(),
+        }
+    }
+}
+
+fn project_recipient_operational_authority(
+    recipient: &crate::recipient_ledger::RecipientLedgerView,
+    policy: Option<&crate::policy_ledger::PolicyLedgerView>,
+    author: ed25519_dalek::VerifyingKey,
+    team_root: ed25519_dalek::VerifyingKey,
+    now: hifitime::Epoch,
+) -> Option<RecipientOperationalAuthority> {
+    let accepted = match recipient.credential(team_root) {
+        Some(RecipientCredentialResolution::Current { credential, .. })
+            if credential.usable_at(now) =>
+        {
+            Some(RecipientOperationalAuthority::Accepted(credential.clone()))
+        }
+        Some(RecipientCredentialResolution::Unaccepted)
+        | Some(RecipientCredentialResolution::Current { .. })
+        | Some(RecipientCredentialResolution::Conflicted { .. })
+        | None => None,
+    };
+
+    let founder = match (recipient.founder_grant(team_root), policy) {
+        (Some(FounderGrantResolution::Current(selection)), Some(policy)) => {
+            let grant = GrantIdentity::new(team_root, author, selection.scope_root());
+            policy
+                .grants()
+                .get(&grant)
+                .and_then(|state| state.usable_at(now))
+                .cloned()
+                .map(RecipientOperationalAuthority::Founder)
+        }
+        (Some(FounderGrantResolution::Unselected), _)
+        | (Some(FounderGrantResolution::Conflicted { .. }), _)
+        | (Some(FounderGrantResolution::Current(_)), None)
+        | (None, _) => None,
+    };
+
+    founder.or(accepted)
+}
+
+/// Resolve live authority from one exact assertion/content boundary.
+///
+/// An explicit founder selection wins when its exact self grant is selected by
+/// a Complete policy view and live at `now`. A stale, disabled, conflicted,
+/// incomplete, or otherwise inert founder selection does not mask an
+/// independently usable ordinary recipient acceptance.
+fn resolve_recipient_operational_authority_from<R>(
+    snapshot: &PinAssertionSnapshot,
+    reader: &R,
+    author: ed25519_dalek::VerifyingKey,
+    team_root: ed25519_dalek::VerifyingKey,
+    now: hifitime::Epoch,
+    operation: &'static str,
+) -> Option<RecipientOperationalAuthority>
+where
+    R: BlobStoreGet,
+{
+    let recipient = match resolve_recipient_ledger(snapshot, author, |handle| {
+        reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+            .ok()
+    }) {
+        RecipientLedgerResolution::Complete(view) => view,
+        RecipientLedgerResolution::Incomplete {
+            missing,
+            unknown_parents,
+        } => {
+            tracing::warn!(
+                operation,
+                missing = missing.len(),
+                unknown_parents = unknown_parents.len(),
+                "recipient ledger incomplete; AUTH deferred"
+            );
+            return None;
+        }
+        RecipientLedgerResolution::Invalid { diagnostics } => {
+            tracing::warn!(
+                operation,
+                diagnostics = ?diagnostics,
+                "recipient ledger invalid; AUTH deferred"
+            );
+            return None;
+        }
+    };
+
+    let policy = if matches!(
+        recipient.founder_grant(team_root),
+        Some(FounderGrantResolution::Current(_))
+    ) {
+        match crate::policy_ledger::resolve_policy_ledger(snapshot, author, |handle| {
+            reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                .ok()
+        }) {
+            crate::policy_ledger::PolicyLedgerResolution::Complete(view) => Some(view),
+            crate::policy_ledger::PolicyLedgerResolution::Incomplete { missing } => {
+                tracing::warn!(
+                    operation,
+                    missing = missing.len(),
+                    "founder policy ledger incomplete; trying ordinary acceptance"
+                );
+                None
+            }
+            crate::policy_ledger::PolicyLedgerResolution::Invalid { diagnostics } => {
+                tracing::warn!(
+                    operation,
+                    diagnostics = ?diagnostics,
+                    "founder policy ledger invalid; trying ordinary acceptance"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    project_recipient_operational_authority(&recipient, policy.as_ref(), author, team_root, now)
+}
+
+/// Convenience resolver for callers which do not also publish a serving
+/// snapshot. Assertions are captured before the reader: because event writers
+/// flush proof closure before assertion append, the later reader contains every
+/// blob licensed by that assertion boundary (and may safely contain more).
+#[cfg(test)]
+fn resolve_recipient_operational_authority<S>(
+    store: &mut S,
+    author: ed25519_dalek::VerifyingKey,
+    team_root: ed25519_dalek::VerifyingKey,
+    now: hifitime::Epoch,
+    operation: &'static str,
+) -> Option<RecipientOperationalAuthority>
+where
+    S: BlobStore + PinAssertionStore,
+{
+    let snapshot = match store.pin_assertion_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                operation,
+                error = %error,
+                "recipient assertion snapshot unavailable; AUTH deferred"
+            );
+            return None;
+        }
+    };
+    let reader = match store.reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::warn!(
+                operation,
+                error = %error,
+                "recipient blob reader unavailable; AUTH deferred"
+            );
+            return None;
+        }
+    };
+    resolve_recipient_operational_authority_from(
+        &snapshot, &reader, author, team_root, now, operation,
+    )
+}
+
+/// Resolve both author ledgers at one coherent assertion/content boundary.
+/// Renewal needs their joint state: a recipient founder selector licenses one
+/// exact policy grant, and neither half may come from a different snapshot.
+fn resolve_complete_recipient_and_policy<S>(
+    store: &mut S,
+    author: ed25519_dalek::VerifyingKey,
+    operation: &'static str,
+) -> Option<(
+    crate::recipient_ledger::RecipientLedgerView,
+    crate::policy_ledger::PolicyLedgerView,
+)>
+where
+    S: BlobStore + PinAssertionStore,
+{
+    let snapshot = match store.pin_assertion_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(operation, error = %error, "joint ledger snapshot unavailable");
+            return None;
+        }
+    };
+    let reader = match store.reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::warn!(operation, error = %error, "joint ledger reader unavailable");
+            return None;
+        }
+    };
+    let recipient = match resolve_recipient_ledger(&snapshot, author, |handle| {
+        reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+            .ok()
+    }) {
+        RecipientLedgerResolution::Complete(view) => view,
+        RecipientLedgerResolution::Incomplete {
+            missing,
+            unknown_parents,
+        } => {
+            tracing::warn!(
+                operation,
+                missing = missing.len(),
+                unknown_parents = unknown_parents.len(),
+                "recipient ledger incomplete; joint action deferred"
+            );
+            return None;
+        }
+        RecipientLedgerResolution::Invalid { diagnostics } => {
+            tracing::warn!(
+                operation,
+                diagnostics = ?diagnostics,
+                "recipient ledger invalid; joint action deferred"
+            );
+            return None;
+        }
+    };
+    let policy = match crate::policy_ledger::resolve_policy_ledger(&snapshot, author, |handle| {
+        reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+            .ok()
+    }) {
+        crate::policy_ledger::PolicyLedgerResolution::Complete(view) => view,
+        crate::policy_ledger::PolicyLedgerResolution::Incomplete { missing } => {
+            tracing::warn!(
+                operation,
+                missing = missing.len(),
+                "policy ledger incomplete; joint action deferred"
+            );
+            return None;
+        }
+        crate::policy_ledger::PolicyLedgerResolution::Invalid { diagnostics } => {
+            tracing::warn!(
+                operation,
+                diagnostics = ?diagnostics,
+                "policy ledger invalid; joint action deferred"
+            );
+            return None;
+        }
+    };
+    Some((recipient, policy))
+}
+
 impl<S> Peer<S>
 where
     S: BlobStore + BlobStorePut + PinStore + PinAssertionStore + StorageFlush + Send + 'static,
@@ -210,20 +485,11 @@ where
     /// Wrap a store in a Peer. Spawns the iroh network thread
     /// internally; the thread lives for the Peer's lifetime and shuts
     /// down when the Peer drops.
-    pub fn new(mut store: S, key: SigningKey, mut config: PeerConfig) -> Self {
-        config.self_cap = startup_self_cap(&mut store, &key, &config);
+    pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Self {
         let team_root = config.team_root;
         let signing_key = key.clone();
-        let initial_self_cap = config.self_cap;
         let (sender, receiver) = host::spawn(key, config);
-        Self::assemble(
-            store,
-            sender,
-            receiver,
-            team_root,
-            signing_key,
-            Some(initial_self_cap),
-        )
+        Self::assemble(store, sender, receiver, team_root, signing_key, None)
     }
 
     /// Wrap a store in a Peer over caller-provided channel halves — the
@@ -243,19 +509,13 @@ where
     }
 
     fn assemble(
-        mut store: S,
+        store: S,
         sender: host::NetSender,
         receiver: host::NetReceiver,
         team_root: ed25519_dalek::VerifyingKey,
         signing_key: SigningKey,
         host_self_cap: Option<RawHash>,
     ) -> Self {
-        // Seed the snapshot served by the network thread so peers
-        // requesting via the protocol see our current state immediately.
-        if let Some(snap) = StoreSnapshot::from_store(&mut store) {
-            sender.update_snapshot(snap);
-        }
-
         // Baseline starts as None. The first `refresh` will diff the
         // store against this and announce every existing blob to the
         // DHT — same outcome as a dedicated startup sweep, but with no
@@ -368,23 +628,6 @@ where
     }
 
     fn refresh_once(&mut self) -> Result<(), PeerRefreshError> {
-        // A process may have stopped after durably entering Activating, or
-        // after installing/flushing the team-cap but before exact journal
-        // cleanup. Recover before accepting another delivery event so the
-        // retained transaction lock has one deterministic outcome.
-        {
-            let mut store = self.store.lock().expect("store mutex");
-            if let Some(self_cap) = recover_outbound_cap_activation(
-                &mut *store,
-                self.team_root,
-                self.signing_key.verifying_key(),
-            )
-            .map_err(|error| PeerRefreshError::new("recover capability activation", error))?
-            {
-                publish_host_self_cap(&self.sender, &mut self.host_self_cap, self_cap);
-            }
-        }
-
         // ── Phase 1: drain incoming events ────────────────────────────
         while let Some(event) = self.receiver.try_recv() {
             self.last_event_at = crate::clock::mono_now();
@@ -418,22 +661,9 @@ where
                     cap_bytes,
                     sig_bytes,
                     proof_blobs,
-                    authority_expires_at,
-                    admission: _admission,
+                    ..
                 } => {
-                    // Verify the delivered chain against our configured
-                    // team root, then store both blobs locally. Pinning
-                    // them into a per-team-cap pin (so compaction
-                    // retains them) comes with the CLI subcommands —
-                    // for now they're orphan blobs in the pile, same
-                    // as our own outgoing-cap blobs.
-                    self.absorb_cap_delivery(
-                        issuer,
-                        cap_bytes,
-                        sig_bytes,
-                        proof_blobs,
-                        authority_expires_at,
-                    )?;
+                    self.absorb_cap_delivery(issuer, cap_bytes, sig_bytes, proof_blobs)?;
                 }
                 NetEvent::CapDeliveryConfirmed {
                     subject,
@@ -535,16 +765,21 @@ where
 
         let mut store = self.store.lock().expect("store mutex");
 
-        // ── Phase 2: refresh the snapshot served by the network thread ─
+        // ── Phase 2: publish one coherent proof/AUTH boundary ─────────
         //
         // MUST happen before any announce below: peers may dial immediately
-        // after DHT discovery, and the network thread serves from this
-        // snapshot.
-        if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
-            self.sender.update_snapshot(snap);
-        } else {
-            self.sender.clear_snapshot();
-        }
+        // after DHT discovery. The authority projection is derived from the
+        // exact frozen reader then installed as the serving snapshot before its
+        // signature reaches the host. A snapshot failure withdraws AUTH rather
+        // than publishing a handle whose proof cannot be served.
+        let _ = refresh_serving_and_reconcile_authority(
+            &mut *store,
+            self.signing_key.verifying_key(),
+            self.team_root,
+            &self.sender,
+            &mut self.host_self_cap,
+            "refresh recipient authority reconciliation",
+        );
 
         // ── Phase 3: diff-and-publish blob deltas ─────────────────────
         // On the first refresh the baseline is `None`, so we announce every
@@ -633,154 +868,57 @@ where
         }
     }
 
-    /// Verify a peer-delivered cap chain against our configured team
-    /// root and, on success, store both blobs locally.
+    /// Admit one peer-delivered proof as a durable recipient decision.
     ///
-    /// Pinning into a per-team-cap pin (for retention across
-    /// compaction) is deferred — the CLI subcommands that surface
-    /// "my current cap" will manage that pin. For now the cap+sig
-    /// blobs live in the pile as orphan blobs, same as the cap blobs
-    /// we issue ourselves via `team invite`. They become reachable
-    /// from a branch once the CLI commits them.
+    /// The host already verified the bounded proof bundle before emitting the
+    /// event, but the semantic writer verifies it again together with the
+    /// current request/credential frontier. It flushes the complete closure
+    /// before appending `CredentialAccepted`. Live AUTH is never changed here:
+    /// the fresh Complete reconciliation at the end of `refresh_once` is the
+    /// only operational materializer.
     fn absorb_cap_delivery(
         &mut self,
         issuer: PublisherKey,
         cap_bytes: anybytes::Bytes,
         sig_bytes: anybytes::Bytes,
         proof_blobs: Vec<anybytes::Bytes>,
-        authority_expires_at: hifitime::Epoch,
     ) -> Result<(), PeerRefreshError> {
         use triblespace_core::blob::Blob;
 
-        // Verification + exact fetch of any missing chain blobs
-        // already happened in the host thread's HandshakeHandler
-        // (the OP_DELIVER_CAP path doesn't ack STATUS_OK until the
-        // chain verifies under our pubkey). The complete bounded bundle is
-        // carried by this single control event, so WriteOnly filtering cannot
-        // discard its proof members.
         let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes);
         let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes);
-        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+        let closure = std::iter::once(cap_blob)
+            .chain(proof_blobs.into_iter().map(Blob::<SimpleArchive>::new));
 
         let mut store = self.store.lock().expect("store mutex");
-        let Some(selection) = select_cap_delivery(
+        match accept_credential(
             &mut *store,
+            &self.signing_key,
             self.team_root,
-            cap_blob.clone(),
-            authority_expires_at,
-        ) else {
-            tracing::warn!(
-                issuer = %hex::encode(&issuer[..4]),
-                "CapDelivered: valid chain was not selected by local request/current-credential policy"
-            );
-            return Ok(());
-        };
-        for bytes in proof_blobs {
-            store
-                .put::<SimpleArchive, Blob<SimpleArchive>>(Blob::new(bytes))
-                .map_err(|error| PeerRefreshError::new("persist delivered proof", error))?;
-        }
-        store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(cap_blob)
-            .map_err(|error| PeerRefreshError::new("persist delivered capability", error))?;
-        store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(sig_blob)
-            .map_err(|error| PeerRefreshError::new("persist delivered signature", error))?;
-
-        let credential = crate::policy::TeamCredential {
-            cap: cap_handle,
-            sig: sig_handle,
-            founder_anchor_sig: selection.founder_anchor_sig,
-        };
-
-        if let Some(pending) = selection.initial_request {
-            // First delivery crosses two independent CAS pins. Lock the exact
-            // Pending request to this candidate, then make that journal (and
-            // every proof blob it retains) durable before team activation.
-            let activating = match crate::policy::begin_outbound_cap_activation_if_pending(
-                &mut *store,
-                pending,
-                credential,
-            ) {
-                Some(crate::policy::OutboundRequestCasResult::Success(state)) => state,
-                Some(crate::policy::OutboundRequestCasResult::Conflict) => {
-                    tracing::info!(
-                        issuer = %hex::encode(&issuer[..4]),
-                        "CapDelivered: request intent changed during selection; dropping stale first delivery"
-                    );
-                    return Ok(());
-                }
-                None => {
-                    return Err(PeerRefreshError::new(
-                        "begin capability activation",
-                        "outbound activation journal update failed",
-                    ));
-                }
-            };
-            debug_assert_eq!(activating.activation.map(|a| a.candidate), Some(credential));
-            store.flush().map_err(|error| {
-                PeerRefreshError::new("flush capability activation journal", error)
-            })?;
-
-            let recovered = recover_outbound_cap_activation(
-                &mut *store,
-                self.team_root,
-                self.signing_key.verifying_key(),
-            )
-            .map_err(|error| PeerRefreshError::new("finish capability activation", error))?;
-            if let Some(self_cap) = recovered {
-                publish_host_self_cap(&self.sender, &mut self.host_self_cap, self_cap);
-                tracing::info!(
-                    issuer = %hex::encode(&issuer[..4]),
-                    sig = %hex::encode(&self_cap[..4]),
-                    "CapDelivered: first credential activated through durable journal"
-                );
-            } else {
-                tracing::info!(
-                    issuer = %hex::encode(&issuer[..4]),
-                    "CapDelivered: candidate expired during activation; request restored"
-                );
-            }
-            return Ok(());
-        }
-
-        match crate::policy::pin_team_credential_if_head(
-            &mut *store,
-            self.team_root,
-            selection.expected_team_head,
-            credential,
+            sig_blob,
+            closure,
+            crate::clock::epoch_now(),
         ) {
-            Some(crate::policy::TeamCredentialPinResult::Success(_pin_id)) => {
-                store.flush().map_err(|error| {
-                    PeerRefreshError::new("flush delivered capability activation", error)
-                })?;
-                // The pin is now the durable source of truth. Only after that
-                // succeeds may future outbound dials begin presenting this
-                // signature handle; the host command also evicts predecessor-
-                // authenticated pooled connections.
-                publish_host_self_cap(&self.sender, &mut self.host_self_cap, sig_handle.raw);
+            Ok(crate::recipient_ledger::RecipientWriteOutcome::Published(receipt)) => {
                 tracing::info!(
                     issuer = %hex::encode(&issuer[..4]),
                     sig = %hex::encode(&sig_handle.raw[..4]),
-                    "CapDelivered: pinned on team-cap pin"
+                    event = %hex::encode(receipt.event().raw),
+                    "CapDelivered durably accepted in recipient ledger"
                 );
                 Ok(())
             }
-            Some(crate::policy::TeamCredentialPinResult::Conflict) => {
-                tracing::info!(
+            Ok(crate::recipient_ledger::RecipientWriteOutcome::Refused(reason)) => {
+                tracing::warn!(
                     issuer = %hex::encode(&issuer[..4]),
-                    "CapDelivered: active credential changed during selection; dropping stale activation"
+                    sig = %hex::encode(&sig_handle.raw[..4]),
+                    reason = ?reason,
+                    "CapDelivered refused by recipient ledger"
                 );
                 Ok(())
             }
-            None => Err(PeerRefreshError::new(
-                "pin delivered capability",
-                format!(
-                    "team-cap pin update failed for issuer {}",
-                    hex::encode(issuer)
-                ),
-            )),
+            Err(error) => Err(PeerRefreshError::new("accept delivered credential", error)),
         }
     }
 
@@ -926,15 +1064,20 @@ where
             );
             return 0;
         }
-        let Some(snapshot) = StoreSnapshot::from_store(&mut *store) else {
-            self.sender.clear_snapshot();
+        if !refresh_serving_and_reconcile_authority(
+            &mut *store,
+            self.signing_key.verifying_key(),
+            self.team_root,
+            &self.sender,
+            &mut self.host_self_cap,
+            "redispatch recipient authority reconciliation",
+        ) {
             tracing::warn!(
                 pending = ready.len(),
-                "redispatch_unauthenticated: serving snapshot failed; deferring"
+                "redispatch_unauthenticated: coherent serving boundary unavailable; deferring"
             );
             return 0;
-        };
-        self.sender.update_snapshot(snapshot);
+        }
 
         let mut dispatched = 0usize;
         for (grant, sig, cap_blob, sig_blob) in ready {
@@ -964,9 +1107,9 @@ where
     /// post-production redispatch pass can send it.
     ///
     /// Founder self-rotation is local. Its successor is asserted first, then a
-    /// fresh selected live winner is materialized on the team-cap pin, flushed,
-    /// exposed through a coherent serving snapshot, and finally installed in
-    /// the host. No delivery marker or self-directed OP_DELIVER_CAP is involved.
+    /// fresh selected live winner is re-resolved, exposed through a coherent
+    /// serving snapshot, and finally installed in the host. No scalar pin,
+    /// delivery marker, or self-directed OP_DELIVER_CAP is involved.
     ///
     /// Returns remote redispatches plus successful founder rotations. `0` on
     /// every tick after the swarm settles into steady state means the daemon is
@@ -1099,327 +1242,6 @@ where
     }
 }
 
-/// Verify one stored operational credential and bind the cap named by its
-/// signature to the cap handle retained by local policy state. Expired chains
-/// remain distinguishable from corrupt chains for startup/recovery only.
-fn verify_stored_credential<S>(
-    store: &mut S,
-    team_root: ed25519_dalek::VerifyingKey,
-    expected_subject: ed25519_dalek::VerifyingKey,
-    credential: crate::policy::TeamCredential,
-) -> Result<triblespace_core::repo::capability::VerifiedCapability, String>
-where
-    S: BlobStore,
-{
-    use triblespace_core::macros::{find, pattern};
-    use triblespace_core::repo::capability::verify_chain_allow_expired;
-
-    let reader = store
-        .reader()
-        .map_err(|error| format!("read credential store: {error}"))?;
-    let sig_set: triblespace_core::trible::TribleSet = reader
-        .get(credential.sig)
-        .map_err(|error| format!("load configured signature: {error}"))?;
-    let mut signed = find!(
-        (entity: Id, cap: Inline<Handle<SimpleArchive>>),
-        pattern!(&sig_set, [{
-            ?entity @ triblespace_core::repo::capability::sig_signs: ?cap,
-        }])
-    );
-    let cap_handle = match (signed.next(), signed.next()) {
-        (Some((_entity, cap)), None) => cap,
-        _ => return Err("signature blob does not name exactly one leaf capability".into()),
-    };
-    if cap_handle != credential.cap {
-        return Err("team-cap state names a cap different from its signature".into());
-    }
-    verify_chain_allow_expired(team_root, credential.sig, expected_subject, |handle| {
-        reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
-            .ok()
-    })
-    .map_err(|error| format!("credential verification failed: {error:?}"))
-}
-
-/// Re-validate the semantic relation which allowed a Pending request to enter
-/// Activating. The journal is durable local authority, but it is not trusted
-/// merely because it parses: recovery repeats both proof verification and the
-/// request/candidate attenuation check before touching the team-cap pin.
-fn verify_journaled_first_delivery<S>(
-    store: &mut S,
-    team_root: ed25519_dalek::VerifyingKey,
-    expected_subject: ed25519_dalek::VerifyingKey,
-    state: crate::policy::OutboundRequestState,
-) -> Result<
-    (
-        crate::policy::TeamCredential,
-        triblespace_core::repo::capability::VerifiedCapability,
-    ),
-    String,
->
-where
-    S: BlobStore,
-{
-    use triblespace_core::repo::capability::scope_subsumes;
-
-    let activation = state
-        .activation
-        .ok_or_else(|| "outbound request is not Activating".to_string())?;
-    let candidate = activation.candidate;
-    let verified = verify_stored_credential(store, team_root, expected_subject, candidate)?;
-    let reader = store
-        .reader()
-        .map_err(|error| format!("read activation journal: {error}"))?;
-    let requested_blob: Blob<SimpleArchive> = reader
-        .get(state.partial_cap)
-        .map_err(|error| format!("load activation request: {error}"))?;
-    let candidate_blob: Blob<SimpleArchive> = reader
-        .get(candidate.cap)
-        .map_err(|error| format!("load activation candidate: {error}"))?;
-    let requested = delivery_cap_fields(requested_blob)
-        .ok_or_else(|| "activation request is malformed".to_string())?;
-    let delivered = delivery_cap_fields(candidate_blob)
-        .ok_or_else(|| "activation candidate is malformed".to_string())?;
-    if requested.subject != expected_subject
-        || delivered.subject != requested.subject
-        || delivered.issuer != requested.issuer
-        || verified.expires_at()
-            > expiry_upper(&requested.expiry)
-                .ok_or_else(|| "activation request expiry is malformed".to_string())?
-        || !scope_subsumes(
-            &requested.set,
-            requested.scope_root,
-            &delivered.set,
-            delivered.scope_root,
-        )
-    {
-        return Err("activation candidate does not match retained request intent".into());
-    }
-    Ok((candidate, verified))
-}
-
-/// Finish or reconcile an interrupted first-delivery transaction.
-///
-/// The only forward order is durable Activating journal -> team-cap CAS ->
-/// durable team-cap -> exact journal clear. A live candidate with no winner is
-/// resumed. An expired candidate with no team-cap winner restores the exact
-/// retained Pending head. A different valid team-cap winner is never
-/// overwritten; it wins and the stale journal is merely cleared.
-fn recover_outbound_cap_activation<S>(
-    store: &mut S,
-    team_root: ed25519_dalek::VerifyingKey,
-    expected_subject: ed25519_dalek::VerifyingKey,
-) -> Result<Option<RawHash>, String>
-where
-    S: BlobStore + BlobStorePut + PinStore + StorageFlush,
-{
-    let Some(journal) = crate::policy::current_outbound_cap_request_state(store) else {
-        return Ok(None);
-    };
-    let Some(activation) = journal.activation else {
-        return Ok(None);
-    };
-    let (candidate, candidate_verified) =
-        verify_journaled_first_delivery(store, team_root, expected_subject, journal)?;
-
-    let mut installed = crate::policy::current_team_credential_state(store, team_root);
-    if installed.is_none() {
-        if crate::policy::find_team_cap_pin(store, team_root).is_some() {
-            return Err("team-cap pin is malformed while recovering activation".into());
-        }
-        if candidate_verified.is_expired() {
-            let restored =
-                crate::policy::restore_outbound_cap_request_pending_if_state(store, journal)
-                    .ok_or_else(|| "restore expired activation to Pending failed".to_string())?;
-            if !restored
-                && crate::policy::current_outbound_cap_request_state(store) == Some(journal)
-            {
-                return Err("restore expired activation lost its head CAS".into());
-            }
-            store
-                .flush()
-                .map_err(|error| format!("flush restored Pending request: {error}"))?;
-            return Ok(None);
-        }
-
-        match crate::policy::pin_team_credential_if_head(store, team_root, None, candidate) {
-            Some(crate::policy::TeamCredentialPinResult::Success(_)) => {}
-            Some(crate::policy::TeamCredentialPinResult::Conflict) => {}
-            None => return Err("team-cap activation write failed".into()),
-        }
-        installed = crate::policy::current_team_credential_state(store, team_root);
-    }
-
-    let installed = installed
-        .ok_or_else(|| "team-cap activation CAS conflicted with unreadable state".to_string())?;
-    // This verifies both an exactly installed candidate and a different
-    // concurrent winner. The latter is authoritative; recovery must not
-    // overwrite it merely because the journal was created first.
-    let installed_verified =
-        verify_stored_credential(store, team_root, expected_subject, installed.credential)?;
-
-    // Whether installed by this call or immediately before a crash, the
-    // active credential must reach stable storage before intent is removed.
-    store
-        .flush()
-        .map_err(|error| format!("flush recovered team-cap activation: {error}"))?;
-    let cleared = crate::policy::clear_outbound_cap_request_if_state(store, journal)
-        .ok_or_else(|| "clear recovered activation journal failed".to_string())?;
-    if !cleared && crate::policy::current_outbound_cap_request_state(store) == Some(journal) {
-        return Err("clear recovered activation journal lost its head CAS".into());
-    }
-    store
-        .flush()
-        .map_err(|error| format!("flush activation journal clear: {error}"))?;
-
-    let raw = if installed_verified.is_expired() {
-        [0; 32]
-    } else {
-        installed.credential.sig.raw
-    };
-    if installed.credential != activation.candidate {
-        tracing::info!(
-            sig = %hex::encode(&installed.credential.sig.raw[..4]),
-            "first-delivery recovery preserved a concurrent team-cap winner"
-        );
-    }
-    Ok(Some(raw))
-}
-
-/// Resolve the outbound credential before any network task can dial. The
-/// durable team-cap pin is authoritative over process configuration. A legacy
-/// nonzero configured handle is accepted only once: after complete local
-/// verification it is promoted to that pin and flushed before host startup.
-///
-/// This method deliberately fails loudly for missing, corrupt, or
-/// wrong-subject state. An otherwise-valid expired *durable pin* is the one
-/// exception: it starts in recovery-only mode so retained founder authority
-/// can rotate a fresh finite credential without first authenticating.
-fn startup_self_cap<S>(store: &mut S, key: &SigningKey, config: &PeerConfig) -> RawHash
-where
-    S: BlobStore + BlobStorePut + PinStore + PinAssertionStore + StorageFlush,
-{
-    let expected_subject = key.verifying_key();
-    recover_outbound_cap_activation(store, config.team_root, expected_subject)
-        .unwrap_or_else(|error| panic!("outbound activation recovery failed: {error}"));
-
-    let resolve_pinned = |store: &mut S, state: crate::policy::TeamCredentialState| {
-        let pinned = state.credential;
-        let verified = verify_stored_credential(store, config.team_root, expected_subject, pinned)
-            .unwrap_or_else(|error| panic!("invalid pinned outbound credential: {error}"));
-
-        // A founder pin combines two kinds of state: the retained anchor is
-        // local rotation material, while the author-scoped asserted ledger is
-        // renewal policy. Never let the pin bootstrap or override that policy.
-        // Startup may present it only when a fresh Complete view selects this
-        // exact usable cap/signature for the exact team, subject, and scope.
-        if pinned.founder_anchor_sig.is_some() {
-            let Some(view) = resolve_complete_policy_ledger(
-                store,
-                expected_subject,
-                "founder startup policy resolution",
-            ) else {
-                return [0; 32];
-            };
-            let grant = GrantIdentity::new(config.team_root, expected_subject, verified.scope_root);
-            let selected = view
-                .grants()
-                .get(&grant)
-                .and_then(|state| state.usable_at(crate::clock::epoch_now()));
-            return match selected {
-                Some(current) if current.cap() == pinned.cap && current.sig() == pinned.sig => {
-                    pinned.sig.raw
-                }
-                _ => {
-                    tracing::warn!(
-                        grant = ?grant,
-                        "founder startup: asserted policy does not select the pinned credential; starting recovery-only"
-                    );
-                    [0; 32]
-                }
-            };
-        }
-
-        // Ordinary member pins retain their recipient-local behavior. An
-        // otherwise-valid expired credential remains pinned for delivery or
-        // operator recovery, but starts inbound-only. Corrupt, unauthorized,
-        // or incomplete ordinary state still fails loudly above.
-        if verified.is_expired() {
-            [0; 32]
-        } else {
-            pinned.sig.raw
-        }
-    };
-
-    if let Some(state) = crate::policy::current_team_credential_state(store, config.team_root) {
-        return resolve_pinned(store, state);
-    }
-    if crate::policy::find_team_cap_pin(store, config.team_root).is_some() {
-        panic!("durable team-cap pin has malformed or unreadable state");
-    }
-
-    if config.self_cap == [0; 32] {
-        // Explicit server-only sentinel: inbound serving remains available,
-        // while every attempted outbound AUTH predictably fails.
-        return config.self_cap;
-    }
-
-    let configured_sig = Inline::<Handle<SimpleArchive>>::new(config.self_cap);
-    let reader = store
-        .reader()
-        .unwrap_or_else(|error| panic!("read configured credential: {error}"));
-    let sig_set: triblespace_core::trible::TribleSet = reader
-        .get(configured_sig)
-        .unwrap_or_else(|error| panic!("load configured signature: {error}"));
-    use triblespace_core::macros::{find, pattern};
-    let mut signed = find!(
-        (entity: Id, cap: Inline<Handle<SimpleArchive>>),
-        pattern!(&sig_set, [{
-            ?entity @ triblespace_core::repo::capability::sig_signs: ?cap,
-        }])
-    );
-    let configured_cap = match (signed.next(), signed.next()) {
-        (Some((_entity, cap)), None) => cap,
-        _ => panic!("configured signature does not name exactly one leaf capability"),
-    };
-    drop(reader);
-    let configured_credential = crate::policy::TeamCredential {
-        cap: configured_cap,
-        sig: configured_sig,
-        founder_anchor_sig: None,
-    };
-    let configured_verified = verify_stored_credential(
-        store,
-        config.team_root,
-        expected_subject,
-        configured_credential,
-    )
-    .unwrap_or_else(|error| panic!("invalid configured outbound credential: {error}"));
-    if configured_verified.is_expired() {
-        panic!("invalid configured outbound credential: credential is expired");
-    }
-    match crate::policy::pin_team_credential_if_head(
-        store,
-        config.team_root,
-        None,
-        configured_credential,
-    ) {
-        Some(crate::policy::TeamCredentialPinResult::Success(_)) => {}
-        Some(crate::policy::TeamCredentialPinResult::Conflict) => {
-            let state = crate::policy::current_team_credential_state(store, config.team_root)
-                .unwrap_or_else(|| {
-                    panic!("concurrently installed team-cap pin is malformed or unreadable")
-                });
-            return resolve_pinned(store, state);
-        }
-        None => panic!("failed to promote configured outbound credential to team-cap pin"),
-    }
-    store.flush().unwrap_or_else(|error| {
-        panic!("failed to durably flush promoted outbound credential: {error}")
-    });
-    configured_sig.raw
-}
-
 // ── Trait delegations ───────────────────────────────────────────────
 //
 // Reads (`reader`, `head`, `pins`) call `refresh()` first so they
@@ -1443,18 +1265,22 @@ where
     {
         let mut store = self.store.lock().expect("store mutex");
         let handle = store.put(item)?;
-        // Snapshot first, then announce — see `refresh` Phase 2 for the
-        // ordering rationale. Without this, DHT-receivers of the announce
-        // dial us, OP_GET_BLOB hits the stale snapshot, returns missing,
-        // and the receiver waits for backoff to retry.
-        if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
-            self.sender.update_snapshot(snap);
-        } else {
-            self.sender.clear_snapshot();
+        // Install one coherent proof/AUTH boundary before announcing. If the
+        // boundary cannot be frozen, leave the blob unannounced: the next
+        // refresh observes it from the unchanged baseline and retries. We do
+        // not advance that baseline here, so a concurrent external append can
+        // never be hidden by this convenience write path; at worst refresh
+        // harmlessly re-announces `handle` once.
+        if refresh_serving_and_reconcile_authority(
+            &mut *store,
+            self.signing_key.verifying_key(),
+            self.team_root,
+            &self.sender,
+            &mut self.host_self_cap,
+            "blob put recipient authority reconciliation",
+        ) {
+            self.sender.announce(handle.raw);
         }
-        self.sender.announce(handle.raw);
-        // Update the blob baseline so refresh doesn't double-announce.
-        self.last_blob_reader = store.reader().ok();
         Ok(handle)
     }
 }
@@ -1637,68 +1463,21 @@ where
         let mut store = self.store.lock().expect("store mutex");
         let result = store.update(id, old, new)?;
         if let PushResult::Success() = &result {
-            // Refresh the snapshot served by the network thread after every
-            // successful pin mutation, including deletion. Otherwise a
-            // branch-scoped requester could keep reading through stale roots.
-            if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
-                self.sender.update_snapshot(snap);
-            } else {
-                self.sender.clear_snapshot();
-            }
+            // Refresh both the served proof boundary and live authority after
+            // every successful pin mutation, including deletion. Otherwise a
+            // branch-scoped requester could keep reading through stale roots,
+            // or AUTH could name proof absent from the frozen reader.
+            let _ = refresh_serving_and_reconcile_authority(
+                &mut *store,
+                self.signing_key.verifying_key(),
+                self.team_root,
+                &self.sender,
+                &mut self.host_self_cap,
+                "pin update recipient authority reconciliation",
+            );
         }
         Ok(result)
     }
-}
-
-struct DeliveryCapFields {
-    set: triblespace_core::trible::TribleSet,
-    subject: ed25519_dalek::VerifyingKey,
-    issuer: ed25519_dalek::VerifyingKey,
-    scope_root: Id,
-    expiry: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
-}
-
-fn delivery_cap_fields(blob: Blob<SimpleArchive>) -> Option<DeliveryCapFields> {
-    use triblespace_core::blob::TryFromBlob;
-    use triblespace_core::inline::encodings::time::NsTAIInterval;
-    use triblespace_core::macros::{find, pattern};
-
-    let set: triblespace_core::trible::TribleSet = TryFromBlob::try_from_blob(blob).ok()?;
-    let mut fields = find!(
-        (
-            cap: Id,
-            subject: ed25519_dalek::VerifyingKey,
-            issuer: ed25519_dalek::VerifyingKey,
-            scope_root: Id,
-            expiry: Inline<NsTAIInterval>,
-        ),
-        pattern!(&set, [{ ?cap @
-            triblespace_core::repo::capability::cap_subject: ?subject,
-            triblespace_core::repo::capability::cap_issuer: ?issuer,
-            triblespace_core::repo::capability::cap_scope_root: ?scope_root,
-            triblespace_core::metadata::expires_at: ?expiry,
-        }])
-    );
-    let (_cap, subject, issuer, scope_root, expiry) = match (fields.next(), fields.next()) {
-        (Some(fields), None) => fields,
-        _ => return None,
-    };
-    Some(DeliveryCapFields {
-        set,
-        subject,
-        issuer,
-        scope_root,
-        expiry,
-    })
-}
-
-fn expiry_upper(
-    expiry: &Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
-) -> Option<hifitime::Epoch> {
-    use triblespace_core::inline::TryFromInline;
-    <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(expiry)
-        .ok()
-        .map(|(_, upper)| upper)
 }
 
 fn signature_leaf_cap_handle(
@@ -1719,62 +1498,8 @@ fn signature_leaf_cap_handle(
     }
 }
 
-/// Resolve one fresh, complete author-scoped policy ledger.
-///
-/// Missing content and known-invalid evidence are global fail-closed states:
-/// no renewal, credential materialization, or host publication may proceed
-/// from a partial projection.
-fn resolve_complete_policy_ledger<S>(
-    store: &mut S,
-    author: ed25519_dalek::VerifyingKey,
-    operation: &'static str,
-) -> Option<crate::policy_ledger::PolicyLedgerView>
-where
-    S: BlobStore + PinAssertionStore,
-{
-    let snapshot = match store.pin_assertion_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            tracing::warn!(operation, error = %error, "policy assertion snapshot unavailable; deferring");
-            return None;
-        }
-    };
-    let reader = match store.reader() {
-        Ok(reader) => reader,
-        Err(error) => {
-            tracing::warn!(operation, error = %error, "policy blob reader unavailable; deferring");
-            return None;
-        }
-    };
-    match crate::policy_ledger::resolve_policy_ledger(&snapshot, author, |handle| {
-        reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
-            .ok()
-    }) {
-        crate::policy_ledger::PolicyLedgerResolution::Complete(view) => Some(view),
-        crate::policy_ledger::PolicyLedgerResolution::Incomplete { missing } => {
-            tracing::warn!(
-                operation,
-                missing = missing.len(),
-                handles = ?missing,
-                "asserted policy ledger incomplete; deferring"
-            );
-            None
-        }
-        crate::policy_ledger::PolicyLedgerResolution::Invalid { diagnostics } => {
-            tracing::warn!(
-                operation,
-                diagnostics = ?diagnostics,
-                "asserted policy ledger invalid; deferring"
-            );
-            None
-        }
-    }
-}
-
-/// Renewal scheduling uses an enabled historical current, deliberately without
-/// applying the live-at-now dispatch guard. An expired credential remains the
-/// exact semantic seed from which a successor can be issued.
+/// Renewal scheduling deliberately retains an enabled historical Current after
+/// expiry so it can seed a strictly fresher successor.
 fn enabled_historical_current(
     state: &crate::policy_ledger::GrantView,
 ) -> Option<&crate::policy_ledger::CurrentGrant> {
@@ -1788,9 +1513,9 @@ fn enabled_historical_current(
     }
 }
 
-/// Withdraw cached founder authority without disturbing its retained pin or
-/// anchor. Unknown caller-managed host state is withdrawn conservatively.
-fn withdraw_founder_host(
+/// Withdraw cached live authority. Unknown caller-managed host state is
+/// withdrawn conservatively; durable ledgers remain untouched for retry.
+fn withdraw_host_authority(
     sender: &NetSender,
     host_self_cap: &mut Option<RawHash>,
     reason: &'static str,
@@ -1801,14 +1526,63 @@ fn withdraw_founder_host(
     publish_host_self_cap(sender, host_self_cap, [0; 32]);
     tracing::warn!(
         reason,
-        "founder policy no longer authorizes the live credential; AUTH withdrawn"
+        "durable projection no longer authorizes AUTH; withdrawn"
     );
+}
+
+/// Publish a coherent proof snapshot before reconciling its selected AUTH
+/// handle. Returns false when no snapshot can be served, in which case AUTH is
+/// withdrawn and a later refresh retries from the unchanged ledgers.
+fn refresh_serving_and_reconcile_authority<S>(
+    store: &mut S,
+    author: ed25519_dalek::VerifyingKey,
+    team_root: ed25519_dalek::VerifyingKey,
+    sender: &NetSender,
+    host_self_cap: &mut Option<RawHash>,
+    operation: &'static str,
+) -> bool
+where
+    S: BlobStore + PinStore + PinAssertionStore,
+{
+    // Assertions first, reader second: validated writers flush every licensed
+    // proof blob before assertion append, so the later frozen reader contains
+    // the entire chosen assertion boundary. External appends after either
+    // snapshot wait for the next refresh instead of mixing two moments.
+    let assertions = match store.pin_assertion_snapshot() {
+        Ok(assertions) => assertions,
+        Err(error) => {
+            tracing::warn!(operation, error = %error, "serving assertion snapshot unavailable");
+            sender.clear_snapshot();
+            withdraw_host_authority(sender, host_self_cap, "serving snapshot unavailable");
+            return false;
+        }
+    };
+    let Some(snapshot) = StoreSnapshot::from_store(store) else {
+        sender.clear_snapshot();
+        withdraw_host_authority(sender, host_self_cap, "serving snapshot unavailable");
+        return false;
+    };
+
+    let desired = resolve_recipient_operational_authority_from(
+        &assertions,
+        &snapshot.reader,
+        author,
+        team_root,
+        crate::clock::epoch_now(),
+        operation,
+    )
+    .map_or([0; 32], |authority| authority.sig().raw);
+    sender.update_snapshot(snapshot);
+    if *host_self_cap != Some(desired) {
+        publish_host_self_cap(sender, host_self_cap, desired);
+    }
+    true
 }
 
 /// Produce every due asserted successor for one peer tick.
 ///
 /// This function has no remote-send path. Its only outward host effect is the
-/// ordered local founder materialization (or fail-closed withdrawal); the
+/// ordered local founder AUTH reconciliation (or fail-closed withdrawal); the
 /// caller invokes asserted redispatch exactly once after releasing the lock.
 fn produce_asserted_renewals<S>(
     store: &mut S,
@@ -1824,185 +1598,112 @@ where
     use triblespace_core::inline::TryToInline;
 
     let author = signing_key.verifying_key();
-    let founder_state = crate::policy::current_team_credential_state(store, team_root)
-        .filter(|state| state.credential.founder_anchor_sig.is_some());
-    let mut view =
-        match resolve_complete_policy_ledger(store, author, "renewal_tick initial resolution") {
-            Some(view) => view,
-            None => {
-                if founder_state.is_some() {
-                    withdraw_founder_host(
-                        sender,
-                        host_self_cap,
-                        "founder policy ledger is not complete",
-                    );
-                }
-                return 0;
-            }
-        };
-
     let now = crate::clock::epoch_now();
     let cutoff = now + renewal_window;
     let mut founder_rotations = 0usize;
+    let Some((recipient, mut view)) = resolve_complete_recipient_and_policy(
+        store,
+        author,
+        "renewal_tick initial joint resolution",
+    ) else {
+        refresh_serving_and_reconcile_authority(
+            store,
+            author,
+            team_root,
+            sender,
+            host_self_cap,
+            "renewal ledgers unavailable authority reconciliation",
+        );
+        return 0;
+    };
+    let selected_founder = match recipient.founder_grant(team_root) {
+        Some(FounderGrantResolution::Current(selection)) => Some(GrantIdentity::new(
+            team_root,
+            author,
+            selection.scope_root(),
+        )),
+        Some(FounderGrantResolution::Unselected)
+        | Some(FounderGrantResolution::Conflicted { .. })
+        | None => None,
+    };
 
-    // The retained anchor is local rotation material, while the asserted grant
-    // is policy authority. The pin's verified scope identifies the one exact
-    // self grant occupying the founder credential slot; unrelated self grants
-    // are never promoted merely because they share a subject.
-    if let Some(credential_state) = founder_state {
-        let anchor_sig = credential_state
-            .credential
-            .founder_anchor_sig
-            .expect("founder state was filtered by retained anchor");
-        let pinned_verified =
-            match verify_stored_credential(store, team_root, author, credential_state.credential) {
-                Ok(verified) => verified,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "renewal_tick: founder credential pin is invalid"
-                    );
-                    withdraw_founder_host(
-                        sender,
-                        host_self_cap,
-                        "founder credential pin is invalid",
-                    );
-                    return 0;
-                }
-            };
-        let self_grant = GrantIdentity::new(team_root, author, pinned_verified.scope_root);
-        let Some(previous) = view
+    // An explicit founder selector names exactly one self grant. Its enabled
+    // historical Current remains a renewal seed after expiry; the terminal
+    // constitutional anchor is reconstructed from the selected proof rather
+    // than retained in a second mutable pin.
+    if let Some(founder_grant) = selected_founder
+        && let Some(previous) = view
             .grants()
-            .get(&self_grant)
+            .get(&founder_grant)
             .and_then(enabled_historical_current)
             .cloned()
-        else {
-            withdraw_founder_host(
-                sender,
-                host_self_cap,
-                "exact founder grant has no enabled historical current",
-            );
-            return 0;
-        };
-
+    {
         if previous.effective_expiry() <= cutoff {
             issue_founder_successor(
                 store,
                 signing_key,
-                self_grant,
+                team_root,
+                founder_grant,
                 &previous,
-                anchor_sig,
                 renewal_window,
             );
         }
 
-        // issue_grant may report an error after its assertion became durable,
-        // and a concurrently asserted sibling may win. Never act on its return
-        // value or our candidate handles: select again from a fresh Complete
-        // view, even when this tick did not need to mint a candidate.
-        view =
-            match resolve_complete_policy_ledger(store, author, "founder post-issuance resolution")
-            {
-                Some(view) => view,
-                None => {
-                    withdraw_founder_host(
-                        sender,
-                        host_self_cap,
-                        "founder post-issuance policy ledger is not complete",
-                    );
-                    return 0;
-                }
-            };
-        let Some(winner) = view
-            .grants()
-            .get(&self_grant)
-            .and_then(|state| state.usable_at(crate::clock::epoch_now()))
-            .cloned()
-        else {
-            withdraw_founder_host(
-                sender,
-                host_self_cap,
-                "exact founder grant has no usable selected current",
-            );
-            return 0;
-        };
-        if !materialize_founder_winner(
+        // Publication errors are outcome-ambiguous and concurrent assertions
+        // may alter either ledger, so only one fresh joint boundary identifies
+        // an operational founder rotation.
+        let Some((fresh_recipient, fresh_view)) = resolve_complete_recipient_and_policy(
             store,
-            team_root,
-            sender,
-            host_self_cap,
-            credential_state,
-            anchor_sig,
-            &winner,
-        ) {
-            return 0;
-        }
-        if winner.sig() != previous.sig() {
-            founder_rotations = 1;
-        }
-    }
-
-    // Founder issuance changed the author ledger even when another sibling won.
-    // Resolve once more so ordinary selection never acts on a pre-mutation view.
-    let view =
-        match resolve_complete_policy_ledger(store, author, "renewal_tick ordinary resolution") {
-            Some(view) => view,
-            None => {
-                if crate::policy::current_team_credential_state(store, team_root)
-                    .is_some_and(|state| state.credential.founder_anchor_sig.is_some())
-                {
-                    withdraw_founder_host(
-                        sender,
-                        host_self_cap,
-                        "ordinary renewal policy ledger is not complete",
-                    );
-                }
-                return founder_rotations;
-            }
-        };
-    let now = crate::clock::epoch_now();
-    let cutoff = now + renewal_window;
-    let parent_state = crate::policy::current_team_credential_state(store, team_root);
-
-    if founder_state.is_some()
-        && !parent_state.is_some_and(|state| state.credential.founder_anchor_sig.is_some())
-    {
-        withdraw_founder_host(
-            sender,
-            host_self_cap,
-            "founder credential pin disappeared during renewal",
-        );
-        return founder_rotations;
-    }
-
-    // A retained founder pin is operational authority only while the same
-    // fresh Complete author ledger selects its exact live cap/signature. This
-    // gates both host AUTH and its use as parent of ordinary successors.
-    if let Some(state) = parent_state
-        && state.credential.founder_anchor_sig.is_some()
-    {
-        let authorized = verify_stored_credential(store, team_root, author, state.credential)
-            .ok()
-            .filter(|verified| !verified.is_expired_at(now))
-            .is_some_and(|verified| {
-                let grant = GrantIdentity::new(team_root, author, verified.scope_root);
-                view.grants()
-                    .get(&grant)
-                    .and_then(|grant_state| grant_state.usable_at(now))
-                    .is_some_and(|selected| {
-                        selected.cap() == state.credential.cap
-                            && selected.sig() == state.credential.sig
-                    })
-            });
-        if !authorized {
-            withdraw_founder_host(
+            author,
+            "founder post-issuance joint resolution",
+        ) else {
+            refresh_serving_and_reconcile_authority(
+                store,
+                author,
+                team_root,
                 sender,
                 host_self_cap,
-                "fresh founder policy does not authorize the pinned parent",
+                "founder post-issuance authority reconciliation",
             );
-            return founder_rotations;
-        }
+            return 0;
+        };
+        let still_selected = matches!(
+            fresh_recipient.founder_grant(team_root),
+            Some(FounderGrantResolution::Current(selection))
+                if GrantIdentity::new(team_root, author, selection.scope_root()) == founder_grant
+        );
+        view = fresh_view;
+        founder_rotations = usize::from(
+            still_selected
+                && view
+                    .grants()
+                    .get(&founder_grant)
+                    .and_then(|state| state.usable_at(crate::clock::epoch_now()))
+                    .is_some_and(|winner| winner.sig() != previous.sig()),
+        );
     }
+
+    if !refresh_serving_and_reconcile_authority(
+        store,
+        author,
+        team_root,
+        sender,
+        host_self_cap,
+        "renewal host authority reconciliation",
+    ) {
+        return 0;
+    }
+
+    // Re-resolve both ledgers at one boundary before selecting remote grants
+    // and their parent authority.
+    let Some((recipient, fresh_view)) = resolve_complete_recipient_and_policy(
+        store,
+        author,
+        "renewal_tick ordinary joint resolution",
+    ) else {
+        return founder_rotations;
+    };
+    view = fresh_view;
 
     let due: Vec<_> = view
         .grants()
@@ -2017,34 +1718,25 @@ where
         return founder_rotations;
     }
 
-    // An ordinary member's local team credential remains recipient-local
-    // authority. A founder credential has already passed the exact asserted
-    // gate above. In both cases, verify the pinned chain before parenting.
-    let Some(parent_state) = parent_state else {
+    // Parent authority is the same fresh projection used for host AUTH:
+    // explicit usable founder selection first, otherwise a usable accepted
+    // recipient credential. No mutable team-cap pin participates.
+    let Some(parent) = project_recipient_operational_authority(
+        &recipient,
+        Some(&view),
+        author,
+        team_root,
+        crate::clock::epoch_now(),
+    ) else {
         tracing::warn!(
             renewable = due.len(),
-            "renewal_tick: no team credential pinned; cannot issue successors"
+            "renewal_tick: no usable recipient authority; cannot issue successors"
         );
         return founder_rotations;
     };
-    let parent = match verify_stored_credential(store, team_root, author, parent_state.credential) {
-        Ok(parent) if !parent.is_expired_at(now) => parent,
-        Ok(_) => {
-            tracing::warn!(
-                renewable = due.len(),
-                "renewal_tick: pinned parent credential is expired"
-            );
-            return founder_rotations;
-        }
-        Err(error) => {
-            tracing::warn!(
-                renewable = due.len(),
-                error = %error,
-                "renewal_tick: pinned parent credential is invalid"
-            );
-            return founder_rotations;
-        }
-    };
+    let parent_cap_handle = parent.cap();
+    let parent_sig_handle = parent.sig();
+    let parent_expiry = parent.capability().expires_at();
     let reader = match store.reader() {
         Ok(reader) => reader,
         Err(error) => {
@@ -2052,26 +1744,24 @@ where
             return founder_rotations;
         }
     };
-    let parent_cap =
-        match reader.get::<Blob<SimpleArchive>, SimpleArchive>(parent_state.credential.cap) {
-            Ok(blob) => blob,
-            Err(error) => {
-                tracing::warn!(error = %error, "renewal_tick: parent cap blob unavailable");
-                return founder_rotations;
-            }
-        };
-    let parent_sig =
-        match reader.get::<Blob<SimpleArchive>, SimpleArchive>(parent_state.credential.sig) {
-            Ok(blob) => blob,
-            Err(error) => {
-                tracing::warn!(error = %error, "renewal_tick: parent signature blob unavailable");
-                return founder_rotations;
-            }
-        };
+    let parent_cap = match reader.get::<Blob<SimpleArchive>, SimpleArchive>(parent_cap_handle) {
+        Ok(blob) => blob,
+        Err(error) => {
+            tracing::warn!(error = %error, "renewal_tick: parent cap blob unavailable");
+            return founder_rotations;
+        }
+    };
+    let parent_sig = match reader.get::<Blob<SimpleArchive>, SimpleArchive>(parent_sig_handle) {
+        Ok(blob) => blob,
+        Err(error) => {
+            tracing::warn!(error = %error, "renewal_tick: parent signature blob unavailable");
+            return founder_rotations;
+        }
+    };
     drop(reader);
 
     let desired_upper = now + renewal_window * 2;
-    let new_upper = desired_upper.min(parent.expires_at());
+    let new_upper = desired_upper.min(parent_expiry);
     for (grant, current) in due {
         if new_upper <= current.effective_expiry() {
             // Reissuing below this parent cannot extend effective authority.
@@ -2125,15 +1815,15 @@ where
     founder_rotations
 }
 
-/// Assert one founder successor directly below the retained non-expiring
-/// anchor. The validated writer prospectively verifies the entire proof before
-/// publishing the issuance; no unasserted candidate can reach the team pin.
+/// Assert one founder successor directly below the terminal non-expiring
+/// anchor reconstructed from the exact selected policy proof. The validated
+/// writer prospectively verifies the entire new proof before publication.
 fn issue_founder_successor<S>(
     store: &mut S,
     signing_key: &SigningKey,
+    team_root: ed25519_dalek::VerifyingKey,
     grant: GrantIdentity,
     previous: &crate::policy_ledger::CurrentGrant,
-    anchor_sig_handle: Inline<Handle<SimpleArchive>>,
     renewal_window: hifitime::Duration,
 ) where
     S: BlobStore + PinAssertionStore + StorageFlush,
@@ -2147,15 +1837,34 @@ fn issue_founder_successor<S>(
             return;
         }
     };
-    let anchor_sig = match reader.get::<Blob<SimpleArchive>, SimpleArchive>(anchor_sig_handle) {
-        Ok(blob) => blob,
+    let reconstructed = match triblespace_core::repo::capability::verify_chain_and_reconstruct_founder_anchor_allow_expired(
+        team_root,
+        previous.sig(),
+        signing_key.verifying_key(),
+        |handle| reader.get::<Blob<SimpleArchive>, SimpleArchive>(handle).ok(),
+    ) {
+        Ok(verified)
+            if verified.chain.leaf_cap == previous.cap()
+                && verified.chain.capability.scope_root == grant.scope_root() => verified,
+        Ok(_) => {
+            tracing::warn!(
+                grant = ?grant,
+                "founder renewal: selected policy proof does not match exact grant"
+            );
+            return;
+        }
         Err(error) => {
-            tracing::warn!(error = %error, "founder renewal: retained anchor signature missing");
+            tracing::warn!(
+                grant = ?grant,
+                error = ?error,
+                "founder renewal: failed to reconstruct terminal anchor"
+            );
             return;
         }
     };
+    let anchor_sig = reconstructed.founder_anchor_sig;
     let Some(anchor_cap_handle) = signature_leaf_cap_handle(anchor_sig.clone()) else {
-        tracing::warn!("founder renewal: retained anchor signature has malformed leaf shape");
+        tracing::warn!("founder renewal: reconstructed anchor has malformed leaf shape");
         return;
     };
     let anchor_cap = match reader.get::<Blob<SimpleArchive>, SimpleArchive>(anchor_cap_handle) {
@@ -2204,195 +1913,6 @@ fn issue_founder_successor<S>(
             "founder renewal: sibling publication indeterminate; resolving fresh"
         ),
     }
-}
-
-/// Materialize one freshly resolved, usable founder winner and publish it to
-/// the live host in durable order. The process-local observed host value is
-/// changed only after publication succeeds, so any failure is rediscovered by
-/// comparing it with the durable selected winner on the next fresh tick.
-fn materialize_founder_winner<S>(
-    store: &mut S,
-    team_root: ed25519_dalek::VerifyingKey,
-    sender: &NetSender,
-    host_self_cap: &mut Option<RawHash>,
-    expected: crate::policy::TeamCredentialState,
-    anchor_sig: Inline<Handle<SimpleArchive>>,
-    winner: &crate::policy_ledger::CurrentGrant,
-) -> bool
-where
-    S: BlobStore + BlobStorePut + PinStore + StorageFlush,
-{
-    let desired = crate::policy::TeamCredential {
-        cap: winner.cap(),
-        sig: winner.sig(),
-        founder_anchor_sig: Some(anchor_sig),
-    };
-    let pin_changed = expected.credential != desired;
-    if pin_changed {
-        match crate::policy::pin_team_credential_if_head(
-            store,
-            team_root,
-            Some(expected.head),
-            desired,
-        ) {
-            Some(crate::policy::TeamCredentialPinResult::Success(_)) => {}
-            Some(crate::policy::TeamCredentialPinResult::Conflict) => {
-                tracing::info!(
-                    grant_sig = ?desired.sig,
-                    "founder materialization: team credential changed concurrently; deferring"
-                );
-                withdraw_founder_host(
-                    sender,
-                    host_self_cap,
-                    "founder credential pin CAS conflicted",
-                );
-                return false;
-            }
-            None => {
-                tracing::warn!("founder materialization: team credential pin failed");
-                withdraw_founder_host(
-                    sender,
-                    host_self_cap,
-                    "founder credential pin update failed",
-                );
-                return false;
-            }
-        }
-    } else if *host_self_cap == Some(desired.sig.raw) {
-        return true;
-    }
-
-    if let Err(error) = store.flush() {
-        tracing::warn!(
-            sig = ?desired.sig,
-            error = %error,
-            "founder materialization: durable credential flush failed"
-        );
-        withdraw_founder_host(sender, host_self_cap, "founder credential flush failed");
-        return false;
-    }
-    let Some(snapshot) = StoreSnapshot::from_store(store) else {
-        sender.clear_snapshot();
-        tracing::warn!(
-            sig = ?desired.sig,
-            "founder materialization: serving snapshot failed"
-        );
-        withdraw_founder_host(sender, host_self_cap, "founder serving snapshot failed");
-        return false;
-    };
-    sender.update_snapshot(snapshot);
-    publish_host_self_cap(sender, host_self_cap, desired.sig.raw);
-    tracing::info!(
-        sig = %hex::encode(&desired.sig.raw[..4]),
-        changed = pin_changed,
-        "founder operational credential materialized from asserted policy"
-    );
-    true
-}
-
-#[derive(Clone, Copy)]
-struct DeliverySelection {
-    expected_team_head: Option<Inline<Handle<SimpleArchive>>>,
-    founder_anchor_sig: Option<Inline<Handle<SimpleArchive>>>,
-    initial_request: Option<crate::policy::OutboundRequestState>,
-}
-
-/// Chain validity proves that an issuer *may describe* this capability; it
-/// does not let arbitrary valid members select our active credential. First
-/// delivery must match local request intent. Thereafter activation is
-/// monotone in issuer, scope, and expiry, so delayed or attenuated candidates
-/// cannot replace a stronger current cap.
-fn select_cap_delivery<S>(
-    store: &mut S,
-    team_root: ed25519_dalek::VerifyingKey,
-    candidate_blob: Blob<SimpleArchive>,
-    candidate_authority_expires_at: hifitime::Epoch,
-) -> Option<DeliverySelection>
-where
-    S: BlobStore + PinStore,
-{
-    use triblespace_core::repo::BlobStoreGet;
-    use triblespace_core::repo::capability::{VerifyError, scope_subsumes, verify_chain};
-
-    let candidate = delivery_cap_fields(candidate_blob)?;
-    let now = crate::clock::epoch_now();
-    if candidate_authority_expires_at < now
-        || candidate_authority_expires_at > expiry_upper(&candidate.expiry)?
-    {
-        // Events can wait behind synchronous store work. Verification at the
-        // host boundary is not permission to activate an authority that died
-        // while queued (and a claimed effective deadline may never exceed the
-        // leaf's own deadline).
-        return None;
-    }
-    if let Some(current_state) = crate::policy::current_team_credential_state(store, team_root) {
-        let current_cap = current_state.credential.cap;
-        let current_sig = current_state.credential.sig;
-        let reader = store.reader().ok()?;
-        let current_blob: Blob<SimpleArchive> = reader.get(current_cap).ok()?;
-        let current = delivery_cap_fields(current_blob)?;
-        if candidate.subject != current.subject
-            || candidate.issuer != current.issuer
-            || !scope_subsumes(
-                &candidate.set,
-                candidate.scope_root,
-                &current.set,
-                current.scope_root,
-            )
-        {
-            return None;
-        }
-        match verify_chain(team_root, current_sig, current.subject, |handle| {
-            reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
-                .ok()
-        }) {
-            Ok(current_verified)
-                if candidate_authority_expires_at < current_verified.expires_at() =>
-            {
-                return None;
-            }
-            Ok(_) => {}
-            // An expired predecessor may be recovered by a live candidate
-            // with the same issuer and a non-weaker scope. Every other proof
-            // failure is ambiguous/corrupt local state and fails closed.
-            Err(VerifyError::Expired) => {}
-            Err(_) => return None,
-        }
-        return Some(DeliverySelection {
-            expected_team_head: Some(current_state.head),
-            founder_anchor_sig: current_state.credential.founder_anchor_sig,
-            initial_request: None,
-        });
-    }
-
-    let requested_state = crate::policy::current_outbound_cap_request_state(store)?;
-    if requested_state.activation.is_some() {
-        // One exact candidate owns the first-delivery transaction until it is
-        // committed or recovery restores the retained Pending head.
-        return None;
-    }
-    let requested_handle = requested_state.partial_cap;
-    let reader = store.reader().ok()?;
-    let requested_blob: Blob<SimpleArchive> = reader.get(requested_handle).ok()?;
-    let requested = delivery_cap_fields(requested_blob)?;
-    if candidate.subject != requested.subject
-        || candidate.issuer != requested.issuer
-        || candidate_authority_expires_at > expiry_upper(&requested.expiry)?
-        || !scope_subsumes(
-            &requested.set,
-            requested.scope_root,
-            &candidate.set,
-            candidate.scope_root,
-        )
-    {
-        return None;
-    }
-    Some(DeliverySelection {
-        expected_team_head: None,
-        founder_anchor_sig: None,
-        initial_request: Some(requested_state),
-    })
 }
 
 /// Extract every trible whose entity is `scope_root` from `set`,
@@ -2844,6 +2364,7 @@ mod tests {
         inner: MemoryRepo,
         flushes: Arc<AtomicUsize>,
         fail_flush: bool,
+        fail_snapshot: bool,
         fail_append: bool,
         fail_after_append_once: bool,
         read_failure: Option<ProbeReadFailure>,
@@ -2905,6 +2426,9 @@ mod tests {
         type Error = InjectedAssertionError;
 
         fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+            if self.fail_snapshot {
+                return Err(InjectedAssertionError::Injected);
+            }
             self.inner
                 .pin_assertion_snapshot()
                 .map_err(InjectedAssertionError::from)
@@ -3087,147 +2611,132 @@ mod tests {
         }
     }
 
-    fn test_capability(
-        issuer: &SigningKey,
-        subject: ed25519_dalek::VerifyingKey,
-        permission: Id,
-        valid_for_seconds: f64,
-    ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-        let scope = genid();
-        let facts: TribleSet = entity! {
-            ExclusiveId::force_ref(&scope) @
-            triblespace_core::metadata::tag: permission,
-        }
-        .into();
-        let now = crate::clock::epoch_now();
-        let expiry = (
-            now,
-            now + hifitime::Duration::from_seconds(valid_for_seconds),
-        )
-            .try_to_inline()
-            .expect("expiry interval");
-        let synthetic_root = SigningKey::from_bytes(&[0xFA; 32]);
-        let anchor_scope = genid();
-        let anchor_facts: TribleSet = entity! {
-            ExclusiveId::force_ref(&anchor_scope) @
-            triblespace_core::metadata::tag:
-                triblespace_core::repo::capability::PERM_ADMIN,
-        }
-        .into();
-        let parent = triblespace_core::repo::capability::build_founder_anchor(
-            &synthetic_root,
-            issuer.verifying_key(),
-            *anchor_scope,
-            anchor_facts,
-        )
-        .expect("build synthetic test anchor");
-        triblespace_core::repo::capability::build_capability(
-            issuer, subject, parent, *scope, facts, expiry,
-        )
-        .expect("build test capability")
+    struct RecipientDeliveryFixture {
+        partial: Blob<SimpleArchive>,
+        cap: Blob<SimpleArchive>,
+        sig: Blob<SimpleArchive>,
+        proof: Vec<Blob<SimpleArchive>>,
     }
 
-    fn capability_until(
-        issuer: &SigningKey,
-        subject: ed25519_dalek::VerifyingKey,
-        parent: Option<(Blob<SimpleArchive>, Blob<SimpleArchive>)>,
-        permission: Id,
-        upper: hifitime::Epoch,
-    ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
-        let scope = genid();
-        let facts: TribleSet = entity! {
-            ExclusiveId::force_ref(&scope) @
-            triblespace_core::metadata::tag: permission,
-        }
-        .into();
-        let now = crate::clock::epoch_now();
-        let lower = if upper < now {
-            upper - hifitime::Duration::from_seconds(1.0)
-        } else {
-            now
-        };
-        let expiry = (lower, upper).try_to_inline().expect("expiry interval");
-        let parent = parent.unwrap_or_else(|| {
-            let synthetic_root = SigningKey::from_bytes(&[0xFB; 32]);
-            let anchor_scope = genid();
-            let anchor_facts: TribleSet = entity! {
-                ExclusiveId::force_ref(&anchor_scope) @
-                triblespace_core::metadata::tag:
-                    triblespace_core::repo::capability::PERM_ADMIN,
-            }
-            .into();
-            triblespace_core::repo::capability::build_founder_anchor(
-                &synthetic_root,
-                issuer.verifying_key(),
-                *anchor_scope,
-                anchor_facts,
-            )
-            .expect("build synthetic bounded-test anchor")
-        });
-        triblespace_core::repo::capability::build_capability(
-            issuer, subject, parent, *scope, facts, expiry,
-        )
-        .expect("build bounded test capability")
-    }
-
-    fn founder_credential_until(
+    fn recipient_delivery_fixture(
         team_root: &SigningKey,
-        founder: &SigningKey,
-        subject: ed25519_dalek::VerifyingKey,
-        permission: Id,
-        upper: hifitime::Epoch,
-    ) -> (
-        (Blob<SimpleArchive>, Blob<SimpleArchive>),
-        (Blob<SimpleArchive>, Blob<SimpleArchive>),
-    ) {
-        let anchor_scope = genid();
-        let anchor_facts: TribleSet = entity! {
-            ExclusiveId::force_ref(&anchor_scope) @
+        issuer: &SigningKey,
+        recipient: &SigningKey,
+        valid_for: hifitime::Duration,
+    ) -> RecipientDeliveryFixture {
+        let now = crate::clock::epoch_now();
+        let upper = now + valid_for;
+        let expiry = (now, upper).try_to_inline().expect("delivery interval");
+        let scope_root = *genid();
+        let scope: TribleSet = entity! {
+            ExclusiveId::force_ref(&scope_root) @
             triblespace_core::metadata::tag:
                 triblespace_core::repo::capability::PERM_ADMIN,
         }
         .into();
-        let anchor = triblespace_core::repo::capability::build_founder_anchor(
+        let partial_fragment = entity! {
+            triblespace_core::repo::capability::cap_subject: recipient.verifying_key(),
+            triblespace_core::repo::capability::cap_issuer: issuer.verifying_key(),
+            triblespace_core::repo::capability::cap_scope_root: scope_root,
+            triblespace_core::metadata::expires_at: expiry,
+        };
+        let mut partial_set = TribleSet::from(partial_fragment);
+        partial_set += scope.clone();
+        let partial = partial_set.to_blob();
+        let (anchor_cap, anchor_sig) = triblespace_core::repo::capability::build_founder_anchor(
             team_root,
-            founder.verifying_key(),
-            *anchor_scope,
-            anchor_facts,
+            issuer.verifying_key(),
+            scope_root,
+            scope.clone(),
         )
-        .expect("build founder anchor");
-        let credential =
-            capability_until(founder, subject, Some(anchor.clone()), permission, upper);
-        (anchor, credential)
+        .expect("delivery founder anchor");
+        let (cap, sig) = triblespace_core::repo::capability::build_capability(
+            issuer,
+            recipient.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope,
+            expiry,
+        )
+        .expect("delivered credential");
+        RecipientDeliveryFixture {
+            partial,
+            cap,
+            sig,
+            proof: vec![anchor_cap, anchor_sig],
+        }
     }
 
-    fn assert_and_pin_founder(
+    fn publish_test_acceptance(
         store: &mut MemoryRepo,
         team_root: &SigningKey,
-        founder: &SigningKey,
-        anchor: &(Blob<SimpleArchive>, Blob<SimpleArchive>),
-        credential: &(Blob<SimpleArchive>, Blob<SimpleArchive>),
-    ) -> (GrantIdentity, crate::policy::TeamCredential) {
-        let fields = delivery_cap_fields(credential.0.clone()).unwrap();
-        let grant = GrantIdentity::new(
-            team_root.verifying_key(),
-            founder.verifying_key(),
-            fields.scope_root,
-        );
-        crate::policy_ledger::issue_grant(
-            store,
-            founder,
-            grant,
-            credential.1.clone(),
-            None,
-            [credential.0.clone(), anchor.0.clone(), anchor.1.clone()],
-        )
-        .unwrap();
-        let pinned = crate::policy::TeamCredential {
-            cap: credential.0.get_handle(),
-            sig: credential.1.get_handle(),
-            founder_anchor_sig: Some(anchor.1.get_handle()),
-        };
-        crate::policy::pin_team_credential(store, team_root.verifying_key(), pinned).unwrap();
-        (grant, pinned)
+        recipient: &SigningKey,
+        delivery: &RecipientDeliveryFixture,
+    ) {
+        assert!(matches!(
+            crate::recipient_ledger::declare_intent(
+                store,
+                recipient,
+                team_root.verifying_key(),
+                delivery.partial.clone(),
+            )
+            .expect("declare test intent"),
+            crate::recipient_ledger::RecipientWriteOutcome::Published(_)
+        ));
+        assert!(matches!(
+            accept_credential(
+                store,
+                recipient,
+                team_root.verifying_key(),
+                delivery.sig.clone(),
+                std::iter::once(delivery.cap.clone()).chain(delivery.proof.iter().cloned()),
+                crate::clock::epoch_now(),
+            )
+            .expect("accept test credential"),
+            crate::recipient_ledger::RecipientWriteOutcome::Published(_)
+        ));
+    }
+
+    struct SnapshotSequenceStore {
+        inner: MemoryRepo,
+        snapshots: Vec<PinAssertionSnapshot>,
+        snapshot_calls: usize,
+    }
+
+    impl BlobStorePut for SnapshotSequenceStore {
+        type PutError = <MemoryRepo as BlobStorePut>::PutError;
+
+        fn put<E, T>(&mut self, item: T) -> Result<Inline<Handle<E>>, Self::PutError>
+        where
+            E: BlobEncoding + 'static,
+            T: IntoBlob<E>,
+            Handle<E>: InlineEncoding,
+        {
+            self.inner.put(item)
+        }
+    }
+
+    impl BlobStore for SnapshotSequenceStore {
+        type Reader = MemoryReader;
+        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.inner.reader()
+        }
+    }
+
+    impl PinAssertionStore for SnapshotSequenceStore {
+        type Error = <MemoryRepo as PinAssertionStore>::Error;
+
+        fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+            let index = self.snapshot_calls.min(self.snapshots.len() - 1);
+            self.snapshot_calls += 1;
+            Ok(self.snapshots[index].clone())
+        }
+
+        fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+            self.inner.append_pin_assertion(assertion)
+        }
     }
 
     struct AssertedGrantSeries {
@@ -3673,6 +3182,7 @@ mod tests {
             inner: MemoryRepo::default(),
             flushes,
             fail_flush: false,
+            fail_snapshot: false,
             fail_append: false,
             fail_after_append_once: false,
             read_failure: None,
@@ -3975,6 +3485,7 @@ mod tests {
             inner: MemoryRepo::default(),
             flushes: Arc::clone(&flushes),
             fail_flush: false,
+            fail_snapshot: false,
             fail_append: false,
             fail_after_append_once: false,
             read_failure: None,
@@ -4135,6 +3646,7 @@ mod tests {
                 inner: MemoryRepo::default(),
                 flushes: Arc::clone(&flushes),
                 fail_flush: true,
+                fail_snapshot: false,
                 fail_append: false,
                 fail_after_append_once: false,
                 read_failure: None,
@@ -4189,6 +3701,7 @@ mod tests {
                 inner: MemoryRepo::default(),
                 flushes: Arc::clone(&flushes),
                 fail_flush: false,
+                fail_snapshot: false,
                 fail_append: true,
                 fail_after_append_once: false,
                 read_failure: None,
@@ -4252,6 +3765,7 @@ mod tests {
                 inner: MemoryRepo::default(),
                 flushes: Arc::clone(&flushes),
                 fail_flush: false,
+                fail_snapshot: false,
                 fail_append: false,
                 fail_after_append_once: true,
                 read_failure: None,
@@ -4536,1639 +4050,343 @@ mod tests {
     }
 
     #[test]
-    fn startup_prefers_verified_durable_team_cap_over_stale_configuration() {
-        let root = SigningKey::from_bytes(&[13; 32]);
-        let founder = SigningKey::from_bytes(&[17; 32]);
-        let subject = SigningKey::from_bytes(&[14; 32]);
-        let (anchor, cap) = founder_credential_until(
-            &root,
-            &founder,
-            subject.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            crate::clock::epoch_now() + hifitime::Duration::from_seconds(600.0),
+    fn startup_and_initial_refresh_reconcile_a_durable_acceptance() {
+        let team_root = SigningKey::from_bytes(&[0x31; 32]);
+        let issuer = SigningKey::from_bytes(&[0x32; 32]);
+        let recipient = SigningKey::from_bytes(&[0x33; 32]);
+        let delivery = recipient_delivery_fixture(
+            &team_root,
+            &issuer,
+            &recipient,
+            hifitime::Duration::from_hours(1.0),
         );
         let mut store = MemoryRepo::default();
-        store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(anchor.0.clone())
-            .unwrap();
-        let cap_handle = store.put(cap.0).unwrap();
-        let sig_handle = store.put(cap.1).unwrap();
-        crate::policy::pin_team_cap(&mut store, root.verifying_key(), cap_handle, sig_handle)
-            .unwrap();
-        let config = PeerConfig {
-            peers: Vec::new(),
-            team_root: root.verifying_key(),
-            self_cap: [0xEE; 32],
-        };
+        publish_test_acceptance(&mut store, &team_root, &recipient, &delivery);
 
         assert_eq!(
-            startup_self_cap(&mut store, &subject, &config),
-            sig_handle.raw
+            resolve_recipient_operational_authority(
+                &mut store,
+                recipient.verifying_key(),
+                team_root.verifying_key(),
+                crate::clock::epoch_now(),
+                "test startup authority resolution",
+            )
+            .map(|authority| authority.sig().raw),
+            Some(delivery.sig.get_handle().raw),
+            "startup derives AUTH only from the durable recipient projection"
+        );
+
+        // Model a crash after CredentialAccepted became durable but before the
+        // host effect: caller-provided wiring starts with unknown AUTH. The
+        // constructor's first level-triggered refresh must publish the winner.
+        let endpoint = EndpointId::from_bytes(&recipient.verifying_key().to_bytes()).unwrap();
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let peer = Peer::with_wiring(
+            store,
+            recipient,
+            team_root.verifying_key(),
+            sender,
+            receiver,
+        );
+        assert_eq!(peer.host_self_cap, Some(delivery.sig.get_handle().raw));
+        assert_eq!(
+            *wiring.self_cap.borrow(),
+            Some(delivery.sig.get_handle().raw),
+            "refresh returns only after the shared live authority is visible"
         );
     }
 
     #[test]
-    fn startup_verifies_and_promotes_unpinned_configured_credential() {
-        let root = SigningKey::from_bytes(&[15; 32]);
-        let founder = SigningKey::from_bytes(&[18; 32]);
-        let subject = SigningKey::from_bytes(&[16; 32]);
-        let (anchor, cap) = founder_credential_until(
-            &root,
-            &founder,
-            subject.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            crate::clock::epoch_now() + hifitime::Duration::from_seconds(600.0),
+    fn unavailable_serving_boundary_clears_snapshot_and_withdraws_live_auth() {
+        let team_root = SigningKey::from_bytes(&[0xB1; 32]);
+        let issuer = SigningKey::from_bytes(&[0xB2; 32]);
+        let recipient = SigningKey::from_bytes(&[0xB3; 32]);
+        let delivery = recipient_delivery_fixture(
+            &team_root,
+            &issuer,
+            &recipient,
+            hifitime::Duration::from_hours(1.0),
         );
-        let mut store = MemoryRepo::default();
-        store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(anchor.0)
-            .unwrap();
-        let cap_handle = store.put(cap.0).unwrap();
-        let sig_handle = store.put(cap.1).unwrap();
-        let config = PeerConfig {
-            peers: Vec::new(),
-            team_root: root.verifying_key(),
-            self_cap: sig_handle.raw,
+        let mut inner = MemoryRepo::default();
+        publish_test_acceptance(&mut inner, &team_root, &recipient, &delivery);
+        let store = FlushProbe {
+            inner,
+            flushes: Arc::new(AtomicUsize::new(0)),
+            fail_flush: false,
+            fail_snapshot: false,
+            fail_append: false,
+            fail_after_append_once: false,
+            read_failure: None,
         };
 
-        assert_eq!(
-            startup_self_cap(&mut store, &subject, &config),
-            sig_handle.raw
+        let endpoint = EndpointId::from_bytes(&recipient.verifying_key().to_bytes()).unwrap();
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            store,
+            recipient,
+            team_root.verifying_key(),
+            sender,
+            receiver,
         );
-        assert_eq!(
-            crate::policy::current_team_cap(&mut store, root.verifying_key()),
-            Some((cap_handle, sig_handle))
-        );
-    }
+        assert_eq!(peer.host_self_cap, Some(delivery.sig.get_handle().raw));
+        assert!(wiring.snapshot.lock().unwrap().is_some());
+        wiring.cmd_rx.try_iter().for_each(drop);
 
-    #[test]
-    fn startup_retains_valid_expired_pin_but_enters_recovery_only_mode() {
-        let root = SigningKey::from_bytes(&[0xA1; 32]);
-        let founder = SigningKey::from_bytes(&[0xA2; 32]);
-        let now = crate::clock::epoch_now();
-        let (anchor, cap) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now - hifitime::Duration::from_seconds(60.0),
-        );
-        let cap_fields = delivery_cap_fields(cap.0.clone()).unwrap();
-        let anchor_sig = anchor.1.get_handle();
-        let cap_handle = cap.0.get_handle();
-        let sig_handle = cap.1.get_handle();
-        let mut store = MemoryRepo::default();
-        crate::policy_ledger::issue_grant(
-            &mut store,
-            &founder,
-            GrantIdentity::new(
-                root.verifying_key(),
-                founder.verifying_key(),
-                cap_fields.scope_root,
-            ),
-            cap.1,
-            None,
-            [cap.0, anchor.0, anchor.1],
-        )
-        .unwrap();
-        let credential = crate::policy::TeamCredential {
-            cap: cap_handle,
-            sig: sig_handle,
-            founder_anchor_sig: Some(anchor_sig),
-        };
-        crate::policy::pin_team_credential(&mut store, root.verifying_key(), credential).unwrap();
-        let config = PeerConfig {
-            peers: Vec::new(),
-            team_root: root.verifying_key(),
-            self_cap: sig_handle.raw,
-        };
+        peer.store.lock().unwrap().fail_snapshot = true;
+        peer.refresh()
+            .expect("projection unavailability is retryable rather than fail-stop");
 
-        assert_eq!(startup_self_cap(&mut store, &founder, &config), [0; 32]);
-        assert_eq!(
-            crate::policy::current_team_credential(&mut store, root.verifying_key()),
-            Some(credential),
-            "recovery startup must retain the durable founder authority"
+        assert_eq!(peer.host_self_cap, Some([0; 32]));
+        assert!(
+            wiring.snapshot.lock().unwrap().is_none(),
+            "proof serving and live AUTH must fail closed together"
         );
-    }
-
-    #[test]
-    fn founder_startup_requires_an_exact_asserted_current() {
-        let root = SigningKey::from_bytes(&[0xB1; 32]);
-        let founder = SigningKey::from_bytes(&[0xB2; 32]);
-        let now = crate::clock::epoch_now();
-        let (anchor, cap) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(600.0),
-        );
-        let cap_fields = delivery_cap_fields(cap.0.clone()).unwrap();
-        let anchor_sig = anchor.1.get_handle();
-        let cap_handle = cap.0.get_handle();
-        let sig_handle = cap.1.get_handle();
-        let grant = GrantIdentity::new(
-            root.verifying_key(),
-            founder.verifying_key(),
-            cap_fields.scope_root,
-        );
-        let mut store = MemoryRepo::default();
-        store.put::<SimpleArchive, _>(anchor.0.clone()).unwrap();
-        store.put::<SimpleArchive, _>(anchor.1.clone()).unwrap();
-        store.put::<SimpleArchive, _>(cap.0.clone()).unwrap();
-        store.put::<SimpleArchive, _>(cap.1.clone()).unwrap();
-        crate::policy::pin_team_credential(
-            &mut store,
-            root.verifying_key(),
-            crate::policy::TeamCredential {
-                cap: cap_handle,
-                sig: sig_handle,
-                founder_anchor_sig: Some(anchor_sig),
-            },
-        )
-        .unwrap();
-        let config = PeerConfig {
-            peers: Vec::new(),
-            team_root: root.verifying_key(),
-            self_cap: sig_handle.raw,
-        };
-
-        assert_eq!(
-            startup_self_cap(&mut store, &founder, &config),
-            [0; 32],
-            "a founder pin must not bootstrap its own policy assertion"
-        );
-        crate::policy_ledger::issue_grant(&mut store, &founder, grant, cap.1, None, [cap.0])
-            .unwrap();
-        assert_eq!(
-            startup_self_cap(&mut store, &founder, &config),
-            sig_handle.raw,
-            "the exact live asserted current may initialize AUTH"
-        );
-
-        let successor_expiry = (now, now + hifitime::Duration::from_seconds(1_200.0))
-            .try_to_inline()
-            .unwrap();
-        let successor = triblespace_core::repo::capability::build_capability(
-            &founder,
-            founder.verifying_key(),
-            anchor,
-            cap_fields.scope_root,
-            extract_scope_subgraph(&cap_fields.set, cap_fields.scope_root),
-            successor_expiry,
-        )
-        .unwrap();
-        crate::policy_ledger::issue_grant(
-            &mut store,
-            &founder,
-            grant,
-            successor.1,
-            None,
-            [successor.0],
-        )
-        .unwrap();
-        assert_eq!(
-            startup_self_cap(&mut store, &founder, &config),
-            [0; 32],
-            "a stale pin must not override a different asserted winner"
-        );
-    }
-
-    #[test]
-    fn founder_startup_panics_for_an_internally_inconsistent_pin() {
-        let root = SigningKey::from_bytes(&[0xA3; 32]);
-        let founder = SigningKey::from_bytes(&[0xA4; 32]);
-        let (anchor, cap) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            crate::clock::epoch_now() + hifitime::Duration::from_seconds(600.0),
-        );
-        let mut store = MemoryRepo::default();
-        let wrong_cap_handle = store.put(anchor.0).unwrap();
-        let anchor_sig = store.put(anchor.1).unwrap();
-        store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(cap.0)
-            .unwrap();
-        let sig_handle = store.put(cap.1).unwrap();
-        crate::policy::pin_team_credential(
-            &mut store,
-            root.verifying_key(),
-            crate::policy::TeamCredential {
-                cap: wrong_cap_handle,
-                sig: sig_handle,
-                founder_anchor_sig: Some(anchor_sig),
-            },
-        )
-        .unwrap();
-        let config = PeerConfig {
-            peers: Vec::new(),
-            team_root: root.verifying_key(),
-            self_cap: sig_handle.raw,
-        };
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            startup_self_cap(&mut store, &founder, &config)
+        assert_eq!(*wiring.self_cap.borrow(), Some([0; 32]));
+        assert!(wiring.cmd_rx.try_iter().any(|command| {
+            matches!(
+                command,
+                crate::channel::NetCommand::AuthRotated {
+                    predecessor,
+                    successor,
+                } if predecessor == delivery.sig.get_handle().raw && successor == [0; 32]
+            )
         }));
-        assert!(
-            result.is_err(),
-            "wrong cap/signature binding must fail loudly"
-        );
     }
 
     #[test]
-    fn founder_self_renewal_asserts_a_sibling_and_preserves_the_anchor() {
-        let root = SigningKey::from_bytes(&[19; 32]);
-        let founder = SigningKey::from_bytes(&[20; 32]);
-        let now = crate::clock::epoch_now();
-        let (anchor, old) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(60.0),
-        );
-        let decoy = capability_until(
-            &founder,
-            founder.verifying_key(),
-            Some(anchor.clone()),
-            triblespace_core::repo::capability::PERM_READ,
-            now + hifitime::Duration::from_seconds(60.0),
-        );
-        let decoy_fields = delivery_cap_fields(decoy.0.clone()).unwrap();
-        let decoy_grant = GrantIdentity::new(
-            root.verifying_key(),
-            founder.verifying_key(),
-            decoy_fields.scope_root,
+    fn delivered_credential_is_accepted_before_refresh_materializes_auth() {
+        let team_root = SigningKey::from_bytes(&[0x34; 32]);
+        let issuer = SigningKey::from_bytes(&[0x35; 32]);
+        let recipient = SigningKey::from_bytes(&[0x36; 32]);
+        let delivery = recipient_delivery_fixture(
+            &team_root,
+            &issuer,
+            &recipient,
+            hifitime::Duration::from_hours(1.0),
         );
         let mut store = MemoryRepo::default();
-        let (self_grant, pinned) =
-            assert_and_pin_founder(&mut store, &root, &founder, &anchor, &old);
-        let decoy_cap = decoy.0.get_handle();
-        let decoy_sig = decoy.1.get_handle();
-        crate::policy_ledger::issue_grant(
-            &mut store,
-            &founder,
-            decoy_grant,
-            decoy.1,
-            None,
-            [decoy.0],
-        )
-        .unwrap();
-
-        let endpoint = EndpointId::from_bytes(&founder.verifying_key().to_bytes()).unwrap();
-        let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::with_wiring(
-            store,
-            founder.clone(),
-            root.verifying_key(),
-            sender,
-            receiver,
-        );
-        while wiring.cmd_rx.try_recv().is_ok() {}
-
-        assert_eq!(
-            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
-            1
-        );
-        let mut saw_rotation = None;
-        for command in wiring.cmd_rx.try_iter() {
-            match command {
-                crate::channel::NetCommand::UpdateSelfCap(sig) => saw_rotation = Some(sig),
-                crate::channel::NetCommand::DeliverCap { subject, .. }
-                    if subject == founder.verifying_key().to_bytes() =>
-                {
-                    panic!("founder rotation must not self-deliver over the network")
-                }
-                _ => {}
-            }
-        }
-
-        let mut store = peer.store.lock().unwrap();
-        let credential = crate::policy::current_team_credential(&mut *store, root.verifying_key())
-            .expect("rotated credential remains pinned");
-        assert_eq!(credential.founder_anchor_sig, pinned.founder_anchor_sig);
-        assert_ne!(credential.cap, pinned.cap);
-        assert_ne!(credential.sig, pinned.sig);
-        assert_eq!(saw_rotation, Some(credential.sig.raw));
-        assert_eq!(
-            store.pin_assertion_snapshot().unwrap().len(),
-            3,
-            "one exact asserted successor joins the two seeded grants"
-        );
-
-        let view = resolve_complete_policy_ledger(
-            &mut *store,
-            founder.verifying_key(),
-            "founder rotation test",
-        )
-        .unwrap();
-        let crate::policy_ledger::GrantIssuanceResolution::Current(current) = view
-            .grants()
-            .get(&self_grant)
-            .unwrap()
-            .historical_issuance()
-        else {
-            panic!("founder grant must select a current sibling");
-        };
-        assert_eq!(current.cap(), credential.cap);
-        assert_eq!(current.sig(), credential.sig);
-        let crate::policy_ledger::GrantIssuanceResolution::Current(untouched_decoy) = view
-            .grants()
-            .get(&decoy_grant)
-            .unwrap()
-            .historical_issuance()
-        else {
-            panic!("unrelated self grant remains coherent");
-        };
-        assert_eq!(untouched_decoy.cap(), decoy_cap);
-        assert_eq!(untouched_decoy.sig(), decoy_sig);
-
-        let reader = store.reader().unwrap();
-        assert!(
-            reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(anchor.0.get_handle())
-                .is_ok(),
-            "the non-derivable anchor remains retained"
-        );
-        let verified = triblespace_core::repo::capability::verify_chain(
-            root.verifying_key(),
-            credential.sig,
-            founder.verifying_key(),
-            |handle| {
-                reader
-                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
-                    .ok()
-            },
-        )
-        .expect("rotated founder credential verifies as an anchor sibling");
-        assert!(
-            verified
-                .permissions()
-                .contains(&triblespace_core::repo::capability::PERM_ADMIN)
-        );
-    }
-
-    #[test]
-    fn founder_materializes_the_asserted_sibling_winner_after_a_crash() {
-        let root = SigningKey::from_bytes(&[0x31; 32]);
-        let founder = SigningKey::from_bytes(&[0x32; 32]);
-        let now = crate::clock::epoch_now();
-        let (anchor, old) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(60.0),
-        );
-        let fields = delivery_cap_fields(old.0.clone()).unwrap();
-        let upper = now + hifitime::Duration::from_seconds(3_600.0);
-        let facts = extract_scope_subgraph(&fields.set, fields.scope_root);
-        let sibling_a = triblespace_core::repo::capability::build_capability(
-            &founder,
-            founder.verifying_key(),
-            anchor.clone(),
-            fields.scope_root,
-            facts.clone(),
-            (now - hifitime::Duration::from_seconds(1.0), upper)
-                .try_to_inline()
-                .unwrap(),
-        )
-        .unwrap();
-        let sibling_b = triblespace_core::repo::capability::build_capability(
-            &founder,
-            founder.verifying_key(),
-            anchor.clone(),
-            fields.scope_root,
-            facts,
-            (now, upper).try_to_inline().unwrap(),
-        )
-        .unwrap();
-        let sibling_a_handles = (sibling_a.0.get_handle(), sibling_a.1.get_handle());
-        let sibling_b_handles = (sibling_b.0.get_handle(), sibling_b.1.get_handle());
-        let expected = if sibling_a_handles.1.raw > sibling_b_handles.1.raw {
-            sibling_a_handles
-        } else {
-            sibling_b_handles
-        };
-
-        let mut store = MemoryRepo::default();
-        let (grant, pinned) = assert_and_pin_founder(&mut store, &root, &founder, &anchor, &old);
-        crate::policy_ledger::issue_grant(
-            &mut store,
-            &founder,
-            grant,
-            sibling_a.1,
-            None,
-            [sibling_a.0],
-        )
-        .unwrap();
-        crate::policy_ledger::issue_grant(
-            &mut store,
-            &founder,
-            grant,
-            sibling_b.1,
-            None,
-            [sibling_b.0],
-        )
-        .unwrap();
-
-        let endpoint = EndpointId::from_bytes(&founder.verifying_key().to_bytes()).unwrap();
-        let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::with_wiring(
-            store,
-            founder.clone(),
-            root.verifying_key(),
-            sender,
-            receiver,
-        );
-        while wiring.cmd_rx.try_recv().is_ok() {}
-
-        assert_eq!(
-            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
-            0,
-            "recovering an asserted winner must not sign another sibling"
-        );
-        let updates: Vec<_> = wiring
-            .cmd_rx
-            .try_iter()
-            .filter_map(|command| match command {
-                crate::channel::NetCommand::UpdateSelfCap(sig) => Some(sig),
-                crate::channel::NetCommand::DeliverCap { subject, .. }
-                    if subject == founder.verifying_key().to_bytes() =>
-                {
-                    panic!("founder recovery must remain local")
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(updates, vec![expected.1.raw]);
-
-        {
-            let mut store = peer.store.lock().unwrap();
-            let credential =
-                crate::policy::current_team_credential(&mut *store, root.verifying_key()).unwrap();
-            assert_eq!(credential.cap, expected.0);
-            assert_eq!(credential.sig, expected.1);
-            assert_eq!(credential.founder_anchor_sig, pinned.founder_anchor_sig);
-            assert_eq!(store.pin_assertion_snapshot().unwrap().len(), 3);
-        }
-        assert_eq!(
-            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
-            0
-        );
-        assert!(
-            wiring.cmd_rx.try_recv().is_err(),
-            "materialization is quiet after the host observation catches up"
-        );
-    }
-
-    #[test]
-    fn founder_renewal_schedules_from_asserted_effective_expiry() {
-        let root = SigningKey::from_bytes(&[0x41; 32]);
-        let founder = SigningKey::from_bytes(&[0x42; 32]);
-        let now = crate::clock::epoch_now();
-        let parent_upper = now + hifitime::Duration::from_seconds(600.0);
-        let leaf_upper = now + hifitime::Duration::from_seconds(3_600.0);
-        let (anchor, parent) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            parent_upper,
-        );
-        let leaf = capability_until(
-            &founder,
-            founder.verifying_key(),
-            Some(parent.clone()),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            leaf_upper,
-        );
-        let fields = delivery_cap_fields(leaf.0.clone()).unwrap();
-        let grant = GrantIdentity::new(
-            root.verifying_key(),
-            founder.verifying_key(),
-            fields.scope_root,
-        );
-        let pinned = crate::policy::TeamCredential {
-            cap: leaf.0.get_handle(),
-            sig: leaf.1.get_handle(),
-            founder_anchor_sig: Some(anchor.1.get_handle()),
-        };
-        let mut store = MemoryRepo::default();
-        crate::policy_ledger::issue_grant(
-            &mut store,
-            &founder,
-            grant,
-            leaf.1.clone(),
-            None,
-            [
-                leaf.0.clone(),
-                parent.0,
-                parent.1,
-                anchor.0.clone(),
-                anchor.1.clone(),
-            ],
-        )
-        .unwrap();
-        crate::policy::pin_team_credential(&mut store, root.verifying_key(), pinned).unwrap();
-
-        let endpoint = EndpointId::from_bytes(&founder.verifying_key().to_bytes()).unwrap();
-        let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::with_wiring(
-            store,
-            founder.clone(),
-            root.verifying_key(),
-            sender,
-            receiver,
-        );
-        while wiring.cmd_rx.try_recv().is_ok() {}
-
-        assert_eq!(peer.renewal_tick(hifitime::Duration::from_seconds(1.0)), 0);
-        assert!(wiring.cmd_rx.try_iter().any(|command| matches!(
-            command,
-            crate::channel::NetCommand::UpdateSelfCap(sig) if sig == pinned.sig.raw
-        )));
-
-        let mut store = peer.store.lock().unwrap();
-        assert_eq!(store.pin_assertion_snapshot().unwrap().len(), 1);
-        let view = resolve_complete_policy_ledger(
-            &mut *store,
-            founder.verifying_key(),
-            "effective expiry test",
-        )
-        .unwrap();
-        let crate::policy_ledger::GrantIssuanceResolution::Current(current) =
-            view.grants().get(&grant).unwrap().historical_issuance()
-        else {
-            panic!("asserted leaf must remain current");
-        };
-        assert_eq!(current.effective_expiry(), parent_upper);
-        assert!(current.effective_expiry() < leaf_upper);
-    }
-
-    #[test]
-    fn expired_ordinary_current_renews_and_dispatches_the_fresh_successor() {
-        let root = SigningKey::from_bytes(&[0x91; 32]);
-        let author = SigningKey::from_bytes(&[0x92; 32]);
-        let subject = SigningKey::from_bytes(&[0x93; 32]).verifying_key();
-        let now = crate::clock::epoch_now();
-        let parent_upper = now + hifitime::Duration::from_seconds(600.0);
-        let (anchor, parent) = founder_credential_until(
-            &root,
-            &author,
-            author.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            parent_upper,
-        );
-        let expired_upper = now - hifitime::Duration::from_seconds(10.0);
-        let expired = capability_until(
-            &author,
-            subject,
-            Some(parent.clone()),
-            triblespace_core::repo::capability::PERM_READ,
-            expired_upper,
-        );
-        let fields = delivery_cap_fields(expired.0.clone()).unwrap();
-        let grant = GrantIdentity::new(root.verifying_key(), subject, fields.scope_root);
-        let old_sig = expired.1.get_handle();
-        let pinned = crate::policy::TeamCredential {
-            cap: parent.0.get_handle(),
-            sig: parent.1.get_handle(),
-            founder_anchor_sig: None,
-        };
-        let mut store = MemoryRepo::default();
-        for blob in [anchor.0, anchor.1, parent.0.clone(), parent.1.clone()] {
-            store.put::<SimpleArchive, _>(blob).unwrap();
-        }
-        crate::policy::pin_team_credential(&mut store, root.verifying_key(), pinned).unwrap();
-        crate::policy_ledger::issue_grant(&mut store, &author, grant, expired.1, None, [expired.0])
-            .unwrap();
-
-        let endpoint = EndpointId::from_bytes(&author.verifying_key().to_bytes()).unwrap();
-        let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::with_wiring(
-            store,
-            author.clone(),
-            root.verifying_key(),
-            sender,
-            receiver,
-        );
-        while wiring.cmd_rx.try_recv().is_ok() {}
-
-        assert_eq!(
-            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
-            1,
-            "the fresh asserted successor is immediately redispatched"
-        );
-        let delivered = take_dispatched_credentials(&wiring);
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].0, subject.to_bytes());
-
-        {
-            let mut store = peer.store.lock().unwrap();
-            assert_eq!(store.pin_assertion_snapshot().unwrap().len(), 2);
-            let view = resolve_complete_policy_ledger(
-                &mut *store,
-                author.verifying_key(),
-                "ordinary renewal test",
+        assert!(matches!(
+            crate::recipient_ledger::declare_intent(
+                &mut store,
+                &recipient,
+                team_root.verifying_key(),
+                delivery.partial.clone(),
             )
-            .unwrap();
-            let crate::policy_ledger::GrantIssuanceResolution::Current(current) =
-                view.grants().get(&grant).unwrap().historical_issuance()
-            else {
-                panic!("ordinary successor must become current");
-            };
-            assert_ne!(current.sig(), old_sig);
-            assert!(current.effective_expiry() > expired_upper);
-            assert!(current.effective_expiry() <= parent_upper);
-            assert_eq!(delivered[0].1, current.cap());
-            assert_eq!(delivered[0].2, current.sig());
-            assert!(
-                view.event_handles().contains(
-                    &crate::policy_ledger::PolicyEvent::GrantIssued {
-                        grant,
-                        sig: current.sig(),
-                        request: None,
-                    }
-                    .handle()
-                )
-            );
-            assert!(view.requests().is_empty());
-        }
-
-        assert_eq!(
-            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
-            0
-        );
-        assert!(take_dispatched_credentials(&wiring).is_empty());
-    }
-
-    #[test]
-    fn founder_same_pin_recovers_after_incomplete_content_arrives() {
-        let root = SigningKey::from_bytes(&[0x51; 32]);
-        let founder = SigningKey::from_bytes(&[0x52; 32]);
-        let now = crate::clock::epoch_now();
-        let (anchor, credential) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(600.0),
-        );
-        let mut store = MemoryRepo::default();
-        let (_grant, pinned) =
-            assert_and_pin_founder(&mut store, &root, &founder, &anchor, &credential);
-        let first_missing = crate::policy_ledger::PolicyEvent::GrantDisabled(GrantIdentity::new(
-            root.verifying_key(),
-            SigningKey::from_bytes(&[0x53; 32]).verifying_key(),
-            *genid(),
+            .unwrap(),
+            crate::recipient_ledger::RecipientWriteOutcome::Published(_)
         ));
-        store
-            .append_pin_assertion(crate::policy_ledger::sign_policy_event(
-                &founder,
-                first_missing,
-            ))
-            .unwrap();
-        let config = PeerConfig {
-            peers: Vec::new(),
-            team_root: root.verifying_key(),
-            self_cap: pinned.sig.raw,
-        };
-        let initial = startup_self_cap(&mut store, &founder, &config);
-        assert_eq!(initial, [0; 32]);
 
-        let endpoint = EndpointId::from_bytes(&founder.verifying_key().to_bytes()).unwrap();
+        let endpoint = EndpointId::from_bytes(&recipient.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::assemble(
+        let mut peer = Peer::with_wiring(
             store,
+            recipient.clone(),
+            team_root.verifying_key(),
             sender,
             receiver,
-            root.verifying_key(),
-            founder.clone(),
-            Some(initial),
         );
-        while wiring.cmd_rx.try_recv().is_ok() {}
-
-        peer.store
-            .lock()
-            .unwrap()
-            .put::<SimpleArchive, _>(first_missing.to_blob())
-            .unwrap();
-        assert_eq!(peer.renewal_tick(hifitime::Duration::from_seconds(1.0)), 0);
-        assert!(matches!(
-            wiring.cmd_rx.try_recv(),
-            Ok(crate::channel::NetCommand::UpdateSelfCap(sig)) if sig == pinned.sig.raw
-        ));
-
-        let second_missing = crate::policy_ledger::PolicyEvent::GrantDisabled(GrantIdentity::new(
-            root.verifying_key(),
-            SigningKey::from_bytes(&[0x54; 32]).verifying_key(),
-            *genid(),
-        ));
-        peer.store
-            .lock()
-            .unwrap()
-            .append_pin_assertion(crate::policy_ledger::sign_policy_event(
-                &founder,
-                second_missing,
-            ))
-            .unwrap();
-        assert_eq!(peer.renewal_tick(hifitime::Duration::from_seconds(1.0)), 0);
-        assert!(matches!(
-            wiring.cmd_rx.try_recv(),
-            Ok(crate::channel::NetCommand::UpdateSelfCap(sig)) if sig == [0; 32]
-        ));
-        assert_eq!(
-            crate::policy::current_team_credential(
-                &mut *peer.store.lock().unwrap(),
-                root.verifying_key(),
-            ),
-            Some(pinned)
-        );
-
-        peer.store
-            .lock()
-            .unwrap()
-            .put::<SimpleArchive, _>(second_missing.to_blob())
-            .unwrap();
-        assert_eq!(peer.renewal_tick(hifitime::Duration::from_seconds(1.0)), 0);
-        assert!(matches!(
-            wiring.cmd_rx.try_recv(),
-            Ok(crate::channel::NetCommand::UpdateSelfCap(sig)) if sig == pinned.sig.raw
-        ));
-    }
-
-    #[test]
-    fn disabled_founder_cannot_parent_ordinary_renewal() {
-        let root = SigningKey::from_bytes(&[0x61; 32]);
-        let founder = SigningKey::from_bytes(&[0x62; 32]);
-        let subject = SigningKey::from_bytes(&[0x63; 32]).verifying_key();
-        let now = crate::clock::epoch_now();
-        let (anchor, credential) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(600.0),
-        );
-        let child = capability_until(
-            &founder,
-            subject,
-            Some(credential.clone()),
-            triblespace_core::repo::capability::PERM_READ,
-            now - hifitime::Duration::from_seconds(10.0),
-        );
-        let child_fields = delivery_cap_fields(child.0.clone()).unwrap();
-        let child_grant =
-            GrantIdentity::new(root.verifying_key(), subject, child_fields.scope_root);
-        let mut store = MemoryRepo::default();
-        let (founder_grant, pinned) =
-            assert_and_pin_founder(&mut store, &root, &founder, &anchor, &credential);
-        let child_sig = child.1.get_handle();
-        crate::policy_ledger::issue_grant(
-            &mut store,
-            &founder,
-            child_grant,
-            child.1,
-            None,
-            [child.0],
-        )
-        .unwrap();
-
-        let endpoint = EndpointId::from_bytes(&founder.verifying_key().to_bytes()).unwrap();
-        let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::assemble(
-            store,
-            sender,
-            receiver,
-            root.verifying_key(),
-            founder.clone(),
-            Some(pinned.sig.raw),
-        );
-        while wiring.cmd_rx.try_recv().is_ok() {}
-        crate::policy_ledger::disable_grant(
-            &mut *peer.store.lock().unwrap(),
-            &founder,
-            founder_grant,
-        )
-        .unwrap();
-
-        assert_eq!(
-            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
-            0
-        );
-        assert!(matches!(
-            wiring.cmd_rx.try_recv(),
-            Ok(crate::channel::NetCommand::UpdateSelfCap(sig)) if sig == [0; 32]
-        ));
-        assert!(wiring.cmd_rx.try_recv().is_err());
-
-        let mut store = peer.store.lock().unwrap();
-        assert_eq!(
-            store.pin_assertion_snapshot().unwrap().len(),
-            3,
-            "no successor is asserted from the disabled founder parent"
-        );
-        let view = resolve_complete_policy_ledger(
-            &mut *store,
-            founder.verifying_key(),
-            "disabled founder test",
-        )
-        .unwrap();
-        assert!(view.grants().get(&founder_grant).unwrap().disabled());
-        let crate::policy_ledger::GrantIssuanceResolution::Current(child_current) = view
-            .grants()
-            .get(&child_grant)
-            .unwrap()
-            .historical_issuance()
-        else {
-            panic!("expired child remains a historical renewal seed");
-        };
-        assert_eq!(child_current.sig(), child_sig);
-        assert_eq!(
-            crate::policy::current_team_credential(&mut *store, root.verifying_key()),
-            Some(pinned)
-        );
-    }
-
-    #[test]
-    fn conflicted_founder_policy_withdraws_runtime_auth() {
-        let root = SigningKey::from_bytes(&[0x71; 32]);
-        let founder = SigningKey::from_bytes(&[0x72; 32]);
-        let now = crate::clock::epoch_now();
-        let (anchor, credential) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(600.0),
-        );
-        let fields = delivery_cap_fields(credential.0.clone()).unwrap();
-        let conflicting_facts: TribleSet = entity! {
-            ExclusiveId::force_ref(&fields.scope_root) @
-            triblespace_core::metadata::tag:
-                triblespace_core::repo::capability::PERM_READ,
-        }
-        .into();
-        let conflicting = triblespace_core::repo::capability::build_capability(
-            &founder,
-            founder.verifying_key(),
-            anchor.clone(),
-            fields.scope_root,
-            conflicting_facts,
-            (now, now + hifitime::Duration::from_seconds(1_200.0))
-                .try_to_inline()
-                .unwrap(),
-        )
-        .unwrap();
-
-        let mut store = MemoryRepo::default();
-        let (grant, pinned) =
-            assert_and_pin_founder(&mut store, &root, &founder, &anchor, &credential);
-        crate::policy_ledger::issue_grant(
-            &mut store,
-            &founder,
-            grant,
-            conflicting.1,
-            None,
-            [conflicting.0],
-        )
-        .unwrap();
-
-        let endpoint = EndpointId::from_bytes(&founder.verifying_key().to_bytes()).unwrap();
-        let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::assemble(
-            store,
-            sender,
-            receiver,
-            root.verifying_key(),
-            founder.clone(),
-            Some(pinned.sig.raw),
-        );
-        while wiring.cmd_rx.try_recv().is_ok() {}
-
-        assert_eq!(
-            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
-            0
-        );
-        assert!(matches!(
-            wiring.cmd_rx.try_recv(),
-            Ok(crate::channel::NetCommand::UpdateSelfCap(sig)) if sig == [0; 32]
-        ));
-        let mut store = peer.store.lock().unwrap();
-        let view = resolve_complete_policy_ledger(
-            &mut *store,
-            founder.verifying_key(),
-            "conflicted founder test",
-        )
-        .unwrap();
-        assert!(matches!(
-            view.grants().get(&grant).unwrap().historical_issuance(),
-            crate::policy_ledger::GrantIssuanceResolution::Conflicted { .. }
-        ));
-        assert_eq!(
-            crate::policy::current_team_credential(&mut *store, root.verifying_key()),
-            Some(pinned)
-        );
-    }
-
-    #[test]
-    fn invalid_founder_policy_withdraws_runtime_auth() {
-        let root = SigningKey::from_bytes(&[0x81; 32]);
-        let founder = SigningKey::from_bytes(&[0x82; 32]);
-        let now = crate::clock::epoch_now();
-        let (anchor, credential) = founder_credential_until(
-            &root,
-            &founder,
-            founder.verifying_key(),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(600.0),
-        );
-        let mut store = MemoryRepo::default();
-        let (grant, pinned) =
-            assert_and_pin_founder(&mut store, &root, &founder, &anchor, &credential);
-        let malformed_sig = crate::policy_ledger::PolicyEvent::GrantDisabled(grant).to_blob();
-        let invalid_event = crate::policy_ledger::PolicyEvent::GrantIssued {
-            grant,
-            sig: malformed_sig.get_handle(),
-            request: None,
-        };
-        store.put::<SimpleArchive, _>(malformed_sig).unwrap();
-        store
-            .put::<SimpleArchive, _>(invalid_event.to_blob())
-            .unwrap();
-        store
-            .append_pin_assertion(crate::policy_ledger::sign_policy_event(
-                &founder,
-                invalid_event,
-            ))
-            .unwrap();
-
-        let endpoint = EndpointId::from_bytes(&founder.verifying_key().to_bytes()).unwrap();
-        let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::assemble(
-            store,
-            sender,
-            receiver,
-            root.verifying_key(),
-            founder,
-            Some(pinned.sig.raw),
-        );
-        while wiring.cmd_rx.try_recv().is_ok() {}
-
-        assert_eq!(
-            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
-            0
-        );
-        assert!(matches!(
-            wiring.cmd_rx.try_recv(),
-            Ok(crate::channel::NetCommand::UpdateSelfCap(sig)) if sig == [0; 32]
-        ));
-        assert_eq!(
-            crate::policy::current_team_credential(
-                &mut *peer.store.lock().unwrap(),
-                root.verifying_key(),
-            ),
-            Some(pinned)
-        );
-    }
-    #[test]
-    fn first_delivery_requires_matching_local_request_intent() {
-        let mut store = MemoryRepo::default();
-        let issuer = SigningKey::from_bytes(&[21; 32]);
-        let other_issuer = SigningKey::from_bytes(&[22; 32]);
-        let subject = SigningKey::from_bytes(&[23; 32]).verifying_key();
-        let (requested, _) = test_capability(
-            &issuer,
-            subject,
-            triblespace_core::repo::capability::PERM_READ,
-            600.0,
-        );
-        crate::policy::record_outbound_cap_request(&mut store, requested)
-            .expect("record local intent");
-
-        let (matching, _) = test_capability(
-            &issuer,
-            subject,
-            triblespace_core::repo::capability::PERM_READ,
-            300.0,
-        );
-        let matching_expiry = expiry_upper(&delivery_cap_fields(matching.clone()).unwrap().expiry)
-            .expect("matching expiry");
-        assert!(matches!(
-            select_cap_delivery(
-                &mut store,
-                issuer.verifying_key(),
-                matching,
-                matching_expiry,
-            ),
-            Some(DeliverySelection {
-                initial_request: Some(_),
-                ..
-            })
-        ));
-
-        let (wrong_issuer, _) = test_capability(
-            &other_issuer,
-            subject,
-            triblespace_core::repo::capability::PERM_READ,
-            300.0,
-        );
-        let wrong_expiry = expiry_upper(&delivery_cap_fields(wrong_issuer.clone()).unwrap().expiry)
-            .expect("wrong expiry");
-        assert!(
-            select_cap_delivery(
-                &mut store,
-                issuer.verifying_key(),
-                wrong_issuer,
-                wrong_expiry,
-            )
-            .is_none()
-        );
-
-        let (stronger_than_requested, _) = test_capability(
-            &issuer,
-            subject,
-            triblespace_core::repo::capability::PERM_ADMIN,
-            300.0,
-        );
-        let stronger_expiry = expiry_upper(
-            &delivery_cap_fields(stronger_than_requested.clone())
-                .unwrap()
-                .expiry,
-        )
-        .expect("stronger expiry");
-        assert!(
-            select_cap_delivery(
-                &mut store,
-                issuer.verifying_key(),
-                stronger_than_requested,
-                stronger_expiry,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn stale_first_delivery_selection_cannot_cross_request_replacement() {
-        let mut store = MemoryRepo::default();
-        let issuer_a = SigningKey::from_bytes(&[0x61; 32]);
-        let issuer_b = SigningKey::from_bytes(&[0x62; 32]);
-        let subject = SigningKey::from_bytes(&[0x63; 32]).verifying_key();
-
-        let request_a = test_capability(
-            &issuer_a,
-            subject,
-            triblespace_core::repo::capability::PERM_READ,
-            600.0,
-        );
-        crate::policy::record_outbound_cap_request(&mut store, request_a.0)
-            .expect("record request A");
-        let candidate_a = test_capability(
-            &issuer_a,
-            subject,
-            triblespace_core::repo::capability::PERM_READ,
-            300.0,
-        );
-        let candidate_upper =
-            expiry_upper(&delivery_cap_fields(candidate_a.0.clone()).unwrap().expiry).unwrap();
-        let stale = select_cap_delivery(
-            &mut store,
-            issuer_a.verifying_key(),
-            candidate_a.0.clone(),
-            candidate_upper,
-        )
-        .expect("A initially matches local intent");
-        let stale_request = stale.initial_request.expect("first-delivery witness");
-
-        let request_b = test_capability(
-            &issuer_b,
-            subject,
-            triblespace_core::repo::capability::PERM_READ,
-            600.0,
-        );
-        let request_b_handle = request_b.0.get_handle();
-        crate::policy::record_outbound_cap_request(&mut store, request_b.0)
-            .expect("replace A with request B");
-
-        let cap = store.put(candidate_a.0).unwrap();
-        let sig = store.put(candidate_a.1).unwrap();
-        assert_eq!(
-            crate::policy::begin_outbound_cap_activation_if_pending(
-                &mut store,
-                stale_request,
-                crate::policy::TeamCredential {
-                    cap,
-                    sig,
-                    founder_anchor_sig: None,
-                },
-            ),
-            Some(crate::policy::OutboundRequestCasResult::Conflict),
-            "selection over A must not lock or activate after B wins the request CAS"
-        );
-        assert_eq!(
-            crate::policy::expected_outbound_cap_request_handle(&mut store),
-            Some(request_b_handle),
-            "request B remains intact"
-        );
-        assert!(
-            crate::policy::current_team_cap(&mut store, issuer_a.verifying_key()).is_none(),
-            "stale A never reaches the team-cap pin"
-        );
-    }
-
-    #[test]
-    fn startup_recovers_crash_after_activating_before_team_cap() {
-        let mut store = MemoryRepo::default();
-        let root = SigningKey::from_bytes(&[0x64; 32]);
-        let founder = SigningKey::from_bytes(&[0x65; 32]);
-        let issuer = SigningKey::from_bytes(&[0x66; 32]);
-        let subject = SigningKey::from_bytes(&[0x67; 32]);
-        let upper = crate::clock::epoch_now() + hifitime::Duration::from_seconds(600.0);
-
-        let request = capability_until(
-            &issuer,
-            subject.verifying_key(),
-            None,
-            triblespace_core::repo::capability::PERM_READ,
-            upper,
-        );
-        crate::policy::record_outbound_cap_request(&mut store, request.0)
-            .expect("record first-delivery intent");
-
-        let anchor_scope = genid();
-        let anchor_facts: TribleSet = entity! {
-            ExclusiveId::force_ref(&anchor_scope) @
-            triblespace_core::metadata::tag:
-                triblespace_core::repo::capability::PERM_ADMIN,
-        }
-        .into();
-        let anchor = triblespace_core::repo::capability::build_founder_anchor(
-            &root,
-            founder.verifying_key(),
-            *anchor_scope,
-            anchor_facts,
-        )
-        .unwrap();
-        let parent = capability_until(
-            &founder,
-            issuer.verifying_key(),
-            Some(anchor.clone()),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            upper,
-        );
-        let candidate = capability_until(
-            &issuer,
-            subject.verifying_key(),
-            Some(parent.clone()),
-            triblespace_core::repo::capability::PERM_READ,
-            upper,
-        );
-        let selection =
-            select_cap_delivery(&mut store, root.verifying_key(), candidate.0.clone(), upper)
-                .expect("candidate matches Pending request");
-
-        let _: Inline<Handle<SimpleArchive>> = store.put(anchor.0).unwrap();
-        let _: Inline<Handle<SimpleArchive>> = store.put(parent.0).unwrap();
-        let cap = store.put(candidate.0).unwrap();
-        let sig = store.put(candidate.1).unwrap();
-        let credential = crate::policy::TeamCredential {
-            cap,
-            sig,
-            founder_anchor_sig: None,
-        };
-        let activating = match crate::policy::begin_outbound_cap_activation_if_pending(
-            &mut store,
-            selection.initial_request.unwrap(),
-            credential,
-        ) {
-            Some(crate::policy::OutboundRequestCasResult::Success(state)) => state,
-            other => panic!("Pending-to-Activating CAS failed: {other:?}"),
-        };
-        store.flush().unwrap();
-        assert!(activating.activation.is_some());
-        assert!(
-            crate::policy::current_team_cap(&mut store, root.verifying_key()).is_none(),
-            "simulated crash point is before the team-cap CAS"
-        );
-        let replacement = test_capability(
-            &issuer,
-            subject.verifying_key(),
-            triblespace_core::repo::capability::PERM_READ,
-            300.0,
-        );
-        assert!(
-            crate::policy::record_outbound_cap_request(&mut store, replacement.0).is_none(),
-            "Activating is an exclusive journal phase"
-        );
-        assert_eq!(
-            crate::policy::clear_outbound_cap_request_if(&mut store, activating.partial_cap),
-            Some(false),
-            "handle-only rejection cleanup cannot tear down Activating"
-        );
-
-        let config = PeerConfig {
-            peers: Vec::new(),
-            team_root: root.verifying_key(),
-            self_cap: [0; 32],
-        };
-        assert_eq!(startup_self_cap(&mut store, &subject, &config), sig.raw);
-        assert_eq!(
-            crate::policy::current_team_credential(&mut store, root.verifying_key()),
-            Some(credential),
-            "startup finishes the interrupted activation"
-        );
-        assert!(
-            crate::policy::expected_outbound_cap_request_handle(&mut store).is_none(),
-            "the exact Activating journal is cleared only after durable activation"
-        );
-    }
-
-    #[test]
-    fn activation_recovery_preserves_a_different_team_cap_winner() {
-        let mut store = MemoryRepo::default();
-        let root = SigningKey::from_bytes(&[0x68; 32]);
-        let founder = SigningKey::from_bytes(&[0x69; 32]);
-        let subject = SigningKey::from_bytes(&[0x6A; 32]);
-        let upper = crate::clock::epoch_now() + hifitime::Duration::from_seconds(600.0);
-
-        let request = capability_until(
-            &founder,
-            subject.verifying_key(),
-            None,
-            triblespace_core::repo::capability::PERM_READ,
-            upper,
-        );
-        crate::policy::record_outbound_cap_request(&mut store, request.0).unwrap();
-        let (anchor, candidate) = founder_credential_until(
-            &root,
-            &founder,
-            subject.verifying_key(),
-            triblespace_core::repo::capability::PERM_READ,
-            upper,
-        );
-        let selection =
-            select_cap_delivery(&mut store, root.verifying_key(), candidate.0.clone(), upper)
-                .expect("candidate matches Pending request");
-        let _: Inline<Handle<SimpleArchive>> = store.put(anchor.0.clone()).unwrap();
-        let candidate_cap = store.put(candidate.0).unwrap();
-        let candidate_sig = store.put(candidate.1).unwrap();
-        let candidate_credential = crate::policy::TeamCredential {
-            cap: candidate_cap,
-            sig: candidate_sig,
-            founder_anchor_sig: None,
-        };
-        assert!(matches!(
-            crate::policy::begin_outbound_cap_activation_if_pending(
-                &mut store,
-                selection.initial_request.unwrap(),
-                candidate_credential,
-            ),
-            Some(crate::policy::OutboundRequestCasResult::Success(_))
-        ));
-        store.flush().unwrap();
-
-        // A separate exact team-cap writer wins before recovery resumes. Its
-        // valid credential is authoritative; the stale activation journal may
-        // be reconciled, never used to overwrite this winner.
-        let winner = capability_until(
-            &founder,
-            subject.verifying_key(),
-            Some(anchor),
-            triblespace_core::repo::capability::PERM_READ,
-            upper,
-        );
-        let winner_cap = store.put(winner.0).unwrap();
-        let winner_sig = store.put(winner.1).unwrap();
-        let winner_credential = crate::policy::TeamCredential {
-            cap: winner_cap,
-            sig: winner_sig,
-            founder_anchor_sig: None,
-        };
-        crate::policy::pin_team_credential(&mut store, root.verifying_key(), winner_credential)
-            .unwrap();
-        store.flush().unwrap();
-
-        let config = PeerConfig {
-            peers: Vec::new(),
-            team_root: root.verifying_key(),
-            self_cap: [0; 32],
-        };
-        assert_eq!(
-            startup_self_cap(&mut store, &subject, &config),
-            winner_sig.raw
-        );
-        assert_eq!(
-            crate::policy::current_team_credential(&mut store, root.verifying_key()),
-            Some(winner_credential),
-            "recovery must preserve the exact concurrent team-cap winner"
-        );
-        assert!(
-            crate::policy::expected_outbound_cap_request_handle(&mut store).is_none(),
-            "the stale journal is exactly cleared after the winner is verified and flushed"
-        );
-    }
-
-    #[test]
-    fn first_delivery_accepts_exact_requested_effective_upper_boundary() {
-        let mut store = MemoryRepo::default();
-        let root = SigningKey::from_bytes(&[31; 32]);
-        let founder = SigningKey::from_bytes(&[39; 32]);
-        let issuer = SigningKey::from_bytes(&[32; 32]);
-        let subject = SigningKey::from_bytes(&[33; 32]).verifying_key();
-        let now = crate::clock::epoch_now();
-        let requested_upper = now + hifitime::Duration::from_seconds(300.0);
-
-        let requested = capability_until(
-            &issuer,
-            subject,
-            None,
-            triblespace_core::repo::capability::PERM_READ,
-            requested_upper,
-        )
-        .0;
-        crate::policy::record_outbound_cap_request(&mut store, requested)
-            .expect("record bounded request");
-
-        let anchor_scope = genid();
-        let anchor_facts: TribleSet = entity! {
-            ExclusiveId::force_ref(&anchor_scope) @
-            triblespace_core::metadata::tag:
-                triblespace_core::repo::capability::PERM_ADMIN,
-        }
-        .into();
-        let anchor = triblespace_core::repo::capability::build_founder_anchor(
-            &root,
-            founder.verifying_key(),
-            *anchor_scope,
-            anchor_facts,
-        )
-        .unwrap();
-        let parent = capability_until(
-            &founder,
-            issuer.verifying_key(),
-            Some(anchor),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            requested_upper,
-        );
-        let candidate = capability_until(
-            &issuer,
-            subject,
-            Some(parent),
-            triblespace_core::repo::capability::PERM_READ,
-            now + hifitime::Duration::from_seconds(600.0),
-        )
-        .0;
-
-        assert!(matches!(
-            select_cap_delivery(&mut store, root.verifying_key(), candidate, requested_upper,),
-            Some(DeliverySelection {
-                initial_request: Some(_),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn delivery_that_expires_in_queue_persists_and_activates_nothing() {
-        let issuer = SigningKey::from_bytes(&[37; 32]);
-        let subject = SigningKey::from_bytes(&[38; 32]);
-        let mut store = MemoryRepo::default();
-        let requested = test_capability(
-            &issuer,
-            subject.verifying_key(),
-            triblespace_core::repo::capability::PERM_READ,
-            600.0,
-        );
-        crate::policy::record_outbound_cap_request(&mut store, requested.0)
-            .expect("record local request");
-        let expected = crate::policy::expected_outbound_cap_request_handle(&mut store)
-            .expect("expectation exists");
-        let delivered = test_capability(
-            &issuer,
-            subject.verifying_key(),
-            triblespace_core::repo::capability::PERM_READ,
-            300.0,
-        );
-        let delivered_cap: Inline<Handle<SimpleArchive>> = delivered.0.get_handle();
-        let delivered_sig: Inline<Handle<SimpleArchive>> = delivered.1.get_handle();
-
-        let endpoint = EndpointId::from_bytes(&subject.verifying_key().to_bytes()).unwrap();
-        let (sender, receiver, wiring) = host::wire(endpoint);
-        let mut peer = Peer::with_wiring(store, subject, issuer.verifying_key(), sender, receiver);
+        wiring.cmd_rx.try_iter().for_each(drop);
         wiring
             .evt_tx
             .send(NetEvent::CapDelivered {
                 issuer: issuer.verifying_key().to_bytes(),
-                cap_bytes: delivered.0.bytes,
-                sig_bytes: delivered.1.bytes,
-                proof_blobs: Vec::new(),
-                authority_expires_at: crate::clock::epoch_now()
-                    - hifitime::Duration::from_nanoseconds(1.0),
+                cap_bytes: delivery.cap.bytes.clone(),
+                sig_bytes: delivery.sig.bytes.clone(),
+                proof_blobs: delivery
+                    .proof
+                    .iter()
+                    .map(|blob| blob.bytes.clone())
+                    .collect(),
                 admission: cap_delivery_admission(),
             })
             .unwrap();
+        peer.refresh().expect("accept and reconcile delivery");
 
-        peer.refresh().unwrap();
         let mut store = peer.store.lock().unwrap();
-        let reader = store.reader().unwrap();
-        assert!(
-            reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(delivered_cap)
-                .is_err()
-        );
-        assert!(
-            reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(delivered_sig)
-                .is_err()
-        );
-        drop(reader);
-        assert_eq!(
-            crate::policy::expected_outbound_cap_request_handle(&mut *store),
-            Some(expected),
-            "an expired queued response must not clear request intent"
-        );
-        assert!(
-            crate::policy::current_team_cap(&mut *store, issuer.verifying_key()).is_none(),
-            "an expired queued response must not install an active credential"
-        );
-    }
-
-    #[test]
-    fn delegated_parent_deadline_prevents_effective_authority_downgrade() {
-        let mut store = MemoryRepo::default();
-        let root = SigningKey::from_bytes(&[34; 32]);
-        let founder = SigningKey::from_bytes(&[40; 32]);
-        let issuer = SigningKey::from_bytes(&[35; 32]);
-        let subject = SigningKey::from_bytes(&[36; 32]).verifying_key();
-        let now = crate::clock::epoch_now();
-        let current_upper = now + hifitime::Duration::from_seconds(300.0);
-        let candidate_upper = now + hifitime::Duration::from_seconds(100.0);
-
-        let anchor_scope = genid();
-        let anchor_facts: TribleSet = entity! {
-            ExclusiveId::force_ref(&anchor_scope) @
-            triblespace_core::metadata::tag:
-                triblespace_core::repo::capability::PERM_ADMIN,
-        }
-        .into();
-        let anchor = triblespace_core::repo::capability::build_founder_anchor(
-            &root,
-            founder.verifying_key(),
-            *anchor_scope,
-            anchor_facts,
+        let (view, _policy) = resolve_complete_recipient_and_policy(
+            &mut *store,
+            recipient.verifying_key(),
+            "test accepted delivery",
         )
-        .unwrap();
-        let current_parent = capability_until(
-            &founder,
-            issuer.verifying_key(),
-            Some(anchor.clone()),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            current_upper,
-        );
-        let current = capability_until(
-            &issuer,
-            subject,
-            Some(current_parent.clone()),
-            triblespace_core::repo::capability::PERM_READ,
-            current_upper,
-        );
-        store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(anchor.0.clone())
-            .unwrap();
-        store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(current_parent.0)
-            .unwrap();
-        let current_cap = store.put(current.0).unwrap();
-        let current_sig = store.put(current.1).unwrap();
-        crate::policy::pin_team_cap(&mut store, root.verifying_key(), current_cap, current_sig)
-            .expect("pin current delegated credential");
-
-        let shorter_parent = capability_until(
-            &founder,
-            issuer.verifying_key(),
-            Some(anchor),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            candidate_upper,
-        );
-        let candidate = capability_until(
-            &issuer,
-            subject,
-            Some(shorter_parent),
-            triblespace_core::repo::capability::PERM_READ,
-            now + hifitime::Duration::from_seconds(600.0),
-        )
-        .0;
-
-        assert!(
-            select_cap_delivery(&mut store, root.verifying_key(), candidate, candidate_upper,)
-                .is_none(),
-            "a later leaf may not hide an earlier parent-authority deadline"
-        );
-    }
-
-    #[test]
-    fn active_cap_selection_is_monotone_under_downgrade_and_reordering() {
-        let mut store = MemoryRepo::default();
-        let root = SigningKey::from_bytes(&[23; 32]);
-        let issuer = SigningKey::from_bytes(&[24; 32]);
-        let other_issuer = SigningKey::from_bytes(&[25; 32]);
-        let subject = SigningKey::from_bytes(&[26; 32]).verifying_key();
-        let team_root = root.verifying_key();
-        let now = crate::clock::epoch_now();
-        let (anchor, (current_cap, current_sig)) = founder_credential_until(
-            &root,
-            &issuer,
-            subject,
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(300.0),
-        );
-        store
-            .put::<SimpleArchive, Blob<SimpleArchive>>(anchor.0.clone())
-            .unwrap();
-        let current_cap_handle = store.put(current_cap.clone()).unwrap();
-        let current_sig_handle = store.put(current_sig).unwrap();
-        crate::policy::pin_team_cap(
-            &mut store,
-            team_root,
-            current_cap_handle,
-            current_sig_handle,
-        )
-        .expect("pin current cap");
-
-        let (weaker, _) = capability_until(
-            &issuer,
-            subject,
-            Some(anchor.clone()),
-            triblespace_core::repo::capability::PERM_READ,
-            now + hifitime::Duration::from_seconds(600.0),
-        );
-        let weaker_expiry = expiry_upper(&delivery_cap_fields(weaker.clone()).unwrap().expiry)
-            .expect("weaker expiry");
-        assert!(select_cap_delivery(&mut store, team_root, weaker, weaker_expiry).is_none());
-
-        let (older, _) = capability_until(
-            &issuer,
-            subject,
-            Some(anchor.clone()),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(100.0),
-        );
-        let older_expiry = expiry_upper(&delivery_cap_fields(older.clone()).unwrap().expiry)
-            .expect("older expiry");
-        assert!(select_cap_delivery(&mut store, team_root, older, older_expiry).is_none());
-
-        let (different_issuer, _) = test_capability(
-            &other_issuer,
-            subject,
-            triblespace_core::repo::capability::PERM_ADMIN,
-            600.0,
-        );
-        let different_issuer_expiry = expiry_upper(
-            &delivery_cap_fields(different_issuer.clone())
-                .unwrap()
-                .expiry,
-        )
-        .expect("different issuer expiry");
-        assert!(
-            select_cap_delivery(
-                &mut store,
-                team_root,
-                different_issuer,
-                different_issuer_expiry,
-            )
-            .is_none()
-        );
-
-        let (newer, newer_sig) = capability_until(
-            &issuer,
-            subject,
-            Some(anchor),
-            triblespace_core::repo::capability::PERM_ADMIN,
-            now + hifitime::Duration::from_seconds(600.0),
-        );
-        let newer_expiry = expiry_upper(&delivery_cap_fields(newer.clone()).unwrap().expiry)
-            .expect("newer expiry");
+        .expect("durable accepted view");
         assert!(matches!(
-            select_cap_delivery(&mut store, team_root, newer.clone(), newer_expiry),
-            Some(DeliverySelection {
-                initial_request: None,
-                expected_team_head: Some(_),
-                ..
-            })
+            view.credential(team_root.verifying_key()),
+            Some(RecipientCredentialResolution::Current { credential, .. })
+                if credential.sig() == delivery.sig.get_handle()
         ));
-        let newer_cap_handle = store.put(newer).unwrap();
-        let newer_sig_handle = store.put(newer_sig).unwrap();
-        crate::policy::pin_team_cap(&mut store, team_root, newer_cap_handle, newer_sig_handle)
-            .expect("activate newer cap");
-        let current_expiry =
-            expiry_upper(&delivery_cap_fields(current_cap.clone()).unwrap().expiry)
-                .expect("current expiry");
-        assert!(
-            select_cap_delivery(&mut store, team_root, current_cap, current_expiry).is_none(),
-            "a delayed older arrival must not regress the active credential"
+        drop(store);
+        assert_eq!(peer.host_self_cap, Some(delivery.sig.get_handle().raw));
+        assert_eq!(
+            *wiring.self_cap.borrow(),
+            Some(delivery.sig.get_handle().raw)
+        );
+        assert!(wiring.cmd_rx.try_iter().any(|command| {
+            matches!(
+                command,
+                crate::channel::NetCommand::AuthRotated {
+                    predecessor,
+                    successor,
+                } if predecessor == [0; 32] && successor == delivery.sig.get_handle().raw
+            )
+        }));
+    }
+
+    #[test]
+    fn one_snapshot_prevents_mixed_founder_projection_and_disabled_founder_falls_back() {
+        let team_root = SigningKey::from_bytes(&[0x37; 32]);
+        let issuer = SigningKey::from_bytes(&[0x38; 32]);
+        let recipient = SigningKey::from_bytes(&[0x39; 32]);
+        let delivery = recipient_delivery_fixture(
+            &team_root,
+            &issuer,
+            &recipient,
+            hifitime::Duration::from_hours(1.0),
+        );
+        let accepted_sig = delivery.sig.get_handle();
+        let mut store = MemoryRepo::default();
+        publish_test_acceptance(&mut store, &team_root, &recipient, &delivery);
+
+        let founder = AssertedGrantSeries::new(&team_root, &recipient, recipient.verifying_key());
+        let (_, founder_sig) = founder.issue(
+            &mut store,
+            &recipient,
+            triblespace_core::repo::capability::PERM_ADMIN,
+            crate::clock::epoch_now() + hifitime::Duration::from_hours(1.0),
+        );
+        assert!(matches!(
+            crate::recipient_ledger::select_founder_grant(
+                &mut store,
+                &recipient,
+                team_root.verifying_key(),
+                founder.scope_root,
+            )
+            .unwrap(),
+            crate::recipient_ledger::RecipientWriteOutcome::Published(_)
+        ));
+
+        assert!(matches!(
+            resolve_recipient_operational_authority(
+                &mut store,
+                recipient.verifying_key(),
+                team_root.verifying_key(),
+                crate::clock::epoch_now(),
+                "test founder priority",
+            ),
+            Some(RecipientOperationalAuthority::Founder(current))
+                if current.sig() == founder_sig
+        ));
+
+        // Capture a boundary where both ledgers license founder authority,
+        // then prove a resolver seeing only recipient assertions in its one
+        // snapshot cannot accidentally fetch policy from a later snapshot.
+        let full = store.pin_assertion_snapshot().unwrap();
+        let policy_pin =
+            crate::policy_ledger::PolicyLedgerDescriptor::pin_identity(recipient.verifying_key());
+        let mut recipient_only = PinAssertionSnapshot::default();
+        for assertion in full.iter() {
+            if assertion.identity() != &policy_pin {
+                recipient_only.insert(*assertion).unwrap();
+            }
+        }
+
+        crate::policy_ledger::disable_grant(&mut store, &recipient, founder.grant).unwrap();
+        assert!(matches!(
+            resolve_recipient_operational_authority(
+                &mut store,
+                recipient.verifying_key(),
+                team_root.verifying_key(),
+                crate::clock::epoch_now(),
+                "test disabled founder fallback",
+            ),
+            Some(RecipientOperationalAuthority::Accepted(current))
+                if current.sig() == accepted_sig
+        ));
+
+        let mut sequenced = SnapshotSequenceStore {
+            inner: store,
+            snapshots: vec![recipient_only, full],
+            snapshot_calls: 0,
+        };
+        assert!(matches!(
+            resolve_recipient_operational_authority(
+                &mut sequenced,
+                recipient.verifying_key(),
+                team_root.verifying_key(),
+                crate::clock::epoch_now(),
+                "test coherent boundary",
+            ),
+            Some(RecipientOperationalAuthority::Accepted(current))
+                if current.sig() == accepted_sig
+        ));
+        assert_eq!(
+            sequenced.snapshot_calls, 1,
+            "recipient and founder policy must share one assertion snapshot"
+        );
+    }
+
+    #[test]
+    fn founder_renewal_reconstructs_the_terminal_anchor_from_selected_proof() {
+        let team_root = SigningKey::from_bytes(&[0x3A; 32]);
+        let founder_key = SigningKey::from_bytes(&[0x3B; 32]);
+        let series =
+            AssertedGrantSeries::new(&team_root, &founder_key, founder_key.verifying_key());
+        let mut store = MemoryRepo::default();
+        let (_, old_sig) = series.issue(
+            &mut store,
+            &founder_key,
+            triblespace_core::repo::capability::PERM_ADMIN,
+            crate::clock::epoch_now() + hifitime::Duration::from_seconds(1.0),
+        );
+        assert!(matches!(
+            crate::recipient_ledger::select_founder_grant(
+                &mut store,
+                &founder_key,
+                team_root.verifying_key(),
+                series.scope_root,
+            )
+            .unwrap(),
+            crate::recipient_ledger::RecipientWriteOutcome::Published(_)
+        ));
+
+        let endpoint = EndpointId::from_bytes(&founder_key.verifying_key().to_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            store,
+            founder_key.clone(),
+            team_root.verifying_key(),
+            sender,
+            receiver,
+        );
+        assert_eq!(
+            peer.renewal_tick(hifitime::Duration::from_seconds(120.0)),
+            1
+        );
+
+        let mut store = peer.store.lock().unwrap();
+        let (_recipient, policy) = resolve_complete_recipient_and_policy(
+            &mut *store,
+            founder_key.verifying_key(),
+            "test renewed founder",
+        )
+        .expect("fresh complete renewed ledgers");
+        let winner = policy
+            .grants()
+            .get(&series.grant)
+            .and_then(|state| state.usable_at(crate::clock::epoch_now()))
+            .expect("usable renewed founder");
+        assert_ne!(winner.sig(), old_sig);
+        assert_eq!(peer.host_self_cap, Some(winner.sig().raw));
+        let reader = store.reader().unwrap();
+        let reconstructed = triblespace_core::repo::capability::verify_chain_and_reconstruct_founder_anchor_allow_expired(
+            team_root.verifying_key(),
+            winner.sig(),
+            founder_key.verifying_key(),
+            |handle| reader.get::<Blob<SimpleArchive>, SimpleArchive>(handle).ok(),
+        )
+        .expect("renewed proof still reconstructs the same constitutional anchor");
+        assert_eq!(
+            reconstructed.founder_anchor_sig.get_handle(),
+            series.anchor.1.get_handle()
         );
     }
 }

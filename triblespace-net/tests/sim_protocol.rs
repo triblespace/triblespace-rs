@@ -5,6 +5,7 @@ mod common;
 
 use std::time::Duration;
 
+use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -17,6 +18,7 @@ use triblespace_core::macros::entity;
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::repo::capability;
+use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pin_assertion::PinAssertionStore;
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
@@ -25,10 +27,29 @@ use triblespace_net::policy_ledger::{
     self, GrantIdentity, GrantIssuanceResolution, PolicyLedgerResolution,
 };
 use triblespace_net::protocol::{OP_GET_BLOB, PILE_SYNC_ALPN, op_auth, send_hash, send_u8};
+use triblespace_net::recipient_ledger::{
+    RecipientCredentialResolution, RecipientEvent, RecipientLedgerResolution, RecipientLedgerView,
+    RecipientWriteOutcome, declare_intent, resolve_recipient_ledger,
+};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 use triblespace_net::transport::{Conn, Transport};
 
 use common::*;
+
+fn complete_recipient_view(store: &mut MemoryRepo, author: VerifyingKey) -> RecipientLedgerView {
+    let snapshot = store
+        .pin_assertion_snapshot()
+        .expect("snapshot recipient ledger");
+    let reader = store.reader().expect("read recipient ledger");
+    match resolve_recipient_ledger(&snapshot, author, |handle| {
+        reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+            .ok()
+    }) {
+        RecipientLedgerResolution::Complete(view) => view,
+        other => panic!("recipient ledger must resolve completely, got {other:?}"),
+    }
+}
 
 #[test]
 fn authenticated_connection_loses_authority_after_cap_expiry() {
@@ -66,7 +87,7 @@ fn authenticated_connection_loses_authority_after_cap_expiry() {
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_cap.1),
+            credential_sig_handle(&server_cap.1),
         );
 
         let client_harness = net.join(pk(&client_key));
@@ -75,7 +96,7 @@ fn authenticated_connection_loses_authority_after_cap_expiry() {
             .dial(pk(&server_key), PILE_SYNC_ALPN)
             .await
             .expect("dial server");
-        op_auth(&connection, &self_cap_of(&client_cap.1))
+        op_auth(&connection, &credential_sig_handle(&client_cap.1))
             .await
             .expect("short-lived capability authenticates before expiry");
 
@@ -148,7 +169,7 @@ fn idle_expired_connection_releases_subject_for_fresh_credential() {
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_cap.1),
+            credential_sig_handle(&server_cap.1),
         );
 
         let client_harness = net.join(pk(&client_key));
@@ -157,7 +178,7 @@ fn idle_expired_connection_releases_subject_for_fresh_credential() {
             .dial(pk(&server_key), PILE_SYNC_ALPN)
             .await
             .expect("dial server");
-        op_auth(&connection, &self_cap_of(&expiring.1))
+        op_auth(&connection, &credential_sig_handle(&expiring.1))
             .await
             .expect("short-lived credential authenticates");
 
@@ -175,7 +196,7 @@ fn idle_expired_connection_releases_subject_for_fresh_credential() {
             .dial(pk(&server_key), PILE_SYNC_ALPN)
             .await
             .expect("dial replacement");
-        op_auth(&replacement, &self_cap_of(&successor.1))
+        op_auth(&replacement, &credential_sig_handle(&successor.1))
             .await
             .expect("fresh successor reconnects after idle expiry cleanup");
     });
@@ -191,14 +212,14 @@ fn one_inbound_connection_per_tls_subject_releases_on_close() {
         let client_key = key(0xB4);
         let server_cap = admin_cap(&root, &server_key);
         let client_cap = admin_cap(&root, &client_key);
-        let client_credential = self_cap_of(&client_cap.1);
+        let client_credential = credential_sig_handle(&client_cap.1);
         let server_store = store_with_caps(&[server_cap.clone(), client_cap]);
         let _server = bring_up(
             &net,
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_cap.1),
+            credential_sig_handle(&server_cap.1),
         );
 
         let client_harness = net.join(pk(&client_key));
@@ -257,7 +278,7 @@ fn ninth_executing_stream_for_one_subject_fails_fast() {
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_cap.1),
+            credential_sig_handle(&server_cap.1),
         );
 
         let client_harness = net.join(pk(&client_key));
@@ -266,7 +287,7 @@ fn ninth_executing_stream_for_one_subject_fails_fast() {
             .dial(pk(&server_key), PILE_SYNC_ALPN)
             .await
             .expect("dial server");
-        op_auth(&connection, &self_cap_of(&client_cap.1))
+        op_auth(&connection, &credential_sig_handle(&client_cap.1))
             .await
             .expect("authenticate connection");
 
@@ -309,7 +330,6 @@ fn recipient_retains_delivered_delegation_and_missing_parent_chain() {
         let recipient_key = key(0xB5);
         let team_root = root.verifying_key();
         let issuer_cap = admin_cap(&root, &issuer_key);
-        let recipient_old_cap = admin_cap(&root, &recipient_key);
 
         let now = clock::epoch_now();
         let expiry: Inline<NsTAIInterval> = (now, now + hifitime::Duration::from_days(30.0))
@@ -326,19 +346,53 @@ fn recipient_retains_delivered_delegation_and_missing_parent_chain() {
         .expect("build delegated capability");
 
         // The issuer can verify and serve the complete new chain. The
-        // recipient deliberately starts with only its unrelated old direct
-        // cap; the delivered leaf arrives in-band and its parent must be
-        // fetched exactly from the TLS-authenticated issuer.
-        let issuer_store = store_with_caps(&[
+        // recipient deliberately starts with only its durable declaration;
+        // the delivered leaf arrives in-band and its parent must be fetched
+        // exactly from the TLS-authenticated issuer.
+        let mut issuer_store = store_with_caps(&[
             issuer_cap.clone(),
             (delivered_cap.clone(), delivered_sig.clone()),
         ]);
-        let mut recipient_store = store_with_caps(&[recipient_old_cap.clone()]);
-        triblespace_net::policy::record_outbound_cap_request(
+        seed_recipient_credential(
+            &mut issuer_store,
+            &issuer_key,
+            team_root,
+            &issuer_cap,
+            std::iter::empty(),
+        );
+
+        let mut recipient_store = store_with_caps(&[]);
+        let intent = match declare_intent(
             &mut recipient_store,
+            &recipient_key,
+            team_root,
             delivered_cap.clone(),
         )
-        .expect("record local delivery intent");
+        .expect("declare local delivery intent")
+        {
+            RecipientWriteOutcome::Published(receipt) => receipt,
+            RecipientWriteOutcome::Refused(reason) => {
+                panic!("cold recipient intent must be accepted, got {reason:?}")
+            }
+        };
+        {
+            let view = complete_recipient_view(&mut recipient_store, recipient_key.verifying_key());
+            assert_eq!(view.event_handles().len(), 1);
+            assert!(matches!(
+                view.event(intent.event()),
+                Some(RecipientEvent::IntentDeclared { .. })
+            ));
+            assert_eq!(
+                view.pending_intents_for(team_root)
+                    .map(|pending| pending.len()),
+                Some(1),
+                "the cold recipient starts with exactly one durable intent"
+            );
+            assert!(
+                view.credential(team_root).is_none(),
+                "the cold recipient starts without accepted authority"
+            );
+        }
 
         let issuer_harness = net.join(pk(&issuer_key));
         let issuer_id = iroh_base::EndpointId::from_bytes(&pk(&issuer_key)).unwrap();
@@ -348,7 +402,6 @@ fn recipient_retains_delivered_delegation_and_missing_parent_chain() {
             triblespace_net::peer::PeerConfig {
                 peers: Vec::new(),
                 team_root,
-                self_cap: self_cap_of(&issuer_cap.1),
             },
             issuer_wiring,
         ));
@@ -360,13 +413,7 @@ fn recipient_retains_delivered_delegation_and_missing_parent_chain() {
             issuer_sender,
             issuer_receiver,
         );
-        let mut recipient = bring_up(
-            &net,
-            &recipient_key,
-            recipient_store,
-            team_root,
-            self_cap_of(&recipient_old_cap.1),
-        );
+        let mut recipient = bring_up_preseeded(&net, &recipient_key, recipient_store, team_root);
 
         deliver.deliver_cap(
             pk(&recipient_key),
@@ -390,6 +437,18 @@ fn recipient_retains_delivered_delegation_and_missing_parent_chain() {
             BlobStoreGet::get::<TribleSet, SimpleArchive>(&reader, parent_cap_handle).is_ok(),
             "the exact missing parent capability must be fetched and cached"
         );
+        drop(reader);
+
+        let mut store = recipient.store();
+        let view = complete_recipient_view(&mut store, recipient_key.verifying_key());
+        let Some(RecipientCredentialResolution::Current { credential, .. }) =
+            view.credential(team_root)
+        else {
+            panic!("delivered credential must be the Complete recipient-ledger current");
+        };
+        assert_eq!(credential.cap(), delivered_cap.get_handle());
+        assert_eq!(credential.sig(), delivered_sig_handle);
+        assert!(view.pending_intents_for(team_root).is_none());
     });
 }
 
@@ -441,18 +500,18 @@ fn successful_delivery_rotates_outbound_auth_and_evicts_predecessor_pool() {
         };
         let server_cap = build_server_cap(server_key.verifying_key());
 
+        let client_scope_root = *ufoid();
+        let client_scope_facts = TribleSet::from(entity! {
+            ExclusiveId::force_ref(&client_scope_root) @
+            triblespace_core::metadata::tag: capability::PERM_ADMIN,
+        });
         let build_client_cap = |upper: hifitime::Epoch| {
-            let scope_root = *ufoid();
-            let scope_facts = TribleSet::from(entity! {
-                ExclusiveId::force_ref(&scope_root) @
-                triblespace_core::metadata::tag: capability::PERM_ADMIN,
-            });
             capability::build_capability(
                 &server_key,
                 client_key.verifying_key(),
                 anchor.clone(),
-                scope_root,
-                scope_facts,
+                client_scope_root,
+                client_scope_facts.clone(),
                 (now, upper).try_to_inline().unwrap(),
             )
             .unwrap()
@@ -466,6 +525,13 @@ fn successful_delivery_rotates_outbound_auth_and_evicts_predecessor_pool() {
             predecessor.clone(),
             successor.clone(),
         ]);
+        seed_recipient_credential(
+            &mut server_store,
+            &server_key,
+            team_root,
+            &server_cap,
+            [anchor.0.clone()],
+        );
         let content: Inline<Handle<LongString>> = server_store
             .put("credential rotation probe".to_owned().to_blob())
             .unwrap();
@@ -477,7 +543,6 @@ fn successful_delivery_rotates_outbound_auth_and_evicts_predecessor_pool() {
             triblespace_net::peer::PeerConfig {
                 peers: Vec::new(),
                 team_root,
-                self_cap: self_cap_of(&server_cap.1),
             },
             server_wiring,
         ));
@@ -491,18 +556,14 @@ fn successful_delivery_rotates_outbound_auth_and_evicts_predecessor_pool() {
         );
 
         let mut client_store = store_with_caps(std::slice::from_ref(&predecessor));
-        triblespace_net::policy::record_outbound_cap_request(
+        seed_recipient_credential(
             &mut client_store,
-            successor.0.clone(),
-        )
-        .expect("record successor expectation");
-        let mut client = bring_up(
-            &net,
             &client_key,
-            client_store,
             team_root,
-            self_cap_of(&predecessor.1),
+            &predecessor,
+            [anchor.0.clone()],
         );
+        let mut client = bring_up_preseeded(&net, &client_key, client_store, team_root);
 
         for _ in 0..20 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -528,10 +589,16 @@ fn successful_delivery_rotates_outbound_auth_and_evicts_predecessor_pool() {
         let successor_handles = (successor.0.get_handle(), successor.1.get_handle());
         {
             let mut store = client.store();
+            let view = complete_recipient_view(&mut store, client_key.verifying_key());
+            let Some(RecipientCredentialResolution::Current { credential, .. }) =
+                view.credential(team_root)
+            else {
+                panic!("successor must be the Complete recipient-ledger current");
+            };
             assert_eq!(
-                triblespace_net::policy::current_team_cap(&mut *store, team_root),
-                Some(successor_handles),
-                "the delivered successor is durably active before host rotation"
+                (credential.cap(), credential.sig()),
+                successor_handles,
+                "the delivered monotone successor is durably current before host rotation"
             );
         }
 
@@ -554,7 +621,6 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
         let recipient_key = key(0xB6);
         let team_root = root.verifying_key();
         let issuer_cap = admin_cap(&root, &issuer_key);
-        let recipient_self_cap = admin_cap(&root, &recipient_key);
 
         let now = clock::epoch_now();
         let renewal_window = hifitime::Duration::from_hours(1.0);
@@ -598,13 +664,13 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
         // created and persisted inside renewal_tick, so the serving snapshot
         // must be rebuilt before the resulting OP_DELIVER_CAP is dispatched.
         let mut issuer_store = store_with_caps(&[issuer_cap.clone()]);
-        triblespace_net::policy::pin_team_cap(
+        seed_recipient_credential(
             &mut issuer_store,
+            &issuer_key,
             team_root,
-            issuer_cap.0.get_handle(),
-            issuer_cap.1.get_handle(),
-        )
-        .expect("pin issuer team capability");
+            &issuer_cap,
+            std::iter::empty(),
+        );
         policy_ledger::issue_grant(
             &mut issuer_store,
             &issuer_key,
@@ -625,9 +691,29 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
         // The recipient is cold with respect to the issuer: it has neither
         // the issuer's root delegation nor either version of the recipient
         // delegation. The narrow delivery proof path must fetch the parent.
-        let mut recipient_store = store_with_caps(&[recipient_self_cap.clone()]);
-        triblespace_net::policy::record_outbound_cap_request(&mut recipient_store, requested_cap)
-            .expect("record local first-delivery intent");
+        let mut recipient_store = store_with_caps(&[]);
+        let intent = match declare_intent(
+            &mut recipient_store,
+            &recipient_key,
+            team_root,
+            requested_cap,
+        )
+        .expect("declare local first-delivery intent")
+        {
+            RecipientWriteOutcome::Published(receipt) => receipt,
+            RecipientWriteOutcome::Refused(reason) => {
+                panic!("cold renewal intent must be accepted, got {reason:?}")
+            }
+        };
+        {
+            let view = complete_recipient_view(&mut recipient_store, recipient_key.verifying_key());
+            assert_eq!(view.event_handles().len(), 1);
+            assert!(matches!(
+                view.event(intent.event()),
+                Some(RecipientEvent::IntentDeclared { .. })
+            ));
+            assert!(view.credential(team_root).is_none());
+        }
         let cold_reader = recipient_store.reader().unwrap();
         let issuer_cap_handle: Inline<Handle<SimpleArchive>> = issuer_cap.0.get_handle();
         assert!(
@@ -640,20 +726,8 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
         );
         drop(cold_reader);
 
-        let mut issuer = bring_up(
-            &net,
-            &issuer_key,
-            issuer_store,
-            team_root,
-            self_cap_of(&issuer_cap.1),
-        );
-        let mut recipient = bring_up(
-            &net,
-            &recipient_key,
-            recipient_store,
-            team_root,
-            self_cap_of(&recipient_self_cap.1),
-        );
+        let mut issuer = bring_up_preseeded(&net, &issuer_key, issuer_store, team_root);
+        let mut recipient = bring_up_preseeded(&net, &recipient_key, recipient_store, team_root);
 
         assert_eq!(
             issuer.renewal_tick(renewal_window),
@@ -717,14 +791,17 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
         drop(reader);
 
         let mut store = recipient.store();
-        assert_eq!(
-            triblespace_net::policy::current_team_cap(&mut *store, team_root),
-            Some((fresh_cap_handle, fresh_sig_handle)),
-            "the fresh pair must become the active team credential"
-        );
+        let view = complete_recipient_view(&mut store, recipient_key.verifying_key());
+        let Some(RecipientCredentialResolution::Current { credential, .. }) =
+            view.credential(team_root)
+        else {
+            panic!("fresh renewal must be the Complete recipient-ledger current");
+        };
+        assert_eq!(credential.cap(), fresh_cap_handle);
+        assert_eq!(credential.sig(), fresh_sig_handle);
         assert!(
-            triblespace_net::policy::expected_outbound_cap_request(&mut *store).is_none(),
-            "successful first delivery must consume the local expectation"
+            view.pending_intents_for(team_root).is_none(),
+            "successful first delivery consumes the durable intent"
         );
     });
 }
@@ -745,7 +822,7 @@ fn non_auth_first_stream_closes_the_connection() {
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_cap.1),
+            credential_sig_handle(&server_cap.1),
         );
 
         let client_harness = net.join(pk(&client_key));
@@ -782,14 +859,14 @@ fn op_auth_is_not_a_per_stream_reauthentication_operation() {
         let client_key = key(0xB1);
         let server_cap = admin_cap(&root, &server_key);
         let client_cap = admin_cap(&root, &client_key);
-        let client_credential = self_cap_of(&client_cap.1);
+        let client_credential = credential_sig_handle(&client_cap.1);
         let server_store = store_with_caps(&[server_cap.clone(), client_cap]);
         let _server = bring_up(
             &net,
             &server_key,
             server_store,
             root.verifying_key(),
-            self_cap_of(&server_cap.1),
+            credential_sig_handle(&server_cap.1),
         );
 
         let client_harness = net.join(pk(&client_key));

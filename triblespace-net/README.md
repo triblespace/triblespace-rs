@@ -24,16 +24,25 @@ separate finite operational capability. Founder renewals are siblings directly
 under the retained anchor, so expiry can advance without an ever-growing proof
 or another root signature.
 
-The durable per-team credential pin materializes the current finite cap/sig
-pair and retains the founder-anchor sig when this node is the founder; process
-configuration cannot replace an existing pin. Founder startup additionally
-requires a fresh Complete issuer ledger to select that exact usable pair before
-activating outbound auth. If the finite credential expires but its entire proof
-remains exact, it may remain as historical rotation material but startup is
-recovery-only: no outbound `OP_AUTH` or ordinary authorized work occurs until
-the founder locally issues a fresh sibling or an ordinary member accepts its
-authorized renewal delivery. Corrupt, malformed, wrong-root, or wrong-subject
-credentials still fail startup.
+Each node's durable outbound choice is an author-scoped recipient effect ledger,
+not a scalar credential pin or process setting. `IntentDeclared`,
+`IntentCanceled`, `CredentialAccepted`, and `FounderGrantSelected` are positive,
+unionable facts. An ordinary first credential must descend from exact pending
+team-scoped intent; later accepted credentials are monotone in issuer, scope,
+and effective expiry. Founder authority additionally requires the matching
+enabled policy grant. A usable selected founder grant has priority, while an
+independently usable accepted credential is the fallback when founder selection
+is inert.
+
+Startup, refresh, delivery, and renewal derive authority from one coherent
+assertion snapshot and reader. The host starts server-only, receives AUTH only
+after a fresh Complete projection and coherent proof snapshot, and is reconciled
+again whenever durable truth changes. There is no `PeerConfig.self_cap`,
+activation journal, or configured bearer promotion. Expired credentials are
+never selected for a new `OP_AUTH`; an operation which already captured its
+predecessor may finish but cannot seed successor-pooled work. An exact expired
+founder proof may remain only as the historical seed for a fresh direct-anchor
+sibling.
 
 Issuer-side lifecycle is one strong author-scoped asserted ledger.
 `RequestObserved`/`RequestRejected` record exact request facts;
@@ -50,37 +59,33 @@ complete grant view and prints the full canonical `GrantDisabled` selector for
 each grant. `team retract --grant-event EVENT_HEX [--key PATH]` signs that
 terminal fact with an existing author key; it does not delete policy history.
 
-Each renewal tick first resolves this peer author's entire ledger as Complete;
-missing or invalid evidence anywhere defers all work. It then considers exactly
-the retained founder pin's own `(team, subject, scope)` grant plus enabled
-historical `Current` grants for remote subjects in the configured team. Foreign
-teams and unrelated local-subject grants are inert after resolution. Expired
-enabled currents remain seeds when their effective chain expiry is inside the
-renewal window, although expiry prevents dispatch. Ordinary successors are
-signed under the exact live local team credential and asserted with
-`GrantIssued`; a single later
+Each renewal tick resolves this peer author's recipient and issuer ledgers from
+one coherent boundary; missing or invalid evidence defers the affected work. It
+then considers exactly the selected founder `(team, subject, scope)` grant plus
+enabled historical `Current` grants for remote subjects in the configured team.
+Foreign teams and unrelated local-subject grants are inert after resolution.
+Expired enabled currents remain seeds when their effective chain expiry is
+inside the renewal window, although expiry prevents dispatch. Ordinary
+successors are signed under the exact fresh local recipient authority and
+asserted with `GrantIssued`; a single later
 redispatch pass fresh-resolves policy, materializes the selected proof closure,
 and sends only live, unauthenticated `usable_at(now)` winners.
 
-Founder self-rotation is not self-delivery. It verifies the retained anchor,
-asserts a direct-anchor sibling, fresh-resolves policy, then materializes
-whichever usable deterministic winner was selected onto the team-credential
-pin while retaining the anchor. Pin flush, coherent serving-snapshot
-publication, and outbound-host update are distinct from policy selection. A
-durable selected winner that differs from the process-local host observation is
-retried on a later fresh tick without another persisted workflow marker;
-restart re-resolves policy before initializing the host from the durable pin.
-The CLI's `team create` is the sole bootstrap
-materialization-before-assertion exception: it flushes the new founder
-retention pin first, publishes `GrantIssued`, then requires a fresh Complete
-view to select that exact usable credential. Startup otherwise treats an
-unasserted founder pin as inert.
+Founder self-rotation is not self-delivery. It reconstructs the standalone
+anchor from the selected historical proof, asserts a direct-anchor sibling,
+then fresh-resolves both ledgers. Coherent serving-snapshot publication precedes
+the outbound-host update. A durable selected winner that differs from the
+process-local host observation is retried on startup or a later refresh without
+another workflow marker. `team create` follows the same ordering law: publish
+`GrantIssued`, publish `FounderGrantSelected`, then require a fresh Complete
+joint view to select that exact usable credential.
 
-The outbound first-delivery path is crash-recoverable across its separate
-outbound-request and team pins. After the verified proof bundle is durable, the
-exact outbound request is CAS-claimed as an activation journal before the
-credential pin changes; startup can finish that activation, and a concurrent
-replacement request cannot be consumed by a stale delivery.
+First delivery is crash-recoverable without a workflow state machine. The
+verified proof closure is durable before `CredentialAccepted`; host AUTH follows
+only after a fresh resolution and coherent serving snapshot. A crash between
+those boundaries leaves positive durable truth which startup or refresh simply
+reconciles again. Cancellation or replacement racing acceptance remains visible
+as inert contested evidence instead of deleting or overwriting either history.
 
 ## Getting started
 
@@ -98,13 +103,12 @@ let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint_addr],
     team_root: team_root_pubkey,
-    self_cap: bootstrap_cap_sig_handle, // one-time seed if no durable pin exists
 });
 ```
 
-`self_cap = [0u8; 32]` is an explicit server-only sentinel, not a synthesized
-root-issued finite credential. It leaves inbound serving and recovery delivery
-available while outbound authenticated operations remain disabled.
+When the pile has no live recipient-selected authority, the host remains
+server-only. The internal all-zero sentinel is not a public setting or a
+synthesized root-issued credential.
 
 See the book's [Distributed Sync](../book/src/distributed-sync.md) and
 [Capability Auth](../book/src/capability-auth.md) chapters for the exact current
@@ -155,7 +159,7 @@ authorizes only after its complete frame has arrived.
 - `protocol` — authenticated v5 blob wire format
 - `handshake` — v2 request, delivery, and exact proof-bootstrap protocol
 - `policy_ledger` — asserted incoming requests and issuer grant lifecycle
-- `policy` — local outbound join intent and active credential materialization
+- `recipient_ledger` — local outbound intent, acceptance, and founder selection
 - `reconcile` — author-scoped asserted-want servicing
 - `identity` — node signing-key handling
 - `host` / `channel` — network thread and its bounded event bridge

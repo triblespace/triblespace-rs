@@ -26,11 +26,14 @@ pub enum NetCommand {
     /// puts trigger this; new providers improve the swarm's
     /// content-distribution fan-out.
     Announce(RawHash),
-    /// Replace the capability presented on every future outbound pile-sync
-    /// connection. The host evicts all pooled connections when applying this
-    /// command, so no connection authenticated with the predecessor remains
-    /// reusable after credential activation.
-    UpdateSelfCap(RawHash),
+    /// Clean up connections belonging to a completed synchronous outbound
+    /// authority transition. The sender-facing authority watch has already
+    /// changed before this command is queued; credential-keyed pool identity
+    /// prevents delayed cleanup from exposing the predecessor to later work.
+    AuthRotated {
+        predecessor: RawHash,
+        successor: RawHash,
+    },
     /// Dispatch a selected cap+sig pair to `subject` via the auth-handshake
     /// ALPN. Asserted-policy redispatch uses this for newly approved and
     /// renewed credentials. The network thread opens a connection to the
@@ -78,8 +81,8 @@ pub enum NetEvent {
     },
     /// A peer issued us a capability — either in response to a prior
     /// `CapRequest` we made, or as an unsolicited renewal push. The
-    /// cap+sig bytes are content-verified before pinning into the
-    /// local team-cap branch.
+    /// cap+sig bytes are content-verified before the recipient effect is
+    /// durably accepted.
     CapDelivered {
         issuer: PublisherKey,
         cap_bytes: Bytes,
@@ -89,10 +92,6 @@ pub enum NetEvent {
         /// host snapshot. The complete bundle is one event so a snapshot
         /// rotation cannot separate the active leaf from its proof.
         proof_blobs: Vec<Bytes>,
-        /// Inclusive upper bound of the verified authority's lifetime: the
-        /// earliest deadline in the entire delegation chain, not merely the
-        /// leaf capability's declared expiry.
-        authority_expires_at: hifitime::Epoch,
         /// Bounds verified deliveries waiting for synchronous persistence.
         admission: tokio::sync::OwnedSemaphorePermit,
     },

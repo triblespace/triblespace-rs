@@ -10,8 +10,10 @@
 //! its natural expiry. There is no team-root broadcast revocation primitive
 //! in the descriptive-caps model.
 //!
-//! All commands accept the relevant team artefacts via CLI flags or
-//! environment variables (`TRIBLE_TEAM_ROOT`, `TRIBLE_TEAM_CAP`).
+//! Commands accept relevant team artefacts via CLI flags or environment
+//! variables. `TRIBLE_TEAM_CAP` is only an explicit parent credential input
+//! while issuing a child; the running peer's operational credential is
+//! selected from the recipient ledger, never from a bearer-handle setting.
 //! The local pile stores the issued cap blobs so they're retrievable
 //! for verification when peers connect.
 
@@ -31,7 +33,6 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::pin_assertion::PinAssertionStore;
 use triblespace_core::repo::BlobStore;
 use triblespace_core::repo::BlobStoreGet;
-use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
 
 type PileBlake3 = Pile;
@@ -131,13 +132,18 @@ pub enum Command {
     /// RequestObserved assertion (visible via `team list-pending`); once they
     /// approve via `team approve`, asserted-policy redispatch sends the
     /// freshly signed cap via the auth-handshake ALPN and the requester daemon
-    /// pins it on the team-cap pin.
+    /// records its accepted recipient event.
     RequestJoin {
         /// Path to the requester's local pile. The requested partial
-        /// capability is recorded here before it is sent, so a later
-        /// first-cap delivery can be matched to deliberate local intent.
+        /// capability and its team-scoped intent are recorded here before it
+        /// is sent, so a later first-cap delivery can be matched to deliberate
+        /// local intent.
         #[arg(long)]
         pile: PathBuf,
+        /// Team root pubkey (hex). This is the durable identity under which
+        /// the request intent and eventual credential delivery are joined.
+        #[arg(long, env = "TRIBLE_TEAM_ROOT")]
+        team_root: String,
         /// Admin's pubkey (hex).
         #[arg(long)]
         admin: String,
@@ -260,10 +266,11 @@ pub fn run(cmd: Command) -> Result<()> {
         } => run_retract(pile, grant_event, key),
         Command::RequestJoin {
             pile,
+            team_root,
             admin,
             scope,
             key,
-        } => run_request_join(pile, admin, scope, key),
+        } => run_request_join(pile, team_root, admin, scope, key),
         Command::Approve {
             pile,
             request_event,
@@ -454,6 +461,101 @@ fn require_exact_usable_grant(
     Ok(())
 }
 
+fn require_exact_founder_bootstrap(
+    pile: &mut PileBlake3,
+    author: VerifyingKey,
+    grant: triblespace_net::policy_ledger::GrantIdentity,
+    expected_cap: Inline<Handle<SimpleArchive>>,
+    expected_sig: Inline<Handle<SimpleArchive>>,
+    team_root: VerifyingKey,
+    scope_root: Id,
+    expected_event: triblespace_net::recipient_ledger::RecipientEventHandle,
+) -> Result<()> {
+    use triblespace_net::recipient_ledger::FounderGrantResolution;
+
+    // Founder AUTH is a projection of two ledgers. Resolve both from the same
+    // assertion snapshot and reader so the post-publication check describes
+    // one coherent durable boundary rather than combining two moments.
+    let snapshot = pile
+        .pin_assertion_snapshot()
+        .map_err(|error| anyhow!("read founder assertion snapshot: {error:?}"))?;
+    let reader = pile
+        .reader()
+        .map_err(|error| anyhow!("open founder bootstrap reader: {error:?}"))?;
+    let policy =
+        match triblespace_net::policy_ledger::resolve_policy_ledger(&snapshot, author, |handle| {
+            reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                .ok()
+        }) {
+            triblespace_net::policy_ledger::PolicyLedgerResolution::Complete(view) => view,
+            triblespace_net::policy_ledger::PolicyLedgerResolution::Incomplete { missing } => {
+                bail!(
+                    "founder bootstrap policy ledger is incomplete; {} blob(s) missing",
+                    missing.len()
+                )
+            }
+            triblespace_net::policy_ledger::PolicyLedgerResolution::Invalid { diagnostics } => {
+                bail!("founder bootstrap policy ledger is invalid: {diagnostics:?}")
+            }
+        };
+    let recipient = match triblespace_net::recipient_ledger::resolve_recipient_ledger(
+        &snapshot,
+        author,
+        |handle| {
+            reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                .ok()
+        },
+    ) {
+        triblespace_net::recipient_ledger::RecipientLedgerResolution::Complete(view) => view,
+        triblespace_net::recipient_ledger::RecipientLedgerResolution::Incomplete {
+            missing,
+            unknown_parents,
+        } => bail!(
+            "founder bootstrap recipient ledger is incomplete; {} blob(s) missing and {} parent event(s) unknown",
+            missing.len(),
+            unknown_parents.len()
+        ),
+        triblespace_net::recipient_ledger::RecipientLedgerResolution::Invalid { diagnostics } => {
+            bail!("founder bootstrap recipient ledger is invalid: {diagnostics:?}")
+        }
+    };
+
+    let selected = policy
+        .grants()
+        .get(&grant)
+        .and_then(|state| state.usable_at(triblespace_net::clock::epoch_now()))
+        .ok_or_else(|| anyhow!("founder bootstrap grant has no selected usable credential"))?;
+    if selected.cap() != expected_cap || selected.sig() != expected_sig {
+        bail!(
+            "another founder credential won policy selection: cap={}, sig={}",
+            hex::encode(selected.cap().raw),
+            hex::encode(selected.sig().raw)
+        );
+    }
+
+    match recipient.founder_grant(team_root) {
+        Some(FounderGrantResolution::Current(selection))
+            if selection.scope_root() == scope_root
+                && recipient.event_handles().contains(&expected_event) =>
+        {
+            Ok(())
+        }
+        Some(FounderGrantResolution::Current(selection)) => bail!(
+            "FounderGrantSelected was durably published, but the current selection is scope {} over {} frontier event(s)",
+            selection.scope_root(),
+            selection.frontier().len()
+        ),
+        Some(FounderGrantResolution::Conflicted { .. }) => bail!(
+            "FounderGrantSelected was durably published, but the fresh founder selection is conflicted"
+        ),
+        None | Some(FounderGrantResolution::Unselected) => bail!(
+            "FounderGrantSelected was durably published, but the fresh recipient view has no founder selection"
+        ),
+    }
+}
+
 fn request_by_event<'a>(
     view: &'a triblespace_net::policy_ledger::PolicyLedgerView,
     request_event: Inline<Handle<SimpleArchive>>,
@@ -526,12 +628,6 @@ fn format_expiry(
 fn format_epoch(epoch: hifitime::Epoch) -> String {
     let (y, mo, d, h, mi, s, _ns) = epoch.to_gregorian_utc();
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
-}
-
-fn store_blob(pile: &mut PileBlake3, blob: Blob<SimpleArchive>) -> Result<()> {
-    pile.put::<SimpleArchive, _>(blob)
-        .map_err(|e| anyhow!("put blob: {e:?}"))?;
-    Ok(())
 }
 
 fn fetch_cap_blob_pair(
@@ -620,35 +716,10 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     )
     .map_err(|e| anyhow!("build founder operational cap: {e:?}"))?;
 
-    let anchor_sig_handle: Inline<Handle<SimpleArchive>> = (&anchor_sig_blob).get_handle();
     let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
     let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
-    let grant_event = with_pile(&pile_path, |pile| {
-        store_blob(pile, anchor_cap_blob)?;
-        store_blob(pile, anchor_sig_blob)?;
-        store_blob(pile, cap_blob.clone())?;
-        store_blob(pile, sig_blob.clone())?;
-
-        triblespace_net::policy::pin_team_credential(
-            pile,
-            team_root_pubkey,
-            triblespace_net::policy::TeamCredential {
-                cap: cap_handle,
-                sig: sig_handle,
-                founder_anchor_sig: Some(anchor_sig_handle),
-            },
-        )
-        .ok_or_else(|| anyhow!("pin founder credential"))?;
-
-        // Team creation is the sole local-materialization-before-authority
-        // exception. Retain the operational pair and standalone founder
-        // anchor durably before publishing GrantIssued. A crash in between
-        // leaves an inert orphan pin; it can never make an unasserted
-        // credential operational policy.
-        pile.flush()
-            .map_err(|error| anyhow!("flush founder credential bootstrap: {error:?}"))?;
-
+    let (grant_event, selection_event) = with_pile(&pile_path, |pile| {
         let grant = triblespace_net::policy_ledger::GrantIdentity::new(
             team_root_pubkey,
             founder_key.verifying_key(),
@@ -660,22 +731,42 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
             grant,
             sig_blob,
             None,
-            [cap_blob],
+            [cap_blob, anchor_cap_blob],
         )
         .map_err(|error| anyhow!("publish founder GrantIssued event: {error}"))?;
 
-        // Publication is not selection. Re-resolve fresh durable truth and
-        // require this exact, still-usable bootstrap credential to win before
-        // returning the team root secret to the operator.
-        require_exact_usable_grant(
+        // Issuance is policy, not the recipient's choice of operational
+        // founder identity. Record that choice as a second durable event only
+        // after the exact policy grant exists; no scalar credential or anchor
+        // handle is materialized alongside it.
+        let selection = match triblespace_net::recipient_ledger::select_founder_grant(
+            pile,
+            &founder_key,
+            team_root_pubkey,
+            scope_root,
+        )
+        .map_err(|error| anyhow!("publish founder FounderGrantSelected event: {error}"))?
+        {
+            triblespace_net::recipient_ledger::RecipientWriteOutcome::Published(receipt) => receipt,
+            triblespace_net::recipient_ledger::RecipientWriteOutcome::Refused(reason) => {
+                bail!("founder selection was refused: {reason:?}")
+            }
+        };
+
+        // Receipts prove publication, not current authority. Resolve both
+        // ledgers again and require the exact policy credential and exact
+        // recipient selection before exposing the bootstrap result.
+        require_exact_founder_bootstrap(
             pile,
             founder_key.verifying_key(),
             grant,
             cap_handle,
             sig_handle,
-            "founder GrantIssued",
+            team_root_pubkey,
+            scope_root,
+            selection.event(),
         )?;
-        Ok(receipt.event())
+        Ok((receipt.event(), selection.event()))
     })?;
 
     println!(
@@ -688,18 +779,21 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
         "Anyone with this key can issue founder-equivalent capabilities.",
     ]);
     println!("team root SECRET:  {}", hex::encode(team_root.to_bytes()));
-    println!("founder anchor sig: {}", hex::encode(anchor_sig_handle.raw));
     println!("founder cap blob:  {}", hex::encode(cap_handle.raw));
     println!("founder cap (sig): {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
     println!("GrantIssued event: {}", hex::encode(grant_event.raw));
+    println!(
+        "FounderGrantSelected event: {}",
+        hex::encode(selection_event.raw)
+    );
     println!();
     println!("Set these in your environment to use the team:");
     println!(
         "  export TRIBLE_TEAM_ROOT={}",
         hex::encode(team_root_pubkey.to_bytes())
     );
-    println!("  export TRIBLE_TEAM_CAP={}", hex::encode(sig_handle.raw));
+    println!("  # the operational credential is selected from this pile's recipient ledger");
 
     Ok(())
 }
@@ -852,8 +946,8 @@ fn run_invite(
         hex::encode(issuer_key.verifying_key().to_bytes())
     );
     println!("The invitee must independently record the scope they want with");
-    println!("`team request-join`, then run `pile net sync` without");
-    println!("TRIBLE_TEAM_CAP until the accepted delivery materializes locally.");
+    println!("`team request-join`, then run `pile net sync`; accepted delivery");
+    println!("materializes automatically from the recipient ledger.");
 
     Ok(())
 }
@@ -1595,6 +1689,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 fn run_request_join(
     pile_path: PathBuf,
+    team_root_hex: String,
     admin_hex: String,
     scope: ScopeArg,
     key: Option<PathBuf>,
@@ -1603,7 +1698,10 @@ fn run_request_join(
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::macros::entity;
 
-    let admin_pubkey = parse_pubkey_hex(&admin_hex)?;
+    let team_root = parse_pubkey_hex(&team_root_hex)
+        .map_err(|error| anyhow!("invalid --team-root (or TRIBLE_TEAM_ROOT): {error:#}"))?;
+    let admin_pubkey =
+        parse_pubkey_hex(&admin_hex).map_err(|error| anyhow!("invalid --admin: {error:#}"))?;
 
     // The requester's identity and the durable delivery expectation
     // deliberately share the same pile location.
@@ -1631,17 +1729,13 @@ fn run_request_join(
     let mut cap_set = TribleSet::from(cap_fragment);
     cap_set += scope_facts;
     let partial_cap: Blob<SimpleArchive> = cap_set.to_blob();
-    let partial_handle: Inline<Handle<SimpleArchive>> = partial_cap.get_handle();
-
-    // Persist intent before any network I/O. A valid capability chain is not
-    // enough to select this node's first credential: the eventual delivery
-    // must match this exact partial request. Refuse to send if that durable
-    // write did not succeed, otherwise an ACK could leave us unable to accept
-    // the capability we just asked for.
-    with_pile(&pile_path, |pile| {
-        triblespace_net::policy::record_outbound_cap_request(pile, partial_cap.clone())
-            .ok_or_else(|| anyhow!("record outbound capability request on local pile"))
-    })?;
+    // License this exact request before any network I/O. A valid capability
+    // chain is not enough to select this node's first credential: the later
+    // delivery must descend from deliberate, team-scoped recipient intent.
+    // Keep the returned event identity rather than reconstructing it from the
+    // partial cap, because cancellation names the exact causal event.
+    let intent = declare_join_intent(&pile_path, &signing_key, team_root, partial_cap.clone())?;
+    println!("IntentDeclared event: {}", hex::encode(intent.raw));
 
     println!(
         "sending OP_REQUEST_CAP to admin {} (scope={:?})…",
@@ -1668,7 +1762,8 @@ fn run_request_join(
             // choice: it permits only the capability we deliberately asked
             // for, while clearing it could strand an accepted request.
             return Err(anyhow!(
-                "send capability request: {error:#}; the durable local expectation was retained because delivery outcome is unknown"
+                "send capability request: {error:#}; exact recipient intent {} was retained because delivery outcome is unknown",
+                hex::encode(intent.raw)
             ));
         }
     };
@@ -1677,55 +1772,128 @@ fn run_request_join(
         triblespace_net::handshake::STATUS_OK => {
             println!("ACK — admin durably observed your exact request.");
             println!(
-                "The exact request remains recorded locally until its first cap is activated."
+                "The exact IntentDeclared event remains current until it is accepted, canceled, or replaced."
             );
             println!("They'll see it under `team list-pending`.");
             println!("Once approved, your cap arrives via the auth-handshake ALPN;");
-            println!("a running `pile net sync` daemon will pin it on the team-cap pin.");
+            println!("a running `pile net sync` daemon will accept it into the recipient ledger.");
             Ok(())
         }
-        triblespace_net::handshake::STATUS_REJECTED => clear_rejected_join_expectation(
+        triblespace_net::handshake::STATUS_REJECTED => cancel_rejected_join_intent(
             &pile_path,
-            partial_handle,
+            &signing_key,
+            intent,
             "admin rejected the request",
         ),
-        triblespace_net::handshake::STATUS_MALFORMED => clear_rejected_join_expectation(
+        triblespace_net::handshake::STATUS_MALFORMED => cancel_rejected_join_intent(
             &pile_path,
-            partial_handle,
+            &signing_key,
+            intent,
             "admin rejected the request as malformed (version mismatch or bad payload)",
         ),
         triblespace_net::handshake::STATUS_INDETERMINATE => bail!(
-            "admin reported an indeterminate persistence outcome; the durable local expectation was retained and the exact request may be replayed safely"
+            "admin reported an indeterminate persistence outcome; exact recipient intent {} was retained and the request may be replayed safely",
+            hex::encode(intent.raw)
         ),
         // An unknown response is not a trustworthy assertion that the request
         // was rejected. Keep the expectation for the same reason as a lost
         // ACK: accepting a later delivery remains bounded to the exact local
         // request, while deleting it could make an accepted request unusable.
         other => bail!(
-            "admin returned unknown status code {other:#x}; the durable local expectation was retained because delivery outcome is unknown"
+            "admin returned unknown status code {other:#x}; exact recipient intent {} was retained because delivery outcome is unknown",
+            hex::encode(intent.raw)
         ),
     }
 }
 
-/// Clear an expectation only when the intended admin explicitly says it did
-/// not accept the request. If clearing fails, surface that fact rather than
-/// pretending the local state agrees with the remote outcome.
-fn clear_rejected_join_expectation(
+fn declare_join_intent(
     pile_path: &PathBuf,
-    expected: Inline<Handle<SimpleArchive>>,
+    author: &SigningKey,
+    team_root: VerifyingKey,
+    partial_cap: Blob<SimpleArchive>,
+) -> Result<triblespace_net::recipient_ledger::RecipientEventHandle> {
+    use triblespace_net::recipient_ledger::{DeclareIntentRefusal, RecipientWriteOutcome};
+
+    let outcome = with_pile(pile_path, |pile| {
+        triblespace_net::recipient_ledger::declare_intent(pile, author, team_root, partial_cap)
+            .map_err(|error| anyhow!("publish recipient IntentDeclared event: {error}"))
+    })?;
+    match outcome {
+        RecipientWriteOutcome::Published(receipt) => Ok(receipt.event()),
+        RecipientWriteOutcome::Refused(reason) => match reason {
+            DeclareIntentRefusal::InvalidClaim(error) => {
+                bail!(
+                    "recipient ledger refused request intent: invalid capability claim: {error:?}"
+                )
+            }
+            DeclareIntentRefusal::SubjectMismatch { declared } => bail!(
+                "recipient ledger refused request intent: capability subject {} does not match requester {}",
+                hex::encode(declared.to_bytes()),
+                hex::encode(author.verifying_key().to_bytes())
+            ),
+            DeclareIntentRefusal::AcceptedIntent { event } => bail!(
+                "recipient ledger already has accepted intent {} for team {}; refusing to replace it",
+                hex::encode(event.raw),
+                hex::encode(team_root.to_bytes())
+            ),
+            DeclareIntentRefusal::AcceptanceRace { intent } => bail!(
+                "recipient ledger observed an acceptance race on intent {}; no request was sent",
+                hex::encode(intent.raw)
+            ),
+            DeclareIntentRefusal::FrontierChanged => {
+                bail!("recipient intent frontier changed during publication; no request was sent")
+            }
+        },
+    }
+}
+
+/// Cancel only the exact declared intent when the intended admin explicitly
+/// says it did not accept the request. Cancellation is another positive
+/// recipient event; it never deletes history or a newer replacement intent.
+fn cancel_rejected_join_intent(
+    pile_path: &PathBuf,
+    author: &SigningKey,
+    intent: triblespace_net::recipient_ledger::RecipientEventHandle,
     rejection: &str,
 ) -> Result<()> {
-    let clear = with_pile(pile_path, |pile| {
-        triblespace_net::policy::clear_outbound_cap_request_if(pile, expected)
-            .ok_or_else(|| anyhow!("clear rejected outbound capability request"))
+    use triblespace_net::recipient_ledger::{CancelIntentRefusal, RecipientWriteOutcome};
+
+    let cancellation = with_pile(pile_path, |pile| {
+        triblespace_net::recipient_ledger::cancel_intent(pile, author, intent)
+            .map_err(|error| anyhow!("publish recipient IntentCanceled event: {error}"))
     });
-    match clear {
-        Ok(true) => bail!("{rejection}; the durable local expectation was cleared"),
-        Ok(false) => bail!(
-            "{rejection}; this request no longer owns the durable local expectation, so the newer intent was preserved"
+    match cancellation {
+        Ok(RecipientWriteOutcome::Published(receipt)) => bail!(
+            "{rejection}; recorded IntentCanceled event {} for exact intent {}",
+            hex::encode(receipt.event().raw),
+            hex::encode(intent.raw)
+        ),
+        Ok(RecipientWriteOutcome::Refused(CancelIntentRefusal::UnknownIntent)) => bail!(
+            "{rejection}; the recipient ledger no longer contains exact intent {}, so no cancellation was recorded",
+            hex::encode(intent.raw)
+        ),
+        Ok(RecipientWriteOutcome::Refused(CancelIntentRefusal::WrongKind { actual })) => bail!(
+            "{rejection}; exact handle {} resolved to recipient event kind {actual:?}, so no cancellation was recorded",
+            hex::encode(intent.raw)
+        ),
+        Ok(RecipientWriteOutcome::Refused(CancelIntentRefusal::NotCurrentFrontier)) => bail!(
+            "{rejection}; exact intent {} is no longer current, so the newer recipient state was preserved",
+            hex::encode(intent.raw)
+        ),
+        Ok(RecipientWriteOutcome::Refused(CancelIntentRefusal::AcceptedIntent)) => bail!(
+            "{rejection}; exact intent {} already has an accepted credential, so acceptance was preserved",
+            hex::encode(intent.raw)
+        ),
+        Ok(RecipientWriteOutcome::Refused(CancelIntentRefusal::AcceptanceRace)) => bail!(
+            "{rejection}; exact intent {} raced with credential acceptance, so no cancellation was recorded",
+            hex::encode(intent.raw)
+        ),
+        Ok(RecipientWriteOutcome::Refused(CancelIntentRefusal::FrontierChanged)) => bail!(
+            "{rejection}; recipient intent frontier changed during cancellation, so no cancellation was recorded"
         ),
         Err(error) => bail!(
-            "{rejection}; additionally the durable local expectation could not be cleared: {error:#}"
+            "{rejection}; additionally exact intent {} could not be canceled: {error:#}",
+            hex::encode(intent.raw)
         ),
     }
 }
@@ -1884,6 +2052,18 @@ fn run_approve(
         )
         .map_err(|error| anyhow!("publish GrantIssued event: {error}"))?;
 
+        // Publication proves history, not that this signature won the grant's
+        // deterministic current projection. Re-resolve before promising that
+        // the daemon can redispatch this exact credential.
+        require_exact_usable_grant(
+            pile,
+            issuer_key.verifying_key(),
+            grant,
+            cap_handle,
+            sig_handle,
+            "approved GrantIssued",
+        )?;
+
         Ok(ApprovalOutcome::Issued {
             signature: sig_handle,
             expiry,
@@ -1979,10 +2159,114 @@ fn run_reject(pile_path: PathBuf, request_event_hex: String, key: Option<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::TryToInline;
     use triblespace_core::macros::entity;
+
+    #[test]
+    fn request_join_requires_team_root_with_the_shared_environment_name() {
+        let command = Command::command();
+        let request_join = command
+            .find_subcommand("request-join")
+            .expect("request-join subcommand");
+        let team_root = request_join
+            .get_arguments()
+            .find(|argument| argument.get_id() == "team_root")
+            .expect("team-root argument");
+        assert!(team_root.is_required_set());
+        assert_eq!(
+            team_root.get_env(),
+            Some(std::ffi::OsStr::new("TRIBLE_TEAM_ROOT"))
+        );
+    }
+
+    #[test]
+    fn request_join_intent_is_team_scoped_and_rejection_cancels_exact_event() {
+        use triblespace_net::recipient_ledger::{
+            resolve_recipient_ledger, IntentDisposition, RecipientEvent, RecipientLedgerResolution,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recipient.pile");
+        std::fs::File::create(&path).unwrap();
+        let requester = SigningKey::from_bytes(&[0x61; 32]);
+        let team_root = SigningKey::from_bytes(&[0x62; 32]).verifying_key();
+        let admin = SigningKey::from_bytes(&[0x63; 32]).verifying_key();
+        let scope_root = *triblespace_core::id::ufoid();
+        let now = triblespace_net::clock::epoch_now();
+        let expiry = (now, now + hifitime::Duration::from_hours(1.0))
+            .try_to_inline()
+            .unwrap();
+        let mut partial_set: TribleSet = entity! {
+            capability::cap_subject: requester.verifying_key(),
+            capability::cap_issuer: admin,
+            capability::cap_scope_root: scope_root,
+            triblespace_core::metadata::expires_at: expiry,
+        }
+        .into();
+        partial_set += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&scope_root) @
+            triblespace_core::metadata::tag: capability::PERM_READ,
+        });
+        let partial: Blob<SimpleArchive> = partial_set.to_blob();
+        let partial_handle = partial.get_handle();
+
+        let intent = declare_join_intent(&path, &requester, team_root, partial).unwrap();
+        assert_eq!(
+            intent,
+            RecipientEvent::IntentDeclared {
+                team_root,
+                partial_cap: partial_handle,
+                supersedes: BTreeSet::new(),
+            }
+            .handle()
+        );
+
+        let disposition = |pile: &mut PileBlake3| -> Result<IntentDisposition> {
+            let snapshot = pile
+                .pin_assertion_snapshot()
+                .map_err(|error| anyhow!("recipient assertion snapshot: {error:?}"))?;
+            let reader = pile
+                .reader()
+                .map_err(|error| anyhow!("recipient blob reader: {error:?}"))?;
+            let RecipientLedgerResolution::Complete(view) =
+                resolve_recipient_ledger(&snapshot, requester.verifying_key(), |handle| {
+                    reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                })
+            else {
+                bail!("recipient ledger did not resolve completely");
+            };
+            let entry = view
+                .intent_frontier(team_root)
+                .and_then(|frontier| frontier.get(&intent))
+                .ok_or_else(|| anyhow!("exact request intent missing from team frontier"))?;
+            assert_eq!(entry.partial_cap(), partial_handle);
+            Ok(entry.disposition())
+        };
+
+        with_pile(&path, |pile| {
+            assert_eq!(disposition(pile)?, IntentDisposition::Pending);
+            Ok(())
+        })
+        .unwrap();
+
+        let rejection =
+            cancel_rejected_join_intent(&path, &requester, intent, "admin rejected the request")
+                .unwrap_err()
+                .to_string();
+        assert!(rejection.contains("recorded IntentCanceled event"));
+        assert!(rejection.contains(&hex::encode(intent.raw)));
+
+        with_pile(&path, |pile| {
+            assert_eq!(disposition(pile)?, IntentDisposition::Canceled);
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn asserted_request_selection_and_rejection_survive_pile_reopen() {

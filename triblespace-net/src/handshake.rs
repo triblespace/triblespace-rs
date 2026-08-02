@@ -18,7 +18,7 @@
 //!   `OP_DELIVER_CAP` (issuer → subject)
 //!     issuer ships the signed (cap, sig) bytes. subject verifies the chain,
 //!     admits the bounded proof bundle, ACKs, and closes. The policy loop later
-//!     durably materializes an accepted winner on the team-credential pin.
+//!     durably appends the exact recipient-ledger `CredentialAccepted` effect.
 //!
 //!   `OP_FETCH_CAPABILITY_BLOB` (verifier → presenter)
 //!     verifier requests one exact missing proof member. The presenter serves

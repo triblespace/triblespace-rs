@@ -1,8 +1,9 @@
 //! End-to-end tests for the `trible pile net status` diagnostic.
 //!
 //! Status reports the auth configuration the running peer would
-//! present on `OP_AUTH`: node id, team root, self_cap, and the
-//! source of each value (env var vs fallback). The format is what
+//! use for authentication: node id, team root, and the root's source. The
+//! operational credential is pile-derived by `sync`, never configured here.
+//! The format is what
 //! ops people will eyeball when debugging a stuck connection, so
 //! lock the contract here.
 
@@ -18,10 +19,8 @@ fn status_without_env_vars_reports_fallbacks() {
         .expect("trible binary")
         .args(["pile", "net", "status", "--key", key_path.to_str().unwrap()])
         // Make sure no test-environment leak: explicitly clear
-        // both env vars so the fallback branches are exercised
-        // even if the CI inherits them.
+        // the env var so the fallback branch is exercised even if CI inherits it.
         .env_remove("TRIBLE_TEAM_ROOT")
-        .env_remove("TRIBLE_TEAM_CAP")
         .assert()
         .success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("utf8 stdout");
@@ -35,8 +34,8 @@ fn status_without_env_vars_reports_fallbacks() {
         "status notes single-user fallback when TRIBLE_TEAM_ROOT unset; got:\n{stdout}"
     );
     assert!(
-        stdout.contains("self_cap:") && stdout.contains("NOT SET"),
-        "status flags self_cap NOT SET when TRIBLE_TEAM_CAP unset; got:\n{stdout}"
+        !stdout.contains("self_cap:"),
+        "status has no configured bearer handle; got:\n{stdout}"
     );
 }
 
@@ -45,8 +44,8 @@ fn status_with_env_vars_reports_from_env() {
     let dir = tempdir().expect("tempdir");
     let key_path = dir.path().join("node.key");
 
-    // Hand-picked deterministic test values; the status command
-    // does no validation, just echoes what the env var contains.
+    // Hand-picked deterministic test value; status reports the trust root but
+    // deliberately ignores the obsolete configured bearer-handle variable.
     let team_root_hex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     let self_cap_hex = "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe";
 
@@ -64,7 +63,7 @@ fn status_with_env_vars_reports_from_env() {
         "status surfaces TRIBLE_TEAM_ROOT value + source; got:\n{stdout}"
     );
     assert!(
-        stdout.contains(self_cap_hex) && stdout.contains("from TRIBLE_TEAM_CAP"),
-        "status surfaces TRIBLE_TEAM_CAP value + source; got:\n{stdout}"
+        !stdout.contains(self_cap_hex),
+        "status ignores obsolete TRIBLE_TEAM_CAP; got:\n{stdout}"
     );
 }

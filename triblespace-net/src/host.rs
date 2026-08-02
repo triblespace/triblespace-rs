@@ -95,11 +95,6 @@ pub struct PeerConfig {
     /// chains. Every connection's first stream must present a cap that
     /// chains back to this key. See `triblespace_core::repo::capability`.
     pub team_root: ed25519_dalek::VerifyingKey,
-    /// This node's own capability sig handle. Presented to remote peers
-    /// as the first stream on every outgoing connection so they can
-    /// authorise us. Required — protocol v5 has mandatory auth on both
-    /// directions of a connection.
-    pub self_cap: RawHash,
 }
 
 // No `Default` impl: every PeerConfig must specify a team root because
@@ -205,15 +200,30 @@ const PROVIDER_FANOUT_CAP: usize = 8;
 struct NetCap<T: Transport> {
     transport: T,
     pool: SharedPool<T::Conn>,
-    self_cap: Arc<Mutex<RawHash>>,
+    /// `None` until Peer has durably projected and installed the first
+    /// outbound authority. Later rotations atomically replace that value;
+    /// credential-keyed pooling isolates any already-captured predecessor.
+    self_cap: tokio::sync::watch::Receiver<Option<RawHash>>,
+}
+
+async fn wait_for_self_cap(
+    mut self_cap: tokio::sync::watch::Receiver<Option<RawHash>>,
+) -> Option<RawHash> {
+    match self_cap.wait_for(Option::is_some).await {
+        Ok(active) => *active,
+        Err(_) => None,
+    }
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> {
         let t = self.transport.clone();
         let pool = self.pool.clone();
-        let self_cap = *self.self_cap.lock().unwrap();
-        Box::pin(async move { fetch_one(&t, &hash, &pool, &self_cap).await })
+        let self_cap = self.self_cap.clone();
+        Box::pin(async move {
+            let self_cap = wait_for_self_cap(self_cap).await?;
+            fetch_one(&t, &hash, &pool, &self_cap).await
+        })
     }
 }
 
@@ -237,6 +247,10 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    /// Synchronous, level-triggered outbound authority. Updating this after a
+    /// serving-snapshot swap makes the new caller-visible boundary immediate;
+    /// the host command queue is only responsible for stale pool cleanup.
+    self_cap: tokio::sync::watch::Sender<Option<RawHash>>,
     /// Readiness slot for the inline fetch capability, published by the
     /// host once its transport binds. `None` until then.
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
@@ -252,11 +266,21 @@ impl NetSender {
         let _ = self.cmd_tx.send(NetCommand::Announce(hash));
     }
 
-    /// Activate a newly pinned outbound authentication credential. This is a
-    /// command rather than shared-store observation so callers can order it
-    /// strictly after durable pin success.
-    pub fn update_self_cap(&self, sig_handle: RawHash) {
-        let _ = self.cmd_tx.send(NetCommand::UpdateSelfCap(sig_handle));
+    /// Reconcile the host's outbound authentication credential from a fresh
+    /// durable projection. The readiness watch changes synchronously, strictly
+    /// after the coherent serving snapshot containing its proof. Connection
+    /// cleanup is asynchronous but cannot leak predecessor authority because
+    /// pooled connections are credential-keyed.
+    pub(crate) fn update_self_cap(&self, sig_handle: RawHash) {
+        let predecessor = self.self_cap.send_replace(Some(sig_handle));
+        if let Some(predecessor) = predecessor
+            && predecessor != sig_handle
+        {
+            let _ = self.cmd_tx.send(NetCommand::AuthRotated {
+                predecessor,
+                successor: sig_handle,
+            });
+        }
     }
 
     /// Dispatch a freshly-signed (cap, sig) blob pair to `subject`.
@@ -363,6 +387,8 @@ pub struct HostWiring {
     /// Publish half of the inline-fetch capability slot; the host fills
     /// it once its transport binds.
     pub(crate) cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
+    /// Receiver for the synchronous authority boundary owned by `NetSender`.
+    pub(crate) self_cap: tokio::sync::watch::Receiver<Option<RawHash>>,
 }
 
 /// Build the Peer↔host channel pair for a node with identity `id`.
@@ -373,10 +399,12 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
     let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> = Arc::new(Mutex::new(None));
     let (cap_tx, cap_rx) = tokio::sync::watch::channel::<Option<Arc<dyn NetCapability>>>(None);
+    let (self_cap_tx, self_cap_rx) = tokio::sync::watch::channel::<Option<RawHash>>(None);
 
     let sender = NetSender {
         cmd_tx,
         snapshot: snapshot.clone(),
+        self_cap: self_cap_tx,
         cap: cap_rx,
         id,
     };
@@ -386,6 +414,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
         evt_tx,
         snapshot,
         cap_tx,
+        self_cap: self_cap_rx,
     };
     (sender, receiver, wiring)
 }
@@ -402,6 +431,7 @@ pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wir
         wiring.evt_tx,
         wiring.snapshot,
         wiring.cap_tx,
+        wiring.self_cap,
     )
     .await;
 }
@@ -478,6 +508,7 @@ async fn host_loop<T: Transport>(
     events: mpsc::Sender<NetEvent>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
+    self_cap: tokio::sync::watch::Receiver<Option<RawHash>>,
 ) {
     let Harness {
         transport,
@@ -485,8 +516,6 @@ async fn host_loop<T: Transport>(
     } = harness;
 
     let my_id: PeerId = transport.local_id();
-    let self_cap = Arc::new(Mutex::new(config.self_cap));
-
     // Host-wide singleflight connection pool — one authed
     // connection per remote peer, reused across lazy blob fetches and exact
     // capability-blob loads. See `SharedPool` docs for the OnceCell-based dial
@@ -500,7 +529,7 @@ async fn host_loop<T: Transport>(
     let _ = cap_tx.send(Some(Arc::new(NetCap {
         transport: transport.clone(),
         pool: conn_pool.clone(),
-        self_cap: self_cap.clone(),
+        self_cap,
     }) as Arc<dyn NetCapability>));
     // One total envelope covers every unauthenticated connection. Non-proof
     // work has a limit one smaller, reserving progress for an exact proof
@@ -628,19 +657,21 @@ async fn host_loop<T: Transport>(
                         t.dht_announce(hash).await;
                     });
                 }
-                NetCommand::UpdateSelfCap(successor) => {
-                    let predecessor = {
-                        let mut active = self_cap.lock().unwrap();
-                        std::mem::replace(&mut *active, successor)
-                    };
-                    if predecessor != successor {
-                        debug!(
-                            predecessor = %hex::encode(&predecessor[..4]),
-                            successor = %hex::encode(&successor[..4]),
-                            "outbound authentication credential rotated; evicting pool"
-                        );
-                        pool_clear(&conn_pool, b"authentication credential rotated").await;
-                    }
+                NetCommand::AuthRotated {
+                    predecessor,
+                    successor,
+                } => {
+                    debug!(
+                        predecessor = %hex::encode(&predecessor[..4]),
+                        successor = %hex::encode(&successor[..4]),
+                        "outbound authentication credential rotated; cleaning old pool"
+                    );
+                    pool_clear_credential(
+                        &conn_pool,
+                        &predecessor,
+                        b"authentication credential rotated",
+                    )
+                    .await;
                 }
                 NetCommand::DeliverCap {
                     subject,
@@ -752,23 +783,40 @@ fn dht_provider_candidates(
     providers
 }
 
-/// Host-wide connection pool: one authed connection per remote peer, shared
-/// across lazy blob fetches and exact capability-chain loads.
+/// Host-wide connection pool: one connection per `(remote peer, outbound AUTH
+/// credential)`, shared across lazy blob fetches and exact capability-chain
+/// loads.
 ///
-/// `OnceCell` per peer provides automatic singleflight: the first
+/// `OnceCell` per authenticated peer provides automatic singleflight: the first
 /// task to encounter a missing entry runs the dial; concurrent tasks
 /// await the same `OnceCell` and reuse the resulting connection. No
 /// dial storm when several lazy reads target the same peer concurrently.
 ///
 /// iroh QUIC multiplexes streams cheaply on a single connection; our
 /// `serve_stream` reuses first-stream auth state for later bi-streams and a
-/// host-wide semaphore bounds their concurrent execution. So one connection
-/// per peer is enough.
+/// host-wide semaphore bounds their concurrent execution. Credential identity
+/// is nevertheless part of the key: a predecessor fetch that finishes DHT
+/// discovery after rotation may still complete for its caller, but it can
+/// never repopulate a cell reused by successor-authenticated work.
+type AuthenticatedPeer = (PeerId, RawHash);
+
 pub(crate) type SharedPool<C> =
-    Arc<tokio::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::OnceCell<C>>>>>;
+    Arc<tokio::sync::Mutex<HashMap<AuthenticatedPeer, Arc<tokio::sync::OnceCell<C>>>>>;
 
 fn new_shared_pool<C>() -> SharedPool<C> {
     Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn pool_cell<C>(
+    pool: &SharedPool<C>,
+    provider: PeerId,
+    self_cap: &RawHash,
+) -> Arc<tokio::sync::OnceCell<C>> {
+    let mut guard = pool.lock().await;
+    guard
+        .entry((provider, *self_cap))
+        .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+        .clone()
 }
 
 /// Get-or-dial an authed connection to `provider` from the shared
@@ -782,13 +830,8 @@ async fn pool_get<T: Transport>(
     provider: PeerId,
     self_cap: &RawHash,
 ) -> Option<T::Conn> {
-    let cell = {
-        let mut guard = pool.lock().await;
-        guard
-            .entry(provider)
-            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
-            .clone()
-    };
+    let authenticated_peer = (provider, *self_cap);
+    let cell = pool_cell(pool, provider, self_cap).await;
     let init = || async {
         match tokio::time::timeout(DIAL_DEADLINE, connect_authed(t, provider, self_cap)).await {
             Ok(r) => r,
@@ -806,9 +849,9 @@ async fn pool_get<T: Transport>(
             // in get_or_try_init, they all got the same Err — they'll
             // retry through their own entries below.
             let mut guard = pool.lock().await;
-            if let Some(existing) = guard.get(&provider) {
+            if let Some(existing) = guard.get(&authenticated_peer) {
                 if std::ptr::eq(Arc::as_ptr(existing), Arc::as_ptr(&cell)) {
-                    guard.remove(&provider);
+                    guard.remove(&authenticated_peer);
                 }
             }
             None
@@ -819,10 +862,10 @@ async fn pool_get<T: Transport>(
 /// Evict a connection from the pool. Called when an op on the pooled
 /// connection errors (peer may have closed, network changed, etc.)
 /// so the next access re-dials.
-async fn pool_evict<C: Conn>(pool: &SharedPool<C>, provider: PeerId) {
+async fn pool_evict<C: Conn>(pool: &SharedPool<C>, provider: PeerId, self_cap: &RawHash) {
     let removed = {
         let mut guard = pool.lock().await;
-        guard.remove(&provider)
+        guard.remove(&(provider, *self_cap))
     };
     if let Some(cell) = removed {
         if let Some(conn) = cell.get() {
@@ -831,16 +874,24 @@ async fn pool_evict<C: Conn>(pool: &SharedPool<C>, provider: PeerId) {
     }
 }
 
-/// Remove and close every initialized pooled connection. Uninitialized
-/// singleflight cells are removed as well: a dial already in flight may still
-/// complete for its current caller, but it cannot become reachable from the
-/// pool after a credential rotation.
-async fn pool_clear<C: Conn>(pool: &SharedPool<C>, reason: &[u8]) {
+/// Remove and close every connection authenticated with one exact credential.
+/// Uninitialized predecessor singleflight cells are removed as well, while a
+/// successor connection created after synchronous authority publication is
+/// left untouched. Work that has not entered the pool yet may still create a
+/// late predecessor-keyed cell, but the successor generation cannot address it.
+async fn pool_clear_credential<C: Conn>(pool: &SharedPool<C>, credential: &RawHash, reason: &[u8]) {
     let removed = {
         let mut guard = pool.lock().await;
-        std::mem::take(&mut *guard)
+        let keys: Vec<_> = guard
+            .keys()
+            .filter(|(_, self_cap)| self_cap == credential)
+            .copied()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| guard.remove(&key))
+            .collect::<Vec<_>>()
     };
-    for cell in removed.into_values() {
+    for cell in removed {
         if let Some(conn) = cell.get() {
             conn.close(0, reason);
         }
@@ -890,7 +941,7 @@ async fn fetch_from_providers<T: Transport>(
                     provider = %hex::encode(&provider[..4]),
                     "provider returned bytes with the wrong content hash; evicting"
                 );
-                pool_evict(pool, provider).await;
+                pool_evict(pool, provider, self_cap).await;
                 continue;
             }
             Ok(None) => {
@@ -901,7 +952,7 @@ async fn fetch_from_providers<T: Transport>(
                 debug!(error = %e, hash = %hex::encode(&hash[..4]), provider = %hex::encode(&provider[..4]), "op_get_blob errored, evicting and trying next provider");
                 // Connection-level error: pooled connection may be
                 // dead. Evict so subsequent ops to this peer re-dial.
-                pool_evict(pool, provider).await;
+                pool_evict(pool, provider, self_cap).await;
                 continue;
             }
         }
@@ -1012,7 +1063,7 @@ const POSTAUTH_STREAM_PER_CONNECTION_LIMIT: usize = 8;
 /// exactly when the queued request is consumed or dropped.
 const CAP_REQUEST_QUEUE_LIMIT: usize = 128;
 /// Maximum fully verified capability bundles waiting for synchronous
-/// persistence and team-cap pinning.
+/// persistence and recipient acceptance.
 const CAP_DELIVERY_QUEUE_LIMIT: usize = 32;
 const CAP_CONFIRMATION_QUEUE_LIMIT: usize = 128;
 
@@ -1643,7 +1694,7 @@ impl<T: Transport> HandshakeHandler<T> {
                         .await;
 
                         match result {
-                            Ok((verified, mut closure)) => {
+                            Ok((_, mut closure)) => {
                                 debug!(
                                     sig = %hex::encode(&sig_hash[..4]),
                                     issuer = %hex::encode(&peer_pubkey_bytes[..4]),
@@ -1662,7 +1713,6 @@ impl<T: Transport> HandshakeHandler<T> {
                                     cap_bytes,
                                     sig_bytes,
                                     proof_blobs: closure.into_values().collect(),
-                                    authority_expires_at: verified.expires_at(),
                                     admission: delivery_admission,
                                 }).is_ok();
                                 let _ = crate::handshake::respond(
@@ -2193,6 +2243,29 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn inline_fetch_authority_waits_for_first_durable_projection() {
+        let (sender, receiver) = tokio::sync::watch::channel::<Option<RawHash>>(None);
+        let waiting = tokio::spawn(wait_for_self_cap(receiver));
+        tokio::task::yield_now().await;
+
+        assert!(
+            !waiting.is_finished(),
+            "transport readiness alone must not race ahead of recipient projection"
+        );
+
+        let projected = [0xA7; 32];
+        sender.send_replace(Some(projected));
+        assert_eq!(waiting.await.unwrap(), Some(projected));
+    }
+
+    #[tokio::test]
+    async fn inline_fetch_authority_becomes_unavailable_when_host_stops_pending() {
+        let (sender, receiver) = tokio::sync::watch::channel::<Option<RawHash>>(None);
+        drop(sender);
+        assert_eq!(wait_for_self_cap(receiver).await, None);
+    }
+
+    #[tokio::test]
     async fn cap_request_status_waits_for_the_peer_durability_receipt() {
         let (events, receiver) = mpsc::channel();
         let request_slots = Arc::new(tokio::sync::Semaphore::new(1));
@@ -2350,6 +2423,42 @@ mod tests {
         fn close(&self, _code: u32, _reason: &[u8]) {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn late_predecessor_pool_cell_is_unreachable_by_successor_generation() {
+        let pool: SharedPool<CloseProbe> = new_shared_pool();
+        let provider = [0xC1; 32];
+        let predecessor = [0xC2; 32];
+        let successor = [0xC3; 32];
+
+        let before_rotation = pool_cell(&pool, provider, &predecessor).await;
+        // Synchronous watch publication may let successor work enter before
+        // the asynchronous cleanup command runs. Cleanup is credential-local,
+        // so that new generation must survive.
+        let successor_cell = pool_cell(&pool, provider, &successor).await;
+        pool_clear_credential(&pool, &predecessor, b"test credential rotation").await;
+        assert!(Arc::ptr_eq(
+            &successor_cell,
+            &pool_cell(&pool, provider, &successor).await
+        ));
+
+        // Model a predecessor fetch that only reaches pool_get after the
+        // rotation clear. It may create a late cell, but successor work must
+        // resolve through a different identity and therefore a different
+        // singleflight connection.
+        let late_predecessor = pool_cell(&pool, provider, &predecessor).await;
+
+        assert!(!Arc::ptr_eq(&before_rotation, &late_predecessor));
+        assert!(!Arc::ptr_eq(&late_predecessor, &successor_cell));
+        assert_eq!(pool.lock().await.len(), 2);
+
+        pool_evict(&pool, provider, &predecessor).await;
+        assert!(!pool.lock().await.contains_key(&(provider, predecessor)));
+        assert!(Arc::ptr_eq(
+            &successor_cell,
+            &pool_cell(&pool, provider, &successor).await
+        ));
     }
 
     #[tokio::test]
@@ -2576,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_scoped_serving_fails_closed_after_legacy_pin_reclassification() {
+    fn branch_scoped_serving_recognizes_legacy_branch_metadata() {
         use triblespace_core::blob::IntoBlob;
         use triblespace_core::blob::encodings::longstring::LongString;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -2637,44 +2746,6 @@ mod tests {
             &verified,
             &old_content_handle.raw
         ));
-
-        let new_entity = genid();
-        let new_tag = genid();
-        let new_content = TribleSet::from(entity! {
-            ExclusiveId::force_ref(&new_entity) @
-            triblespace_core::metadata::tag: *new_tag,
-        })
-        .to_blob();
-        let new_content_handle: Inline<Handle<SimpleArchive>> = store
-            .put(new_content.clone())
-            .expect("store local-only content");
-        let mut local_metadata =
-            triblespace_core::repo::branch::branch_unsigned(pin_id, name, Some(new_content));
-        let marker = genid();
-        local_metadata += TribleSet::from(entity! {
-            ExclusiveId::force_ref(&marker) @
-            crate::policy::local_only_pin: crate::policy::KIND_OUTBOUND_CAP_REQUEST,
-        });
-        let local_head: Inline<Handle<SimpleArchive>> = store
-            .put(local_metadata)
-            .expect("store local-only metadata");
-        assert!(matches!(
-            store.update(pin_id, Some(legacy_head), Some(local_head)),
-            Ok(PushResult::Success())
-        ));
-
-        let local_snapshot = StoreSnapshot::from_store(&mut store).expect("local snapshot");
-        for hash in [
-            legacy_head.raw,
-            old_content_handle.raw,
-            local_head.raw,
-            new_content_handle.raw,
-        ] {
-            assert!(
-                !blob_in_scope(&local_snapshot, &verified, &hash),
-                "reclassified local-only pin must not remain a scoped serving root"
-            );
-        }
     }
 
     #[test]

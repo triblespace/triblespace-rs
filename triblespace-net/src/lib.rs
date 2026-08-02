@@ -28,7 +28,6 @@ pub mod host;
 pub mod identity;
 mod legacy;
 pub mod peer;
-pub mod policy;
 /// Monotone signed event model for incoming requests and issuer renewal policy.
 pub mod policy_ledger;
 pub mod protocol;
