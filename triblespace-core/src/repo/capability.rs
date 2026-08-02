@@ -629,6 +629,26 @@ pub struct VerifiedCapability {
     pub expires_at: Epoch,
 }
 
+/// A completely verified capability proof together with the authority
+/// identities discovered while walking it.
+///
+/// [`verify_chain_and_extract_root_allow_expired`] uses the explicit founder
+/// anchor as the unique constitutional terminator, so callers that are
+/// migrating historical credentials do not need to guess a team root or try
+/// every signer in the proof. This discovers the proof's identity; it does not
+/// establish that an application trusts the discovered team.
+#[derive(Debug, Clone)]
+pub struct VerifiedCapabilityChain {
+    /// The key that signed and declared the terminal founder anchor.
+    pub team_root: VerifyingKey,
+    /// Exact capability blob named by the outer leaf signature.
+    pub leaf_cap: Inline<Handle<SimpleArchive>>,
+    /// Issuer of the finite operational leaf capability.
+    pub leaf_issuer: VerifyingKey,
+    /// The verified operational authority carried by the leaf.
+    pub capability: VerifiedCapability,
+}
+
 impl VerifiedCapability {
     /// Return the inclusive upper bound of this verified authority's lifetime.
     pub fn expires_at(&self) -> Epoch {
@@ -910,8 +930,49 @@ pub fn verify_chain_allow_expired<F>(
     team_root: VerifyingKey,
     leaf_sig_handle: Inline<Handle<SimpleArchive>>,
     expected_subject: VerifyingKey,
-    mut fetch_blob: F,
+    fetch_blob: F,
 ) -> Result<VerifiedCapability, VerifyError>
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    Ok(verify_chain_inner(
+        Some(team_root),
+        leaf_sig_handle,
+        expected_subject,
+        fetch_blob,
+    )?
+    .capability)
+}
+
+/// Verify a complete capability proof while discovering its team root.
+///
+/// The proof must terminate at one canonical [`FounderAnchor`]. Its verified
+/// signer must equal the anchor's declared issuer; that key is returned as the
+/// team root. This is intended for evidence-bound migration and recovery when
+/// the exact historical credential is present but its authority-domain key was
+/// not stored separately. Expiry is reported in the result but is not required
+/// to be live.
+///
+/// This function discovers which team the proof names. Callers remain
+/// responsible for deciding whether that team is trusted and for binding the
+/// returned leaf cap and issuer to the state being migrated.
+pub fn verify_chain_and_extract_root_allow_expired<F>(
+    leaf_sig_handle: Inline<Handle<SimpleArchive>>,
+    expected_subject: VerifyingKey,
+    fetch_blob: F,
+) -> Result<VerifiedCapabilityChain, VerifyError>
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    verify_chain_inner(None, leaf_sig_handle, expected_subject, fetch_blob)
+}
+
+fn verify_chain_inner<F>(
+    expected_team_root: Option<VerifyingKey>,
+    leaf_sig_handle: Inline<Handle<SimpleArchive>>,
+    expected_subject: VerifyingKey,
+    mut fetch_blob: F,
+) -> Result<VerifiedCapabilityChain, VerifyError>
 where
     F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
@@ -992,31 +1053,40 @@ where
     let mut depth = 1usize;
 
     loop {
-        // The configured root may sign only the explicit founder anchor. A
-        // finite root-signed cap would quietly restore the old "root as an
-        // online issuer" model, so it is not a valid terminator.
-        if current_signer == team_root {
-            match &current_fields.kind {
-                CapKind::FounderAnchor(anchor) if anchor.issuer == team_root => {}
-                CapKind::FounderAnchor(_) => return Err(VerifyError::InvalidFounderAnchor),
-                CapKind::Operational { .. } => return Err(VerifyError::FounderAnchorRequired),
+        // A founder anchor is the one constitutional terminator. Its verified
+        // signer and declared issuer must be the same key; that key is the
+        // structurally discovered team root. A caller-supplied root, when
+        // present, is an additional trust-domain equality check.
+        if let CapKind::FounderAnchor(anchor) = &current_fields.kind {
+            let team_root = anchor.issuer;
+            if current_signer != team_root
+                || current_fields.issuer != team_root
+                || expected_team_root.is_some_and(|expected| expected != team_root)
+            {
+                return Err(VerifyError::InvalidFounderAnchor);
             }
             if canonical_sig_entity_id(&current_proof, current_cap_handle) != current_outer_id {
                 return Err(VerifyError::MalformedSig);
             }
             validate_sig_proof_shape(&sig_set, leaf_outer_id, &proof_shape)?;
-            return Ok(VerifiedCapability {
-                subject: leaf_fields.subject,
-                scope_root: leaf_fields.scope_root,
-                cap_set: leaf_cap_set,
-                expires_at: authority_expires_at,
+            return Ok(VerifiedCapabilityChain {
+                team_root,
+                leaf_cap: leaf_cap_handle,
+                leaf_issuer: leaf_fields.issuer,
+                capability: VerifiedCapability {
+                    subject: leaf_fields.subject,
+                    scope_root: leaf_fields.scope_root,
+                    cap_set: leaf_cap_set,
+                    expires_at: authority_expires_at,
+                },
             });
         }
 
-        // Founder anchors are constitutional terminators, never ordinary
-        // delegating intermediates signed by another member.
-        if matches!(current_fields.kind, CapKind::FounderAnchor(_)) {
-            return Err(VerifyError::InvalidFounderAnchor);
+        // A configured root may sign only an explicit founder anchor. A finite
+        // root-signed cap would quietly restore the old "root as an online
+        // issuer" model, so it is not a valid terminator.
+        if expected_team_root.is_some_and(|expected| current_signer == expected) {
+            return Err(VerifyError::FounderAnchorRequired);
         }
 
         // The current cap needs a parent, but fetching one would exceed
@@ -1059,9 +1129,9 @@ where
         let parent_signer = parent_proof.signer;
         match &parent_fields.kind {
             CapKind::FounderAnchor(anchor) => {
-                if parent_signer != team_root
-                    || parent_fields.issuer != team_root
-                    || anchor.issuer != team_root
+                if parent_signer != parent_fields.issuer
+                    || anchor.issuer != parent_signer
+                    || expected_team_root.is_some_and(|expected| expected != parent_signer)
                 {
                     return Err(VerifyError::InvalidFounderAnchor);
                 }
@@ -1360,6 +1430,52 @@ mod tests {
 
         assert_eq!(verified.subject, founder.verifying_key());
         assert_eq!(verified.scope_root, scope_root);
+    }
+
+    #[test]
+    fn expired_tolerant_walk_extracts_the_unique_anchor_root_and_leaf_identity() {
+        let team_root = key();
+        let founder = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (scope_root, scope_facts) = empty_scope();
+        let (cap, sig) = build_capability(
+            &founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope_facts,
+            interval(3600.0),
+        )
+        .expect("build finite founder credential");
+        let cap_handle = cap.get_handle();
+        let sig_handle = sig.get_handle();
+        let blobs = [anchor_cap, anchor_sig, cap, sig];
+
+        let discovered = verify_chain_and_extract_root_allow_expired(
+            sig_handle,
+            founder.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("canonical founder proof discovers its root");
+
+        assert_eq!(discovered.team_root, team_root.verifying_key());
+        assert_eq!(discovered.leaf_cap, cap_handle);
+        assert_eq!(discovered.leaf_issuer, founder.verifying_key());
+        assert_eq!(discovered.capability.subject, founder.verifying_key());
+        assert_eq!(discovered.capability.scope_root, scope_root);
+
+        // A mid-chain signer cannot masquerade as the root: when supplied as
+        // the configured root it reaches an operational cap, not the required
+        // constitutional founder anchor.
+        assert!(matches!(
+            verify_chain_allow_expired(
+                founder.verifying_key(),
+                sig_handle,
+                founder.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::FounderAnchorRequired)
+        ));
     }
 
     #[test]
