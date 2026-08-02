@@ -103,7 +103,8 @@ fn ingests_facts_and_roundtrips_via_query() {
     assert_eq!(link_count, 1, "one wrote edge");
 
     // Actually commit, to prove the facts are a valid commit payload.
-    ws.commit(facts, "ntriples import");
+    ws.commit(facts, "ntriples import")
+        .expect("workspace rank has room for the N-Triples import");
     repo.push(&mut ws).expect("push succeeds");
 }
 

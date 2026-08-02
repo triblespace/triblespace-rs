@@ -26,10 +26,10 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{Blob, IntoBlob};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
-use crate::repo::branch_assertion::{
-    AssertionId, AssertionWitness, BranchAssertionSnapshot, BranchIdentity,
-};
+use crate::repo::branch_assertion::BranchIdentity;
+use crate::repo::branch_pin::{commit_from_value, BranchPinDescriptor, BranchRank};
 use crate::repo::commit::merge_metadata;
+use crate::repo::pin_assertion::{PinAssertionId, PinAssertionSnapshot, PinAssertionWitness};
 use crate::repo::CommitHandle;
 
 /// Result of looking up one commit's direct parents.
@@ -73,7 +73,10 @@ pub enum BranchResolution {
     /// pairwise relation from being decided. Its conservative root is a
     /// descriptor only: it is neither checkout-safe nor assertion-safe.
     Partial(PartialFrontier),
-    /// The complete maximal antichain is known.
+    /// The maximal antichain is known under the branch rank contract.
+    /// Dishonest author-signed labels can conservatively retain redundant tips
+    /// and make that over-approximation appear complete, but cannot remove a
+    /// truly maximal tip.
     Complete(CompleteFrontier),
 }
 
@@ -137,6 +140,7 @@ impl PartialFrontier {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompleteFrontier {
     tips: Vec<CommitHandle>,
+    resolved_rank: Option<BranchRank>,
 }
 
 impl CompleteFrontier {
@@ -149,6 +153,16 @@ impl CompleteFrontier {
     /// merge over the whole divergent frontier.
     pub fn resolved_head(&self) -> ResolvedHead {
         resolved_head(&self.tips)
+    }
+
+    /// Rank carried by the existing singleton head or assigned to the
+    /// deterministic synthetic merge.
+    ///
+    /// `None` means an all-`0xFF` parent rank cannot be advanced. Checkout is
+    /// still sound, but publication must fail explicitly rather than wrapping
+    /// or inventing a rank.
+    pub fn resolved_rank(&self) -> Option<BranchRank> {
+        self.resolved_rank
     }
 }
 
@@ -165,31 +179,40 @@ pub enum ResolvedHead {
 /// Resolve the assertions for one exact branch identity.
 ///
 /// The result is invariant under assertion insertion and physical log order.
-/// BranchId is used only by the snapshot's prefix scan; the snapshot rechecks
-/// the complete descriptor before returning witnesses. Persisted witnesses are
+/// The generic snapshot narrows by the full pin-identity digest and then
+/// rechecks the complete identity before returning witnesses. Persisted witnesses are
 /// authenticated only when their semantic `(identity, commit)` claim reaches
-/// the optimistic frontier. One valid witness licenses a claim; if every
-/// witness for a frontier claim is invalid, that claim is removed and
-/// domination is recomputed from the remaining claims. Thus every returned tip
-/// has a verified witness in this call, and invalid claims never create fetch
-/// demand.
+/// the optimistic frontier. At least one valid witness licenses a claim; all
+/// surviving siblings are checked so publication provenance can take the
+/// greatest valid rank. If every witness for a frontier claim is invalid, that
+/// claim is removed and domination is recomputed from the remaining claims.
+/// Thus every returned tip has a verified witness in this call, and invalid
+/// claims never create fetch demand.
 pub fn resolve_branch<D: PartialCommitDag>(
-    snapshot: &BranchAssertionSnapshot,
+    snapshot: &PinAssertionSnapshot,
     identity: &BranchIdentity,
     dag: &mut D,
 ) -> Result<BranchResolution, D::Error> {
-    let witnesses = snapshot.witnesses_for_branch(identity);
+    let pin_identity = BranchPinDescriptor::pin_identity(identity.author(), identity.name());
+    let witnesses = snapshot.witnesses_for_pin(&pin_identity);
     if witnesses.is_empty() {
         return Ok(BranchResolution::Absent);
     }
 
-    let mut claims: BTreeMap<CommitHandle, Vec<&AssertionWitness>> = BTreeMap::new();
+    // Exact values are the semantic claim identity. Group them before looking
+    // at labels: equal labels rule out *strict* ancestry only between distinct
+    // commits, and repeated assertions of one commit must never compare as two
+    // tips.
+    let mut claims: BTreeMap<CommitHandle, Vec<&PinAssertionWitness>> = BTreeMap::new();
     for witness in witnesses {
-        claims.entry(witness.commit()).or_default().push(witness);
+        claims
+            .entry(commit_from_value(witness.claimed_value()))
+            .or_default()
+            .push(witness);
     }
     let initial_distinct_claims = claims.len();
     let mut view = PartialDagView::new(dag);
-    let mut verification = HashMap::<AssertionId, bool>::new();
+    let mut verification = HashMap::<PinAssertionId, bool>::new();
     let mut rounds = 0usize;
 
     loop {
@@ -201,22 +224,51 @@ pub fn resolve_branch<D: PartialCommitDag>(
             return Ok(BranchResolution::Absent);
         }
 
-        let tips: Vec<_> = claims.keys().copied().collect();
-        let optimistic = optimistic_frontier(&tips, &mut view)?;
-
-        let invalid_frontier: Vec<_> = optimistic
-            .tips
+        let tips: Vec<_> = claims
             .iter()
-            .copied()
-            .filter(|commit| {
-                !claim_has_valid_witness(
-                    claims
-                        .get(commit)
-                        .expect("an optimistic tip belongs to the active claim set"),
-                    &mut verification,
-                )
-            })
+            .map(|(commit, witnesses)| (*commit, consistent_rank_hint(witnesses)))
             .collect();
+        let optimistic = match optimistic_frontier(&tips, &mut view) {
+            Ok(frontier) => frontier,
+            Err(error) => {
+                // An unauthenticated claim may point at malformed local bytes
+                // or a backend failure and trigger that error during the
+                // optimistic ancestry fold. On this exceptional path, verify
+                // every active exact claim. Removing all-invalid groups and
+                // retrying prevents forged witnesses from poisoning a valid
+                // branch; if every active group has a valid witness, the
+                // storage/metadata error is genuine and remains observable.
+                let invalid: Vec<_> = claims
+                    .iter()
+                    .filter_map(|(commit, witnesses)| {
+                        claim_max_valid_rank(witnesses, &mut verification)
+                            .is_none()
+                            .then_some(*commit)
+                    })
+                    .collect();
+                if invalid.is_empty() {
+                    return Err(error);
+                }
+                for commit in invalid {
+                    claims.remove(&commit);
+                }
+                continue;
+            }
+        };
+
+        let mut invalid_frontier = Vec::new();
+        let mut valid_frontier_ranks = BTreeMap::new();
+        for commit in &optimistic.tips {
+            let witnesses = claims
+                .get(commit)
+                .expect("an optimistic tip belongs to the active claim set");
+            match claim_max_valid_rank(witnesses, &mut verification) {
+                Some(rank) => {
+                    valid_frontier_ranks.insert(*commit, rank);
+                }
+                None => invalid_frontier.push(*commit),
+            }
+        }
         if !invalid_frontier.is_empty() {
             for commit in invalid_frontier {
                 claims.remove(&commit);
@@ -259,25 +311,58 @@ pub fn resolve_branch<D: PartialCommitDag>(
                 missing_ancestry: optimistic.missing_ancestry,
             }));
         }
+        let resolved_rank = if optimistic.tips.len() == 1 {
+            Some(
+                *valid_frontier_ranks
+                    .get(&optimistic.tips[0])
+                    .expect("every complete tip has an authenticated rank"),
+            )
+        } else {
+            BranchRank::after(optimistic.tips.iter().map(|tip| {
+                *valid_frontier_ranks
+                    .get(tip)
+                    .expect("every complete tip has an authenticated rank")
+            }))
+        };
         return Ok(BranchResolution::Complete(CompleteFrontier {
             tips: optimistic.tips,
+            resolved_rank,
         }));
     }
 }
 
-fn claim_has_valid_witness(
-    witnesses: &[&AssertionWitness],
-    memo: &mut HashMap<AssertionId, bool>,
-) -> bool {
-    witnesses.iter().any(|witness| {
-        let id = witness.id();
-        if let Some(valid) = memo.get(&id) {
-            return *valid;
-        }
-        let valid = witness.verified().is_ok();
-        memo.insert(id, valid);
-        valid
-    })
+/// A claim receives a label hint only when every structural witness agrees.
+/// A forged conflicting sibling can therefore disable an optimisation but can
+/// never create one. Verification remains lazy until the claim survives.
+fn consistent_rank_hint(witnesses: &[&PinAssertionWitness]) -> Option<BranchRank> {
+    let mut labels = witnesses.iter().map(|witness| witness.claimed_label());
+    let first = labels.next()?;
+    labels
+        .all(|label| label == first)
+        .then(|| BranchRank::from_label(first))
+}
+
+/// Authenticate every surviving sibling and retain the greatest valid rank.
+///
+/// Taking the maximum means a newly authored child can advance beyond every
+/// valid assertion of its parent commit. Invalid siblings remain forensic data
+/// but cannot influence publication provenance.
+fn claim_max_valid_rank(
+    witnesses: &[&PinAssertionWitness],
+    memo: &mut HashMap<PinAssertionId, bool>,
+) -> Option<BranchRank> {
+    witnesses
+        .iter()
+        .filter_map(|witness| {
+            let id = witness.id();
+            if let Some(valid) = memo.get(&id) {
+                return valid.then(|| BranchRank::from_label(witness.claimed_label()));
+            }
+            let valid = witness.verified().is_ok();
+            memo.insert(id, valid);
+            valid.then(|| BranchRank::from_label(witness.claimed_label()))
+        })
+        .max()
 }
 
 struct OptimisticFrontier {
@@ -287,7 +372,7 @@ struct OptimisticFrontier {
 }
 
 fn optimistic_frontier<D: PartialCommitDag>(
-    tips: &[CommitHandle],
+    tips: &[(CommitHandle, Option<BranchRank>)],
     view: &mut PartialDagView<'_, D>,
 ) -> Result<OptimisticFrontier, D::Error> {
     let mut dominated = vec![false; tips.len()];
@@ -295,21 +380,46 @@ fn optimistic_frontier<D: PartialCommitDag>(
 
     for left in 0..tips.len() {
         for right in (left + 1)..tips.len() {
-            let forward = view.is_ancestor(tips[left], tips[right])?;
-            if forward.relation == Ancestry::Yes {
+            let (left_commit, left_rank) = tips[left];
+            let (right_commit, right_rank) = tips[right];
+
+            // A branch rank may suppress only the direction it proves
+            // impossible. It never establishes ancestry and therefore never
+            // marks a claim dominated. Arbitrary labels can make us retain an
+            // extra tip, but cannot make us drop a real one.
+            let forward = match (left_rank, right_rank) {
+                (Some(left_rank), Some(right_rank)) if left_rank >= right_rank => None,
+                _ => Some(view.is_ancestor(left_commit, right_commit)?),
+            };
+            if forward
+                .as_ref()
+                .is_some_and(|walk| walk.relation == Ancestry::Yes)
+            {
                 dominated[left] = true;
                 continue;
             }
 
-            let reverse = view.is_ancestor(tips[right], tips[left])?;
-            if reverse.relation == Ancestry::Yes {
+            let reverse = match (left_rank, right_rank) {
+                (Some(left_rank), Some(right_rank)) if right_rank >= left_rank => None,
+                _ => Some(view.is_ancestor(right_commit, left_commit)?),
+            };
+            if reverse
+                .as_ref()
+                .is_some_and(|walk| walk.relation == Ancestry::Yes)
+            {
                 dominated[right] = true;
                 continue;
             }
 
-            if forward.relation == Ancestry::Unknown || reverse.relation == Ancestry::Unknown {
-                let mut missing = forward.missing;
-                missing.extend(reverse.missing);
+            if forward
+                .as_ref()
+                .is_some_and(|walk| walk.relation == Ancestry::Unknown)
+                || reverse
+                    .as_ref()
+                    .is_some_and(|walk| walk.relation == Ancestry::Unknown)
+            {
+                let mut missing = forward.map(|walk| walk.missing).unwrap_or_default();
+                missing.extend(reverse.map(|walk| walk.missing).unwrap_or_default());
                 canonicalize(&mut missing);
                 unknown_pairs.push((left, right, missing));
             }
@@ -321,9 +431,8 @@ fn optimistic_frontier<D: PartialCommitDag>(
         .any(|(left, right, _)| !dominated[*left] && !dominated[*right]);
     let mut frontier: Vec<_> = tips
         .iter()
-        .copied()
         .enumerate()
-        .filter_map(|(index, commit)| (!dominated[index]).then_some(commit))
+        .filter_map(|(index, (commit, _))| (!dominated[index]).then_some(*commit))
         .collect();
     canonicalize(&mut frontier);
 
@@ -438,9 +547,10 @@ mod tests {
 
     use super::*;
     use crate::blob::encodings::longstring::LongString;
-    use crate::repo::branch_assertion::{
-        reset_signature_verification_count, signature_verification_count, BranchAssertion,
-        UnverifiedBranchAssertion,
+    use crate::repo::branch_pin::sign_branch_assertion;
+    use crate::repo::pin_assertion::{
+        reset_signature_verification_count, signature_verification_count, PinAssertion,
+        SubsumptionLabel, UnverifiedPinAssertion,
     };
 
     #[derive(Clone, Default)]
@@ -460,6 +570,44 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CountingDag {
+        parents: HashMap<CommitHandle, ParentLookup>,
+        calls: Vec<CommitHandle>,
+    }
+
+    impl PartialCommitDag for CountingDag {
+        type Error = Infallible;
+
+        fn parents(&mut self, commit: CommitHandle) -> Result<ParentLookup, Self::Error> {
+            self.calls.push(commit);
+            Ok(self
+                .parents
+                .get(&commit)
+                .cloned()
+                .unwrap_or(ParentLookup::Missing))
+        }
+    }
+
+    struct FailingDag {
+        resident: CommitHandle,
+        failing: CommitHandle,
+    }
+
+    impl PartialCommitDag for FailingDag {
+        type Error = ();
+
+        fn parents(&mut self, commit: CommitHandle) -> Result<ParentLookup, Self::Error> {
+            if commit == self.failing {
+                Err(())
+            } else if commit == self.resident {
+                Ok(ParentLookup::Present(vec![]))
+            } else {
+                Ok(ParentLookup::Missing)
+            }
+        }
+    }
+
     fn commit(byte: u8) -> CommitHandle {
         Inline::new([byte; 32])
     }
@@ -472,13 +620,42 @@ mod tests {
         SigningKey::from_bytes(&[7; 32])
     }
 
-    fn snapshot(commits: impl IntoIterator<Item = CommitHandle>) -> BranchAssertionSnapshot {
+    fn rank(byte: u8) -> BranchRank {
+        let mut raw = [0u8; 32];
+        raw[31] = byte;
+        BranchRank::from_label(SubsumptionLabel::from_raw(raw))
+    }
+
+    fn rank_for_commit(commit: CommitHandle) -> BranchRank {
+        rank(commit.raw[0])
+    }
+
+    fn assertion(commit: CommitHandle, rank: BranchRank) -> PinAssertion {
+        sign_branch_assertion(&key(), name(3), commit, rank)
+    }
+
+    fn snapshot(commits: impl IntoIterator<Item = CommitHandle>) -> PinAssertionSnapshot {
         let key = key();
-        let mut snapshot = BranchAssertionSnapshot::new();
+        let mut snapshot = PinAssertionSnapshot::new();
         for commit in commits {
             snapshot
-                .insert(BranchAssertion::sign(&key, name(3), commit))
+                .insert(sign_branch_assertion(
+                    &key,
+                    name(3),
+                    commit,
+                    rank_for_commit(commit),
+                ))
                 .unwrap();
+        }
+        snapshot
+    }
+
+    fn ranked_snapshot(
+        claims: impl IntoIterator<Item = (CommitHandle, BranchRank)>,
+    ) -> PinAssertionSnapshot {
+        let mut snapshot = PinAssertionSnapshot::new();
+        for (commit, rank) in claims {
+            snapshot.insert(assertion(commit, rank)).unwrap();
         }
         snapshot
     }
@@ -486,18 +663,26 @@ mod tests {
     fn structural_witness(
         commit: CommitHandle,
         corrupt_signature_byte: Option<usize>,
-    ) -> UnverifiedBranchAssertion {
-        let mut bytes = BranchAssertion::sign(&key(), name(3), commit).encode();
+    ) -> UnverifiedPinAssertion {
+        structural_witness_ranked(commit, rank_for_commit(commit), corrupt_signature_byte)
+    }
+
+    fn structural_witness_ranked(
+        commit: CommitHandle,
+        rank: BranchRank,
+        corrupt_signature_byte: Option<usize>,
+    ) -> UnverifiedPinAssertion {
+        let mut bytes = assertion(commit, rank).encode();
         if let Some(index) = corrupt_signature_byte {
-            bytes[96 + index % 64] ^= 1;
+            bytes[128 + index % 64] ^= 1;
         }
-        UnverifiedBranchAssertion::decode_structural(bytes).unwrap()
+        UnverifiedPinAssertion::decode_structural(bytes).unwrap()
     }
 
     fn structural_snapshot(
-        witnesses: impl IntoIterator<Item = UnverifiedBranchAssertion>,
-    ) -> BranchAssertionSnapshot {
-        let mut snapshot = BranchAssertionSnapshot::new();
+        witnesses: impl IntoIterator<Item = UnverifiedPinAssertion>,
+    ) -> PinAssertionSnapshot {
+        let mut snapshot = PinAssertionSnapshot::new();
         for witness in witnesses {
             snapshot.insert_unverified(witness).unwrap();
         }
@@ -514,6 +699,24 @@ mod tests {
             BranchResolution::Complete(frontier) => frontier.tips,
             other => panic!("fully resident acyclic DAG must resolve completely: {other:?}"),
         }
+    }
+
+    fn complete_frontier(tips: impl IntoIterator<Item = CommitHandle>) -> CompleteFrontier {
+        let mut tips: Vec<_> = tips.into_iter().collect();
+        canonicalize(&mut tips);
+        let resolved_rank = if tips.len() == 1 {
+            Some(rank_for_commit(tips[0]))
+        } else {
+            BranchRank::after(tips.iter().copied().map(rank_for_commit))
+        };
+        CompleteFrontier {
+            tips,
+            resolved_rank,
+        }
+    }
+
+    fn complete(tips: impl IntoIterator<Item = CommitHandle>) -> BranchResolution {
+        BranchResolution::Complete(complete_frontier(tips))
     }
 
     fn candidate_tips(resolution: &BranchResolution) -> &[CommitHandle] {
@@ -553,10 +756,161 @@ mod tests {
         present(&mut dag, b, &[a]);
         present(&mut dag, c, &[b]);
         let resolved = resolve_branch(&snapshot([b, a, c]), &identity(), &mut dag).unwrap();
+        assert_eq!(resolved, complete([c]));
+    }
+
+    #[test]
+    fn honest_ranks_walk_only_the_causally_possible_direction() {
+        let (parent, child) = (commit(1), commit(2));
+        let mut dag = CountingDag {
+            parents: HashMap::from([
+                (parent, ParentLookup::Present(vec![])),
+                (child, ParentLookup::Present(vec![parent])),
+            ]),
+            calls: Vec::new(),
+        };
+        let mut view = PartialDagView::new(&mut dag);
+        let frontier = optimistic_frontier(
+            &[(parent, Some(rank(1))), (child, Some(rank(2)))],
+            &mut view,
+        )
+        .unwrap();
+
+        assert_eq!(frontier.tips, vec![child]);
         assert_eq!(
-            resolved,
-            BranchResolution::Complete(CompleteFrontier { tips: vec![c] })
+            dag.calls,
+            vec![child],
+            "the impossible child→parent direction must not be walked"
         );
+    }
+
+    #[test]
+    fn equal_ranks_skip_both_directions_between_distinct_values() {
+        struct ForbiddenDag;
+        impl PartialCommitDag for ForbiddenDag {
+            type Error = Infallible;
+
+            fn parents(&mut self, _: CommitHandle) -> Result<ParentLookup, Self::Error> {
+                panic!("equal ranks should suppress both strict-ancestry walks")
+            }
+        }
+
+        let (left, right) = (commit(1), commit(2));
+        let mut dag = ForbiddenDag;
+        let mut view = PartialDagView::new(&mut dag);
+        let frontier =
+            optimistic_frontier(&[(left, Some(rank(7))), (right, Some(rank(7)))], &mut view)
+                .unwrap();
+        assert_eq!(frontier.tips, vec![left, right]);
+        assert!(!frontier.unresolved_pair);
+    }
+
+    #[test]
+    fn a_larger_rank_never_prunes_a_divergent_smaller_rank() {
+        let (left, right) = (commit(1), commit(2));
+        let mut dag = CountingDag {
+            parents: HashMap::from([
+                (left, ParentLookup::Present(vec![])),
+                (right, ParentLookup::Present(vec![])),
+            ]),
+            calls: Vec::new(),
+        };
+        let mut view = PartialDagView::new(&mut dag);
+        let frontier = optimistic_frontier(
+            &[(left, Some(rank(1))), (right, Some(rank(200)))],
+            &mut view,
+        )
+        .unwrap();
+
+        assert_eq!(frontier.tips, vec![left, right]);
+        assert_eq!(dag.calls, vec![right]);
+    }
+
+    #[test]
+    fn exact_values_group_before_labels_and_keep_the_maximum_valid_rank() {
+        let tip = commit(4);
+        let assertions = ranked_snapshot([(tip, rank(1)), (tip, rank(9))]);
+        let mut dag = TestDag::default();
+        present(&mut dag, tip, &[]);
+
+        let BranchResolution::Complete(frontier) =
+            resolve_branch(&assertions, &identity(), &mut dag).unwrap()
+        else {
+            panic!("one resident exact value must complete")
+        };
+        assert_eq!(frontier.tips(), &[tip]);
+        assert_eq!(frontier.resolved_rank(), Some(rank(9)));
+
+        let pin_identity =
+            BranchPinDescriptor::pin_identity(identity().author(), identity().name());
+        let witnesses = assertions.witnesses_for_pin(&pin_identity);
+        assert_eq!(witnesses.len(), 2);
+        assert_eq!(consistent_rank_hint(&witnesses), None);
+    }
+
+    #[test]
+    fn invalid_high_rank_siblings_do_not_influence_provenance() {
+        let tip = commit(4);
+        let assertions = structural_snapshot([
+            structural_witness_ranked(tip, rank(3), None),
+            structural_witness_ranked(tip, rank(250), Some(17)),
+        ]);
+        let mut dag = TestDag::default();
+        present(&mut dag, tip, &[]);
+
+        reset_signature_verification_count();
+        let BranchResolution::Complete(frontier) =
+            resolve_branch(&assertions, &identity(), &mut dag).unwrap()
+        else {
+            panic!("the valid sibling must license the exact claim")
+        };
+        assert_eq!(frontier.resolved_rank(), Some(rank(3)));
+        assert_eq!(signature_verification_count(), 2);
+    }
+
+    #[test]
+    fn invalid_claims_cannot_turn_optimistic_read_failures_into_branch_errors() {
+        let (resident, forged) = (commit(1), commit(2));
+        let assertions = structural_snapshot([
+            structural_witness_ranked(resident, rank(1), None),
+            structural_witness_ranked(forged, rank(2), Some(17)),
+        ]);
+        let mut dag = FailingDag {
+            resident,
+            failing: forged,
+        };
+
+        assert_eq!(
+            resolve_branch(&assertions, &identity(), &mut dag),
+            Ok(complete([resident]))
+        );
+    }
+
+    #[test]
+    fn valid_claims_preserve_optimistic_read_failures() {
+        let (resident, failing) = (commit(1), commit(2));
+        let assertions = ranked_snapshot([(resident, rank(1)), (failing, rank(2))]);
+        let mut dag = FailingDag { resident, failing };
+
+        assert_eq!(resolve_branch(&assertions, &identity(), &mut dag), Err(()));
+    }
+
+    #[test]
+    fn divergent_rank_overflow_is_explicit() {
+        let (left, right) = (commit(1), commit(2));
+        let full = BranchRank::from_label(SubsumptionLabel::from_raw([0xFF; 32]));
+        let assertions = ranked_snapshot([(left, full), (right, BranchRank::ROOT)]);
+        let mut dag = TestDag::default();
+        present(&mut dag, left, &[]);
+        present(&mut dag, right, &[]);
+
+        let BranchResolution::Complete(frontier) =
+            resolve_branch(&assertions, &identity(), &mut dag).unwrap()
+        else {
+            panic!("resident divergent roots must complete")
+        };
+        assert_eq!(frontier.tips(), &[left, right]);
+        assert_eq!(frontier.resolved_rank(), None);
     }
 
     #[test]
@@ -568,17 +922,11 @@ mod tests {
         let assertions = snapshot([root, child]);
 
         let resolved = resolve_branch(&assertions, &identity(), &mut dag).unwrap();
-        assert_eq!(
-            resolved,
-            BranchResolution::Complete(CompleteFrontier { tips: vec![child] })
-        );
+        assert_eq!(resolved, complete([child]));
 
         present(&mut dag, missing, &[]);
-        let complete = resolve_branch(&assertions, &identity(), &mut dag).unwrap();
-        assert_eq!(
-            complete,
-            BranchResolution::Complete(CompleteFrontier { tips: vec![child] })
-        );
+        let completed = resolve_branch(&assertions, &identity(), &mut dag).unwrap();
+        assert_eq!(completed, complete([child]));
     }
 
     #[test]
@@ -587,7 +935,9 @@ mod tests {
         let mut dag = TestDag::default();
         present(&mut dag, left, &[missing]);
         present(&mut dag, right, &[]);
-        let assertions = snapshot([left, right]);
+        // Only right→left can still be causal under these ranks, and that
+        // exact walk crosses `left`'s missing parent.
+        let assertions = ranked_snapshot([(left, rank(2)), (right, rank(1))]);
 
         assert_eq!(
             resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
@@ -600,9 +950,7 @@ mod tests {
         present(&mut dag, missing, &[]);
         assert_eq!(
             resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
-            BranchResolution::Complete(CompleteFrontier {
-                tips: vec![left, right],
-            })
+            complete([left, right])
         );
     }
 
@@ -622,7 +970,7 @@ mod tests {
         present(&mut dag, tip, &[]);
         assert_eq!(
             resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
-            BranchResolution::Complete(CompleteFrontier { tips: vec![tip] })
+            complete([tip])
         );
     }
 
@@ -655,7 +1003,7 @@ mod tests {
         };
         assert_eq!(
             resolve_branch(&snapshot([tip]), &identity(), &mut dag).unwrap(),
-            BranchResolution::Complete(CompleteFrontier { tips: vec![tip] })
+            complete([tip])
         );
         assert_eq!(dag.calls, 1, "the surviving tip is checked exactly once");
     }
@@ -717,7 +1065,7 @@ mod tests {
         reset_signature_verification_count();
         assert_eq!(
             resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
-            BranchResolution::Complete(CompleteFrontier { tips: vec![real] })
+            complete([real])
         );
         assert_eq!(
             signature_verification_count(),
@@ -740,11 +1088,13 @@ mod tests {
         reset_signature_verification_count();
         assert_eq!(
             resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
-            BranchResolution::Complete(CompleteFrontier { tips: vec![tip] })
+            complete([tip])
         );
-        assert!((1..=3).contains(&signature_verification_count()));
+        assert_eq!(signature_verification_count(), 3);
+        let pin_identity =
+            BranchPinDescriptor::pin_identity(identity().author(), identity().name());
         assert_eq!(
-            assertions.for_branch(&identity()).len(),
+            assertions.for_pin(&pin_identity).len(),
             1,
             "the two invalid siblings never escape the snapshot as public assertions"
         );
@@ -771,9 +1121,7 @@ mod tests {
         reset_signature_verification_count();
         assert_eq!(
             resolve_branch(&assertions, &identity(), &mut dag).unwrap(),
-            BranchResolution::Complete(CompleteFrontier {
-                tips: vec![*commits.last().unwrap()],
-            })
+            complete([*commits.last().unwrap()])
         );
         assert_eq!(
             signature_verification_count(),
@@ -801,10 +1149,7 @@ mod tests {
         let ResolvedHead::Synthetic(first) = frontier.resolved_head() else {
             panic!("three tips must synthesize a merge")
         };
-        let ResolvedHead::Synthetic(second) = CompleteFrontier {
-            tips: vec![c, b, a],
-        }
-        .resolved_head() else {
+        let ResolvedHead::Synthetic(second) = complete_frontier([c, b, a]).resolved_head() else {
             panic!("three tips must synthesize a merge")
         };
         assert_eq!(first, second);
@@ -841,6 +1186,55 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn arbitrary_labels_only_overapproximate_the_exact_frontier(
+            node_count in 1usize..9,
+            parent_masks in prop::collection::vec(any::<u16>(), 8),
+            assertion_mask in 1u16..=u16::MAX,
+            labels in prop::collection::vec(any::<u8>(), 8),
+        ) {
+            let commits: Vec<_> = (0..node_count)
+                .map(|index| commit(index as u8 + 1))
+                .collect();
+            let mut dag = TestDag::default();
+            for index in 0..node_count {
+                let lower = if index == 0 { 0 } else { (1u16 << index) - 1 };
+                let parents: Vec<_> = (0..index)
+                    .filter(|parent| parent_masks[index] & (1u16 << parent) & lower != 0)
+                    .map(|parent| commits[parent])
+                    .collect();
+                present(&mut dag, commits[index], &parents);
+            }
+
+            let selected: Vec<_> = commits
+                .iter()
+                .enumerate()
+                .filter_map(|(index, commit)| {
+                    (assertion_mask & (1u16 << index) != 0).then_some((index, *commit))
+                })
+                .collect();
+            prop_assume!(!selected.is_empty());
+
+            let exact_input: Vec<_> = selected
+                .iter()
+                .map(|(_, commit)| (*commit, None))
+                .collect();
+            let guided_input: Vec<_> = selected
+                .iter()
+                .map(|(index, commit)| (*commit, Some(rank(labels[*index]))))
+                .collect();
+            let mut exact_dag = dag.clone();
+            let mut exact_view = PartialDagView::new(&mut exact_dag);
+            let exact = optimistic_frontier(&exact_input, &mut exact_view).unwrap();
+            let mut guided_view = PartialDagView::new(&mut dag);
+            let guided = optimistic_frontier(&guided_input, &mut guided_view).unwrap();
+
+            prop_assert!(
+                exact.tips.iter().all(|tip| guided.tips.contains(tip)),
+                "label guidance discarded an exact maximal tip"
+            );
+        }
+
         #[test]
         fn max_is_a_sufficient_statistic_on_generated_dags(
             node_count in 1usize..9,

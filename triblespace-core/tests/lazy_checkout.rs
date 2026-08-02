@@ -36,9 +36,13 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
 
     let e = triblespace_core::id::rngid();
     let data: TribleSet = entity! { &e @ test_ns::label: "payload" }.into();
-    ws.commit(data.clone(), "the payload commit");
+    ws.commit(data.clone(), "the payload commit")
+        .expect("workspace rank has room for the payload commit");
     repo_a.push(&mut ws).expect("push");
     let head = ws.head().expect("published head");
+    let head_rank = ws
+        .head_rank()
+        .expect("published head carries authenticated rank provenance");
 
     // The commit's content blob — the one we withhold from the replica.
     let content_blob: Blob<triblespace_core::blob::encodings::simplearchive::SimpleArchive> =
@@ -65,7 +69,7 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     let lazy = Lazy::new(replica);
     let mut repo_b = Repository::new(lazy, key, TribleSet::new()).expect("replica repo");
     let mut ws_b = repo_b.create_workspace("main").expect("workspace");
-    ws_b.set_head(head);
+    ws_b.set_head(head, head_rank).unwrap();
 
     let err = ws_b
         .checkout(..)

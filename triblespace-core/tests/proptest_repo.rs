@@ -37,7 +37,7 @@ proptest! {
             let e = rngid();
             data += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data.clone(), "test commit");
+        ws.commit(data.clone(), "test commit").expect("workspace rank has room");
 
         // Checkout and verify
         let checkout = ws.checkout(..).expect("checkout");
@@ -75,7 +75,7 @@ proptest! {
             let e = rngid();
             data1 += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data1.clone(), "batch 1");
+        ws.commit(data1.clone(), "batch 1").expect("workspace rank has room");
 
         // Second commit
         let mut data2 = TribleSet::new();
@@ -83,7 +83,7 @@ proptest! {
             let e = rngid();
             data2 += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data2.clone(), "batch 2");
+        ws.commit(data2.clone(), "batch 2").expect("workspace rank has room");
 
         // Full checkout should contain both batches
         let checkout = ws.checkout(..).expect("checkout");
@@ -119,7 +119,7 @@ proptest! {
             let e = rngid();
             data += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data, "commit");
+        ws.commit(data, "commit").expect("workspace rank has room");
         repo.push(&mut ws).expect("push");
 
         // Fresh pull should see the same data
@@ -159,7 +159,7 @@ proptest! {
             let e = rngid();
             data1 += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data1.clone(), "batch 1");
+        ws.commit(data1.clone(), "batch 1").expect("workspace rank has room");
         repo.push(&mut ws).expect("push");
 
         // First checkout — sees everything
@@ -172,7 +172,7 @@ proptest! {
             let e = rngid();
             data2 += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data2.clone(), "batch 2");
+        ws.commit(data2.clone(), "batch 2").expect("workspace rank has room");
         repo.push(&mut ws).expect("push");
 
         // Incremental checkout — should only see batch2
@@ -225,7 +225,7 @@ proptest! {
             let e = rngid();
             data_a += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws_a.commit(data_a, "from A");
+        ws_a.commit(data_a, "from A").expect("workspace rank has room");
         repo.push(&mut ws_a).expect("push A");
 
         // Workspace B commits (on top of A)
@@ -235,7 +235,7 @@ proptest! {
             let e = rngid();
             data_b += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws_b.commit(data_b, "from B");
+        ws_b.commit(data_b, "from B").expect("workspace rank has room");
         repo.push(&mut ws_b).expect("push B");
 
         // Checkout should contain both
@@ -274,7 +274,7 @@ proptest! {
             let e = rngid();
             data1 += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data1.clone(), "batch 1");
+        ws.commit(data1.clone(), "batch 1").expect("workspace rank has room");
         repo.push(&mut ws).expect("push");
 
         // First checkout
@@ -288,7 +288,7 @@ proptest! {
             let e = rngid();
             data2 += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data2.clone(), "batch 2");
+        ws.commit(data2.clone(), "batch 2").expect("workspace rank has room");
         repo.push(&mut ws).expect("push");
 
         // Second checkout (only new commits)
@@ -356,7 +356,7 @@ proptest! {
             let e = rngid();
             data += entity! { &e @ test_ns::label: label.as_str() };
         }
-        ws.commit(data, "commit");
+        ws.commit(data, "commit").expect("workspace rank has room");
 
         let checkout = ws.checkout(..).expect("checkout");
         // commits() should be non-empty after a checkout with data

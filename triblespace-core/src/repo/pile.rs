@@ -395,7 +395,12 @@ struct PinAssertionHeaderV3 {
 }
 
 impl PinAssertionHeaderV3 {
+    #[cfg(test)]
     fn new(assertion: PinAssertion) -> Self {
+        Self::from_unverified(assertion.into())
+    }
+
+    fn from_unverified(assertion: UnverifiedPinAssertion) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_PIN_ASSERTION_V3,
             assertion: assertion.encode(),
@@ -2108,31 +2113,27 @@ impl BranchAssertionStore for Pile {
     }
 }
 
-impl PinAssertionStore for Pile {
-    type Error = PilePinAssertionError;
-
-    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
-        self.refresh()?;
-        Ok(self.pin_assertions.clone())
-    }
-
-    /// Append one verified generic assertion as a fixed 256-byte Pile record.
+impl Pile {
+    /// Preserve one structurally admitted witness during a physical rewrite.
     ///
-    /// The operation is durable on return. Duplicate append remains a durable
-    /// success without growing the log; fresh bytes are admitted through the
-    /// canonical replay decoder before the durability barrier.
-    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+    /// This is intentionally crate-private: public semantic admission requires
+    /// [`PinAssertion`], while compaction must reproduce even an invalid
+    /// signature byte-for-byte rather than silently healing the artifact.
+    pub(crate) fn append_replayed_pin_assertion(
+        &mut self,
+        assertion: UnverifiedPinAssertion,
+    ) -> Result<(), PilePinAssertionError> {
         self.file.lock()?;
         let result = (|| {
             self.refresh_locked()?;
 
-            if self.pin_assertions.contains(&assertion)? {
+            if self.pin_assertions.contains_unverified(&assertion)? {
                 self.file.sync_all()?;
                 self.dirty = false;
                 return Ok(());
             }
 
-            let header = PinAssertionHeaderV3::new(assertion);
+            let header = PinAssertionHeaderV3::from_unverified(assertion);
             self.dirty = true;
             self.file.write_all(header.as_bytes())?;
             match self.apply_next()? {
@@ -2156,6 +2157,24 @@ impl PinAssertionStore for Pile {
         result?;
         unlock_result?;
         Ok(())
+    }
+}
+
+impl PinAssertionStore for Pile {
+    type Error = PilePinAssertionError;
+
+    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+        self.refresh()?;
+        Ok(self.pin_assertions.clone())
+    }
+
+    /// Append one verified generic assertion as a fixed 256-byte Pile record.
+    ///
+    /// The operation is durable on return. Duplicate append remains a durable
+    /// success without growing the log; fresh bytes are admitted through the
+    /// canonical replay decoder before the durability barrier.
+    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+        self.append_replayed_pin_assertion(assertion.into())
     }
 }
 

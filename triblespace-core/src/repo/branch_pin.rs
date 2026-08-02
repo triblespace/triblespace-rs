@@ -217,6 +217,20 @@ impl BranchRank {
         None
     }
 
+    /// Preserve an already monotone descendant rank, or raise it just enough
+    /// to sit strictly above a proven ancestor.
+    ///
+    /// A fast-forward may import rank provenance from another branch lineage.
+    /// Exact ancestry licenses this local repair without materialising or
+    /// relabelling the commits between the two endpoints.
+    pub fn raise_above(self, ancestor: Self) -> Option<Self> {
+        if self > ancestor {
+            Some(self)
+        } else {
+            ancestor.successor()
+        }
+    }
+
     /// Root for an empty parent set; otherwise one past the greatest parent.
     pub fn after<I>(parents: I) -> Option<Self>
     where
@@ -348,5 +362,22 @@ mod tests {
         let child = merge.successor().unwrap();
         assert!(child > merge);
         assert!(child.label() > merge.label());
+    }
+
+    #[test]
+    fn rank_repair_preserves_good_provenance_and_minimally_raises_stale_provenance() {
+        let root = BranchRank::ROOT;
+        let one = root.successor().unwrap();
+        let two = one.successor().unwrap();
+
+        assert_eq!(two.raise_above(one), Some(two));
+        assert_eq!(root.raise_above(one), Some(two));
+        assert_eq!(one.raise_above(one), Some(two));
+        assert_eq!(
+            root.raise_above(BranchRank::from_label(SubsumptionLabel::from_raw(
+                [0xFF; 32]
+            ))),
+            None
+        );
     }
 }

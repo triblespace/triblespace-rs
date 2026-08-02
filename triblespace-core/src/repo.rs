@@ -155,12 +155,12 @@ use crate::prelude::inlineencodings::GenId;
 use crate::trible::TribleSet;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use crate::repo::branch_assertion::{
-    AssertionId, BranchAssertion, BranchAssertionStore, BranchId, BranchIdentity,
-};
+use crate::repo::branch_assertion::{BranchId, BranchIdentity};
 use crate::repo::branch_frontier::{
     BranchResolution, PartialCommitDag, PartialFrontier, ResolvedHead, TipPendingFrontier,
 };
+use crate::repo::branch_pin::{sign_branch_assertion, BranchPinDescriptor, BranchRank};
+use crate::repo::pin_assertion::{PinAssertionId, PinAssertionStore};
 
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -721,14 +721,30 @@ pub enum MergeError {
     /// (e.g. via `fetch_reachable`) before retrying. The contained string
     /// is a human-readable description of the underlying read failure.
     AncestryWalkFailed(String),
+    /// No strictly greater branch rank can be represented for a merge or
+    /// proven strict-descendant repair because the relevant ancestor rank is
+    /// already all `0xFF`.
+    RankExhausted,
 }
+
+/// A workspace cannot construct a rank strictly above its current head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceRankExhausted;
+
+impl fmt::Display for WorkspaceRankExhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "branch rank is exhausted")
+    }
+}
+
+impl Error for WorkspaceRankExhausted {}
 
 /// An assertion-native repository that publishes branches owned by one key.
 ///
 /// Blob storage and grow-only branch assertions are separate capabilities.
 /// Merely constructing a repository therefore needs only [`BlobStore`]; branch
 /// resolution and publication are available when the backend additionally
-/// implements [`BranchAssertionStore`].
+/// implements [`PinAssertionStore`].
 pub struct Repository<Storage: BlobStore> {
     storage: Storage,
     signing_key: SigningKey,
@@ -804,6 +820,9 @@ pub enum AssertionPullError<AssertionErr, ReaderErr, DagErr> {
     TipPending(TipPendingFrontier),
     /// Tip metadata is readable, but missing ancestry keeps the frontier partial.
     Partial(PartialFrontier),
+    /// A complete divergent frontier cannot receive a strictly greater
+    /// synthetic-merge rank.
+    RankExhausted,
 }
 
 /// Result of publishing a workspace.
@@ -812,7 +831,7 @@ pub enum PublishOutcome {
     /// The workspace head already equals its base; no assertion was added.
     NoChange,
     /// A verified assertion was durably appended (or was already present).
-    Published(AssertionId),
+    Published(PinAssertionId),
 }
 
 /// Failure before a workspace assertion reaches its durable append point.
@@ -832,6 +851,8 @@ pub enum PublishError<PutErr, FlushErr, ReaderErr, GetErr, AssertionErr> {
     BadCommitMetadata(commit::CommitMetadataError),
     /// A changed workspace unexpectedly has no proposed head.
     MissingHead,
+    /// A changed workspace has no authenticated rank provenance for its head.
+    MissingRank,
     /// Durably appending the signed branch assertion failed.
     AssertionStore(AssertionErr),
 }
@@ -928,6 +949,9 @@ where
         staged
             .put::<LongString, _>(name_blob)
             .expect("MemoryBlobStore::put is infallible");
+        staged
+            .put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(identity.name()))
+            .expect("MemoryBlobStore::put is infallible");
         let base_blobs = self
             .storage
             .reader()
@@ -938,7 +962,9 @@ where
             base_blobs,
             identity,
             head: None,
+            head_rank: None,
             base_head: None,
+            base_rank: None,
             signing_key: self.signing_key.clone(),
             commit_metadata: self.commit_metadata,
         })
@@ -957,7 +983,7 @@ where
 
 impl<Storage> Repository<Storage>
 where
-    Storage: BlobStore + BranchAssertionStore,
+    Storage: BlobStore + PinAssertionStore,
     Storage::Reader: PartialCommitDag,
 {
     /// Resolve the grow-only assertions for one exact own-key identity.
@@ -972,7 +998,7 @@ where
     ) -> Result<
         BranchResolution,
         ResolveBranchError<
-            <Storage as BranchAssertionStore>::Error,
+            <Storage as PinAssertionStore>::Error,
             Storage::ReaderError,
             <Storage::Reader as PartialCommitDag>::Error,
         >,
@@ -981,7 +1007,7 @@ where
             .map_err(ResolveBranchError::ForeignIdentity)?;
         let snapshot = self
             .storage
-            .assertion_snapshot()
+            .pin_assertion_snapshot()
             .map_err(ResolveBranchError::AssertionStore)?;
         let mut reader = self
             .storage
@@ -998,7 +1024,7 @@ where
     ) -> Result<
         BranchResolution,
         ResolveBranchError<
-            <Storage as BranchAssertionStore>::Error,
+            <Storage as PinAssertionStore>::Error,
             Storage::ReaderError,
             <Storage::Reader as PartialCommitDag>::Error,
         >,
@@ -1019,7 +1045,7 @@ where
     ) -> Result<
         Workspace<Storage>,
         AssertionPullError<
-            <Storage as BranchAssertionStore>::Error,
+            <Storage as PinAssertionStore>::Error,
             Storage::ReaderError,
             <Storage::Reader as PartialCommitDag>::Error,
         >,
@@ -1028,7 +1054,7 @@ where
             .map_err(AssertionPullError::ForeignIdentity)?;
         let snapshot = self
             .storage
-            .assertion_snapshot()
+            .pin_assertion_snapshot()
             .map_err(AssertionPullError::AssertionStore)?;
         let mut base_blobs = self
             .storage
@@ -1048,6 +1074,18 @@ where
         };
 
         let mut staged = MemoryBlobStore::new();
+        // Resolution can succeed from the exact identity even when
+        // replication delivered the assertion before its typed descriptor.
+        // Every writable workspace therefore repairs that ordering locally:
+        // push flushes this descriptor before it appends any new assertion,
+        // allowing kind-aware retention to recognize the branch after a
+        // crash regardless of arrival order.
+        staged
+            .put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(identity.name()))
+            .expect("MemoryBlobStore::put is infallible");
+        let resolved_rank = complete
+            .resolved_rank()
+            .ok_or(AssertionPullError::RankExhausted)?;
         let resolved = match complete.resolved_head() {
             ResolvedHead::Existing(commit) => commit,
             ResolvedHead::Synthetic(blob) => staged
@@ -1060,7 +1098,9 @@ where
             base_blobs,
             identity,
             head: Some(resolved),
+            head_rank: Some(resolved_rank),
             base_head: Some(resolved),
+            base_rank: Some(resolved_rank),
             signing_key: self.signing_key.clone(),
             commit_metadata: self.commit_metadata,
         })
@@ -1069,7 +1109,7 @@ where
 
 impl<Storage> Repository<Storage>
 where
-    Storage: BlobStore + StorageFlush + BranchAssertionStore,
+    Storage: BlobStore + StorageFlush + PinAssertionStore,
 {
     /// Publish the workspace head as one signed grow-only assertion.
     ///
@@ -1087,12 +1127,21 @@ where
             <Storage as StorageFlush>::Error,
             Storage::ReaderError,
             <Storage::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-            <Storage as BranchAssertionStore>::Error,
+            <Storage as PinAssertionStore>::Error,
         >,
     > {
         self.require_own_identity(&workspace.identity)
             .map_err(PublishError::ForeignIdentity)?;
 
+        // Enforce the typed-retention boundary at publication itself rather
+        // than relying on constructor staging, which callers may legitimately
+        // replace. The descriptor is deterministic from the exact identity
+        // and must cross the durability boundary before any assertion that
+        // Yard will later interpret as a branch root.
+        workspace
+            .staged
+            .put::<BranchPinDescriptor, _>(BranchPinDescriptor::blob(workspace.identity.name()))
+            .expect("MemoryBlobStore::put is infallible");
         let staged = workspace
             .staged
             .reader()
@@ -1105,25 +1154,31 @@ where
         self.storage.flush().map_err(PublishError::StorageFlush)?;
 
         let reader = self.storage.reader().map_err(PublishError::StorageReader)?;
-        if workspace.head == workspace.base_head {
+        if workspace.head == workspace.base_head && workspace.head_rank == workspace.base_rank {
             workspace.base_blobs = reader;
             workspace.staged = MemoryBlobStore::new();
             return Ok(PublishOutcome::NoChange);
         }
 
         let proposed = workspace.head.ok_or(PublishError::MissingHead)?;
+        let proposed_rank = workspace.head_rank.ok_or(PublishError::MissingRank)?;
         let commit_meta: TribleSet = reader.get(proposed).map_err(PublishError::StorageGet)?;
         commit::direct_parents(&commit_meta).map_err(PublishError::BadCommitMetadata)?;
 
-        let assertion =
-            BranchAssertion::sign(&self.signing_key, workspace.identity.name(), proposed);
+        let assertion = sign_branch_assertion(
+            &self.signing_key,
+            workspace.identity.name(),
+            proposed,
+            proposed_rank,
+        );
         let assertion_id = assertion.id();
         self.storage
-            .append_assertion(assertion)
+            .append_pin_assertion(assertion)
             .map_err(PublishError::AssertionStore)?;
 
         workspace.base_blobs = reader;
         workspace.base_head = Some(proposed);
+        workspace.base_rank = Some(proposed_rank);
         workspace.staged = MemoryBlobStore::new();
         Ok(PublishOutcome::Published(assertion_id))
     }
@@ -1243,11 +1298,15 @@ pub struct Workspace<Blobs: BlobStore> {
     identity: BranchIdentity,
     /// Handle to the current commit in the working branch. `None` for an empty branch.
     head: Option<CommitHandle>,
+    /// Authenticated inductive rank provenance paired with `head`.
+    head_rank: Option<BranchRank>,
     /// Resolved head from which local work began.
     ///
     /// Equality with `head` means there is no new branch claim to publish. A
     /// divergent complete frontier uses its canonical synthetic merge here.
     base_head: Option<CommitHandle>,
+    /// Rank paired with `base_head` at the last pull or successful push.
+    base_rank: Option<BranchRank>,
     /// Signing key used for authored commits.
     signing_key: SigningKey,
     /// Metadata handle for commits created in this workspace.
@@ -1265,7 +1324,9 @@ where
             .field("base_blobs", &self.base_blobs)
             .field("identity", &self.identity)
             .field("base_head", &self.base_head)
+            .field("base_rank", &self.base_rank)
             .field("head", &self.head)
+            .field("head_rank", &self.head_rank)
             .field("commit_metadata", &self.commit_metadata)
             .finish()
     }
@@ -1960,6 +2021,11 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         self.head
     }
 
+    /// Authenticated inductive rank paired with the current head.
+    pub fn head_rank(&self) -> Option<BranchRank> {
+        self.head_rank
+    }
+
     /// Returns the workspace metadata handle.
     pub fn metadata(&self) -> MetadataHandle {
         self.commit_metadata
@@ -2005,8 +2071,12 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     /// into `self.staged` alongside the commit-content blob.
     /// This method creates a new commit blob (stored in the local
     /// blobset) and updates the current commit handle.
-    pub fn commit(&mut self, content_: impl Into<Fragment>, message_: &str) {
-        self.commit_internal(content_.into(), Some(self.commit_metadata), Some(message_));
+    pub fn commit(
+        &mut self,
+        content_: impl Into<Fragment>,
+        message_: &str,
+    ) -> Result<(), WorkspaceRankExhausted> {
+        self.commit_internal(content_.into(), Some(self.commit_metadata), Some(message_))
     }
 
     /// Like [`commit`](Self::commit) but attaches one-off metadata
@@ -2028,11 +2098,14 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         content_: impl Into<Fragment>,
         metadata_: impl Into<Fragment>,
         message_: &str,
-    ) {
+    ) -> Result<(), WorkspaceRankExhausted> {
+        // Refuse before absorbing caller-provided metadata blobs so rank
+        // exhaustion leaves the workspace unchanged.
+        self.next_rank()?;
         let (meta_facts, meta_blobs) = metadata_.into().into_facts_and_blobs();
         self.staged.union(meta_blobs);
         let metadata_handle = self.put(meta_facts);
-        self.commit_internal(content_.into(), Some(metadata_handle), Some(message_));
+        self.commit_internal(content_.into(), Some(metadata_handle), Some(message_))
     }
 
     /// Like [`commit`](Self::commit) but attaches an already-archived
@@ -2045,8 +2118,8 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         content_: impl Into<Fragment>,
         metadata_: MetadataHandle,
         message_: &str,
-    ) {
-        self.commit_internal(content_.into(), Some(metadata_), Some(message_));
+    ) -> Result<(), WorkspaceRankExhausted> {
+        self.commit_internal(content_.into(), Some(metadata_), Some(message_))
     }
 
     fn commit_internal(
@@ -2054,7 +2127,8 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         content_: Fragment,
         metadata_handle: Option<MetadataHandle>,
         message_: Option<&str>,
-    ) {
+    ) -> Result<(), WorkspaceRankExhausted> {
+        let next_rank = self.next_rank()?;
         let (content_facts, content_blobs) = content_.into_facts_and_blobs();
         // 0. Absorb any blobs the Fragment carried with it into the
         //    staging area before producing the commit blob, so handles
@@ -2084,6 +2158,12 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
             .expect("failed to put commit blob");
         // 3. Update `self.head` to point to the new commit.
         self.head = Some(commit_handle);
+        self.head_rank = Some(next_rank);
+        Ok(())
+    }
+
+    fn next_rank(&self) -> Result<BranchRank, WorkspaceRankExhausted> {
+        BranchRank::after(self.head_rank).ok_or(WorkspaceRankExhausted)
     }
 
     /// Merge another workspace into this one.
@@ -2127,7 +2207,14 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         //    has no head, there's nothing further to integrate — just return
         //    our current head (which may or may not exist).
         match other.head {
-            Some(other_head) => Ok(Some(self.merge_commit(other_head)?)),
+            Some(other_head) => Ok(Some(
+                self.merge_commit(
+                    other_head,
+                    other
+                        .head_rank
+                        .expect("every nonempty workspace head carries rank provenance"),
+                )?,
+            )),
             None => Ok(self.head),
         }
     }
@@ -2153,16 +2240,23 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     pub fn merge_commit(
         &mut self,
         other: Inline<Handle<SimpleArchive>>,
+        other_rank: BranchRank,
     ) -> Result<CommitHandle, MergeError> {
         // Trivial cases first.
         let local_head = match self.head {
             None => {
                 // No local head — fast-forward to `other`.
                 self.head = Some(other);
+                self.head_rank = Some(other_rank);
                 return Ok(other);
             }
             Some(h) if h == other => {
                 // Identical — no-op.
+                self.head_rank = Some(
+                    self.head_rank
+                        .expect("every nonempty workspace head carries rank provenance")
+                        .max(other_rank),
+                );
                 return Ok(h);
             }
             Some(h) => h,
@@ -2181,7 +2275,17 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
             .get(&other.raw)
             .is_some();
         if remote_in_local {
-            // `other` is already in our history → no-op.
+            // `other` is already in our history → keep the exact head. Rank
+            // provenance may come from another branch lineage, though, so
+            // repair a known non-monotone ancestor/descendant pair before we
+            // next sign this workspace's head.
+            let local_rank = self
+                .head_rank
+                .expect("every nonempty workspace head carries rank provenance");
+            let repaired_rank = local_rank
+                .raise_above(other_rank)
+                .ok_or(MergeError::RankExhausted)?;
+            self.head_rank = Some(repaired_rank);
             return Ok(local_head);
         }
 
@@ -2191,12 +2295,27 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
             .get(&local_head.raw)
             .is_some();
         if local_in_remote {
-            // We're behind `other` → fast-forward.
+            // We're behind `other` → fast-forward. Preserve compatible
+            // incoming provenance, otherwise exact ancestry licenses the
+            // smallest local repair strictly above our old head.
+            let local_rank = self
+                .head_rank
+                .expect("every nonempty workspace head carries rank provenance");
+            let repaired_rank = other_rank
+                .raise_above(local_rank)
+                .ok_or(MergeError::RankExhausted)?;
             self.head = Some(other);
+            self.head_rank = Some(repaired_rank);
             return Ok(other);
         }
 
-        // Truly divergent — create a merge commit.
+        // Truly divergent — establish rank provenance before mutating staged
+        // blobs, then create a merge commit.
+        let local_rank = self
+            .head_rank
+            .expect("every nonempty workspace head carries rank provenance");
+        let merge_rank =
+            BranchRank::after([local_rank, other_rank]).ok_or(MergeError::RankExhausted)?;
         let parents = self.head.iter().copied().chain(Some(other));
         let merge_commit = crate::repo::commit::merge_metadata(parents);
         let commit_handle = self
@@ -2204,6 +2323,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
             .put(merge_commit)
             .expect("failed to put merge commit blob");
         self.head = Some(commit_handle);
+        self.head_rank = Some(merge_rank);
         Ok(commit_handle)
     }
 
@@ -2212,12 +2332,32 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     /// This is the "fast-forward" case: when the new commit is a descendant
     /// of (or equal to) the current head, you can advance directly without
     /// a merge commit. The caller is responsible for verifying the
-    /// descendancy relationship — typically via [`ancestors`] over `commit`.
+    /// descendancy relationship and supplying the authenticated `rank` paired
+    /// with `commit` — typically from another resolved workspace. Equal heads
+    /// retain the greater rank; a strict descendant with stale provenance is
+    /// raised minimally above the current head. Exhaustion leaves the
+    /// workspace unchanged.
     ///
     /// Use this in pull/sync flows to avoid spurious merge commits when one
     /// peer is simply behind the other.
-    pub fn set_head(&mut self, commit: CommitHandle) {
+    pub fn set_head(
+        &mut self,
+        commit: CommitHandle,
+        rank: BranchRank,
+    ) -> Result<(), WorkspaceRankExhausted> {
+        let rank = match (self.head, self.head_rank) {
+            (None, _) => rank,
+            (Some(current), Some(current_rank)) if current == commit => current_rank.max(rank),
+            (Some(_), Some(current_rank)) => rank
+                .raise_above(current_rank)
+                .ok_or(WorkspaceRankExhausted)?,
+            (Some(_), None) => {
+                unreachable!("every nonempty workspace head carries rank provenance")
+            }
+        };
         self.head = Some(commit);
+        self.head_rank = Some(rank);
+        Ok(())
     }
 
     /// Returns the combined [`TribleSet`] for the specified commits.

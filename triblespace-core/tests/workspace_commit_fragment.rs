@@ -55,7 +55,8 @@ fn commit_fragment_absorbs_blobs() {
 
     // Commit-via-Fragment must absorb the fragment's blobs into staged
     // before producing the commit content blob, so the handle resolves.
-    ws.commit(frag, "commit with fragment payload");
+    ws.commit(frag, "commit with fragment payload")
+        .expect("workspace rank has room for the fragment commit");
 
     let mut staged = ws.staged.clone();
     let reader = staged.reader().expect("reader");
@@ -81,7 +82,8 @@ fn commit_tribleset_auto_promotes() {
     // pass a bare TribleSet to commit.
     let h: triblespace_core::inline::Inline<Handle<LongString>> = ws.put("tribleset-side bytes");
     data += entity! { &e @ ns::note: h };
-    ws.commit(data, "tribleset commit");
+    ws.commit(data, "tribleset commit")
+        .expect("workspace rank has room for the tribleset commit");
 
     let mut staged = ws.staged.clone();
     let reader = staged.reader().expect("reader");

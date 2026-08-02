@@ -50,8 +50,8 @@
 //! **big-endian**, or byte order will not agree with numeric order and the
 //! encoding will silently stop being monotone in the unsound direction. This
 //! module ships no encoder, precisely so no label model is canonised here; see
-//! [`super::branch_pin`] for the branch kind's depth codec and the negative
-//! control that pins the endianness requirement.
+//! [`super::branch_pin`] for the branch kind's inductive rank codec and its
+//! byte-order tests.
 
 use std::error::Error;
 use std::fmt;
@@ -361,12 +361,12 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn reset_signature_verification_count() {
+pub(crate) fn reset_signature_verification_count() {
     SIGNATURE_VERIFICATIONS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
-fn signature_verification_count() -> usize {
+pub(crate) fn signature_verification_count() -> usize {
     SIGNATURE_VERIFICATIONS.with(Cell::get)
 }
 
@@ -549,9 +549,25 @@ impl PinAssertionSnapshot {
         &self,
         assertion: &PinAssertion,
     ) -> Result<bool, PinAssertionKeyCollision> {
-        let witness = PinAssertionWitness::from_verified(*assertion);
-        match self.assertions.get(&assertion.index_key()) {
-            Some(existing) if existing == &witness => Ok(true),
+        self.contains_witness(&PinAssertionWitness::from_verified(*assertion))
+    }
+
+    /// Check exact structural membership during physical replay without
+    /// promoting an unauthenticated witness into semantic currency.
+    pub(crate) fn contains_unverified(
+        &self,
+        assertion: &UnverifiedPinAssertion,
+    ) -> Result<bool, PinAssertionKeyCollision> {
+        self.contains_witness(&PinAssertionWitness::from_unverified(*assertion))
+    }
+
+    fn contains_witness(
+        &self,
+        witness: &PinAssertionWitness,
+    ) -> Result<bool, PinAssertionKeyCollision> {
+        let key = witness_index_key(&witness.unverified);
+        match self.assertions.get(&key) {
+            Some(existing) if existing == witness => Ok(true),
             Some(_) => Err(PinAssertionKeyCollision),
             None => Ok(false),
         }
@@ -595,6 +611,18 @@ impl PinAssertionSnapshot {
                 .get(key)
                 .expect("a key yielded by PATCH resolves in the same snapshot");
             witness.verified().ok()
+        })
+    }
+
+    /// Iterate the exact structurally admitted witnesses for a physical
+    /// rewrite. Invalid signatures stay opaque and must never cross the public
+    /// semantic iterator, but compaction must not silently erase their bytes.
+    pub(crate) fn iter_unverified(&self) -> impl Iterator<Item = UnverifiedPinAssertion> + '_ {
+        self.assertions.iter_ordered().map(|key| {
+            self.assertions
+                .get(key)
+                .expect("a key yielded by PATCH resolves in the same snapshot")
+                .unverified
         })
     }
 
