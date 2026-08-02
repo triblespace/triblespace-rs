@@ -34,6 +34,7 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
+use subject::core::blob::encodings::longstring::LongString;
 use subject::core::blob::encodings::simplearchive::SimpleArchive;
 use subject::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use subject::core::inline::encodings::hash::Handle;
@@ -57,10 +58,11 @@ use subject::core::query::Candidates;
 // engine/batched-frontier onward.
 #[cfg(feature = "frontier")]
 use subject::core::query::Frontier;
-use subject::core::repo::branch_assertion::{BranchAssertionStore, BranchIdentity};
 use subject::core::repo::branch_frontier::{BranchResolution, ResolvedHead};
+use subject::core::repo::branch_pin::{BranchIdentity, BranchPinDescriptor};
 use subject::core::repo::pile::Pile;
-use subject::core::repo::{self, Repository};
+use subject::core::repo::pin_assertion::PinAssertionStore;
+use subject::core::repo::{self, BlobStoreMeta, Repository};
 
 // ---------------------------------------------------------------------------
 // Crash isolation
@@ -371,16 +373,34 @@ fn commit_chain(
 /// head that this adapter may choose on the caller's behalf.
 fn asserted_branch(pile: &mut Pile, branch: Option<&str>) -> (String, CommitHandle) {
     let snapshot = pile
-        .assertion_snapshot()
-        .expect("snapshot branch assertions");
-    let mut identities: Vec<BranchIdentity> = snapshot
-        .iter()
-        .map(|assertion| *assertion.identity())
-        .collect();
+        .pin_assertion_snapshot()
+        .expect("snapshot asserted pins");
+    let mut reader = pile.reader().expect("pile reader");
+    let mut identities = Vec::new();
+    for assertion in snapshot.iter() {
+        let descriptor =
+            Inline::<Handle<BranchPinDescriptor>>::new(assertion.identity().pin().raw());
+        if reader
+            .metadata(descriptor)
+            .expect("inspect asserted-pin descriptor")
+            .is_none()
+        {
+            continue;
+        }
+        let Ok(name) = reader.get::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
+        else {
+            // Generic pins are branch identities only when their locally
+            // present descriptor has the exact canonical branch shape.
+            continue;
+        };
+        let identity = BranchIdentity::new(assertion.identity().author(), name);
+        if identity.pin_identity() == *assertion.identity() {
+            identities.push(identity);
+        }
+    }
     identities.sort_unstable();
     identities.dedup();
 
-    let mut reader = pile.reader().expect("pile reader");
     let mut named = Vec::new();
     for identity in identities {
         let Ok(name): Result<anybytes::View<str>, _> = reader.get(identity.name()) else {

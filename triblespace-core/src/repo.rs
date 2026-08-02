@@ -31,7 +31,9 @@
 //! let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
 //! let mut workspace = repo.create_workspace("main").expect("open blob snapshot");
 //! let identity = *workspace.identity();
-//! workspace.commit(entity! { literature::title: "Dune" }, "initial commit");
+//! workspace
+//!     .commit(entity! { literature::title: "Dune" }, "initial commit")
+//!     .expect("workspace rank has room");
 //! repo.push(&mut workspace).expect("publish assertion");
 //!
 //! let mut current = repo.pull(identity).expect("complete branch frontier");
@@ -155,11 +157,12 @@ use crate::prelude::inlineencodings::GenId;
 use crate::trible::TribleSet;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use crate::repo::branch_assertion::{BranchId, BranchIdentity};
 use crate::repo::branch_frontier::{
     BranchResolution, PartialCommitDag, PartialFrontier, ResolvedHead, TipPendingFrontier,
 };
-use crate::repo::branch_pin::{sign_branch_assertion, BranchPinDescriptor, BranchRank};
+use crate::repo::branch_pin::{
+    sign_branch_assertion, BranchIdentity, BranchPinDescriptor, BranchRank,
+};
 use crate::repo::pin_assertion::{PinAssertionId, PinAssertionStore};
 
 use crate::blob::encodings::longstring::LongString;
@@ -2012,10 +2015,6 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     }
 
     /// Returns the intrinsic branch index prefix associated with this workspace.
-    pub fn branch_id(&self) -> BranchId {
-        self.identity.id()
-    }
-
     /// Returns the current commit handle if one exists.
     pub fn head(&self) -> Option<CommitHandle> {
         self.head

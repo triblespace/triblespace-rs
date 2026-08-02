@@ -93,11 +93,13 @@ fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
     )
     .unwrap();
     let mut workspace = repo.create_workspace("path-expr").unwrap();
-    let branch_id = workspace.identity().id().entity();
+    let index_home_id = *ufoid();
 
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);
-    workspace.commit(graph.clone(), "materialize compiled path expression");
+    workspace
+        .commit(graph.clone(), "materialize compiled path expression")
+        .expect("workspace rank has room");
     let source_head = workspace.head().unwrap();
     repo.push(&mut workspace).unwrap();
 
@@ -119,7 +121,7 @@ fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
     .unwrap();
     let branch_entity = ufoid();
     manifest += entity! { &branch_entity @
-        repo::branch: branch_id,
+        repo::branch: index_home_id,
         repo::head: source_head,
     }
     .into_facts();
@@ -127,12 +129,14 @@ fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
         repo.storage_mut().put(manifest.to_blob()).unwrap();
     assert!(matches!(
         repo.storage_mut()
-            .update(branch_id, None, Some(metadata_head))
+            .update(index_home_id, None, Some(metadata_head))
             .unwrap(),
         PushResult::Success()
     ));
 
-    let index = rollup.attach_exact(repo.storage_mut(), branch_id).unwrap();
+    let index = rollup
+        .attach_exact(repo.storage_mut(), index_home_id)
+        .unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));
     let reachable = Query::new(index.constraint(start, end), |binding: &Binding| {

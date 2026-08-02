@@ -140,7 +140,9 @@ let data = br#"
 "#;
 let (facts, count) = ingest_ntriples(&mut workspace, Cursor::new(&data[..]));
 assert_eq!(count, 2);
-workspace.commit(facts, "import example");
+workspace
+    .commit(facts, "import example")
+    .expect("workspace rank has room");
 ```
 
 **URI → entity id.** Every subject and URI-valued object gets a stable

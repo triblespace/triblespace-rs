@@ -18,8 +18,10 @@ fn concurrent_publications_form_a_complete_frontier() {
         .create_workspace("main")
         .expect("create second workspace");
 
-    ws1.commit(TribleSet::new(), "first");
-    ws2.commit(TribleSet::new(), "second");
+    ws1.commit(TribleSet::new(), "first")
+        .expect("workspace rank has room");
+    ws2.commit(TribleSet::new(), "second")
+        .expect("workspace rank has room");
 
     assert!(matches!(
         repo.push(&mut ws1).expect("publish first workspace"),

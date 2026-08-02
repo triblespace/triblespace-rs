@@ -26,9 +26,9 @@ fn main() {
     let mut repository = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .expect("create repo");
 
-    // Publish one source commit under the exact (author, name) identity.
-    let identity = repository.branch_identity("main");
-    let branch_id = identity.id().entity();
+    // Publish one source commit under the exact (author, name) identity. The
+    // derived manifest has its own independent index-home identity.
+    let index_home_id = *ufoid();
     let mut workspace = repository
         .create_workspace("main")
         .expect("create workspace");
@@ -36,7 +36,9 @@ fn main() {
     for name in ["Ada", "Grace", "Barbara"] {
         people += entity! { &ufoid() @ literature::firstname: name };
     }
-    workspace.commit(people.clone(), "add people");
+    workspace
+        .commit(people.clone(), "add people")
+        .expect("workspace rank has room");
     let source_head = workspace.head().expect("commit head");
     repository
         .push(&mut workspace)
@@ -68,7 +70,7 @@ fn main() {
     // manifest. That pin is not branch publication and carries no source data.
     let branch_entity = ufoid();
     manifest += entity! { &branch_entity @
-        repo::branch: branch_id,
+        repo::branch: index_home_id,
         repo::head: source_head,
     }
     .into_facts();
@@ -79,14 +81,14 @@ fn main() {
     assert!(matches!(
         repository
             .storage_mut()
-            .update(branch_id, None, Some(manifest_head))
+            .update(index_home_id, None, Some(manifest_head))
             .expect("publish manifest"),
         PushResult::Success()
     ));
 
     // Query attached persisted segments without materializing the source
     // branch checkout again.
-    let mut home = IndexHome::new(repository.storage_mut(), branch_id, rollup);
+    let mut home = IndexHome::new(repository.storage_mut(), index_home_id, rollup);
     let segments = home.attach_all().expect("attach segments");
     let union = SuccinctRollup::union(&segments);
     let mut names: Vec<String> = find!(

@@ -15,7 +15,9 @@ fn main() {
     // Create a detached workspace and add its first commit. Empty branches are
     // deliberately unrepresentable until a commit is published.
     let mut workspace = repo.create_workspace("feature").expect("create workspace");
-    workspace.commit(TribleSet::new(), "start feature work");
+    workspace
+        .commit(TribleSet::new(), "start feature work")
+        .expect("workspace rank has room");
 
     // Publication appends a signed grow-only assertion. Concurrent stale
     // workspaces may publish too; branch resolution later derives the maximal

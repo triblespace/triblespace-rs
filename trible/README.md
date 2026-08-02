@@ -64,31 +64,23 @@ Run `trible <COMMAND>` to invoke a subcommand.
 - `pile create <PATH>` — initialize a new empty pile without replacing an existing file; the parent directory must already exist.
 - `pile diagnose check <PILE>` — verify pile integrity.
 - `pile diagnose locate-hash <PILE> <HANDLE>` — scan raw pile bytes and report where a handle appears (blob header vs payload references).
-- `pile migrate <PILE> list` — list known migrations and whether they are needed for this pile.
-- `pile migrate <PILE> run [MIGRATION]` — run migrations (all by default). Pass `--dry-run` to preview changes.
-
-If branch names are missing in an older pile, run:
-
-```bash
-trible pile migrate <PILE> run branch-metadata-name
-```
-
 #### Branches
 
-- `pile branch assert <PILE> <NAME> <COMMIT> --signing-key <KEY>` — durably publish one assertion for a locally present canonical commit.
 - `pile branch list <PILE> [--signing-key <KEY> | --author <AUTHOR> | --all]` — list exact identities and their local `complete`, `partial`, or `tip-pending` resolution.
 - `pile branch show <PILE> <BRANCH>` — inspect one exact descriptor, its assertions, frontier, missing ancestry, and derived read head.
 - `pile branch log <PILE> <BRANCH>` — walk locally available ancestry from the resolver's candidate tips.
 - `pile branch forget <SOURCE> <DESTINATION> <BRANCH>` — create a new local pile generation without that exact identity's assertion records. This is physical forgetting, not replicated deletion; the source remains untouched and synchronization can reintroduce the assertions.
 
 `<BRANCH>` is always the full descriptor
-`ed25519:<64 hex>/blake3:<64 hex>`. The truncated 16-byte branch id printed as
-`index=…` is advisory only and is never accepted as a selector. Empty branches,
-mutable scalar heads, rename, consolidation, and replicated deletion are not
-part of the StrongPin model.
+`ed25519:<64 hex>/blake3:<64 hex>`. Its full-width generic pin digest is
+diagnostic output and is never accepted as a selector. Empty branches, mutable
+scalar heads, rename, consolidation, raw CLI authoring, and replicated deletion
+are not part of the asserted-pin branch model. Publication goes through a
+`Repository` workspace, which carries the authenticated branch-rank provenance
+needed to sign a safe assertion.
 
 Signing key format
-- `branch assert` requires a stable signing-key file via `--signing-key` or the `TRIBLES_SIGNING_KEY` path. The file contains one 64-character hex Ed25519 seed. Commands never invent an ephemeral branch author.
+- `branch list` can select the configured local author through `--signing-key` or the `TRIBLES_SIGNING_KEY` path. The file contains one 64-character hex Ed25519 seed. Commands never invent an ephemeral branch author.
 
 #### Blobs
 

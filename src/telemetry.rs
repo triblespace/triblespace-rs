@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::metadata;
-use crate::core::repo::branch_assertion::BranchIdentity;
 use crate::core::repo::branch_frontier::BranchResolution;
+use crate::core::repo::branch_pin::BranchIdentity;
 use crate::core::repo::pile::Pile;
 use crate::core::repo::{Repository, Workspace};
 use crate::prelude::blobencodings::LongString;
@@ -381,7 +381,11 @@ impl Telemetry {
             schema::name: ws.put(session_name.to_string()),
             schema::begin_ns: 0u64,
         };
-        ws.commit(init, "telemetry session");
+        if let Err(err) = ws.commit(init, "telemetry session") {
+            log::warn!("telemetry session rank exhausted ({err:?}); telemetry disabled");
+            let _ = repo.close();
+            return None;
+        }
         if repo.push(&mut ws).is_err() {
             let _ = repo.close();
             return None;
@@ -448,9 +452,15 @@ impl Drop for Telemetry {
                         schema::end_ns: end_ns,
                         schema::duration_ns: end_ns,
                     };
-                    ws.commit(end, "telemetry session end");
-                    if let Err(e) = repo.push(&mut ws) {
-                        log::warn!("telemetry session end push failed: {e:?}");
+                    match ws.commit(end, "telemetry session end") {
+                        Ok(()) => {
+                            if let Err(e) = repo.push(&mut ws) {
+                                log::warn!("telemetry session end push failed: {e:?}");
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("telemetry session end rank exhausted: {e:?}");
+                        }
                     }
                 }
             }
@@ -492,7 +502,9 @@ fn span_begin(
     if let Some(source) = source {
         tribles += entity! { span_entity @ schema::source: ws.put(source) };
     }
-    ws.commit(tribles, "telemetry span");
+    if let Err(e) = ws.commit(tribles, "telemetry span") {
+        log::warn!("telemetry span rank exhausted: {e:?}");
+    }
 }
 
 fn span_end(ws: &mut Workspace<Pile>, span_id: Id, at_ns: u64, duration_ns: u64) {
@@ -502,5 +514,7 @@ fn span_end(ws: &mut Workspace<Pile>, span_id: Id, at_ns: u64, duration_ns: u64)
         schema::end_ns: at_ns,
         schema::duration_ns: duration_ns,
     };
-    ws.commit(tribles, "telemetry span end");
+    if let Err(e) = ws.commit(tribles, "telemetry span end") {
+        log::warn!("telemetry span-end rank exhausted: {e:?}");
+    }
 }

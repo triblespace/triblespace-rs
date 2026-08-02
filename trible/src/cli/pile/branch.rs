@@ -2,9 +2,11 @@
 //!
 //! A branch is the grow-only set of signed assertions made by one exact
 //! `(author key, name handle)` identity. Human-readable names are presentation
-//! blobs, and the 16-byte `BranchId` is only an index prefix; neither is a
-//! selector. There is consequently no create, set, rename, consolidate, or
-//! replicated delete operation here.
+//! blobs, while generic storage indexes the exact `(author, descriptor)` pin
+//! identity. Neither a name nor a digest is a selector. There is consequently
+//! no create, set, rename, consolidate, raw assert, or replicated delete
+//! operation here; publication goes through a repository workspace carrying
+//! authenticated rank provenance.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
@@ -16,39 +18,26 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use ed25519_dalek::VerifyingKey;
 
-use triblespace::prelude::{BlobStore, BlobStoreGet, BlobStorePut, View};
+use triblespace::prelude::{BlobStore, BlobStoreGet, View};
 use triblespace_core::blob::encodings::longstring::LongString;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::inline::encodings::hash::{Handle, Hash};
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::branch_assertion::{
-    AssertionId, BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore, BranchIdentity,
-};
 use triblespace_core::repo::branch_frontier::{
     resolve_branch, BranchResolution, ParentLookup, PartialCommitDag, ResolvedHead,
 };
+use triblespace_core::repo::branch_pin::{
+    commit_from_value, BranchIdentity, BranchPinDescriptor, BranchRank,
+};
 use triblespace_core::repo::pile::{Pile, PileReader, PileRecordContent, PileRecords};
+use triblespace_core::repo::pin_assertion::{
+    PinAssertionId, PinAssertionSnapshot, PinAssertionStore,
+};
 use triblespace_core::repo::{BlobStoreMeta, CommitHandle};
-
-use crate::cli::util::parse_blob_handle;
 
 use super::signing::load_required_signing_key;
 
 #[derive(Parser)]
 pub enum Command {
-    /// Publish one signed assertion for a locally present canonical commit.
-    Assert {
-        /// Pile receiving the name blob and durable assertion.
-        pile: PathBuf,
-        /// Human-readable branch name. Its content handle is part of identity.
-        name: String,
-        /// Commit to assert, in canonical `blake3:<64 hex>` form.
-        commit: String,
-        /// Stable Ed25519 seed file; falls back to TRIBLES_SIGNING_KEY.
-        #[arg(long)]
-        signing_key: Option<PathBuf>,
-    },
     /// List exact asserted branch identities and their local resolution.
     List {
         /// Pile to inspect.
@@ -97,12 +86,6 @@ pub enum Command {
 
 pub fn run(command: Command) -> Result<()> {
     match command {
-        Command::Assert {
-            pile,
-            name,
-            commit,
-            signing_key,
-        } => assert_branch(pile, name, commit, signing_key),
         Command::List {
             pile,
             all,
@@ -156,7 +139,7 @@ fn forget_branch(
     match (result, unlock) {
         (Ok(summary), Ok(())) => {
             println!("Forgot: {}", summary.identity);
-            println!("Index: {} (advisory only)", branch_index(&summary.identity));
+            println!("Pin identity digest: {}", pin_digest(&summary.identity));
             println!("Removed assertion records: {}", summary.removed_records);
             println!("Source generation: {}", source_path.display());
             println!("New generation: {}", destination_path.display());
@@ -187,22 +170,18 @@ fn forget_locked(
     let mut records =
         PileRecords::from_file(source).map_err(|error| forget_read_error(source_path, error))?;
     let source_bytes = records.bytes().clone();
-    let mut assertions = BranchAssertionSnapshot::new();
+    let pin_identity = identity.pin_identity();
     let mut removed_records = 0usize;
     let mut destination = tempfile::NamedTempFile::new_in(destination_parent)
         .with_context(|| format!("create temporary pile in {}", destination_parent.display()))?;
 
     for record in &mut records {
         let record = record.map_err(|error| forget_read_error(source_path, error))?;
-        let omit = match record.content {
-            PileRecordContent::BranchAssertion { assertion } => {
-                assertions
-                    .insert(assertion)
-                    .map_err(|error| anyhow!("validate assertion index: {error}"))?;
-                assertion.identity() == &identity
-            }
-            _ => false,
-        };
+        let omit = matches!(
+            record.content,
+            PileRecordContent::PinAssertion { assertion }
+                if assertion.identity() == &pin_identity
+        );
         if omit {
             removed_records += 1;
         } else {
@@ -222,7 +201,7 @@ fn forget_locked(
         );
     }
     if removed_records == 0 {
-        bail!("source pile contains no assertions for {identity}");
+        bail!("source pile contains no valid assertions for {identity}");
     }
 
     destination
@@ -268,54 +247,6 @@ fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn assert_branch(
-    pile_path: PathBuf,
-    name: String,
-    commit: String,
-    signing_key: Option<PathBuf>,
-) -> Result<()> {
-    let signing_key = load_required_signing_key(&signing_key)?;
-    let commit = parse_commit(&commit)?;
-    let mut pile = super::open_refreshed(&pile_path)?;
-
-    let result = (|| -> Result<()> {
-        let mut reader = pile
-            .reader()
-            .map_err(|error| anyhow!("snapshot {}: {error:?}", pile_path.display()))?;
-        match reader
-            .parents(commit)
-            .map_err(|error| anyhow!("validate asserted commit {commit:?}: {error}"))?
-        {
-            ParentLookup::Present(_) => {}
-            ParentLookup::Missing => bail!(
-                "cannot assert {}: canonical commit metadata is not present in {}",
-                commit_text(commit),
-                pile_path.display()
-            ),
-        }
-
-        let name_blob: Blob<LongString> = name.to_owned().to_blob();
-        let name_handle = name_blob.get_handle();
-        let identity = BranchIdentity::new(signing_key.verifying_key(), name_handle);
-        pile.put::<LongString, _>(name_blob)
-            .map_err(|error| anyhow!("store branch name: {error:?}"))?;
-        pile.flush()
-            .map_err(|error| anyhow!("make branch name durable: {error}"))?;
-
-        let assertion = BranchAssertion::sign(&signing_key, name_handle, commit);
-        pile.append_assertion(assertion)
-            .map_err(|error| anyhow!("publish branch assertion: {error}"))?;
-
-        println!("Branch: {identity}");
-        println!("Index: {} (advisory only)", branch_index(&identity));
-        println!("Assertion: {}", assertion_id(assertion.id()));
-        println!("Commit: {}", commit_text(commit));
-        Ok(())
-    })();
-
-    finish_pile(pile, result, &pile_path)
-}
-
 fn list_branches(
     pile_path: PathBuf,
     all: bool,
@@ -337,16 +268,16 @@ fn list_branches(
     let mut pile = super::open_refreshed(&pile_path)?;
     let result = (|| -> Result<()> {
         let snapshot = pile
-            .assertion_snapshot()
+            .pin_assertion_snapshot()
             .map_err(|error| anyhow!("snapshot assertions: {error}"))?;
         let mut reader = pile
             .reader()
             .map_err(|error| anyhow!("snapshot pile: {error:?}"))?;
-        let identities = exact_identities(&snapshot, author);
+        let identities = exact_identities(&snapshot, &reader, author)?;
         let mut failures = Vec::new();
 
         for identity in identities {
-            let assertions = snapshot.for_branch(&identity);
+            let assertions = snapshot.for_pin(&identity.pin_identity());
             let name = match branch_name(&reader, &identity) {
                 Ok(name) => render_name(name),
                 Err(error) => {
@@ -358,16 +289,16 @@ fn list_branches(
                 Ok(resolution) => {
                     let (state, tips) = resolution_state(&resolution);
                     println!(
-                        "{identity}\tindex={}\tassertions={}\tstate={state}\ttips={}\tname={name}",
-                        branch_index(&identity),
+                        "{identity}\tpin-digest={}\tassertions={}\tstate={state}\ttips={}\tname={name}",
+                        pin_digest(&identity),
                         assertions.len(),
                         commit_list(tips)
                     );
                 }
                 Err(error) => {
                     println!(
-                        "{identity}\tindex={}\tassertions={}\tstate=error\ttips=-\tname={name}",
-                        branch_index(&identity),
+                        "{identity}\tpin-digest={}\tassertions={}\tstate=error\ttips=-\tname={name}",
+                        pin_digest(&identity),
                         assertions.len()
                     );
                     failures.push(format!("{identity}: {error}"));
@@ -393,12 +324,12 @@ fn show_branch(pile_path: PathBuf, identity: BranchIdentity) -> Result<()> {
     let mut pile = super::open_refreshed(&pile_path)?;
     let result = (|| -> Result<()> {
         let snapshot = pile
-            .assertion_snapshot()
+            .pin_assertion_snapshot()
             .map_err(|error| anyhow!("snapshot assertions: {error}"))?;
         let mut reader = pile
             .reader()
             .map_err(|error| anyhow!("snapshot pile: {error:?}"))?;
-        let mut assertions = snapshot.for_branch(&identity);
+        let mut assertions = snapshot.for_pin(&identity.pin_identity());
         assertions.sort_unstable_by_key(|assertion| assertion.id().raw());
         let name = branch_name(&reader, &identity)?;
         let resolution = resolve_branch(&snapshot, &identity, &mut reader)
@@ -411,15 +342,16 @@ fn show_branch(pile_path: PathBuf, identity: BranchIdentity) -> Result<()> {
         );
         println!("Name handle: blake3:{}", hex::encode(identity.name().raw));
         println!("Name: {}", render_name(name));
-        println!("Index: {} (advisory only)", branch_index(&identity));
+        println!("Pin identity digest: {}", pin_digest(&identity));
         println!("Assertions: {}", assertions.len());
         render_resolution(&resolution);
 
         for assertion in assertions {
             println!(
-                "Assertion {} -> {}",
+                "Assertion {} -> {} rank={}",
                 assertion_id(assertion.id()),
-                commit_text(assertion.commit())
+                commit_text(commit_from_value(assertion.value())),
+                rank_text(BranchRank::from_label(assertion.label()))
             );
         }
         Ok(())
@@ -432,7 +364,7 @@ fn log_branch(pile_path: PathBuf, identity: BranchIdentity, limit: usize) -> Res
     let mut pile = super::open_refreshed(&pile_path)?;
     let result = (|| -> Result<()> {
         let snapshot = pile
-            .assertion_snapshot()
+            .pin_assertion_snapshot()
             .map_err(|error| anyhow!("snapshot assertions: {error}"))?;
         let mut reader = pile
             .reader()
@@ -498,20 +430,41 @@ fn log_branch(pile_path: PathBuf, identity: BranchIdentity, limit: usize) -> Res
     finish_pile(pile, result, &pile_path)
 }
 
-fn exact_identities(
-    snapshot: &BranchAssertionSnapshot,
+pub(super) fn exact_identities(
+    snapshot: &PinAssertionSnapshot,
+    reader: &PileReader,
     author: Option<[u8; 32]>,
-) -> BTreeSet<BranchIdentity> {
-    snapshot
-        .iter()
-        .filter_map(|assertion| {
-            let identity = *assertion.identity();
-            author
-                .map(|wanted| identity.author().to_bytes() == wanted)
-                .unwrap_or(true)
-                .then_some(identity)
-        })
-        .collect()
+) -> Result<BTreeSet<BranchIdentity>> {
+    let mut identities = BTreeSet::new();
+    for assertion in snapshot.iter() {
+        if author
+            .map(|wanted| assertion.identity().author().to_bytes() != wanted)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let descriptor =
+            Inline::<Handle<BranchPinDescriptor>>::new(assertion.identity().pin().raw());
+        if reader
+            .metadata(descriptor)
+            .map_err(|error| anyhow!("inspect pin descriptor: {error}"))?
+            .is_none()
+        {
+            continue;
+        }
+        let Ok(name) = reader.get::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
+        else {
+            // A generic pin whose locally present descriptor is not the exact
+            // canonical branch shape belongs to another kind.
+            continue;
+        };
+        let identity = BranchIdentity::new(assertion.identity().author(), name);
+        if identity.pin_identity() == *assertion.identity() {
+            identities.insert(identity);
+        }
+    }
+    Ok(identities)
 }
 
 fn branch_name(reader: &PileReader, identity: &BranchIdentity) -> Result<Option<String>> {
@@ -588,12 +541,6 @@ fn resolved_head_text(head: ResolvedHead) -> String {
     }
 }
 
-fn parse_commit(value: &str) -> Result<CommitHandle> {
-    let hash: Inline<Hash<triblespace_core::inline::encodings::hash::Blake3>> =
-        parse_blob_handle(value).context("commit must be blake3:<64 hex>")?;
-    Ok(Handle::<SimpleArchive>::from_hash(hash))
-}
-
 fn parse_author(value: &str) -> Result<VerifyingKey> {
     let hex = value
         .strip_prefix("ed25519:")
@@ -605,12 +552,16 @@ fn parse_author(value: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&bytes).map_err(|_| anyhow!("author is not a valid Ed25519 key"))
 }
 
-fn branch_index(identity: &BranchIdentity) -> String {
-    hex::encode(identity.id().raw())
+fn pin_digest(identity: &BranchIdentity) -> String {
+    format!("blake3:{}", hex::encode(identity.pin_identity().digest()))
 }
 
-fn assertion_id(id: AssertionId) -> String {
+fn assertion_id(id: PinAssertionId) -> String {
     format!("blake3:{}", hex::encode(id.raw()))
+}
+
+fn rank_text(rank: BranchRank) -> String {
+    format!("0x{}", hex::encode(rank.label().raw()))
 }
 
 fn commit_text(commit: CommitHandle) -> String {

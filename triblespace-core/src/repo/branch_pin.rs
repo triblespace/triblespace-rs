@@ -28,6 +28,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::str::FromStr;
 
 use anybytes::Bytes;
 use hex_literal::hex;
@@ -43,7 +44,117 @@ use crate::inline::Inline;
 use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};
 use crate::trible::Fragment;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+
+/// The exact human-facing identity of one branch: `(author key, name handle)`.
+///
+/// The generic asserted-pin layer indexes the corresponding
+/// `(author key, descriptor handle)` pair. This typed descriptor deliberately
+/// keeps the name handle because it is what users select and what repositories
+/// stage as presentation content. Neither the name nor any truncated digest is
+/// a branch selector by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BranchIdentity {
+    author: [u8; 32],
+    name: Inline<Handle<LongString>>,
+}
+
+impl BranchIdentity {
+    /// Construct an identity from a checked Ed25519 key and a name handle.
+    pub fn new(author: VerifyingKey, name: Inline<Handle<LongString>>) -> Self {
+        Self {
+            author: author.to_bytes(),
+            name,
+        }
+    }
+
+    /// Return the complete checked author key.
+    pub fn author(&self) -> VerifyingKey {
+        VerifyingKey::from_bytes(&self.author)
+            .expect("BranchIdentity is constructible only from a checked key")
+    }
+
+    /// Return the content-addressed branch-name handle.
+    pub const fn name(&self) -> Inline<Handle<LongString>> {
+        self.name
+    }
+
+    /// Return the exact generic identity used by asserted-pin storage.
+    pub fn pin_identity(&self) -> PinIdentity {
+        BranchPinDescriptor::pin_identity(self.author(), self.name)
+    }
+}
+
+impl fmt::Display for BranchIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ed25519:{}/blake3:{}",
+            hex::encode(self.author),
+            hex::encode(self.name.raw)
+        )
+    }
+}
+
+impl FromStr for BranchIdentity {
+    type Err = BranchIdentityParseError;
+
+    fn from_str(selector: &str) -> Result<Self, Self::Err> {
+        let encoded = selector
+            .strip_prefix("ed25519:")
+            .ok_or(BranchIdentityParseError::InvalidFormat)?;
+        let (author, name) = encoded
+            .split_once("/blake3:")
+            .ok_or(BranchIdentityParseError::InvalidFormat)?;
+        if author.len() != 64 || name.len() != 64 || name.contains('/') {
+            return Err(BranchIdentityParseError::InvalidFormat);
+        }
+
+        let mut author_bytes = [0u8; 32];
+        hex::decode_to_slice(author, &mut author_bytes)
+            .map_err(|_| BranchIdentityParseError::InvalidAuthorHex)?;
+        let author = VerifyingKey::from_bytes(&author_bytes)
+            .map_err(|_| BranchIdentityParseError::InvalidAuthorKey)?;
+
+        let mut name_bytes = [0u8; 32];
+        hex::decode_to_slice(name, &mut name_bytes)
+            .map_err(|_| BranchIdentityParseError::InvalidNameHex)?;
+        Ok(Self::new(author, Inline::new(name_bytes)))
+    }
+}
+
+/// Why a textual exact branch descriptor could not be parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchIdentityParseError {
+    /// The selector is not `ed25519:<64 hex>/blake3:<64 hex>`.
+    InvalidFormat,
+    /// The author component is not hexadecimal.
+    InvalidAuthorHex,
+    /// The decoded author is not a valid Ed25519 verifying key.
+    InvalidAuthorKey,
+    /// The name-handle component is not hexadecimal.
+    InvalidNameHex,
+}
+
+impl fmt::Display for BranchIdentityParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFormat => write!(
+                f,
+                "branch selector must be ed25519:<64 hex>/blake3:<64 hex>"
+            ),
+            Self::InvalidAuthorHex => write!(f, "branch selector author is not hexadecimal"),
+            Self::InvalidAuthorKey => {
+                write!(f, "branch selector author is not a valid Ed25519 key")
+            }
+            Self::InvalidNameHex => {
+                write!(f, "branch selector name handle is not hexadecimal")
+            }
+        }
+    }
+}
+
+impl Error for BranchIdentityParseError {}
 
 /// Canonical byte length of a V1 branch-pin descriptor.
 pub const BRANCH_PIN_DESCRIPTOR_LEN: usize = 16 + 32;
@@ -149,8 +260,9 @@ impl fmt::Display for BranchPinDescriptorError {
 
 impl Error for BranchPinDescriptorError {}
 
-/// Reinterpret a generic assertion value as a branch commit handle.
-pub(crate) fn commit_from_value(value: ValueHandle) -> CommitHandle {
+/// Reinterpret a generic assertion value as a branch commit handle after its
+/// pin identity has been established as a canonical branch descriptor.
+pub fn commit_from_value(value: ValueHandle) -> CommitHandle {
     Inline::new(value.raw())
 }
 

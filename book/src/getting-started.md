@@ -105,7 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         literature::quote: "I must not fear. Fear is the mind-killer.",
     };
 
-    ws.commit(library, "import dune");
+    ws.commit(library, "import dune")
+        .expect("workspace rank has room");
 
     // `checkout(..)` returns a Checkout — a TribleSet paired with the
     // commits that produced it, usable for incremental delta queries.
@@ -142,13 +143,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ws.commit(
         entity! { &herbert @ literature::firstname: "Francis" },
         "use pen name",
-    );
+    )
+    .expect("workspace rank has room");
 
     let mut collaborator = repo.pull(identity).expect("pull");
     collaborator.commit(
         entity! { &herbert @ literature::firstname: "Franklin" },
         "record legal first name",
-    );
+    )
+    .expect("workspace rank has room");
     repo.push(&mut collaborator).expect("publish collaborator");
 
     // The stale workspace publishes another signed assertion. Nothing is
@@ -170,7 +173,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     merged.commit(
         entity! { &herbert @ literature::alias: "Francis" },
         "keep pen-name as alias",
-    );
+    )
+    .expect("workspace rank has room");
     repo.push(&mut merged).expect("publish merged descendant");
 
     Ok(())

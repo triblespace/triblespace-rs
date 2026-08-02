@@ -170,7 +170,8 @@ use triblespace_paths::PathIndex;
 
 let identity = repo.branch_identity("main");
 let mut ws = repo.create_workspace("main")?;
-ws.commit(graph, "add social graph");
+ws.commit(graph, "add social graph")
+    .expect("workspace rank has room");
 repo.push(&mut ws)?;
 
 let mut resolved = repo.pull(identity)?;

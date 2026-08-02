@@ -878,11 +878,14 @@ mod tests {
         let mut left = repo.create_workspace("paths").unwrap();
         let mut right = repo.create_workspace("paths").unwrap();
         let identity = *left.identity();
-        let branch_id = identity.id().entity();
+        let index_home_id = *ufoid();
         let left_source = edge_facts(1, 2);
         let right_source = edge_facts(2, 3);
-        left.commit(left_source.clone(), "left edge");
-        right.commit(right_source.clone(), "right edge");
+        left.commit(left_source.clone(), "left edge")
+            .expect("workspace rank has room");
+        right
+            .commit(right_source.clone(), "right edge")
+            .expect("workspace rank has room");
         let left_head = left.head().unwrap();
         let right_head = right.head().unwrap();
         repo.push(&mut left).unwrap();
@@ -923,15 +926,22 @@ mod tests {
         )
         .unwrap();
         set_index_head(repo.storage_mut(), &rollup, &mut manifest, Some(merge_head)).unwrap();
-        publish_manifest(repo.storage_mut(), branch_id, manifest, Some(merge_head));
+        publish_manifest(
+            repo.storage_mut(),
+            index_home_id,
+            manifest,
+            Some(merge_head),
+        );
 
-        let index = rollup.attach_exact(repo.storage_mut(), branch_id).unwrap();
+        let index = rollup
+            .attach_exact(repo.storage_mut(), index_home_id)
+            .unwrap();
         assert!(index.contains(
             &RawInline::from(Id::new([1; 16]).unwrap()),
             &RawInline::from(Id::new([3; 16]).unwrap())
         ));
 
-        let mut home = IndexHome::new(repo.storage_mut(), branch_id, rollup);
+        let mut home = IndexHome::new(repo.storage_mut(), index_home_id, rollup);
         let snapshot = home.read_snapshot().unwrap();
         assert_eq!(snapshot.source_head(), Some(merge_head));
         assert_eq!(snapshot.manifest().ranges().len(), 3);

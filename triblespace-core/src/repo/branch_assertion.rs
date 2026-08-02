@@ -24,7 +24,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::str::FromStr;
 use std::sync::OnceLock;
 
 #[cfg(test)]
@@ -42,6 +41,7 @@ use crate::inline::Inline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::patch::{Entry, IdentitySchema, PATCH};
+use crate::repo::branch_pin::BranchIdentity;
 use crate::repo::CommitHandle;
 
 /// Number of semantic bytes in a canonical branch assertion.
@@ -84,6 +84,19 @@ impl fmt::Display for BranchId {
     }
 }
 
+fn branch_id(identity: &BranchIdentity) -> BranchId {
+    let author = identity.author();
+    let fragment = entity! {
+        metadata::name: identity.name(),
+        crate::repo::signed_by: author,
+    };
+    BranchId(
+        fragment
+            .root()
+            .expect("a two-fact intrinsic identity exports one entity"),
+    )
+}
+
 /// Blake3 content id of one canonical signed assertion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssertionId([u8; 32]);
@@ -94,122 +107,6 @@ impl AssertionId {
         self.0
     }
 }
-
-/// The exact identity descriptor of one branch.
-///
-/// The name's content may be absent locally without making the identity
-/// malformed: its content-addressed handle is the identity component.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BranchIdentity {
-    author: [u8; 32],
-    name: Inline<Handle<LongString>>,
-}
-
-impl BranchIdentity {
-    /// Construct an identity from a checked Ed25519 key and a name handle.
-    pub fn new(author: VerifyingKey, name: Inline<Handle<LongString>>) -> Self {
-        Self {
-            author: author.to_bytes(),
-            name,
-        }
-    }
-
-    /// Return the complete checked author key.
-    pub fn author(&self) -> VerifyingKey {
-        VerifyingKey::from_bytes(&self.author)
-            .expect("BranchIdentity is constructible only from a checked key")
-    }
-
-    /// Return the content-addressed branch-name handle.
-    pub const fn name(&self) -> Inline<Handle<LongString>> {
-        self.name
-    }
-
-    /// Derive the intrinsic id of the exact two-fact identity entity.
-    pub fn id(&self) -> BranchId {
-        let author = self.author();
-        let fragment = entity! {
-            metadata::name: self.name,
-            crate::repo::signed_by: author,
-        };
-        BranchId(
-            fragment
-                .root()
-                .expect("a two-fact intrinsic identity exports one entity"),
-        )
-    }
-}
-
-impl fmt::Display for BranchIdentity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ed25519:{}/blake3:{}",
-            hex::encode(self.author),
-            hex::encode(self.name.raw)
-        )
-    }
-}
-
-impl FromStr for BranchIdentity {
-    type Err = BranchIdentityParseError;
-
-    fn from_str(selector: &str) -> Result<Self, Self::Err> {
-        let encoded = selector
-            .strip_prefix("ed25519:")
-            .ok_or(BranchIdentityParseError::InvalidFormat)?;
-        let (author, name) = encoded
-            .split_once("/blake3:")
-            .ok_or(BranchIdentityParseError::InvalidFormat)?;
-        if author.len() != 64 || name.len() != 64 || name.contains('/') {
-            return Err(BranchIdentityParseError::InvalidFormat);
-        }
-
-        let mut author_bytes = [0u8; 32];
-        hex::decode_to_slice(author, &mut author_bytes)
-            .map_err(|_| BranchIdentityParseError::InvalidAuthorHex)?;
-        let author = VerifyingKey::from_bytes(&author_bytes)
-            .map_err(|_| BranchIdentityParseError::InvalidAuthorKey)?;
-
-        let mut name_bytes = [0u8; 32];
-        hex::decode_to_slice(name, &mut name_bytes)
-            .map_err(|_| BranchIdentityParseError::InvalidNameHex)?;
-        Ok(Self::new(author, Inline::new(name_bytes)))
-    }
-}
-
-/// Why a textual exact branch descriptor could not be parsed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BranchIdentityParseError {
-    /// The selector is not `ed25519:<64 hex>/blake3:<64 hex>`.
-    InvalidFormat,
-    /// The author component is not hexadecimal.
-    InvalidAuthorHex,
-    /// The decoded author is not a valid Ed25519 verifying key.
-    InvalidAuthorKey,
-    /// The name-handle component is not hexadecimal.
-    InvalidNameHex,
-}
-
-impl fmt::Display for BranchIdentityParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidFormat => write!(
-                f,
-                "branch selector must be ed25519:<64 hex>/blake3:<64 hex>"
-            ),
-            Self::InvalidAuthorHex => write!(f, "branch selector author is not hexadecimal"),
-            Self::InvalidAuthorKey => {
-                write!(f, "branch selector author is not a valid Ed25519 key")
-            }
-            Self::InvalidNameHex => {
-                write!(f, "branch selector name handle is not hexadecimal")
-            }
-        }
-    }
-}
-
-impl Error for BranchIdentityParseError {}
 
 /// A canonical branch assertion whose signature has already been verified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,7 +121,7 @@ impl BranchAssertion {
     /// by construction and can enter a [`BranchAssertionSnapshot`].
     pub fn sign(key: &SigningKey, name: Inline<Handle<LongString>>, commit: CommitHandle) -> Self {
         let identity = BranchIdentity::new(key.verifying_key(), name);
-        let message = signed_message(&identity.author, &name.raw, &commit.raw);
+        let message = signed_message(&identity.author().to_bytes(), &name.raw, &commit.raw);
         let signature = key.sign(&message).to_bytes();
         Self {
             identity,
@@ -245,8 +142,8 @@ impl BranchAssertion {
     /// Encode this verified assertion into its canonical 160 semantic bytes.
     pub fn encode(&self) -> [u8; BRANCH_ASSERTION_LEN] {
         let mut bytes = [0u8; BRANCH_ASSERTION_LEN];
-        bytes[AUTHOR_RANGE].copy_from_slice(&self.identity.author);
-        bytes[NAME_RANGE].copy_from_slice(&self.identity.name.raw);
+        bytes[AUTHOR_RANGE].copy_from_slice(&self.identity.author().to_bytes());
+        bytes[NAME_RANGE].copy_from_slice(&self.identity.name().raw);
         bytes[COMMIT_RANGE].copy_from_slice(&self.commit.raw);
         bytes[SIGNATURE_RANGE].copy_from_slice(&self.signature);
         bytes
@@ -268,7 +165,7 @@ impl BranchAssertion {
     }
 
     fn index_key(&self) -> [u8; ASSERTION_INDEX_KEY_LEN] {
-        index_key(self.identity.id(), self.id())
+        index_key(branch_id(&self.identity), self.id())
     }
 }
 
@@ -307,8 +204,8 @@ impl UnverifiedBranchAssertion {
 
     pub(crate) fn encode(self) -> [u8; BRANCH_ASSERTION_LEN] {
         let mut bytes = [0u8; BRANCH_ASSERTION_LEN];
-        bytes[AUTHOR_RANGE].copy_from_slice(&self.identity.author);
-        bytes[NAME_RANGE].copy_from_slice(&self.identity.name.raw);
+        bytes[AUTHOR_RANGE].copy_from_slice(&self.identity.author().to_bytes());
+        bytes[NAME_RANGE].copy_from_slice(&self.identity.name().raw);
         bytes[COMMIT_RANGE].copy_from_slice(&self.commit.raw);
         bytes[SIGNATURE_RANGE].copy_from_slice(&self.signature);
         bytes
@@ -327,7 +224,7 @@ impl UnverifiedBranchAssertion {
     }
 
     fn index_key(self) -> [u8; ASSERTION_INDEX_KEY_LEN] {
-        index_key(self.identity.id(), self.id())
+        index_key(branch_id(&self.identity), self.id())
     }
 
     pub(crate) fn verify_strict(self) -> Result<BranchAssertion, AssertionError> {
@@ -335,12 +232,10 @@ impl UnverifiedBranchAssertion {
         SIGNATURE_VERIFICATIONS.with(|count| count.set(count.get() + 1));
 
         let author = self.identity.author();
+        let author_bytes = author.to_bytes();
+        let name = self.identity.name();
         let signature = Signature::from_bytes(&self.signature);
-        let message = signed_message(
-            &self.identity.author,
-            &self.identity.name.raw,
-            &self.commit.raw,
-        );
+        let message = signed_message(&author_bytes, &name.raw, &self.commit.raw);
         author
             .verify_strict(&message, &signature)
             .map_err(|_| AssertionError::InvalidSignature)?;
@@ -613,7 +508,7 @@ impl BranchAssertionSnapshot {
     /// is the sole consumer: it verifies only optimistic-frontier claims before
     /// exposing any tip or demand.
     pub(crate) fn witnesses_for_branch(&self, identity: &BranchIdentity) -> Vec<&AssertionWitness> {
-        let branch = identity.id();
+        let branch = branch_id(identity);
         let mut assertions = Vec::new();
         self.assertions
             .infixes::<16, 32, _>(&branch.raw(), |assertion_id| {
@@ -671,6 +566,7 @@ pub trait BranchAssertionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::branch_pin::BranchIdentityParseError;
 
     fn name(byte: u8) -> Inline<Handle<LongString>> {
         Inline::new([byte; 32])
@@ -699,7 +595,7 @@ mod tests {
             )
         );
         assert_eq!(
-            assertion.identity().id().raw(),
+            branch_id(assertion.identity()).raw(),
             hex!("AFF4BA00CA5D7270149C932647173802")
         );
         assert_eq!(
@@ -730,11 +626,11 @@ mod tests {
         let renamed = BranchIdentity::new(key.verifying_key(), name(2));
         let rekeyed = BranchIdentity::new(signing_key(4).verifying_key(), name(1));
         assert_eq!(a, same);
-        assert_eq!(a.id(), same.id());
+        assert_eq!(branch_id(&a), branch_id(&same));
         assert_ne!(a, renamed);
-        assert_ne!(a.id(), renamed.id());
+        assert_ne!(branch_id(&a), branch_id(&renamed));
         assert_ne!(a, rekeyed);
-        assert_ne!(a.id(), rekeyed.id());
+        assert_ne!(branch_id(&a), branch_id(&rekeyed));
     }
 
     #[test]
@@ -758,7 +654,7 @@ mod tests {
         let selector = identity.to_string();
 
         assert_eq!(
-            identity.id().to_string().parse::<BranchIdentity>(),
+            branch_id(&identity).to_string().parse::<BranchIdentity>(),
             Err(BranchIdentityParseError::InvalidFormat)
         );
         assert_eq!(
@@ -800,7 +696,7 @@ mod tests {
     fn branch_id_prefix_is_never_identity_equality() {
         let wanted = BranchAssertion::sign(&signing_key(1), name(1), commit(1));
         let colliding = BranchAssertion::sign(&signing_key(2), name(2), commit(2));
-        let forced_prefix = wanted.identity().id();
+        let forced_prefix = branch_id(wanted.identity());
         let mut snapshot = BranchAssertionSnapshot::new();
         snapshot.insert(wanted.clone()).unwrap();
         snapshot.insert_with_branch_prefix_for_test(forced_prefix, colliding);

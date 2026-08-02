@@ -80,7 +80,8 @@ the commit with `push`:
 let mut ws = repo.create_workspace("main")?;
 let main = *ws.identity();
 
-ws.commit(TribleSet::new(), "initial commit");
+ws.commit(TribleSet::new(), "initial commit")
+    .expect("workspace rank has room");
 
 let outcome = repo.push(&mut ws)?;
 assert!(matches!(
@@ -276,7 +277,8 @@ let mut change = entity! {
 };
 change += entity! { repo::content: archive_handle.clone() };
 
-ws.commit(change, "attach annotated dataset");
+ws.commit(change, "attach annotated dataset")
+    .expect("workspace rank has room");
 repo.push(&mut ws)?;
 
 let mut reopened = repo.pull(main)?;

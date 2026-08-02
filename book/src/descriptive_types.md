@@ -266,7 +266,8 @@ Publication does not update a mutable branch pointer. A changed workspace
 appends one signed assertion after its staged blobs are durable:
 
 ```rust,ignore
-ws.commit(content, "plan-update");
+ws.commit(content, "plan-update")
+    .expect("workspace rank has room");
 repo.push(&mut ws)?;
 ```
 

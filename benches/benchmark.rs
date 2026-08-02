@@ -980,7 +980,8 @@ fn checkout_benchmark(c: &mut Criterion) {
                 };
             }
             total_tribles += commit_data.len() as u64;
-            ws.commit(commit_data, "bench commit");
+            ws.commit(commit_data, "bench commit")
+                .expect("workspace rank has room");
         }
         repo.push(&mut ws).expect("push");
 

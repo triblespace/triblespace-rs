@@ -2,7 +2,8 @@
 //!
 //! Owns the inner store, spawns the iroh network thread on construction,
 //! and exposes the standard storage traits (`BlobStore + BlobStorePut +
-//! PinStore`) with content-addressed transport behavior built in:
+//! PinStore + PinAssertionStore`) with content-addressed transport behavior
+//! built in:
 //!
 //! - **Reads** auto-call [`refresh`](Peer::refresh), which drains pending
 //!   capability control events and publishes blobs appended by external
@@ -12,7 +13,7 @@
 //!   cannot change their associated error types, but a later explicit
 //!   [`refresh`](Peer::refresh) reports the retained [`PeerRefreshError`].
 //! - **Writes** delegate to the inner store. Blobs are announced to the DHT.
-//!   Signed branch assertions are forwarded only to local storage and are not
+//!   Signed asserted pins are forwarded only to local storage and are not
 //!   replicated by this layer.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
@@ -53,6 +54,9 @@ use triblespace_core::repo::branch_assertion::{
 };
 use triblespace_core::repo::branch_frontier::{ParentLookup, PartialCommitDag};
 use triblespace_core::repo::lazy::WantRecordError;
+use triblespace_core::repo::pin_assertion::{
+    PinAssertion, PinAssertionSnapshot, PinAssertionStore,
+};
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
     StorageFlush, WeakPinStore,
@@ -131,7 +135,7 @@ impl PeerRefreshError {
 ///     self_cap: [0u8; 32],
 /// });
 /// // From here `peer` forwards the wrapped store's blob, local-pin,
-/// // durability, and branch-assertion capabilities — wrap it in
+/// // durability, and asserted-pin capabilities — wrap it in
 /// // `Repository::new` and use it like any other storage.
 /// drop(peer);
 /// ```
@@ -1638,6 +1642,39 @@ where
     }
 }
 
+/// Generic asserted pins are authority state rather than blob payloads. The
+/// peer therefore forwards their coherent snapshots and durable appends to its
+/// local store, just like the legacy branch-specific assertion surface, while
+/// leaving replication to a future assertion wire protocol.
+impl<S> PinAssertionStore for Peer<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + PinStore
+        + WeakPinStore
+        + StorageFlush
+        + PinAssertionStore
+        + Send
+        + 'static,
+{
+    type Error = <S as PinAssertionStore>::Error;
+
+    fn pin_assertion_snapshot(&mut self) -> Result<PinAssertionSnapshot, Self::Error> {
+        let _ = self.refresh();
+        self.store
+            .lock()
+            .expect("store mutex")
+            .pin_assertion_snapshot()
+    }
+
+    fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
+        self.store
+            .lock()
+            .expect("store mutex")
+            .append_pin_assertion(assertion)
+    }
+}
+
 impl<S> PinStore for Peer<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
@@ -2514,6 +2551,46 @@ mod tests {
         Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
             .expect("one delivery slot")
+    }
+
+    #[test]
+    fn generic_pin_assertions_round_trip_through_peer() {
+        use triblespace_core::repo::pin_assertion::{
+            PinHandle, PinIdentity, SubsumptionLabel, ValueHandle,
+        };
+
+        let signing_key = SigningKey::from_bytes(&[0xA1; 32]);
+        let endpoint = EndpointId::from_bytes(&signing_key.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, _wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            sender,
+            receiver,
+        );
+        let pin = PinHandle::from_raw([0xB2; 32]);
+        let assertion = PinAssertion::sign(
+            &signing_key,
+            pin,
+            ValueHandle::from_raw([0xC3; 32]),
+            SubsumptionLabel::from_raw([0xD4; 32]),
+        );
+
+        peer.append_pin_assertion(assertion)
+            .expect("forward assertion append");
+        peer.append_pin_assertion(assertion)
+            .expect("duplicate append remains idempotent");
+
+        let snapshot = peer
+            .pin_assertion_snapshot()
+            .expect("forward assertion snapshot");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot.for_pin(&PinIdentity::new(signing_key.verifying_key(), pin)),
+            vec![assertion]
+        );
     }
 
     fn test_capability(

@@ -1,11 +1,12 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 
-use triblespace_core::repo::branch_assertion::{AssertionId, BranchAssertionStore, BranchIdentity};
+use triblespace_core::repo::branch_pin::{commit_from_value, BranchIdentity, BranchRank};
+use triblespace_core::repo::pin_assertion::{PinAssertionId, PinAssertionStore};
 
 #[derive(Parser)]
 pub enum Command {
@@ -49,7 +50,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     let mut pile = super::open_refreshed(pile_path)?;
     let result = (|| -> Result<()> {
         let snapshot = pile
-            .assertion_snapshot()
+            .pin_assertion_snapshot()
             .map_err(|error| anyhow!("snapshot assertions: {error}"))?;
         let mut reader = pile
             .reader()
@@ -90,10 +91,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
             }
         }
 
-        let identities: BTreeSet<_> = snapshot
-            .iter()
-            .map(|assertion| *assertion.identity())
-            .collect();
+        let identities = super::branch::exact_identities(&snapshot, &reader, None)?;
         println!("\nSigned branches: {}", identities.len());
         for identity in identities {
             let name = match branch_name_status(&reader, &identity) {
@@ -300,19 +298,51 @@ fn inspect_commit_closure(
 
 fn branch_history(pile_path: &Path, filter: Option<BranchIdentity>) -> Result<()> {
     use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
+    use triblespace_core::repo::pin_assertion::PinIdentity;
+    use triblespace_core::repo::BlobStore;
 
-    println!("Physical assertion arrival order only; this is not branch precedence or a reflog.");
+    let mut pile = super::open_refreshed(pile_path)?;
+    let discovery = (|| -> Result<BTreeSet<BranchIdentity>> {
+        if let Some(identity) = filter {
+            return Ok(BTreeSet::from([identity]));
+        }
+        let snapshot = pile
+            .pin_assertion_snapshot()
+            .map_err(|error| anyhow!("snapshot assertions: {error}"))?;
+        let reader = pile
+            .reader()
+            .map_err(|error| anyhow!("snapshot pile: {error:?}"))?;
+        super::branch::exact_identities(&snapshot, &reader, None)
+    })();
+    let close = pile
+        .close()
+        .map_err(|error| anyhow!("close pile {}: {error}", pile_path.display()));
+    let identities = match (discovery, close) {
+        (Ok(identities), Ok(())) => identities,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(close)) => {
+            return Err(anyhow!("{error:#}; additionally failed to {close:#}"));
+        }
+    };
+    let branches: BTreeMap<PinIdentity, BranchIdentity> = identities
+        .into_iter()
+        .map(|identity| (identity.pin_identity(), identity))
+        .collect();
+
+    println!(
+        "Physical asserted-pin arrival order for recognized branches only; this is not branch precedence or a reflog."
+    );
     with_locked_records(pile_path, |records: &mut PileRecords| {
-        let mut seen = HashSet::<AssertionId>::new();
+        let mut seen = HashSet::<PinAssertionId>::new();
         let mut count = 0usize;
         let mut invalid = 0usize;
         for record in records {
             let record = record?;
             let assertion = match record.content {
-                PileRecordContent::BranchAssertion { assertion } => assertion,
-                PileRecordContent::InvalidBranchAssertion { id } => {
+                PileRecordContent::PinAssertion { assertion } => assertion,
+                PileRecordContent::InvalidPinAssertion { id } => {
                     println!(
-                        "offset={} assertion={} invalid-signature=yes (claim hidden)",
+                        "offset={} assertion={} invalid-signature=yes (pin kind and claim hidden)",
                         record.offset,
                         assertion_text(id),
                     );
@@ -321,26 +351,24 @@ fn branch_history(pile_path: &Path, filter: Option<BranchIdentity>) -> Result<()
                 }
                 _ => continue,
             };
-            if filter
-                .map(|wanted| assertion.identity() != &wanted)
-                .unwrap_or(false)
-            {
+            let Some(branch) = branches.get(assertion.identity()) else {
                 continue;
-            }
+            };
             let id = assertion.id();
             let duplicate = !seen.insert(id);
             println!(
-                "offset={} assertion={} branch={} commit={} duplicate={}",
+                "offset={} assertion={} branch={} commit={} rank=0x{} duplicate={}",
                 record.offset,
                 assertion_text(id),
-                assertion.identity(),
-                commit_text(assertion.commit()),
+                branch,
+                commit_text(commit_from_value(assertion.value())),
+                hex::encode(BranchRank::from_label(assertion.label()).label().raw()),
                 if duplicate { "yes" } else { "no" }
             );
             count += 1;
         }
         println!("Assertion records: {count}");
-        println!("Invalid-signature records: {invalid}");
+        println!("Invalid-signature generic records (unclassifiable): {invalid}");
         Ok(())
     })
 }
@@ -494,7 +522,7 @@ fn with_locked_records<T>(
     }
 }
 
-fn assertion_text(id: AssertionId) -> String {
+fn assertion_text(id: PinAssertionId) -> String {
     format!("blake3:{}", hex::encode(id.raw()))
 }
 

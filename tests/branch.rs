@@ -21,7 +21,9 @@ fn repository_publishes_a_branch_on_its_first_commit() {
         BranchResolution::Absent
     ));
 
-    workspace.commit(triblespace::prelude::TribleSet::new(), "first commit");
+    workspace
+        .commit(triblespace::prelude::TribleSet::new(), "first commit")
+        .expect("workspace rank has room");
     assert!(matches!(
         repo.push(&mut workspace).expect("publish first commit"),
         PublishOutcome::Published(_)

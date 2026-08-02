@@ -183,7 +183,10 @@ where
         return;
     }
 
-    workspace.commit(set, "macro invocation");
+    if workspace.commit(set, "macro invocation").is_err() {
+        let _ = repo.close();
+        return;
+    }
 
     {
         let mut context = MetadataContext {
@@ -279,7 +282,9 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
                 ::triblespace_core::macros::entity! { &entity @ attribute::attribute_type: handle };
         }
 
-        context.workspace().commit(set, "macro invocation");
+        if context.workspace().commit(set, "macro invocation").is_err() {
+            return;
+        }
     }
 }
 

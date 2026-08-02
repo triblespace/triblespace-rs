@@ -456,7 +456,9 @@ fn corrupt_source_fails_loud_without_truncation() {
         let mut repo = Repository::new(pile, key, TribleSet::new()).unwrap();
         let mut workspace = repo.create_workspace("main").unwrap();
         let identity = *workspace.identity();
-        workspace.commit(TribleSet::new(), "seed");
+        workspace
+            .commit(TribleSet::new(), "seed")
+            .expect("workspace rank has room");
         repo.push(&mut workspace).unwrap();
         repo.close().unwrap();
         identity
@@ -496,10 +498,16 @@ fn corrupt_source_fails_loud_without_truncation() {
         "forget must not publish a destination from a corrupt source"
     );
 
-    // migrate (in-place rewrite): still refuses to open a corrupt pile.
+    // Read-only branch observation also refuses to open a corrupt pile.
     Command::cargo_bin("trible")
         .unwrap()
-        .args(["pile", "migrate", src_path.to_str().unwrap(), "list"])
+        .args([
+            "pile",
+            "branch",
+            "list",
+            src_path.to_str().unwrap(),
+            "--all",
+        ])
         .assert()
         .failure()
         .stderr(fail_loud);

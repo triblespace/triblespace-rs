@@ -6,9 +6,10 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, MemoryBlobStore};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
-use triblespace_core::repo::branch_assertion::BranchIdentity;
 use triblespace_core::repo::branch_frontier::{BranchResolution, ResolvedHead};
-use triblespace_core::repo::branch_pin::{sign_branch_assertion, BranchPinDescriptor, BranchRank};
+use triblespace_core::repo::branch_pin::{
+    sign_branch_assertion, BranchIdentity, BranchPinDescriptor, BranchRank,
+};
 use triblespace_core::repo::commit;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::Pile;

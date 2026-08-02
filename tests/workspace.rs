@@ -19,7 +19,8 @@ fn workspace_commit_updates_head() {
         Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let mut ws = repo.create_workspace("main").expect("create workspace");
 
-    ws.commit(TribleSet::new(), "change");
+    ws.commit(TribleSet::new(), "change")
+        .expect("workspace rank has room");
 
     repo.push(&mut ws).expect("push");
 }
@@ -52,7 +53,8 @@ fn workspace_checkout_unions_commits() {
     let mut s1 = TribleSet::new();
     s1.insert(&t1);
 
-    ws.commit(s1.clone(), "commit");
+    ws.commit(s1.clone(), "commit")
+        .expect("workspace rank has room");
     let c1 = ws.head().unwrap();
 
     let e2 = ufoid();
@@ -62,7 +64,8 @@ fn workspace_checkout_unions_commits() {
     let mut s2 = TribleSet::new();
     s2.insert(&t2);
 
-    ws.commit(s2.clone(), "commit");
+    ws.commit(s2.clone(), "commit")
+        .expect("workspace rank has room");
     let c2 = ws.head().unwrap();
 
     let result = ws.checkout(&[c1, c2][..]).expect("checkout");
@@ -89,7 +92,8 @@ fn workspace_checkout_single_commit() {
     let mut s = TribleSet::new();
     s.insert(&t);
 
-    ws.commit(s.clone(), "commit");
+    ws.commit(s.clone(), "commit")
+        .expect("workspace rank has room");
     let c = ws.head().unwrap();
 
     let result = ws.checkout(c).expect("checkout single");
@@ -115,7 +119,8 @@ fn workspace_checkout_vec_commits() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(s.clone(), "commit")
+            .expect("workspace rank has room");
         sets.push(s);
         commits.push(ws.head().unwrap());
     }
@@ -146,9 +151,11 @@ fn workspace_checkout_metadata_returns_repo_metadata() {
         Repository::new(storage, SigningKey::generate(&mut OsRng), meta.clone()).unwrap();
     let mut ws = repo.create_workspace("main").expect("create workspace");
 
-    ws.commit(TribleSet::new(), "first");
+    ws.commit(TribleSet::new(), "first")
+        .expect("workspace rank has room");
     let c1 = ws.head().unwrap();
-    ws.commit(TribleSet::new(), "second");
+    ws.commit(TribleSet::new(), "second")
+        .expect("workspace rank has room");
     let c2 = ws.head().unwrap();
 
     let result = ws
@@ -181,7 +188,8 @@ fn workspace_checkout_with_metadata_returns_both() {
     let mut data = TribleSet::new();
     data.insert(&data_t);
 
-    ws.commit(data.clone(), "commit");
+    ws.commit(data.clone(), "commit")
+        .expect("workspace rank has room");
     let c = ws.head().unwrap();
 
     let (data_out, meta_out) = ws
@@ -215,7 +223,8 @@ fn workspace_commit_uses_repo_metadata() {
     let mut data = TribleSet::new();
     data.insert(&data_t);
 
-    ws.commit(data.clone(), "commit");
+    ws.commit(data.clone(), "commit")
+        .expect("workspace rank has room");
     let c = ws.head().unwrap();
 
     let (data_out, meta_out) = ws
@@ -244,7 +253,8 @@ fn workspace_checkout_range_variants() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(s.clone(), "commit")
+            .expect("workspace rank has room");
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -357,7 +367,8 @@ fn workspace_checkout_symmetric_diff() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(s.clone(), "commit")
+            .expect("workspace rank has room");
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -387,7 +398,8 @@ fn workspace_checkout_set_operation_selectors() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(s.clone(), "commit")
+            .expect("workspace rank has room");
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -431,7 +443,8 @@ fn workspace_get_local_and_base() {
     set.insert(&t);
 
     let handle = ws.put(set.clone());
-    ws.commit(set.clone(), "commit");
+    ws.commit(set.clone(), "commit")
+        .expect("workspace rank has room");
 
     let local: TribleSet = ws.get(handle).expect("get local");
     assert_eq!(local, set);
@@ -461,7 +474,8 @@ fn workspace_checkout_head_collects_history() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(s.clone(), "commit")
+            .expect("workspace rank has room");
         sets.push(s);
     }
 
@@ -492,7 +506,8 @@ fn workspace_nth_ancestor_selector() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), "commit");
+        ws.commit(s.clone(), "commit")
+            .expect("workspace rank has room");
         sets.push(s);
     }
 
@@ -526,7 +541,9 @@ fn workspace_parents_selector() {
     let t0 = Trible::new(&e0, &a0, &v0);
     let mut s0 = TribleSet::new();
     s0.insert(&t0);
-    ws_main.commit(s0, "commit");
+    ws_main
+        .commit(s0, "commit")
+        .expect("workspace rank has room");
     repo.push(&mut ws_main).expect("push base");
 
     // Fork a second workspace from the same base commit.
@@ -539,7 +556,9 @@ fn workspace_parents_selector() {
     let t1 = Trible::new(&e1, &a1, &v1);
     let mut s1 = TribleSet::new();
     s1.insert(&t1);
-    ws_main.commit(s1.clone(), "commit");
+    ws_main
+        .commit(s1.clone(), "commit")
+        .expect("workspace rank has room");
 
     let e2 = ufoid();
     let a2 = ufoid();
@@ -547,7 +566,9 @@ fn workspace_parents_selector() {
     let t2 = Trible::new(&e2, &a2, &v2);
     let mut s2 = TribleSet::new();
     s2.insert(&t2);
-    ws_feature.commit(s2.clone(), "commit");
+    ws_feature
+        .commit(s2.clone(), "commit")
+        .expect("workspace rank has room");
 
     // Merge the feature workspace into main to create a commit with two parents.
     ws_main.merge(&mut ws_feature).expect("merge workspaces");
@@ -580,15 +601,18 @@ fn workspace_history_of_entity() {
 
     let mut s1 = TribleSet::new();
     s1.insert(&Trible::new(&entity, &a1, &v1));
-    ws.commit(s1.clone(), "commit");
+    ws.commit(s1.clone(), "commit")
+        .expect("workspace rank has room");
 
     let mut s2 = TribleSet::new();
     s2.insert(&Trible::new(&ufoid(), &a1, &v1));
-    ws.commit(s2.clone(), "commit");
+    ws.commit(s2.clone(), "commit")
+        .expect("workspace rank has room");
 
     let mut s3 = TribleSet::new();
     s3.insert(&Trible::new(&entity, &a2, &v2));
-    ws.commit(s3.clone(), "commit");
+    ws.commit(s3.clone(), "commit")
+        .expect("workspace rank has room");
 
     let result = ws.checkout(history_of(*entity)).expect("history_of");
 

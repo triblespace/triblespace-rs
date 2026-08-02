@@ -26,14 +26,16 @@ fn main() {
     let mut change = TribleSet::new();
     change += entity! { &ufoid() @ literature::firstname: "Alice" };
 
-    ws1.commit(change, "add alice");
+    ws1.commit(change, "add alice")
+        .expect("workspace rank has room");
     repo.push(&mut ws1).expect("publish ws1");
 
     // A later workspace resolves the branch assertions and adds Bob.
     let mut ws2 = repo.pull(identity).expect("pull");
     let mut change = TribleSet::new();
     change += entity! { &ufoid() @ literature::firstname: "Bob" };
-    ws2.commit(change, "add bob");
+    ws2.commit(change, "add bob")
+        .expect("workspace rank has room");
 
     repo.push(&mut ws2).expect("publish ws2");
     println!("Published two signed branch assertions");

@@ -32,7 +32,8 @@ fn main() {
     initial +=
         entity! { &herbert @ literature::firstname: "Frank", literature::lastname: "Herbert" };
     initial += entity! { &dune @ literature::title: "Dune", literature::author: &herbert };
-    ws.commit(initial, "initial");
+    ws.commit(initial, "initial")
+        .expect("workspace rank has room");
     repo.push(&mut ws).unwrap();
 
     // ── first checkout: load everything ──────────────────────────────
@@ -61,7 +62,8 @@ fn main() {
     ws.commit(
         entity! { &messiah @ literature::title: "Dune Messiah", literature::author: &herbert },
         "add Dune Messiah",
-    );
+    )
+    .expect("workspace rank has room");
     repo.push(&mut ws).unwrap();
 
     // ── incremental update ───────────────────────────────────────────

@@ -140,7 +140,8 @@ mod readme_example {
             ),
         };
 
-        ws.commit(library, "import dune");
+        ws.commit(library, "import dune")
+            .expect("workspace rank has room");
 
         let catalog = ws.checkout(..)?;
         let title = "Dune";
@@ -169,13 +170,16 @@ mod readme_example {
         ws.commit(
             entity! { &herbert @ literature::firstname: "Francis" },
             "use pen name",
-        );
+        )
+        .expect("workspace rank has room");
 
         let mut collaborator = repo.pull(identity).expect("pull");
-        collaborator.commit(
-            entity! { &herbert @ literature::firstname: "Franklin" },
-            "record legal first name",
-        );
+        collaborator
+            .commit(
+                entity! { &herbert @ literature::firstname: "Franklin" },
+                "record legal first name",
+            )
+            .expect("workspace rank has room");
         repo.push(&mut collaborator).expect("publish collaborator");
 
         // Publication is grow-only: the stale workspace contributes a second
@@ -192,10 +196,12 @@ mod readme_example {
         first_names.sort();
         assert_eq!(first_names, ["Francis", "Frank", "Franklin"]);
 
-        merged.commit(
-            entity! { &herbert @ literature::alias: "Francis" },
-            "keep pen-name as alias",
-        );
+        merged
+            .commit(
+                entity! { &herbert @ literature::alias: "Francis" },
+                "keep pen-name as alias",
+            )
+            .expect("workspace rank has room");
         repo.push(&mut merged).expect("publish merged descendant");
 
         Ok(())

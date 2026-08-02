@@ -1653,9 +1653,8 @@ mod tests {
 
     #[test]
     fn optimistic_branch_probes_never_mint_weak_wants() {
-        use crate::repo::branch_assertion::BranchIdentity;
         use crate::repo::branch_frontier::{resolve_branch, BranchResolution};
-        use crate::repo::branch_pin::{sign_branch_assertion, BranchRank};
+        use crate::repo::branch_pin::{sign_branch_assertion, BranchIdentity, BranchRank};
 
         let (_dir, mut yard) = yard_with(1, YardConfig::default());
         let signing_key = SigningKey::from_bytes(&[7; 32]);

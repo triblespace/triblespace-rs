@@ -118,7 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         literature::quote: "I must not fear. Fear is the mind-killer.",
     };
 
-    ws.commit(library, "import dune");
+    ws.commit(library, "import dune")
+        .expect("workspace rank has room");
 
     // `checkout(..)` returns a Checkout — a TribleSet paired with the
     // commits that produced it, usable for incremental delta queries.
@@ -162,7 +163,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             literature::lastname: "Butler",
         },
         "add Butler",
-    );
+    )
+    .expect("workspace rank has room");
 
     let mut collaborator = repo.pull(identity).expect("pull");
     let leguin = ufoid();
@@ -172,7 +174,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             literature::lastname: "Le Guin",
         },
         "add Le Guin",
-    );
+    )
+    .expect("workspace rank has room");
     repo.push(&mut collaborator).expect("publish collaborator");
 
     // A stale workspace may publish too: it adds another signed assertion

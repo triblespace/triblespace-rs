@@ -8,14 +8,13 @@ use triblespace_core::repo::pile::Pile;
 pub mod blob;
 pub mod branch;
 mod diagnose;
-mod migrate;
 pub mod net;
 pub mod pin;
 mod signing;
 
 #[derive(Parser)]
 pub enum PileCommand {
-    /// Observe and publish exact StrongPin branch assertions.
+    /// Observe exact asserted-pin branches and physically forget local records.
     Branch {
         #[command(subcommand)]
         cmd: branch::Command,
@@ -55,13 +54,6 @@ pub enum PileCommand {
     Amputate {
         /// Path to the pile file to amputate (TRUNCATED in place)
         path: PathBuf,
-    },
-    /// Migrate legacy pile metadata to the current schemas.
-    Migrate {
-        /// Path to the pile file to modify
-        pile: PathBuf,
-        #[command(subcommand)]
-        cmd: migrate::Command,
     },
     /// Distributed pile sync over iroh (p2p QUIC connections).
     Net {
@@ -139,7 +131,6 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             }
             Ok(())
         }
-        PileCommand::Migrate { pile, cmd } => migrate::run(pile, cmd),
     }
 }
 
