@@ -247,6 +247,10 @@ pub enum PolicyEvent {
         grant: GrantIdentity,
         sig: Inline<Handle<SimpleArchive>>,
     },
+    /// Stop renewing and redispatching this grant. This is revocation by
+    /// attrition, not immediate denial: a credential already delivered to the
+    /// subject remains cryptographically valid until its expiry, so the
+    /// revocation-latency bound is the credential's remaining lifetime.
     GrantDisabled(GrantIdentity),
 }
 

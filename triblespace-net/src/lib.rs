@@ -32,5 +32,7 @@ pub mod policy;
 /// Monotone signed event model for incoming requests and issuer renewal policy.
 pub mod policy_ledger;
 pub mod protocol;
+/// Recipient-authored intent, accepted-credential, and founder-selection effects.
+pub mod recipient_ledger;
 pub mod reconcile;
 pub mod transport;

@@ -649,6 +649,35 @@ pub struct VerifiedCapabilityChain {
     pub capability: VerifiedCapability,
 }
 
+/// A fully verified capability chain together with the canonical standalone
+/// signature blob of its terminal founder anchor.
+///
+/// Delegated signature blobs embed every parent proof but omit the embedded
+/// proof entity's `sig_signs` fact. Verification already proves the canonical
+/// entity id and the exact linear proof shape, so restoring that one fact for
+/// the terminal anchor reconstructs the original standalone blob byte-for-byte.
+/// This lets founder renewal retain only a stable grant selector instead of a
+/// second mutable handle to material that is already present in the selected
+/// proof.
+#[derive(Debug, Clone)]
+pub struct VerifiedCapabilityWithFounderAnchor {
+    /// The verified operational leaf and authority identities.
+    pub chain: VerifiedCapabilityChain,
+    /// Canonical standalone signature over the terminal founder-anchor cap.
+    pub founder_anchor_sig: Blob<SimpleArchive>,
+}
+
+/// Verified chain plus the already-validated ingredients needed to recreate
+/// its terminal standalone anchor. Keeping the ingredients internal avoids
+/// allocating and sorting an archive on ordinary verification paths that do
+/// not ask for founder renewal material.
+struct VerifiedCapabilityProof {
+    chain: VerifiedCapabilityChain,
+    founder_anchor_entity: crate::id::Id,
+    founder_anchor_cap: Inline<Handle<SimpleArchive>>,
+    founder_anchor_proof: VerifiedSigProof,
+}
+
 impl VerifiedCapability {
     /// Return the inclusive upper bound of this verified authority's lifetime.
     pub fn expires_at(&self) -> Epoch {
@@ -1016,12 +1045,48 @@ pub fn verify_chain_details_allow_expired<F>(
 where
     F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
-    verify_chain_inner(
+    Ok(verify_chain_inner(
         Some(team_root),
         leaf_sig_handle,
         expected_subject,
         fetch_blob,
-    )
+    )?
+    .chain)
+}
+
+/// Verify a complete capability proof and reconstruct its terminal founder
+/// anchor's standalone signature blob.
+///
+/// This has the same expired-tolerant trust boundary as
+/// [`verify_chain_details_allow_expired`]: `team_root` and `expected_subject`
+/// are checked before any reconstructed material is returned. The returned
+/// anchor signature is not an operational credential. It is authority material
+/// for minting a new finite founder sibling beneath the already-verified
+/// constitutional anchor.
+pub fn verify_chain_and_reconstruct_founder_anchor_allow_expired<F>(
+    team_root: VerifyingKey,
+    leaf_sig_handle: Inline<Handle<SimpleArchive>>,
+    expected_subject: VerifyingKey,
+    fetch_blob: F,
+) -> Result<VerifiedCapabilityWithFounderAnchor, VerifyError>
+where
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    let verified = verify_chain_inner(
+        Some(team_root),
+        leaf_sig_handle,
+        expected_subject,
+        fetch_blob,
+    )?;
+    let founder_anchor_sig = standalone_signature_blob(
+        verified.founder_anchor_entity,
+        verified.founder_anchor_cap,
+        &verified.founder_anchor_proof,
+    );
+    Ok(VerifiedCapabilityWithFounderAnchor {
+        chain: verified.chain,
+        founder_anchor_sig,
+    })
 }
 
 /// Verify a complete capability proof while discovering its team root.
@@ -1044,7 +1109,7 @@ pub fn verify_chain_and_extract_root_allow_expired<F>(
 where
     F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
-    verify_chain_inner(None, leaf_sig_handle, expected_subject, fetch_blob)
+    Ok(verify_chain_inner(None, leaf_sig_handle, expected_subject, fetch_blob)?.chain)
 }
 
 fn verify_chain_inner<F>(
@@ -1052,7 +1117,7 @@ fn verify_chain_inner<F>(
     leaf_sig_handle: Inline<Handle<SimpleArchive>>,
     expected_subject: VerifyingKey,
     mut fetch_blob: F,
-) -> Result<VerifiedCapabilityChain, VerifyError>
+) -> Result<VerifiedCapabilityProof, VerifyError>
 where
     F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
@@ -1147,16 +1212,21 @@ where
                 return Err(VerifyError::MalformedSig);
             }
             validate_sig_proof_shape(&sig_set, leaf_outer_id, &proof_shape)?;
-            return Ok(VerifiedCapabilityChain {
-                team_root,
-                leaf_cap: leaf_cap_handle,
-                leaf_issuer: leaf_fields.issuer,
-                capability: VerifiedCapability {
-                    subject: leaf_fields.subject,
-                    scope_root: leaf_fields.scope_root,
-                    cap_set: leaf_cap_set,
-                    expires_at: authority_expires_at,
+            return Ok(VerifiedCapabilityProof {
+                chain: VerifiedCapabilityChain {
+                    team_root,
+                    leaf_cap: leaf_cap_handle,
+                    leaf_issuer: leaf_fields.issuer,
+                    capability: VerifiedCapability {
+                        subject: leaf_fields.subject,
+                        scope_root: leaf_fields.scope_root,
+                        cap_set: leaf_cap_set,
+                        expires_at: authority_expires_at,
+                    },
                 },
+                founder_anchor_entity: current_outer_id,
+                founder_anchor_cap: current_cap_handle,
+                founder_anchor_proof: current_proof,
             });
         }
 
@@ -1273,6 +1343,27 @@ fn canonical_sig_entity_id(
     fragment
         .root()
         .expect("canonical signature entity exports exactly one intrinsic id")
+}
+
+/// Reconstruct the canonical standalone signature container for one proof
+/// entity. Callers must first prove that `entity` is the canonical id for
+/// `(proof, signed_cap)`; [`verify_chain_inner`] does so at every traversed
+/// level and invokes this helper only for the verified founder terminator.
+fn standalone_signature_blob(
+    entity: crate::id::Id,
+    signed_cap: Inline<Handle<SimpleArchive>>,
+    proof: &VerifiedSigProof,
+) -> Blob<SimpleArchive> {
+    let signature = Signature::from_components(proof.r, proof.s);
+    let set: TribleSet = entity! {
+        ExclusiveId::force_ref(&entity) @
+        sig_signs: signed_cap,
+        crate::repo::signed_by: proof.signer,
+        crate::repo::signature_r: signature,
+        crate::repo::signature_s: signature,
+    }
+    .into();
+    set.to_blob()
 }
 
 /// Require the signature container to be exactly the one linear proof chain
@@ -1553,6 +1644,76 @@ mod tests {
                 fetch_from(&blobs),
             ),
             Err(VerifyError::FounderAnchorRequired)
+        ));
+    }
+
+    #[test]
+    fn verified_founder_leaf_reconstructs_exact_standalone_anchor_signature() {
+        let team_root = key();
+        let founder = key();
+        let (anchor_cap, anchor_sig) = anchor_for(&team_root, &founder);
+        let (scope_root, scope_facts) = empty_scope();
+        let (cap, sig) = build_capability(
+            &founder,
+            founder.verifying_key(),
+            (anchor_cap.clone(), anchor_sig.clone()),
+            scope_root,
+            scope_facts,
+            interval(3600.0),
+        )
+        .expect("build finite founder credential");
+        let sig_handle = sig.get_handle();
+        let blobs = [anchor_cap, anchor_sig.clone(), cap, sig];
+
+        let reconstructed = verify_chain_and_reconstruct_founder_anchor_allow_expired(
+            team_root.verifying_key(),
+            sig_handle,
+            founder.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("verified proof reconstructs its founder anchor");
+
+        assert_eq!(reconstructed.founder_anchor_sig.bytes, anchor_sig.bytes);
+        assert_eq!(
+            reconstructed.founder_anchor_sig.get_handle(),
+            anchor_sig.get_handle()
+        );
+    }
+
+    #[test]
+    fn deep_verified_leaf_reconstructs_terminal_anchor_and_keeps_trust_binding() {
+        let (team_root, _founder, leaf_subject, blobs, leaf_sig_handle) = three_level_chain();
+        let anchor_sig = blobs[1].clone();
+
+        let reconstructed = verify_chain_and_reconstruct_founder_anchor_allow_expired(
+            team_root.verifying_key(),
+            leaf_sig_handle,
+            leaf_subject.verifying_key(),
+            fetch_from(&blobs),
+        )
+        .expect("deep proof reconstructs the terminal anchor");
+        assert_eq!(reconstructed.founder_anchor_sig.bytes, anchor_sig.bytes);
+
+        let wrong_root = key();
+        assert!(matches!(
+            verify_chain_and_reconstruct_founder_anchor_allow_expired(
+                wrong_root.verifying_key(),
+                leaf_sig_handle,
+                leaf_subject.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::InvalidFounderAnchor)
+        ));
+
+        let wrong_subject = key();
+        assert!(matches!(
+            verify_chain_and_reconstruct_founder_anchor_allow_expired(
+                team_root.verifying_key(),
+                leaf_sig_handle,
+                wrong_subject.verifying_key(),
+                fetch_from(&blobs),
+            ),
+            Err(VerifyError::SubjectMismatch)
         ));
     }
 
