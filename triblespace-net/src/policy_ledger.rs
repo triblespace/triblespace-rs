@@ -1196,7 +1196,12 @@ impl GrantView {
         self.disabled
     }
 
-    pub fn issuance(&self) -> &GrantIssuanceResolution {
+    /// Historical issuance projection, retained even after disablement.
+    ///
+    /// Inspection and positive-evidence recording may need this exact past
+    /// issuance. Operational dispatch must use [`Self::active_current`]
+    /// instead so disabled grants cannot drive work.
+    pub fn historical_issuance(&self) -> &GrantIssuanceResolution {
         &self.issuance
     }
 
@@ -2562,7 +2567,7 @@ mod tests {
         let grant_view = view.grants().get(&grant).unwrap();
         assert!(grant_view.disabled());
         assert!(grant_view.active_current().is_none());
-        let GrantIssuanceResolution::Current(current) = grant_view.issuance() else {
+        let GrantIssuanceResolution::Current(current) = grant_view.historical_issuance() else {
             panic!("one valid issuance must be current");
         };
         assert_eq!(current.cap(), cap);
@@ -2596,7 +2601,7 @@ mod tests {
                 panic!("complete closure must resolve");
             };
             let GrantIssuanceResolution::Current(current) =
-                view.grants().get(&grant).unwrap().issuance()
+                view.grants().get(&grant).unwrap().historical_issuance()
             else {
                 panic!("equal-scope siblings must select a current credential");
             };
@@ -2628,7 +2633,7 @@ mod tests {
             panic!("understood scope disagreement is a local conflict");
         };
         let GrantIssuanceResolution::Conflicted { signatures } =
-            view.grants().get(&grant).unwrap().issuance()
+            view.grants().get(&grant).unwrap().historical_issuance()
         else {
             panic!("different exact scope facts must not be hash-arbitrated");
         };

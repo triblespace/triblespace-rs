@@ -58,6 +58,7 @@ use triblespace_core::repo::{
 
 use crate::channel::{NetEvent, PublisherKey};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
+use crate::policy_ledger::GrantIdentity;
 use crate::protocol::RawHash;
 
 pub use crate::host::PeerConfig;
@@ -175,12 +176,15 @@ where
     /// fresh caps for entries on the renewal-policy pin.
     signing_key: SigningKey,
 
-    /// Per-entry cooldown for undelivered-cap re-dispatch. The
+    /// Per-grant cooldown for unauthenticated credential re-dispatch. The
     /// renewal daemon's tick runs every 100 ms; without this gate it
     /// would hammer iroh-connect attempts for any peer that's down.
-    /// Recorded against `entry.id`; the whole map is in-memory and rebuilds
-    /// naturally if the daemon restarts.
-    last_dispatch_attempt: HashMap<Id, crate::clock::Mono>,
+    /// Each stable grant retains only its latest dispatched signature and
+    /// attempt time, so a successor resets cooldown without accumulating
+    /// stale signature keys. The map is in-memory and rebuilds naturally if
+    /// the daemon restarts.
+    last_dispatch_attempt:
+        HashMap<GrantIdentity, (Inline<Handle<SimpleArchive>>, crate::clock::Mono)>,
 }
 
 impl<S> Peer<S>
@@ -452,17 +456,18 @@ where
                         }
                     };
 
-                    // Authentication is evidence about the exact historical
-                    // issuance, even after a grant has been disabled. Do not
-                    // use `active_current`: disabled grants intentionally keep
-                    // their selected issuance available for this match.
+                    // Authentication recording is evidence about the exact
+                    // historical issuance, even after a grant is disabled, so
+                    // this path deliberately inspects `historical_issuance`.
+                    // Dispatch paths must instead use `active_current` so a
+                    // disabled grant can never drive operational work.
                     let grant = {
                         let mut matches =
                             view.grants().iter().filter_map(|(grant, state)| {
                                 if grant.subject() != subject_key {
                                     return None;
                                 }
-                                match state.issuance() {
+                                match state.historical_issuance() {
                                     crate::policy_ledger::GrantIssuanceResolution::Current(
                                         current,
                                     ) if current.sig() == sig_inline => Some(*grant),
@@ -753,94 +758,171 @@ where
         }
     }
 
-    /// Cooldown for re-dispatching undelivered cap blobs. The daemon's
-    /// tick cadence is sub-second; without this gate we'd hammer
+    /// Cooldown for re-dispatching unauthenticated asserted credentials. The
+    /// daemon's tick cadence is sub-second; without this gate we'd hammer
     /// iroh-connect against a down peer 10× per second.
-    const UNDELIVERED_REDISPATCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
+    const UNAUTHENTICATED_REDISPATCH_COOLDOWN: std::time::Duration =
+        std::time::Duration::from_secs(15);
 
-    /// Re-dispatch the cap+sig pairs for every renewal-policy entry
-    /// that's not yet been ack'd by its subject, rate-limited per
-    /// entry via `last_dispatch_attempt`. The cap is NOT re-signed —
-    /// the same `(latest_cap, latest_sig)` blobs are sent again, so
-    /// idempotent on the receiver side (their OP_DELIVER_CAP handler
-    /// content-hashes the bytes and dedupes against what's already
-    /// pinned).
+    /// Re-dispatch each current asserted credential for this Peer's configured
+    /// team that has not yet been authenticated by its subject, rate-limited
+    /// per exact grant/signature through `last_dispatch_attempt`. The
+    /// credential is not re-signed: the selected current cap and signature
+    /// blobs are sent byte-for-byte, so the receiver's content-addressed
+    /// persistence remains idempotent.
+    ///
+    /// Only a complete locally-authored policy ledger may drive network work.
+    /// Snapshot, reader, incomplete-ledger, invalid-ledger, flush, and serving-
+    /// snapshot failures all defer the whole pass without dispatching.
     ///
     /// Returns the count of entries dispatched this tick.
-    fn redispatch_undelivered(&mut self) -> usize {
-        use triblespace_core::blob::Blob;
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::repo::BlobStoreGet;
-
+    fn redispatch_unauthenticated(&mut self) -> usize {
         let mut store = self.store.lock().expect("store mutex");
-
+        let assertion_snapshot = match store.pin_assertion_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "redispatch_unauthenticated: policy assertion snapshot unavailable; deferring"
+                );
+                return 0;
+            }
+        };
+        let reader = match store.reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "redispatch_unauthenticated: policy blob reader unavailable; deferring"
+                );
+                return 0;
+            }
+        };
+        let resolution = crate::policy_ledger::resolve_policy_ledger(
+            &assertion_snapshot,
+            self.signing_key.verifying_key(),
+            |handle| {
+                reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                    .ok()
+            },
+        );
+        let view = match resolution {
+            crate::policy_ledger::PolicyLedgerResolution::Complete(view) => view,
+            crate::policy_ledger::PolicyLedgerResolution::Incomplete { missing } => {
+                tracing::warn!(
+                    missing = missing.len(),
+                    handles = ?missing,
+                    "redispatch_unauthenticated: asserted policy ledger incomplete; deferring"
+                );
+                return 0;
+            }
+            crate::policy_ledger::PolicyLedgerResolution::Invalid { diagnostics } => {
+                tracing::warn!(
+                    diagnostics = ?diagnostics,
+                    "redispatch_unauthenticated: asserted policy ledger invalid; deferring"
+                );
+                return 0;
+            }
+        };
         let now = crate::clock::mono_now();
         let local_subject = self.signing_key.verifying_key();
-        let entries: Vec<_> = crate::policy::undelivered_entries(&mut *store)
-            .into_iter()
+        let entries: Vec<_> = view
+            .grants()
+            .iter()
+            // A signing identity may author policy for multiple teams. This
+            // Peer instance serves exactly its configured team root.
+            .filter(|(grant, _)| grant.team_root() == self.team_root)
             // Local credential rotation is a direct, durable founder action,
             // never an OP_DELIVER_CAP round-trip to ourselves.
-            .filter(|entry| entry.subject != local_subject)
-            .filter(|entry| {
-                self.last_dispatch_attempt
-                    .get(&entry.id)
-                    .is_none_or(|prev| {
-                        now.duration_since(*prev) >= Self::UNDELIVERED_REDISPATCH_COOLDOWN
-                    })
+            .filter(|(grant, _)| grant.subject() != local_subject)
+            .filter_map(|(grant, state)| {
+                let current = state.active_current()?;
+                (!current.authenticated()).then_some((*grant, current.cap(), current.sig()))
+            })
+            .filter(|(grant, _cap, sig)| {
+                self.last_dispatch_attempt.get(grant).is_none_or(
+                    |(previous_sig, previous_attempt)| {
+                        previous_sig != sig
+                            || now.duration_since(*previous_attempt)
+                                >= Self::UNAUTHENTICATED_REDISPATCH_COOLDOWN
+                    },
+                )
             })
             .collect();
         if entries.is_empty() {
             return 0;
         }
 
-        // An undelivered entry may be the residue of a prior renewal whose
-        // flush or serving-snapshot rebuild failed. Re-establish both barriers
-        // on every redispatch attempt; otherwise the next tick could bypass
-        // the failure and advertise proof handles this process has not made
-        // durably and coherently servable.
+        // Resolve exact bytes for the whole action set before any outward
+        // effect. Although Complete proved every closure member readable once,
+        // a backend may fail a subsequent read; that must defer the whole pass
+        // rather than partially dispatch a prefix of grants.
+        let mut ready = Vec::with_capacity(entries.len());
+        for (grant, cap, sig) in entries {
+            let cap_blob = match reader.get::<Blob<SimpleArchive>, SimpleArchive>(cap) {
+                Ok(blob) => blob,
+                Err(error) => {
+                    tracing::warn!(
+                        grant = ?grant,
+                        cap = ?cap,
+                        error = %error,
+                        "redispatch_unauthenticated: selected cap blob unreadable; deferring"
+                    );
+                    return 0;
+                }
+            };
+            let sig_blob = match reader.get::<Blob<SimpleArchive>, SimpleArchive>(sig) {
+                Ok(blob) => blob,
+                Err(error) => {
+                    tracing::warn!(
+                        grant = ?grant,
+                        sig = ?sig,
+                        error = %error,
+                        "redispatch_unauthenticated: selected signature blob unreadable; deferring"
+                    );
+                    return 0;
+                }
+            };
+            ready.push((grant, sig, cap_blob, sig_blob));
+        }
+        drop(reader);
+
+        // Re-establish both barriers on every redispatch attempt; otherwise a
+        // prior interrupted publication could advertise proof handles this
+        // process has not made durably and coherently servable.
         if let Err(error) = store.flush() {
             tracing::warn!(
-                pending = entries.len(),
+                pending = ready.len(),
                 error = %error,
-                "redispatch_undelivered: durable flush failed; deferring"
+                "redispatch_unauthenticated: durable flush failed; deferring"
             );
             return 0;
         }
         let Some(snapshot) = StoreSnapshot::from_store(&mut *store) else {
             self.sender.clear_snapshot();
             tracing::warn!(
-                pending = entries.len(),
-                "redispatch_undelivered: serving snapshot failed; deferring"
+                pending = ready.len(),
+                "redispatch_unauthenticated: serving snapshot failed; deferring"
             );
             return 0;
         };
         self.sender.update_snapshot(snapshot);
-        let Ok(reader) = store.reader() else {
-            return 0;
-        };
 
         let mut dispatched = 0usize;
-        for entry in entries {
-            let Ok(cap_blob) = reader.get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
-            else {
-                continue;
-            };
-            let Ok(sig_blob) = reader.get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_sig)
-            else {
-                continue;
-            };
-
+        for (grant, sig, cap_blob, sig_blob) in ready {
             self.sender.deliver_cap(
-                entry.subject.to_bytes(),
+                grant.subject().to_bytes(),
                 cap_blob.bytes.clone(),
                 sig_blob.bytes.clone(),
             );
-            self.last_dispatch_attempt.insert(entry.id, now);
+            self.last_dispatch_attempt.insert(grant, (sig, now));
             dispatched += 1;
             tracing::debug!(
-                subject = %hex::encode(entry.subject.to_bytes()),
-                entry = ?entry.id,
-                "redispatch_undelivered: re-sent OP_DELIVER_CAP"
+                subject = %hex::encode(grant.subject().to_bytes()),
+                grant = ?grant,
+                sig = ?sig,
+                "redispatch_unauthenticated: re-sent OP_DELIVER_CAP"
             );
         }
         dispatched
@@ -850,23 +932,20 @@ where
     ///
     /// Performs two pieces of work each tick:
     ///
-    /// 1. **Redispatch undelivered entries.** For each renewal-policy
-    ///    entry that's not yet been ack'd by its subject, re-send the
-    ///    same `(latest_cap, latest_sig)` blobs via
-    ///    `crate::channel::NetCommand::DeliverCap`, rate-limited per
-    ///    entry by `Self::UNDELIVERED_REDISPATCH_COOLDOWN`. This is
-    ///    what catches the case where the initial `team approve`
-    ///    delivery failed (subject offline) and the subject comes back
-    ///    later.
+    /// 1. **Redispatch unauthenticated asserted grants.** Resolve our complete
+    ///    policy ledger and re-send each active current `(cap, sig)` that has
+    ///    not acquired its exact `CredentialAuthenticated` fact, rate-limited
+    ///    per stable grant and current signature. This catches an initial
+    ///    delivery that missed an offline subject.
     ///
     /// 2. **Re-sign near-expiry entries.** For each entry whose current
     ///    cap upper bound falls within `renewal_window` of now, sign a
     ///    fresh cap+sig (using our team-cap as parent) and dispatch.
-    ///    The policy entry is updated in lockstep, which also clears
-    ///    any `delivered_at` so step (1) on the next tick picks the
-    ///    fresh cap up for re-confirmation.
+    ///    The legacy renewal policy entry is updated in lockstep. Its asserted
+    ///    issuance migration is intentionally separate from this redispatch
+    ///    consumer cut.
     ///
-    /// Returns the total count of dispatches this tick (undelivered
+    /// Returns the total count of dispatches this tick (unauthenticated
     /// re-sends + fresh renewals). `0` on every tick after the swarm
     /// settles into steady state means the daemon is quiet.
     ///
@@ -881,7 +960,7 @@ where
         use triblespace_core::inline::{Inline, TryFromInline, TryToInline};
         use triblespace_core::repo::BlobStoreGet;
 
-        let redispatched = self.redispatch_undelivered();
+        let redispatched = self.redispatch_unauthenticated();
 
         let mut store = self.store.lock().expect("store mutex");
         let credential_state =
@@ -1129,7 +1208,15 @@ where
             )
             .is_some()
             {
-                ready_to_dispatch.push((entry.id, entry.subject, cap_bytes, sig_bytes));
+                let grant = GrantIdentity::new(self.team_root, entry.subject, entry.scope);
+                ready_to_dispatch.push((
+                    entry.id,
+                    grant,
+                    new_sig_handle,
+                    entry.subject,
+                    cap_bytes,
+                    sig_bytes,
+                ));
             } else {
                 tracing::warn!(
                     entry = ?entry.id,
@@ -1166,11 +1253,11 @@ where
 
         let mut dispatched = 0usize;
         if serving_ready {
-            for (entry_id, subject, cap_bytes, sig_bytes) in ready_to_dispatch {
+            for (entry_id, grant, sig, subject, cap_bytes, sig_bytes) in ready_to_dispatch {
                 self.sender
                     .deliver_cap(subject.to_bytes(), cap_bytes, sig_bytes);
                 self.last_dispatch_attempt
-                    .insert(entry_id, crate::clock::mono_now());
+                    .insert(grant, (sig, crate::clock::mono_now()));
                 dispatched += 1;
                 tracing::info!(
                     subject = %hex::encode(subject.to_bytes()),
@@ -2661,12 +2748,118 @@ mod tests {
         Inner(#[from] triblespace_core::repo::pin_assertion::PinAssertionKeyCollision),
     }
 
+    type MemoryReader = <MemoryRepo as BlobStore>::Reader;
+
+    #[derive(Clone)]
+    struct ProbeReadFailure {
+        handle: [u8; 32],
+        fail_at: usize,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl ProbeReadFailure {
+        fn should_fail(&self, handle: [u8; 32]) -> bool {
+            handle == self.handle && self.reads.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at
+        }
+    }
+
+    #[derive(Clone)]
+    struct ProbeReader {
+        inner: MemoryReader,
+        failure: Option<ProbeReadFailure>,
+    }
+
+    impl PartialEq for ProbeReader {
+        fn eq(&self, other: &Self) -> bool {
+            let same_failure = match (&self.failure, &other.failure) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    left.handle == right.handle
+                        && left.fail_at == right.fail_at
+                        && Arc::ptr_eq(&left.reads, &right.reads)
+                }
+                (None, Some(_)) | (Some(_), None) => false,
+            };
+            self.inner == other.inner && same_failure
+        }
+    }
+
+    impl Eq for ProbeReader {}
+
+    #[derive(Debug)]
+    enum ProbeGetError<E> {
+        Injected,
+        Inner(E),
+    }
+
+    impl<E> std::fmt::Display for ProbeGetError<E>
+    where
+        E: std::fmt::Display,
+    {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Injected => formatter.write_str("injected blob read failure"),
+                Self::Inner(error) => error.fmt(formatter),
+            }
+        }
+    }
+
+    impl<E> std::error::Error for ProbeGetError<E>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Injected => None,
+                Self::Inner(error) => Some(error),
+            }
+        }
+    }
+
+    impl BlobStoreGet for ProbeReader {
+        type GetError<E: std::error::Error + Send + Sync + 'static> =
+            ProbeGetError<<MemoryReader as BlobStoreGet>::GetError<E>>;
+
+        fn get<T, E>(
+            &self,
+            handle: Inline<Handle<E>>,
+        ) -> Result<T, Self::GetError<<T as TryFromBlob<E>>::Error>>
+        where
+            E: BlobEncoding + 'static,
+            T: TryFromBlob<E>,
+            Handle<E>: InlineEncoding,
+        {
+            if self
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.should_fail(handle.raw))
+            {
+                return Err(ProbeGetError::Injected);
+            }
+            self.inner.get(handle).map_err(ProbeGetError::Inner)
+        }
+    }
+
+    impl BlobStoreList for ProbeReader {
+        type Iter<'a> = <MemoryReader as BlobStoreList>::Iter<'a>;
+        type Err = <MemoryReader as BlobStoreList>::Err;
+
+        fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+            self.inner.blobs()
+        }
+
+        fn blobs_diff<'a>(&'a self, old: &Self) -> Self::Iter<'a> {
+            self.inner.blobs_diff(&old.inner)
+        }
+    }
+
     struct FlushProbe {
         inner: MemoryRepo,
         flushes: Arc<AtomicUsize>,
         fail_flush: bool,
         fail_append: bool,
         fail_after_append_once: bool,
+        read_failure: Option<ProbeReadFailure>,
     }
 
     impl triblespace_core::repo::BlobStorePut for FlushProbe {
@@ -2683,11 +2876,14 @@ mod tests {
     }
 
     impl triblespace_core::repo::BlobStore for FlushProbe {
-        type Reader = <MemoryRepo as triblespace_core::repo::BlobStore>::Reader;
+        type Reader = ProbeReader;
         type ReaderError = <MemoryRepo as triblespace_core::repo::BlobStore>::ReaderError;
 
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-            self.inner.reader()
+            Ok(ProbeReader {
+                inner: self.inner.reader()?,
+                failure: self.read_failure.clone(),
+            })
         }
     }
 
@@ -3016,43 +3212,484 @@ mod tests {
         (anchor, credential)
     }
 
+    struct AssertedGrantSeries {
+        grant: GrantIdentity,
+        anchor: (Blob<SimpleArchive>, Blob<SimpleArchive>),
+        scope_root: Id,
+    }
+
+    impl AssertedGrantSeries {
+        fn new(
+            team_root: &SigningKey,
+            author: &SigningKey,
+            subject: ed25519_dalek::VerifyingKey,
+        ) -> Self {
+            let anchor_scope = genid();
+            let anchor_facts: TribleSet = entity! {
+                ExclusiveId::force_ref(&anchor_scope) @
+                triblespace_core::metadata::tag:
+                    triblespace_core::repo::capability::PERM_ADMIN,
+            }
+            .into();
+            let anchor = triblespace_core::repo::capability::build_founder_anchor(
+                team_root,
+                author.verifying_key(),
+                *anchor_scope,
+                anchor_facts,
+            )
+            .expect("build asserted grant anchor");
+            let scope_root = *genid();
+            Self {
+                grant: GrantIdentity::new(team_root.verifying_key(), subject, scope_root),
+                anchor,
+                scope_root,
+            }
+        }
+
+        fn issue<S>(
+            &self,
+            store: &mut S,
+            author: &SigningKey,
+            permission: Id,
+            upper: hifitime::Epoch,
+        ) -> (Inline<Handle<SimpleArchive>>, Inline<Handle<SimpleArchive>>)
+        where
+            S: BlobStore + StorageFlush + PinAssertionStore,
+        {
+            let facts: TribleSet = entity! {
+                ExclusiveId::force_ref(&self.scope_root) @
+                triblespace_core::metadata::tag: permission,
+            }
+            .into();
+            let expiry = (crate::clock::epoch_now(), upper)
+                .try_to_inline()
+                .expect("asserted grant expiry");
+            let (cap, sig) = triblespace_core::repo::capability::build_capability(
+                author,
+                self.grant.subject(),
+                self.anchor.clone(),
+                self.scope_root,
+                facts,
+                expiry,
+            )
+            .expect("build asserted credential");
+            let cap_handle = cap.get_handle();
+            let sig_handle = sig.get_handle();
+            crate::policy_ledger::issue_grant(
+                store,
+                author,
+                self.grant,
+                sig,
+                None,
+                [cap, self.anchor.0.clone(), self.anchor.1.clone()],
+            )
+            .expect("issue asserted grant");
+            (cap_handle, sig_handle)
+        }
+    }
+
     fn issue_asserted_grant<S>(
         store: &mut S,
         team_root: &SigningKey,
         author: &SigningKey,
         subject: ed25519_dalek::VerifyingKey,
     ) -> (
-        crate::policy_ledger::GrantIdentity,
+        GrantIdentity,
+        Inline<Handle<SimpleArchive>>,
         Inline<Handle<SimpleArchive>>,
     )
     where
         S: BlobStore + StorageFlush + PinAssertionStore,
     {
         let upper = crate::clock::epoch_now() + hifitime::Duration::from_hours(1.0);
-        let (anchor, credential) = founder_credential_until(
-            team_root,
+        let series = AssertedGrantSeries::new(team_root, author, subject);
+        let (cap, sig) = series.issue(
+            store,
             author,
-            subject,
             triblespace_core::repo::capability::PERM_READ,
             upper,
         );
-        let fields = delivery_cap_fields(credential.0.clone()).expect("credential fields");
-        let sig = credential.1.get_handle();
-        let grant = crate::policy_ledger::GrantIdentity::new(
-            team_root.verifying_key(),
-            subject,
-            fields.scope_root,
+        (series.grant, cap, sig)
+    }
+
+    fn take_dispatched_credentials(
+        wiring: &host::HostWiring,
+    ) -> Vec<(
+        PublisherKey,
+        Inline<Handle<SimpleArchive>>,
+        Inline<Handle<SimpleArchive>>,
+    )> {
+        wiring
+            .cmd_rx
+            .try_iter()
+            .filter_map(|command| match command {
+                crate::channel::NetCommand::DeliverCap {
+                    subject,
+                    cap_bytes,
+                    sig_bytes,
+                } => Some((
+                    subject,
+                    Blob::<SimpleArchive>::new(cap_bytes).get_handle(),
+                    Blob::<SimpleArchive>::new(sig_bytes).get_handle(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn redispatch_sends_exact_unauthenticated_current_credential() {
+        let team_root = SigningKey::from_bytes(&[0x92; 32]);
+        let author = SigningKey::from_bytes(&[0x93; 32]);
+        let subject = SigningKey::from_bytes(&[0x94; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let (grant, cap, sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer =
+            Peer::with_wiring(store, author, team_root.verifying_key(), sender, receiver);
+        assert!(take_dispatched_credentials(&wiring).is_empty());
+
+        assert_eq!(peer.redispatch_unauthenticated(), 1);
+        assert_eq!(
+            take_dispatched_credentials(&wiring),
+            vec![(subject.to_bytes(), cap, sig)]
         );
-        crate::policy_ledger::issue_grant(
-            store,
-            author,
-            grant,
-            credential.1,
-            None,
-            [credential.0, anchor.0, anchor.1],
+        assert_eq!(peer.last_dispatch_attempt.len(), 1);
+        assert_eq!(peer.last_dispatch_attempt.get(&grant).unwrap().0, sig);
+
+        assert_eq!(peer.redispatch_unauthenticated(), 0);
+        assert!(
+            take_dispatched_credentials(&wiring).is_empty(),
+            "the same current signature is cooldown-limited"
+        );
+    }
+
+    #[test]
+    fn redispatch_suppresses_authenticated_disabled_conflicted_local_and_foreign_team_grants() {
+        let team_root = SigningKey::from_bytes(&[0x95; 32]);
+        let foreign_root = SigningKey::from_bytes(&[0xA4; 32]);
+        let author = SigningKey::from_bytes(&[0x96; 32]);
+        let authenticated_subject = SigningKey::from_bytes(&[0x97; 32]).verifying_key();
+        let disabled_subject = SigningKey::from_bytes(&[0x98; 32]).verifying_key();
+        let conflicted_subject = SigningKey::from_bytes(&[0x99; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+
+        let (authenticated_grant, _cap, authenticated_sig) =
+            issue_asserted_grant(&mut store, &team_root, &author, authenticated_subject);
+        crate::policy_ledger::authenticate_credential(
+            &mut store,
+            &author,
+            authenticated_grant,
+            authenticated_sig,
         )
-        .expect("issue asserted grant");
-        (grant, sig)
+        .expect("authenticate asserted grant");
+
+        let (disabled_grant, _cap, _sig) =
+            issue_asserted_grant(&mut store, &team_root, &author, disabled_subject);
+        crate::policy_ledger::disable_grant(&mut store, &author, disabled_grant)
+            .expect("disable asserted grant");
+
+        let conflicted = AssertedGrantSeries::new(&team_root, &author, conflicted_subject);
+        let now = crate::clock::epoch_now();
+        conflicted.issue(
+            &mut store,
+            &author,
+            triblespace_core::repo::capability::PERM_READ,
+            now + hifitime::Duration::from_hours(1.0),
+        );
+        conflicted.issue(
+            &mut store,
+            &author,
+            triblespace_core::repo::capability::PERM_WRITE,
+            now + hifitime::Duration::from_hours(2.0),
+        );
+
+        let (local_grant, _cap, _sig) =
+            issue_asserted_grant(&mut store, &team_root, &author, author.verifying_key());
+        let foreign_subject = SigningKey::from_bytes(&[0xA5; 32]).verifying_key();
+        let (foreign_grant, _cap, _sig) =
+            issue_asserted_grant(&mut store, &foreign_root, &author, foreign_subject);
+
+        let snapshot = store.pin_assertion_snapshot().unwrap();
+        let reader = store.reader().unwrap();
+        let crate::policy_ledger::PolicyLedgerResolution::Complete(view) =
+            crate::policy_ledger::resolve_policy_ledger(
+                &snapshot,
+                author.verifying_key(),
+                |handle| {
+                    reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                },
+            )
+        else {
+            panic!("suppression fixture must be a complete policy ledger");
+        };
+        assert!(
+            view.grants()
+                .get(&authenticated_grant)
+                .unwrap()
+                .active_current()
+                .unwrap()
+                .authenticated()
+        );
+        assert!(view.grants().get(&disabled_grant).unwrap().disabled());
+        assert!(matches!(
+            view.grants()
+                .get(&conflicted.grant)
+                .unwrap()
+                .historical_issuance(),
+            crate::policy_ledger::GrantIssuanceResolution::Conflicted { .. }
+        ));
+        assert!(
+            view.grants()
+                .get(&local_grant)
+                .unwrap()
+                .active_current()
+                .is_some()
+        );
+        assert!(
+            view.grants()
+                .get(&foreign_grant)
+                .unwrap()
+                .active_current()
+                .is_some(),
+            "foreign-team fixture must otherwise be dispatchable"
+        );
+        drop(reader);
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer =
+            Peer::with_wiring(store, author, team_root.verifying_key(), sender, receiver);
+        assert!(take_dispatched_credentials(&wiring).is_empty());
+
+        assert_eq!(peer.redispatch_unauthenticated(), 0);
+        assert!(take_dispatched_credentials(&wiring).is_empty());
+        assert!(peer.last_dispatch_attempt.is_empty());
+    }
+
+    #[test]
+    fn redispatch_new_current_signature_resets_cooldown_without_growing_map() {
+        let team_root = SigningKey::from_bytes(&[0x9A; 32]);
+        let author = SigningKey::from_bytes(&[0x9B; 32]);
+        let subject = SigningKey::from_bytes(&[0x9C; 32]).verifying_key();
+        let series = AssertedGrantSeries::new(&team_root, &author, subject);
+        let now = crate::clock::epoch_now();
+        let mut store = MemoryRepo::default();
+        let first = series.issue(
+            &mut store,
+            &author,
+            triblespace_core::repo::capability::PERM_READ,
+            now + hifitime::Duration::from_hours(1.0),
+        );
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            store,
+            author.clone(),
+            team_root.verifying_key(),
+            sender,
+            receiver,
+        );
+        assert!(take_dispatched_credentials(&wiring).is_empty());
+        assert_eq!(peer.redispatch_unauthenticated(), 1);
+        assert_eq!(
+            take_dispatched_credentials(&wiring),
+            vec![(subject.to_bytes(), first.0, first.1)]
+        );
+        assert_eq!(peer.redispatch_unauthenticated(), 0);
+
+        let successor = {
+            let mut store = peer.store.lock().expect("store mutex");
+            series.issue(
+                &mut *store,
+                &author,
+                triblespace_core::repo::capability::PERM_READ,
+                now + hifitime::Duration::from_hours(2.0),
+            )
+        };
+        assert_ne!(successor, first);
+
+        assert_eq!(
+            peer.redispatch_unauthenticated(),
+            1,
+            "a selected successor signature bypasses its predecessor's cooldown"
+        );
+        assert_eq!(
+            take_dispatched_credentials(&wiring),
+            vec![(subject.to_bytes(), successor.0, successor.1)]
+        );
+        assert_eq!(peer.last_dispatch_attempt.len(), 1);
+        assert_eq!(
+            peer.last_dispatch_attempt.get(&series.grant).unwrap().0,
+            successor.1
+        );
+    }
+
+    #[test]
+    fn redispatch_defers_incomplete_and_invalid_policy_ledgers() {
+        let incomplete_root = SigningKey::from_bytes(&[0x9D; 32]);
+        let incomplete_author = SigningKey::from_bytes(&[0x9E; 32]);
+        let incomplete_subject = SigningKey::from_bytes(&[0x9F; 32]).verifying_key();
+        let incomplete_grant = GrantIdentity::new(
+            incomplete_root.verifying_key(),
+            incomplete_subject,
+            *genid(),
+        );
+        let missing_sig = Inline::<Handle<SimpleArchive>>::new([0xA0; 32]);
+        let missing_event = crate::policy_ledger::PolicyEvent::GrantIssued {
+            grant: incomplete_grant,
+            sig: missing_sig,
+            request: None,
+        };
+        let mut incomplete_store = MemoryRepo::default();
+        incomplete_store
+            .append_pin_assertion(crate::policy_ledger::sign_policy_event(
+                &incomplete_author,
+                missing_event,
+            ))
+            .expect("append assertion without event blob");
+        let endpoint = EndpointId::from_bytes(&incomplete_author.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut incomplete_peer = Peer::with_wiring(
+            incomplete_store,
+            incomplete_author,
+            incomplete_root.verifying_key(),
+            sender,
+            receiver,
+        );
+        assert_eq!(incomplete_peer.redispatch_unauthenticated(), 0);
+        assert!(take_dispatched_credentials(&wiring).is_empty());
+
+        let invalid_root = SigningKey::from_bytes(&[0xA1; 32]);
+        let invalid_author = SigningKey::from_bytes(&[0xA2; 32]);
+        let invalid_subject = SigningKey::from_bytes(&[0xA3; 32]).verifying_key();
+        let invalid_grant =
+            GrantIdentity::new(invalid_root.verifying_key(), invalid_subject, *genid());
+        let malformed_sig_blob =
+            crate::policy_ledger::PolicyEvent::GrantDisabled(invalid_grant).to_blob();
+        let malformed_sig = malformed_sig_blob.get_handle();
+        let invalid_event = crate::policy_ledger::PolicyEvent::GrantIssued {
+            grant: invalid_grant,
+            sig: malformed_sig,
+            request: None,
+        };
+        let mut invalid_store = MemoryRepo::default();
+        invalid_store
+            .put::<SimpleArchive, _>(malformed_sig_blob)
+            .expect("store malformed proof");
+        invalid_store
+            .put::<SimpleArchive, _>(invalid_event.to_blob())
+            .expect("store invalid policy event");
+        invalid_store
+            .append_pin_assertion(crate::policy_ledger::sign_policy_event(
+                &invalid_author,
+                invalid_event,
+            ))
+            .expect("append invalid issuance assertion");
+        let endpoint = EndpointId::from_bytes(&invalid_author.verifying_key().to_bytes())
+            .expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut invalid_peer = Peer::with_wiring(
+            invalid_store,
+            invalid_author,
+            invalid_root.verifying_key(),
+            sender,
+            receiver,
+        );
+        assert_eq!(invalid_peer.redispatch_unauthenticated(), 0);
+        assert!(take_dispatched_credentials(&wiring).is_empty());
+    }
+
+    #[test]
+    fn redispatch_second_selected_blob_read_failure_defers_the_whole_pass() {
+        let team_root = SigningKey::from_bytes(&[0xA6; 32]);
+        let author = SigningKey::from_bytes(&[0xA7; 32]);
+        let first_subject = SigningKey::from_bytes(&[0xA8; 32]).verifying_key();
+        let second_subject = SigningKey::from_bytes(&[0xA9; 32]).verifying_key();
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut store = FlushProbe {
+            inner: MemoryRepo::default(),
+            flushes,
+            fail_flush: false,
+            fail_append: false,
+            fail_after_append_once: false,
+            read_failure: None,
+        };
+        let first = issue_asserted_grant(&mut store, &team_root, &author, first_subject);
+        let second = issue_asserted_grant(&mut store, &team_root, &author, second_subject);
+        let (earlier, later) = if first.0 < second.0 {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let reads = Arc::new(AtomicUsize::new(0));
+
+        // Establish that one complete reduction reads this cap exactly once;
+        // the injected second access below is therefore materialization after
+        // selection, not an incomplete-ledger fixture.
+        store.read_failure = Some(ProbeReadFailure {
+            handle: later.1.raw,
+            fail_at: usize::MAX,
+            reads: Arc::clone(&reads),
+        });
+        let snapshot = store.pin_assertion_snapshot().unwrap();
+        let reader = store.reader().unwrap();
+        assert!(matches!(
+            crate::policy_ledger::resolve_policy_ledger(
+                &snapshot,
+                author.verifying_key(),
+                |handle| {
+                    reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                },
+            ),
+            crate::policy_ledger::PolicyLedgerResolution::Complete(_)
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        reads.store(0, Ordering::SeqCst);
+        store.read_failure = Some(ProbeReadFailure {
+            handle: later.1.raw,
+            fail_at: 2,
+            reads: Arc::clone(&reads),
+        });
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer =
+            Peer::with_wiring(store, author, team_root.verifying_key(), sender, receiver);
+        assert!(take_dispatched_credentials(&wiring).is_empty());
+
+        assert_eq!(peer.redispatch_unauthenticated(), 0);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(
+            take_dispatched_credentials(&wiring).is_empty(),
+            "a later selected-blob failure must not leak the earlier grant"
+        );
+        assert!(peer.last_dispatch_attempt.is_empty());
+
+        assert_eq!(
+            peer.redispatch_unauthenticated(),
+            2,
+            "the one-shot read fault must leave both valid grants retryable"
+        );
+        assert_eq!(
+            take_dispatched_credentials(&wiring),
+            vec![
+                (earlier.0.subject().to_bytes(), earlier.1, earlier.2),
+                (later.0.subject().to_bytes(), later.1, later.2),
+            ]
+        );
     }
 
     #[test]
@@ -3061,7 +3698,7 @@ mod tests {
         let author = SigningKey::from_bytes(&[0x82; 32]);
         let subject = SigningKey::from_bytes(&[0x83; 32]).verifying_key();
         let mut store = MemoryRepo::default();
-        let (grant, sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
+        let (grant, _cap, sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
         crate::policy_ledger::disable_grant(&mut store, &author, grant)
             .expect("disable asserted grant");
 
@@ -3106,7 +3743,8 @@ mod tests {
         };
         let grant_view = view.grants().get(&grant).expect("issued grant");
         assert!(grant_view.disabled());
-        let crate::policy_ledger::GrantIssuanceResolution::Current(current) = grant_view.issuance()
+        let crate::policy_ledger::GrantIssuanceResolution::Current(current) =
+            grant_view.historical_issuance()
         else {
             panic!("disabled grant retains its current historical issuance");
         };
@@ -3123,7 +3761,8 @@ mod tests {
         let author = SigningKey::from_bytes(&[0x85; 32]);
         let subject = SigningKey::from_bytes(&[0x86; 32]).verifying_key();
         let mut store = MemoryRepo::default();
-        let (grant, issued_sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
+        let (grant, _cap, issued_sig) =
+            issue_asserted_grant(&mut store, &team_root, &author, subject);
         let unknown_sig = Inline::<Handle<SimpleArchive>>::new([0x87; 32]);
         assert_ne!(unknown_sig, issued_sig);
 
@@ -3166,7 +3805,7 @@ mod tests {
             panic!("issued policy ledger must remain complete");
         };
         let crate::policy_ledger::GrantIssuanceResolution::Current(current) =
-            view.grants().get(&grant).unwrap().issuance()
+            view.grants().get(&grant).unwrap().historical_issuance()
         else {
             panic!("issued grant must remain current");
         };
@@ -3285,8 +3924,9 @@ mod tests {
             fail_flush: false,
             fail_append: false,
             fail_after_append_once: false,
+            read_failure: None,
         };
-        let (grant, sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
+        let (grant, _cap, sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
         store.fail_append = true;
 
         let endpoint =
@@ -3337,7 +3977,7 @@ mod tests {
             panic!("pre-effect assertion failure leaves the ledger complete");
         };
         let crate::policy_ledger::GrantIssuanceResolution::Current(current) =
-            view.grants().get(&grant).unwrap().issuance()
+            view.grants().get(&grant).unwrap().historical_issuance()
         else {
             panic!("issued grant remains current");
         };
@@ -3444,6 +4084,7 @@ mod tests {
                 fail_flush: true,
                 fail_append: false,
                 fail_after_append_once: false,
+                read_failure: None,
             },
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3497,6 +4138,7 @@ mod tests {
                 fail_flush: false,
                 fail_append: true,
                 fail_after_append_once: false,
+                read_failure: None,
             },
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3559,6 +4201,7 @@ mod tests {
                 fail_flush: false,
                 fail_append: false,
                 fail_after_append_once: true,
+                read_failure: None,
             },
             signing_key.clone(),
             signing_key.verifying_key(),

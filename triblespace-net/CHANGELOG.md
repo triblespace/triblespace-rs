@@ -78,7 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful subject authentication records an exact
   `CredentialAuthenticated` assertion only after resolving a complete issuer
   ledger and uniquely matching the current subject/signature issuance;
-  incomplete or invalid policy fails closed.
+  incomplete or invalid policy fails closed. Redispatch now resolves that same
+  ledger afresh and sends only unauthenticated active current grants for this
+  daemon's configured team. Disabled, conflicted, local-subject, and
+  foreign-team grants cannot drive dispatch; successor signatures reset one
+  bounded per-grant cooldown. All selected blobs are materialized before the
+  first send, while any read, flush, or serving-snapshot failure defers the
+  whole pass.
 - **Serving resources fail closed.** Unauthenticated work, authenticated
   connections, and post-auth streams are globally bounded; each subject may
   hold at most one live inbound pile-sync connection, including while admitted

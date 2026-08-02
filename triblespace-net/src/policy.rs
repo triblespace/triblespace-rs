@@ -78,17 +78,10 @@ attributes! {
     /// daemon skips entries with this attribute; the corresponding
     /// peer's chain dies naturally at the current cap's expiry.
     "57C45D022B79C4D3A021AC0114D973EE" as pub policy_retracted_at: NsTAIInterval;
-    /// Set when the most recently dispatched `OP_DELIVER_CAP` to the
-    /// subject returned a STATUS_OK ack — i.e. the subject's daemon
-    /// confirmed receipt of `policy_latest_cap` / `policy_latest_sig`.
-    /// Cleared (the attribute removed) every time we re-sign the cap
-    /// (on a renewal tick), so the next dispatch round resumes
-    /// retry-until-ack until the new cap also lands.
-    ///
-    /// The daemon's tick treats entries without this attribute as
-    /// "still pending delivery" and re-dispatches them (rate-limited
-    /// via an in-memory per-entry cooldown so a peer that's
-    /// persistently unreachable doesn't get hammered).
+    /// Legacy positive-delivery marker for the cap/signature named by this
+    /// entry. Cleared when that legacy entry is re-signed. Asserted-policy
+    /// redispatch derives authentication from `CredentialAuthenticated`
+    /// events and deliberately does not consult this attribute.
     "2E289E766CFD4F2554D430C31337BE2B" as pub policy_delivered_at: NsTAIInterval;
 
     // ── Pending request entry ─────────────────────────────────────────
@@ -1141,11 +1134,8 @@ pub struct PolicyEntry {
     /// `Some(t)` if A has chosen to stop auto-renewing this entry;
     /// the daemon must skip entries with this set.
     pub retracted_at: Option<Inline<NsTAIInterval>>,
-    /// `Some(t)` once the subject's daemon has ack'd receipt of the
-    /// current `latest_cap` / `latest_sig` via OP_DELIVER_CAP's
-    /// STATUS_OK. `None` means delivery is still pending — the
-    /// renewal daemon's tick re-dispatches such entries until the
-    /// ack lands.
+    /// Legacy positive-delivery marker for the current cap/signature. The
+    /// asserted-policy redispatch consumer does not consult this field.
     pub delivered_at: Option<Inline<NsTAIInterval>>,
 }
 
@@ -1228,21 +1218,6 @@ where
                 }
             },
         )
-        .collect()
-}
-
-/// Filter `list_renewal_policy` to entries that are still pending
-/// delivery: not retracted, and not yet ack'd by the subject's
-/// daemon. These are the entries the renewal daemon re-dispatches on
-/// each tick until the ack lands.
-pub fn undelivered_entries<S>(store: &mut S) -> Vec<PolicyEntry>
-where
-    S: BlobStore + PinStore,
-{
-    list_renewal_policy(store)
-        .into_iter()
-        .filter(|e| e.retracted_at.is_none())
-        .filter(|e| e.delivered_at.is_none())
         .collect()
 }
 
@@ -1431,10 +1406,8 @@ where
         meta = meta.difference(&t);
     }
 
-    // Re-signing supersedes the prior cap. The subject's daemon
-    // needs to ack the new (cap, sig) pair afresh, so clear any
-    // existing `policy_delivered_at` and let the next tick's
-    // `undelivered_entries` pick it up for re-dispatch.
+    // Re-signing supersedes the prior cap, so its legacy positive-delivery
+    // marker no longer describes the entry's current signature.
     let cur_delivered_at: Option<Inline<NsTAIInterval>> = find!(
         t: Inline<NsTAIInterval>,
         pattern!(&meta, [{ entry_id @ policy_delivered_at: ?t }])
@@ -1465,13 +1438,9 @@ where
     }
 }
 
-/// Mark a renewal-policy entry as delivered (sets
-/// `policy_delivered_at = now`). Called after the subject authenticates with
-/// the exact current signature handle.
-/// The daemon's `undelivered_entries` filter then skips this entry
-/// on subsequent ticks; only renewable_within (near-expiry) picks
-/// it up again, and `update_policy_entry` clears the field when the
-/// daemon re-signs.
+/// Mark a legacy renewal-policy entry as delivered (`policy_delivered_at =
+/// now`). Retained while remaining local writers migrate to asserted policy;
+/// asserted-policy redispatch does not consult this marker.
 pub fn mark_policy_delivered<S>(store: &mut S, entry_id: Id) -> Option<()>
 where
     S: BlobStore + BlobStorePut + PinStore,
@@ -1484,9 +1453,9 @@ where
     let reader = store.reader().ok()?;
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
 
-    // Exact authentication replays are true no-ops. A fresh re-sign removes
-    // this field in `update_policy_entry`, so an existing value already
-    // confirms the current `(subject, latest_sig)` selected by the caller.
+    // Repeating the exact legacy mark is a true no-op. A fresh re-sign removes
+    // this field in `update_policy_entry`, so an existing value already marks
+    // the current `(subject, latest_sig)` selected by the caller.
     let cur: Option<Inline<NsTAIInterval>> = find!(
         t: Inline<NsTAIInterval>,
         pattern!(&meta, [{ entry_id @ policy_delivered_at: ?t }])

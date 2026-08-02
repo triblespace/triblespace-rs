@@ -37,7 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Successful subject authentication is likewise recorded as an exact
   `CredentialAuthenticated` effect after a fresh complete-ledger resolution;
   missing or invalid policy fails closed, while an unrelated signature is a
-  no-op rather than invented evidence.
+  no-op rather than invented evidence. Credential redispatch now consumes that
+  same resolved truth: only an unauthenticated `active_current()` grant for the
+  daemon's configured team may drive a send. Disabled, conflicted, local-subject,
+  and foreign-team grants are inert; a successor signature resets the bounded
+  per-grant cooldown. Every selected blob is materialized before the first send,
+  and any read, flush, or serving-snapshot failure defers the whole pass.
   Operation-order tests pin that one-way crash protocol; real-Pile reopen
   coverage verifies the resulting ledger and both retention descriptors replay
   as complete content.
