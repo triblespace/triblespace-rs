@@ -1071,7 +1071,9 @@ where
 /// evidence are global fail-closed states for this deliberately coarse first
 /// ledger layout. Complete means closure-valid for the supplied assertion
 /// snapshot; it does not imply that every independently mutated replica has
-/// converged into that snapshot.
+/// converged into that snapshot. Fetching missing content for the same snapshot
+/// can refine resolution, but adding or merging assertions creates a new input;
+/// callers must not cache a complete policy view across that boundary.
 #[derive(Debug)]
 pub enum PolicyLedgerResolution {
     Complete(PolicyLedgerView),

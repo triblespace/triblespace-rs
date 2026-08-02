@@ -61,6 +61,12 @@ pub trait PartialCommitDag {
 }
 
 /// Canonical branch resolution from a coherent assertion snapshot.
+///
+/// Every result, including [`BranchResolution::Complete`], is scoped to the
+/// exact assertion snapshot supplied to the resolver. Fetching more commit
+/// metadata for that same snapshot can refine missing ancestry, but adding or
+/// merging assertions creates a new input and requires fresh resolution. Do
+/// not cache a complete frontier across an assertion merge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BranchResolution {
     /// No assertion exists for the requested exact identity. Empty branches are
