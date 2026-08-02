@@ -72,7 +72,7 @@ pub enum Command {
         #[arg(long, value_enum, default_value = "read")]
         scope: ScopeArg,
         /// Restrict legacy blob RPC scope to specific mutable local pins
-        /// (32 hex chars). Repeatable. This cannot name an exact StrongPin
+        /// (32 hex chars). Repeatable. This cannot name an exact asserted
         /// `(author, name-handle)` branch identity.
         #[arg(long = "legacy-pin", value_name = "PIN_HEX")]
         legacy_pins: Vec<String>,

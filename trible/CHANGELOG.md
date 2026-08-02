@@ -8,11 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
-- **The pile branch CLI now mirrors StrongPin directly.** Exact
+- **The pile branch CLI now mirrors the typed branch-pin model.** Exact
   `ed25519:<author>/blake3:<name-handle>` descriptors replace truncated branch
-  ids and human names as selectors. The surface is reduced to durable
-  single-assertion publication, deterministic list/show/candidate-rooted log observation, and
-  an explicit source-to-destination local `forget` rewrite. Mutable create,
+  ids and human names as selectors. The surface is reduced to deterministic
+  list/show/candidate-rooted log observation and an explicit
+  source-to-destination local `forget` rewrite. Raw assertion authoring is
+  removed because only a Repository workspace carries trustworthy
+  `BranchRank` provenance. Mutable create,
   set, rename, delete, reflog, consolidation, merge-import, and the legacy
   top-level merge/extract/re-id/squash rewrites are removed rather than kept as
   compatibility paths.
@@ -24,7 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   incompletely durable multi-directory side effect.
 - **Remote mutable cells are exposed only as local pins.** The misleading
   `store branch` surface is replaced by `store pin list`; direct object-store
-  StrongPin assertions remain unavailable until a backend can meet coherent
+  generic assertions remain unavailable until a backend can meet coherent
   snapshot and durable-append contracts.
 - **Legacy mutable-HEAD transport is gone.** `pile net sync` announces content
   and services durable lazy-fetch wants; it neither exchanges scalar HEADs nor
@@ -36,13 +38,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   tail, incoming persistence failure, or final flush failure instead of
   silently succeeding. Ctrl-C uses the same orderly close path, and malformed
   explicit peer ids are rejected rather than silently dropped.
-- **Capability CLI wording no longer aliases legacy pins with StrongPin
+- **Capability CLI wording no longer aliases legacy pins with asserted
   branches.** `team invite --legacy-pin` replaces `--branch`, and audit output
   labels those 16-byte `scope_branch` values as `legacy-pins`; they restrict the
   current blob RPC only and cannot select `(author, name-handle)` authority.
 - **The legacy name-schema migration no longer renames duplicate names.** It
   performs only the requested ShortString-to-LongString attribute migration;
-  duplicate presentation names are not an ambiguity in the StrongPin model and
+  duplicate presentation names are not an ambiguity in the branch-pin model and
   no longer trigger a hidden destructive rewrite.
 
 ## [0.41.4] - 2026-05-17

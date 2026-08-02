@@ -893,13 +893,13 @@ mod tests {
 
         // Independent assertions from the same empty base resolve to one
         // canonical, contentless merge. A no-change push caches that synthetic
-        // commit without adding a third branch assertion.
+        // commit without adding a third asserted branch-pin value.
         let mut merged = repo.pull(identity).unwrap();
         let merge_head = merged.head().unwrap();
         repo.push(&mut merged).unwrap();
 
         // Derived index publication is deliberately explicit and separate
-        // from branch assertion publication.
+        // from typed branch-pin publication.
         let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
         append_range(
             repo.storage_mut(),

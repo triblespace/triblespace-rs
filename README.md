@@ -178,8 +178,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .expect("workspace rank has room");
     repo.push(&mut collaborator).expect("publish collaborator");
 
-    // A stale workspace may publish too: it adds another signed assertion
-    // instead of racing a mutable compare-and-set branch pointer.
+    // A stale workspace may publish too: it adds another generic assertion
+    // carrying the branch descriptor, commit, and authenticated rank instead
+    // of racing a mutable compare-and-set branch pointer.
     repo.push(&mut ws).expect("publish concurrent tip");
 
     // Both tips and their ancestry are local, so the frontier is Complete.

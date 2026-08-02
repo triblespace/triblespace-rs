@@ -10,7 +10,7 @@ use triblespace_core::repo::pin_assertion::{PinAssertionId, PinAssertionStore};
 
 #[derive(Parser)]
 pub enum Command {
-    /// Verify blob integrity and report exact StrongPin completeness.
+    /// Verify blob integrity and report exact asserted-branch completeness.
     Check {
         /// Path to the pile file to inspect.
         pile: PathBuf,
@@ -430,31 +430,6 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                     }
                 }
                 PileRecordContent::PinTombstone { .. } => {}
-                PileRecordContent::BranchAssertion { assertion } => {
-                    if assertion.identity().name().raw == needle {
-                        assertion_field_matches += 1;
-                        println!(
-                            "branch assertion name-handle match at byte {}",
-                            record.offset
-                        );
-                    }
-                    if assertion.commit().raw == needle {
-                        assertion_field_matches += 1;
-                        println!(
-                            "branch assertion commit-handle match at byte {}",
-                            record.offset
-                        );
-                    }
-                }
-                PileRecordContent::InvalidBranchAssertion { id } => {
-                    if id.raw() == needle {
-                        assertion_field_matches += 1;
-                        println!(
-                            "invalid branch assertion record-id match at byte {} (claim hidden)",
-                            record.offset
-                        );
-                    }
-                }
                 PileRecordContent::PinAssertion { assertion } => {
                     if assertion.identity().pin().raw() == needle {
                         assertion_field_matches += 1;

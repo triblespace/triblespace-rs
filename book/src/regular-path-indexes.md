@@ -236,7 +236,8 @@ and reject stale coverage. Imported or manually assembled metadata should be
 checked with `Manifest::audit_exact_cover` against a blob reader before it is
 trusted, or rebuilt. See [Range-Native Derived Indexes](index-ranges.md) for the
 inclusive frontier and exact-cover rules. This audit belongs to the derived
-index workflow; source branch assertions remain a small, index-neutral ledger.
+index workflow; source branch pins remain a small typed projection over the
+generic, index-neutral asserted-pin ledger.
 
 ## Cost model: sparse input, potentially dense answer
 

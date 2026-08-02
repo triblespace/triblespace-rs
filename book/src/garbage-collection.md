@@ -1,16 +1,17 @@
 # Garbage Collection and Forgetting
 
-Repositories grow over time as commits, branch assertions, and user blobs
+Repositories grow over time as commits, generic pin assertions, and user blobs
 accumulate. Because every blob is content addressed and immutable, nothing is
 overwritten in place. A retention backend such as `Yard` can periodically
 _forget_ blobs that are not reachable from durable roots, while a raw `Pile`
 remains append-only until an explicit rewrite.
 
 Forgetting is deliberately conservative. It only removes local copies, so an
-explicit low-level forget can leave an assertion `TipPending` until a peer
-restores its target. Automatic repository collection is stricter: every
-accepted branch assertion is a durable root, so its locally present name,
-commit target, and target closure survive collection.
+explicit low-level forget can leave a branch `TipPending` until a peer restores
+its asserted target. Automatic repository collection is stricter for recognized
+branch pins: every valid assertion whose locally present descriptor decodes as
+a canonical `BranchPinDescriptor` roots that descriptor, its name, its commit
+target, and the target's locally present closure.
 
 The main challenge is deciding which blobs are still reachable without
 reconstructing every `TribleSet`. The sections below outline how the repository
@@ -19,16 +20,19 @@ own tools.
 
 ## Understanding the Roots
 
-The walk begins with a _root set_—the handles you know must stay alive. For an
-assertion-native repository, every assertion's commit target is a hard root.
-Collectors must use all accepted assertions, not only a branch's currently
-resolved frontier: missing ancestry can make domination impossible to prove,
-and collection must not turn uncertainty into deletion. Admission policy and
-quota bound which remote assertions become accepted; pressure never silently
-weakens accepted state.
+The walk begins with a _root set_—the handles you know must stay alive. Generic
+asserted-pin storage itself is kind-neutral: an unknown descriptor never turns
+its opaque value into a permanent content root. The branch adapter recognizes a
+branch only when the pin's descriptor blob is locally present and decodes as
+the canonical `BranchPinDescriptor`. It then treats every valid assertion's
+commit target as a hard root. Collectors must use all such assertions, not only
+a branch's currently resolved frontier: missing ancestry can make domination
+impossible to prove, and collection must not turn uncertainty into deletion.
+Admission policy and quota bound which remote assertions become accepted;
+pressure never silently weakens accepted state.
 
-The content-addressed name handle in each exact branch descriptor is retained
-directly when present. It is not traversed as a generic blob graph: arbitrary
+The content-addressed descriptor and name handle are retained directly. The
+name is not traversed as a generic blob graph: arbitrary
 `LongString` bytes do not acquire reference semantics merely because they
 contain a 32-byte sequence. Commit targets, in contrast, are traversed
 recursively, retaining parents, content, metadata, messages, attachments, and
@@ -63,9 +67,11 @@ eligible for forgetting.
 
 ## Traversal Algorithm
 
-1. Take one coherent snapshot of all accepted branch assertions.
-2. Add every asserted commit target to the hard root set and retain each
-   descriptor's name handle directly when it is present.
+1. Take one coherent snapshot of all generic pin assertions.
+2. For each valid assertion, load its descriptor locally. If it is a canonical
+   `BranchPinDescriptor`, retain the descriptor and name directly and add the
+   assertion's commit value to the hard root set. Preserve unknown assertion
+   records without treating their values as branch roots.
 3. Recursively walk the discovered commits and content blobs. Each blob is
    scanned in 32-byte steps; any chunk whose lookup succeeds is enqueued instead
    of deserialising the archive.
@@ -87,51 +93,63 @@ helper exposes the traversal as a reusable iterator so you can compose other
 operations along the way, while
 [`transfer`](https://docs.rs/triblespace/latest/triblespace/repo/fn.transfer.html)
 duplicates whichever handles you feed it. A store that combines blobs and
-assertions can derive the hard roots directly from its assertion snapshot:
+generic assertions can derive branch roots by projecting the typed descriptor
+from its assertion snapshot:
 
 ```rust,ignore
+use triblespace::core::blob::encodings::{longstring::LongString, UnknownBlob};
 use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::repo::branch_assertion::BranchAssertionStore;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
+use triblespace::core::repo::branch_pin::{commit_from_value, BranchPinDescriptor};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::{self, BlobStore, BlobStoreKeep};
+use triblespace::core::repo::pin_assertion::PinAssertionStore;
+use triblespace::core::repo::{self, BlobStore, BlobStoreGet, BlobStoreKeep};
 
 let mut store = MemoryRepo::default();
 // ... populate the store or import data ...
 
-let assertions = store.assertion_snapshot()?;
+let assertions = store.pin_assertion_snapshot()?;
 let reader = store.reader()?;
-let commit_roots: Vec<_> = assertions
-    .iter()
-    .map(|assertion| assertion.commit().transmute())
-    .collect();
-let names: Vec<_> = assertions
-    .iter()
-    .map(|assertion| assertion.identity().name().transmute())
-    .collect();
+let mut commit_roots = Vec::<Inline<Handle<UnknownBlob>>>::new();
+let mut direct = Vec::<Inline<Handle<UnknownBlob>>>::new();
 
-// Walk only commit structure, then retain names directly without treating
-// arbitrary LongString bytes as edges in the blob graph.
-store.keep(
-    repo::reachable(&reader, commit_roots.clone()).chain(names.iter().copied()),
-);
+for assertion in assertions.iter() {
+    let descriptor = Inline::<Handle<BranchPinDescriptor>>::new(
+        assertion.identity().pin().raw(),
+    );
+    let Ok(name) = reader.get::<Inline<Handle<LongString>>, BranchPinDescriptor>(descriptor)
+    else {
+        // Missing or unknown descriptors stay in the assertion ledger but do
+        // not lend branch-root semantics to an opaque value.
+        continue;
+    };
+
+    direct.push(descriptor.transmute());
+    direct.push(name.transmute());
+    commit_roots.push(commit_from_value(assertion.value()).transmute());
+}
+
+// Walk commit structure, then retain descriptors and names directly without
+// treating arbitrary LongString bytes as edges in the blob graph.
+let live: Vec<_> = repo::reachable(&reader, commit_roots)
+    .chain(direct)
+    .collect();
+store.keep(live.iter().copied());
 
 // Optionally copy the same reachable blobs into another store. `transfer`
-// reports an error if an asserted target or name is not materialised locally.
+// reports an error if a selected target, descriptor, or name is not local.
 let mut scratch = MemoryBlobStore::default();
-let visited = repo::reachable(&reader, commit_roots.clone()).count() + names.len();
-let mapping: Vec<_> = repo::transfer(
-    &reader,
-    &mut scratch,
-    repo::reachable(&reader, commit_roots).chain(names),
-)
-.collect::<Result<_, _>>()?;
+let visited = live.len();
+let mapping: Vec<_> = repo::transfer(&reader, &mut scratch, live)
+    .collect::<Result<_, _>>()?;
 
 println!("visited {} blobs, copied {}", visited, mapping.len());
 println!("rewrote {} handles", mapping.len());
 ```
 
-In practice you seed the walker with every asserted target plus any additional
-application roots. The helper takes any `IntoIterator` of handles, so those
+In practice you seed the walker with every recognized branch-pin target plus
+any additional application roots. The helper takes any `IntoIterator` of handles, so those
 roots can be fed directly into the traversal without writing custom queues or
 visitor logic. Passing the resulting iterator to `MemoryBlobStore::keep` or
 `repo::transfer` makes it easy to implement
@@ -157,10 +175,11 @@ helper converts its value column into the conservative stream of
   retained, include it in the root set. Collisions between 32-byte handles are
   effectively impossible, so cautious root selection simply preserves anything
   that might be referenced.
-- **Rewrite assertion records atomically.** A physical Pile replacement must
-  write the segment's complete assertion set into the temporary Pile before the
-  atomic rename. Re-appending assertions afterwards creates a crash window in
-  which accepted grow-only state has vanished.
+- **Rewrite asserted-pin records atomically.** A physical Pile replacement must
+  write the segment's complete generic assertion set—including structurally
+  admitted witnesses of unknown kinds—into the temporary Pile before the atomic
+  rename. Re-appending assertions afterwards creates a crash window in which
+  accepted grow-only state has vanished.
 
 ## Future Work
 

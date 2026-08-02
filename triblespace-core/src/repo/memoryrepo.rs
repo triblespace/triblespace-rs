@@ -8,9 +8,6 @@ use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
-use crate::repo::branch_assertion::{
-    AssertionKeyCollision, BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore,
-};
 use crate::repo::pin_assertion::{
     PinAssertion, PinAssertionKeyCollision, PinAssertionSnapshot, PinAssertionStore,
 };
@@ -31,8 +28,6 @@ pub struct MemoryRepo {
     pub blobs: MemoryBlobStore,
     /// Map from local pin id to its current arbitrary SimpleArchive value.
     pub pins: HashMap<Id, Inline<Handle<SimpleArchive>>>,
-    /// Verified grow-only branch assertions.
-    assertions: BranchAssertionSnapshot,
     /// Generic grow-only asserted pins.
     pin_assertions: PinAssertionSnapshot,
     /// LWW-resolved weak-pin set (see [`WeakPinStore`]). In memory the
@@ -40,18 +35,6 @@ pub struct MemoryRepo {
     /// are exactly as ephemeral as the blobs themselves — the trait is a
     /// capability, durability is the store's own property.
     pub weak: HashSet<Inline<Handle<UnknownBlob>>>,
-}
-
-impl BranchAssertionStore for MemoryRepo {
-    type Error = AssertionKeyCollision;
-
-    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
-        Ok(self.assertions.clone())
-    }
-
-    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
-        self.assertions.insert(assertion)
-    }
 }
 
 impl PinAssertionStore for MemoryRepo {
@@ -194,39 +177,11 @@ impl crate::repo::StorageClose for MemoryRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::encodings::longstring::LongString;
     use crate::repo::pin_assertion::{PinHandle, SubsumptionLabel, ValueHandle};
     use ed25519_dalek::SigningKey;
 
     fn handle(byte: u8) -> Inline<Handle<UnknownBlob>> {
         Inline::new([byte; 32])
-    }
-
-    #[test]
-    fn assertion_store_is_grow_only_idempotent_and_snapshot_coherent() {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let assertion = BranchAssertion::sign(
-            &key,
-            Inline::<Handle<LongString>>::new([11; 32]),
-            Inline::<Handle<SimpleArchive>>::new([19; 32]),
-        );
-        let mut repo = MemoryRepo::default();
-
-        repo.append_assertion(assertion).unwrap();
-        repo.append_assertion(assertion).unwrap();
-
-        let first = repo.assertion_snapshot().unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first.iter().copied().collect::<Vec<_>>(), vec![assertion]);
-
-        let second = BranchAssertion::sign(
-            &key,
-            Inline::<Handle<LongString>>::new([11; 32]),
-            Inline::<Handle<SimpleArchive>>::new([23; 32]),
-        );
-        repo.append_assertion(second).unwrap();
-        assert_eq!(first.len(), 1, "an earlier snapshot stays coherent");
-        assert_eq!(repo.assertion_snapshot().unwrap().len(), 2);
     }
 
     #[test]

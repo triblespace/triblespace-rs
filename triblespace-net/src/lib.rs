@@ -4,8 +4,9 @@
 //! iroh network thread internally and exposes the standard storage traits
 //! (`BlobStore + BlobStorePut + PinStore`). Blob writes are announced through
 //! the DHT; missing weak-pinned blobs are fetched lazily by content hash.
-//! Signed branch assertions remain local: this crate does not yet replicate
-//! them.
+//! Generic pin assertions and their descriptor blobs remain local: this crate
+//! does not yet replicate them. Branch semantics are a typed adapter above that
+//! envelope, not a separate network operation.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 

@@ -97,7 +97,6 @@ use crate::inline::{Inline, InlineEncoding, RawInline};
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
 };
-use super::branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore};
 use super::branch_frontier::{ParentLookup, PartialCommitDag};
 use super::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
 use super::{
@@ -507,35 +506,6 @@ where
     }
 }
 
-/// The lazy wrapper changes how missing blobs are read, not the authority
-/// model of the wrapped repository. Signed assertions therefore pass through
-/// the same mutex as every other mutable store operation and retain the
-/// wrapped store's coherent-snapshot and durable-idempotent-append semantics.
-impl<S> BranchAssertionStore for Lazy<S>
-where
-    S: BlobStore
-        + BlobStorePut
-        + PinStore
-        + WeakPinStore
-        + StorageFlush
-        + BranchAssertionStore
-        + Send
-        + 'static,
-{
-    type Error = <S as BranchAssertionStore>::Error;
-
-    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
-        self.store.lock().expect("store mutex").assertion_snapshot()
-    }
-
-    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
-        self.store
-            .lock()
-            .expect("store mutex")
-            .append_assertion(assertion)
-    }
-}
-
 /// Generic asserted pins are authority state too, so `Lazy` forwards their
 /// coherent snapshots and durable appends through the same store mutex without
 /// involving blob-want wakeups.
@@ -911,7 +881,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::encodings::longstring::LongString;
     use crate::repo::commit::{CommitMetadataError, StoredCommitError};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
@@ -930,27 +899,6 @@ mod tests {
     fn fresh_pile(path: &std::path::Path) -> Pile {
         std::fs::File::create(path).unwrap();
         Pile::open(path).unwrap()
-    }
-
-    /// `Lazy` is transparent to the grow-only authority layer: duplicate
-    /// assertion append stays idempotent and a snapshot remains coherent after
-    /// a later append through the wrapper.
-    #[test]
-    fn assertion_store_forwards_idempotent_append_and_coherent_snapshot() {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let name = Inline::<Handle<LongString>>::new([11; 32]);
-        let first = BranchAssertion::sign(&key, name, Inline::new([19; 32]));
-        let second = BranchAssertion::sign(&key, name, Inline::new([23; 32]));
-        let mut lazy = Lazy::new(MemoryRepo::default());
-
-        lazy.append_assertion(first).unwrap();
-        lazy.append_assertion(first).unwrap();
-        let snapshot = lazy.assertion_snapshot().unwrap();
-        assert_eq!(snapshot.iter().copied().collect::<Vec<_>>(), vec![first]);
-
-        lazy.append_assertion(second).unwrap();
-        assert_eq!(snapshot.len(), 1, "an earlier snapshot stays coherent");
-        assert_eq!(lazy.assertion_snapshot().unwrap().len(), 2);
     }
 
     #[test]

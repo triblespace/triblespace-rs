@@ -1,4 +1,5 @@
-//! Resolve grow-only branch assertions under partially available ancestry.
+//! Resolve the typed branch projection of generic asserted pins under partially
+//! available ancestry.
 //!
 //! Only definitely dominated assertions disappear. A missing surviving tip is
 //! [`BranchResolution::TipPending`];

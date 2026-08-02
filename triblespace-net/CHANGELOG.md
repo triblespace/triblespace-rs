@@ -9,14 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The network surface now matches the StrongPin boundary.** Scalar mutable-
+- **The network surface now matches the asserted-pin boundary.** Scalar mutable-
   HEAD gossip, local tracking materialization, publisher-hint state, legacy
   direction modes, and `OP_CHILDREN` are deleted. Pile-sync v5
   (`/triblespace/pile-sync/5`) accepts mandatory first-stream `OP_AUTH` followed
   only by scope-gated `OP_GET_BLOB`. DHT content announcements and lazy
-  weak-want fetching remain. Signed `BranchAssertion` replication is explicitly
-  not implemented yet; `Peer` merely forwards the wrapped store's assertion and
-  partial-DAG traits for local repository use.
+  weak-want fetching remain. Generic `PinAssertion` envelopes and their typed
+  descriptor blobs are explicitly not replicated yet; `Peer` merely forwards
+  the wrapped store's `PinAssertionStore` and partial-DAG traits for local
+  repository use.
 - **Capability verification is exact and live.** Parent chain links and the
   embedded recursive proof live in the sig blob, while cap blobs remain pure
   declarations. `MissingBlob` carries the exact typed handle, the 32-level

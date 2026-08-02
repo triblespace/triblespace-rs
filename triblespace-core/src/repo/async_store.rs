@@ -36,7 +36,6 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
-    branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore},
     branch_frontier::{ParentLookup, PartialCommitDag},
     pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore},
     BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
@@ -136,14 +135,12 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
     fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
 }
 
-/// Async counterpart of [`PinStore`]: replica-local, atomically-updatable
-/// handles to `SimpleArchive` blobs.
+/// Async counterpart of the legacy [`PinStore`] atomically-updatable cells.
 ///
-/// Pins are transport/retention state local to one replica. They are not
-/// StrongPin branch authority and must never be exposed as a scalar branch
-/// head. Shared asserted state lives in [`AsyncBranchAssertionStore`] and
-/// [`AsyncPinAssertionStore`]; callers may use replica-local pins for local
-/// policy, retention, or durable fetch intent.
+/// They are not asserted-pin or branch authority and must never be exposed as a
+/// scalar branch head. Shared state lives in [`AsyncPinAssertionStore`]; this
+/// compatibility surface remains only while policy, retention, and durable
+/// fetch consumers migrate.
 pub trait AsyncPinStore {
     /// Error type for listing pins.
     type PinsError: Error + Debug + Send + Sync + 'static;
@@ -171,28 +168,6 @@ pub trait AsyncPinStore {
         old: Option<Inline<Handle<SimpleArchive>>>,
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send;
-}
-
-/// Async storage surface for the shared grow-only branch-assertion layer.
-///
-/// This is the remote-backend counterpart of [`BranchAssertionStore`]. It
-/// deliberately has no scalar head, update, delete, or compare-and-swap
-/// operation: an assertion is immutable replicated state, and duplicate
-/// append is an idempotent success.
-pub trait AsyncBranchAssertionStore {
-    /// Storage or validation error.
-    type Error: Error + Debug + Send + Sync + 'static;
-
-    /// Return one coherent snapshot containing only verified assertions.
-    fn assertion_snapshot(
-        &mut self,
-    ) -> impl Future<Output = Result<BranchAssertionSnapshot, Self::Error>> + Send;
-
-    /// Durably append one verified assertion. Duplicate append is success.
-    fn append_assertion(
-        &mut self,
-        assertion: BranchAssertion,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// Async storage surface for the generic grow-only asserted-pin layer.
@@ -405,26 +380,6 @@ where
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
         async move { self.0.update(id, old, new) }
-    }
-}
-
-impl<S> AsyncBranchAssertionStore for SyncAsAsync<S>
-where
-    S: BranchAssertionStore + Send,
-{
-    type Error = S::Error;
-
-    fn assertion_snapshot(
-        &mut self,
-    ) -> impl Future<Output = Result<BranchAssertionSnapshot, Self::Error>> + Send {
-        async move { self.0.assertion_snapshot() }
-    }
-
-    fn append_assertion(
-        &mut self,
-        assertion: BranchAssertion,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async move { self.0.append_assertion(assertion) }
     }
 }
 
@@ -680,19 +635,6 @@ impl<A: AsyncPinStore> PinStore for Blocking<A> {
 }
 
 #[cfg(feature = "object-store")]
-impl<A: AsyncBranchAssertionStore> BranchAssertionStore for Blocking<A> {
-    type Error = A::Error;
-
-    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
-        self.rt.block_on(self.inner.assertion_snapshot())
-    }
-
-    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
-        self.rt.block_on(self.inner.append_assertion(assertion))
-    }
-}
-
-#[cfg(feature = "object-store")]
 impl<A: AsyncPinAssertionStore> PinAssertionStore for Blocking<A> {
     type Error = A::Error;
 
@@ -888,9 +830,7 @@ mod tests {
 
     #[cfg(feature = "object-store")]
     #[test]
-    fn assertion_and_flush_capabilities_roundtrip_through_both_adapters() {
-        use crate::blob::encodings::longstring::LongString;
-        use crate::repo::branch_assertion::{BranchAssertion, BranchAssertionStore};
+    fn pin_assertion_and_flush_capabilities_roundtrip_through_both_adapters() {
         use crate::repo::memoryrepo::MemoryRepo;
         use crate::repo::pin_assertion::{
             PinAssertion, PinAssertionStore, PinHandle, SubsumptionLabel, ValueHandle,
@@ -899,11 +839,6 @@ mod tests {
         use ed25519_dalek::SigningKey;
 
         let mut store = Blocking::new(SyncAsAsync::new(MemoryRepo::default())).unwrap();
-        let assertion = BranchAssertion::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            Inline::<Handle<LongString>>::new([11; 32]),
-            Inline::new([19; 32]),
-        );
         let pin_assertion = PinAssertion::sign(
             &SigningKey::from_bytes(&[7; 32]),
             PinHandle::from_raw([13; 32]),
@@ -911,18 +846,10 @@ mod tests {
             SubsumptionLabel::from_raw([5; 32]),
         );
 
-        store.append_assertion(assertion).unwrap();
-        store.append_assertion(assertion).unwrap();
         store.append_pin_assertion(pin_assertion).unwrap();
         store.append_pin_assertion(pin_assertion).unwrap();
         store.flush().unwrap();
 
-        let snapshot = store.assertion_snapshot().unwrap();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(
-            snapshot.iter().copied().collect::<Vec<_>>(),
-            vec![assertion]
-        );
         let snapshot = store.pin_assertion_snapshot().unwrap();
         assert_eq!(
             snapshot.iter().copied().collect::<Vec<_>>(),

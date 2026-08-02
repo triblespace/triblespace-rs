@@ -1,9 +1,10 @@
 #![allow(clippy::type_complexity)]
-//! Content-addressed commit storage with grow-only signed branch assertions.
+//! Content-addressed commit storage with grow-only signed asserted pins.
 //!
 //! Blobs are immutable and addressed by their hashes. A branch is not a mutable
-//! `(id -> head)` cell: its replicated state is the set of signed assertions
-//! that exact identity has made. [`branch_frontier::resolve_branch`] removes
+//! `(id -> head)` cell: its replicated state is the branch-kind assertions in
+//! the generic pin envelope made by that exact identity.
+//! [`branch_frontier::resolve_branch`] removes
 //! only definitely dominated tips under commit ancestry. A singleton frontier
 //! is its own head; a complete divergent frontier has one deterministic flat
 //! authorless merge as its derived read view.
@@ -51,10 +52,9 @@
 pub mod async_store;
 
 pub mod branch;
-/// Immutable, signed branch assertions and their grow-only snapshots.
-pub mod branch_assertion;
 /// Partial-ancestry resolution of branch assertion frontiers.
 pub mod branch_frontier;
+/// Typed branch identities, descriptors, values, and causal rank encoding.
 pub mod branch_pin;
 /// Capability-based authorization for triblespace networks.
 pub mod capability;
@@ -70,7 +70,7 @@ pub mod lazy;
 /// Fully in-memory repository implementation for tests and ephemeral use.
 pub mod memoryrepo;
 #[cfg(feature = "object-store")]
-/// Blob and replica-local-pin backend for `object_store`-compatible remotes.
+/// Blob and legacy mutable-pin backend for `object_store`-compatible remotes.
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
@@ -357,7 +357,7 @@ pub trait BlobChildren: BlobStoreGet {
 // Use `impl_blob_children_default!` for the scan-and-check fallback.
 
 /// Outcome of a compare-and-swap update on the separate mutable
-/// [`PinStore`] primitive. StrongPin branch publication does not use this type.
+/// [`PinStore`] primitive. Asserted branch publication does not use this type.
 #[derive(Debug)]
 pub enum PushResult {
     /// The CAS succeeded — the pin now points to the new value.
@@ -384,11 +384,11 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// pile's compaction sweep treats every pin head as a reachability
 /// root: blobs reachable from a pin survive; the rest are reclaimed.
 ///
-/// Pins back specialized replica-local uses distinguished at higher layers by
-/// metadata markers: renewal policy, pending requests, credential holdings,
-/// retention roots, and durable fetch wants. Older stores may also contain
-/// mutable content-branch heads; those remain readable only as legacy local
-/// pins and are not StrongPin branch authority.
+/// Legacy callers distinguish roles at higher layers with metadata markers:
+/// renewal policy, pending requests, credential holdings, retention roots, and
+/// durable fetch wants. Older stores may also contain mutable content-branch
+/// heads. None of these scalar cells are asserted-pin or branch authority, and
+/// pile copying means they cannot honestly be treated as semantically local.
 ///
 /// `PinStore` itself doesn't know about these distinctions — it just
 /// provides the primitive: enumerate ids, read the current head, CAS

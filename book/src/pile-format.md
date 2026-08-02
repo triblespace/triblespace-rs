@@ -1,6 +1,6 @@
 # Pile Format
 
-The on-disk pile keeps blobs, signed branch assertions, and local pins in one
+The on-disk pile keeps blobs, generic signed pin assertions, and local pins in one
 append-only file. The
 write-ahead log *is* the database: all indices are reconstructed from the bytes
 already stored on disk. This design avoids background compaction, manifest
@@ -18,7 +18,7 @@ memory map never exposes half-written records.
 ## Record model: uniform 256-byte records (V3)
 
 Every record the pile writes today — blob, local pin head, local pin
-tombstone, signed branch assertion, weak-pin marker, weak-unpin marker
+tombstone, generic asserted pin, weak-pin marker, weak-unpin marker
 — uses the **V3** layout: a fixed **256-byte header**, followed (for blobs) by
 the payload, padded so the whole record is a **256-byte multiple**. This
 uniformity is load-bearing:
@@ -70,7 +70,7 @@ refreshing state.
    `applied_length`, and rebuilds the blob/pin indices in memory. It **fails
    loud** on a corrupt or torn tail (`ReadError::CorruptPile { valid_length }`)
    and never mutates the file. Callers rarely need to invoke it directly:
-   `reader`, local pin operations, and branch-assertion snapshot/append
+   `reader`, local pin operations, and asserted-pin snapshot/append
    operations call `refresh` internally before they inspect or apply records,
    so external writers are visible without a standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
@@ -82,7 +82,7 @@ refreshing state.
    The `trible pile amputate <path>` command wraps it for operators.
 4. **Append new records.** `put` (through the `BlobStorePut` trait) normally
    extends the file via one `write_vectored` call; small local pin records use
-   one fixed-header write. A branch assertion takes the exclusive lock, writes
+   one fixed-header write. A generic pin assertion takes the exclusive lock, writes
    one 256-byte record, replays it, and crosses `sync_all` before reporting
    success because its storage trait promises durable append. Every append
    feeds its bytes back through the record scanner so in-memory indices stay
@@ -115,11 +115,12 @@ after a crash, so validation and repair only operate on that region. Each
 record's validation state is cached for the lifetime of the process under this
 assumption, avoiding repeated hash verification for frequently accessed blobs.
 
-Blob hash verification only happens when blobs are read. Signed branch
-assertions are different: replay verifies every Ed25519 signature eagerly so
-raw or invalid assertion bytes never enter a public snapshot. Opening remains
-lazy over blob payloads, but its cost now includes one verification per new
-assertion record.
+Blob hash verification only happens when blobs are read. Generic pin-assertion
+replay likewise performs only structural decoding: its opaque snapshot retains
+the exact witness and memoizes signature verification when a public semantic
+iterator or typed resolver first needs it. Invalid signatures never cross the
+public `PinAssertion` boundary, but physical rewrite preserves their exact
+structurally valid records rather than silently changing the log.
 
 Every record begins with a 16&nbsp;byte magic marker that identifies its kind.
 The sections below illustrate the layout of each type.
@@ -135,7 +136,7 @@ remembers the last offset it processed and, after appending, scans any gap left
 by concurrent writes before advancing this `applied_length`. Writers may race
 and duplicate blobs, but content addressing keeps the data consistent. Each
 handle tracks hashes of pending appends separately so repeated writes are
-deduplicated until a `refresh`. Local pin updates and branch assertions do not
+deduplicated until a `refresh`. Local pin updates and generic assertions do not
 require the referenced commit blob to exist in the pile, so assertions may
 arrive before their content under lazy replication.
 
@@ -182,7 +183,7 @@ the built-in refreshes performed by `reader` and pin helpers, mutate via
 mutable local pin requires a brief critical section—`flush → refresh → lock →
 refresh → append → unlock`—so a caller observes a consistent local value even
 when multiple processes contend for the same file descriptor. This mechanism
-does not participate in StrongPin branch resolution. `refresh` acquires a
+does not participate in typed asserted-branch resolution. `refresh` acquires a
 shared lock so it cannot race with an explicit `amputate`, which takes an
 exclusive lock before truncating a corrupted tail.
 
@@ -262,42 +263,52 @@ local retention and transport state to point at content served by another
 store.
 
 Pins have mutable last-writer-wins/CAS semantics because they are local
-operational state. They are distinct from the grow-only branch assertions
-below: a pin is not a branch, its 16-byte id is not a `BranchIdentity`, and its
-physical arrival order says nothing about branch precedence. Legacy files may
-contain records once used as branch heads; reading those bytes does not make
-that model authoritative.
+operational state. They are distinct from the generic grow-only assertions
+below: a local pin is not an asserted pin, its 16-byte id is not a
+`PinIdentity`, and its physical arrival order says nothing about branch
+precedence. Historical files may contain local-pin records once used as branch
+heads; reading those bytes does not make that model authoritative.
 
-## Signed Branch-Assertion Records
+## Generic Asserted-Pin Records
 
 ```text
-            ┌────16 byte───┐┌────32 byte────┐┌────32 byte────┐┌────32 byte────┐┌────64 byte────┐┌──80 byte──┐
-          ┌ ┌──────────────┐┌───────────────┐┌───────────────┐┌───────────────┐┌───────────────┐┌───────────┐
- assertion│ │ DACC… marker ││  author key   ││  name handle  ││ commit handle ││   signature   ││  zero pad │
- (256 B)  └ └──────────────┘└───────────────┘└───────────────┘└───────────────┘└───────────────┘└───────────┘
+            ┌─16 B─┐┌──32 B──┐┌──32 B──┐┌──32 B──┐┌──32 B──┐┌──64 B──┐┌─48 B─┐
+          ┌ ┌──────┐┌──────────┐┌──────────┐┌──────────┐┌──────────┐┌──────────┐┌──────┐
+ assertion│ │marker││ author key ││ pin handle ││value handle││   label    ││ signature  ││zeroes│
+ (256 B)  └ └──────┘└──────────┘└──────────┘└──────────┘└──────────┘└──────────┘└──────┘
 ```
 
-The marker is `DACC331F5C1C2036E6725C7B24EE2A51`. Bytes 16–176 are exactly the
-canonical 160-byte `BranchAssertion` encoding; neither `BranchId` nor
-`AssertionId` is stored because both are derived from those bytes. The final
-80 bytes must be zero. Replay rejects nonzero padding instead of treating it as
-an extension envelope, and strictly verifies the Ed25519 signature before
-exposing the assertion.
+The marker is `DEE2A5635561AE0AF36550AD07C1EBEB`. Bytes 16–208 are the
+canonical 192-byte `PinAssertion` envelope:
+
+```text
+author key [32] | pin handle [32] | value handle [32] |
+subsumption label [32] | Ed25519 signature [64]
+```
+
+The final 48 bytes must be zero. Replay rejects nonzero reserve bytes instead
+of treating them as an extension envelope. The signature authenticates a
+domain-separated message containing all four 32-byte semantic fields. Public
+iteration verifies signatures lazily and memoizes both outcomes; an invalid
+witness remains physical data for exact rewrites but is never returned as a
+verified `PinAssertion`.
 
 Assertion records form a set: concatenating piles unions them, physical order
-has no meaning, and exact duplicates collapse in the in-memory
-`BranchId || AssertionId` PATCH. There is no replacement, tombstone, scalar
-head, or silent pressure eviction. Authorization remains an ingest-layer
-decision over a configured identity/key set; the raw Pile store verifies
-authenticity but does not choose which authors a deployment trusts.
+has no meaning, and exact duplicates collapse under a 64-byte PATCH key formed
+from the full 32-byte identity digest and full 32-byte `PinAssertionId`. Exact
+identity is still rechecked from the witness. There is no replacement,
+tombstone, scalar head, or silent pressure eviction. Authorization remains an
+ingest-layer decision over authors and pin kinds; signature verification alone
+does not choose what a deployment trusts.
 
-The complete branch identity is the assertion's author key plus name handle.
-The 16-byte `BranchId` stored in the in-memory index is only a prefix; lookups
-recheck the full descriptor. The pile stores assertions, not a cached resolved
-head. Resolution walks commit ancestry and reports absent, tip-pending, partial,
-or complete state. A synthetic flat merge for a divergent frontier is derived
-by the repository and is not written as branch state unless an author later
-publishes an ordinary signed descendant.
+The envelope is deliberately kind-neutral. For branches, the pin handle is the
+content handle of a 48-byte `BranchPinDescriptor` blob containing its 16-byte
+kind marker and 32-byte name handle. The value is a commit handle and the label
+is a full-width big-endian `BranchRank`. Rank order can suppress an impossible
+strict-ancestry walk but never proves domination. The branch resolver groups
+equal values, verifies a surviving witness, and reports absent, tip-pending,
+partial, or complete state. Unknown descriptor kinds remain preserved without
+being interpreted as branches.
 
 ## Weak-Pin Records (want / retention markers)
 
@@ -328,12 +339,14 @@ had no weak-pin records.
 
 ## Recovery
 
-`refresh` scans an existing file to ensure every header uses a known marker
-and that the whole record fits. It does not verify blob hashes, but it does
-strictly verify signed branch assertions before admitting them. If a truncated,
-unknown, or invalid assertion record is found, the function reports the number
-of bytes that were valid so far using `ReadError::CorruptPile` — and leaves the
-file untouched.
+`refresh` scans an existing file to ensure every header uses a known marker,
+every fixed field is structurally valid, and the whole record fits. It does not
+verify blob hashes or every asserted-pin signature. Signature results are
+memoized on semantic access; a structurally valid witness with an invalid
+signature remains replayable physical data but does not appear in public
+assertion iteration. A truncated, unknown, malformed-key, or nonzero-reserve
+record reports the number of bytes that were valid so far using
+`ReadError::CorruptPile` and leaves the file untouched.
 
 If the file shrinks between scans into data that has already been applied, the
 process aborts immediately. Previously returned `Bytes` handles would dangle
@@ -348,9 +361,8 @@ validation under an exclusive lock and truncates the file to the valid length
 if corruption is encountered, discarding incomplete data left by an
 interrupted write. Run it deliberately (e.g. via `trible pile amputate <path>`)
 — never as a routine part of opening — and only once you know the "corruption"
-isn't just an older binary meeting newer record kinds. Blob hash verification
-happens lazily only when individual blobs are loaded; assertion signature
-verification is part of replay.
+isn't just an older binary meeting newer record kinds. Blob hash and assertion
+signature verification both happen lazily at their typed read boundaries.
 
 For more details on interacting with a pile see the [`Pile` struct
 documentation](https://docs.rs/triblespace/latest/triblespace/repo/pile/struct.Pile.html).

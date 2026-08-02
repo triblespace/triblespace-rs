@@ -9,38 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Branch assertions have a closed, signed, grow-only core model.** A branch
-  identity is now expressible as the intrinsic two-fact `(author key, name
-  handle)` descriptor, while one canonical 160-byte Ed25519 assertion carries
-  exactly that descriptor and a commit. Public assertion values are
-  verified-only; pile replay retains structurally decoded witnesses behind an
-  opaque PATCH snapshot and derives every 48-byte `BranchId || AssertionId`
-  key from the value without verifying every historical signature on open.
-  Resolution groups equal `(exact identity, commit)` claims, verifies a
-  surviving witness before exposing any tip or demand, drops an all-invalid
-  claim and recomputes domination, and memoizes both valid and invalid results.
-  The snapshot exposes no replacement, deletion, CAS, or scalar-head
-  operation. A partial-DAG resolver distinguishes
-  an unreadable target (`TipPending`) from readable candidates with unknown
-  ancestry (`Partial`) and the true maximal antichain (`Complete`). Partial
-  frontiers expose only a candidate-root descriptor and cannot be
-  checked out or license an asserted merge; complete divergence builds one
-  deterministic flat authorless merge.
-  Generated acyclic-DAG tests pin resolution-order independence for one fixed
-  replica snapshot and `Max(Max(A) ∪ B) = Max(A ∪ B)`; this does not claim a
-  network delivery protocol or convergence between replicas with different
-  assertion sets.
-- **Pile stores branch assertions as one canonical fixed record.** The new V3
-  record is exactly 256 bytes: its marker, the canonical 160-byte signed
-  assertion, and 80 mandatory zero bytes. Replay structurally decodes records
-  with zero signature checks, rejects noncanonical padding, and folds witnesses into the opaque
-  `BranchId || AssertionId` PATCH without physical-order semantics. Duplicate
-  append is idempotent, concatenated piles union cleanly, and the assertion
-  store crosses `sync_all` before reporting durable success. The explicit
-  forensic record iterator verifies on access and reports a bad signature only
-  as an `InvalidBranchAssertion` id, never as an authenticated claim. Legacy CAS branch
-  records remain readable but are not dual-authored by the assertion-native
-  path; legacy pile rewrites fail closed rather than silently omit assertions.
+- **Generic asserted pins replace kind-specific replicated cells.**
+  `PinAssertionStore` is one coherent grow-only set with no update, delete,
+  tombstone, CAS, scalar-head, or kind-specific operation. Its canonical
+  192-byte Ed25519 envelope authenticates `author key | descriptor handle |
+  value handle | opaque 32-byte label`; exact identity uses the complete
+  `(author, descriptor)` pair and a full 32-byte digest rather than a truncated
+  selector. The opaque PATCH snapshot keys witnesses by that digest plus the
+  full `PinAssertionId`, preserves unknown kinds, and verifies public semantic
+  values lazily while memoizing both outcomes. Signature validity identifies an
+  author but remains separate from foreign-author and pin-kind admission.
+- **Branches are a typed adapter over generic asserted pins.** A canonical
+  48-byte `BranchPinDescriptor` blob contains its kind marker and LongString
+  name handle; the descriptor's own content handle is the generic pin handle.
+  Its asserted value is a commit and its label is a full-width big-endian
+  `BranchRank`, constructed inductively as zero for a root and one greater than
+  the greatest parent for a child or merge. Rank order only suppresses
+  impossible ancestry checks and never proves domination, so dishonest labels
+  may retain extra candidates but cannot remove a true maximal tip. Resolution
+  groups equal values, authenticates a surviving witness before exposing any
+  tip or fetch demand, drops all-invalid groups, and distinguishes `TipPending`,
+  `Partial`, and `Complete`; complete divergence derives one deterministic flat
+  authorless merge.
+- **Pile persists each generic assertion in one fixed V3 record.** The
+  256-byte record is its marker, the canonical 192-byte envelope, and 48
+  mandatory zero bytes. Replay structurally decodes with zero signature checks
+  and no physical-order semantics. Duplicate append is idempotent,
+  concatenated piles union cleanly, and durable append crosses `sync_all`.
+  Forensic access verifies on demand and reports a bad signature only as an
+  `InvalidPinAssertion` id, while exact physical rewrites preserve structurally
+  valid unknown or invalid witnesses without promoting them into semantic
+  claims.
 - **Demand-curve receipts render as explicit performance fingerprints.** The
   feature-gated `tribleset-bench` GORBIE notebook normalizes fragmented TSV
   axes in memory and gives every engine/storage/execution subject the same
@@ -88,27 +87,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Storage composition now carries assertion authority explicitly.** Async
-  adapters expose signed-assertion snapshots and partial commit-DAG lookup;
-  `HybridStore` composes a blob store with a separate assertion store; and the
-  lazy wrapper preserves assertion storage while keeping commit-DAG ancestry
+- **Storage composition now carries asserted-pin authority explicitly.** Async
+  adapters expose generic assertion snapshots and partial commit-DAG lookup;
+  `HybridStore` composes a blob store with a separate `PinAssertionStore`; and
+  the lazy wrapper preserves asserted-pin storage while keeping commit-DAG ancestry
   lookup strictly local. Optimistic pre-verification ancestry misses never
   become weak-pin/network wants; only demand returned after the resolver has
   verified its surviving claim may cross into fetch policy. The blocking async
   adapter lowers this trait only for a `SyncAsAsync` store which already
   satisfies the local contract; a remote `ObjectStoreReader` cannot masquerade
   as a synchronous resolver DAG. `ObjectStoreRemote` is intentionally only
-  a blob plus replica-local-pin backend: its CAS namespace moves from
+  a blob plus legacy mutable-pin backend: its CAS namespace moves from
   `branches/` to `pins/`, reads verify content hashes, and it does not pretend
-  generic LIST or file-backend PUT semantics satisfy StrongPin snapshot and
-  durability contracts.
-- **Network transport now stops cleanly at the StrongPin boundary.** The scalar
+  generic LIST or file-backend PUT semantics satisfy coherent asserted-pin
+  snapshot and durability contracts.
+- **Network transport now stops cleanly at the asserted-pin boundary.** The scalar
   mutable-HEAD gossip/tracking bridge, publisher-hint state, direction modes,
   and `OP_CHILDREN` are deleted. Pile-sync v5 exposes only mandatory
   first-stream `OP_AUTH` and scope-gated `OP_GET_BLOB`; DHT content
   announcements and durable weak-want fetching remain. `Peer` forwards local
-  assertion, durability, and partial-DAG capabilities, but signed assertion
-  replication and foreign-author admission remain an explicit later protocol.
+  assertion, durability, and partial-DAG capabilities, but generic envelope
+  replication and foreign-author/kind admission remain an explicit later protocol.
   Auth-handshake v2 provides bounded request, delivery, and exact proof-member
   operations. Proof locators are not secrets: the server fully verifies its
   local named chain and returns only a member touched by that verification.
@@ -149,36 +148,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It schedules from the verified chain-effective deadline and uses the local
   delivery marker as a durable proof-snapshot/outbound-auth publication
   journal.
-- **The command-line branch model is now exact and assertion-native.**
+- **The command-line branch model is now exact and asserted-pin native.**
   `trible pile branch` accepts only full `(Ed25519 author, Blake3 name-handle)`
-  descriptors, publishes one already-present canonical commit per `assert`,
-  and exposes deterministic `list`, `show`, and candidate-rooted `log` views.
+  descriptors and exposes deterministic `list`, `show`, and candidate-rooted
+  `log` views. Raw CLI assertion authoring is removed: only a `Repository`
+  workspace carries authenticated `BranchRank` provenance for safe publication.
   Local `forget` writes a fresh no-clobber pile generation while preserving
   every non-target record byte-for-byte; it is explicitly not replicated
   deletion. The unpublished mutable-pin branch commands and legacy
   merge/extract/re-id/squash rewrites are deleted instead of emulated.
   Empty pile creation now uses a durable no-clobber publication as well, so a
   repeated `pile create` cannot erase an existing append-only generation.
-- **Yard collection now preserves assertion-native branches.** Yard implements
-  the grow-only assertion store across all generations, treats every accepted
-  assertion's name and commit closure as hard retention roots even when weak
-  want markers predate blob arrival, and copies each segment's assertion set
-  into its replacement Pile before the atomic reclaim rename.
-- **Breaking: `Repository` publishes own-key grow-only branch assertions.**
+- **Yard collection now preserves generic asserted pins.** Yard unions the
+  grow-only assertion store across all generations and preserves unknown kinds
+  without treating their opaque values as roots. When a locally present
+  descriptor decodes as `BranchPinDescriptor`, every valid assertion's
+  descriptor, name, commit, and locally present closure become hard roots even
+  if weak want markers predate blob arrival. Reclaim copies each segment's exact
+  assertion set before the atomic rename.
+- **Breaking: `Repository` publishes own-key branch pins through the generic envelope.**
   `create_workspace(name)` now begins an unpublished branch without writing an
-  empty state; its first changed `push` makes staged blobs durable, validates
-  the proposed canonical commit metadata, and appends one signed assertion.
+  empty state; its first changed `push` makes the name and canonical descriptor
+  durable, validates the proposed commit metadata, and appends one signed
+  `(author, descriptor, commit, rank)` assertion.
   `resolve` exposes `Absent`, `TipPending`, `Partial`, and `Complete` directly,
   while `pull` creates a writable workspace only from a complete frontier and
   stages the deterministic flat merge for complete divergence without
   asserting that derived view. The CAS lifecycle (`create_branch`, scalar
   lookup/ensure, key overrides, `try_push`, conflict workspaces, and branch-head
   commit hooks) is removed rather than dual-authored. Local authoring rejects a
-  foreign `(author key, name handle)` descriptor before any store operation;
-  policy-bearing replicated ingest remains a separate capability. Optional
+  foreign `(author key, name handle)` selector before any store operation;
+  policy-bearing generic ingest remains a separate capability. Optional
   proc-macro instrumentation now names its own-key assertion branch with
-  `TRIBLESPACE_METADATA_BRANCH_NAME`; a truncated branch id can no longer
-  reconstruct the exact descriptor required for authoring.
+  `TRIBLESPACE_METADATA_BRANCH_NAME`; only the canonical descriptor's full
+  content handle enters asserted-pin identity.
 
 - **SuccinctArchive CPU range confirmation batches wavelet descents.** The
   frontier still forms and routes each complete candidate region before any

@@ -57,14 +57,6 @@ use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
-#[cfg(test)]
-use crate::repo::branch_assertion::{
-    reset_signature_verification_count, signature_verification_count,
-};
-use crate::repo::branch_assertion::{
-    AssertionId, AssertionKeyCollision, BranchAssertion, BranchAssertionSnapshot,
-    BranchAssertionStore, UnverifiedBranchAssertion, BRANCH_ASSERTION_LEN,
-};
 use crate::repo::pin_assertion::{
     PinAssertion, PinAssertionId, PinAssertionKeyCollision, PinAssertionSnapshot,
     PinAssertionStore, UnverifiedPinAssertion, PIN_ASSERTION_LEN,
@@ -74,8 +66,8 @@ const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_PIN: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 const MAGIC_MARKER_PIN_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
 /// V3 record markers — the uniform 256-byte-header format (minted 2026-06-29 via
-/// `trible genid`). Every V3 record (blob, legacy pin cell, signed branch
-/// assertion, generic asserted pin, or weak marker) has a FIXED 256-byte header
+/// `trible genid`). Every V3 record (blob, legacy pin cell, generic asserted
+/// pin, or weak marker) has a FIXED 256-byte header
 /// and is padded to a 256-byte multiple. Consequences:
 ///   * blob data starts at a constant `record_start + V3_HEADER_LEN` — reads are
 ///     position-INDEPENDENT (no offset-derived pad), so a record survives
@@ -89,11 +81,6 @@ const MAGIC_MARKER_PIN_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430
 const MAGIC_MARKER_BLOB_V3: RawId = hex!("9C33EEB525065A62EAEC4BE43DCC355A");
 const MAGIC_MARKER_PIN_V3: RawId = hex!("AC363D04AFE1AF17B39581B1E23021D7");
 const MAGIC_MARKER_PIN_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205671E4F");
-/// Signed grow-only branch-assertion marker (minted 2026-08-01 via
-/// `trible genid`). The record is marker + canonical 160-byte assertion +
-/// zeroed padding, exactly one V3 unit. Nonzero padding is rejected so these
-/// records cannot become an implicit extension envelope.
-const MAGIC_MARKER_BRANCH_ASSERTION_V3: RawId = hex!("DACC331F5C1C2036E6725C7B24EE2A51");
 /// Generic asserted-pin marker (minted 2026-08-02 via `trible genid`). The
 /// record is marker + canonical 192-byte signed assertion + 48 bytes of
 /// required-zero reserve, exactly one V3 unit.
@@ -120,8 +107,6 @@ const GPU_DATA_ALIGNMENT: usize = 256;
 /// and the whole record is padded to a multiple of this.
 const V3_HEADER_LEN: usize = 256;
 const V3_ALIGNMENT: usize = GPU_DATA_ALIGNMENT;
-const BRANCH_ASSERTION_RESERVED_LEN: usize =
-    V3_HEADER_LEN - std::mem::size_of::<RawId>() - BRANCH_ASSERTION_LEN;
 const PIN_ASSERTION_RESERVED_LEN: usize =
     V3_HEADER_LEN - std::mem::size_of::<RawId>() - PIN_ASSERTION_LEN;
 /// Post-data padding that rounds a V3 record up to a 256-byte multiple. The
@@ -366,25 +351,6 @@ impl PinTombstoneHeaderV3 {
     }
 }
 
-/// V3 signed branch assertion — one complete fixed 256-byte record.
-#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
-#[repr(C)]
-struct BranchAssertionHeaderV3 {
-    magic_marker: RawId,
-    assertion: [u8; BRANCH_ASSERTION_LEN],
-    reserved: [u8; BRANCH_ASSERTION_RESERVED_LEN],
-}
-
-impl BranchAssertionHeaderV3 {
-    fn new(assertion: BranchAssertion) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_BRANCH_ASSERTION_V3,
-            assertion: assertion.encode(),
-            reserved: [0u8; BRANCH_ASSERTION_RESERVED_LEN],
-        }
-    }
-}
-
 /// V3 generic asserted pin — one complete fixed 256-byte record.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -454,7 +420,6 @@ const _: () = {
     assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<PinHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<PinTombstoneHeaderV3>() == V3_HEADER_LEN);
-    assert!(std::mem::size_of::<BranchAssertionHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<PinAssertionHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakPinHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakUnpinHeaderV3>() == V3_HEADER_LEN);
@@ -466,8 +431,8 @@ const _: () = {
 /// record's header starts at `offset` and the whole record (header + payload +
 /// padding) spans `len` bytes, so `offset + len` is the offset of the next
 /// record. This is the same decoder the [`Pile`] itself replays on open, so it
-/// understands every record format ever written (V1 64-byte records and V3
-/// uniform 256-aligned records alike).
+/// understands each supported record format (V1 64-byte records and V3 uniform
+/// 256-aligned records alike).
 #[derive(Debug, Clone, Copy)]
 pub struct PileRecord {
     /// Byte offset of the record header within the pile file.
@@ -506,18 +471,6 @@ pub enum PileRecordContent {
     PinTombstone {
         /// The pin being tombstoned.
         pin_id: Id,
-    },
-    /// A strictly verified, grow-only branch assertion.
-    BranchAssertion {
-        /// The canonical signed assertion carried by this record.
-        assertion: BranchAssertion,
-    },
-    /// A structurally valid branch-assertion record whose signature is
-    /// invalid. Only its content id is exposed; its unauthenticated identity
-    /// and commit claim never leave replay storage.
-    InvalidBranchAssertion {
-        /// Blake3 id of the exact canonical witness bytes.
-        id: AssertionId,
     },
     /// A strictly verified generic asserted pin.
     PinAssertion {
@@ -565,9 +518,6 @@ enum DecodedPileRecordContent {
     },
     PinTombstone {
         pin_id: Id,
-    },
-    BranchAssertion {
-        assertion: UnverifiedBranchAssertion,
     },
     PinAssertion {
         assertion: UnverifiedPinAssertion,
@@ -686,20 +636,6 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<DecodedPileRecord, ReadE
                 content: DecodedPileRecordContent::PinTombstone { pin_id },
             })
         }
-        MAGIC_MARKER_BRANCH_ASSERTION_V3 => {
-            let (header, _) =
-                BranchAssertionHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            if header.reserved.iter().any(|byte| *byte != 0) {
-                return Err(corrupt());
-            }
-            let assertion = UnverifiedBranchAssertion::decode_structural(header.assertion)
-                .map_err(|_| corrupt())?;
-            Ok(DecodedPileRecord {
-                offset,
-                len: V3_HEADER_LEN,
-                content: DecodedPileRecordContent::BranchAssertion { assertion },
-            })
-        }
         MAGIC_MARKER_PIN_ASSERTION_V3 => {
             let (header, _) =
                 PinAssertionHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
@@ -759,12 +695,6 @@ fn verify_record(record: DecodedPileRecord) -> PileRecord {
         DecodedPileRecordContent::Pin { pin_id, head } => PileRecordContent::Pin { pin_id, head },
         DecodedPileRecordContent::PinTombstone { pin_id } => {
             PileRecordContent::PinTombstone { pin_id }
-        }
-        DecodedPileRecordContent::BranchAssertion { assertion } => {
-            match assertion.verify_strict() {
-                Ok(assertion) => PileRecordContent::BranchAssertion { assertion },
-                Err(_) => PileRecordContent::InvalidBranchAssertion { id: assertion.id() },
-            }
         }
         DecodedPileRecordContent::PinAssertion { assertion } => match assertion.verify_strict() {
             Ok(assertion) => PileRecordContent::PinAssertion { assertion },
@@ -849,7 +779,7 @@ fn indexed_blob_record(
 /// Iterator over the raw records of a pile file, in log order.
 ///
 /// This is the record-level view of the append-only log: every blob, historical
-/// mutable-pin update/tombstone, signed branch or generic pin assertion, and
+/// mutable-pin update/tombstone, generic pin assertion, and
 /// weak-pin marker ever appended, including records that later ones supersede.
 /// It shares its decoder with the [`Pile`] replay path, so both V1 and V3
 /// records are understood; tools that need history or forensics (reflogs,
@@ -932,7 +862,6 @@ enum Applied {
     Blob { hash: Inline<Hash<Blake3>> },
     Pin { id: Id, hash: Inline<Hash<Blake3>> },
     PinTombstone { id: Id },
-    BranchAssertion { id: AssertionId },
     PinAssertion { id: PinAssertionId },
     WeakPin { handle: Inline<Handle<UnknownBlob>> },
     WeakUnpin { handle: Inline<Handle<UnknownBlob>> },
@@ -959,7 +888,6 @@ pub struct Pile {
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
     validations: ValidationCache,
     pins: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
-    assertions: BranchAssertionSnapshot,
     pin_assertions: PinAssertionSnapshot,
     /// LWW-resolved weak-pin set: weak-pin records insert the handle,
     /// weak-unpin records remove it; log-order application makes the last
@@ -1256,56 +1184,6 @@ impl From<ReadError> for PileWriteError {
     }
 }
 
-/// Error returned by the grow-only branch-assertion store.
-#[derive(Debug)]
-pub enum PileAssertionError {
-    /// Existing pile bytes could not be replayed safely.
-    ReadError(ReadError),
-    /// Appending or durably flushing the assertion failed.
-    IoError(std::io::Error),
-    /// Two different canonical assertion witnesses produced the same 48-byte
-    /// index key.
-    KeyCollision(AssertionKeyCollision),
-}
-
-impl std::fmt::Display for PileAssertionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ReadError(err) => write!(f, "pile replay failed: {err}"),
-            Self::IoError(err) => write!(f, "assertion append failed: {err}"),
-            Self::KeyCollision(err) => std::fmt::Display::fmt(err, f),
-        }
-    }
-}
-
-impl std::error::Error for PileAssertionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ReadError(err) => Some(err),
-            Self::IoError(err) => Some(err),
-            Self::KeyCollision(err) => Some(err),
-        }
-    }
-}
-
-impl From<ReadError> for PileAssertionError {
-    fn from(err: ReadError) -> Self {
-        Self::ReadError(err)
-    }
-}
-
-impl From<std::io::Error> for PileAssertionError {
-    fn from(err: std::io::Error) -> Self {
-        Self::IoError(err)
-    }
-}
-
-impl From<AssertionKeyCollision> for PileAssertionError {
-    fn from(err: AssertionKeyCollision) -> Self {
-        Self::KeyCollision(err)
-    }
-}
-
 /// Error returned by the generic grow-only asserted-pin store.
 #[derive(Debug)]
 pub enum PilePinAssertionError {
@@ -1435,7 +1313,6 @@ impl Pile {
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
             validations: ValidationCache::default(),
             pins: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
-            assertions: BranchAssertionSnapshot::new(),
             pin_assertions: PinAssertionSnapshot::new(),
             weak_pins: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
@@ -1516,7 +1393,7 @@ impl Pile {
             .unwrap()
         };
         // Single decoder shared with [`PileRecords`] — understands every
-        // record format ever written (V1 and V3 alike).
+        // supported record format (V1 and V3 alike).
         let record = decode_record(slice, start_offset)?;
         let next_applied_length = start_offset + record.len;
         let applied = match record.content {
@@ -1557,15 +1434,6 @@ impl Pile {
             DecodedPileRecordContent::PinTombstone { pin_id } => {
                 self.pins.remove(&pin_id.into());
                 Applied::PinTombstone { id: pin_id }
-            }
-            DecodedPileRecordContent::BranchAssertion { assertion } => {
-                let id = assertion.id();
-                self.assertions.insert_unverified(assertion).map_err(|_| {
-                    ReadError::CorruptPile {
-                        valid_length: start_offset,
-                    }
-                })?;
-                Applied::BranchAssertion { id }
             }
             DecodedPileRecordContent::PinAssertion { assertion } => {
                 let id = assertion.id();
@@ -1671,7 +1539,6 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.blobs);
             std::ptr::drop_in_place(&mut this.validations);
             std::ptr::drop_in_place(&mut this.pins);
-            std::ptr::drop_in_place(&mut this.assertions);
             std::ptr::drop_in_place(&mut this.pin_assertions);
             std::ptr::drop_in_place(&mut this.weak_pins);
         }
@@ -1922,7 +1789,6 @@ impl Pile {
                     }
                     Some(Applied::Pin { .. }) => {}
                     Some(Applied::PinTombstone { .. }) => {}
-                    Some(Applied::BranchAssertion { .. }) => {}
                     Some(Applied::PinAssertion { .. }) => {}
                     Some(Applied::WeakPin { .. }) => {}
                     Some(Applied::WeakUnpin { .. }) => {}
@@ -2056,60 +1922,6 @@ impl PinStore for Pile {
         let out = res?;
         unlock_res?;
         Ok(out)
-    }
-}
-
-impl BranchAssertionStore for Pile {
-    type Error = PileAssertionError;
-
-    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
-        self.refresh()?;
-        Ok(self.assertions.clone())
-    }
-
-    /// Append one verified assertion as a fixed 256-byte Pile record.
-    ///
-    /// Unlike the legacy pin and weak-pin APIs, this method fulfils the trait's
-    /// durability promise before returning: both fresh appends and idempotent
-    /// duplicates pass through `sync_all` while the exclusive Pile lock is
-    /// held. A fresh record is decoded and applied through the normal replay
-    /// path before the durability barrier, so the disk parser remains the one
-    /// source of truth for admission.
-    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
-        self.file.lock()?;
-        let result = (|| {
-            self.refresh_locked()?;
-
-            if self.assertions.contains(&assertion)? {
-                self.file.sync_all()?;
-                self.dirty = false;
-                return Ok(());
-            }
-
-            let header = BranchAssertionHeaderV3::new(assertion);
-            self.dirty = true;
-            self.file.write_all(header.as_bytes())?;
-            match self.apply_next()? {
-                Some(Applied::BranchAssertion { id }) if id == assertion.id() => {}
-                Some(_) => {
-                    return Err(PileAssertionError::IoError(std::io::Error::other(
-                        "unexpected record after branch assertion write",
-                    )));
-                }
-                None => {
-                    return Err(PileAssertionError::IoError(std::io::Error::other(
-                        "branch assertion missing after write",
-                    )));
-                }
-            }
-            self.file.sync_all()?;
-            self.dirty = false;
-            Ok(())
-        })();
-        let unlock_result = self.file.unlock();
-        result?;
-        unlock_result?;
-        Ok(())
     }
 }
 
@@ -2336,14 +2148,6 @@ mod tests {
     use crate::repo::BlobStoreMeta;
     use crate::repo::PushResult;
 
-    fn branch_assertion(key: u8, name: u8, commit: u8) -> BranchAssertion {
-        BranchAssertion::sign(
-            &SigningKey::from_bytes(&[key; 32]),
-            Inline::new([name; 32]),
-            Inline::new([commit; 32]),
-        )
-    }
-
     fn pin_assertion(key: u8, pin: u8, value: u8, label: u8) -> PinAssertion {
         PinAssertion::sign(
             &SigningKey::from_bytes(&[key; 32]),
@@ -2382,63 +2186,6 @@ mod tests {
             std::mem::size_of::<IndexEntry>(),
             std::mem::size_of::<usize>()
         );
-    }
-
-    #[test]
-    fn branch_assertion_record_is_fixed_verified_idempotent_and_durable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "assertion.pile");
-        let assertion = branch_assertion(7, 11, 19);
-
-        let mut pile = Pile::open(&path).unwrap();
-        pile.append_assertion(assertion).unwrap();
-        assert!(!pile.dirty, "durable assertion append must cross sync_all");
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            V3_HEADER_LEN as u64
-        );
-
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..16], &MAGIC_MARKER_BRANCH_ASSERTION_V3);
-        assert_eq!(&bytes[16..16 + BRANCH_ASSERTION_LEN], &assertion.encode());
-        assert!(bytes[16 + BRANCH_ASSERTION_LEN..]
-            .iter()
-            .all(|byte| *byte == 0));
-
-        let snapshot = pile.assertion_snapshot().unwrap();
-        assert_eq!(
-            snapshot.iter().copied().collect::<Vec<_>>(),
-            vec![assertion]
-        );
-
-        let len = std::fs::metadata(&path).unwrap().len();
-        pile.append_assertion(assertion).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
-        pile.close().unwrap();
-
-        let mut second_handle = Pile::open(&path).unwrap();
-        second_handle.append_assertion(assertion).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
-        second_handle.close().unwrap();
-
-        let records: Vec<_> = PileRecords::open(&path)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(records.len(), 1);
-        assert!(matches!(
-            records[0].content,
-            PileRecordContent::BranchAssertion { assertion: decoded }
-                if decoded == assertion
-        ));
-
-        let mut reopened = Pile::open(&path).unwrap();
-        let snapshot = reopened.assertion_snapshot().unwrap();
-        assert_eq!(
-            snapshot.iter().copied().collect::<Vec<_>>(),
-            vec![assertion]
-        );
-        reopened.close().unwrap();
     }
 
     #[test]
@@ -2625,134 +2372,6 @@ mod tests {
                 ..
             }] if *hash == replacement_handle.into()
         ));
-    }
-
-    #[test]
-    fn branch_assertion_replay_defers_bad_signatures_but_rejects_nonzero_padding() {
-        let dir = tempfile::tempdir().unwrap();
-        let assertion = branch_assertion(7, 11, 19);
-        let canonical = BranchAssertionHeaderV3::new(assertion);
-
-        let signature_path = fresh_empty_pile_path(&dir, "signature.pile");
-        let mut invalid_signature = canonical.as_bytes().to_vec();
-        invalid_signature[16 + 96] ^= 1;
-        std::fs::write(&signature_path, invalid_signature).unwrap();
-
-        reset_signature_verification_count();
-        let mut pile = Pile::open(&signature_path).unwrap();
-        pile.refresh().unwrap();
-        assert_eq!(signature_verification_count(), 0);
-        let snapshot = pile.assertion_snapshot().unwrap();
-        assert_eq!(snapshot.len(), 1, "the exact persisted witness is retained");
-        assert_eq!(snapshot.iter().count(), 0, "invalid claims never escape");
-        assert_eq!(signature_verification_count(), 1);
-        pile.close().unwrap();
-
-        // The forensic view preserves the structural record boundary but does
-        // not expose its unauthenticated identity or commit claim.
-        assert!(matches!(
-            PileRecords::open(&signature_path).unwrap().next(),
-            Some(Ok(PileRecord {
-                content: PileRecordContent::InvalidBranchAssertion { .. },
-                ..
-            }))
-        ));
-
-        let reserved_path = fresh_empty_pile_path(&dir, "reserved.pile");
-        let mut invalid_padding = canonical.as_bytes().to_vec();
-        invalid_padding[V3_HEADER_LEN - 1] ^= 1;
-        std::fs::write(&reserved_path, invalid_padding).unwrap();
-        let mut pile = Pile::open(&reserved_path).unwrap();
-        assert!(matches!(
-            pile.refresh(),
-            Err(ReadError::CorruptPile { valid_length: 0 })
-        ));
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn replaying_many_assertions_performs_zero_signature_verifications() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "many-assertions.pile");
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        for commit in 0..=127 {
-            let assertion = branch_assertion(7, 11, commit);
-            file.write_all(BranchAssertionHeaderV3::new(assertion).as_bytes())
-                .unwrap();
-        }
-        file.sync_all().unwrap();
-        drop(file);
-
-        reset_signature_verification_count();
-        let mut pile = Pile::open(&path).unwrap();
-        pile.refresh().unwrap();
-        assert_eq!(pile.assertions.len(), 128);
-        assert_eq!(
-            signature_verification_count(),
-            0,
-            "structural pile replay must not perform signature equations"
-        );
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn truncated_branch_assertion_reports_and_amputates_at_the_record_boundary() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = BranchAssertionHeaderV3::new(branch_assertion(7, 11, 19));
-        let second = BranchAssertionHeaderV3::new(branch_assertion(7, 11, 23));
-
-        for prefix_len in [1usize, 16, 175, V3_HEADER_LEN - 1] {
-            let path = fresh_empty_pile_path(&dir, &format!("truncated-{prefix_len}.pile"));
-            let mut bytes = first.as_bytes().to_vec();
-            bytes.extend_from_slice(&second.as_bytes()[..prefix_len]);
-            std::fs::write(&path, bytes).unwrap();
-
-            let mut pile = Pile::open(&path).unwrap();
-            assert!(matches!(
-                pile.refresh(),
-                Err(ReadError::CorruptPile { valid_length })
-                    if valid_length == V3_HEADER_LEN
-            ));
-            pile.amputate().unwrap();
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().len(),
-                V3_HEADER_LEN as u64
-            );
-            assert_eq!(pile.assertion_snapshot().unwrap().len(), 1);
-            pile.close().unwrap();
-        }
-    }
-
-    #[test]
-    fn cat_merge_unions_branch_assertions_without_log_order_semantics() {
-        let dir = tempfile::tempdir().unwrap();
-        let left_path = fresh_empty_pile_path(&dir, "left.pile");
-        let right_path = fresh_empty_pile_path(&dir, "right.pile");
-        let first = branch_assertion(7, 11, 19);
-        let second = branch_assertion(7, 11, 23);
-
-        let mut left = Pile::open(&left_path).unwrap();
-        left.append_assertion(first).unwrap();
-        left.close().unwrap();
-
-        let mut right = Pile::open(&right_path).unwrap();
-        right.append_assertion(second).unwrap();
-        right.append_assertion(first).unwrap();
-        right.close().unwrap();
-
-        let right_bytes = std::fs::read(&right_path).unwrap();
-        let mut left_file = OpenOptions::new().append(true).open(&left_path).unwrap();
-        left_file.write_all(&right_bytes).unwrap();
-        left_file.sync_all().unwrap();
-        drop(left_file);
-
-        let mut merged = Pile::open(&left_path).unwrap();
-        let snapshot = merged.assertion_snapshot().unwrap();
-        assert_eq!(snapshot.len(), 2);
-        let assertions: Vec<_> = snapshot.iter().copied().collect();
-        assert!(assertions.contains(&first));
-        assert!(assertions.contains(&second));
-        merged.close().unwrap();
     }
 
     #[test]
@@ -4148,7 +3767,6 @@ mod tests {
             Blob::<UnknownBlob>::new(Bytes::from_source(vec![11u8; 13])).get_handle();
         let retracted: Inline<Handle<UnknownBlob>> =
             Blob::<UnknownBlob>::new(Bytes::from_source(vec![12u8; 13])).get_handle();
-        let assertion = branch_assertion(7, 11, 19);
         let generic_assertion = pin_assertion(7, 13, 29, 5);
 
         let mut pile: Pile = Pile::open(&path).unwrap();
@@ -4157,7 +3775,6 @@ mod tests {
         // Interleave every current V3 state family with blobs and one legacy
         // V1 record.
         pile.pin_weak(want).unwrap();
-        pile.append_assertion(assertion).unwrap();
         pile.append_pin_assertion(generic_assertion).unwrap();
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
@@ -4184,14 +3801,6 @@ mod tests {
         drop(reader);
 
         assert_eq!(pile.head(pin_id).unwrap(), Some(h1.transmute()));
-        assert_eq!(
-            pile.assertion_snapshot()
-                .unwrap()
-                .iter()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![assertion]
-        );
         assert_eq!(
             pile.pin_assertion_snapshot()
                 .unwrap()

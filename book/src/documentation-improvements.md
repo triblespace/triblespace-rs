@@ -13,13 +13,14 @@ The following themes unblock common deployment or operational scenarios and
 should be tackled first when planning documentation work:
 
 ### Remote object stores
-`repo::objectstore::ObjectStoreRemote::with_url` wires blob storage and
-replica-local mutable pins into
+`repo::objectstore::ObjectStoreRemote::with_url` wires blob storage and the
+legacy mutable-pin namespace into
 [`object_store`](https://docs.rs/object_store/latest/object_store/) services such
-as S3, local filesystems or Azure storage. It is deliberately not a StrongPin
-assertion store: the generic `ObjectStore::list` contract is not a coherent
+as S3, local filesystems or Azure storage. It deliberately does not implement
+`PinAssertionStore`: the generic `ObjectStore::list` contract is not a coherent
 point-in-time snapshot, and the local-filesystem backend does not expose the
-file and directory durability barriers required by `BranchAssertionStore`.
+file and directory durability barriers required by a grow-only assertion
+ledger.
 The future chapter should cover credentials, namespace selection, the clean
 `pins/` versus `blobs/` split, hash validation on reads, and the additional
 backend-specific durability capability required before remote blobs can sit on
@@ -28,8 +29,8 @@ explicit immutable-snapshot protocol and truthful durability boundary; a
 LIST-plus-GET shim is not sufficient.
 
 ### Hybrid storage recipes
-`repo::hybridstore::HybridStore` mixes a blob store with a separate signed
-assertion store. Documenting a few reference layouts—durable piles with a
+`repo::hybridstore::HybridStore` mixes a blob store with a separate generic
+asserted-pin store. Documenting a few reference layouts—durable piles with a
 separate assertion ledger, piles with in-memory assertions for tests, or
 two-tier blob caches—will help teams evaluate trade-offs quickly. Remote blob
 storage becomes such a layout only once its adapter truthfully exposes the
@@ -38,11 +39,13 @@ trait contract.
 
 ### Signature verification
 `repo::commit::verify` validates signed commit metadata, while
-`BranchAssertion::decode_verified` is the only constructor for assertion bytes
-received from storage or a peer. A hands-on example should distinguish
+`PinAssertion::decode_verified` is the public constructor for generic envelope
+bytes received from a peer. A hands-on example should distinguish
 cryptographic validity from authorization: signature verification admits no
-foreign assertion by itself, and the remote ingest boundary must still enforce
-an exact identity policy and resource bounds.
+foreign assertion or descriptor kind by itself, and the remote ingest boundary
+must still enforce exact identity, kind, and resource policies. Branch handling
+then separately loads `BranchPinDescriptor` and interprets the opaque label as
+`BranchRank`; the generic layer must not do either.
 
 ### Repository migration helpers
 `repo::transfer` rewrites whichever handles you feed it and returns the old and

@@ -46,7 +46,7 @@ use super::PushResult;
 const LOCAL_PIN_INFIX: &str = "pins";
 const BLOB_INFIX: &str = "blobs";
 
-/// Blob and replica-local pin storage backed by an [`object_store`]
+/// Blob and legacy mutable-pin storage backed by an [`object_store`]
 /// compatible backend.
 ///
 /// All data is stored in an external service (e.g. S3, local filesystem)
@@ -54,8 +54,8 @@ const BLOB_INFIX: &str = "blobs";
 /// type is **async-native**: it implements the
 /// [`AsyncBlobStore`] family
 /// directly, awaiting each operation, with no owned runtime.
-/// It deliberately does not implement branch-assertion storage or a crash
-/// durability barrier, so it is not by itself a StrongPin repository backend.
+/// It deliberately does not implement asserted-pin storage or a crash
+/// durability barrier, so it cannot by itself implement `PinAssertionStore`.
 ///
 /// Synchronous callers wrap it in
 /// [`Blocking`](super::async_store::Blocking), which carries the single
@@ -176,8 +176,8 @@ impl AsyncPinStore for ObjectStoreRemote {
     ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send
     {
         async move {
-            // These CAS cells are replica-local transport/retention pins, not
-            // shared StrongPin branch authority.
+            // These CAS cells are the legacy mutable-pin namespace, not shared
+            // asserted-pin authority.
             let prefix = self.prefix.child(LOCAL_PIN_INFIX);
             let stream = self.store.list(Some(&prefix)).filter_map(|r| async move {
                 match r {
@@ -562,7 +562,7 @@ impl fmt::Display for ListBlobsErr {
 }
 impl Error for ListBlobsErr {}
 
-/// Error returned when listing replica-local pins from the object store.
+/// Error returned when listing legacy mutable pins from the object store.
 #[derive(Debug)]
 pub enum ListPinsErr {
     /// The underlying list operation failed.
@@ -587,7 +587,7 @@ impl fmt::Display for ListPinsErr {
 }
 impl Error for ListPinsErr {}
 
-/// Error returned when reading a replica-local pin from the object store.
+/// Error returned when reading a legacy mutable pin from the object store.
 #[derive(Debug)]
 pub enum ReadPinErr {
     /// The stored bytes could not be parsed as a valid handle.
@@ -619,7 +619,7 @@ impl From<TryFromSliceError> for ReadPinErr {
     }
 }
 
-/// Error returned when updating a replica-local pin in the object store.
+/// Error returned when updating a legacy mutable pin in the object store.
 #[derive(Debug)]
 pub enum UpdatePinErr {
     /// The stored bytes could not be parsed as a valid handle during a

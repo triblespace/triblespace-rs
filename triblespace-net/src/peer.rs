@@ -49,9 +49,6 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::repo::branch_assertion::{
-    BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore,
-};
 use triblespace_core::repo::branch_frontier::{ParentLookup, PartialCommitDag};
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::pin_assertion::{
@@ -1613,39 +1610,9 @@ where
     }
 }
 
-impl<S> BranchAssertionStore for Peer<S>
-where
-    S: BlobStore
-        + BlobStorePut
-        + PinStore
-        + WeakPinStore
-        + StorageFlush
-        + BranchAssertionStore
-        + Send
-        + 'static,
-{
-    type Error = <S as BranchAssertionStore>::Error;
-
-    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
-        let _ = self.refresh();
-        self.store.lock().expect("store mutex").assertion_snapshot()
-    }
-
-    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
-        // Assertions are already immutable, verified values. A future wire
-        // protocol can replicate their exact `(author, name handle) -> commit`
-        // identity without synthesizing mutable heads.
-        self.store
-            .lock()
-            .expect("store mutex")
-            .append_assertion(assertion)
-    }
-}
-
 /// Generic asserted pins are authority state rather than blob payloads. The
 /// peer therefore forwards their coherent snapshots and durable appends to its
-/// local store, just like the legacy branch-specific assertion surface, while
-/// leaving replication to a future assertion wire protocol.
+/// local store while leaving replication to a future assertion wire protocol.
 impl<S> PinAssertionStore for Peer<S>
 where
     S: BlobStore

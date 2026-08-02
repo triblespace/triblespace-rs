@@ -1,11 +1,11 @@
 //! `trible pile pin …` — generic operations on the pin storage
 //! primitive. Pins are atomically-updatable handles to SimpleArchive blobs.
-//! They remain useful for local retention and policy state, but they are not
-//! StrongPin branch authority.
+//! They remain temporarily for legacy retention and policy consumers, but they
+//! are not asserted-pin or branch authority.
 //!
 //! Signed branches live under `trible pile branch …` and are selected by their
 //! full `(author key, name handle)` identity. This lower-level surface sees
-//! only mutable local/legacy pins.
+//! only legacy mutable pins.
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -23,14 +23,14 @@ use triblespace_core::trible::TribleSet;
 #[derive(Parser)]
 pub enum Command {
     /// List every local/legacy pin in a pile, classified by role (LEGACY-BRANCH /
-    /// POLICY / UNNAMED / UNREADABLE). Signed StrongPin branches are
+    /// POLICY / UNNAMED / UNREADABLE). Asserted branch pins are
     /// separate state inspected with `pile branch list`.
     List {
         /// Path to the pile file to inspect.
         path: PathBuf,
     },
     /// Inspect a single pin: print its role, head handle, and the
-    /// raw count of tribles in its head metadata. Signed StrongPin branches are
+    /// raw count of tribles in its head metadata. Asserted branch pins are
     /// separate state inspected with `pile branch show`.
     Inspect {
         /// Path to the pile file to inspect.
@@ -44,8 +44,8 @@ pub enum Command {
     /// become unreachable; physical reclamation requires a separate
     /// retention rewrite.
     ///
-    /// StrongPin branches cannot be deleted through this command. This is the
-    /// raw local path for incorrect policy or retention entries.
+    /// Asserted branch pins cannot be deleted through this command. This is the
+    /// legacy scalar path for incorrect policy or retention entries.
     Delete {
         /// Path to the pile file to modify.
         path: PathBuf,
@@ -111,7 +111,7 @@ fn classify(meta: &TribleSet, pin_id: Id) -> Role {
         if let Some(name) = name_iter.next() {
             // Keep this low-level pin view self-contained. Dereferencing the
             // LongString would require another blob fetch, so expose its exact
-            // handle instead of implying a relationship to StrongPin state.
+            // handle instead of implying a relationship to asserted-pin state.
             return Role::Branch(format!("name-handle=blake3:{}", hex::encode(name.raw)));
         }
     }

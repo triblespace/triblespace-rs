@@ -97,7 +97,7 @@ pub enum Command {
         key: Option<PathBuf>,
     },
     /// Announce local blobs and service durable weak-pin wants over the team
-    /// network. This does not replicate signed branch assertions.
+    /// network. This does not replicate generic pin assertions or descriptors.
     /// The team root is read from `TRIBLE_TEAM_ROOT`, falling back to this
     /// node's own pubkey for single-user / team-of-one workflows.
     Sync {
@@ -242,7 +242,7 @@ fn run_sync(
         .map_err(|error| anyhow!("install Ctrl-C handler: {error}"))?;
 
     // A single pile handle wrapped in a Peer. Local blobs are announced to the
-    // DHT; signed branch assertions remain local.
+    // DHT; generic pin assertions and descriptors remain local.
     let pile = open_pile(&pile_path)?;
     let team_root = team_root_from_env(&key)?;
     let self_cap = self_cap_from_env()?;

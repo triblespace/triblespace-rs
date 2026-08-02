@@ -418,6 +418,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_identity_selector_has_one_stable_rendering() {
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let identity = BranchIdentity::new(key.verifying_key(), name(1));
+        let selector = identity.to_string();
+
+        assert_eq!(
+            selector,
+            concat!(
+                "ed25519:ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1/",
+                "blake3:0101010101010101010101010101010101010101010101010101010101010101"
+            )
+        );
+        assert_eq!(selector.parse::<BranchIdentity>().unwrap(), identity);
+    }
+
+    #[test]
+    fn exact_identity_selector_rejects_ambiguous_or_malformed_inputs() {
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let identity = BranchIdentity::new(key.verifying_key(), name(1));
+        let selector = identity.to_string();
+
+        assert_eq!(
+            "00000000000000000000000000000000".parse::<BranchIdentity>(),
+            Err(BranchIdentityParseError::InvalidFormat)
+        );
+        assert_eq!(
+            selector
+                .replace("ed25519:", "key:")
+                .parse::<BranchIdentity>(),
+            Err(BranchIdentityParseError::InvalidFormat)
+        );
+        assert_eq!(
+            selector
+                .replace("blake3:01", "blake3:zz")
+                .parse::<BranchIdentity>(),
+            Err(BranchIdentityParseError::InvalidNameHex)
+        );
+    }
+
+    #[test]
     fn branch_values_are_exact_commit_handles() {
         let raw = [19; 32];
         assert_eq!(commit_from_value(ValueHandle::from_raw(raw)).raw, raw);

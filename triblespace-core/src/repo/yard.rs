@@ -27,11 +27,9 @@ use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use crate::prelude::blobencodings::SimpleArchive;
 
-use super::branch_assertion::{BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore};
 use super::branch_pin::{commit_from_value, BranchPinDescriptor};
 use super::pile::{
-    GetBlobError, InsertError, Pile, PileAssertionError, PilePinAssertionError, PileReader,
-    PileWriteError, ReadError,
+    GetBlobError, InsertError, Pile, PilePinAssertionError, PileReader, PileWriteError, ReadError,
 };
 use super::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
 use super::{
@@ -389,23 +387,9 @@ impl Yard {
         })
     }
 
-    /// Union the grow-only assertion sets stored in every segment.
-    ///
-    /// Yard owns its generation files exclusively while it is open. Within
-    /// that ownership boundary, joining per-segment snapshots is a coherent
-    /// snapshot: assertion state is a set and has no log-order semantics.
-    fn collect_assertions(&mut self) -> Result<BranchAssertionSnapshot, PileAssertionError> {
-        let mut assertions = BranchAssertionSnapshot::new();
-        for generation in &mut self.generations {
-            for segment in &mut generation.segments {
-                assertions.union(segment.pile_mut().assertion_snapshot()?)?;
-            }
-        }
-        Ok(assertions)
-    }
-
-    /// Union generic asserted-pin snapshots from every segment. Like branch
-    /// assertions, this state is a grow-only set with no generation order.
+    /// Union generic asserted-pin snapshots from every segment. Yard owns its
+    /// generation files exclusively while open, so joining their grow-only
+    /// sets is one coherent snapshot with no generation-order semantics.
     fn collect_pin_assertions(&mut self) -> Result<PinAssertionSnapshot, PilePinAssertionError> {
         let mut assertions = PinAssertionSnapshot::new();
         for generation in &mut self.generations {
@@ -468,14 +452,11 @@ impl Yard {
 
     /// Recompute the keep set and logically collect cold weak pins and orphans.
     pub fn collect(&mut self) -> Result<(), YardCollectError> {
-        let assertions = self
-            .collect_assertions()
-            .map_err(YardCollectError::Assertions)?;
         let pin_assertions = self
             .collect_pin_assertions()
             .map_err(YardCollectError::PinAssertions)?;
         let reader = self.reader().map_err(YardCollectError::Reader)?;
-        let durable_keep = self.durable_keep_set(&reader, &assertions, &pin_assertions);
+        let durable_keep = self.durable_keep_set(&reader, &pin_assertions);
         let present = reader.live_set();
         let weak_keep = self
             .weak_state
@@ -503,14 +484,11 @@ impl Yard {
         let mut dumped = Vec::new();
 
         {
-            let assertions = self
-                .collect_assertions()
-                .map_err(YardCollectError::Assertions)?;
             let pin_assertions = self
                 .collect_pin_assertions()
                 .map_err(YardCollectError::PinAssertions)?;
             let reader = self.reader().map_err(YardCollectError::Reader)?;
-            let durable_keep = self.durable_keep_set(&reader, &assertions, &pin_assertions);
+            let durable_keep = self.durable_keep_set(&reader, &pin_assertions);
 
             for level in 0..last {
                 let durable_here = self.generations[level].segments[0]
@@ -676,18 +654,16 @@ impl Yard {
 
     /// Keep set for state that may never be silently evicted.
     ///
-    /// Legacy strong pins retain their historical weak-veto semantics. Branch
-    /// assertions are different: every accepted assertion remains true, so its
-    /// target and complete locally-present closure are hard roots even when a
-    /// demand-born weak marker predates arrival of those blobs.
+    /// Legacy strong pins retain their historical weak-veto semantics. Typed
+    /// branch pins are different: every accepted assertion remains true, so
+    /// its target and complete locally-present closure are hard roots even when
+    /// a demand-born weak marker predates arrival of those blobs.
     fn durable_keep_set(
         &self,
         reader: &YardReader,
-        assertions: &BranchAssertionSnapshot,
         pin_assertions: &PinAssertionSnapshot,
     ) -> HandleSet {
         let mut keep = self.strong_keep_set(reader);
-        keep.union(assertion_keep_set(reader, assertions));
         keep.union(branch_pin_keep_set(reader, pin_assertions));
         keep
     }
@@ -713,26 +689,6 @@ impl Yard {
             .live
             .insert(&Entry::new(&unknown.raw));
         Ok(handle)
-    }
-}
-
-impl BranchAssertionStore for Yard {
-    type Error = PileAssertionError;
-
-    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
-        self.collect_assertions()
-    }
-
-    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
-        // Avoid writing a physical duplicate merely because its first copy is
-        // in an older segment. A collision is surfaced before any append.
-        if self.collect_assertions()?.contains(&assertion)? {
-            return Ok(());
-        }
-        self.generations[0]
-            .active_mut()
-            .pile_mut()
-            .append_assertion(assertion)
     }
 }
 
@@ -1203,40 +1159,6 @@ fn collect_list<E>(
     Ok(set)
 }
 
-/// Trace every locally-present blob reachable from every asserted target,
-/// deliberately bypassing the Yard weak veto.
-///
-/// Missing roots are still included in the returned set (and disappear when
-/// intersected with a segment's live set). If they arrive later, the next
-/// collection retains them and discovers whatever closure is then present.
-fn assertion_keep_set(reader: &YardReader, assertions: &BranchAssertionSnapshot) -> HandleSet {
-    let mut queue = std::collections::VecDeque::new();
-    let mut keep = HandleSet::new();
-    for assertion in assertions.iter() {
-        let target: Inline<Handle<UnknownBlob>> = assertion.commit().transmute();
-        queue.push_back(target);
-
-        // The name handle is part of the exact branch descriptor. Retain its
-        // content when present, but do not scan arbitrary LongString bytes as
-        // a reference graph: only commit targets carry recursive structure.
-        let name: Inline<Handle<UnknownBlob>> = assertion.identity().name().transmute();
-        keep.insert(&Entry::new(&name.raw));
-    }
-
-    while let Some(handle) = queue.pop_front() {
-        if keep.get(&handle.raw).is_some() {
-            continue;
-        }
-        keep.insert(&Entry::new(&handle.raw));
-        for child in reader.children_without_weak_veto(handle) {
-            if keep.get(&child.raw).is_none() {
-                queue.push_back(child);
-            }
-        }
-    }
-    keep
-}
-
 /// Project the built-in branch kind out of the generic asserted-pin set and
 /// retain its locally present commit closure.
 ///
@@ -1297,13 +1219,8 @@ fn reclaim_generation(
 
     // Assertions are immutable set members. Copy them before the atomic
     // rename: re-appending after replacement would leave a crash window in
-    // which accepted replicated state had vanished. Generic witnesses are
-    // reproduced structurally (including invalid signatures retained for
-    // diagnostics); the legacy branch format is removed by the asserted-pin
-    // migration rather than extended with another raw replay surface.
-    let assertions = old_pile
-        .assertion_snapshot()
-        .map_err(YardReclaimError::Assertions)?;
+    // which accepted replicated state had vanished. Witnesses are reproduced
+    // structurally, including invalid signatures retained for diagnostics.
     let pin_assertions = old_pile
         .pin_assertion_snapshot()
         .map_err(YardReclaimError::PinAssertions)?;
@@ -1320,11 +1237,6 @@ fn reclaim_generation(
         result.map_err(YardReclaimError::Transfer)?;
     }
 
-    for assertion in assertions.iter().copied() {
-        new_pile
-            .append_assertion(assertion)
-            .map_err(YardReclaimError::Assertions)?;
-    }
     for assertion in pin_assertions.iter_unverified() {
         new_pile
             .append_replayed_pin_assertion(assertion)
@@ -1424,7 +1336,6 @@ impl<E: Error + 'static> Error for YardGetError<E> {}
 
 #[derive(Debug)]
 pub enum YardCollectError {
-    Assertions(PileAssertionError),
     PinAssertions(PilePinAssertionError),
     Reader(YardReaderError),
     Transfer(TransferError<Infallible, YardGetError<Infallible>, InsertError>),
@@ -1436,7 +1347,6 @@ pub enum YardCollectError {
 impl fmt::Display for YardCollectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Assertions(err) => write!(f, "failed to snapshot yard assertions: {err}"),
             Self::PinAssertions(err) => {
                 write!(f, "failed to snapshot generic yard pin assertions: {err}")
             }
@@ -1474,7 +1384,6 @@ impl Error for YardCloseError {}
 pub enum YardReclaimError {
     Io(std::io::Error),
     Pile(ReadError),
-    Assertions(PileAssertionError),
     PinAssertions(PilePinAssertionError),
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     Close(super::pile::FlushError),
@@ -1497,7 +1406,6 @@ impl fmt::Display for YardReclaimError {
         match self {
             Self::Io(err) => write!(f, "failed to replace yard generation pile: {err}"),
             Self::Pile(err) => write!(f, "failed to read yard generation pile: {err}"),
-            Self::Assertions(err) => write!(f, "failed to preserve yard assertions: {err}"),
             Self::PinAssertions(err) => {
                 write!(f, "failed to preserve generic yard pin assertions: {err}")
             }

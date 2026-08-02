@@ -8,11 +8,11 @@ Network transport for TribleSpace piles over
 - durable weak-pin wants for lazy fetching; and
 - the capability request, delivery, renewal, and proof-bootstrap channel.
 
-The network does **not** replicate StrongPin branch assertions yet. Appending a
-signed assertion to one peer does not announce or admit that assertion on
-another peer. The former scalar mutable-HEAD gossip/tracking bridge and its
-`OP_CHILDREN` traversal RPC were deleted rather than carried into the StrongPin
-model.
+The network does **not** replicate generic asserted pins yet. Appending a
+`PinAssertion` to one peer does not announce or admit that envelope or its
+descriptor blob on another peer. The former scalar mutable-HEAD
+gossip/tracking bridge and its `OP_CHILDREN` traversal RPC were deleted rather
+than carried into the asserted-pin model.
 
 ## Capability model
 

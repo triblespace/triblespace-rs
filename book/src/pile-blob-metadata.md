@@ -12,7 +12,7 @@ The header written ahead of every blob contains four fields (64 bytes total):
 
 | Field         | Size (bytes) | Purpose                                                                 |
 | ------------- | ------------ | ------------------------------------------------------------------------ |
-| Magic marker  | 16           | Distinguishes blob records from branch updates.                         |
+| Magic marker  | 16           | Distinguishes blob records from local pins and generic assertions.      |
 | Timestamp     | 8            | Milliseconds since the Unix epoch when the payload was appended.        |
 | Length        | 8            | Size of the payload in bytes (padding is stored separately).            |
 | Hash          | 32           | The 256-bit digest of the payload used to validate the stored bytes.    |

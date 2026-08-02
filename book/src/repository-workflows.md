@@ -2,9 +2,10 @@
 
 TribleSpace repositories separate immutable, content-addressed blobs from the
 small amount of replicated state needed to name a line of work. That replicated
-state is a set of immutable, signed branch assertions. There is no mutable
-branch-head slot: publishing adds an assertion, and resolving a branch derives
-its current frontier from all assertions known for its exact identity.
+state uses the same immutable asserted-pin envelope as every other pin kind.
+There is no mutable branch-head slot: publishing adds a typed branch-pin
+assertion, and resolving a branch derives its current frontier from all generic
+assertions known for its exact descriptor.
 
 The main types are:
 
@@ -14,10 +15,15 @@ The main types are:
   current commit head, and blobs not yet uploaded to the repository.
 - **`BranchIdentity`** — the exact `(author key, name handle)` pair identifying
   a branch. The name is a content-addressed `LongString` blob.
-- **`BranchAssertion`** — an immutable signature by the branch author over that
-  exact identity and one commit handle.
-- **`BranchAssertionStore`** — storage for a coherent, grow-only set of verified
-  assertions.
+- **`BranchPinDescriptor`** — the canonical typed blob containing the branch
+  kind marker and name handle. Its content handle is the generic pin handle.
+- **`BranchRank`** — the branch kind's authenticated, causally monotone
+  256-bit label carried through workspace provenance.
+- **`PinAssertion`** — the generic signed envelope over an author, descriptor
+  handle, value handle, and opaque label. For a branch, the value is a commit
+  and the label is a `BranchRank`.
+- **`PinAssertionStore`** — storage for one coherent, grow-only set of generic
+  assertion witnesses, including kinds the current binary does not understand.
 
 This model deliberately allows concurrent publications. If two writers publish
 incomparable descendants, both assertions remain true; resolution computes the
@@ -48,7 +54,7 @@ Repository operations are capability-gated by the backend:
 
 - `BlobStore` is sufficient to construct a repository and create a detached
   workspace.
-- `BranchAssertionStore` and a reader implementing `PartialCommitDag` add
+- `PinAssertionStore` and a reader implementing `PartialCommitDag` add
   branch resolution and pull.
 - `StorageFlush` adds publication, because blobs must cross a durability
   boundary before an assertion may point at them.
@@ -56,8 +62,8 @@ Repository operations are capability-gated by the backend:
   shutdown.
 
 `MemoryRepo` provides all of these capabilities for tests and ephemeral work.
-`Pile` provides the durable local implementation: blobs and fixed-size branch
-assertion records share one append-only file. Other storage compositions can
+`Pile` provides the durable local implementation: blobs and fixed-size generic
+asserted-pin records share one append-only file. Other storage compositions can
 implement the same capabilities without changing the repository semantics.
 
 ## Branch identity and first publication
@@ -69,9 +75,11 @@ full pair of the repository's public key and the content handle of the name:
 BranchIdentity = (author verifying key, branch-name handle)
 ```
 
-`BranchIdentity` is `Copy`, so callers can retain it as the stable descriptor
-used by `resolve` and `pull`. Its shorter `BranchId` is an intrinsic index
-prefix, not a substitute for comparing the full descriptor.
+`BranchIdentity` is `Copy`, so callers can retain it as the stable selector used
+by `resolve` and `pull`. Internally, `BranchPinDescriptor` deterministically
+turns its name into a typed descriptor blob; the full 32-byte handle of that
+blob, paired with the author key, is the generic asserted-pin identity. No
+truncated branch id participates in selection or equality.
 
 Create a new line of work with `create_workspace`, commit into it, and publish
 the commit with `push`:
@@ -92,11 +100,12 @@ assert!(matches!(
 let mut reopened = repo.pull(main)?;
 ```
 
-Creating the workspace only stages the branch-name blob locally. It does not
-write an assertion or create an empty branch. Pushing a workspace whose head
-has not changed returns `PublishOutcome::NoChange`; empty branches therefore
-remain unrepresentable. The first changed push makes the staged blobs durable
-and adds the first signed assertion.
+Creating the workspace stages the branch-name blob and canonical
+`BranchPinDescriptor` locally. It does not write an assertion or create an
+empty branch. Pushing a workspace whose head has not changed returns
+`PublishOutcome::NoChange`; empty branches therefore remain unrepresentable.
+The first changed push makes the staged blobs durable and adds the first
+generic assertion carrying the commit value and root rank.
 
 For an existing name owned by the repository key, callers can derive the same
 descriptor without opening a workspace:
@@ -121,13 +130,16 @@ metadata, stages all resulting blobs, and advances the local head.
 These operations do not mutate repository branch state. Applications may keep
 several workspaces for one identity and let them advance independently. Their
 only replicated effect occurs when `push` appends an assertion for a changed
-head. `Workspace::identity`, `head`, `put`, `get`, `commit`, `checkout`, and the
+head. The workspace also retains authenticated rank provenance: roots start at
+zero, and each child or merge advances beyond its greatest parent rank.
+`Workspace::identity`, `head`, `put`, `get`, `commit`, `checkout`, and the
 explicit merge helpers all operate within this local view.
 
 ## Resolving assertions
 
-`Repository::resolve` takes a coherent assertion snapshot and classifies what
-can be established from the commit metadata currently available locally. It
+`Repository::resolve` takes a coherent generic assertion snapshot, selects the
+exact branch-pin identity, and classifies what can be established from the
+commit metadata currently available locally. It
 returns one of four states:
 
 | State | Meaning | Safe next step |
@@ -137,8 +149,11 @@ returns one of four states:
 | `Partial` | Every surviving tip is a well-formed commit, but missing ancestry prevents the resolver from deciding all dominance relations. | Inspect `candidate_root()` only as a deterministic descriptor, fetch `missing_ancestry()`, and resolve again before checkout or authoring. |
 | `Complete` | The complete, sorted, nonempty maximal antichain is known. | Inspect `tips()` or open a writable workspace with `pull`. |
 
-Absence is distinct from incomplete replication. A signed assertion can arrive
-before the commit metadata it names, producing `TipPending`; readable tips can
+Absence is distinct from incomplete replication. A generic assertion can arrive
+before its branch descriptor or the commit metadata it names. A caller that
+already knows the exact branch identity can still resolve it; a missing commit
+produces `TipPending`, while the absent descriptor prevents enumeration by
+branch kind. Readable tips can
 arrive before enough ancestry to compare them, producing `Partial`. Backend
 failures and malformed commit metadata remain errors rather than being
 misreported as missing data.
@@ -155,10 +170,11 @@ authorless merge metadata blob whose parents are all maximal tips in raw-handle
 order. The shape depends only on the frontier, not on assertion arrival order
 or a history of pairwise merges.
 
-That synthetic merge is a derived view, not a branch assertion. Pull stages it
+That synthetic merge is a derived view, not an asserted branch-pin value. Pull stages it
 as the workspace's base head. Merely pulling and pushing it unchanged returns
 `NoChange`; making a new commit creates an authored descendant of the derived
-merge, and pushing that descendant adds a normal signed assertion.
+merge, and pushing that descendant adds a normal generic assertion with a rank
+strictly above every merged tip.
 
 `PartialFrontier::candidate_root` uses the same flat representation over the
 non-definitely-dominated candidates. It is a deterministic lower-bound
@@ -172,14 +188,16 @@ asserted because additional ancestry could later prove a candidate dominated.
 `Repository::push` has one publication point and no compare-and-swap loop. For
 a changed workspace it performs these steps in order:
 
-1. Upload every staged blob.
-2. Flush the storage so those blobs are durable.
-3. Read the proposed head metadata from the durable snapshot.
-4. Verify that the head has one of the canonical authored-commit or flat
+1. Reconstruct and stage the canonical `BranchPinDescriptor` from the exact
+   workspace identity.
+2. Upload every staged blob.
+3. Flush the storage so those blobs and the descriptor are durable.
+4. Read the proposed head metadata from the durable snapshot.
+5. Verify that the head has one of the canonical authored-commit or flat
    authorless-merge shapes.
-5. Sign `(author key, name handle, commit handle)` and durably append the
-   assertion.
-6. Refresh the workspace base and clear its staging area.
+6. Sign the generic `(author key, descriptor handle, commit handle, branch
+   rank)` envelope and durably append it.
+7. Refresh the workspace base and clear its staging area.
 
 No fallible storage operation follows a successful assertion append. Thus a
 returned `Published` assertion cannot point at a commit that was only buffered
@@ -294,8 +312,9 @@ logging, reuse, or later reads.
 
 `Workspace::get` checks staged blobs first and then its repository snapshot.
 Before publication, newly added payloads exist only in the workspace. A
-successful changed `push` uploads and flushes them before appending the branch
-assertion, so handles reachable from the published commit remain resolvable.
+successful changed `push` uploads and flushes them before appending the generic
+branch-pin assertion, so handles reachable from the published commit remain
+resolvable.
 
 ## Closing durable storage
 

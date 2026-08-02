@@ -113,7 +113,7 @@ continue by delegation. See
 the full design.
 
 - `team create --pile PATH [--key KEY_PATH]` — mint a team root, sign one non-expiring founder anchor, issue a finite founder operational cap beneath it, and durably pin the complete credential. Prints the public team root, root secret to archive offline, anchor and operational handles, and operational expiry.
-- `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--legacy-pin HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--legacy-pin` (repeatable) restricts the current blob RPC to reachability from mutable local-pin roots; it does not select an exact StrongPin branch.
+- `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--legacy-pin HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--legacy-pin` (repeatable) restricts the current blob RPC to reachability from mutable local-pin roots; it does not select an exact asserted branch pin.
 - `team request-join --admin HEX --scope (read|write|admin) [--key PATH] [--pile PATH]` — send an `OP_REQUEST_CAP` to an admin asking to be issued a capability via the running auth-handshake daemon.
 - `team approve --pile PATH --entry HEX --team-root HEX --cap HEX [--key PATH]` — approve a pending join request, sign the cap, dispatch it via the auth-handshake ALPN, and add a renewal-policy entry so the cap stays renewed.
 - `team retract --pile PATH --entry HEX` — stop auto-renewing a (subject, scope) entry. The peer's cap chain dies at its next natural expiry. Pure local decision, takes effect on the next daemon tick. There is no team-root broadcast revocation primitive; eviction is per-issuer non-renewal.
@@ -134,11 +134,11 @@ the full design.
 
 #### Mutable legacy pins
 
-- `store pin list <URL>` — list every replica-local mutable pin id at an object-store URL. This is an unclassified storage view and can include old content-branch heads as well as local policy or retention pins.
+- `store pin list <URL>` — list every legacy mutable pin id at an object-store URL. This is an unclassified storage view and can include old content-branch heads as well as policy or retention cells.
 
-`ObjectStoreRemote` intentionally exposes only blobs and replica-local pins.
+`ObjectStoreRemote` intentionally exposes only blobs and the legacy mutable-pin namespace.
 It does not claim the coherent snapshot and durable-append contracts required
-by a StrongPin assertion store: generic object-store listing is not a
+by `PinAssertionStore`: generic object-store listing is not a
 point-in-time snapshot, and the advertised file backend exposes no directory
 durability barrier. Remote assertion persistence and replication therefore need
 an explicit assertion ledger rather than a scalar-HEAD or LIST-plus-GET shim.

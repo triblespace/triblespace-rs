@@ -1,4 +1,4 @@
-//! Exact StrongPin branch operations.
+//! Exact typed branch-pin operations over the generic asserted-pin ledger.
 //!
 //! A branch is the grow-only set of signed assertions made by one exact
 //! `(author key, name handle)` identity. Human-readable names are presentation

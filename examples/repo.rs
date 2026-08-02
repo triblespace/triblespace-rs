@@ -30,7 +30,7 @@ fn main() {
         .expect("workspace rank has room");
     repo.push(&mut ws1).expect("publish ws1");
 
-    // A later workspace resolves the branch assertions and adds Bob.
+    // A later workspace resolves the typed branch-pin frontier and adds Bob.
     let mut ws2 = repo.pull(identity).expect("pull");
     let mut change = TribleSet::new();
     change += entity! { &ufoid() @ literature::firstname: "Bob" };

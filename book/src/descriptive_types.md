@@ -263,7 +263,8 @@ and easy to reason about.
 ### 6. Grow-only publication for writers
 
 Publication does not update a mutable branch pointer. A changed workspace
-appends one signed assertion after its staged blobs are durable:
+appends one generic signed envelope carrying its typed branch descriptor,
+commit value, and `BranchRank` after its staged blobs are durable:
 
 ```rust,ignore
 ws.commit(content, "plan-update")

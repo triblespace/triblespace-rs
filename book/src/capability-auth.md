@@ -107,7 +107,7 @@ trible team invite --pile PATH --team-root HEX --cap HEX --key ISSUER
     invitee's pubkey appears on its own (use
     `trible pile net identity` on the invitee's machine to print it).
     `--legacy-pin` restricts only the current blob
-    RPC's mutable-pin roots; it cannot name a StrongPin branch. Prints the
+    RPC's mutable-pin roots; it cannot name an asserted branch pin. Prints the
     invitee's cap-sig handle.
 
 trible team request-join --pile PATH --admin HEX
@@ -335,10 +335,12 @@ Capabilities encode their scope as tribles hung off `cap_scope_root`:
   means "all branches".
 
 `scope_branch` currently carries a legacy 16-byte mutable-pin id. It cannot
-name an exact StrongPin `(author key, name handle)` identity and must not be
-used as authorization for signed-assertion ingest. The assertion-replication
-milestone therefore includes a new exact-identity scope schema (or an explicit
-intentionally broader policy).
+name an exact asserted pin `(author key, descriptor handle)` and must not be
+used as authorization for generic assertion ingest. An assertion-replication
+protocol therefore needs a new exact-identity scope schema (or an explicit,
+intentionally broader policy). A branch-specific UI may recover its name by
+loading the canonical `BranchPinDescriptor`; the name itself is not the generic
+identity.
 
 For the current read-only RPC, a branch-restricted capability limits blob
 access by reachability from matching mutable-pin roots in the server's local
@@ -363,10 +365,9 @@ does not erase a resource restriction inherited from a parent.
 
 `scope_branch` is the legacy mutable-pin authorization key used by the current
 blob RPC only. The old mutable-HEAD gossip and tracking machinery has been
-deleted, and this field must not be interpreted as a replicated StrongPin
-assertion identity. Assertion replication needs an exact
-`(author, name-handle)` scope schema and a separate foreign-author admission
-policy.
+deleted, and this field must not be interpreted as a replicated asserted-pin
+identity. Assertion replication needs an exact `(author, descriptor-handle)`
+scope schema plus separate foreign-author and pin-kind admission policies.
 
 ## Eviction
 

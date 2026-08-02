@@ -28,6 +28,22 @@ An abstraction that persists blobs. Implementations back local piles, in-memory
 workspaces, or remote object stores while presenting a common `BlobStore`
 interface that handles hashing, deduplication, and retrieval.
 
+### Asserted Pin
+A grow-only signed claim in the generic `PinAssertionStore`. Its exact identity
+is `(author key, descriptor blob handle)`, and its canonical envelope carries an
+opaque value handle and opaque 32-byte subsumption label. Storage preserves and
+unions every accepted kind without interpreting it. A typed adapter loads the
+descriptor and assigns meaning to the value and label; signature verification
+authenticates an author but is not by itself an admission policy.
+
+### Branch Pin
+The typed branch adapter over an [asserted pin](#asserted-pin). A canonical
+`BranchPinDescriptor` blob contains a branch-kind marker and the
+content-addressed branch-name handle; its own handle is the generic pin handle.
+The asserted value is a commit and the label is a `BranchRank`, built
+inductively so every descendant is strictly greater than its parents. Rank can
+skip an impossible ancestry comparison but can never prove domination.
+
 ### Capability
 A signed authorisation to act with a specific scope on a triblespace network.
 Each capability is two `SimpleArchive` blobs: a `cap` blob carrying
@@ -109,16 +125,17 @@ segments relevant to their bindings, further described in
 [the deep-dive chapter](deep-dive/patch.md).
 
 ### Pile
-An append-only collection of blobs, signed branch assertions, and separate
-local pin records stored in a single file. Piles act as durable backing storage
-for repositories, providing a write-ahead-log style format that can be memory
-mapped, repaired after crashes, and safely shared between threads.
+An append-only collection of blobs, generic asserted-pin envelopes, and legacy
+mutable-pin records stored in a single file. Piles act as durable backing
+storage for repositories, providing a write-ahead-log style format that can be
+memory mapped, repaired after crashes, and safely shared between threads.
 
 ### Repository
-The authoring and resolution layer over blob storage and grow-only branch
-assertions. A repository owns one signing key, publishes commits under exact
-`(author key, name handle)` identities, and derives their maximal commit
-frontiers while keeping replica-local pins outside branch authority.
+The authoring and resolution layer over blob storage and the generic grow-only
+asserted-pin store. A repository owns one signing key, publishes commits through
+canonical branch descriptors, and derives their maximal commit frontiers while
+keeping legacy mutable pins outside branch authority while their remaining
+consumers migrate.
 
 ### Encoding
 The byte-layout contract for a typed value. Encodings assign language-agnostic
@@ -133,13 +150,14 @@ referencing those blobs stay portable. The corresponding traits are
 The set of permissions a [Capability](#capability) grants. Output as tribles
 hung off the cap's `cap_scope_root` entity: one or more `metadata::tag: PERM_*`
 triples (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`) optionally combined with
-`scope_branch: <branch_id>` triples that restrict the permission to specific
+`scope_branch: <legacy-pin-id>` triples that restrict the permission to specific
 branches. An empty branch-restriction set means "every branch within the
 permission set." Sub-capabilities issued via delegation must have a scope that
 is a subset of the parent's; the verifier enforces this via `scope_subsumes`
 during chain walk. The current `scope_branch` value belongs to the legacy HEAD
-transport; exact StrongPin assertion ingest still needs an
-`(author key, name handle)` scope representation.
+transport; exact asserted-pin ingest still needs an `(author key, descriptor
+handle)` scope representation, with branch presentation recovered through a
+canonical `BranchPinDescriptor`.
 
 ### Team Root
 The single immutable keypair that anchors a triblespace network's

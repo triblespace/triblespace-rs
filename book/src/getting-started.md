@@ -20,7 +20,7 @@ cargo add triblespace ed25519-dalek rand
 
 The walkthrough below mirrors the quick-start program featured in the
 README. It defines the attributes your application needs, stages and queries
-book data, publishes the first signed branch assertion, and finally shows how
+book data, publishes the first typed branch-pin assertion, and finally shows how
 concurrent publications resolve to one canonical frontier.
 
 ```rust,ignore
@@ -154,7 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .expect("workspace rank has room");
     repo.push(&mut collaborator).expect("publish collaborator");
 
-    // The stale workspace publishes another signed assertion. Nothing is
+    // The stale workspace publishes another generic assertion carrying the
+    // typed branch descriptor, commit value, and authenticated rank. Nothing is
     // overwritten and there is no retry loop around a mutable branch pointer.
     repo.push(&mut ws).expect("publish concurrent tip");
 
@@ -207,9 +208,10 @@ To persist data across runs, swap `MemoryRepo::default()` for
 * **Committing data.** The `entity!` macro builds a set of attribute/value
   assertions. When paired with the `ws.commit` call it records a transaction in
   the workspace that becomes visible to others once pushed.
-* **Publishing changes.** `Repository::push` makes staged blobs durable and
-  appends one signed grow-only assertion for a changed workspace. Concurrent
-  stale workspaces may both publish; neither overwrites the other.
+* **Publishing changes.** `Repository::push` makes staged blobs—including the
+  canonical `BranchPinDescriptor`—durable and appends one generic signed
+  envelope carrying the commit value and `BranchRank`. Concurrent stale
+  workspaces may both publish; neither overwrites the other.
 * **Resolving concurrency.** `Repository::resolve` reports an absent, pending,
   partial, or complete frontier. `Repository::pull` opens only a complete
   frontier. When several maximal tips remain it roots the workspace at their
@@ -229,7 +231,9 @@ additional modules and examples.
 ## Signing identity
 
 Each `Repository` is an own-key authoring boundary: its signing key is fixed at
-construction and every branch it publishes is identified by that key plus the
-content-addressed name. A foreign identity is refused before storage is read or
-written. Importing assertions by other authors is a separate, policy-bearing
+construction and every branch it publishes is selected by that key plus the
+content-addressed name. The typed adapter turns the name into a canonical
+descriptor whose full content handle is the generic pin identity. A foreign
+identity is refused before storage is read or written. Importing generic
+assertions by other authors or descriptor kinds is a separate, policy-bearing
 replication operation rather than a key override on a local workspace.

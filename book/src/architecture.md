@@ -40,8 +40,9 @@ The consequences are profound:
 
 Entity ownership and branch publication solve different problems. A workspace
 still stages a coherent commit locally, but publishing it does not mutate a
-compare-and-set branch pointer. It appends a signed assertion that an exact
-branch identity contains that commit. Concurrent publications therefore remain
+compare-and-set branch pointer. It appends a generic signed envelope whose
+typed descriptor, value, and rank assert that an exact branch contains that
+commit. Concurrent publications therefore remain
 visible instead of racing for one scalar slot. Resolution removes only
 assertions whose commits are known ancestors of another asserted commit; any
 incomparable maximal commits form a frontier until later work joins them.
@@ -69,7 +70,7 @@ The system is organised into a small set of layers that compose cleanly:
 │  branches, commits, push/pull, merge        │
 ├─────────────────────────────────────────────┤
 │  Store capabilities (often composed)        │
-│  blobs + signed assertions; local pins aside│
+│  blobs + generic asserted pins; legacy pins │
 ├─────────────────────────────────────────────┤
 │  Data Model                                 │
 │  Trible (64 bytes) → TribleSet (6 indexes)  │
@@ -77,7 +78,7 @@ The system is organised into a small set of layers that compose cleanly:
 ```
 
 1. **Data model** – the immutable trible structures that encode facts.
-2. **Stores** – generic blob and branch-assertion capabilities that abstract over persistence backends; mutable local pins are a separate capability.
+2. **Stores** – generic blob and asserted-pin capabilities that abstract over persistence backends; the older mutable-pin capability remains only while its consumers migrate.
 3. **Repository** – the coordination layer that combines stores into a versioned history.
 4. **Workspaces** – the in‑memory editing surface used by applications and tools.
 
@@ -104,18 +105,36 @@ All persistent data lives in a [`BlobStore`](https://docs.rs/triblespace/latest/
 
 Content addressing also means that blob stores can be layered.  Applications commonly use a fast local cache backed by a slower durable store.  Only the outermost layer needs to implement eviction; inner layers simply re-use the same hash keys, so cache misses fall through cleanly.
 
-## Branch Assertions
+## Branch Pins over Generic Asserted Pins
 
-A branch is identified by the complete pair `(author Ed25519 key, name blob
-handle)`. The derived 16-byte `BranchId` is an index prefix, never identity
-equality. This matters both for collision safety and because two authors may use
-the same human-readable name without sharing a branch.
+[`PinAssertionStore`](https://docs.rs/triblespace/latest/triblespace/repo/pin_assertion/trait.PinAssertionStore.html)
+stores one grow-only set of generic signed assertions. Its exact identity is the
+pair `(author Ed25519 key, descriptor blob handle)`, indexed through a full
+32-byte digest and always rechecked by value. Each canonical envelope carries
+an opaque value handle and an opaque 32-byte subsumption label. The storage
+layer does not know whether a pin names a branch, a want set, or a future pin
+kind; it preserves unknown kinds without inventing semantics for them.
 
-[`BranchAssertionStore`](https://docs.rs/triblespace/latest/triblespace/repo/branch_assertion/trait.BranchAssertionStore.html)
-stores a grow-only set of signed `(identity, commit)` assertions. Appending the
-same assertion is idempotent; there is no replacement, tombstone, ordering by
-arrival, or scalar authoritative head. Physical pile order is storage history,
-not branch precedence.
+A branch is the first typed adapter over that primitive. Its canonical
+[`BranchPinDescriptor`](https://docs.rs/triblespace/latest/triblespace/repo/branch_pin/struct.BranchPinDescriptor.html)
+blob contains a kind marker plus the content-addressed branch-name handle. The
+descriptor's own content handle is the generic pin handle, while the
+human-facing [`BranchIdentity`](https://docs.rs/triblespace/latest/triblespace/repo/branch_pin/struct.BranchIdentity.html)
+remains the complete pair `(author key, name handle)`. Repositories stage both
+the descriptor and its name before publishing, so branch enumeration can
+recover the typed identity without treating arbitrary descriptors as branches.
+
+For this kind, the generic value is a commit handle and the label is a
+[`BranchRank`](https://docs.rs/triblespace/latest/triblespace/repo/branch_pin/struct.BranchRank.html):
+a 256-bit big-endian rank built inductively as zero for a root and one greater
+than the greatest parent rank for a child or merge. Its only sound use is to
+skip an ancestry walk that cannot prove strict ancestry. A rank never proves
+domination and never removes a claim; dishonest author-signed ranks can retain
+extra tips but cannot hide a true maximal tip.
+
+Appending the same generic assertion is idempotent. There is no replacement,
+tombstone, ordering by arrival, or scalar authoritative head. Physical pile
+order is storage history, not branch precedence.
 
 Resolution compares asserted commits through the commit DAG and retains the
 maximal ancestry frontier. It reports four states explicitly:
@@ -134,16 +153,20 @@ descriptor: they cannot be checked out or license a new authored merge
 assertion until ancestry is complete.
 
 Mutable [`PinStore`](https://docs.rs/triblespace/latest/triblespace/repo/trait.PinStore.html)
-entries still exist for local retention and transport bookkeeping. They are not
-branches and must not be interpreted or replicated as branch authority.
+entries still exist while retention and policy consumers migrate. They are
+legacy scalar cells, not asserted pins or branch authority. A copied pile can
+diverge and later be concatenated, so “replica-local” is not a semantic escape
+hatch; new replicated state belongs in the asserted-pin ledger.
 
 ## Repository
 
-The [`Repository`](https://docs.rs/triblespace/latest/triblespace/repo/struct.Repository.html) combines a blob store, a local authoring key, and—when the backend supports it—a branch-assertion store. Commits store content and parent metadata as immutable blobs. Because everything is content addressed, multiple repositories can share blobs without coordinating their placement.
+The [`Repository`](https://docs.rs/triblespace/latest/triblespace/repo/struct.Repository.html) combines a blob store, a local authoring key, and—when the backend supports it—a generic asserted-pin store. Commits store content and parent metadata as immutable blobs. Because everything is content addressed, multiple repositories can share blobs without coordinating their placement.
 
 Repository logic performs a few critical duties:
 
-- **Validation** – ensure published tips are canonical commits and branch assertions carry valid signatures.
+- **Validation** – ensure published tips are canonical commits, branch
+  descriptors have the typed shape, and surviving generic witnesses carry
+  valid signatures.
 - **Blob synchronization** – upload staged data through the content-addressed blob store, which skips
   already-present bytes and reports integrity errors.
 - **Frontier resolution** – use commit ancestry to derive the maximal asserted tips without assigning meaning to assertion arrival order.
@@ -153,7 +176,7 @@ All of these operations rely only on hashes and immutable blobs, so repositories
 
 ## Workspaces
 
-A [`Workspace`](https://docs.rs/triblespace/latest/triblespace/repo/struct.Workspace.html) represents mutable state during editing. Creating an unpublished workspace or pulling a complete frontier yields a workspace backed by a fresh `MemoryBlobStore`. Commits are created locally and only become branch state when a signed assertion is published.
+A [`Workspace`](https://docs.rs/triblespace/latest/triblespace/repo/struct.Workspace.html) represents mutable state during editing. Creating an unpublished workspace or pulling a complete frontier yields a workspace backed by a fresh `MemoryBlobStore`. Commits are created locally and only become branch state when a typed branch-pin assertion is published through the generic envelope.
 
 Workspaces behave like sandboxes.  They host application caches, pending trible sets and user blobs.  Because they speak the same blob language as repositories, synchronisation is just a matter of copying hashes from the workspace store into the shared store once a commit is finalised.
 
@@ -166,7 +189,7 @@ durable history shared between repositories.
 Because commits are immutable, rollback and branching are cheap. Diverging
 histories coexist as a maximal frontier. Reading can use the deterministic
 synthetic flat merge; publishing a descendant turns an intentional
-reconciliation into another immutable commit and signed assertion.
+reconciliation into another immutable commit and asserted branch-pin value.
 
 ## Putting It Together
 
@@ -174,9 +197,9 @@ reconciliation into another immutable commit and signed assertion.
 +---------------------------------------------------+
 |                    Repository                     |
 |  BlobStore (content addressed)                    |
-|  BranchAssertionStore (grow-only signed set)      |
+|  PinAssertionStore (generic grow-only signed set) |
 +-----------------------------+---------------------+
-          ^ push assertion       resolve / pull
+          ^ push branch pin      resolve / pull
           |                              |
           |                              v
 +-----------------------------+---------------------+
@@ -192,18 +215,20 @@ reconciliation into another immutable commit and signed assertion.
 +---------------------------------------------------+
 ```
 
-`Repository::resolve` snapshots assertions and classifies an exact identity's
-frontier. `Repository::pull` opens only a complete frontier as a writable
+`Repository::resolve` snapshots generic assertions, selects the exact
+`BranchPinDescriptor` identity, and classifies its commit frontier.
+`Repository::pull` opens only a complete frontier as a writable
 workspace; if it is divergent, the workspace starts from the derived flat
 merge. Workspace methods stage blobs and commits locally. `Repository::push`
-first copies and flushes every staged blob, validates the proposed commit, then
-durably appends one signed assertion. There is deliberately no compare-and-set
-race and no hidden conflict winner.
+first copies and flushes every staged blob—including the branch descriptor—,
+validates the proposed commit, then durably appends one generic assertion with
+the commit value and authenticated branch rank. There is deliberately no
+compare-and-set race and no hidden conflict winner.
 
 The boundaries between layers encourage modular tooling. A CLI client can
 operate entirely within a workspace while transport moves immutable blobs.
-An assertion-native synchronizer can separately union signed assertions once
-it implements exact identity, verification, admission, and durability; the
-current `triblespace-net` migration bridge does not yet do so. As long as
-components honour the blob and assertion contracts they can evolve
+An asserted-pin synchronizer can separately union generic envelopes once it
+implements exact identity, verification, kind-aware admission, and durability;
+the current `triblespace-net` transport does not yet do so. As long as
+components honour the blob and asserted-pin contracts they can evolve
 independently without risking the core guarantees of TribleSpace.

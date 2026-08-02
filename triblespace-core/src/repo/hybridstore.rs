@@ -3,9 +3,6 @@ use crate::blob::IntoBlob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
-use crate::repo::branch_assertion::{
-    BranchAssertion, BranchAssertionSnapshot, BranchAssertionStore,
-};
 use crate::repo::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
@@ -65,7 +62,7 @@ where
 pub struct HybridStore<B, A> {
     /// Storage for commit, content and metadata blobs.
     pub blobs: B,
-    /// Storage for grow-only branch and generic pin assertions.
+    /// Storage for generic grow-only pin assertions.
     pub assertions: A,
 }
 
@@ -101,21 +98,6 @@ where
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         self.blobs.reader()
-    }
-}
-
-impl<B, A> BranchAssertionStore for HybridStore<B, A>
-where
-    A: BranchAssertionStore,
-{
-    type Error = A::Error;
-
-    fn assertion_snapshot(&mut self) -> Result<BranchAssertionSnapshot, Self::Error> {
-        self.assertions.assertion_snapshot()
-    }
-
-    fn append_assertion(&mut self, assertion: BranchAssertion) -> Result<(), Self::Error> {
-        self.assertions.append_assertion(assertion)
     }
 }
 
@@ -217,23 +199,6 @@ mod tests {
             self.0.set(self.0.get() + 1);
             Ok(())
         }
-    }
-
-    #[test]
-    fn delegates_branch_assertions_to_the_assertion_store() {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let assertion = BranchAssertion::sign(&key, Inline::new([11; 32]), Inline::new([19; 32]));
-        let mut hybrid = HybridStore::new((), MemoryRepo::default());
-
-        hybrid.append_assertion(assertion).unwrap();
-        hybrid.append_assertion(assertion).unwrap();
-
-        let snapshot = hybrid.assertion_snapshot().unwrap();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(
-            snapshot.iter().copied().collect::<Vec<_>>(),
-            vec![assertion]
-        );
     }
 
     #[test]

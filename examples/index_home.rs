@@ -1,6 +1,6 @@
 //! Persist and attach a succinct range manifest explicitly.
 //!
-//! Source publication uses grow-only branch assertions. Derived index
+//! Source publication uses typed branch pins over generic assertions. Derived index
 //! maintenance is a separate operation: build a typed range artifact, certify
 //! the source frontier in a manifest, and publish that manifest to its index
 //! home. No hidden repository hook couples the two ledgers.

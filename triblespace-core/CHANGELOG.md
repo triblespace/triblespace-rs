@@ -9,14 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Async adapters now forward `BranchAssertionStore`, `PartialCommitDag`, and
-  truthful `StorageFlush` capabilities. `HybridStore` composes blobs with a
-  separate signed-assertion store, and `Lazy` preserves assertion authority
+- Generic `PinAssertionStore` provides one grow-only signed envelope for every
+  pin kind. Its full-width `(author, descriptor)` identity, value, and opaque
+  label are kind-neutral; `BranchPinDescriptor` and `BranchRank` supply the
+  branch-specific commit and causal-order semantics without a separate branch
+  assertion store. Async adapters forward this generic capability plus
+  `PartialCommitDag` and truthful `StorageFlush`; `HybridStore` composes blobs
+  with a separate asserted-pin store, and `Lazy` preserves assertion authority
   while turning only genuine missing commit metadata into durable wants.
-- `ObjectStoreRemote` now names mutable replica-local cells under `pins/` and
+- `ObjectStoreRemote` now names legacy mutable cells under `pins/` and
   verifies blob content against requested handles. It intentionally does not
-  implement StrongPin assertion storage or `StorageFlush`: generic object-store
-  listing is not a coherent assertion snapshot, and its file backend exposes no
+  implement `PinAssertionStore` or `StorageFlush`: generic object-store listing
+  is not a coherent assertion snapshot, and its file backend exposes no
   crash-durability barrier.
 - `MemoryRepo::branches` is renamed to `pins`; mutable cells are no longer
   presented as content-branch authority even in test storage.

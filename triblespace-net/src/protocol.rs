@@ -19,9 +19,9 @@
 //!
 //! Earlier protocol versions also had `OP_LIST`, `OP_CHILDREN`, and `OP_HEAD`;
 //! all three are retired.
-//! None of these legacy surfaces replicate StrongPin branch authority: there
-//! is not yet a wire operation for signed branch assertions or their exact
-//! `(author key, name handle)` identity.
+//! None of these legacy surfaces replicate asserted-pin authority: there is not
+//! yet a wire operation for generic signed envelopes, their descriptor blobs,
+//! or their exact `(author key, descriptor handle)` identities.
 
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/5";
 
@@ -35,8 +35,8 @@ pub const OP_GET_BLOB: u8 = 0x02;
 /// verified scope; subsequent ops on the same connection inherit it.
 pub const OP_AUTH: u8 = 0x05;
 // CAS_PUSH was removed with mutable remote branch writes. The current protocol
-// is read-only; future StrongPin replication must transfer verified immutable
-// assertions rather than restore scalar CAS.
+// is read-only; future asserted-pin replication must transfer verified generic
+// envelopes and descriptors rather than restore scalar CAS.
 
 /// Auth response: capability verified, all subsequent ops on this
 /// connection are scope-gated by the verified cap.
