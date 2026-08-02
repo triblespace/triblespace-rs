@@ -515,7 +515,10 @@ impl<K: IndexKind> Manifest<K> {
     pub fn audit_exact_cover<R: BlobStoreGet>(
         &self,
         reader: &R,
-    ) -> Result<(), RangeValidationError<R::GetError<UnarchiveError>>> {
+    ) -> Result<
+        (),
+        RangeValidationError<crate::repo::commit::StoredCommitError<R::GetError<UnarchiveError>>>,
+    > {
         let mut dag = StoredCommitDag::new(reader);
         let ranges: Vec<_> = self
             .ranges

@@ -26,8 +26,9 @@ use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::find;
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
 use crate::prelude::{attributes, entity, pattern};
-use crate::repo::{BlobStoreGet, CommitHandle};
+use crate::repo::{commit, BlobStoreGet, CommitHandle};
 use crate::trible::TribleSet;
 
 attributes! {
@@ -168,15 +169,14 @@ impl<R> CommitDag for StoredCommitDag<'_, R>
 where
     R: BlobStoreGet,
 {
-    type Error = R::GetError<UnarchiveError>;
+    type Error = commit::StoredCommitError<R::GetError<UnarchiveError>>;
 
     fn parents(&mut self, commit: CommitHandle) -> Result<Vec<CommitHandle>, Self::Error> {
-        let metadata: TribleSet = self.reader.get(commit)?;
-        Ok(find!(
-            parent_: CommitHandle,
-            pattern!(&metadata, [{ crate::repo::parent: ?parent_ }])
-        )
-        .collect())
+        let metadata: TribleSet = self
+            .reader
+            .get(commit)
+            .map_err(commit::StoredCommitError::Read)?;
+        commit::direct_parents(&metadata).map_err(commit::StoredCommitError::Metadata)
     }
 }
 
@@ -185,6 +185,72 @@ where
 pub struct CommitRange {
     start: Vec<CommitHandle>,
     end: Vec<CommitHandle>,
+}
+
+/// One locally usable standalone range-record archive offered to cover
+/// commits at read time.
+///
+/// The archive handle, rather than the intrinsic range entity id, is the
+/// candidate identity. Two independent builds may describe the same range
+/// entity while carrying different typed artifact facts; keeping their archive
+/// handles distinct lets selection choose one canonical alternative without
+/// fact-unioning the standalone records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeCoverCandidate {
+    record: Inline<Handle<SimpleArchive>>,
+    range: CommitRange,
+}
+
+impl RangeCoverCandidate {
+    /// Pair one standalone record archive with its parsed source range.
+    ///
+    /// Typed artifact parsing and local availability are deliberately the
+    /// caller's responsibility. A canonical empty projection is therefore a
+    /// valid candidate even though it carries no physical artifact handle.
+    pub fn new(record: Inline<Handle<SimpleArchive>>, range: CommitRange) -> Self {
+        Self { record, range }
+    }
+
+    /// Exact standalone archive asserted by the rollup pin.
+    pub const fn record(&self) -> Inline<Handle<SimpleArchive>> {
+        self.record
+    }
+
+    /// Exact commit region certified by the parsed record.
+    pub const fn range(&self) -> &CommitRange {
+        &self.range
+    }
+}
+
+/// Deterministic artifact cover of one authoritative commit frontier.
+///
+/// `selected` contains pairwise-disjoint, locally usable record archives.
+/// `residual` contains every target commit not covered by them and must be
+/// evaluated from source data. `invalid` names candidate archives whose
+/// boundaries looked relevant but failed individual range validation; one bad
+/// grow-only assertion never poisons the rest of the pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeCoverSelection {
+    selected: Vec<Inline<Handle<SimpleArchive>>>,
+    residual: Vec<CommitHandle>,
+    invalid: Vec<Inline<Handle<SimpleArchive>>>,
+}
+
+impl RangeCoverSelection {
+    /// Canonically ordered, pairwise-disjoint standalone records.
+    pub fn selected(&self) -> &[Inline<Handle<SimpleArchive>>] {
+        &self.selected
+    }
+
+    /// Canonically ordered target commits that must be read from source.
+    pub fn residual(&self) -> &[CommitHandle] {
+        &self.residual
+    }
+
+    /// Canonically ordered candidate records rejected by range validation.
+    pub fn invalid(&self) -> &[Inline<Handle<SimpleArchive>>] {
+        &self.invalid
+    }
 }
 
 impl CommitRange {
@@ -582,6 +648,101 @@ where
     Ok(())
 }
 
+/// Select a deterministic disjoint artifact cover and leave every gap as a
+/// source-data residual.
+///
+/// The authoritative target is the ancestor closure of `frontier`; it is never
+/// claimed by an index record. Candidates are independent immutable facts from
+/// one recipe's asserted G-set. A candidate is eligible only when its exact
+/// validated member set lies inside the target. Eligible candidates are tried
+/// by descending coverage size and then by standalone archive handle, and are
+/// accepted only when disjoint from everything already selected.
+///
+/// This greedy order is an optimization policy, not a correctness invariant.
+/// Merged replicas may contain overlapping or alternative compactions, and an
+/// evicted artifact may simply be omitted by the caller. Whatever the chosen
+/// records do not cover is returned in `residual`, so incomplete pools and
+/// non-optimal covers remain exact. Candidates whose boundaries are wholly
+/// outside the target are irrelevant rather than invalid.
+pub fn select_range_cover<D>(
+    dag: &mut D,
+    candidates: &[RangeCoverCandidate],
+    frontier: &[CommitHandle],
+) -> Result<RangeCoverSelection, RangeValidationError<D::Error>>
+where
+    D: CommitDag,
+{
+    let mut view = DagView::new(dag);
+    view.ensure_antichain("head", frontier)?;
+
+    let mut target = HashSet::new();
+    for head in frontier {
+        target.extend(view.ancestors(*head)?);
+    }
+
+    let mut eligible = Vec::new();
+    let mut invalid = Vec::new();
+    for candidate in candidates {
+        // Every member of an eligible range lies between its boundaries, so a
+        // boundary outside the target proves irrelevance without loading an
+        // off-branch history merely to reject it.
+        if candidate
+            .range
+            .start()
+            .iter()
+            .chain(candidate.range.end())
+            .any(|commit| !target.contains(commit))
+        {
+            continue;
+        }
+
+        match view.range_members(&candidate.range) {
+            Ok(members) if members.is_subset(&target) => {
+                eligible.push((candidate.record, members));
+            }
+            Ok(_) => {}
+            Err(RangeValidationError::Graph(error)) => {
+                return Err(RangeValidationError::Graph(error));
+            }
+            Err(RangeValidationError::CyclicGraph) => {
+                return Err(RangeValidationError::CyclicGraph);
+            }
+            Err(_) => invalid.push(candidate.record),
+        }
+    }
+
+    eligible.sort_unstable_by(
+        |(left_record, left_members), (right_record, right_members)| {
+            right_members
+                .len()
+                .cmp(&left_members.len())
+                .then_with(|| left_record.raw.cmp(&right_record.raw))
+        },
+    );
+
+    let mut remaining = target;
+    let mut selected = Vec::new();
+    for (record, members) in eligible {
+        if members.iter().all(|commit| remaining.contains(commit)) {
+            for commit in members {
+                remaining.remove(&commit);
+            }
+            selected.push(record);
+        }
+    }
+
+    let mut residual: Vec<_> = remaining.into_iter().collect();
+    residual.sort_unstable_by_key(|commit| commit.raw);
+    invalid.sort_unstable_by_key(|record| record.raw);
+    invalid.dedup();
+
+    Ok(RangeCoverSelection {
+        selected,
+        residual,
+        invalid,
+    })
+}
+
 /// Return whether `ancestor` is reachable from `descendant` by following zero
 /// or more parent edges. The iterative walk is used by commit-batch guards
 /// before an index hook starts extending a certified manifest.
@@ -906,6 +1067,10 @@ mod tests {
         Inline::new(raw)
     }
 
+    fn cover_candidate(byte: u8, range: CommitRange) -> RangeCoverCandidate {
+        RangeCoverCandidate::new(Inline::new([byte; 32]), range)
+    }
+
     fn chain() -> (HashMap<CommitHandle, Vec<CommitHandle>>, [CommitHandle; 3]) {
         let a = commit(1);
         let b = commit(2);
@@ -1083,6 +1248,115 @@ mod tests {
             Err(RangeValidationError::IncompleteCover)
         ));
         validate_exact_cover(&mut graph, &[], None).unwrap();
+    }
+
+    #[test]
+    fn cover_selection_is_canonical_and_returns_source_residual() {
+        let (graph, [a, b, c]) = chain();
+        let ab = CommitRange::new(vec![a], vec![b]).unwrap();
+        let candidates = vec![
+            cover_candidate(9, CommitRange::leaf(c)),
+            cover_candidate(7, ab),
+        ];
+
+        let mut forward_graph = graph.clone();
+        let forward = select_range_cover(&mut forward_graph, &candidates, &[c]).unwrap();
+        assert_eq!(
+            forward.selected(),
+            &[Inline::new([7; 32]), Inline::new([9; 32])]
+        );
+        assert!(forward.residual().is_empty());
+        assert!(forward.invalid().is_empty());
+
+        let mut reversed = candidates;
+        reversed.reverse();
+        let mut reverse_graph = graph;
+        assert_eq!(
+            select_range_cover(&mut reverse_graph, &reversed, &[c]).unwrap(),
+            forward,
+            "assertion arrival order must not affect the chosen cover"
+        );
+
+        let mut graph = chain().0;
+        let empty = select_range_cover(&mut graph, &[], &[c]).unwrap();
+        assert!(empty.selected().is_empty());
+        assert_eq!(empty.residual(), &[a, b, c]);
+    }
+
+    #[test]
+    fn off_frontier_compaction_never_hides_an_eligible_smaller_range() {
+        let (mut graph, [g, a, _b, m]) = diamond();
+        let whole_fork = CommitRange::new(vec![g], vec![m]).unwrap();
+        let selected_branch = CommitRange::new(vec![g], vec![a]).unwrap();
+        let selection = select_range_cover(
+            &mut graph,
+            &[
+                cover_candidate(1, whole_fork),
+                cover_candidate(2, selected_branch),
+            ],
+            &[a],
+        )
+        .unwrap();
+
+        assert_eq!(selection.selected(), &[Inline::new([2; 32])]);
+        assert!(selection.residual().is_empty());
+        assert!(selection.invalid().is_empty());
+    }
+
+    #[test]
+    fn same_range_alternatives_remain_distinct_and_tie_by_archive_handle() {
+        let (mut graph, [a, b, _c]) = chain();
+        let range = CommitRange::new(vec![a], vec![b]).unwrap();
+        let selection = select_range_cover(
+            &mut graph,
+            &[cover_candidate(9, range.clone()), cover_candidate(3, range)],
+            &[b],
+        )
+        .unwrap();
+
+        assert_eq!(selection.selected(), &[Inline::new([3; 32])]);
+        assert!(selection.residual().is_empty());
+    }
+
+    #[test]
+    fn one_invalid_assertion_does_not_poison_the_pool() {
+        let (mut graph, [g, a, b, m]) = diamond();
+        let disconnected = CommitRange::new(vec![a], vec![b]).unwrap();
+        let whole = CommitRange::new(vec![g], vec![m]).unwrap();
+        let selection = select_range_cover(
+            &mut graph,
+            &[cover_candidate(1, disconnected), cover_candidate(2, whole)],
+            &[m],
+        )
+        .unwrap();
+
+        assert_eq!(selection.selected(), &[Inline::new([2; 32])]);
+        assert!(selection.residual().is_empty());
+        assert_eq!(selection.invalid(), &[Inline::new([1; 32])]);
+    }
+
+    #[test]
+    fn stored_commit_dag_accepts_only_canonical_commit_metadata() {
+        use crate::blob::MemoryBlobStore;
+        use crate::repo::{BlobStore, BlobStorePut};
+
+        let mut store = MemoryBlobStore::new();
+        let [a, b] = [commit(1), commit(2)];
+        let canonical = crate::repo::commit::merge_metadata([a, b]);
+        let canonical = store.put::<SimpleArchive, _>(canonical).unwrap();
+        let noncanonical: TribleSet = entity! {
+            crate::repo::parent: a,
+        }
+        .into();
+        let noncanonical = store.put::<SimpleArchive, _>(noncanonical).unwrap();
+        let reader = store.reader().unwrap();
+        let mut dag = StoredCommitDag::new(&reader);
+
+        assert_eq!(dag.parents(canonical).unwrap(), vec![a, b]);
+        assert!(matches!(
+            dag.parents(noncanonical),
+            Err(crate::repo::commit::StoredCommitError::Metadata(_))
+        ));
     }
 
     #[test]

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added deterministic `select_range_cover` with source-data residuals for
+  merged grow-only rollup pools. Selection is keyed by standalone record blob
+  handle, excludes off-frontier ranges, isolates invalid candidates, and uses
+  canonical commit metadata rather than accepting arbitrary parent facts.
 - Added a typed, grow-only `RollupPinDescriptor` keyed by source branch and
   index recipe. Its strongly wrapped assertion values are exact standalone
   range-record archive handles; the descriptor keeps source identity and
