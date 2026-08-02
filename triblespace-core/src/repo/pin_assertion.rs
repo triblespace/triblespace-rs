@@ -98,7 +98,10 @@ pub struct ValueHandle([u8; 32]);
 ///
 /// `Ord` is the derived lexicographic order over the raw bytes, which is
 /// exactly `memcmp`. Kinds encode into it; this layer never interprets it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// Deliberately **not** `Default`: an implicit all-zero value is the same
+/// sentinel that was removed as `NONE`, reintroduced somewhere harder to see.
+/// Every label is chosen explicitly via [`SubsumptionLabel::from_raw`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubsumptionLabel([u8; 32]);
 
 impl SubsumptionLabel {
@@ -275,11 +278,19 @@ impl UnverifiedPinAssertion {
     pub fn claimed_value(self) -> ValueHandle {
         self.value
     }
-    /// The label is claimed like everything else, but a *lying* label only
-    /// harms its own author: an inflated one skips checks and leaves a
-    /// dominated assertion in the author's own frontier (spurious divergence),
-    /// and a deflated one merely costs traversals. It is inside the signature,
-    /// so nobody else can set it.
+    /// The label is claimed like everything else.
+    ///
+    /// A dishonest or malformed label may only ever **over-approximate the
+    /// frontier**; it can never drop a claim, because labels suppress exact
+    /// checks and nothing else. There is no direction-specific promise here:
+    /// inflating an ancestor and deflating its descendant are the same event
+    /// seen from either end — both make `label(ancestor) >= label(descendant)`
+    /// hold, skipping the walk that would have found the domination, so the
+    /// ancestor wrongly survives as spurious divergence. Only the *relative*
+    /// order matters.
+    ///
+    /// The label is inside the signature, so nobody but the author can set it,
+    /// and the damage is confined to that author's own register.
     pub fn claimed_label(self) -> SubsumptionLabel {
         self.label
     }
@@ -416,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn label_is_inside_the_signature_so_only_its_author_can_inflate_it() {
+    fn label_is_inside_the_signature_so_only_its_author_can_alter_it() {
         let a = PinAssertion::sign(&key(7), pin(11), val(19), label(1));
         let mut forged = a.encode();
         forged[LABEL_RANGE].copy_from_slice(&label(9).raw());
