@@ -1,16 +1,20 @@
-//! Grow-only branch rollup records as one typed asserted pin.
+//! Grow-only branch rollup nodes as one typed asserted pin.
 //!
 //! A rollup pin is identified by a source branch and an index recipe. The
 //! source branch's author occupies the generic [`PinIdentity`] author slot;
 //! the typed descriptor contains the source [`BranchPinDescriptor`] handle and
-//! recipe id. Its assertion values are exact standalone range-record
-//! [`SimpleArchive`] handles.
+//! recipe id. Each assertion atomically pairs two exact [`SimpleArchive`]
+//! handles:
+//!
+//! - the assertion value is a core-only range record and stays hard;
+//! - the opaque label is one complete artifact node for that range and stays
+//!   outside generic hard reachability.
 //!
 //! The typed descriptor is wrapped in [`StrongPinDescriptor`]. This makes the
-//! small range-record archives part of hard retention while allowing their
-//! aligned artifact handles to become explicit weak-pin boundaries. The pin is
-//! a grow-only set: labels are fixed signed padding and have no ordering or
-//! subsumption meaning in this module.
+//! small coverage records part of hard retention without turning every
+//! historical derived artifact into a permanent weak-pin demand. The label is
+//! never ordered by this module: its bytes are a content handle, not a
+//! subsumption clock.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -61,7 +65,7 @@ impl MetaDescribe for RollupPinDescriptor {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "rollup-pin-descriptor-v1",
-                metadata::description: "Canonical inner descriptor for one asserted branch rollup G-set: a V1 kind marker, sixteen zero padding bytes, the aligned BranchPinDescriptor handle of the source branch, and the index recipe id. A StrongPinDescriptor wraps its content handle so standalone range-record values remain hard while weak-pinned derived artifacts remain evictable.",
+                metadata::description: "Canonical inner descriptor for one asserted branch rollup G-set: a V1 kind marker, sixteen zero padding bytes, the aligned BranchPinDescriptor handle of the source branch, and the index recipe id. A StrongPinDescriptor wraps its content handle so core-only range-record assertion values remain hard; each opaque assertion label names one complete unowned artifact node.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -198,12 +202,6 @@ impl fmt::Display for RollupPinDescriptorError {
 
 impl Error for RollupPinDescriptorError {}
 
-fn canonical_label() -> SubsumptionLabel {
-    // Signed padding, not a neutral element. Rollup projection never compares
-    // labels, so the kind takes zero label-based skips.
-    SubsumptionLabel::from_raw([0u8; 32])
-}
-
 fn value_from_range_record(record: Inline<Handle<SimpleArchive>>) -> ValueHandle {
     ValueHandle::from_raw(record.raw)
 }
@@ -212,31 +210,78 @@ fn range_record_from_value(value: ValueHandle) -> Inline<Handle<SimpleArchive>> 
     Inline::new(value.raw())
 }
 
-/// Sign one grow-only rollup record for the signing author's source branch.
+fn label_from_node(node: Inline<Handle<SimpleArchive>>) -> SubsumptionLabel {
+    SubsumptionLabel::from_raw(node.raw)
+}
+
+fn node_from_label(label: SubsumptionLabel) -> Inline<Handle<SimpleArchive>> {
+    Inline::new(label.raw())
+}
+
+/// One atomic rollup alternative over a fixed logical source range.
+///
+/// `range_record` names the canonical core-only [`RangeRecord`](super::index_range::RangeRecord)
+/// archive. `node` names one complete standalone archive containing that same
+/// core plus all conjunctive typed artifact components for the alternative.
+/// Distinct nodes may share one range record; they remain disjunctive
+/// alternatives and must never be fact-unioned merely because their intrinsic
+/// range entity is equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RollupRecord {
+    range_record: Inline<Handle<SimpleArchive>>,
+    node: Inline<Handle<SimpleArchive>>,
+}
+
+impl RollupRecord {
+    /// Pair one hard range core with one complete derived artifact node.
+    pub const fn new(
+        range_record: Inline<Handle<SimpleArchive>>,
+        node: Inline<Handle<SimpleArchive>>,
+    ) -> Self {
+        Self { range_record, node }
+    }
+
+    /// Hard-retained core-only range record archive.
+    pub const fn range_record(self) -> Inline<Handle<SimpleArchive>> {
+        self.range_record
+    }
+
+    /// Unowned complete artifact-node archive.
+    pub const fn node(self) -> Inline<Handle<SimpleArchive>> {
+        self.node
+    }
+}
+
+/// Sign one grow-only rollup alternative for the signing author's source branch.
+///
+/// The generic strong wrapper follows `range_record` because it is the
+/// assertion value. It deliberately ignores `node`, carried in the opaque
+/// label. Typed rollup resolution never compares labels.
 pub fn sign_rollup_record(
     key: &SigningKey,
     source_name: Inline<Handle<LongString>>,
     recipe: Id,
     range_record: Inline<Handle<SimpleArchive>>,
+    node: Inline<Handle<SimpleArchive>>,
 ) -> PinAssertion {
     PinAssertion::sign(
         key,
         RollupPinDescriptor::pin_handle(source_name, recipe),
         value_from_range_record(range_record),
-        canonical_label(),
+        label_from_node(node),
     )
 }
 
-/// Project one source branch and recipe's exact range-record handle set.
+/// Project one source branch and recipe's exact rollup-alternative set.
 ///
-/// Values are deduplicated even if redundant valid assertions carry different
-/// opaque labels. Other authors, source branches, and recipes remain in the
-/// generic snapshot but do not enter this typed view.
+/// Exact duplicate pairs are deduplicated. The same range core paired with two
+/// node handles remains two alternatives. Other authors, source branches, and
+/// recipes remain in the generic snapshot but do not enter this typed view.
 pub fn rollup_records_in_snapshot(
     snapshot: &PinAssertionSnapshot,
     source: &BranchIdentity,
     recipe: Id,
-) -> BTreeSet<Inline<Handle<SimpleArchive>>> {
+) -> BTreeSet<RollupRecord> {
     snapshot
         .for_pin(&RollupPinDescriptor::pin_identity(
             source.author(),
@@ -244,7 +289,12 @@ pub fn rollup_records_in_snapshot(
             recipe,
         ))
         .into_iter()
-        .map(|assertion| range_record_from_value(assertion.value()))
+        .map(|assertion| {
+            RollupRecord::new(
+                range_record_from_value(assertion.value()),
+                node_from_label(assertion.label()),
+            )
+        })
         .collect()
 }
 
@@ -338,11 +388,18 @@ mod tests {
         let author = key(1);
         let source = BranchIdentity::new(author.verifying_key(), name(3));
         let recipe_id = recipe(5);
-        let first = record(7);
-        let second = record(8);
+        let first = RollupRecord::new(record(7), record(8));
+        let alternative = RollupRecord::new(record(7), record(9));
+        let second = RollupRecord::new(record(10), record(11));
         let mut snapshot = PinAssertionSnapshot::new();
 
-        let duplicate = sign_rollup_record(&author, source.name(), recipe_id, first);
+        let duplicate = sign_rollup_record(
+            &author,
+            source.name(),
+            recipe_id,
+            first.range_record(),
+            first.node(),
+        );
         snapshot.insert(duplicate).unwrap();
         snapshot.insert(duplicate).unwrap();
         snapshot
@@ -350,30 +407,36 @@ mod tests {
                 &author,
                 source.name(),
                 recipe_id,
-                second,
+                alternative.range_record(),
+                alternative.node(),
             ))
             .unwrap();
-
-        // Labels are opaque signed padding for this kind. Even a redundant
-        // generic witness with another label projects to the same set value.
         snapshot
-            .insert(PinAssertion::sign(
+            .insert(sign_rollup_record(
                 &author,
-                RollupPinDescriptor::pin_handle(source.name(), recipe_id),
-                value_from_range_record(first),
-                SubsumptionLabel::from_raw([9; 32]),
+                source.name(),
+                recipe_id,
+                second.range_record(),
+                second.node(),
             ))
             .unwrap();
 
         snapshot
-            .insert(sign_rollup_record(&author, name(4), recipe_id, record(10)))
+            .insert(sign_rollup_record(
+                &author,
+                name(4),
+                recipe_id,
+                record(12),
+                record(13),
+            ))
             .unwrap();
         snapshot
             .insert(sign_rollup_record(
                 &author,
                 source.name(),
                 recipe(6),
-                record(11),
+                record(14),
+                record(15),
             ))
             .unwrap();
         snapshot
@@ -381,13 +444,14 @@ mod tests {
                 &key(2),
                 source.name(),
                 recipe_id,
-                record(12),
+                record(16),
+                record(17),
             ))
             .unwrap();
 
         assert_eq!(
             rollup_records_in_snapshot(&snapshot, &source, recipe_id),
-            BTreeSet::from([first, second])
+            BTreeSet::from([first, alternative, second])
         );
     }
 

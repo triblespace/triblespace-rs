@@ -187,33 +187,34 @@ pub struct CommitRange {
     end: Vec<CommitHandle>,
 }
 
-/// One locally usable standalone range-record archive offered to cover
+/// One locally usable standalone artifact-node archive offered to cover
 /// commits at read time.
 ///
 /// The archive handle, rather than the intrinsic range entity id, is the
 /// candidate identity. Two independent builds may describe the same range
-/// entity while carrying different typed artifact facts; keeping their archive
-/// handles distinct lets selection choose one canonical alternative without
-/// fact-unioning the standalone records.
+/// entity while carrying different complete artifact bundles; keeping their
+/// archive handles distinct lets selection choose one canonical alternative
+/// without fact-unioning the standalone nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeCoverCandidate {
-    record: Inline<Handle<SimpleArchive>>,
+    node: Inline<Handle<SimpleArchive>>,
     range: CommitRange,
 }
 
 impl RangeCoverCandidate {
-    /// Pair one standalone record archive with its parsed source range.
+    /// Pair one complete standalone artifact node with its hard range core.
     ///
-    /// Typed artifact parsing and local availability are deliberately the
-    /// caller's responsibility. A canonical empty projection is therefore a
-    /// valid candidate even though it carries no physical artifact handle.
-    pub fn new(record: Inline<Handle<SimpleArchive>>, range: CommitRange) -> Self {
-        Self { record, range }
+    /// Core/node association validation, typed artifact parsing, and local
+    /// availability are deliberately the caller's responsibility. A canonical
+    /// empty projection has the same archive handle for both roles and remains
+    /// a valid candidate.
+    pub fn new(node: Inline<Handle<SimpleArchive>>, range: CommitRange) -> Self {
+        Self { node, range }
     }
 
-    /// Exact standalone archive asserted by the rollup pin.
-    pub const fn record(&self) -> Inline<Handle<SimpleArchive>> {
-        self.record
+    /// Exact complete artifact-node archive asserted by the rollup pin label.
+    pub const fn node(&self) -> Inline<Handle<SimpleArchive>> {
+        self.node
     }
 
     /// Exact commit region certified by the parsed record.
@@ -224,9 +225,9 @@ impl RangeCoverCandidate {
 
 /// Deterministic artifact cover of one authoritative commit frontier.
 ///
-/// `selected` contains pairwise-disjoint, locally usable record archives.
+/// `selected` contains pairwise-disjoint, locally usable artifact nodes.
 /// `residual` contains every target commit not covered by them and must be
-/// evaluated from source data. `invalid` names candidate archives whose
+/// evaluated from source data. `invalid` names candidate nodes whose
 /// boundaries looked relevant but failed individual range validation; one bad
 /// grow-only assertion never poisons the rest of the pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,7 +238,7 @@ pub struct RangeCoverSelection {
 }
 
 impl RangeCoverSelection {
-    /// Canonically ordered, pairwise-disjoint standalone records.
+    /// Canonically ordered, pairwise-disjoint standalone artifact nodes.
     pub fn selected(&self) -> &[Inline<Handle<SimpleArchive>>] {
         &self.selected
     }
@@ -247,7 +248,7 @@ impl RangeCoverSelection {
         &self.residual
     }
 
-    /// Canonically ordered candidate records rejected by range validation.
+    /// Canonically ordered candidate nodes rejected by range validation.
     pub fn invalid(&self) -> &[Inline<Handle<SimpleArchive>>] {
         &self.invalid
     }
@@ -596,8 +597,8 @@ where
 ///
 /// This greedy order is an optimization policy, not a correctness invariant.
 /// Merged replicas may contain overlapping or alternative compactions, and an
-/// evicted artifact may simply be omitted by the caller. Whatever the chosen
-/// records do not cover is returned in `residual`, so incomplete pools and
+/// evicted artifact node may simply be omitted by the caller. Whatever the
+/// chosen nodes do not cover is returned in `residual`, so incomplete pools and
 /// non-optimal covers remain exact. Candidates whose boundaries are wholly
 /// outside the target are irrelevant rather than invalid.
 pub fn select_range_cover<D>(
@@ -634,7 +635,7 @@ where
 
         match view.range_members(&candidate.range) {
             Ok(members) if members.is_subset(&target) => {
-                eligible.push((candidate.record, members));
+                eligible.push((candidate.node, members));
             }
             Ok(_) => {}
             Err(RangeValidationError::Graph(error)) => {
@@ -643,33 +644,31 @@ where
             Err(RangeValidationError::CyclicGraph) => {
                 return Err(RangeValidationError::CyclicGraph);
             }
-            Err(_) => invalid.push(candidate.record),
+            Err(_) => invalid.push(candidate.node),
         }
     }
 
-    eligible.sort_unstable_by(
-        |(left_record, left_members), (right_record, right_members)| {
-            right_members
-                .len()
-                .cmp(&left_members.len())
-                .then_with(|| left_record.raw.cmp(&right_record.raw))
-        },
-    );
+    eligible.sort_unstable_by(|(left_node, left_members), (right_node, right_members)| {
+        right_members
+            .len()
+            .cmp(&left_members.len())
+            .then_with(|| left_node.raw.cmp(&right_node.raw))
+    });
 
     let mut remaining = target;
     let mut selected = Vec::new();
-    for (record, members) in eligible {
+    for (node, members) in eligible {
         if members.iter().all(|commit| remaining.contains(commit)) {
             for commit in members {
                 remaining.remove(&commit);
             }
-            selected.push(record);
+            selected.push(node);
         }
     }
 
     let mut residual: Vec<_> = remaining.into_iter().collect();
     residual.sort_unstable_by_key(|commit| commit.raw);
-    invalid.sort_unstable_by_key(|record| record.raw);
+    invalid.sort_unstable_by_key(|node| node.raw);
     invalid.dedup();
 
     Ok(RangeCoverSelection {

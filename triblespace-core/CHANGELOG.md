@@ -17,10 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle, excludes off-frontier ranges, isolates invalid candidates, and uses
   canonical commit metadata rather than accepting arbitrary parent facts.
 - Added a typed, grow-only `RollupPinDescriptor` keyed by source branch and
-  index recipe. Its strongly wrapped assertion values are exact standalone
-  range-record archive handles; the descriptor keeps source identity and
-  recipe separation canonical without adding publication or cover-selection
-  state.
+  index recipe. Each signed assertion pairs a hard core-only range-record
+  value with one complete unowned artifact-node handle in its opaque label.
+  This keeps coverage metadata durable without turning every historical
+  derived payload into permanent weak-pin demand; equal-range nodes remain
+  atomic alternatives rather than being fact-unioned.
 - Hard retention is now an explicit `StrongPinDescriptor` decorator rather
   than a branch-special case in Yard. The canonical V1 wrapper contains an
   exact inner descriptor handle; authentic assertions sharing its outer pin
