@@ -33,7 +33,7 @@ use crate::query::{
     VariableSet,
 };
 use crate::repo::index_range::{
-    convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
+    convex_union, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
     RangeValidationError, StoredCommitDag,
 };
 use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle};
@@ -84,46 +84,6 @@ impl fmt::Display for CoverageMismatch {
 }
 
 impl Error for CoverageMismatch {}
-
-/// A commit batch attempted to replace/rewind a certified head rather than
-/// monotonically extend it.
-#[derive(Debug, Clone)]
-pub struct NonMonotoneCommitBatch {
-    /// Previously certified base head.
-    pub base: CommitHandle,
-    /// Proposed replacement head.
-    pub proposed: CommitHandle,
-}
-
-impl fmt::Display for NonMonotoneCommitBatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "index commit batch is non-monotone: {:?} is not an ancestor of {:?}",
-            self.base, self.proposed
-        )
-    }
-}
-
-impl Error for NonMonotoneCommitBatch {}
-
-/// Validate the monotone head relation of a commit batch before building any
-/// artifacts. A genesis batch (`base == None`) is monotone by definition.
-pub fn validate_monotone_batch<R: BlobStoreGet>(
-    reader: &R,
-    base: Option<CommitHandle>,
-    proposed: CommitHandle,
-) -> Result<(), ArtifactError> {
-    let Some(base) = base else {
-        return Ok(());
-    };
-    let mut dag = StoredCommitDag::new(reader);
-    if is_ancestor(&mut dag, base, proposed).map_err(|error| Box::new(error) as ArtifactError)? {
-        Ok(())
-    } else {
-        Err(Box::new(NonMonotoneCommitBatch { base, proposed }))
-    }
-}
 
 /// Dynamically reported recipe/artifact failure.
 pub type ArtifactError = Box<dyn Error + Send + Sync>;
@@ -886,8 +846,8 @@ pub fn append_range<S: BlobStore, K: IndexKind>(
 /// every range and unknown recipe-owned fact.
 ///
 /// This hot-path primitive assumes the explicit maintenance workflow
-/// established monotonicity with [`validate_monotone_batch`] and appended
-/// exactly the incoming batch's disjoint ranges. Use
+/// established monotonicity and appended exactly the incoming batch's
+/// disjoint ranges. Use
 /// [`set_index_head_audited`] for an untrusted or repaired range set.
 pub fn set_index_frontier<S: BlobStore, K: IndexKind>(
     storage: &mut S,

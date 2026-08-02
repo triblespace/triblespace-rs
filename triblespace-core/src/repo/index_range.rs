@@ -453,70 +453,6 @@ fn entity_facts(set: &TribleSet, entity: Id) -> TribleSet {
     facts
 }
 
-/// Copy every fact for selected entity ids verbatim, without parsing or
-/// reconstructing the records. This is the lossless carry-forward primitive.
-pub fn select_range_record_facts(
-    set: &TribleSet,
-    entities: impl IntoIterator<Item = Id>,
-) -> TribleSet {
-    let entities: HashSet<_> = entities.into_iter().collect();
-    let mut selected = TribleSet::new();
-    for trible in set.iter().filter(|trible| entities.contains(trible.e())) {
-        selected.insert(trible);
-    }
-    selected
-}
-
-/// Replace complete range entities in a manifest fact set.
-///
-/// Every fact whose subject is in `retired` is removed, including attributes
-/// unknown to this crate. Every other subject is preserved verbatim. Use this
-/// when retiring the complete `(recipe, range)` slot and every artifact owned
-/// by it; use [`replace_range_attributes`] to change only one co-located typed
-/// representation.
-pub fn replace_range_records(
-    manifest_set: &mut TribleSet,
-    retired: impl IntoIterator<Item = Id>,
-    replacements: impl IntoIterator<Item = RangeRecord>,
-) {
-    let retired: HashSet<_> = retired.into_iter().collect();
-    let mut next = TribleSet::new();
-    for trible in manifest_set
-        .iter()
-        .filter(|trible| !retired.contains(trible.e()))
-    {
-        next.insert(trible);
-    }
-    for record in replacements {
-        next += record.to_tribles();
-    }
-    *manifest_set = next;
-}
-
-/// Replace selected typed attributes without disturbing other artifacts or
-/// unknown facts co-located on the same range entities.
-///
-/// Each `(entity, attribute)` pair removes every repeated value for that typed
-/// attribute. `additions` is then unioned verbatim. The recipe and boundary
-/// facts remain even when no typed handles are left: that core-only record is
-/// the canonical certificate for an empty filtered/contentless projection.
-pub fn replace_range_attributes(
-    manifest_set: &mut TribleSet,
-    removals: impl IntoIterator<Item = (Id, Id)>,
-    additions: TribleSet,
-) {
-    let removals: HashSet<_> = removals.into_iter().collect();
-    let mut next = TribleSet::new();
-    for trible in manifest_set
-        .iter()
-        .filter(|trible| !removals.contains(&(*trible.e(), *trible.a())))
-    {
-        next.insert(trible);
-    }
-    next += additions;
-    *manifest_set = next;
-}
-
 /// Merge pairwise-disjoint victim ranges if and only if their union is one
 /// exact order-convex commit region.
 pub fn convex_union<D>(
@@ -741,30 +677,6 @@ where
         residual,
         invalid,
     })
-}
-
-/// Return whether `ancestor` is reachable from `descendant` by following zero
-/// or more parent edges. The iterative walk is used by commit-batch guards
-/// before an index hook starts extending a certified manifest.
-pub fn is_ancestor<D>(
-    dag: &mut D,
-    ancestor: CommitHandle,
-    descendant: CommitHandle,
-) -> Result<bool, RangeValidationError<D::Error>>
-where
-    D: CommitDag,
-{
-    let mut visited = HashSet::new();
-    let mut stack = vec![descendant];
-    while let Some(commit) = stack.pop() {
-        if commit == ancestor {
-            return Ok(true);
-        }
-        if visited.insert(commit) {
-            stack.extend(dag.parents(commit).map_err(RangeValidationError::Graph)?);
-        }
-    }
-    Ok(false)
 }
 
 struct DagView<'a, D: CommitDag> {
@@ -1381,83 +1293,6 @@ mod tests {
         let other_record = RangeRecord::new(*other_recipe, CommitRange::leaf(a));
         assert_ne!(other_record.entity(), entity);
         assert_eq!(other_record.range(), record.range());
-    }
-
-    #[test]
-    fn replacement_removes_every_fact_of_a_retired_entity() {
-        let a = commit(1);
-        let b = commit(2);
-        let recipe = fucid();
-        let mut old = RangeRecord::new(*recipe, CommitRange::leaf(a));
-        let old_entity = old.entity();
-        let opaque = fucid();
-        *old.facts_mut() += entity! { ExclusiveId::force_ref(&old_entity) @
-            metadata::tag: &opaque,
-        };
-
-        let unrelated = fucid();
-        let mut head = old.to_tribles();
-        head += entity! { &unrelated @ metadata::tag: &opaque };
-        let replacement = RangeRecord::new(*recipe, CommitRange::leaf(b));
-        let replacement_entity = replacement.entity();
-        replace_range_records(&mut head, [old_entity], [replacement]);
-
-        assert!(!head.iter().any(|trible| *trible.e() == old_entity));
-        assert!(head.iter().any(|trible| *trible.e() == *unrelated));
-        assert!(head.iter().any(|trible| *trible.e() == replacement_entity));
-    }
-
-    #[test]
-    fn typed_attribute_replacement_preserves_co_located_facts() {
-        let a = commit(1);
-        let recipe = fucid();
-        let mut record = RangeRecord::new(*recipe, CommitRange::leaf(a));
-        let entity = record.entity();
-        let artifact_a = fucid();
-        let artifact_b = fucid();
-        *record.facts_mut() += entity! { ExclusiveId::force_ref(&entity) @
-            metadata::tag: &artifact_a,
-            crate::repo::branch: &artifact_b,
-        };
-        let mut head = record.to_tribles();
-
-        replace_range_attributes(&mut head, [(entity, metadata::tag.id())], TribleSet::new());
-        assert!(!head
-            .iter()
-            .any(|trible| *trible.e() == entity && trible.a() == &metadata::tag.id()));
-        assert!(head
-            .iter()
-            .any(|trible| *trible.e() == entity && trible.a() == &crate::repo::branch.id()));
-        assert!(head
-            .iter()
-            .any(|trible| *trible.e() == entity && trible.a() == &commit_start.id()));
-
-        replace_range_attributes(
-            &mut head,
-            [(entity, crate::repo::branch.id())],
-            TribleSet::new(),
-        );
-        assert!(head.iter().any(|trible| *trible.e() == entity));
-        let empty = RangeRecord::parse(&head, entity).unwrap();
-        assert_eq!(empty.recipe(), *recipe);
-        assert_eq!(
-            empty.facts().len(),
-            3,
-            "recipe + singleton start/end remain"
-        );
-    }
-
-    #[test]
-    fn selected_record_facts_are_carried_verbatim() {
-        let recipe = fucid();
-        let a = RangeRecord::new(*recipe, CommitRange::leaf(commit(1)));
-        let b = RangeRecord::new(*recipe, CommitRange::leaf(commit(2)));
-        let mut head = a.to_tribles();
-        head += b.to_tribles();
-        assert_eq!(
-            select_range_record_facts(&head, [a.entity()]),
-            a.to_tribles()
-        );
     }
 
     #[test]

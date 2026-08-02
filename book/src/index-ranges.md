@@ -59,16 +59,9 @@ Artifact handles themselves never participate in the id.
 
 `RangeRecord` retains every fact whose subject is its real entity id, including
 attributes unknown to the current binary, and refreshes only the intrinsic
-recipe-plus-frontier core when it is serialized. `select_range_record_facts`
-is the preferred carry-forward primitive because it copies selected entity
-facts verbatim without parsing or reconstruction.
-
-Independent typed maintenance uses `replace_range_attributes`: it removes only
-the selected `(entity, typed attribute)` facts and preserves all co-located and
-unknown attributes. The recipe/range core remains even with zero typed handles;
-that is the canonical completed-empty projection. `replace_range_records`
-removes every fact under a retired entity and is used when compacting the
-complete recipe/range slot and all artifacts owned by it.
+recipe-plus-frontier core when it is serialized. The recipe/range core remains
+valid with zero typed handles; that is the canonical completed-empty
+projection.
 
 ## Typed immutable manifests
 

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed the unused mutable-manifest range replacement helpers and monotone
+  commit-batch guard. Range records retain their immutable open-fact model;
+  pool cover selection derives freshness from the authoritative frontier.
 - Added deterministic `select_range_cover` with source-data residuals for
   merged grow-only rollup pools. Selection is keyed by standalone record blob
   handle, excludes off-frontier ranges, isolates invalid candidates, and uses
