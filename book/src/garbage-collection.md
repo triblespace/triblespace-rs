@@ -10,9 +10,10 @@ Forgetting is deliberately conservative. It only removes local copies, so an
 explicit low-level forget can leave a branch `TipPending` until a peer restores
 its asserted target. Automatic repository collection recognizes the generic
 `StrongPinDescriptor`: every valid assertion whose locally present outer
-descriptor decodes canonically roots that outer blob, the locally present
-closure of its exact inner descriptor, and the locally present closure of every
-distinct asserted value. The collector does not need to know the inner kind.
+descriptor decodes canonically retains that outer blob and begins hard
+propagation from its exact inner descriptor and every distinct asserted value.
+An asserted weak pin cuts that propagation. The collector does not need to know
+the inner kind.
 
 The main challenge is deciding which blobs are still reachable without
 reconstructing every `TribleSet`. The sections below outline how the repository
@@ -30,25 +31,27 @@ authorization, or any other meaning. Collectors use all distinct values, not a
 kind-specific resolved frontier: retention must not turn uncertainty into
 deletion.
 Admission policy and quota bound which remote assertions become accepted;
-pressure never silently weakens accepted state.
+pressure never silently removes accepted assertions.
 
-The outer descriptor is retained directly because its inner handle begins at
-byte 16 and is not visible to the aligned conservative scanner. After exact
-decoding, Yard explicitly seeds traversal with the inner handle and asserted
-values. A branch's V2 inner descriptor places its name handle at byte 32, so a
+Unless it is itself weak-pinned, the outer descriptor is retained directly
+because its inner handle begins at byte 16 and is not visible to the aligned
+conservative scanner. After exact decoding, Yard explicitly seeds traversal
+with the inner handle and asserted values. A weak outer cuts the entire wrapper
+effect. A branch's V2 inner descriptor places its name handle at byte 32, so a
 locally present name is then retained by ordinary closure discovery. Name bytes
 may remain absent without invalidating an exact branch identity.
 
-`Yard` also derives soft cache roots from signed asserted wants. It recognizes
-the fixed `WantPinDescriptor`, unions authentic values across all authors,
-orders those exact handles canonically, and selects a global prefix of at most
-`YardConfig::want_budget` **before** checking local presence. It retains the
-selected values that are present. An absent low-ranked value therefore reserves
-its slot instead of letting a present tail value enter a cache frontier that the
-reconciler cannot reproduce. These soft roots retain only the named blobs; they
-never veto or weaken a strong hard root or its closure. Satisfaction, budget
-eviction, and local absence do not erase the underlying assertions—the want
-view is a grow-only set.
+`Yard` also derives weak boundaries and soft cache roots from signed asserted
+wants. It recognizes the fixed `WantPinDescriptor` and unions authentic values
+across all authors. Every exact value is a cut point: a hard walk stops before
+it, so arrival below a strong root does not silently make the fetched blob hard.
+Yard orders those exact handles canonically and selects a global prefix of at
+most `YardConfig::want_budget` **before** checking local presence. It retains
+only selected values that are present, without traversing their closure. An
+absent low-ranked value therefore reserves its slot instead of letting a
+present tail value enter a cache frontier that the reconciler cannot reproduce.
+Satisfaction, budget eviction, and local absence do not erase the underlying
+assertions—the weak-pin view is a grow-only set.
 
 ## Conservative Reachability
 
@@ -73,18 +76,21 @@ eligible for forgetting.
 
 ## Traversal Algorithm
 
-1. Take one coherent snapshot of all generic pin assertions.
-2. Group valid assertions by outer pin handle. If that locally present blob
-   decodes as a canonical `StrongPinDescriptor`, retain the outer directly and
-   add its exact inner handle plus every distinct assertion value to the hard
-   root set. Missing or malformed outers are neutral; preserve their assertion
-   records unchanged.
-3. Independently project authentic `WantPinDescriptor` values across every
-   author. Retain up to the configured budget of canonically ordered, locally
-   present exact values as soft cache roots; do not traverse their closure.
-4. Recursively walk the discovered inner descriptors, values, and content. Each blob is
-   scanned in 32-byte steps; any chunk whose lookup succeeds is enqueued instead
-   of deserialising the archive.
+1. Take one coherent snapshot of all generic pin assertions and project the
+   union of every authentic `WantPinDescriptor` value as the weak cut set.
+2. Group valid assertions by outer pin handle. If the outer is weak, skip the
+   whole wrapper effect. Otherwise, if the locally present blob decodes as a
+   canonical `StrongPinDescriptor`, retain the outer directly and add its exact
+   inner handle plus every distinct assertion value to the hard root set.
+   Missing or malformed outers are neutral; preserve their assertion records
+   unchanged.
+3. Walk the discovered hard roots. Before retaining or scanning a handle, stop
+   if it belongs to the weak cut set. Otherwise scan the blob in 32-byte steps;
+   any chunk whose lookup succeeds is enqueued instead of deserialising the
+   archive.
+4. Select up to the configured budget of canonically ordered weak handles and
+   retain each exact value that is locally present as a soft cache root. Do not
+   traverse its closure.
 5. Stream the discovered handles into whatever operation you need. The
    [`reachable`](https://docs.rs/triblespace/latest/triblespace/repo/fn.reachable.html)
    helper returns an iterator of handles, so you can retain them, transfer
@@ -97,10 +103,10 @@ by a particular branch or to export a log of missing blobs for diagnostics.
 
 ## Automating the Walk
 
-The repository module already provides most of the required plumbing. The
+The repository module provides most of the required plumbing. The generic
 [`reachable`](https://docs.rs/triblespace/latest/triblespace/repo/fn.reachable.html)
-helper exposes the traversal as a reusable iterator so you can compose other
-operations along the way, while
+helper exposes an unconditional traversal as a reusable iterator. A collector
+with weak pins adds the stop predicate described above, while
 [`transfer`](https://docs.rs/triblespace/latest/triblespace/repo/fn.transfer.html)
 duplicates whichever handles you feed it. A store that combines blobs and
 generic assertions can derive hard roots by projecting the generic strong

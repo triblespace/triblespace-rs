@@ -29,10 +29,12 @@ use super::pile::{
 };
 use super::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
 use super::strong_pin::StrongPinDescriptor;
-use super::want::{selected_wants_in_snapshot, WantCachePolicy, WantCachePolicySource};
+use super::want::{
+    all_wants_in_snapshot, selected_wants_in_snapshot, WantCachePolicy, WantCachePolicySource,
+};
 use super::{
-    reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    PinStore, PushResult, StorageClose, TransferError,
+    transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore,
+    PushResult, StorageClose, TransferError,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -363,10 +365,10 @@ impl Yard {
         let reader = self.reader().map_err(YardCollectError::Reader)?;
         let durable_keep = self.durable_keep_set(&reader, &pin_assertions);
         let present = reader.live_set();
-        let want_keep = asserted_want_keep_set(&pin_assertions, &present, self.want_cache_policy());
+        let weak_keep = soft_weak_keep_set(&pin_assertions, &present, self.want_cache_policy());
 
         let mut keep = durable_keep;
-        keep.union(want_keep);
+        keep.union(weak_keep);
         for generation in &mut self.generations {
             for segment in &mut generation.segments {
                 segment.live = segment.live.intersect(&keep);
@@ -533,33 +535,35 @@ impl Yard {
         self.config.strong_level_budget.saturating_mul(multiplier)
     }
 
-    fn strong_keep_set(&self, reader: &YardReader) -> HandleSet {
+    fn strong_keep_set(
+        &self,
+        reader: &YardReader,
+        weak: &std::collections::BTreeSet<Inline<Handle<UnknownBlob>>>,
+    ) -> HandleSet {
         let roots: Vec<_> = (&self.strong_pins)
             .into_iter()
             .filter_map(|pin| self.strong_pins.get(pin).copied())
             .collect();
-
-        let mut keep = HandleSet::new();
-        for handle in reachable(reader, roots) {
-            keep.insert(&Entry::new(&handle.raw));
-        }
-        keep
+        hard_reachable_keep_set(reader, roots, weak)
     }
 
     /// Keep set for state that may never be silently evicted.
     ///
     /// Legacy scalar pins remain hard compatibility roots. Assertions whose
     /// locally present outer descriptor is a canonical strong wrapper retain
-    /// the wrapped descriptor and every asserted value's local closure. Wants
-    /// are handled separately as budgeted soft roots and never veto a hard
-    /// edge.
+    /// the wrapped descriptor and every asserted value's local closure until
+    /// an asserted weak pin cuts the walk. The same positive weak-pin set is
+    /// handled separately as budgeted soft roots: absent members are demand,
+    /// while present members remain evictable instead of becoming hard merely
+    /// because they arrived below a strong root.
     fn durable_keep_set(
         &self,
         reader: &YardReader,
         pin_assertions: &PinAssertionSnapshot,
     ) -> HandleSet {
-        let mut keep = self.strong_keep_set(reader);
-        keep.union(strong_pin_keep_set(reader, pin_assertions));
+        let weak = all_wants_in_snapshot(pin_assertions);
+        let mut keep = self.strong_keep_set(reader, &weak);
+        keep.union(strong_pin_keep_set(reader, pin_assertions, &weak));
         keep
     }
 
@@ -939,14 +943,15 @@ fn collect_list<E>(
     Ok(set)
 }
 
-/// Retain the locally present members of the canonical asserted-want prefix.
+/// Retain the locally present members of the canonical weak-pin prefix.
 ///
-/// Assertions are durable intent; retention is artifact-local cache policy.
-/// Evicting a wanted blob therefore never erases its assertion, and a later
-/// reconciliation may fetch it again. Selection happens before the presence
-/// test, so an absent low-ranked value reserves its slot and collection agrees
-/// exactly with the reconciler's fetch policy.
-fn asserted_want_keep_set(
+/// Assertions classify every exact handle as a hard-reachability cut point;
+/// this artifact-local policy selects which present cut points remain as soft
+/// cache roots. Eviction never erases an assertion, and reconciliation may
+/// fetch the blob again. Selection happens before the presence test, so an
+/// absent low-ranked value reserves its slot and collection agrees exactly
+/// with the reconciler's fetch policy.
+fn soft_weak_keep_set(
     assertions: &PinAssertionSnapshot,
     present: &HandleSet,
     policy: WantCachePolicy,
@@ -965,13 +970,19 @@ fn asserted_want_keep_set(
 ///
 /// The wrapper is the complete generic policy boundary. Yard neither knows nor
 /// guesses the inner kind: once a locally present outer descriptor decodes
-/// exactly, the outer itself is retained and the wrapped descriptor plus every
-/// distinct authentic assertion value becomes a conservative local-closure
-/// root. Missing or malformed outers are neutral while their assertion records
-/// remain durable. Publication flushes dependency blobs before the assertion,
-/// while replication may safely deliver them in either order.
-fn strong_pin_keep_set(reader: &YardReader, assertions: &PinAssertionSnapshot) -> HandleSet {
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+/// exactly, the outer itself and the wrapped descriptor plus every distinct
+/// authentic assertion value begin hard propagation. An asserted weak pin stops
+/// that propagation before its exact handle; a weak outer therefore disables
+/// the whole wrapper's hard-retention effect. Missing or malformed outers are
+/// neutral while their assertion records remain durable. Publication flushes
+/// dependency blobs before the assertion, while replication may safely deliver
+/// them in either order.
+fn strong_pin_keep_set(
+    reader: &YardReader,
+    assertions: &PinAssertionSnapshot,
+    weak: &std::collections::BTreeSet<Inline<Handle<UnknownBlob>>>,
+) -> HandleSet {
+    use std::collections::{BTreeMap, BTreeSet};
 
     let mut values_by_pin = BTreeMap::<_, BTreeSet<_>>::new();
     for assertion in assertions.iter() {
@@ -981,11 +992,15 @@ fn strong_pin_keep_set(reader: &YardReader, assertions: &PinAssertionSnapshot) -
             .insert(assertion.value());
     }
 
-    let mut queue = VecDeque::new();
+    let mut roots = Vec::new();
     let mut keep = HandleSet::new();
 
     for (pin, values) in values_by_pin {
         let outer = StrongPinDescriptor::descriptor_handle(pin);
+        let outer_untyped = Inline::<Handle<UnknownBlob>>::new(outer.raw);
+        if weak.contains(&outer_untyped) {
+            continue;
+        }
         let Some(Ok(inner)) =
             reader.get_local::<Inline<Handle<UnknownBlob>>, StrongPinDescriptor>(outer)
         else {
@@ -993,24 +1008,39 @@ fn strong_pin_keep_set(reader: &YardReader, assertions: &PinAssertionSnapshot) -
         };
 
         keep.insert(&Entry::new(&outer.raw));
-        queue.push_back(inner);
-        queue.extend(
+        roots.push(inner);
+        roots.extend(
             values
                 .into_iter()
                 .map(|value| Inline::<Handle<UnknownBlob>>::new(value.raw())),
         );
     }
 
+    keep.union(hard_reachable_keep_set(reader, roots, weak));
+    keep
+}
+
+/// Propagate hard reachability until an explicitly weak-pinned handle.
+///
+/// Weak pins are cut points, not merely additional roots. The cut handle and
+/// everything reachable only through it stay outside the hard set; the caller
+/// may retain the exact cut handle separately under the soft cache budget.
+fn hard_reachable_keep_set(
+    reader: &YardReader,
+    roots: impl IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
+    weak: &std::collections::BTreeSet<Inline<Handle<UnknownBlob>>>,
+) -> HandleSet {
+    use std::collections::VecDeque;
+
+    let mut queue: VecDeque<_> = roots.into_iter().collect();
+    let mut keep = HandleSet::new();
+
     while let Some(handle) = queue.pop_front() {
-        if keep.get(&handle.raw).is_some() {
+        if weak.contains(&handle) || keep.get(&handle.raw).is_some() {
             continue;
         }
         keep.insert(&Entry::new(&handle.raw));
-        for child in reader.local_children(handle) {
-            if keep.get(&child.raw).is_none() {
-                queue.push_back(child);
-            }
-        }
+        queue.extend(reader.local_children(handle));
     }
     keep
 }
@@ -1592,6 +1622,42 @@ mod tests {
     }
 
     #[test]
+    fn weak_pin_on_strong_outer_cuts_the_whole_asserted_closure() {
+        let (_dir, mut yard) = yard_with(
+            1,
+            YardConfig {
+                want_budget: 0,
+                ..YardConfig::default()
+            },
+        );
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let value = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"asserted value".to_vec()))
+            .unwrap();
+        let inner = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"inner descriptor".to_vec()))
+            .unwrap();
+        let outer = yard
+            .put::<StrongPinDescriptor, _>(StrongPinDescriptor::blob(inner))
+            .unwrap();
+        append_strong(&mut yard, &key, inner, value, 1);
+        append_want(&mut yard, &key, outer);
+
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+        assert!(matches!(
+            reader.get::<Blob<StrongPinDescriptor>, StrongPinDescriptor>(outer),
+            Err(YardGetError::NotFound)
+        ));
+        for handle in [inner, value] {
+            assert!(matches!(
+                reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
+                Err(YardGetError::NotFound)
+            ));
+        }
+    }
+
+    #[test]
     fn missing_or_malformed_strong_outer_is_neutral_until_exact_outer_arrives() {
         let (_dir, mut yard) = yard_with(
             1,
@@ -1752,7 +1818,7 @@ mod tests {
         }
         // Insert in reverse rank order to make ordering visibly independent
         // from record order.
-        for (handle, _) in candidates.iter().rev() {
+        for (handle, _) in candidates[..3].iter().rev() {
             append_want(&mut yard, &key, *handle);
         }
         yard.pin_strong(pin_id(18), hard_outside_prefix).unwrap();
@@ -1776,7 +1842,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_pin_closure_remains_hard_when_its_values_are_also_soft_wants() {
+    fn weak_pin_cuts_an_asserted_branch_closure() {
         use crate::blob::encodings::longstring::LongString;
         use crate::repo::branch_pin::{sign_branch_assertion, BranchRank};
         use crate::repo::commit;
@@ -1808,8 +1874,8 @@ mod tests {
         let strong = strong_blob.get_handle();
 
         // Stage and flush the complete locally authored dependency chain before
-        // publishing the assertion. A zero soft budget must not weaken any
-        // member of the resulting strong closure.
+        // publishing the assertion. The content is then explicitly classified
+        // as weak: its parent remains hard, but hard propagation stops there.
         assert_eq!(yard.put::<LongString, _>(name_blob).unwrap(), name);
         assert_eq!(
             yard.put::<BranchPinDescriptor, _>(descriptor_blob).unwrap(),
@@ -1830,11 +1896,6 @@ mod tests {
             BranchRank::ROOT.successor().unwrap(),
         ))
         .unwrap();
-        append_want(&mut yard, &key, strong);
-        append_want(&mut yard, &key, descriptor);
-        append_want(&mut yard, &key, name);
-        append_want(&mut yard, &key, target);
-        append_want(&mut yard, &key, parent);
         append_want(&mut yard, &key, content);
         let dead = yard
             .put::<RawBytes, _>(raw_blob(b"unasserted orphan"))
@@ -1851,7 +1912,10 @@ mod tests {
         assert_eq!(&*restored_name, "weak-before-arrival");
         assert!(reader.get::<TribleSet, SimpleArchive>(target).is_ok());
         assert!(reader.get::<TribleSet, SimpleArchive>(parent).is_ok());
-        assert!(reader.get::<TribleSet, SimpleArchive>(content).is_ok());
+        assert!(matches!(
+            reader.get::<TribleSet, SimpleArchive>(content),
+            Err(YardGetError::NotFound)
+        ));
         assert!(matches!(
             get_raw(&reader, dead),
             Err(YardGetError::NotFound)
@@ -1926,7 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn asserted_wants_never_veto_hard_reachability() {
+    fn weak_pin_cuts_legacy_strong_reachability() {
         let (_dir, mut yard) = yard_with(
             1,
             YardConfig {
@@ -1935,9 +1999,8 @@ mod tests {
             },
         );
         let key = SigningKey::from_bytes(&[9; 32]);
-        // The child is both softly wanted and reachable from a hard root. A
-        // zero soft budget may evict standalone wants, but cannot cut a hard
-        // reachability edge.
+        // The child is reachable from a hard root but explicitly weak. With no
+        // soft capacity it is evicted instead of inheriting hard retention.
         let child = Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
         append_want(&mut yard, &key, child);
         yard.put::<UnknownBlob, _>(Bytes::from_source(b"child".to_vec()))
@@ -1951,7 +2014,10 @@ mod tests {
         let reader = yard.reader().unwrap();
 
         assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(parent).is_ok());
-        assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(child).is_ok());
+        assert!(matches!(
+            reader.get::<Blob<UnknownBlob>, UnknownBlob>(child),
+            Err(YardGetError::NotFound)
+        ));
     }
 
     #[test]
@@ -2558,6 +2624,7 @@ mod tests {
         fn model_strong_keep(
             roots: &[RawHandle],
             present: &BTreeSet<RawHandle>,
+            weak: &BTreeSet<RawHandle>,
             model: &Model,
         ) -> BTreeSet<RawHandle> {
             let mut queue = VecDeque::new();
@@ -2567,7 +2634,7 @@ mod tests {
 
             let mut keep = BTreeSet::new();
             while let Some(raw) = queue.pop_front() {
-                if !keep.insert(raw) || !present.contains(&raw) {
+                if weak.contains(&raw) || !keep.insert(raw) || !present.contains(&raw) {
                     continue;
                 }
 
@@ -2590,7 +2657,7 @@ mod tests {
 
         fn expected_live_after_collect(yard: &Yard, model: &Model) -> BTreeSet<RawHandle> {
             let present = live_union(yard);
-            let strong_keep = model_strong_keep(&strong_roots(yard), &present, model);
+            let strong_keep = model_strong_keep(&strong_roots(yard), &present, &model.wants, model);
             let want_keep = budgeted_wants(&model.wants, &present, yard.config.want_budget);
 
             present
@@ -2632,7 +2699,7 @@ mod tests {
             );
             let reader = yard.reader().unwrap();
             let live = live_union(yard);
-            let strong_keep = model_strong_keep(&strong_roots(yard), &live, model);
+            let strong_keep = model_strong_keep(&strong_roots(yard), &live, &model.wants, model);
 
             for raw in strong_keep.intersection(&live) {
                 let expected = model
@@ -2897,11 +2964,11 @@ mod tests {
         }
 
         #[test]
-        fn asserted_want_does_not_downgrade_a_tenured_hard_root() {
+        fn weak_pin_can_downgrade_a_tenured_hard_root() {
             let (_dir, mut yard) = yard_with(
                 3,
                 YardConfig {
-                    want_budget: 1,
+                    want_budget: 0,
                     strong_level_budget: 0,
                     fanout: 1,
                 },
@@ -2919,8 +2986,9 @@ mod tests {
             yard.compact().unwrap();
 
             assert!(
-                yard.contains_in_generation(2, tenured),
-                "soft demand must not weaken a hard root"
+                (0..yard.generation_count())
+                    .all(|level| !yard.contains_in_generation(level, tenured)),
+                "the weak mark must make an already-tenured root evictable"
             );
         }
     }

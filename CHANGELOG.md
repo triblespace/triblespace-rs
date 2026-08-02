@@ -187,10 +187,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authors and selects one canonical exact-value prefix under
   `YardConfig::want_budget` before presence filtering. Reconciliation fetches
   only the local author's share of that same prefix, giving finite caches a
-  stable fixed point instead of a fetch/evict loop. Wants never veto hard roots,
-  and satisfaction or eviction never erases an assertion. Historical weak-pin/unpin records remain
-  decodable only for migration and forensics, with no live index or writer and
-  no automatic conversion into authored wants. `Lazy::new` now takes
+  stable fixed point instead of a fetch/evict loop. The full authentic set cuts
+  hard reachability at each exact weak-pinned handle, so fetched content remains
+  evictable; satisfaction or eviction never erases an assertion. Historical
+  weak-pin/unpin records remain decodable only for migration and forensics, with
+  no live index or writer and no automatic conversion into authored wants.
+  `Lazy::new` now takes
   `(store, SigningKey)`, and `YardConfig::weak_budget` is renamed to
   `want_budget`.
 - **Storage composition now carries asserted-pin authority explicitly.** Async
@@ -270,9 +272,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without treating their opaque values as roots. When a locally present
   descriptor decodes as `BranchPinDescriptor`, every valid assertion's
   descriptor, name, commit, and locally present closure become hard roots.
-  Authentic asserted-want values are separate bounded soft roots and can never
-  weaken that closure. Reclaim copies each segment's exact assertion set before
-  the atomic rename.
+  Authentic asserted-want values cut hard propagation at their exact handles;
+  the bounded selected prefix supplies separate soft roots. Reclaim copies each
+  segment's exact assertion set before the atomic rename.
 - **Breaking: `Repository` publishes own-key branch pins through the generic envelope.**
   `create_workspace(name)` now begins an unpublished branch without writing an
   empty state; its first changed `push` makes the name and canonical descriptor

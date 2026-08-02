@@ -6,10 +6,11 @@
 //! while the wrapped descriptor remains responsible for every domain-specific
 //! meaning: value interpretation, labels, resolution, authorization, and UI.
 //!
-//! A retention backend that recognizes this exact outer descriptor may keep
-//! the outer descriptor, the wrapped descriptor's locally present closure, and
-//! every distinct authentic assertion value's locally present closure. Missing
-//! or malformed outer content is neutral: the assertion remains durable but
+//! A retention backend that recognizes this exact outer descriptor propagates
+//! hard retention from it, the wrapped descriptor, and every distinct authentic
+//! assertion value. Propagation stops at an exact weak-pin boundary, including
+//! the outer itself, whose retention remains soft and budgeted. Missing or
+//! malformed outer content is neutral: the assertion remains durable but
 //! acquires no hard-retention semantics until valid descriptor content arrives.
 //! This module intentionally defines no resolver, signer, or store trait.
 
@@ -43,8 +44,9 @@ pub const STRONG_PIN_DESCRIPTOR_V1: [u8; 16] = hex!("D8C90DA77903FBBB84DCBE912AA
 ///
 /// The canonical bytes are `kind marker [16] | inner descriptor handle [32]`.
 /// The wrapper says only that locally present content reachable from the inner
-/// descriptor and asserted values is hard retention state. It deliberately
-/// does not confer any interpretation or authorization on the inner kind.
+/// descriptor and asserted values propagates as hard retention until an
+/// explicitly weak-pinned handle. It deliberately does not confer any
+/// interpretation or authorization on the inner kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StrongPinDescriptor;
 
@@ -56,7 +58,7 @@ impl MetaDescribe for StrongPinDescriptor {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "strong-pin-descriptor-v1",
-                metadata::description: "Canonical retention-only wrapper for an asserted pin descriptor: a V1 kind marker followed by the exact content handle of the inner descriptor. Recognized assertions retain the locally present closure of the inner descriptor and every distinct asserted value.",
+                metadata::description: "Canonical retention-only wrapper for an asserted pin descriptor: a V1 kind marker followed by the exact content handle of the inner descriptor. Recognized assertions propagate hard retention from the inner descriptor and every distinct asserted value until an asserted weak-pin boundary.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }

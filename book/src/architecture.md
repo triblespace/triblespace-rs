@@ -165,10 +165,12 @@ the configured author. `Lazy` and `Peer` own that author's signing key and
 append a durable assertion when a wrapped read misses; raw `Pile` and `Yard`
 reads remain observational. The reconciler services only its own author's
 wants within the storage artifact's canonical global cache prefix, while
-`Yard` retains the present values from that same all-author prefix as bounded
+`Yard` uses the full all-author set as weak boundaries in hard-reachability
+walks, then retains the present values from the canonical prefix as bounded
 soft cache roots. Selecting before presence gives background fetch and
 collection a stable fixed point. Satisfaction and eviction never retract an
-assertion, and wants never weaken branch hard roots.
+assertion: absent means durable demand, while present means evictable rather
+than silently inheriting hard retention from a branch root.
 
 Mutable [`PinStore`](https://docs.rs/triblespace/latest/triblespace/repo/trait.PinStore.html)
 entries still exist while retention and policy consumers migrate. They are

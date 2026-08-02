@@ -37,8 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `weak_budget`) before presence filtering. `WantCachePolicySource` exposes
   only that artifact-local capacity to service layers; selection remains one
   fixed raw-handle-ordered global prefix before author or presence filtering,
-  giving bounded collection and reconciliation a stable fixed point. Soft wants
-  never veto hard reachability.
+  giving bounded collection and reconciliation a stable fixed point. The full
+  authentic set supplies hard-reachability cut points: absent values remain
+  durable demand, while present values are retained only through the bounded
+  soft prefix instead of silently inheriting hard retention.
 - Generic `PinAssertionStore` provides one grow-only signed envelope for every
   pin kind. Its full-width `(author, descriptor)` identity, value, and opaque
   label are kind-neutral; `BranchPinDescriptor` and `BranchRank` supply the

@@ -44,12 +44,13 @@ publication and frontier resolution therefore continue to work through a
 on one peer is not encoded, announced, fetched, verified, or admitted on
 another peer by the current network protocol.
 
-Wants are another typed view over the same assertion set. Every author uses the
-fixed `WantPinDescriptor`, while the author key keeps principals distinct. The
-asserted value is the exact wanted blob handle and the label is fixed canonical
-padding, not an ordering relation. Consequently, each author's wants form a
-grow-only set: duplicate assertions collapse, satisfaction merely makes a want
-inert, and there is no unpin or tombstone.
+Weak pins are another typed view over the same assertion set. Every author uses
+the fixed `WantPinDescriptor`, while the author key keeps principals distinct.
+The asserted value is the exact blob handle and the label is fixed canonical
+padding, not an ordering relation. Consequently, each author's weak pins form a
+grow-only set: duplicate assertions collapse and there is no unpin or
+tombstone. The assertion is durable fetch demand while the blob is absent; once
+present it remains a soft, evictable boundary at which hard reachability stops.
 
 ## What Works Today
 
@@ -68,9 +69,10 @@ The current stack moves content in three complementary steps:
   provider lookup and transfer for that same author's share of the store's
   canonical global want-cache prefix. Capacity is applied across authentic
   values from every author before the local-author intersection, matching
-  `Yard` retention exactly; over-budget demand remains durable without entering
-  a fetch/evict loop. An unavailable selected blob remains pending rather than
-  losing the demand. `--no-lazy` disables this reconciler.
+  `Yard`'s soft-retention prefix exactly. The complete authentic set still
+  supplies Yard's hard-reachability cuts. Over-budget demand remains durable
+  without entering a fetch/evict loop. An unavailable selected blob remains
+  pending rather than losing the demand. `--no-lazy` disables this reconciler.
 
 Pile-sync v5 (`/triblespace/pile-sync/5`) has no branch enumeration, HEAD,
 child-list, or remote-write operation. It serves only `OP_AUTH` and

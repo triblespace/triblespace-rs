@@ -311,13 +311,15 @@ equal values, verifies a surviving witness, and reports absent, tip-pending,
 partial, or complete state. Unknown descriptor kinds remain preserved without
 being interpreted as branches.
 
-For fetch wants, every author uses the same fixed `WantPinDescriptor` handle;
+For weak pins, every author uses the same fixed `WantPinDescriptor` handle;
 the author key in the generic identity keeps their sets distinct. The value is
-the exact wanted blob handle and the label is fixed canonical padding rather
-than an ordering relation. Each author's typed view is therefore a grow-only
-set with no replacement, unpin, or tombstone. `Lazy` and `Peer` append these
-assertions with their configured signing key. Raw `Pile` reads are
-observational and never mint demand merely because a blob is absent.
+the exact blob handle and the label is fixed canonical padding rather than an
+ordering relation. Each author's typed view is therefore a grow-only set with
+no replacement, unpin, or tombstone. While absent, the value is durable fetch
+demand; while present, it is an evictable hard-reachability boundary. `Lazy`
+and `Peer` append these assertions with their configured signing key. Raw
+`Pile` reads are observational and never mint demand merely because a blob is
+absent.
 
 ## Retired Weak-Pin Records
 

@@ -1,10 +1,16 @@
-//! Grow-only fetch wants as one typed view over asserted pins.
+//! Grow-only weak pins as one typed view over asserted pins.
 //!
-//! A want is not a mutable weak-pin bit. Each author owns one fixed pin
-//! identity and asserts exact blob handles as its values. The view is therefore
-//! a G-set: duplicate assertions collapse, satisfaction makes an entry inert,
-//! and there is no semantic unpin or tombstone. Forgetting is an explicit
-//! physical rewrite; concatenating an older pile may harmlessly restore a want.
+//! A weak pin is a positive assertion, not a mutable bit. Each author owns one
+//! fixed pin identity and asserts exact blob handles as its values. The view is
+//! therefore a G-set: duplicate assertions collapse and there is no semantic
+//! unpin or tombstone. Forgetting is an explicit physical rewrite;
+//! concatenating an older pile may harmlessly restore an assertion.
+//!
+//! The same fact has two complementary readings. While its blob is absent, a
+//! weak pin is durable fetch demand. While the blob is present, it marks an
+//! evictable cache boundary: hard reachability stops before that handle, and a
+//! storage artifact may retain the exact handle under its soft-cache budget.
+//! Arrival and eviction never change the assertion.
 //!
 //! This kind has no ancestry or dominance relation. Its label bytes are fixed
 //! solely to make repeated signing canonical; the resolver never compares
@@ -42,12 +48,13 @@ pub const WANT_PIN_DESCRIPTOR_LEN: usize = 16;
 pub const WANT_PIN_DESCRIPTOR_V1: [u8; WANT_PIN_DESCRIPTOR_LEN] =
     hex!("38AB8FB8FE80F3054AB165A64E322FF1");
 
-/// Blob encoding for the fixed descriptor naming an author's want G-set.
+/// Blob encoding for the fixed descriptor naming an author's weak-pin G-set.
 ///
 /// Every author uses the same descriptor content; the author key in
 /// [`PinIdentity`] keeps their sets distinct. The wanted blob handle belongs in
 /// the assertion value—not in this descriptor—so one pin can accumulate many
-/// values.
+/// values. A present value is a soft-retention boundary; an absent value is
+/// fetch demand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WantPinDescriptor;
 
@@ -61,7 +68,7 @@ impl MetaDescribe for WantPinDescriptor {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "want-pin-descriptor-v1",
-                metadata::description: "Fixed descriptor for one author's grow-only set of asserted blob-fetch wants. Wanted handles are assertion values; this descriptor identifies the collection kind.",
+                metadata::description: "Fixed descriptor for one author's grow-only set of asserted weak pins. Each exact handle is durable fetch demand while absent and an evictable hard-reachability boundary while present.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -143,7 +150,7 @@ fn handle_from_value(value: ValueHandle) -> Inline<Handle<UnknownBlob>> {
     Inline::new(value.raw())
 }
 
-/// Sign one durable grow-only want assertion.
+/// Sign one durable grow-only weak-pin assertion.
 pub fn sign_want<S>(key: &SigningKey, handle: Inline<Handle<S>>) -> PinAssertion
 where
     S: BlobEncoding + 'static,
@@ -174,13 +181,14 @@ pub fn wants_in_snapshot(
         .collect()
 }
 
-/// Project the union of every author's wanted handles from a coherent generic
-/// snapshot.
+/// Project the union of every author's weak-pinned handles from a coherent
+/// generic snapshot.
 ///
-/// This is the storage-policy view used by garbage collection: any authentic
-/// want retains the named blob regardless of which author asserted it. Normal
-/// consumers should use [`wants_in_snapshot`] or [`WantStore::wants`] instead,
-/// so one principal never mistakes another principal's demand for its own.
+/// Garbage collection uses the whole set as hard-reachability cut points,
+/// regardless of which author asserted them. A separately selected prefix may
+/// retain exact present handles as soft cache roots. Normal consumers should
+/// use [`wants_in_snapshot`] or [`WantStore::wants`] instead, so one principal
+/// never mistakes another principal's demand for its own.
 pub fn all_wants_in_snapshot(
     snapshot: &PinAssertionSnapshot,
 ) -> BTreeSet<Inline<Handle<UnknownBlob>>> {

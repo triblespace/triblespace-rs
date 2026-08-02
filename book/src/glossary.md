@@ -47,6 +47,14 @@ The asserted value is a commit and the label is a `BranchRank`, built
 inductively so every descendant is strictly greater than its parents. Rank can
 skip an impossible ancestry comparison but can never prove domination.
 
+### Weak Pin
+A positive, grow-only asserted pin under the fixed `WantPinDescriptor`. Its
+exact value is a blob handle. While the blob is absent, the assertion is durable
+fetch demand. While present, it marks an evictable boundary: hard reachability
+stops before the handle, and the storage artifact may retain that exact blob as
+a bounded soft cache root. There is no weak-unpin or tombstone; satisfaction and
+eviction do not mutate the assertion.
+
 ### Capability
 A signed authorisation to act with a specific scope on a triblespace network.
 Each capability is two `SimpleArchive` blobs: a `cap` blob carrying
