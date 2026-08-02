@@ -826,6 +826,7 @@ where
             }
         };
         let now = crate::clock::mono_now();
+        let epoch_now = crate::clock::epoch_now();
         let local_subject = self.signing_key.verifying_key();
         let entries: Vec<_> = view
             .grants()
@@ -838,7 +839,8 @@ where
             .filter(|(grant, _)| grant.subject() != local_subject)
             .filter_map(|(grant, state)| {
                 let current = state.active_current()?;
-                (!current.authenticated()).then_some((*grant, current.cap(), current.sig()))
+                (!current.authenticated() && !current.capability().is_expired_at(epoch_now))
+                    .then_some((*grant, current.cap(), current.sig()))
             })
             .filter(|(grant, _cap, sig)| {
                 self.last_dispatch_attempt.get(grant).is_none_or(
@@ -3261,7 +3263,13 @@ mod tests {
                 triblespace_core::metadata::tag: permission,
             }
             .into();
-            let expiry = (crate::clock::epoch_now(), upper)
+            let now = crate::clock::epoch_now();
+            let lower = if upper < now {
+                upper - hifitime::Duration::from_seconds(1.0)
+            } else {
+                now
+            };
+            let expiry = (lower, upper)
                 .try_to_inline()
                 .expect("asserted grant expiry");
             let (cap, sig) = triblespace_core::repo::capability::build_capability(
@@ -3368,13 +3376,15 @@ mod tests {
     }
 
     #[test]
-    fn redispatch_suppresses_authenticated_disabled_conflicted_local_and_foreign_team_grants() {
+    fn redispatch_suppresses_authenticated_disabled_conflicted_expired_local_and_foreign_team_grants()
+     {
         let team_root = SigningKey::from_bytes(&[0x95; 32]);
         let foreign_root = SigningKey::from_bytes(&[0xA4; 32]);
         let author = SigningKey::from_bytes(&[0x96; 32]);
         let authenticated_subject = SigningKey::from_bytes(&[0x97; 32]).verifying_key();
         let disabled_subject = SigningKey::from_bytes(&[0x98; 32]).verifying_key();
         let conflicted_subject = SigningKey::from_bytes(&[0x99; 32]).verifying_key();
+        let expired_subject = SigningKey::from_bytes(&[0xAA; 32]).verifying_key();
         let mut store = MemoryRepo::default();
 
         let (authenticated_grant, _cap, authenticated_sig) =
@@ -3405,6 +3415,13 @@ mod tests {
             &author,
             triblespace_core::repo::capability::PERM_WRITE,
             now + hifitime::Duration::from_hours(2.0),
+        );
+        let expired = AssertedGrantSeries::new(&team_root, &author, expired_subject);
+        expired.issue(
+            &mut store,
+            &author,
+            triblespace_core::repo::capability::PERM_READ,
+            now - hifitime::Duration::from_seconds(1.0),
         );
 
         let (local_grant, _cap, _sig) =
@@ -3444,6 +3461,18 @@ mod tests {
                 .historical_issuance(),
             crate::policy_ledger::GrantIssuanceResolution::Conflicted { .. }
         ));
+        let expired_current = view
+            .grants()
+            .get(&expired.grant)
+            .unwrap()
+            .active_current()
+            .expect("expiry does not erase historical current selection");
+        assert!(
+            expired_current
+                .capability()
+                .is_expired_at(crate::clock::epoch_now()),
+            "the fixture must isolate dispatch-time liveness from reduction"
+        );
         assert!(
             view.grants()
                 .get(&local_grant)

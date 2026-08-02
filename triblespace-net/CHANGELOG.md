@@ -80,7 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ledger and uniquely matching the current subject/signature issuance;
   incomplete or invalid policy fails closed. Redispatch now resolves that same
   ledger afresh and sends only unauthenticated active current grants for this
-  daemon's configured team. Disabled, conflicted, local-subject, and
+  daemon's configured team. Disabled, conflicted, expired, local-subject, and
   foreign-team grants cannot drive dispatch; successor signatures reset one
   bounded per-grant cooldown. All selected blobs are materialized before the
   first send, while any read, flush, or serving-snapshot failure defers the
