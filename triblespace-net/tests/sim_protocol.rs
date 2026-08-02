@@ -6,6 +6,7 @@ mod common;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::clock;
 use triblespace_core::id::{ExclusiveId, ufoid};
@@ -16,9 +17,13 @@ use triblespace_core::macros::entity;
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::repo::capability;
+use triblespace_core::repo::pin_assertion::PinAssertionStore;
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::Peer;
+use triblespace_net::policy_ledger::{
+    self, GrantIdentity, GrantIssuanceResolution, PolicyLedgerResolution,
+};
 use triblespace_net::protocol::{OP_GET_BLOB, PILE_SYNC_ALPN, op_auth, send_hash, send_u8};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 use triblespace_net::transport::{Conn, Transport};
@@ -574,6 +579,7 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
         .expect("build expiring delegation");
         let old_cap_handle: Inline<Handle<SimpleArchive>> = old_cap.get_handle();
         let old_sig_handle: Inline<Handle<SimpleArchive>> = old_sig.get_handle();
+        let grant = GrantIdentity::new(team_root, recipient_key.verifying_key(), scope_root);
 
         // The request records a deliberately wider expiry ceiling than the
         // successor renewal_tick will mint. It is local selection intent, not
@@ -591,8 +597,7 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
         // Only the *old* delegation exists before the tick. The fresh pair is
         // created and persisted inside renewal_tick, so the serving snapshot
         // must be rebuilt before the resulting OP_DELIVER_CAP is dispatched.
-        let mut issuer_store =
-            store_with_caps(&[issuer_cap.clone(), (old_cap.clone(), old_sig.clone())]);
+        let mut issuer_store = store_with_caps(&[issuer_cap.clone()]);
         triblespace_net::policy::pin_team_cap(
             &mut issuer_store,
             team_root,
@@ -600,17 +605,22 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
             issuer_cap.1.get_handle(),
         )
         .expect("pin issuer team capability");
-        let policy_entry = triblespace_net::policy::record_policy_entry(
+        policy_ledger::issue_grant(
             &mut issuer_store,
-            recipient_key.verifying_key(),
-            scope_root,
-            old_expiry,
-            old_cap_handle,
+            &issuer_key,
+            grant,
+            old_sig.clone(),
+            None,
+            [old_cap.clone()],
+        )
+        .expect("assert expiring grant issuance");
+        policy_ledger::authenticate_credential(
+            &mut issuer_store,
+            &issuer_key,
+            grant,
             old_sig_handle,
         )
-        .expect("record expiring renewal entry");
-        triblespace_net::policy::mark_policy_delivered(&mut issuer_store, policy_entry)
-            .expect("suppress redispatch of the old delegation");
+        .expect("suppress redispatch of the authenticated predecessor");
 
         // The recipient is cold with respect to the issuer: it has neither
         // the issuer's root delegation nor either version of the recipient
@@ -652,10 +662,35 @@ fn renewal_tick_delivers_freshly_persisted_cap_to_cold_recipient() {
         );
         let (fresh_cap_handle, fresh_sig_handle) = {
             let mut store = issuer.store();
-            let mut entries = triblespace_net::policy::list_renewal_policy(&mut *store);
-            assert_eq!(entries.len(), 1);
-            let entry = entries.pop().unwrap();
-            (entry.latest_cap, entry.latest_sig)
+            let snapshot = store
+                .pin_assertion_snapshot()
+                .expect("snapshot renewed policy ledger");
+            let reader = store.reader().expect("read renewed policy ledger");
+            let resolution = policy_ledger::resolve_policy_ledger(
+                &snapshot,
+                issuer_key.verifying_key(),
+                |handle| {
+                    reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                },
+            );
+            let PolicyLedgerResolution::Complete(view) = resolution else {
+                panic!("renewed policy ledger must resolve completely");
+            };
+            let GrantIssuanceResolution::Current(current) = view
+                .grants()
+                .get(&grant)
+                .expect("renewed grant remains asserted")
+                .historical_issuance()
+            else {
+                panic!("renewed grant must select one current issuance");
+            };
+            assert!(
+                !current.authenticated(),
+                "the freshly minted successor must await exact authentication"
+            );
+            (current.cap(), current.sig())
         };
         assert_ne!(fresh_cap_handle, old_cap_handle);
         assert_ne!(fresh_sig_handle, old_sig_handle);
