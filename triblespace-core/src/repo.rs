@@ -75,6 +75,8 @@ pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
 pub mod pin_assertion;
+/// Grow-only branch-and-recipe rollup records over asserted pins.
+pub mod rollup_pin;
 /// Retention-only wrapper for asserted pin descriptors.
 pub mod strong_pin;
 /// Grow-only fetch wants as a typed asserted-pin G-set.

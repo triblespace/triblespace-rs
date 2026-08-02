@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added a typed, grow-only `RollupPinDescriptor` keyed by source branch and
+  index recipe. Its strongly wrapped assertion values are exact standalone
+  range-record archive handles; the descriptor keeps source identity and
+  recipe separation canonical without adding publication or cover-selection
+  state.
 - Hard retention is now an explicit `StrongPinDescriptor` decorator rather
   than a branch-special case in Yard. The canonical V1 wrapper contains an
   exact inner descriptor handle; authentic assertions sharing its outer pin
