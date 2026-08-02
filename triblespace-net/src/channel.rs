@@ -37,13 +37,11 @@ pub enum NetCommand {
     /// pending request). The network thread opens a connection to
     /// the subject's pubkey, sends `OP_DELIVER_CAP`, and closes.
     ///
-    /// Delivery is best-effort fire-and-forget at this layer.
-    /// Confirmation happens later, when the subject actually
-    /// authenticates against our pile-sync ALPN presenting the
-    /// delivered cap — see `NetEvent::CapDeliveryConfirmed`. The
-    /// renewal daemon redispatches entries that haven't been
-    /// confirmed yet (per-entry cooldown to avoid hammering an
-    /// unreachable peer).
+    /// Delivery is best-effort fire-and-forget at this layer. Positive
+    /// evidence arrives later, when the subject authenticates against our
+    /// pile-sync ALPN with the delivered signature — see
+    /// `NetEvent::CapDeliveryConfirmed`. The synchronous Peer records that
+    /// evidence as an asserted policy event for the exact issued credential.
     DeliverCap {
         subject: PublisherKey,
         cap_bytes: Bytes,
@@ -104,21 +102,22 @@ pub enum NetEvent {
     /// This is the unambiguous "the subject has the cap and uses
     /// it" signal — the wire-level STATUS_OK on `OP_DELIVER_CAP`
     /// only tells us the bytes landed; auth tells us the subject
-    /// can both load AND verify the chain. The Peer side uses this
-    /// to mark the matching renewal-policy entry as delivered so
-    /// the daemon's next tick skips it from the redispatch set.
+    /// can both load AND verify the chain. The Peer resolves its fresh
+    /// asserted-policy ledger and records `CredentialAuthenticated` only
+    /// when exactly one current issuance matches this subject and signature.
+    /// An incomplete or invalid ledger is fail-stop; no match or an ambiguous
+    /// match is a safe no-op. Disabled grants retain their current historical
+    /// issuance and may therefore still receive this positive fact.
     ///
-    /// Field is the *signature* handle, not the cap blob handle —
-    /// OP_AUTH wires the sig blob since that's the credential the
-    /// dialer needs to prove possession of. Match against
-    /// `PolicyEntry::latest_sig` (not `latest_cap`) when looking up
-    /// the corresponding renewal-policy entry.
+    /// Field is the *signature* handle, not the cap blob handle: OP_AUTH
+    /// wires the signature blob because that is the credential the dialer
+    /// presents. The asserted issuance retains both handles.
     CapDeliveryConfirmed {
         subject: PublisherKey,
         sig_handle: RawHash,
         /// Best-effort notification queue admission. Dropping a confirmation
-        /// is safe: the issuer simply keeps the renewal entry eligible for a
-        /// later redispatch/auth confirmation.
+        /// does not manufacture a negative fact; a later successful auth may
+        /// report the same positive evidence again.
         admission: tokio::sync::OwnedSemaphorePermit,
     },
 }

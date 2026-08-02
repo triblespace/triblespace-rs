@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-fatal, and storage failures fail-stop the peer without manufacturing a
   rejection. Their wire result is explicitly indeterminate because a failed
   append may already have taken effect; exact replay resolves the outcome.
+  Successful subject authentication is likewise recorded as an exact
+  `CredentialAuthenticated` effect after a fresh complete-ledger resolution;
+  missing or invalid policy fails closed, while an unrelated signature is a
+  no-op rather than invented evidence.
   Operation-order tests pin that one-way crash protocol; real-Pile reopen
   coverage verifies the resulting ledger and both retention descriptors replay
   as complete content.

@@ -178,8 +178,7 @@ where
     /// Per-entry cooldown for undelivered-cap re-dispatch. The
     /// renewal daemon's tick runs every 100 ms; without this gate it
     /// would hammer iroh-connect attempts for any peer that's down.
-    /// Recorded against `entry.id`. Cleared (entry-level) when the
-    /// delivery confirms; the whole map is in-memory and rebuilds
+    /// Recorded against `entry.id`; the whole map is in-memory and rebuilds
     /// naturally if the daemon restarts.
     last_dispatch_attempt: HashMap<Id, crate::clock::Mono>,
 }
@@ -411,33 +410,94 @@ where
                     sig_handle,
                     admission: _admission,
                 } => {
-                    // The subject's daemon authenticated against us with
-                    // a cap we dispatched. `sig_handle` is the signature
-                    // blob handle (what OP_AUTH wires) — match by
-                    // subject + latest_sig and mark the entry delivered
-                    // so the daemon's next tick skips it from the
-                    // re-dispatch set.
-                    use triblespace_core::inline::Inline;
-                    use triblespace_core::inline::encodings::hash::Handle;
                     let subject_key = match ed25519_dalek::VerifyingKey::from_bytes(&subject) {
                         Ok(k) => k,
                         Err(_) => continue,
                     };
                     let sig_inline: Inline<Handle<SimpleArchive>> = Inline::new(sig_handle);
                     let mut store = self.store.lock().expect("store mutex");
-                    if let Some(entry_id) = crate::policy::find_policy_entry_by_subject_and_sig(
+                    let snapshot = store.pin_assertion_snapshot().map_err(|error| {
+                        PeerRefreshError::new("snapshot delivery-confirmation policy", error)
+                    })?;
+                    let reader = store.reader().map_err(|error| {
+                        PeerRefreshError::new("read delivery-confirmation policy", error)
+                    })?;
+                    let resolution = crate::policy_ledger::resolve_policy_ledger(
+                        &snapshot,
+                        self.signing_key.verifying_key(),
+                        |handle| {
+                            reader
+                                .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                                .ok()
+                        },
+                    );
+                    drop(reader);
+
+                    let view = match resolution {
+                        crate::policy_ledger::PolicyLedgerResolution::Complete(view) => view,
+                        crate::policy_ledger::PolicyLedgerResolution::Incomplete { missing } => {
+                            return Err(PeerRefreshError::new(
+                                "resolve delivery-confirmation policy",
+                                format!(
+                                    "policy ledger is incomplete; missing {} blob(s): {missing:?}",
+                                    missing.len()
+                                ),
+                            ));
+                        }
+                        crate::policy_ledger::PolicyLedgerResolution::Invalid { diagnostics } => {
+                            return Err(PeerRefreshError::new(
+                                "resolve delivery-confirmation policy",
+                                format!("policy ledger is invalid: {diagnostics:?}"),
+                            ));
+                        }
+                    };
+
+                    // Authentication is evidence about the exact historical
+                    // issuance, even after a grant has been disabled. Do not
+                    // use `active_current`: disabled grants intentionally keep
+                    // their selected issuance available for this match.
+                    let grant = {
+                        let mut matches =
+                            view.grants().iter().filter_map(|(grant, state)| {
+                                if grant.subject() != subject_key {
+                                    return None;
+                                }
+                                match state.issuance() {
+                                    crate::policy_ledger::GrantIssuanceResolution::Current(
+                                        current,
+                                    ) if current.sig() == sig_inline => Some(*grant),
+                                    crate::policy_ledger::GrantIssuanceResolution::Unissued
+                                    | crate::policy_ledger::GrantIssuanceResolution::Current(_)
+                                    | crate::policy_ledger::GrantIssuanceResolution::Conflicted {
+                                        ..
+                                    } => None,
+                                }
+                            });
+                        match (matches.next(), matches.next()) {
+                            (Some(grant), None) => Some(grant),
+                            (None, _) | (Some(_), Some(_)) => None,
+                        }
+                    };
+                    let Some(grant) = grant else {
+                        continue;
+                    };
+
+                    let receipt = crate::policy_ledger::authenticate_credential(
                         &mut *store,
-                        subject_key,
+                        &self.signing_key,
+                        grant,
                         sig_inline,
-                    ) {
-                        let _ = crate::policy::mark_policy_delivered(&mut *store, entry_id);
-                        tracing::debug!(
-                            subject = %hex::encode(&subject[..4]),
-                            sig = %hex::encode(&sig_handle[..4]),
-                            entry = ?entry_id,
-                            "delivery confirmed; policy entry marked delivered"
-                        );
-                    }
+                    )
+                    .map_err(|error| {
+                        PeerRefreshError::new("record credential authentication", error)
+                    })?;
+                    tracing::debug!(
+                        subject = %hex::encode(&subject[..4]),
+                        sig = %hex::encode(&sig_handle[..4]),
+                        event = %hex::encode(receipt.event().raw),
+                        grant = ?grant,
+                        "confirmed credential authentication asserted"
+                    );
                 }
             }
         }
@@ -2954,6 +3014,334 @@ mod tests {
         let credential =
             capability_until(founder, subject, Some(anchor.clone()), permission, upper);
         (anchor, credential)
+    }
+
+    fn issue_asserted_grant<S>(
+        store: &mut S,
+        team_root: &SigningKey,
+        author: &SigningKey,
+        subject: ed25519_dalek::VerifyingKey,
+    ) -> (
+        crate::policy_ledger::GrantIdentity,
+        Inline<Handle<SimpleArchive>>,
+    )
+    where
+        S: BlobStore + StorageFlush + PinAssertionStore,
+    {
+        let upper = crate::clock::epoch_now() + hifitime::Duration::from_hours(1.0);
+        let (anchor, credential) = founder_credential_until(
+            team_root,
+            author,
+            subject,
+            triblespace_core::repo::capability::PERM_READ,
+            upper,
+        );
+        let fields = delivery_cap_fields(credential.0.clone()).expect("credential fields");
+        let sig = credential.1.get_handle();
+        let grant = crate::policy_ledger::GrantIdentity::new(
+            team_root.verifying_key(),
+            subject,
+            fields.scope_root,
+        );
+        crate::policy_ledger::issue_grant(
+            store,
+            author,
+            grant,
+            credential.1,
+            None,
+            [credential.0, anchor.0, anchor.1],
+        )
+        .expect("issue asserted grant");
+        (grant, sig)
+    }
+
+    #[test]
+    fn cap_delivery_confirmation_asserts_authentication_for_disabled_current_issuance() {
+        let team_root = SigningKey::from_bytes(&[0x81; 32]);
+        let author = SigningKey::from_bytes(&[0x82; 32]);
+        let subject = SigningKey::from_bytes(&[0x83; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let (grant, sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
+        crate::policy_ledger::disable_grant(&mut store, &author, grant)
+            .expect("disable asserted grant");
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            store,
+            author.clone(),
+            team_root.verifying_key(),
+            sender,
+            receiver,
+        );
+        wiring
+            .evt_tx
+            .send(NetEvent::CapDeliveryConfirmed {
+                subject: subject.to_bytes(),
+                sig_handle: sig.raw,
+                admission: cap_delivery_admission(),
+            })
+            .expect("event channel open");
+
+        peer.refresh()
+            .expect("record confirmed credential authentication");
+
+        let mut store = peer.store.lock().expect("store mutex");
+        let snapshot = store.pin_assertion_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 3, "issue, disable, and auth are asserted");
+        let reader = store.reader().unwrap();
+        let crate::policy_ledger::PolicyLedgerResolution::Complete(view) =
+            crate::policy_ledger::resolve_policy_ledger(
+                &snapshot,
+                author.verifying_key(),
+                |handle| {
+                    reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                },
+            )
+        else {
+            panic!("confirmed policy ledger must remain complete");
+        };
+        let grant_view = view.grants().get(&grant).expect("issued grant");
+        assert!(grant_view.disabled());
+        let crate::policy_ledger::GrantIssuanceResolution::Current(current) = grant_view.issuance()
+        else {
+            panic!("disabled grant retains its current historical issuance");
+        };
+        assert_eq!(current.sig(), sig);
+        assert!(current.authenticated());
+        assert!(view.event_handles().contains(
+            &crate::policy_ledger::PolicyEvent::CredentialAuthenticated { grant, sig }.handle()
+        ));
+    }
+
+    #[test]
+    fn unknown_cap_delivery_confirmation_is_a_noop() {
+        let team_root = SigningKey::from_bytes(&[0x84; 32]);
+        let author = SigningKey::from_bytes(&[0x85; 32]);
+        let subject = SigningKey::from_bytes(&[0x86; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let (grant, issued_sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
+        let unknown_sig = Inline::<Handle<SimpleArchive>>::new([0x87; 32]);
+        assert_ne!(unknown_sig, issued_sig);
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            store,
+            author.clone(),
+            team_root.verifying_key(),
+            sender,
+            receiver,
+        );
+        wiring
+            .evt_tx
+            .send(NetEvent::CapDeliveryConfirmed {
+                subject: subject.to_bytes(),
+                sig_handle: unknown_sig.raw,
+                admission: cap_delivery_admission(),
+            })
+            .expect("event channel open");
+
+        peer.refresh().expect("an unknown confirmation is harmless");
+
+        let mut store = peer.store.lock().expect("store mutex");
+        let snapshot = store.pin_assertion_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 1, "an unknown signature appends no event");
+        let reader = store.reader().unwrap();
+        let crate::policy_ledger::PolicyLedgerResolution::Complete(view) =
+            crate::policy_ledger::resolve_policy_ledger(
+                &snapshot,
+                author.verifying_key(),
+                |handle| {
+                    reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                },
+            )
+        else {
+            panic!("issued policy ledger must remain complete");
+        };
+        let crate::policy_ledger::GrantIssuanceResolution::Current(current) =
+            view.grants().get(&grant).unwrap().issuance()
+        else {
+            panic!("issued grant must remain current");
+        };
+        assert!(!current.authenticated());
+    }
+
+    #[test]
+    fn incomplete_confirmation_policy_is_sticky_fail_stop() {
+        let team_root = SigningKey::from_bytes(&[0x88; 32]);
+        let author = SigningKey::from_bytes(&[0x89; 32]);
+        let subject = SigningKey::from_bytes(&[0x8A; 32]).verifying_key();
+        let grant =
+            crate::policy_ledger::GrantIdentity::new(team_root.verifying_key(), subject, *genid());
+        let missing_sig = Inline::<Handle<SimpleArchive>>::new([0x8B; 32]);
+        let event = crate::policy_ledger::PolicyEvent::GrantIssued {
+            grant,
+            sig: missing_sig,
+            request: None,
+        };
+        let mut store = MemoryRepo::default();
+        store
+            .append_pin_assertion(crate::policy_ledger::sign_policy_event(&author, event))
+            .expect("append assertion without its named event blob");
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer =
+            Peer::with_wiring(store, author, team_root.verifying_key(), sender, receiver);
+        wiring
+            .evt_tx
+            .send(NetEvent::CapDeliveryConfirmed {
+                subject: subject.to_bytes(),
+                sig_handle: missing_sig.raw,
+                admission: cap_delivery_admission(),
+            })
+            .expect("event channel open");
+
+        let error = peer
+            .refresh()
+            .expect_err("an incomplete policy ledger must fail closed");
+        assert_eq!(error.operation(), "resolve delivery-confirmation policy");
+        assert!(error.detail().contains("policy ledger is incomplete"));
+        assert_eq!(
+            peer.refresh().expect_err("resolution failure stays sticky"),
+            error
+        );
+    }
+
+    #[test]
+    fn invalid_confirmation_policy_is_sticky_fail_stop() {
+        let team_root = SigningKey::from_bytes(&[0x8C; 32]);
+        let author = SigningKey::from_bytes(&[0x8D; 32]);
+        let subject = SigningKey::from_bytes(&[0x8E; 32]).verifying_key();
+        let grant =
+            crate::policy_ledger::GrantIdentity::new(team_root.verifying_key(), subject, *genid());
+        let malformed_sig_blob = crate::policy_ledger::PolicyEvent::GrantDisabled(grant).to_blob();
+        let malformed_sig = malformed_sig_blob.get_handle();
+        let event = crate::policy_ledger::PolicyEvent::GrantIssued {
+            grant,
+            sig: malformed_sig,
+            request: None,
+        };
+        let mut store = MemoryRepo::default();
+        assert_eq!(
+            store
+                .put::<SimpleArchive, _>(malformed_sig_blob)
+                .expect("store malformed proof"),
+            malformed_sig
+        );
+        let event_blob = event.to_blob();
+        assert_eq!(
+            store
+                .put::<SimpleArchive, _>(event_blob)
+                .expect("store policy event"),
+            event.handle()
+        );
+        store
+            .append_pin_assertion(crate::policy_ledger::sign_policy_event(&author, event))
+            .expect("append invalid issuance assertion");
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer =
+            Peer::with_wiring(store, author, team_root.verifying_key(), sender, receiver);
+        wiring
+            .evt_tx
+            .send(NetEvent::CapDeliveryConfirmed {
+                subject: subject.to_bytes(),
+                sig_handle: malformed_sig.raw,
+                admission: cap_delivery_admission(),
+            })
+            .expect("event channel open");
+
+        let error = peer
+            .refresh()
+            .expect_err("an invalid policy ledger must fail closed");
+        assert_eq!(error.operation(), "resolve delivery-confirmation policy");
+        assert!(error.detail().contains("policy ledger is invalid"));
+        assert_eq!(
+            peer.refresh().expect_err("resolution failure stays sticky"),
+            error
+        );
+    }
+
+    #[test]
+    fn confirmation_authentication_append_failure_is_sticky_fail_stop() {
+        let team_root = SigningKey::from_bytes(&[0x8F; 32]);
+        let author = SigningKey::from_bytes(&[0x90; 32]);
+        let subject = SigningKey::from_bytes(&[0x91; 32]).verifying_key();
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut store = FlushProbe {
+            inner: MemoryRepo::default(),
+            flushes: Arc::clone(&flushes),
+            fail_flush: false,
+            fail_append: false,
+            fail_after_append_once: false,
+        };
+        let (grant, sig) = issue_asserted_grant(&mut store, &team_root, &author, subject);
+        store.fail_append = true;
+
+        let endpoint =
+            EndpointId::from_bytes(&author.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, wiring) = host::wire(endpoint);
+        let mut peer = Peer::with_wiring(
+            store,
+            author.clone(),
+            team_root.verifying_key(),
+            sender,
+            receiver,
+        );
+        wiring
+            .evt_tx
+            .send(NetEvent::CapDeliveryConfirmed {
+                subject: subject.to_bytes(),
+                sig_handle: sig.raw,
+                admission: cap_delivery_admission(),
+            })
+            .expect("event channel open");
+
+        let error = peer
+            .refresh()
+            .expect_err("authentication assertion failure must propagate");
+        assert_eq!(error.operation(), "record credential authentication");
+        assert!(error.detail().contains("failed to append policy assertion"));
+        assert_eq!(flushes.load(Ordering::SeqCst), 2, "issue and auth flush");
+        assert_eq!(
+            peer.refresh().expect_err("append failure stays sticky"),
+            error
+        );
+
+        let mut store = peer.store.lock().expect("store mutex");
+        let snapshot = store.pin_assertion_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 1, "failed append asserted no auth event");
+        let reader = store.reader().unwrap();
+        let crate::policy_ledger::PolicyLedgerResolution::Complete(view) =
+            crate::policy_ledger::resolve_policy_ledger(
+                &snapshot,
+                author.verifying_key(),
+                |handle| {
+                    reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(handle)
+                        .ok()
+                },
+            )
+        else {
+            panic!("pre-effect assertion failure leaves the ledger complete");
+        };
+        let crate::policy_ledger::GrantIssuanceResolution::Current(current) =
+            view.grants().get(&grant).unwrap().issuance()
+        else {
+            panic!("issued grant remains current");
+        };
+        assert!(!current.authenticated());
     }
 
     #[test]

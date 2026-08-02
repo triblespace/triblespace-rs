@@ -74,7 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recording and flush. Explicit policy or pre-admission failures are rejected;
   a persistence error after admission returns `STATUS_INDETERMINATE`, because a
   failed append may already have taken effect. Exact idempotent replay resolves
-  that outcome. Delivery ACKs retain their queue-admission meaning.
+  that outcome. Delivery ACKs retain their queue-admission meaning. A later
+  successful subject authentication records an exact
+  `CredentialAuthenticated` assertion only after resolving a complete issuer
+  ledger and uniquely matching the current subject/signature issuance;
+  incomplete or invalid policy fails closed.
 - **Serving resources fail closed.** Unauthenticated work, authenticated
   connections, and post-auth streams are globally bounded; each subject may
   hold at most one live inbound pile-sync connection, including while admitted

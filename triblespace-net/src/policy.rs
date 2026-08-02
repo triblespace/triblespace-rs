@@ -1513,27 +1513,6 @@ where
     }
 }
 
-/// Look up a renewal-policy entry by `(subject, latest_sig)`. Used by
-/// the Peer's `CapDeliveryConfirmed` handler to find which entry the
-/// subject just authenticated with. The match key is the *signature*
-/// handle because that's what OP_AUTH wires (and what the host's
-/// `CapDeliveryConfirmed` event carries); the cap-blob handle is
-/// reachable separately via the matched entry's `latest_cap` if a
-/// caller needs it.
-pub fn find_policy_entry_by_subject_and_sig<S>(
-    store: &mut S,
-    subject: ed25519_dalek::VerifyingKey,
-    latest_sig: Inline<Handle<SimpleArchive>>,
-) -> Option<Id>
-where
-    S: BlobStore + PinStore,
-{
-    list_renewal_policy(store)
-        .into_iter()
-        .find(|e| e.subject == subject && e.latest_sig == latest_sig)
-        .map(|e| e.id)
-}
-
 /// Mark a renewal-policy entry as retracted (sets `policy_retracted_at
 /// = now`). The daemon's `renewable_within` filter then skips it on
 /// subsequent ticks; the corresponding peer's chain dies naturally at
@@ -2267,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_delivery_confirmation_is_a_head_preserving_noop() {
+    fn repeated_mark_policy_delivered_is_a_head_preserving_noop() {
         let mut store = MemoryRepo::default();
         let subject = key_for(2);
         let scope = *genid();

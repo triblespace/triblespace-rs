@@ -649,12 +649,13 @@ async fn host_loop<T: Transport>(
                 } => {
                     // Open a fresh connection on the auth-handshake
                     // ALPN, send OP_DELIVER_CAP, close. On STATUS_OK
-                    // ack we emit `NetEvent::CapDeliveryConfirmed`
-                    // so the Peer can mark the matching
-                    // renewal-policy entry as delivered; on any
-                    // failure (connect/send/non-OK) the entry stays
-                    // in the undelivered set and the next renewal
-                    // tick attempts redispatch.
+                    // ack only says the bytes reached the recipient. Positive
+                    // evidence arrives later from OP_AUTH as
+                    // `NetEvent::CapDeliveryConfirmed`; the Peer binds that
+                    // exact presented signature to a current asserted grant.
+                    // On any delivery failure (connect/send/non-OK), no
+                    // confirmation event exists and issuer policy remains
+                    // unauthenticated.
                     let t_for_deliver = transport.clone();
                     tokio::spawn(async move {
                         let conn = match t_for_deliver
@@ -2080,11 +2081,10 @@ async fn serve_stream<T: Transport>(
                 // Cold proof members stay connection-local. Persisting every
                 // valid remote credential would let sequential self-
                 // delegation grow this node's durable store without bound.
-                // Tell the Peer thread that this remote authed with
-                // `cap_handle_raw`. If the Peer issued a cap to this
-                // subject and `cap_handle_raw` matches the policy
-                // entry's `latest_sig`, the Peer marks the entry as
-                // delivered (the subject has the cap and can use it).
+                // Tell the Peer thread that this remote authenticated with
+                // `cap_handle_raw`. If exactly one current asserted grant for
+                // this subject names that signature, the Peer records the
+                // positive `CredentialAuthenticated` fact.
                 if let Ok(admission) = confirmation_slots.clone().try_acquire_owned() {
                     let _ = events.send(NetEvent::CapDeliveryConfirmed {
                         subject: peer_pubkey.to_bytes(),
@@ -2094,7 +2094,7 @@ async fn serve_stream<T: Transport>(
                 } else {
                     debug!(
                         limit = CAP_CONFIRMATION_QUEUE_LIMIT,
-                        "delivery-confirmation queue full; leaving policy entry unconfirmed"
+                        "delivery-confirmation queue full; dropping positive evidence until a later authentication"
                     );
                 }
                 *auth_state.write().await = Some(verified);
