@@ -73,6 +73,8 @@ pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
 pub mod pin_assertion;
+/// Grow-only fetch wants as a typed asserted-pin G-set.
+pub mod want;
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 
