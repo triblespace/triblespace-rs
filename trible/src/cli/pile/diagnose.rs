@@ -427,6 +427,28 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                         );
                     }
                 }
+                PileRecordContent::PinAssertion { assertion } => {
+                    if assertion.identity().pin().raw() == needle {
+                        assertion_field_matches += 1;
+                        println!(
+                            "pin assertion descriptor-handle match at byte {}",
+                            record.offset
+                        );
+                    }
+                    if assertion.value().raw() == needle {
+                        assertion_field_matches += 1;
+                        println!("pin assertion value-handle match at byte {}", record.offset);
+                    }
+                }
+                PileRecordContent::InvalidPinAssertion { id } => {
+                    if id.raw() == needle {
+                        assertion_field_matches += 1;
+                        println!(
+                            "invalid pin assertion record-id match at byte {} (claim hidden)",
+                            record.offset
+                        );
+                    }
+                }
                 PileRecordContent::WeakPin { handle } | PileRecordContent::WeakUnpin { handle } => {
                     if handle.raw == needle {
                         weak_marker_matches += 1;
