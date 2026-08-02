@@ -1108,6 +1108,35 @@ impl Default for LevelValues {
 /// work as expanding them one at a time, and the AGM bound is a statement
 /// about output size, not traversal order.
 ///
+/// # Width is a multiplicative memory budget
+///
+/// The index and estimate rows above are **not** the dominant term. A level's
+/// [`ProposalBuffer`] is filled for the *whole* frontier in one un-budgeted
+/// call, and a **parent-independent** source — one whose candidates do not
+/// depend on the bound parent row, such as a set-membership constraint —
+/// re-pushes its entire domain *per row*, because the propose protocol gives it
+/// no way to say "same for every row":
+///
+/// ```text
+/// for row in 0..frontier.len() { proposals.extend(whole_domain) }
+/// ```
+///
+/// Peak proposal residency at one level is therefore
+/// `width × candidates-per-parent × 40 bytes` (32 for the candidate, 4 each for
+/// the liveness and parent columns):
+///
+/// | width | candidates/parent | peak at one level |
+/// |------:|------------------:|------------------:|
+/// | 1     | 10 000            | 0.4 MB            |
+/// | 4 096 | 10 000            | 1.6 GB            |
+/// | 16 384| 10 000            | **6.6 GB**        |
+///
+/// Nothing bounds `candidates-per-parent`, so **width is the only lever**, and
+/// the relationship is exactly linear: halving the width halves the peak.
+/// Lower it with [`Query::with_frontier_width`] for queries that join against
+/// large parent-independent sources. There is deliberately no automatic cap —
+/// the engine will not silently trade your result latency for memory.
+///
 /// Tune per query with [`Query::with_frontier_width`].
 pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 
