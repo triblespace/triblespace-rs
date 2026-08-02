@@ -6,20 +6,24 @@
 //! sync`) services the local peer author's set. This module is the mechanism,
 //! the CLI is just the wiring: each [`tick`](Reconciler::tick) diffs that
 //! author-scoped set against the blobs actually present, drives the [`Peer`]'s
-//! existing swarm fetch for each missing want, and keeps per-want retry state
-//! (exponential backoff) for the ones nobody served yet. Assertions from other
-//! authors remain preserved in the generic store but cannot amplify this
-//! peer's fetch work.
+//! existing swarm fetch for each selected missing want, and keeps per-want
+//! retry state (exponential backoff) for the ones nobody served yet. The
+//! selected set is the local author's share of the store's canonical global
+//! cache prefix, so collection and fetching converge even when permanent wants
+//! exceed finite capacity. Assertions from other authors remain preserved and
+//! may occupy cache-prefix slots, but cannot directly amplify this peer's fetch
+//! work.
 //!
 //! Semantics:
 //!
 //! - **Pins and branches are never touched.** The reconciler reads asserted
 //!   wants and lands blobs; retention remains the wrapped store's policy.
 //! - **"Absent" is always "not obtained yet", never definitely-absent**
-//!   — existence is semidecidable. A want that can't be satisfied stays
-//!   pending and is retried with backoff; it is NOT an error and NOT dropped.
-//!   The grow-only assertion stays on record.
-//! - A want whose blob is already present is satisfied and inert — the
+//!   — existence is semidecidable. A selected want that can't be satisfied
+//!   stays pending and is retried with backoff; it is NOT an error and NOT
+//!   dropped. Unselected wants remain durably asserted without becoming
+//!   pending network work.
+//! - A selected want whose blob is already present is satisfied and inert — the
 //!   presence diff filters it out.
 
 use std::collections::hash_map::Entry;
@@ -30,7 +34,7 @@ use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::pin_assertion::PinAssertionStore;
-use triblespace_core::repo::want::WantStore;
+use triblespace_core::repo::want::WantCachePolicySource;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, StorageFlush};
 
 use crate::peer::Peer;
@@ -43,17 +47,24 @@ use crate::protocol::RawHash;
 pub struct ReconcileStats {
     /// Handles asserted by this peer's author, whether present or absent.
     pub wants: usize,
-    /// Wants whose blob was absent locally at the start of the pass.
+    /// Authored wants inside the artifact's canonical global cache prefix.
+    ///
+    /// `selected <= wants`. The difference is durable demand outside this
+    /// store's finite materialisation capacity; it remains recorded but is not
+    /// fetched into a cache that would immediately evict it.
+    pub selected: usize,
+    /// Selected wants whose blob was absent locally at the start of the pass.
     pub missing: usize,
     /// Fetches actually issued this pass (`missing` minus the
     /// backoff-gated).
     pub attempted: usize,
-    /// Wants satisfied this pass: fetched from the swarm and landed in
-    /// the store.
+    /// Selected wants satisfied this pass: fetched from the swarm and landed
+    /// in the store.
     pub fetched: usize,
-    /// Wants still outstanding after the pass. **Normal, not an error**
-    /// — their assertions stay on record and they are retried with
-    /// backoff on later passes.
+    /// Selected wants still outstanding after the pass. **Normal, not an
+    /// error** — their assertions stay on record and they are retried with
+    /// backoff on later passes. Wants outside the selected prefix are counted
+    /// by `wants - selected`, not here.
     pub pending: usize,
 }
 
@@ -124,11 +135,12 @@ impl Reconciler {
 
     /// One reconcile pass.
     ///
-    /// 1. Enumerate this peer author's wants through [`WantStore`]. The
-    ///    generic assertion snapshot refreshes the wrapped store first, so
-    ///    assertions appended by another process since the last tick become
-    ///    visible without admitting another author's wants.
-    /// 2. Diff against presence: take a reader (which also runs
+    /// 1. Read one generic assertion snapshot and the wrapped store's
+    ///    [`WantCachePolicySource`]. Select the canonical global prefix first,
+    ///    then retain only this peer author's share. Assertions appended by
+    ///    another process since the last tick become visible; another author
+    ///    can occupy a cache slot but never becomes fetch work for this peer.
+    /// 2. Diff the selected set against presence: take a reader (which also runs
     ///    [`Peer::refresh`] — freshly-fetched blobs count as present)
     ///    and keep the wants whose blob the local snapshot can't serve.
     /// 3. For each missing want not gated by its backoff timer, drive
@@ -137,28 +149,39 @@ impl Reconciler {
     ///    per state change (want became pending / pending want
     ///    resolved), not per retry.
     ///
-    /// A pass with unsatisfiable wants completes in bounded time (the
-    /// fetch resolves Unavailable on the DHT deadline); the wants stay
+    /// A pass with unsatisfiable selected wants completes in bounded time (the
+    /// fetch resolves Unavailable on the DHT deadline); those wants stay
     /// pending — that is their normal state until a holder is
     /// reachable, never an error.
     pub async fn tick<S>(&mut self, peer: &mut Peer<S>) -> ReconcileStats
     where
-        S: BlobStore + BlobStorePut + PinStore + PinAssertionStore + StorageFlush + Send + 'static,
+        S: BlobStore
+            + BlobStorePut
+            + PinStore
+            + PinAssertionStore
+            + StorageFlush
+            + WantCachePolicySource
+            + Send
+            + 'static,
     {
         let mut stats = ReconcileStats::default();
 
-        // ── Wants: this peer author's asserted G-set ─────────────────
-        let wants: Vec<RawHash> = match peer.wants() {
-            Ok(wants) => wants.into_iter().map(|handle| handle.raw).collect(),
+        // ── Wants: canonical cache prefix ∩ this peer's author ───────
+        let (want_count, wants): (usize, Vec<RawHash>) = match peer.selected_authored_wants() {
+            Ok((want_count, selected)) => (
+                want_count,
+                selected.into_iter().map(|handle| handle.raw).collect(),
+            ),
             Err(error) => {
                 tracing::warn!(
                     error = ?error,
-                    "reconcile: authored want enumeration failed; skipping pass"
+                    "reconcile: authored want selection failed; skipping pass"
                 );
                 return stats;
             }
         };
-        stats.wants = wants.len();
+        stats.wants = want_count;
+        stats.selected = wants.len();
 
         // ── Presence: which wants the local snapshot already serves ───
         // Peer::reader() runs refresh() (absorbs control events and announces

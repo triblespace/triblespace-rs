@@ -12,7 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lazy fetch demand is now a signed asserted-want G-set scoped to the peer's
   own author key. Direct and transparent read misses append the want durably
   before fetching, and `Reconciler` ignores foreign-authored wants so imported
-  assertions cannot amplify this peer's network work.
+  assertions cannot directly amplify this peer's network work. Background
+  reconciliation fetches only the local author's share of the wrapped store's
+  canonical all-author cache prefix, matching finite retention policy and
+  preventing over-budget fetch/evict oscillation.
 - **The network surface now matches the asserted-pin boundary.** Scalar mutable-
   HEAD gossip, local tracking materialization, publisher-hint state, legacy
   direction modes, and `OP_CHILDREN` are deleted. Pile-sync v5

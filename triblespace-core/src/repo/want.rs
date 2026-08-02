@@ -192,6 +192,82 @@ pub fn all_wants_in_snapshot(
         .collect()
 }
 
+/// Artifact-local capacity policy for materialising asserted wants.
+///
+/// The ordering is deliberately not configurable: every consumer selects the
+/// lexicographically smallest distinct raw handles from the global want union.
+/// A bounded store and the reconciler serving it therefore agree on one stable
+/// prefix instead of repeatedly fetching values that collection will evict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WantCachePolicy {
+    /// Materialise every asserted want.
+    Unbounded,
+    /// Materialise at most `capacity` distinct asserted values.
+    Bounded { capacity: usize },
+}
+
+impl WantCachePolicy {
+    /// A policy that selects every distinct asserted want.
+    pub const fn unbounded() -> Self {
+        Self::Unbounded
+    }
+
+    /// A policy that selects the first `capacity` distinct asserted values.
+    pub const fn bounded(capacity: usize) -> Self {
+        Self::Bounded { capacity }
+    }
+
+    /// The bounded capacity, or `None` when every asserted want is selected.
+    pub const fn capacity(self) -> Option<usize> {
+        match self {
+            Self::Unbounded => None,
+            Self::Bounded { capacity } => Some(capacity),
+        }
+    }
+}
+
+/// Expose the want materialisation policy owned by a storage artifact.
+///
+/// Implementations are explicit rather than defaulted: choosing a finite
+/// capacity is part of a store's observable fetch/retention contract.
+pub trait WantCachePolicySource {
+    /// Return this artifact's asserted-want materialisation policy.
+    fn want_cache_policy(&self) -> WantCachePolicy;
+}
+
+/// Select the canonical global prefix of asserted wants for one artifact.
+///
+/// Values are first deduplicated across all authors, ordered by their raw
+/// handle bytes, and only then bounded. Presence in a local blob store is not
+/// considered here: an absent low-ranked value reserves its slot so
+/// reconciliation and collection converge on the same fixed point.
+pub fn selected_wants_in_snapshot(
+    snapshot: &PinAssertionSnapshot,
+    policy: WantCachePolicy,
+) -> BTreeSet<Inline<Handle<UnknownBlob>>> {
+    let wants = all_wants_in_snapshot(snapshot);
+    match policy.capacity() {
+        Some(capacity) => wants.into_iter().take(capacity).collect(),
+        None => wants,
+    }
+}
+
+/// Select one author's share of the canonical global want prefix.
+///
+/// Capacity is applied to the union across authors before author filtering.
+/// This is `selected_wants_in_snapshot(snapshot, policy) ∩
+/// wants_in_snapshot(snapshot, author)`, not an independently budgeted prefix
+/// per author.
+pub fn selected_wants_for_author_in_snapshot(
+    snapshot: &PinAssertionSnapshot,
+    author: VerifyingKey,
+    policy: WantCachePolicy,
+) -> BTreeSet<Inline<Handle<UnknownBlob>>> {
+    let selected = selected_wants_in_snapshot(snapshot, policy);
+    let authored = wants_in_snapshot(snapshot, author);
+    selected.intersection(&authored).copied().collect()
+}
+
 /// Author-scoped durable operations over the generic asserted-want G-set.
 ///
 /// An implementation owns or otherwise has a configured signing identity.
@@ -271,6 +347,97 @@ mod tests {
         assert_eq!(first_wants, second_wants);
         assert_eq!(first_wants.len(), 1);
         assert_eq!(all_wants_in_snapshot(&snapshot), first_wants);
+    }
+
+    #[test]
+    fn bounded_selection_uses_one_global_prefix_before_author_projection() {
+        let first = key(1);
+        let second = key(2);
+        let mut snapshot = PinAssertionSnapshot::new();
+        for (author, value) in [(&first, 4), (&second, 2), (&first, 1), (&second, 3)] {
+            snapshot.insert(sign_want(author, handle(value))).unwrap();
+        }
+
+        let policy = WantCachePolicy::bounded(3);
+        assert_eq!(
+            selected_wants_in_snapshot(&snapshot, policy),
+            BTreeSet::from([
+                handle(1).transmute(),
+                handle(2).transmute(),
+                handle(3).transmute(),
+            ])
+        );
+        assert_eq!(
+            selected_wants_for_author_in_snapshot(&snapshot, first.verifying_key(), policy),
+            BTreeSet::from([handle(1).transmute()]),
+            "the first author does not receive an independent capacity-three prefix"
+        );
+        assert_eq!(
+            selected_wants_for_author_in_snapshot(&snapshot, second.verifying_key(), policy),
+            BTreeSet::from([handle(2).transmute(), handle(3).transmute()])
+        );
+    }
+
+    #[test]
+    fn selection_is_invariant_to_insertion_duplicates_and_duplicate_authors() {
+        let first = key(1);
+        let second = key(2);
+        let third = key(3);
+
+        let mut minimal = PinAssertionSnapshot::new();
+        for value in [1, 2, 3, 4] {
+            minimal.insert(sign_want(&first, handle(value))).unwrap();
+        }
+
+        let mut redundant = PinAssertionSnapshot::new();
+        for (author, value) in [
+            (&third, 4),
+            (&second, 2),
+            (&first, 3),
+            (&third, 1),
+            (&first, 1),
+            (&second, 2),
+            (&second, 3),
+            (&first, 4),
+        ] {
+            redundant.insert(sign_want(author, handle(value))).unwrap();
+        }
+
+        let policy = WantCachePolicy::bounded(3);
+        let expected = BTreeSet::from([
+            handle(1).transmute(),
+            handle(2).transmute(),
+            handle(3).transmute(),
+        ]);
+        assert_eq!(selected_wants_in_snapshot(&minimal, policy), expected);
+        assert_eq!(selected_wants_in_snapshot(&redundant, policy), expected);
+        assert_eq!(
+            selected_wants_in_snapshot(&redundant, WantCachePolicy::unbounded()),
+            all_wants_in_snapshot(&redundant)
+        );
+    }
+
+    #[test]
+    fn invalid_low_ranked_witness_does_not_reserve_capacity() {
+        let author = key(1);
+        let mut snapshot = PinAssertionSnapshot::new();
+        snapshot.insert(sign_want(&author, handle(1))).unwrap();
+        snapshot.insert(sign_want(&author, handle(2))).unwrap();
+
+        let mut forged = sign_want(&author, handle(0)).encode();
+        let signature_byte = forged.len() - 1;
+        forged[signature_byte] ^= 1;
+        snapshot
+            .insert_unverified(
+                crate::repo::pin_assertion::UnverifiedPinAssertion::decode_structural(forged)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            selected_wants_in_snapshot(&snapshot, WantCachePolicy::bounded(1)),
+            BTreeSet::from([handle(1).transmute()])
+        );
     }
 
     #[test]

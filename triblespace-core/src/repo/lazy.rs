@@ -476,6 +476,20 @@ where
     }
 }
 
+impl<S> super::want::WantCachePolicySource for Lazy<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + PinAssertionStore
+        + super::want::WantCachePolicySource
+        + Send
+        + 'static,
+{
+    fn want_cache_policy(&self) -> super::want::WantCachePolicy {
+        self.store.lock().expect("store mutex").want_cache_policy()
+    }
+}
+
 // ── Async surface ────────────────────────────────────────────────────
 
 /// Async put: semantically identical to the sync [`BlobStorePut`] (a

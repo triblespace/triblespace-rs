@@ -73,9 +73,11 @@ See the book's [Distributed Sync](../book/src/distributed-sync.md) and
 [Capability Auth](../book/src/capability-auth.md) chapters for the exact current
 boundary and team setup. The CLI surface is
 `trible pile net {identity,status,sync}`. `sync` announces local content and
-services only the local peer author's durable wants; foreign assertions cannot
-create fetch work. `--no-lazy` disables the reconciler. It does not synthesize
-or exchange branch state.
+services only the local peer author's share of the wrapped store's canonical
+global want-cache prefix. Foreign assertions can occupy a finite cache slot but
+never become this peer's fetch work; over-budget assertions remain durable and
+unfetched. `--no-lazy` disables the reconciler. It does not synthesize or
+exchange branch state.
 
 Pile-sync protocol v5 (`/triblespace/pile-sync/5`) deliberately has only two
 operations: mandatory first-stream `OP_AUTH`, followed by scope-gated

@@ -289,7 +289,7 @@ fn run_sync(
     let mut next_reconcile = std::time::Instant::now();
     let mut wants_fetched_total: u64 = 0;
     let mut wants_pending: usize = 0;
-    let mut last_pending_logged: Option<usize> = None;
+    let mut last_want_status_logged: Option<(usize, usize, usize)> = None;
     let mut ingest_error = None;
     // Most recent time a want was actually serviced — lazy progress
     // counts as activity for --quiescent-for (pending wants do NOT:
@@ -347,9 +347,12 @@ fn run_sync(
         // Want-reconcile tick: each signed assertion says "I would like this
         // blob; fetch it if absent; retain it only as budgeted cache data."
         // Each pass re-reads the pile (assertions appended by other processes
-        // sharing this node's author key become visible), diffs this author's
-        // want set against the blobs present, and swarm-fetches the missing
-        // ones. Failed fetches retry with per-want exponential backoff
+        // sharing this node's author key become visible), selects the local
+        // author's share of the store's canonical cache prefix, diffs it
+        // against the blobs present, and swarm-fetches the missing ones.
+        // Demand outside a finite store budget remains recorded without being
+        // fetched into a cache that would immediately evict it. Failed fetches
+        // retry with per-want exponential backoff
         // inside the Reconciler; a want nobody serves stays pending —
         // normal, never an error, never dropped. Strong pins/branches
         // are untouched.
@@ -361,14 +364,20 @@ fn run_sync(
             if stats.fetched > 0 {
                 last_want_progress = std::time::Instant::now();
             }
-            // Trace on change (a want serviced, or the pending count
-            // moved), not per tick — pending wants are steady state.
-            if stats.fetched > 0 || last_pending_logged != Some(stats.pending) {
+            // Trace on change (a want serviced, authored/selected membership
+            // moved, or the pending count moved), not per tick — pending and
+            // over-budget wants are both steady state.
+            let want_status = (stats.wants, stats.selected, stats.pending);
+            if stats.fetched > 0 || last_want_status_logged != Some(want_status) {
                 eprintln!(
-                    "  wants: {} seen, {} fetched this pass ({} total), {} pending",
-                    stats.wants, stats.fetched, wants_fetched_total, stats.pending,
+                    "  wants: {} authored, {} selected, {} fetched this pass ({} total), {} pending",
+                    stats.wants,
+                    stats.selected,
+                    stats.fetched,
+                    wants_fetched_total,
+                    stats.pending,
                 );
-                last_pending_logged = Some(stats.pending);
+                last_want_status_logged = Some(want_status);
             }
         }
 

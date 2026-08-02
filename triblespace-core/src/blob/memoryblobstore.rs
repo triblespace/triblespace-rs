@@ -115,6 +115,12 @@ impl PartialEq for MemoryBlobStore {
 
 impl Eq for MemoryBlobStore {}
 
+impl crate::repo::want::WantCachePolicySource for MemoryBlobStore {
+    fn want_cache_policy(&self) -> crate::repo::want::WantCachePolicy {
+        crate::repo::want::WantCachePolicy::unbounded()
+    }
+}
+
 impl Default for MemoryBlobStore {
     fn default() -> Self {
         Self::new()

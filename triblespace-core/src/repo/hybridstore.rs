@@ -4,6 +4,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::repo::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
+use crate::repo::want::{WantCachePolicy, WantCachePolicySource};
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
 use crate::repo::StorageClose;
@@ -113,6 +114,15 @@ where
 
     fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
         self.assertions.append_pin_assertion(assertion)
+    }
+}
+
+impl<B, A> WantCachePolicySource for HybridStore<B, A>
+where
+    B: WantCachePolicySource,
+{
+    fn want_cache_policy(&self) -> WantCachePolicy {
+        self.blobs.want_cache_policy()
     }
 }
 

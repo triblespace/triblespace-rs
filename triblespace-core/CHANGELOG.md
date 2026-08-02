@@ -15,8 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assertion-append boundary without a second flush. Raw Pile and Yard reads are
   observational; old weak pin/unpin records remain decodable for forensics but
   are ignored semantically and are not migrated automatically. Yard retains a
-  canonical budgeted subset through `YardConfig::want_budget` (renamed from
-  `weak_budget`), and soft wants never veto hard reachability.
+  canonical global prefix through `YardConfig::want_budget` (renamed from
+  `weak_budget`) before presence filtering. `WantCachePolicySource` exposes
+  only that artifact-local capacity to service layers; selection remains one
+  fixed raw-handle-ordered global prefix before author or presence filtering,
+  giving bounded collection and reconciliation a stable fixed point. Soft wants
+  never veto hard reachability.
 - Generic `PinAssertionStore` provides one grow-only signed envelope for every
   pin kind. Its full-width `(author, descriptor)` identity, value, and opaque
   label are kind-neutral; `BranchPinDescriptor` and `BranchRank` supply the

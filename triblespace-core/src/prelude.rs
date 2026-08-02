@@ -83,7 +83,7 @@ pub use crate::repo::pile::Pile;
 pub use crate::repo::symmetric_diff;
 pub use crate::repo::time_range;
 pub use crate::repo::union;
-pub use crate::repo::want::WantStore;
+pub use crate::repo::want::{WantCachePolicy, WantCachePolicySource, WantStore};
 pub use crate::repo::BlobChildren;
 pub use crate::repo::BlobStore;
 pub use crate::repo::BlobStoreGet;

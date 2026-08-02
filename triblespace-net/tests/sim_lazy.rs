@@ -1237,6 +1237,10 @@ fn reconcile_tick_services_authored_want() {
             .await
             .expect("reconcile tick completes");
         assert_eq!(stats.wants, 1, "the authored assertion is the want set");
+        assert_eq!(
+            stats.selected, 1,
+            "an unbounded MemoryRepo selects every authored want"
+        );
         assert_eq!(stats.missing, 1, "its blob was absent at pass start");
         assert_eq!(stats.fetched, 1, "the want was serviced from the swarm");
         assert_eq!(stats.pending, 0, "nothing left outstanding");
@@ -1359,6 +1363,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let s1 = drive_future(rec.tick(&mut peer_a), || {}, 400)
             .await
             .expect("tick 1 completes despite the unsatisfiable want");
+        assert_eq!(s1.selected, 1);
         assert_eq!(s1.missing, 1);
         assert_eq!(s1.attempted, 1, "first sighting is attempted immediately");
         assert_eq!(s1.fetched, 0);

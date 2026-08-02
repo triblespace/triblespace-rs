@@ -40,11 +40,14 @@ any other locally present referenced blobs.
 
 `Yard` also derives soft cache roots from signed asserted wants. It recognizes
 the fixed `WantPinDescriptor`, unions authentic values across all authors,
-orders those exact handles canonically, discards values that are not locally
-present, and retains up to `YardConfig::want_budget`. These soft roots retain
-only the named blobs; they never veto or weaken a branch hard root or its
-closure. Satisfaction, budget eviction, and local absence do not erase the
-underlying assertions—the want view is a grow-only set.
+orders those exact handles canonically, and selects a global prefix of at most
+`YardConfig::want_budget` **before** checking local presence. It retains the
+selected values that are present. An absent low-ranked value therefore reserves
+its slot instead of letting a present tail value enter a cache frontier that the
+reconciler cannot reproduce. These soft roots retain only the named blobs; they
+never veto or weaken a branch hard root or its closure. Satisfaction, budget
+eviction, and local absence do not erase the underlying assertions—the want
+view is a grow-only set.
 
 ## Conservative Reachability
 
@@ -190,13 +193,15 @@ helper converts its value column into the conservative stream of
   `Pile` or `Yard` never creates a want. An authoring wrapper records one on a
   miss, while successful retrieval and later eviction leave the assertion
   intact.
-- **Pair finite budgets with an explicit service policy.** Grow-only wants
-  deliberately persist. If one author has more serviceable wants than
-  `want_budget`, collection can evict an unbudgeted blob and reconciliation can
-  fetch it again. The current implementation does not yet define a typed
-  physical-forgetting operation for selected wants or a service-selection
-  policy. Until one exists, the budget alone cannot prevent this
-  collect/reconcile oscillation.
+- **Keep fetch and retention on the same canonical frontier.**
+  `WantCachePolicySource` exposes only the artifact's capacity; ordering is not
+  configurable. Both collection and reconciliation select the same global
+  all-author prefix before presence filtering. `Yard` retains the present
+  members, while each peer fetches only its own authored share. Once assertions
+  quiesce, background reconciliation cannot fetch a value collection will
+  evict. The deliberate trade-off is honest starvation: an unsatisfiable
+  low-ranked want can reserve capacity ahead of later values until a future
+  explicit retirement mechanism exists.
 
 ## Future Work
 

@@ -1971,6 +1971,12 @@ impl PinAssertionStore for Pile {
     }
 }
 
+impl super::want::WantCachePolicySource for Pile {
+    fn want_cache_policy(&self) -> super::want::WantCachePolicy {
+        super::want::WantCachePolicy::unbounded()
+    }
+}
+
 impl crate::repo::BlobStoreMeta for PileReader {
     type MetaError = Infallible;
 

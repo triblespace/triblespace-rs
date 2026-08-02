@@ -30,7 +30,7 @@ use super::pile::{
     GetBlobError, InsertError, Pile, PilePinAssertionError, PileReader, PileWriteError, ReadError,
 };
 use super::pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore};
-use super::want::all_wants_in_snapshot;
+use super::want::{selected_wants_in_snapshot, WantCachePolicy, WantCachePolicySource};
 use super::{
     reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
     PinStore, PushResult, StorageClose, TransferError,
@@ -41,8 +41,9 @@ type StrongPins = PATCH<16, IdentitySchema, Inline<Handle<UnknownBlob>>>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct YardConfig {
-    /// Maximum number of present asserted-want values retained as soft cache
-    /// roots. Selection is canonical and affects only this artifact.
+    /// Capacity of the canonical global asserted-want prefix used as soft
+    /// cache roots. An absent selected value reserves its slot; only present
+    /// members of the prefix are retained. This affects only this artifact.
     pub want_budget: usize,
     /// Strong survivor budget for the youngest level.
     pub strong_level_budget: usize,
@@ -363,10 +364,10 @@ impl Yard {
         let reader = self.reader().map_err(YardCollectError::Reader)?;
         let durable_keep = self.durable_keep_set(&reader, &pin_assertions);
         let present = reader.live_set();
-        let weak_keep = asserted_want_keep_set(&pin_assertions, &present, self.config.want_budget);
+        let want_keep = asserted_want_keep_set(&pin_assertions, &present, self.want_cache_policy());
 
         let mut keep = durable_keep;
-        keep.union(weak_keep);
+        keep.union(want_keep);
         for generation in &mut self.generations {
             for segment in &mut generation.segments {
                 segment.live = segment.live.intersect(&keep);
@@ -603,6 +604,12 @@ impl PinAssertionStore for Yard {
             .active_mut()
             .pile_mut()
             .append_pin_assertion(assertion)
+    }
+}
+
+impl WantCachePolicySource for Yard {
+    fn want_cache_policy(&self) -> WantCachePolicy {
+        WantCachePolicy::bounded(self.config.want_budget)
     }
 }
 
@@ -932,23 +939,23 @@ fn collect_list<E>(
     Ok(set)
 }
 
-/// Select the canonical, budgeted subset of locally present asserted wants.
+/// Retain the locally present members of the canonical asserted-want prefix.
 ///
 /// Assertions are durable intent; retention is artifact-local cache policy.
 /// Evicting a wanted blob therefore never erases its assertion, and a later
-/// reconciliation may fetch it again. The ordered set projection makes the
-/// same snapshot and budget select the same roots on every replica.
+/// reconciliation may fetch it again. Selection happens before the presence
+/// test, so an absent low-ranked value reserves its slot and collection agrees
+/// exactly with the reconciler's fetch policy.
 fn asserted_want_keep_set(
     assertions: &PinAssertionSnapshot,
     present: &HandleSet,
-    budget: usize,
+    policy: WantCachePolicy,
 ) -> HandleSet {
     let mut keep = HandleSet::new();
-    for handle in all_wants_in_snapshot(assertions)
-        .into_iter()
-        .filter(|handle| present.get(&handle.raw).is_some())
-        .take(budget)
-    {
+    for handle in selected_wants_in_snapshot(assertions, policy) {
+        if present.get(&handle.raw).is_none() {
+            continue;
+        }
         keep.insert(&Entry::new(&handle.raw));
     }
     keep
@@ -1228,7 +1235,7 @@ mod tests {
     use crate::repo::pin_assertion::{
         PinHandle, SubsumptionLabel, UnverifiedPinAssertion, ValueHandle,
     };
-    use crate::repo::want::{sign_want, wants_in_snapshot};
+    use crate::repo::want::{all_wants_in_snapshot, sign_want, wants_in_snapshot};
     use ed25519_dalek::SigningKey;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -1486,6 +1493,64 @@ mod tests {
             wants_in_snapshot(&yard.pin_assertion_snapshot().unwrap(), key.verifying_key()),
             BTreeSet::from([wanted.transmute()]),
             "cache eviction must not erase durable intent"
+        );
+    }
+
+    #[test]
+    fn absent_prefix_want_reserves_capacity_without_displacing_hard_roots() {
+        let (_dir, mut yard) = yard_with(
+            1,
+            YardConfig {
+                want_budget: 2,
+                ..YardConfig::default()
+            },
+        );
+        let key = SigningKey::from_bytes(&[18; 32]);
+        let mut candidates = [
+            b"policy-candidate-a".as_slice(),
+            b"policy-candidate-b".as_slice(),
+            b"policy-candidate-c".as_slice(),
+            b"policy-candidate-d".as_slice(),
+        ]
+        .into_iter()
+        .map(|source| {
+            let bytes = Bytes::from_source(source.to_vec());
+            let handle = Blob::<RawBytes>::new(bytes.clone()).get_handle();
+            (handle, bytes)
+        })
+        .collect::<Vec<_>>();
+        candidates.sort_by_key(|(handle, _)| handle.raw);
+
+        let absent = candidates[0].0;
+        let selected_present = candidates[1].0;
+        let unselected_present = candidates[2].0;
+        let hard_outside_prefix = candidates[3].0;
+        for (handle, bytes) in &candidates[1..] {
+            let stored = yard.put::<RawBytes, _>(bytes.clone()).unwrap();
+            assert_eq!(stored, *handle);
+        }
+        // Insert in reverse rank order to make ordering visibly independent
+        // from record order.
+        for (handle, _) in candidates.iter().rev() {
+            append_want(&mut yard, &key, *handle);
+        }
+        yard.pin_strong(pin_id(18), hard_outside_prefix).unwrap();
+
+        yard.collect().unwrap();
+        let reader = yard.reader().unwrap();
+
+        assert!(matches!(
+            get_raw(&reader, absent),
+            Err(YardGetError::NotFound)
+        ));
+        assert!(get_raw(&reader, selected_present).is_ok());
+        assert!(matches!(
+            get_raw(&reader, unselected_present),
+            Err(YardGetError::NotFound)
+        ));
+        assert!(
+            get_raw(&reader, hard_outside_prefix).is_ok(),
+            "hard roots survive independently of asserted-want selection"
         );
     }
 
@@ -2211,8 +2276,8 @@ mod tests {
         ) -> BTreeSet<RawHandle> {
             wants
                 .iter()
-                .filter(|raw| present.contains(*raw))
                 .take(budget)
+                .filter(|raw| present.contains(*raw))
                 .copied()
                 .collect()
         }

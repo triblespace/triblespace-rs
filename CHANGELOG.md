@@ -93,9 +93,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes to the configured author. `Lazy` and `Peer` sign durable wants on
   misses, raw `Pile`/`Yard` reads remain observational, and reconciliation
   services only its own author's set. Yard unions authentic wants across
-  authors as canonically ordered exact-value soft roots under
-  `YardConfig::want_budget`; wants never veto hard roots, and satisfaction or
-  eviction never erases an assertion. Historical weak-pin/unpin records remain
+  authors and selects one canonical exact-value prefix under
+  `YardConfig::want_budget` before presence filtering. Reconciliation fetches
+  only the local author's share of that same prefix, giving finite caches a
+  stable fixed point instead of a fetch/evict loop. Wants never veto hard roots,
+  and satisfaction or eviction never erases an assertion. Historical weak-pin/unpin records remain
   decodable only for migration and forensics, with no live index or writer and
   no automatic conversion into authored wants. `Lazy::new` now takes
   `(store, SigningKey)`, and `YardConfig::weak_budget` is renamed to

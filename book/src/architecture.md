@@ -159,9 +159,11 @@ kind-specific store. `WantStore` deliberately scopes both writes and reads to
 the configured author. `Lazy` and `Peer` own that author's signing key and
 append a durable assertion when a wrapped read misses; raw `Pile` and `Yard`
 reads remain observational. The reconciler services only its own author's
-wants, while `Yard` may union authentic wants from every author as bounded soft
-cache roots. Satisfaction and eviction never retract an assertion, and wants
-never weaken branch hard roots.
+wants within the storage artifact's canonical global cache prefix, while
+`Yard` retains the present values from that same all-author prefix as bounded
+soft cache roots. Selecting before presence gives background fetch and
+collection a stable fixed point. Satisfaction and eviction never retract an
+assertion, and wants never weaken branch hard roots.
 
 Mutable [`PinStore`](https://docs.rs/triblespace/latest/triblespace/repo/trait.PinStore.html)
 entries still exist while retention and policy consumers migrate. They are

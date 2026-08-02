@@ -47,7 +47,10 @@ use triblespace_core::repo::branch_frontier::{ParentLookup, PartialCommitDag};
 use triblespace_core::repo::pin_assertion::{
     PinAssertion, PinAssertionSnapshot, PinAssertionStore,
 };
-use triblespace_core::repo::want::{WantStore, sign_want, wants_in_snapshot};
+use triblespace_core::repo::want::{
+    WantCachePolicy, WantCachePolicySource, WantStore, selected_wants_for_author_in_snapshot,
+    sign_want, wants_in_snapshot,
+};
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
     StorageFlush,
@@ -1597,6 +1600,22 @@ where
     }
 }
 
+impl<S> WantCachePolicySource for Peer<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + PinStore
+        + PinAssertionStore
+        + StorageFlush
+        + WantCachePolicySource
+        + Send
+        + 'static,
+{
+    fn want_cache_policy(&self) -> WantCachePolicy {
+        self.store.lock().expect("store mutex").want_cache_policy()
+    }
+}
+
 /// Generic asserted pins are authority state rather than blob payloads. The
 /// peer therefore forwards their coherent snapshots and durable appends to its
 /// local store while leaving replication to a future assertion wire protocol.
@@ -1619,6 +1638,42 @@ where
             .lock()
             .expect("store mutex")
             .append_pin_assertion(assertion)
+    }
+}
+
+impl<S> Peer<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + PinStore
+        + StorageFlush
+        + PinAssertionStore
+        + WantCachePolicySource
+        + Send
+        + 'static,
+{
+    /// Project the exact authored want count and the subset this artifact can
+    /// stably materialise.
+    ///
+    /// Policy and assertions come from the same store lock. Selection first
+    /// takes the canonical global prefix across every author and only then
+    /// intersects it with this peer's author. The returned set is owned, so no
+    /// storage lock crosses a network await in the reconciler.
+    pub(crate) fn selected_authored_wants(
+        &mut self,
+    ) -> Result<(usize, BTreeSet<Inline<Handle<UnknownBlob>>>), <S as PinAssertionStore>::Error>
+    {
+        let _ = self.refresh();
+        let author = self.signing_key.verifying_key();
+        let (policy, snapshot) = {
+            let mut store = self.store.lock().expect("store mutex");
+            let policy = store.want_cache_policy();
+            let snapshot = store.pin_assertion_snapshot()?;
+            (policy, snapshot)
+        };
+        let authored = wants_in_snapshot(&snapshot, author);
+        let selected = selected_wants_for_author_in_snapshot(&snapshot, author, policy);
+        Ok((authored.len(), selected))
     }
 }
 
@@ -2563,6 +2618,113 @@ mod tests {
             snapshot.for_pin(&PinIdentity::new(signing_key.verifying_key(), pin)),
             vec![assertion]
         );
+    }
+
+    #[test]
+    fn selected_authored_wants_share_one_global_cache_prefix() {
+        use triblespace_core::repo::want::sign_want;
+        use triblespace_core::repo::yard::{Yard, YardConfig};
+
+        let local = SigningKey::from_bytes(&[0xA2; 32]);
+        let foreign = SigningKey::from_bytes(&[0xB2; 32]);
+        let endpoint =
+            EndpointId::from_bytes(&local.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, _wiring) = host::wire(endpoint);
+        let dir = tempfile::tempdir().expect("temporary yard");
+        let yard = Yard::create(
+            [dir.path().join("young.pile")],
+            YardConfig {
+                want_budget: 2,
+                ..YardConfig::default()
+            },
+        )
+        .expect("create yard");
+        let mut peer =
+            Peer::with_wiring(yard, local.clone(), local.verifying_key(), sender, receiver);
+
+        let foreign_low = Inline::<Handle<UnknownBlob>>::new([1; 32]);
+        let local_middle = Inline::<Handle<UnknownBlob>>::new([2; 32]);
+        let local_high = Inline::<Handle<UnknownBlob>>::new([3; 32]);
+        peer.store()
+            .append_pin_assertion(sign_want(&foreign, foreign_low))
+            .unwrap();
+        peer.assert_want(local_high).unwrap();
+        peer.assert_want(local_middle).unwrap();
+
+        let (authored_count, selected) = peer.selected_authored_wants().unwrap();
+        assert_eq!(authored_count, 2, "the exact authored G-set stays visible");
+        assert_eq!(
+            selected,
+            BTreeSet::from([local_middle]),
+            "capacity applies globally before the local-author intersection"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_want_collection_and_reconciliation_reach_a_fixed_point() {
+        use triblespace_core::blob::encodings::rawbytes::RawBytes;
+        use triblespace_core::repo::BlobStoreList;
+        use triblespace_core::repo::yard::{Yard, YardConfig};
+
+        fn resident(peer: &mut Peer<Yard>) -> BTreeSet<[u8; 32]> {
+            let mut store = peer.store();
+            let reader = store.reader().unwrap();
+            reader.blobs().map(|handle| handle.unwrap().raw).collect()
+        }
+
+        let local = SigningKey::from_bytes(&[0xA3; 32]);
+        let endpoint =
+            EndpointId::from_bytes(&local.verifying_key().to_bytes()).expect("valid endpoint id");
+        let (sender, receiver, _wiring) = host::wire(endpoint);
+        let dir = tempfile::tempdir().expect("temporary yard");
+        let yard = Yard::create(
+            [dir.path().join("young.pile")],
+            YardConfig {
+                want_budget: 1,
+                ..YardConfig::default()
+            },
+        )
+        .expect("create yard");
+        let mut peer =
+            Peer::with_wiring(yard, local.clone(), local.verifying_key(), sender, receiver);
+
+        let mut blobs = [
+            Bytes::from_source(b"fixed-point-a".to_vec()),
+            Bytes::from_source(b"fixed-point-b".to_vec()),
+        ]
+        .into_iter()
+        .map(|bytes| {
+            let handle = Blob::<RawBytes>::new(bytes.clone()).get_handle();
+            (handle, bytes)
+        })
+        .collect::<Vec<_>>();
+        blobs.sort_by_key(|(handle, _)| handle.raw);
+        for (handle, bytes) in &blobs {
+            assert_eq!(
+                peer.store().put::<RawBytes, _>(bytes.clone()).unwrap(),
+                *handle
+            );
+            peer.assert_want(*handle).unwrap();
+        }
+
+        peer.store().collect().unwrap();
+        let fixed = resident(&mut peer);
+        assert_eq!(fixed, BTreeSet::from([blobs[0].0.raw]));
+
+        let mut reconciler = crate::reconcile::Reconciler::new();
+        for _ in 0..2 {
+            let stats = reconciler.tick(&mut peer).await;
+            assert_eq!(stats.wants, 2);
+            assert_eq!(stats.selected, 1);
+            assert_eq!(stats.missing, 0);
+            assert_eq!(stats.attempted, 0, "the evicted tail is never refetched");
+            peer.store().collect().unwrap();
+            assert_eq!(
+                resident(&mut peer),
+                fixed,
+                "two full reconcile/collect cycles must preserve the resident set"
+            );
+        }
     }
 
     fn test_capability(

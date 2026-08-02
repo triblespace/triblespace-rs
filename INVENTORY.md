@@ -232,12 +232,12 @@ prioritized for efficient zero-copy access.
   while leaving the append-only Pile records in place. Add a future physical
   compaction/rewrite path when Yard needs to reclaim disk space, preserving
   live readers while replacing generation files.
-- Define retirement or service-selection semantics for asserted wants that
-  exceed a finite `YardConfig::want_budget`. Grow-only wants deliberately
-  survive satisfaction and eviction, so collection can evict an unbudgeted
-  blob and reconciliation can fetch it again indefinitely. The current API has
-  neither typed physical forgetting for selected wants nor a policy for which
-  authored wants the reconciler should decline to service.
+- Add an explicit, author-capability-gated retirement mechanism if permanent
+  asserted wants eventually need relief from cache-frontier starvation. Fetch
+  and retention now share one stable global-prefix service policy, so the old
+  collect/reconcile oscillation is gone; however, an unsatisfiable low-ranked
+  want deliberately reserves its slot until assertions can be retired or an
+  artifact is physically rewritten without them.
 - The packed device confirm path assumes `UNIT_POS_PLANE` relates linearly to
   the cube-local invocation index — condition (c) on
   `membership_confirm_ballot_kernel`. It is true on Metal and CUDA and is what

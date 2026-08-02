@@ -64,9 +64,12 @@ The current stack moves content in three complementary steps:
   assertion before a fetch begins. `Lazy` and `Peer` own a signing key, so both
   appending and reading wants are scoped to that configured author. Assertion
   append is already durable; it needs no second flush. The reconciler retries
-  provider lookup and transfer for that same author's wants; an unavailable
-  blob remains pending rather than losing the demand. `--no-lazy` disables this
-  reconciler.
+  provider lookup and transfer for that same author's share of the store's
+  canonical global want-cache prefix. Capacity is applied across authentic
+  values from every author before the local-author intersection, matching
+  `Yard` retention exactly; over-budget demand remains durable without entering
+  a fetch/evict loop. An unavailable selected blob remains pending rather than
+  losing the demand. `--no-lazy` disables this reconciler.
 
 Pile-sync v5 (`/triblespace/pile-sync/5`) has no branch enumeration, HEAD,
 child-list, or remote-write operation. It serves only `OP_AUTH` and

@@ -40,6 +40,7 @@ use super::async_store::{
 };
 use super::branch_frontier::ParentLookup;
 use super::commit::{self, StoredCommitError};
+use super::want::{WantCachePolicy, WantCachePolicySource};
 use super::BlobMetadata;
 use super::PushResult;
 
@@ -119,6 +120,14 @@ impl ObjectStoreRemote {
             store: Arc::from(store),
             prefix: path,
         })
+    }
+}
+
+impl WantCachePolicySource for ObjectStoreRemote {
+    fn want_cache_policy(&self) -> WantCachePolicy {
+        // Explicit `forget` calls may remove individual blobs, but this
+        // backend performs no capacity-driven cache eviction of its own.
+        WantCachePolicy::unbounded()
     }
 }
 

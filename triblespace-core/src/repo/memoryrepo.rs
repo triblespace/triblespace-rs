@@ -10,6 +10,7 @@ use crate::prelude::*;
 use crate::repo::pin_assertion::{
     PinAssertion, PinAssertionKeyCollision, PinAssertionSnapshot, PinAssertionStore,
 };
+use crate::repo::want::{WantCachePolicy, WantCachePolicySource};
 use crate::repo::PinStore;
 use crate::repo::PushResult;
 
@@ -39,6 +40,12 @@ impl PinAssertionStore for MemoryRepo {
 
     fn append_pin_assertion(&mut self, assertion: PinAssertion) -> Result<(), Self::Error> {
         self.pin_assertions.insert(assertion)
+    }
+}
+
+impl WantCachePolicySource for MemoryRepo {
+    fn want_cache_policy(&self) -> WantCachePolicy {
+        WantCachePolicy::unbounded()
     }
 }
 

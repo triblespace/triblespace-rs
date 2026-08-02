@@ -38,6 +38,7 @@ use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
     branch_frontier::{ParentLookup, PartialCommitDag},
     pin_assertion::{PinAssertion, PinAssertionSnapshot, PinAssertionStore},
+    want::{WantCachePolicy, WantCachePolicySource},
     BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
     BlobStorePut, CommitHandle, PinStore, PushResult, StorageFlush,
 };
@@ -264,6 +265,15 @@ impl<S> SyncAsAsync<S> {
     /// Unwrap back to the sync store.
     pub fn into_inner(self) -> S {
         self.0
+    }
+}
+
+impl<S> WantCachePolicySource for SyncAsAsync<S>
+where
+    S: WantCachePolicySource,
+{
+    fn want_cache_policy(&self) -> WantCachePolicy {
+        self.0.want_cache_policy()
     }
 }
 
@@ -545,6 +555,16 @@ impl<A> Blocking<A> {
     /// Unwrap back to the async store.
     pub fn into_inner(self) -> A {
         self.inner
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A> WantCachePolicySource for Blocking<A>
+where
+    A: WantCachePolicySource,
+{
+    fn want_cache_policy(&self) -> WantCachePolicy {
+        self.inner.want_cache_policy()
     }
 }
 
