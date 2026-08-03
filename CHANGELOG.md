@@ -175,6 +175,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Range-cover selection exposes only executable state.** Invalid rollup
+  offers are still ignored independently, but the diagnostic-only rejected
+  node list is no longer retained in `RangeCoverSelection`; consumers receive
+  only the selected artifacts and exact source residual they must execute.
 - **Join-request ACKs now certify durable admission.** The auth-handshake host
   waits for the synchronous Peer to flush an incoming request's exact closure
   and durably append its `RequestObserved` assertion before returning
