@@ -582,6 +582,9 @@ fn freeze_succinct_segment(
     entity: Id,
     segment: &SuccinctArchive<OrderedUniverse>,
 ) -> Result<Fragment, ArtifactError> {
+    if segment.eav_c.len() == 0 {
+        return Err("an empty Succinct projection has no physical segment".into());
+    }
     let (raw_blob, rank9_blob) = segment.to_blob_pair();
     let raw_handle = raw_blob.get_handle();
     let source = SuccinctArchiveRank9IndexBlob::source_handle(&rank9_blob)
@@ -684,7 +687,12 @@ impl IndexKind for SuccinctRollup {
         if segments.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(vec![merge_ordered_archives(segments)])
+        let archive = merge_ordered_archives(segments);
+        if archive.eav_c.len() == 0 {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![archive])
+        }
     }
 }
 
@@ -771,7 +779,11 @@ where
         } else {
             merge_ordered_archives(segments)
         };
-        Ok(vec![archive])
+        if archive.eav_c.len() == 0 {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![archive])
+        }
     }
 }
 
@@ -907,6 +919,34 @@ mod tests {
     use crate::id::{fucid, ExclusiveId};
     use crate::repo::BlobStorePut;
 
+    struct ResidentResidual {
+        resident: UnionArchive<OrderedUniverse>,
+        residual: TribleSet,
+    }
+
+    impl TriblePattern for ResidentResidual {
+        type PatternConstraint<'a>
+            = Arc<UnionConstraint<Box<dyn Constraint<'a> + Send + Sync + 'a>>>
+        where
+            Self: 'a;
+
+        fn pattern<'a, V: InlineEncoding>(
+            &'a self,
+            e: impl Into<Term<GenId>>,
+            a: impl Into<Term<GenId>>,
+            v: impl Into<Term<V>>,
+        ) -> Self::PatternConstraint<'a> {
+            let e = e.into();
+            let a = a.into();
+            let v = v.into();
+            Arc::new(UnionConstraint::new(vec![
+                Box::new(self.resident.pattern(e, a, v))
+                    as Box<dyn Constraint<'a> + Send + Sync + 'a>,
+                Box::new(self.residual.pattern(e, a, v)),
+            ]))
+        }
+    }
+
     struct SilentSegmentKind;
 
     impl IndexKind for SilentSegmentKind {
@@ -995,6 +1035,16 @@ mod tests {
         let reader = storage.reader().unwrap();
         let loaded = load_range(&reader, &kind, stored.rollup_record()).unwrap();
         assert!(loaded.segments().is_empty());
+    }
+
+    #[test]
+    fn succinct_physical_zero_normalizes_to_no_segment() {
+        let kind = SuccinctRollup::new();
+        let empty_source = TribleSet::new();
+        let empty: SuccinctArchive<OrderedUniverse> = (&empty_source).into();
+
+        assert!(kind.merge(std::slice::from_ref(&empty)).unwrap().is_empty());
+        assert!(kind.freeze(*fucid(), &empty).is_err());
     }
 
     #[test]
@@ -1171,6 +1221,75 @@ mod tests {
             small_source
         );
         assert_eq!(cover.residual(), &[third]);
+    }
+
+    #[test]
+    fn resident_and_residual_join_as_one_set_shaped_source() {
+        let mut storage = MemoryBlobStore::new();
+        let kind = SuccinctRollup::new();
+        let first = commit(1);
+        let second = commit(2);
+        let mut dag = HashMap::from([(first, Vec::new()), (second, vec![first])]);
+
+        let subject = fucid();
+        let resident_tag = fucid();
+        let residual_tag = fucid();
+        let overlap_tag = fucid();
+        let resident: TribleSet = entity! { &subject @
+            metadata::tag*: [&resident_tag, &overlap_tag],
+        }
+        .into_facts();
+        let residual: TribleSet = entity! { &subject @
+            metadata::tag*: [&residual_tag, &overlap_tag],
+        }
+        .into_facts();
+        let stored = store_succinct_range(&mut storage, &kind, &resident, CommitRange::leaf(first));
+
+        let reader = storage.reader().unwrap();
+        let cover = resolve_resident_range_cover(
+            &reader,
+            &mut dag,
+            &kind,
+            &[stored.rollup_record()],
+            &[second],
+        )
+        .unwrap();
+        assert_eq!(cover.selected().len(), 1);
+        assert_eq!(cover.residual(), &[second]);
+
+        let segments = cover
+            .selected()
+            .iter()
+            .flat_map(|node| node.segments().iter().cloned())
+            .collect::<Vec<_>>();
+        let mixed = ResidentResidual {
+            resident: SuccinctRollup::union(&segments),
+            residual: residual.clone(),
+        };
+        let mut monolithic = resident;
+        monolithic += residual;
+
+        let mixed_rows = find!(
+            (entity: Id),
+            pattern!(&mixed, [
+                { ?entity @ metadata::tag: &resident_tag },
+                { ?entity @ metadata::tag: &residual_tag },
+                { ?entity @ metadata::tag: &overlap_tag },
+            ])
+        )
+        .collect::<Vec<_>>();
+        let monolithic_rows = find!(
+            (entity: Id),
+            pattern!(&monolithic, [
+                { ?entity @ metadata::tag: &resident_tag },
+                { ?entity @ metadata::tag: &residual_tag },
+                { ?entity @ metadata::tag: &overlap_tag },
+            ])
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(mixed_rows, monolithic_rows);
+        assert_eq!(mixed_rows, vec![(subject.to_owned(),)]);
     }
 
     #[test]

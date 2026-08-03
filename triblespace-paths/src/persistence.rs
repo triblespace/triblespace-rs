@@ -454,7 +454,11 @@ impl IndexKind for PathRollup {
         if summary.automaton() != &self.automaton {
             return Err(Box::new(PathSummaryBlobError::DifferentAutomaton));
         }
-        Ok(vec![summary])
+        if summary.vertices().is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![summary])
+        }
     }
 }
 
@@ -690,6 +694,19 @@ mod tests {
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
         assert!(foreign.thaw(&reader, frozen.facts(), range_entity).is_err());
+    }
+
+    #[test]
+    fn physical_zero_normalizes_to_no_segment() {
+        let rollup = PathRollup::new(plus(9));
+        let empty =
+            PathSummary::from_edges(rollup.automaton().clone(), std::iter::empty::<GraphEdge>());
+
+        assert!(rollup
+            .merge(std::slice::from_ref(&empty))
+            .unwrap()
+            .is_empty());
+        assert!(rollup.freeze(*ufoid(), &empty).is_err());
     }
 
     #[test]
