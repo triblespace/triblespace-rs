@@ -58,7 +58,7 @@ use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::trible::{Fragment, TribleSet};
 
 use crate::hnsw::HNSWBuilder;
-use crate::index_schema::{index_dimension, index_seed, index_source_attribute, seg_hnsw};
+use crate::index_schema::{index_dimension, index_source_attribute, seg_hnsw};
 use crate::schemas::{EmbHandle, Embedding};
 use crate::succinct::{SuccinctHNSWBlob, SuccinctHNSWIndex};
 
@@ -80,7 +80,6 @@ pub struct HnswRollup<R> {
     reader: R,
     dim: usize,
     attr: Id,
-    seed: u64,
 }
 
 impl<R> HnswRollup<R> {
@@ -88,18 +87,7 @@ impl<R> HnswRollup<R> {
     /// under `attr`, resolving them to `dim`-dimensional vectors
     /// through `reader`.
     pub fn new(reader: R, dim: usize, attr: Id) -> Self {
-        Self {
-            reader,
-            dim,
-            attr,
-            seed: DEFAULT_SEED,
-        }
-    }
-
-    /// Override the deterministic build seed.
-    pub fn with_seed(mut self, seed: u64) -> Self {
-        self.seed = seed;
-        self
+        Self { reader, dim, attr }
     }
 
     /// Stable kind id — minted via `trible genid`
@@ -156,7 +144,7 @@ where
     {
         let mut pairs: Vec<_> = pairs.into_iter().collect();
         pairs.sort_unstable_by_key(|(handle, _)| handle.raw);
-        let mut builder = HNSWBuilder::new(self.dim).with_seed(self.seed);
+        let mut builder = HNSWBuilder::new(self.dim).with_seed(DEFAULT_SEED);
         for (h, v) in pairs {
             builder
                 .insert(h, v)
@@ -193,7 +181,6 @@ where
             metadata::tag: algorithm,
             index_source_attribute: self.attr,
             index_dimension: self.dim as u64,
-            index_seed: self.seed,
         }
     }
 
@@ -802,21 +789,18 @@ mod tests {
     }
 
     #[test]
-    fn recipe_identity_tracks_source_dimension_and_seed_not_reader() {
+    fn recipe_identity_tracks_source_and_dimension_not_reader() {
         let mut left_store = MemoryRepo::default();
         let mut right_store = MemoryRepo::default();
-        let left = HnswRollup::new(left_store.reader().unwrap(), 2, emb.id()).with_seed(7);
-        let same = HnswRollup::new(right_store.reader().unwrap(), 2, emb.id()).with_seed(7);
-        let source =
-            HnswRollup::new(right_store.reader().unwrap(), 2, alternate_emb.id()).with_seed(7);
-        let dimension = HnswRollup::new(right_store.reader().unwrap(), 3, emb.id()).with_seed(7);
-        let seed = HnswRollup::new(right_store.reader().unwrap(), 2, emb.id()).with_seed(8);
+        let left = HnswRollup::new(left_store.reader().unwrap(), 2, emb.id());
+        let same = HnswRollup::new(right_store.reader().unwrap(), 2, emb.id());
+        let source = HnswRollup::new(right_store.reader().unwrap(), 2, alternate_emb.id());
+        let dimension = HnswRollup::new(right_store.reader().unwrap(), 3, emb.id());
 
         let root = left.recipe_fragment().root();
         assert_eq!(root, same.recipe_fragment().root());
         assert_ne!(root, source.recipe_fragment().root());
         assert_ne!(root, dimension.recipe_fragment().root());
-        assert_ne!(root, seed.recipe_fragment().root());
     }
 
     #[test]
@@ -825,8 +809,8 @@ mod tests {
         let (source_a, _) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let (source_b, _) = stage(&mut storage, alternate_emb.id(), *fucid(), vec![0.0, 1.0]);
         let reader = storage.reader().unwrap();
-        let kind_a = HnswRollup::new(reader.clone(), 2, emb.id()).with_seed(7);
-        let kind_b = HnswRollup::new(reader, 2, alternate_emb.id()).with_seed(7);
+        let kind_a = HnswRollup::new(reader.clone(), 2, emb.id());
+        let kind_b = HnswRollup::new(reader, 2, alternate_emb.id());
         let artifact_a = kind_a.build(&source_a).unwrap().unwrap();
         let artifact_b = kind_b.build(&source_b).unwrap().unwrap();
         let range = CommitRange::leaf(commit(1));

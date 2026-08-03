@@ -71,7 +71,7 @@ range start.
 A `RangeRecord` has an intrinsic entity id derived from
 `(index_recipe, commit_start*, commit_end*)`. The recipe identifies the question
 and its source parameters: for example a path automaton fingerprint, a BM25
-content attribute, or an HNSW source attribute, dimension, and seed.
+content attribute, or an HNSW source attribute and dimension.
 
 One published rollup alternative is a pair of content-addressed archives:
 
@@ -151,8 +151,9 @@ The common layer does not claim one universal byte-level merge law:
 - **HNSW** owns graph rebuilding, candidate union, and exact rescoring. Rescore
   is exact only over each graph's approximate candidate set, so graph
   repartition can change recall while source-embedding coverage remains exact.
-  Rebuild sorts embedding handles before seeded insertion, making the artifact
-  independent of source and compaction input order.
+  Rebuild sorts embedding handles before insertion under one fixed seed, making
+  the artifact independent of source and compaction input order without a
+  recipe tuning knob.
 
 Recipe identity and representation are orthogonal. The recipe says what
 question is answered; typed attributes such as `seg_succinct`, `seg_bm25`, or

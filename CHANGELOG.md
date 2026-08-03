@@ -184,8 +184,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Compaction publishes another immutable pair and never mutates or supersedes
   its victims. Succinct artifacts pair raw archives with source-bound Rank9
   blobs; BM25 rejects empty or noncanonical-tuning artifacts; HNSW rejects
-  empty artifacts and sorts handles before seeded rebuilds; and Path owns its
-  distinct exact-summary merge semantics on the same storage algebra.
+  empty artifacts and sorts handles before rebuilds under one fixed seed; and
+  Path owns its distinct exact-summary merge semantics on the same storage
+  algebra. HNSW rollups no longer expose or persist a seed tuning knob; recipe
+  identity is exactly kind, source attribute, and dimension.
 - **The remote scalar-pin compatibility island is removed.**
   `AsyncPinStore`, its sync/async adapter implementations, the object-store
   `pins/` CAS namespace, and `trible store pin` are deleted. Remote object

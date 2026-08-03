@@ -22,6 +22,4 @@ attributes! {
     "38FA73632BEF15C5D125AA4A8E168D84" as pub index_source_attribute: GenId;
     /// Vector dimension of an HNSW recipe.
     "45818F54828F1EAEC1FB8E34C8E290EB" as pub index_dimension: U256BE;
-    /// Deterministic graph-construction seed of an HNSW recipe.
-    "7E03D090721DF88BD001AA3ACCCA7256" as pub index_seed: U256BE;
 }
