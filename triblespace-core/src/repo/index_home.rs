@@ -33,8 +33,8 @@ use crate::query::{
     VariableSet,
 };
 use crate::repo::index_range::{
-    convex_union, validate_exact_frontier_cover, RangeCoverCandidate, RangeRecord,
-    RangeRecordError, RangeValidationError, StoredCommitDag,
+    convex_union, select_range_cover, validate_exact_frontier_cover, CommitDag,
+    RangeCoverCandidate, RangeRecord, RangeRecordError, RangeValidationError, StoredCommitDag,
 };
 use crate::repo::rollup_pin::RollupRecord;
 use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle};
@@ -280,6 +280,48 @@ pub struct StoredRangeNode<A> {
     handle: Inline<Handle<SimpleArchive>>,
     record: RangeRecord,
     artifacts: Vec<A>,
+}
+
+/// One complete standalone range node whose typed artifacts are resident.
+///
+/// Keeping the attached segments beside their node preserves the atomic
+/// alternative chosen by cover selection. In particular, callers never have
+/// to reconstruct which conjunctive shards came from which node.
+#[derive(Debug)]
+pub struct ResidentRangeNode<A, S> {
+    node: StoredRangeNode<A>,
+    segments: Vec<S>,
+}
+
+impl<A, S> ResidentRangeNode<A, S> {
+    /// Structurally and type-validated standalone node.
+    pub const fn node(&self) -> &StoredRangeNode<A> {
+        &self.node
+    }
+
+    /// Every attached typed segment carried by this one complete node.
+    pub fn segments(&self) -> &[S] {
+        &self.segments
+    }
+}
+
+/// Exact read-time cover formed only from locally usable rollup nodes.
+#[derive(Debug)]
+pub struct ResidentRangeCover<A, S> {
+    selected: Vec<ResidentRangeNode<A, S>>,
+    residual: Vec<CommitHandle>,
+}
+
+impl<A, S> ResidentRangeCover<A, S> {
+    /// Deterministically selected, pairwise-disjoint resident node bundles.
+    pub fn selected(&self) -> &[ResidentRangeNode<A, S>] {
+        &self.selected
+    }
+
+    /// Exact target commits not covered by the selected resident nodes.
+    pub fn residual(&self) -> &[CommitHandle] {
+        &self.residual
+    }
 }
 
 impl<A> StoredRangeNode<A> {
@@ -1063,6 +1105,68 @@ pub fn attach_range<R: BlobStoreGet, K: IndexKind>(
         .iter()
         .map(|artifact| kind.attach(reader, artifact).map_err(IndexError::Artifact))
         .collect()
+}
+
+/// Resolve the exact locally usable cover of an authoritative commit frontier.
+///
+/// Rollup assertions are optimization offers, not source-of-truth metadata.
+/// Each pair must load as one complete standalone node and every artifact in
+/// that node must attach before its range becomes eligible. Missing blobs,
+/// malformed nodes, foreign recipes, and attachment failures therefore only
+/// remove that offer from consideration. [`select_range_cover`] returns every
+/// resulting gap in `residual`, preserving correctness through source reads.
+///
+/// Duplicate node handles are attached at most once. Commit-DAG failures and
+/// invalid caller frontiers still return normally because they prevent an
+/// exact residual from being computed.
+pub fn resolve_resident_range_cover<R, D, K>(
+    reader: &R,
+    dag: &mut D,
+    kind: &K,
+    rollups: &[RollupRecord],
+    frontier: &[CommitHandle],
+) -> Result<ResidentRangeCover<K::StoredArtifact, K::Segment>, RangeValidationError<D::Error>>
+where
+    R: BlobStoreGet,
+    D: CommitDag,
+    K: IndexKind,
+{
+    let mut rollups = rollups.to_vec();
+    rollups.sort_unstable_by_key(|record| (record.node().raw, record.range_record().raw));
+
+    let mut admitted = HashSet::new();
+    let mut resident = HashMap::new();
+    for rollup in rollups {
+        if admitted.contains(&rollup.node()) {
+            continue;
+        }
+        let Ok(node) = load_range(reader, kind, rollup) else {
+            continue;
+        };
+        let Ok(segments) = attach_range(reader, kind, &node) else {
+            continue;
+        };
+        admitted.insert(node.handle());
+        resident.insert(node.handle(), ResidentRangeNode { node, segments });
+    }
+
+    let candidates: Vec<_> = resident
+        .values()
+        .map(|resident| resident.node.candidate())
+        .collect();
+    let selection = select_range_cover(dag, &candidates, frontier)?;
+    let residual = selection.residual().to_vec();
+    let selected = selection
+        .selected()
+        .iter()
+        .map(|handle| {
+            resident
+                .remove(handle)
+                .expect("cover selection returns only supplied candidates")
+        })
+        .collect();
+
+    Ok(ResidentRangeCover { selected, residual })
 }
 
 fn make_entry<K: IndexKind>(
@@ -1901,6 +2005,58 @@ mod tests {
 
         assert_eq!(TribleSet::from(&first_attached[0]), first_source);
         assert_eq!(TribleSet::from(&second_attached[0]), second_source);
+    }
+
+    #[test]
+    fn missing_large_offer_does_not_starve_a_smaller_resident_cover() {
+        let mut storage = MemoryBlobStore::new();
+        let kind = SuccinctRollup::new();
+        let first = commit(1);
+        let second = commit(2);
+        let third = commit(3);
+        let mut dag = HashMap::from([
+            (first, Vec::new()),
+            (second, vec![first]),
+            (third, vec![second]),
+        ]);
+
+        let large = store_range(
+            &mut storage,
+            &kind,
+            CommitRange::new(vec![first], vec![third]).unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        let missing_large = RollupRecord::new(
+            large.core().handle(),
+            Inline::<Handle<SimpleArchive>>::new([0xff; 32]),
+        );
+        let small_source = source("resident");
+        let small = store_succinct_range(
+            &mut storage,
+            &kind,
+            &small_source,
+            CommitRange::new(vec![first], vec![second]).unwrap(),
+        );
+
+        let reader = storage.reader().unwrap();
+        let cover = resolve_resident_range_cover(
+            &reader,
+            &mut dag,
+            &kind,
+            &[missing_large, small.rollup_record(), small.rollup_record()],
+            &[third],
+        )
+        .unwrap();
+
+        assert_eq!(cover.selected().len(), 1);
+        assert_eq!(cover.selected()[0].node().handle(), small.handle());
+        assert_eq!(cover.selected()[0].segments().len(), 1);
+        assert_eq!(
+            TribleSet::from(&cover.selected()[0].segments()[0]),
+            small_source
+        );
+        assert_eq!(cover.residual(), &[third]);
     }
 
     #[test]
