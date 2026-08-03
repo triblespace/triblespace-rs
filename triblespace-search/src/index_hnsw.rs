@@ -272,10 +272,11 @@ where
 ///
 /// Each graph proposes candidates independently. The union is deduplicated
 /// and rescored with exact cosine against the vector resolved from
-/// `query_handle` before sorting. Resolving one authoritative query source
-/// prevents a caller from walking the graph with one vector and reranking it
-/// with another. Any unreadable, wrong-width, or non-finite vector is an
-/// error; incomplete rankings are never returned as successes.
+/// `query_handle`, filtered against `floor` again, then sorted by score and
+/// handle. Resolving one authoritative query source prevents a caller from
+/// walking the graph with one vector and reranking it with another. Any
+/// unreadable, wrong-width, or non-finite vector is an error; incomplete
+/// rankings are never returned as successes.
 pub fn nearest_across<B>(
     segments: &[SuccinctHNSWIndex],
     store: &B,
@@ -350,10 +351,19 @@ where
                     format!("HNSW candidate {:?} produced a non-finite cosine", handle).into(),
                 );
             }
-            rows.push((cosine, handle));
+            // The graph score is only a candidate-generation hint. Reapply
+            // the caller's contract to the authoritative exact rescore.
+            if cosine >= floor {
+                rows.push((cosine, handle));
+            }
         }
     }
-    rows.sort_by(|left, right| right.0.total_cmp(&left.0));
+    rows.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.raw.cmp(&right.1.raw))
+    });
     Ok(rows)
 }
 
@@ -482,6 +492,38 @@ mod tests {
         let ranked = nearest_across(&[segment], &reader, *probe, 0.0).unwrap();
         assert_eq!(ranked[0].1, *probe);
         assert_eq!(ranked[0].1, brute_top1(&table, vector));
+    }
+
+    #[test]
+    fn exact_rescore_contract_is_thresholded_and_tie_deterministic() {
+        let mut storage = MemoryRepo::default();
+        let (left_source, left_handle) = stage(&mut storage, emb.id(), *fucid(), vec![0.8, 0.6]);
+        let (right_source, right_handle) = stage(&mut storage, emb.id(), *fucid(), vec![0.8, -0.6]);
+        let query = put_embedding(&mut storage, vec![1.0, 0.0]).unwrap();
+        let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
+        let left = build_segment(&kind, &left_source);
+        let right = build_segment(&kind, &right_source);
+        let reload = |segment: &SuccinctHNSWIndex| {
+            SuccinctHNSWIndex::try_from_blob(Blob::new(segment.bytes.clone())).unwrap()
+        };
+        let reader = storage.reader().unwrap();
+
+        let forward =
+            nearest_across(&[reload(&left), reload(&right)], &reader, query, 0.5).unwrap();
+        let reverse = nearest_across(&[right, left], &reader, query, 0.5).unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 2);
+        assert!(forward.iter().all(|(score, _)| *score >= 0.5));
+        let mut expected = [left_handle, right_handle];
+        expected.sort_unstable_by_key(|handle| handle.raw);
+        assert_eq!(
+            forward
+                .iter()
+                .map(|(_, handle)| *handle)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
