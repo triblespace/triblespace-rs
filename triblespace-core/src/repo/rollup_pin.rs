@@ -2,9 +2,10 @@
 //!
 //! A rollup pin is identified by a source branch and an index recipe. The
 //! source branch's author occupies the generic [`PinIdentity`] author slot;
-//! the typed descriptor contains the source [`BranchPinDescriptor`] handle and
-//! recipe id. Each assertion atomically pairs two exact [`SimpleArchive`]
-//! handles:
+//! the typed descriptor contains the source branch-name handle and recipe id.
+//! Together, the generic author and that name are the exact [`BranchIdentity`]
+//! without nesting another pin descriptor. Each assertion atomically pairs two
+//! exact [`SimpleArchive`] handles:
 //!
 //! - the assertion value is a core-only range record and stays hard;
 //! - the opaque label is one complete artifact node for that range and stays
@@ -24,7 +25,7 @@ use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hex_literal::hex;
 
-use super::branch_pin::{BranchIdentity, BranchPinDescriptor};
+use super::branch_pin::BranchIdentity;
 use super::pin_assertion::{
     PinAssertion, PinAssertionId, PinAssertionSnapshot, PinAssertionStore, PinHandle, PinIdentity,
     SubsumptionLabel, ValueHandle,
@@ -53,9 +54,12 @@ pub const ROLLUP_PIN_DESCRIPTOR_V1: [u8; 16] = hex!("0E1295F9D56242186CA30D3B7BB
 /// Blob encoding for one branch-and-recipe rollup G-set.
 ///
 /// The canonical bytes are `kind marker [16] | zero padding [16] | source
-/// BranchPinDescriptor handle [32] | recipe id [16]`. The padding aligns the
-/// source descriptor handle for conservative closure discovery. The generic
-/// pin is a [`StrongPinDescriptor`] around this descriptor's content handle.
+/// branch-name handle [32] | recipe id [16]`. The padding aligns the name
+/// handle for conservative closure discovery. The generic assertion author and
+/// source name are the [`BranchIdentity`]; the V1 marker supplies the source-
+/// branch meaning without a nested [`super::branch_pin::BranchPinDescriptor`].
+/// The generic pin is a [`StrongPinDescriptor`] around this descriptor's
+/// content handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RollupPinDescriptor;
 
@@ -67,7 +71,7 @@ impl MetaDescribe for RollupPinDescriptor {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "rollup-pin-descriptor-v1",
-                metadata::description: "Canonical inner descriptor for one asserted branch rollup G-set: a V1 kind marker, sixteen zero padding bytes, the aligned BranchPinDescriptor handle of the source branch, and the index recipe id. A StrongPinDescriptor wraps its content handle so core-only range-record assertion values remain hard; each opaque assertion label names one complete unowned artifact node.",
+                metadata::description: "Canonical inner descriptor for one asserted branch rollup G-set: a V1 kind marker, sixteen zero padding bytes, the aligned LongString name handle of the source branch, and the index recipe id. The generic assertion author plus the name handle form the exact BranchIdentity. A StrongPinDescriptor wraps its content handle so core-only range-record assertion values remain hard; each opaque assertion label names one complete unowned artifact node.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -76,14 +80,14 @@ impl MetaDescribe for RollupPinDescriptor {
 /// The typed content decoded from a canonical rollup-pin descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RollupPinKey {
-    source_branch: Inline<Handle<BranchPinDescriptor>>,
+    source_name: Inline<Handle<LongString>>,
     recipe: Id,
 }
 
 impl RollupPinKey {
-    /// Exact inner descriptor handle of the source branch.
-    pub const fn source_branch(&self) -> Inline<Handle<BranchPinDescriptor>> {
-        self.source_branch
+    /// Exact content-addressed name handle of the source branch.
+    pub const fn source_name(&self) -> Inline<Handle<LongString>> {
+        self.source_name
     }
 
     /// Index recipe whose range records form this rollup set.
@@ -100,7 +104,7 @@ impl RollupPinDescriptor {
     ) -> [u8; ROLLUP_PIN_DESCRIPTOR_LEN] {
         let mut raw = [0u8; ROLLUP_PIN_DESCRIPTOR_LEN];
         raw[..16].copy_from_slice(&ROLLUP_PIN_DESCRIPTOR_V1);
-        raw[32..64].copy_from_slice(&BranchPinDescriptor::descriptor_handle(source_name).raw);
+        raw[32..64].copy_from_slice(&source_name.raw);
         raw[64..].copy_from_slice(&recipe.raw());
         raw
     }
@@ -162,12 +166,11 @@ impl TryFromBlob<RollupPinDescriptor> for RollupPinKey {
         if bytes[16..32].iter().any(|byte| *byte != 0) {
             return Err(RollupPinDescriptorError::NonZeroReserved);
         }
-        let source_branch =
-            Inline::new(bytes[32..64].try_into().expect("descriptor length checked"));
+        let source_name = Inline::new(bytes[32..64].try_into().expect("descriptor length checked"));
         let recipe = Id::new(bytes[64..80].try_into().expect("descriptor length checked"))
             .ok_or(RollupPinDescriptorError::NilRecipe)?;
         Ok(Self {
-            source_branch,
+            source_name,
             recipe,
         })
     }
@@ -546,6 +549,7 @@ mod tests {
 
     #[test]
     fn descriptor_is_canonical_typed_content_and_roundtrips() {
+        let source_author = key(13).verifying_key();
         let source_name = name(7);
         let recipe = recipe(11);
         let blob = RollupPinDescriptor::blob(source_name, recipe);
@@ -555,10 +559,7 @@ mod tests {
         assert_eq!(blob.bytes.len(), ROLLUP_PIN_DESCRIPTOR_LEN);
         assert_eq!(&blob.bytes[..16], &ROLLUP_PIN_DESCRIPTOR_V1);
         assert_eq!(&blob.bytes[16..32], &[0u8; 16]);
-        assert_eq!(
-            &blob.bytes[32..64],
-            &BranchPinDescriptor::descriptor_handle(source_name).raw
-        );
+        assert_eq!(&blob.bytes[32..64], &source_name.raw);
         assert_eq!(&blob.bytes[64..], &recipe.raw());
         assert_eq!(
             RollupPinDescriptor::descriptor_handle(source_name, recipe),
@@ -570,11 +571,38 @@ mod tests {
         );
 
         let decoded: RollupPinKey = blob.try_from_blob().unwrap();
-        assert_eq!(
-            decoded.source_branch(),
-            BranchPinDescriptor::descriptor_handle(source_name)
-        );
+        assert_eq!(decoded.source_name(), source_name);
         assert_eq!(decoded.recipe(), recipe);
+
+        let decoded_source = BranchIdentity::new(source_author, decoded.source_name());
+        let expected_source = BranchIdentity::new(source_author, source_name);
+        assert_eq!(decoded_source, expected_source);
+        assert_eq!(
+            decoded_source.pin_identity(),
+            expected_source.pin_identity(),
+            "the assertion author plus decoded name reconstruct the current source branch pin"
+        );
+    }
+
+    #[test]
+    fn aligned_descriptor_discovers_the_present_source_name_directly() {
+        use crate::blob::MemoryBlobStore;
+        use crate::repo::{BlobChildren, BlobStore, BlobStorePut};
+
+        let mut store = MemoryBlobStore::new();
+        let source_name = store
+            .put::<LongString, _>("rollup-source".to_owned())
+            .unwrap();
+        let descriptor = store
+            .put::<RollupPinDescriptor, _>(RollupPinDescriptor::blob(source_name, recipe(5)))
+            .unwrap();
+        let reader = store.reader().unwrap();
+
+        assert_eq!(
+            reader.children(descriptor.transmute()),
+            vec![source_name.transmute()],
+            "the rollup descriptor reaches the name without a branch descriptor blob"
+        );
     }
 
     #[test]

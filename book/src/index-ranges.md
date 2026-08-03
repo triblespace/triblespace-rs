@@ -77,6 +77,13 @@ loader. A recipe identifies the question and its source parameters: for
 example a path automaton fingerprint, a BM25 content attribute, or an HNSW
 source attribute and dimension.
 
+The descriptor stores the source branch's aligned `LongString` name handle
+directly. Its generic assertion author plus that handle are already the exact
+`BranchIdentity`; nesting a `BranchPinDescriptor` would only couple this rollup
+identity to the source assertion's encoding and add a closure lookup. The
+rollup V1 marker supplies the source-branch meaning, while its zero padding
+keeps the name handle visible to conservative reachability scanning.
+
 One published rollup alternative is a pair of content-addressed archives:
 
 ```text
@@ -267,6 +274,12 @@ The hard core currently contains aligned commit handles. Strong reachability
 therefore retains its boundary commits and reachable source ancestry. That is
 redundant while the source branch is already strong, but it guarantees that the
 residual fallback remains available.
+
+The aligned source-name handle in the rollup descriptor is likewise reached
+directly. A rollup does not retain a nested branch descriptor merely to name
+its source; the source branch's own assertion retains its descriptor, while
+the rollup's generic author and direct name remain sufficient to reconstruct
+the `BranchIdentity`.
 
 Rollup caching requires no transaction over an artifact: partially downloaded
 blobs are inert until the whole node thaws. Stores with garbage collection do

@@ -18,11 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifact- and recipe-neutral range core. Core identity contains only the
   inclusive commit frontiers, so equal ranges reuse one core across recipes.
 - A typed grow-only `RollupPinDescriptor` identifies each source branch and
-  recipe. Every signed assertion pairs a hard core-only range-record value with
-  one complete unowned node in its opaque label. Nodes sharing a core remain
-  atomic alternatives, while repeated typed facts inside one node are
-  conjunctive segments. Completed-empty ranges share the canonical empty
-  `SimpleArchive` node.
+  recipe. Its generic assertion author plus aligned source-name handle form the
+  exact `BranchIdentity` directly, without nesting a `BranchPinDescriptor`.
+  Every signed assertion pairs a hard core-only range-record value with one
+  complete unowned node in its opaque label. Nodes sharing a core remain atomic
+  alternatives, while repeated typed facts inside one node are conjunctive
+  segments. Completed-empty ranges share the canonical empty `SimpleArchive`
+  node.
 - `select_range_cover` deterministically admits fully resident standalone
   nodes against the authoritative source frontier and returns every uncovered
   commit as an exact source-data residual. The typed rollup-pin projection is

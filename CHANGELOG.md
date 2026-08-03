@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Rollup identities name their source branch directly.** The typed rollup
+  descriptor stores the aligned source-name handle rather than the handle of a
+  nested branch descriptor. Together with the generic assertion author this is
+  already the exact `BranchIdentity`, removes one closure lookup, and leaves
+  branch assertion encoding independent of derived-index identity.
 - **Rollup artifact nodes are range-neutral.** `IndexKind::freeze` and `thaw`
   no longer receive a range entity; each kind persists one deterministic
   artifact-rooted fragment instead. Identical physical artifacts can therefore
