@@ -51,20 +51,16 @@
 //! compilation (the design point of this file), never emulated at runtime.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
 use triblespace_core::prelude::*;
-use triblespace_core::query::unionconstraint::UnionConstraint;
-use triblespace_core::query::{Constraint, Term};
 use triblespace_core::repo::index_home::{
-    resolve_resident_range_cover, store_range, IndexKind, SuccinctRollup, UnionArchive,
+    resolve_resident_range_cover, store_range, IndexKind, ResidentResidual, SuccinctRollup,
 };
 use triblespace_core::repo::index_range::{convex_union, CommitRange};
 use triblespace_core::repo::pile::Pile;
@@ -355,55 +351,6 @@ fn measure_queries<S: TriblePattern>(
         })
         .collect();
     (keyed, final_counts)
-}
-
-/// Query view for the exact read-time law: every triple pattern is evaluated
-/// against either a selected resident Succinct shard or the uncovered source
-/// facts. The boxed union is intentionally local to the benchmark; it lets a
-/// multi-clause query join values across the storage boundary instead of
-/// running two whole queries and incorrectly unioning their final rows.
-struct ResidentResidual {
-    resident: Option<UnionArchive<OrderedUniverse>>,
-    residual: TribleSet,
-}
-
-impl ResidentResidual {
-    fn new(artifacts: Vec<SuccinctArchive<OrderedUniverse>>, residual: TribleSet) -> Self {
-        assert!(
-            !artifacts.is_empty() || !residual.is_empty(),
-            "resident+residual source cannot be empty"
-        );
-        Self {
-            resident: (!artifacts.is_empty()).then(|| SuccinctRollup::union(&artifacts)),
-            residual,
-        }
-    }
-}
-
-impl TriblePattern for ResidentResidual {
-    type PatternConstraint<'a>
-        = Arc<UnionConstraint<Box<dyn Constraint<'a> + Send + Sync + 'a>>>
-    where
-        Self: 'a;
-
-    fn pattern<'a, V: InlineEncoding>(
-        &'a self,
-        e: impl Into<Term<GenId>>,
-        a: impl Into<Term<GenId>>,
-        v: impl Into<Term<V>>,
-    ) -> Self::PatternConstraint<'a> {
-        let e = e.into();
-        let a = a.into();
-        let v = v.into();
-        let mut sources: Vec<Box<dyn Constraint<'a> + Send + Sync + 'a>> = Vec::with_capacity(2);
-        if let Some(resident) = &self.resident {
-            sources.push(Box::new(resident.pattern(e, a, v)));
-        }
-        if !self.residual.is_empty() {
-            sources.push(Box::new(self.residual.pattern(e, a, v)));
-        }
-        Arc::new(UnionConstraint::new(sources))
-    }
 }
 
 // ---------------------------------------------------------------------------

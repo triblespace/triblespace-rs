@@ -186,6 +186,13 @@ covered commits union residual commits == T(H)
 covered commits intersect residual commits == empty
 ```
 
+For Succinct rollups, `ResidentResidual` turns the selected artifacts and the
+checked-out residual facts into one `TriblePattern`. The union is below the
+query's conjunction, at each individual trible pattern, so clauses may join
+across the resident/source boundary without materializing a combined archive.
+Overlapping facts are deduplicated with set semantics, and an empty resident
+side, residual side, or whole source uses the same API.
+
 A missing large alternative is omitted before selection, so it cannot starve a
 smaller resident node. DAG failures and invalid caller frontiers still fail:
 without a trustworthy target set, an exact residual cannot be computed.

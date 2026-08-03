@@ -851,40 +851,69 @@ where
     }
 }
 
+/// One set-shaped query source over resident Succinct artifacts and uncovered
+/// source facts.
+///
+/// The union happens independently for every trible pattern. A multi-clause
+/// query may therefore join a fact found in a resident artifact with one found
+/// in the residual [`TribleSet`]. [`UnionConstraint`] also deduplicates
+/// overlapping facts, so the view has set rather than bag semantics.
+///
+/// Either side may be empty, including both. The all-empty case is represented
+/// by the residual set's ordinary empty constraint rather than a zero-arm
+/// union.
+pub struct ResidentResidual<U> {
+    resident: Option<UnionArchive<U>>,
+    residual: TribleSet,
+}
+
+impl<U> ResidentResidual<U> {
+    /// Construct a read view from the locally attached artifacts and the exact
+    /// source facts for uncovered commits.
+    pub fn new(artifacts: impl Into<Arc<[SuccinctArchive<U>]>>, residual: TribleSet) -> Self {
+        let artifacts = artifacts.into();
+        Self {
+            resident: (!artifacts.is_empty()).then(|| UnionArchive::new(artifacts)),
+            residual,
+        }
+    }
+}
+
+impl<U> TriblePattern for ResidentResidual<U>
+where
+    U: Universe + Send + Sync,
+{
+    type PatternConstraint<'a>
+        = UnionConstraint<Box<dyn Constraint<'a> + Send + Sync + 'a>>
+    where
+        Self: 'a;
+
+    fn pattern<'a, V: InlineEncoding>(
+        &'a self,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
+    ) -> Self::PatternConstraint<'a> {
+        let e = e.into();
+        let a = a.into();
+        let v = v.into();
+        let mut sources: Vec<Box<dyn Constraint<'a> + Send + Sync + 'a>> = Vec::with_capacity(2);
+        if let Some(resident) = &self.resident {
+            sources.push(Box::new(resident.pattern(e, a, v)));
+        }
+        if !self.residual.is_empty() || sources.is_empty() {
+            sources.push(Box::new(self.residual.pattern(e, a, v)));
+        }
+        UnionConstraint::new(sources)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blob::MemoryBlobStore;
     use crate::id::{fucid, ExclusiveId};
     use crate::repo::BlobStorePut;
-
-    struct ResidentResidual {
-        resident: UnionArchive<OrderedUniverse>,
-        residual: TribleSet,
-    }
-
-    impl TriblePattern for ResidentResidual {
-        type PatternConstraint<'a>
-            = Arc<UnionConstraint<Box<dyn Constraint<'a> + Send + Sync + 'a>>>
-        where
-            Self: 'a;
-
-        fn pattern<'a, V: InlineEncoding>(
-            &'a self,
-            e: impl Into<Term<GenId>>,
-            a: impl Into<Term<GenId>>,
-            v: impl Into<Term<V>>,
-        ) -> Self::PatternConstraint<'a> {
-            let e = e.into();
-            let a = a.into();
-            let v = v.into();
-            Arc::new(UnionConstraint::new(vec![
-                Box::new(self.resident.pattern(e, a, v))
-                    as Box<dyn Constraint<'a> + Send + Sync + 'a>,
-                Box::new(self.residual.pattern(e, a, v)),
-            ]))
-        }
-    }
 
     struct SilentArtifactKind;
 
@@ -1177,10 +1206,7 @@ mod tests {
             .iter()
             .filter_map(|node| node.artifact().cloned())
             .collect::<Vec<_>>();
-        let mixed = ResidentResidual {
-            resident: SuccinctRollup::union(&artifacts),
-            residual: residual.clone(),
-        };
+        let mixed = ResidentResidual::new(artifacts, residual.clone());
         let mut monolithic = resident;
         monolithic += residual;
 
@@ -1205,6 +1231,54 @@ mod tests {
 
         assert_eq!(mixed_rows, monolithic_rows);
         assert_eq!(mixed_rows, vec![(subject.to_owned(),)]);
+    }
+
+    #[test]
+    fn resident_residual_deduplicates_overlapping_facts() {
+        let subject = fucid();
+        let tag = fucid();
+        let facts: TribleSet = entity! { &subject @ metadata::tag: &tag }.into_facts();
+        let archive: SuccinctArchive<OrderedUniverse> = (&facts).into();
+        let mixed = ResidentResidual::new(vec![archive], facts);
+
+        let rows = find!(
+            (entity: Id),
+            pattern!(&mixed, [{ ?entity @ metadata::tag: &tag }])
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(rows, vec![(subject.to_owned(),)]);
+    }
+
+    #[test]
+    fn resident_residual_accepts_empty_sides() {
+        let subject = fucid();
+        let tag = fucid();
+        let facts: TribleSet = entity! { &subject @ metadata::tag: &tag }.into_facts();
+        let archive: SuccinctArchive<OrderedUniverse> = (&facts).into();
+        let resident_only = ResidentResidual::new(vec![archive], TribleSet::new());
+        let residual_only = ResidentResidual::<OrderedUniverse>::new(Vec::new(), facts.clone());
+        let empty = ResidentResidual::<OrderedUniverse>::new(Vec::new(), TribleSet::new());
+
+        let resident_rows = find!(
+            (entity: Id),
+            pattern!(&resident_only, [{ ?entity @ metadata::tag: &tag }])
+        )
+        .collect::<Vec<_>>();
+        let residual_rows = find!(
+            (entity: Id),
+            pattern!(&residual_only, [{ ?entity @ metadata::tag: &tag }])
+        )
+        .collect::<Vec<_>>();
+        let empty_rows = find!(
+            (entity: Id),
+            pattern!(&empty, [{ ?entity @ metadata::tag: &tag }])
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(resident_rows, vec![(subject.to_owned(),)]);
+        assert_eq!(residual_rows, resident_rows);
+        assert!(empty_rows.is_empty());
     }
 
     #[test]

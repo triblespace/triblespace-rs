@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Succinct rollup reads have one set-shaped resident/residual source.**
+  `ResidentResidual` exposes selected Succinct artifacts together with
+  uncovered `TribleSet` facts as one `TriblePattern`, allowing multi-clause
+  joins to cross the storage boundary without materializing a merged archive.
+  Duplicate facts and empty sides retain exact set semantics.
 - **BM25 rollups are exact under repartition.** Succinct BM25 blobs now persist
   exact bit-packed raw term frequencies rather than quantized scores. Builders
   and rollup compaction share the `(Docs union, pointwise-max TF)` algebra,
