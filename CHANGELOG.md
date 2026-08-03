@@ -175,6 +175,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Commit-range boundaries accept set-shaped input.** `CommitRange::new`
+  sorts and deduplicates each nonempty boundary, so repeated caller values
+  produce exactly the same canonical entity and serialized facts as their
+  unique set instead of returning a structural error.
 - **Range-cover selection exposes only executable state.** Invalid rollup
   offers are still ignored independently, but the diagnostic-only rejected
   node list is no longer retained in `RangeCoverSelection`; consumers receive
