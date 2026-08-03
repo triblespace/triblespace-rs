@@ -60,7 +60,7 @@ fn main() {
         .map(|archive| archive.eav_c.len())
         .sum::<usize>();
     eprintln!(
-        "built {} input segments / {input_rows} threshold rows in {:.3}s",
+        "built {} input segments / {input_rows} summed rows in {:.3}s",
         archives.len(),
         start.elapsed().as_secs_f64()
     );
@@ -83,7 +83,7 @@ fn main() {
     assert_eq!(accelerated.bytes.as_ref(), cpu.bytes.as_ref());
 
     println!("base rows per input segment: {rows}");
-    println!("threshold input rows: {input_rows}");
+    println!("summed input rows: {input_rows}");
     println!("deduplicated output rows: {}", cpu.eav_c.len());
     println!("CPU structural merge: {cpu_seconds:.3}s");
     println!("WGPU structural merge: {gpu_seconds:.3}s");

@@ -208,10 +208,11 @@ prioritized for efficient zero-copy access.
   materialisation currently selects one matching body; either make the schema
   cardinality explicit or make resolution deterministic and test it.
 - The optional CubeCL succinct-merge backend's per-level block-prefix scan is
-  still one serial device thread. Packed CPU reduced the measured WGPU gain to
-  5–8% on large Apple Metal tiers; investigate a hierarchical device scan and
-  rotation batching before considering GPU acceleration for default archive
-  maintenance. Keep the summed-input crossover hardware-calibrated.
+  still one serial device thread. The current parallel packed CPU path beats
+  WGPU on small Apple Metal merges and tied it at 315k summed input rows in the
+  clean 2026-08-03 confirmation. Measure CUDA on Spark, then investigate a
+  hierarchical device scan and rotation batching before restoring any
+  high-level accelerated rollup adapter.
 - Yard collection currently evicts blobs from per-generation live PATCH sets
   while leaving the append-only Pile records in place. Add a future physical
   compaction/rewrite path when Yard needs to reclaim disk space, preserving

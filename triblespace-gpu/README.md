@@ -99,29 +99,13 @@ for the lighter membership shape. `16_384` is the single-knob compromise; use
 cargo test -p triblespace-gpu --release --test batch_confirm_parity -- --ignored --nocapture confirm_crossover_sweep
 ```
 
-## Structural merge acceleration
+## Structural merge backend
 
-The production rollup type is
-`triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:
-
-```rust,no_run
-# #[cfg(feature = "wgpu")]
-# {
-use triblespace_core::repo::index_home::AcceleratedSuccinctRollup;
-use triblespace_gpu::WgpuWaveletFreeze;
-
-let backend = WgpuWaveletFreeze::new(&Default::default());
-// This is the sum of rows in the input segments, before merge deduplication.
-let rollup = AcceleratedSuccinctRollup::new(backend, 300_000);
-# let _ = rollup;
-# }
-```
-
-The wrapper uses the accelerator only at or above the configured
-`min_input_rows`. A returned backend error triggers one canonical CPU retry and
-opens a circuit breaker, so subsequent merges stay on CPU until
-`reset_accelerator()` is called. This is deliberately not unwind containment:
-panics, aborts, allocation failures, and OOM are not caught.
+Core exposes the stateless `WaveletMatrixFreezeBackend` trait and
+`merge_ordered_archives_with_backend` experiment seam. Domain remapping, the
+canonical EAV union, the other Ring rotations, prefix vectors, section order,
+and Rank9 attachment remain in Core; a backend only freezes the six wavelet
+matrices. Successful output is byte-identical to the canonical CPU builder.
 
 Core cheaply validates plane shape, every all-zero plane before the sequence's
 highest set bit, that first informative plane pointwise, and zero tail padding.
@@ -132,99 +116,48 @@ boundary. This CubeCL backend explicitly synchronizes queued commands before
 readback so device validation errors are returned rather than mistaken for zero
 or stale output.
 
+There is deliberately no high-level adaptive rollup wrapper. A derived rollup
+is an optional offer: if accelerated compaction fails, publish nothing and
+retain the previous cover plus exact source residual. Callers that want CPU
+execution already have `SuccinctRollup`; hiding CPU fallback, a row threshold,
+and a process-local circuit breaker inside one kind would mix physical
+strategies without improving correctness.
+
 Repository builds patch CubeCL 0.10's runtime and WGPU crates to the project's
 fork, which exposes immutable external-buffer registration for mmap-to-Metal
 aliasing. Cargo patches are root-local, so application workspaces that need the
-aliasing seam must select the same fork themselves. The current compaction
-backend still uploads a newly materialized `u32` rotation and reads the packed
-planes back; merely selecting the fork does not make that transient path
-zero-copy.
-
-## Runtime selection in `faculties/archive`
-
-`faculties` can keep its default build GPU-free with an optional feature:
-
-```toml
-[features]
-gpu-succinct = ["dep:triblespace-gpu", "triblespace-gpu/wgpu"]
-
-[dependencies]
-triblespace-gpu = { path = "../triblespace-rs/triblespace-gpu", optional = true, default-features = false }
-```
-
-At runtime, the archive command can branch once on its CLI/config choice and
-call the same generic indexing helper with either `SuccinctRollup::new()` or
-`AcceleratedSuccinctRollup::new(WgpuWaveletFreeze::new(&Default::default()),
-min_input_rows)`. The two kinds intentionally share the same kind id and segment
-bytes. No GPU dependency reaches core or a default faculties build; only a
-faculties binary compiled with `gpu-succinct` can select WGPU at runtime.
+aliasing seam must select the same fork themselves. The current backend still
+uploads a newly materialized `u32` rotation and reads the packed planes back;
+merely selecting the fork does not make that transient path zero-copy.
 
 ## Validation and benchmark
 
-CPU-only validation does not compile CubeCL:
+CPU-only validation does not compile CubeCL. WGPU parity and the structural
+benchmark are opt-in:
 
 ```sh
-cargo test -p triblespace-gpu --no-default-features
-```
-
-The WGPU parity gate and full structural benchmark are opt-in:
-
-```sh
+cargo test -p triblespace-gpu --no-default-features --lib
 cargo test -p triblespace-gpu --features wgpu --test batch_confirm_parity
 cargo run --release -p triblespace-gpu --features wgpu --example archive_merge -- 100000
 ```
 
 WGPU has runtime parity coverage on Apple Metal. CUDA exposes the same CubeCL
-kernels and is compile-checked, but remains experimental until the parity gate
-has also run on CUDA hardware.
+kernels and is compile-checked, but remains experimental until parity and
+performance have also been measured on CUDA hardware.
 
-Initial Apple Metal measurements from 2026-07-12 used CubeCL 0.9, three
-overlapping segments, and warm shaders and allocator state. They predate both
-the move to the project's shared CubeCL 0.10 runtime lineage and the
-materialize-once rotation pipeline, parallel source decode, and parallel packed
-CPU freeze, and are retained as the optimization baseline. The threshold
-column is the exact quantity compared by `min_input_rows`.
+A clean 2026-08-03 confirmation on a 16-core Apple M4 Max used CubeCL 0.10,
+three overlapping segments, warm shaders and allocator state, the
+materialize-once rotation pipeline, and the parallel packed CPU builder. Each
+row is the median of five separate process runs; every output was
+byte-identical.
 
-| base rows/input | threshold input rows | output rows | old Jerky CPU | packed CPU | WGPU | WGPU speedup |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1,000 | 3,159 | 3,053 | 27 ms | 18 ms | 48 ms | 0.38x |
-| 10,000 | 31,581 | 30,527 | 204 ms | 138 ms | 159 ms | 0.87x |
-| 30,000 | 94,737 | 91,579 | 747 ms | 460 ms | 468 ms | 0.98x |
-| 100,000 | 315,792 | 305,264 | 2.956 s | 1.785 s | 1.708 s | 1.05x |
-| 300,000 | 947,370 | 915,790 | 10.732 s | 6.484 s | 6.104 s | 1.06x |
-
-All initial outputs were byte-identical. At that stage, the packed O(n log σ)
-CPU algorithm superseded the old Jerky O(n log² σ) baseline and left WGPU as
-only a modest upper-tier optimization. `300_000` summed input rows was kept as
-a conservative starting crossover; calibrate it on deployment hardware and do
-not transplant a threshold based only on deduplicated output rows.
-
-Remeasuring current `main` after the materialize-once and parallel CPU work
-shows why that conservative threshold remains useful while the upper-tier GPU
-case became substantially stronger:
-
-| base rows/input | threshold input rows | output rows | parallel CPU | WGPU | WGPU speedup |
+| base rows/input | summed input rows | output rows | parallel CPU median (range) | WGPU median (range) | WGPU speedup |
 |---:|---:|---:|---:|---:|---:|
-| 10,000 | 31,581 | 30,527 | 47 ms | 46 ms | 1.02x |
-| 30,000 | 94,737 | 91,579 | 141 ms | 138 ms | 1.02x |
-| 100,000 | 315,792 | 305,264 | 1.306 s | 0.740 s | 1.76x |
+| 1,000 | 3,159 | 3,053 | 15 ms (15–16) | 56 ms (55–56) | 0.27x |
+| 100,000 | 315,792 | 305,264 | 282 ms (274–291) | 289 ms (280–301) | 0.98x |
 
-All remeasured outputs were again byte-identical. Below roughly 100k summed
-input rows WGPU only ties the CPU path, while the first point above the 300k
-activation threshold has a material win.
-
-After moving the same backend to the shared CubeCL 0.10 fork and Rust 1.92,
-recovered-system repeated runs produced the following medians. The 30k row is
-five runs and the 100k row is three; every output was byte-identical. These are
-not a controlled CubeCL-only comparison with the preceding one-shot table—the
-CPU path also became much faster—so the stable conclusion is the crossover
-shape, not the difference between individual historical timings.
-
-| base rows/input | threshold input rows | output rows | parallel CPU median (range) | WGPU median (range) | paired median speedup |
-|---:|---:|---:|---:|---:|---:|
-| 30,000 | 94,737 | 91,579 | 0.322 s (0.304–0.330) | 0.297 s (0.288–0.366) | 1.06x |
-| 100,000 | 315,792 | 305,264 | 0.533 s (0.529–0.534) | 0.420 s (0.418–0.454) | 1.27x |
-
-Thus 94k summed input rows remains effectively a tie, while 315k retains a
-material GPU win. The conservative 300,000-row activation threshold still
-selects the useful side of the crossover after the runtime migration.
+WGPU therefore loses materially on small structural merges and does not beat
+the current CPU implementation at 315k summed rows on this machine. Preserve
+the low-level seam for CUDA measurement and kernel work; do not restore a
+production rollup adapter until its target backend demonstrates a useful
+deployment-level win.

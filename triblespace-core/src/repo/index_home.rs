@@ -8,14 +8,12 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
-    SuccinctArchiveBlob, SuccinctArchiveConstraint, SuccinctArchiveRank9IndexBlob, Universe,
-    WaveletMatrixFreezeBackend,
+    merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
+    SuccinctArchiveConstraint, SuccinctArchiveRank9IndexBlob, Universe,
 };
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
@@ -627,97 +625,6 @@ impl IndexKind for SuccinctRollup {
             return Ok(None);
         }
         let archive = merge_ordered_archives(artifacts);
-        if archive.eav_c.len() == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(archive))
-        }
-    }
-}
-
-/// Succinct recipe with an optional accelerated wavelet-freeze backend.
-pub struct AcceleratedSuccinctRollup<B> {
-    backend: B,
-    min_input_rows: usize,
-    accelerator_enabled: AtomicBool,
-}
-
-impl<B> AcceleratedSuccinctRollup<B> {
-    /// Construct an accelerated recipe.
-    pub fn new(backend: B, min_input_rows: usize) -> Self {
-        Self {
-            backend,
-            min_input_rows,
-            accelerator_enabled: AtomicBool::new(true),
-        }
-    }
-
-    /// Borrow the configured backend.
-    pub fn backend(&self) -> &B {
-        &self.backend
-    }
-
-    /// Configured CPU/device input-row crossover.
-    pub fn min_input_rows(&self) -> usize {
-        self.min_input_rows
-    }
-
-    /// Whether returned accelerator failures have opened the circuit breaker.
-    pub fn accelerator_enabled(&self) -> bool {
-        self.accelerator_enabled.load(Ordering::Relaxed)
-    }
-
-    /// Re-enable accelerator attempts.
-    pub fn reset_accelerator(&self) {
-        self.accelerator_enabled.store(true, Ordering::Relaxed);
-    }
-}
-
-impl<B> IndexKind for AcceleratedSuccinctRollup<B>
-where
-    B: WaveletMatrixFreezeBackend,
-{
-    type Artifact = SuccinctArchive<OrderedUniverse>;
-
-    fn recipe_id(&self) -> Id {
-        succinct_recipe_id()
-    }
-
-    fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
-        SuccinctRollup.build(source)
-    }
-
-    fn freeze(&self, entity: Id, artifact: &Self::Artifact) -> Result<Fragment, ArtifactError> {
-        SuccinctRollup.freeze(entity, artifact)
-    }
-
-    fn thaw<R: BlobStoreGet>(
-        &self,
-        reader: &R,
-        facts: &TribleSet,
-        entity: Id,
-    ) -> Result<Self::Artifact, ArtifactError> {
-        SuccinctRollup.thaw(reader, facts, entity)
-    }
-
-    fn merge(&self, artifacts: &[Self::Artifact]) -> Result<Option<Self::Artifact>, ArtifactError> {
-        if artifacts.is_empty() {
-            return Ok(None);
-        }
-        let input_rows = artifacts.iter().fold(0usize, |sum, artifact| {
-            sum.saturating_add(artifact.eav_c.len())
-        });
-        let archive = if input_rows >= self.min_input_rows && self.accelerator_enabled() {
-            match merge_ordered_archives_with_backend(artifacts, &self.backend) {
-                Ok(archive) => archive,
-                Err(_) => {
-                    self.accelerator_enabled.store(false, Ordering::Relaxed);
-                    merge_ordered_archives(artifacts)
-                }
-            }
-        } else {
-            merge_ordered_archives(artifacts)
-        };
         if archive.eav_c.len() == 0 {
             Ok(None)
         } else {

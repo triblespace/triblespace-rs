@@ -190,15 +190,6 @@ fn needed_bits(value: usize) -> usize {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "wgpu")]
-    #[test]
-    fn wgpu_rollup_is_send_and_sync_for_parallel_maintenance() {
-        use triblespace_core::repo::index_home::AcceleratedSuccinctRollup;
-
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<AcceleratedSuccinctRollup<WgpuWaveletFreeze>>();
-    }
-
     fn geometry(alphabet_size: usize, len: usize) -> Result<FreezeGeometry, GpuFreezeError> {
         let planes = vec![len.div_ceil(64); needed_bits(alphabet_size)];
         FreezeGeometry::checked(alphabet_size, len, &planes)

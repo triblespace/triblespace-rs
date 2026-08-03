@@ -147,9 +147,9 @@ fn stable_scatter(
 /// one upload, keeps all stable partitions device-resident, explicitly
 /// synchronizes queued work, and then performs one final readback.
 ///
-/// Returned device and geometry errors are suitable for
-/// `AcceleratedSuccinctRollup`'s CPU fallback. Allocation failure, runtime
-/// panic, abort, and OOM are not converted into `GpuFreezeError`.
+/// Device and geometry failures are returned to the caller. Allocation
+/// failure, runtime panic, abort, and OOM are not converted into
+/// `GpuFreezeError`.
 pub struct CubeClWaveletFreeze<R: Runtime> {
     client: ComputeClient<R>,
 }
