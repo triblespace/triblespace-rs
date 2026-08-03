@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Exact commit selections have a pure read-only materializer.**
+  `materialize_commit_contents` loads and set-unions the content of an exact
+  commit slice or iterator through `BlobStoreGet`, without constructing a
+  workspace, resolving a branch, or taking an assertion snapshot.
 - **Generic asserted pins replace kind-specific replicated cells.**
   `PinAssertionStore` is one coherent grow-only set with no update, delete,
   tombstone, CAS, scalar-head, or kind-specific operation. Its canonical
