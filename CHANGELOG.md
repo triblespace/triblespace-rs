@@ -193,8 +193,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Derived indexes are an asserted rollup pool, not a mutable catalog.** For
   each source branch and intrinsic recipe, one grow-only assertion set pairs a
-  hard artifact-neutral range core with one complete but unowned node. Nodes
-  sharing a core remain atomic alternatives; read-time selection admits only
+  hard recipe- and artifact-neutral range core with one complete but unowned
+  node. Nodes sharing a core remain atomic alternatives; read-time selection admits only
   fully resident nodes and returns every uncovered source commit as an exact
   residual. `IndexKind` is one `Artifact` type plus recipe, build, freeze, thaw,
   and merge operations. Recipe identity is a direct `Id`; private intrinsic
@@ -205,8 +205,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vector-of-artifacts shape inside one node without changing the
   several-selected-nodes read model. A distinct soft node is artifact-only:
   the signed pair already associates it with the hard core, so it no longer
-  duplicates recipe or range-boundary facts. `RangeRecord` consequently
-  serializes canonical core facts only.
+  duplicates range-boundary facts. `RangeRecord` consequently serializes only
+  the intrinsic `(commit_start*, commit_end*)` core. Recipe identity lives once
+  in the `(source branch, recipe)` rollup pin descriptor, so identical ranges
+  reuse one core across independent recipes.
   Compaction publishes another immutable pair and never mutates or supersedes
   its victims. Succinct artifacts pair raw archives with source-bound Rank9
   blobs; BM25 rejects empty or noncanonical-tuning artifacts; HNSW rejects
@@ -1417,8 +1419,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intrinsic range-record identities, canonical core facts, deterministic
   cover/residual selection, and convexity-checked range union. The `commit_start` id
   `FC67FFBAD460A96D07EBA341CD4127E7` and `commit_end` id
-  `FAD9B5F3ABA90AC846D08C787A831C7D`, plus the `index_recipe` id
-  `8DB05C6453156E9F3424A2B4BE924513`, were minted with `trible genid` on
+  `FAD9B5F3ABA90AC846D08C787A831C7D` were minted with `trible genid` on
   2026-07-13.
 - **Succinct archives separate canonical raw data from Rank9 acceleration.**
   `SuccinctArchiveBlob` now ends after the deterministic Ring/wavelet sections

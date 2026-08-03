@@ -108,8 +108,6 @@ pub enum RangeNodeError {
     /// The artifact-node archive was empty, used another subject, or contained
     /// range-control facts.
     NodeNotStandalone { entity: Id },
-    /// The stored range belongs to another runtime recipe.
-    RecipeMismatch { expected: Id, actual: Id },
     /// An artifact froze to an empty, unrooted, foreign, or control-bearing fragment.
     InvalidArtifactFragment { entity: Id },
     /// A range record was structurally invalid.
@@ -133,10 +131,6 @@ impl fmt::Display for RangeNodeError {
                     "artifact node for range {entity:x} is empty, uses another subject, or contains range-control facts"
                 )
             }
-            Self::RecipeMismatch { expected, actual } => write!(
-                f,
-                "range recipe {actual:x} does not match runtime recipe {expected:x}"
-            ),
             Self::InvalidArtifactFragment { entity } => write!(
                 f,
                 "index recipe froze an invalid artifact fragment for range {entity:x}"
@@ -182,11 +176,6 @@ impl StoredRangeCore {
     /// Stable intrinsic range entity id.
     pub fn entity(&self) -> Id {
         self.record.entity()
-    }
-
-    /// Recipe owning this range.
-    pub fn recipe(&self) -> Id {
-        self.record.recipe()
     }
 
     /// Inclusive source range.
@@ -295,8 +284,7 @@ fn artifact_facts_are_valid(entity: Id, facts: &TribleSet) -> bool {
             && !matches!(
                 *fact.a(),
                 attribute
-                    if attribute == crate::repo::index_range::index_recipe.id()
-                        || attribute == crate::repo::index_range::commit_start.id()
+                    if attribute == crate::repo::index_range::commit_start.id()
                         || attribute == crate::repo::index_range::commit_end.id()
             )
     })
@@ -316,9 +304,10 @@ fn one_range_record(facts: &TribleSet) -> Result<RangeRecord, RangeNodeError> {
 ///
 /// A present artifact freezes to a nonempty, self-contained fragment rooted at
 /// the intrinsic range entity. Fragment blobs are persisted before either
-/// archive. The core contains exactly `(recipe, commit_start*, commit_end*)`;
-/// a distinct node contains only artifact facts. Empty projections use the
-/// core itself as their node.
+/// archive. The core contains exactly `(commit_start*, commit_end*)`, so the
+/// same range core is reusable across recipe-scoped assertion sets. A distinct
+/// node contains only artifact facts. Empty projections use the core itself as
+/// their node.
 /// The returned value has been reloaded through [`load_range`], so cover
 /// selection cannot observe a node before structural and typed thaw succeeds.
 pub fn store_range<S: BlobStore, K: IndexKind>(
@@ -327,8 +316,7 @@ pub fn store_range<S: BlobStore, K: IndexKind>(
     range: CommitRange,
     artifact: Option<K::Artifact>,
 ) -> Result<StoredRangeNode<K::Artifact>, IndexError> {
-    let recipe = kind.recipe_id();
-    let core_record = RangeRecord::new(recipe, range);
+    let core_record = RangeRecord::new(range);
     let entity = core_record.entity();
     let core_facts = core_record.to_tribles();
 
@@ -373,24 +361,15 @@ pub fn store_range<S: BlobStore, K: IndexKind>(
 /// is deliberately not a query-attachment path: a range becomes eligible for
 /// a read-time cover only after [`load_range`] has also loaded and thawed one
 /// complete typed node. [`resolve_resident_range_cover`] enforces that order.
-pub fn load_range_core<R: BlobStoreGet, K: IndexKind>(
+pub fn load_range_core<R: BlobStoreGet>(
     reader: &R,
-    kind: &K,
     handle: Inline<Handle<SimpleArchive>>,
 ) -> Result<StoredRangeCore, IndexError> {
-    let expected_recipe = kind.recipe_id();
     let core_facts = reader
         .get::<TribleSet, SimpleArchive>(handle)
         .map_err(storage_error)?;
     let core_record = one_range_record(&core_facts)?;
-    if core_record.recipe() != expected_recipe {
-        return Err(RangeNodeError::RecipeMismatch {
-            expected: expected_recipe,
-            actual: core_record.recipe(),
-        }
-        .into());
-    }
-    let canonical_core = RangeRecord::new(expected_recipe, core_record.range().clone());
+    let canonical_core = RangeRecord::new(core_record.range().clone());
     if core_facts != canonical_core.to_tribles() {
         return Err(RangeNodeError::CoreNotStandalone {
             entity: core_record.entity(),
@@ -410,13 +389,15 @@ pub fn load_range_core<R: BlobStoreGet, K: IndexKind>(
 /// the same intrinsic range entity. The hard value must be exactly one
 /// core-only record. A distinct label must be exactly one nonempty artifact
 /// fact set rooted at the core entity; the signed pair supplies their
-/// association.
+/// association. Recipe identity is not duplicated in either archive: callers
+/// must obtain `rollup` from the source-and-recipe-scoped assertion projection
+/// before loading it with the matching kind.
 pub fn load_range<R: BlobStoreGet, K: IndexKind>(
     reader: &R,
     kind: &K,
     rollup: RollupRecord,
 ) -> Result<StoredRangeNode<K::Artifact>, IndexError> {
-    let core = load_range_core(reader, kind, rollup.range_record())?;
+    let core = load_range_core(reader, rollup.range_record())?;
 
     let completed_empty = rollup.node() == rollup.range_record();
     let artifact = if completed_empty {
@@ -448,9 +429,10 @@ pub fn load_range<R: BlobStoreGet, K: IndexKind>(
 ///
 /// Rollup assertions are optimization offers, not source-of-truth metadata.
 /// Each pair must load and thaw as one complete standalone node before its
-/// range becomes eligible. Missing blobs, malformed nodes, foreign recipes,
-/// and typed decode failures therefore only remove that offer from
-/// consideration. [`select_range_cover`] returns every resulting gap in
+/// range becomes eligible. The caller supplies records from exactly one
+/// recipe-scoped rollup pin. Missing blobs, malformed nodes, and typed decode
+/// failures therefore only remove that offer from consideration.
+/// [`select_range_cover`] returns every resulting gap in
 /// `residual`, preserving complete source coverage through fallback reads.
 ///
 /// Duplicate node handles are attached at most once. Commit-DAG failures and
@@ -822,13 +804,13 @@ mod tests {
     use crate::id::{fucid, ExclusiveId};
     use crate::repo::BlobStorePut;
 
-    struct SilentArtifactKind;
+    struct SilentArtifactKind(Id);
 
     impl IndexKind for SilentArtifactKind {
         type Artifact = ();
 
         fn recipe_id(&self) -> Id {
-            succinct_recipe_id()
+            self.0
         }
 
         fn build(&self, _source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
@@ -901,7 +883,7 @@ mod tests {
             stored.core().entity(),
             &node_facts
         ));
-        let core = load_range_core(&reader, &kind, stored.core().handle()).unwrap();
+        let core = load_range_core(&reader, stored.core().handle()).unwrap();
         assert_eq!(core, *stored.core());
         let loaded = load_range(&reader, &kind, stored.rollup_record()).unwrap();
         assert_eq!(loaded.core(), stored.core());
@@ -912,7 +894,7 @@ mod tests {
     #[test]
     fn standalone_empty_range_uses_its_core_as_the_node() {
         let mut storage = MemoryBlobStore::new();
-        let kind = SilentArtifactKind;
+        let kind = SilentArtifactKind(succinct_recipe_id());
         let range = CommitRange::leaf(commit(1));
         let stored = store_range(&mut storage, &kind, range.clone(), None).unwrap();
 
@@ -923,6 +905,22 @@ mod tests {
         let reader = storage.reader().unwrap();
         let loaded = load_range(&reader, &kind, stored.rollup_record()).unwrap();
         assert!(loaded.artifact().is_none());
+    }
+
+    #[test]
+    fn completed_empty_range_reuses_its_core_across_recipes() {
+        let mut storage = MemoryBlobStore::new();
+        let first_kind = SilentArtifactKind(*fucid());
+        let second_kind = SilentArtifactKind(*fucid());
+        let range = CommitRange::leaf(commit(1));
+
+        let first = store_range(&mut storage, &first_kind, range.clone(), None).unwrap();
+        let second = store_range(&mut storage, &second_kind, range, None).unwrap();
+
+        assert_ne!(first_kind.recipe_id(), second_kind.recipe_id());
+        assert_eq!(first.core(), second.core());
+        assert_eq!(first.handle(), first.core().handle());
+        assert_eq!(second.handle(), second.core().handle());
     }
 
     #[test]
@@ -940,7 +938,7 @@ mod tests {
         let mut storage = MemoryBlobStore::new();
         let error = store_range(
             &mut storage,
-            &SilentArtifactKind,
+            &SilentArtifactKind(succinct_recipe_id()),
             CommitRange::leaf(commit(1)),
             Some(()),
         )

@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   facts are not persisted or exposed by the generic lifecycle. Each frozen
   artifact is a self-contained `Fragment`; generic storage persists its typed
   facts and owned blobs as one standalone node over a canonical
-  artifact-neutral range core.
+  artifact- and recipe-neutral range core. Core identity contains only the
+  inclusive commit frontiers, so equal ranges reuse one core across recipes.
 - A typed grow-only `RollupPinDescriptor` identifies each source branch and
   recipe. Every signed assertion pairs a hard core-only range-record value with
   one complete unowned node in its opaque label. Nodes sharing a core remain
@@ -23,11 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conjunctive segments. Completed-empty ranges use their core as the node.
 - `select_range_cover` deterministically admits fully resident standalone
   nodes against the authoritative source frontier and returns every uncovered
-  commit as an exact source-data residual. Off-frontier, overlapping, missing,
-  malformed, and foreign-recipe offers cannot omit source commits. Compaction
-  convex-unions explicitly selected victims and publishes another immutable
-  pair without durable levels, sequences, replacement, or supersession state;
-  exact query equivalence under repartition remains a kind-specific law.
+  commit as an exact source-data residual. The typed rollup-pin projection is
+  the sole recipe partition; off-frontier, overlapping, missing, and malformed
+  offers cannot omit source commits. Compaction convex-unions explicitly
+  selected victims and publishes another immutable pair without durable
+  levels, sequences, replacement, or supersession state; exact query
+  equivalence under repartition remains a kind-specific law.
 - Hard retention is now an explicit `StrongPinDescriptor` decorator rather
   than a branch-special case in Yard. The canonical V1 wrapper contains an
   exact inner descriptor handle; authentic assertions sharing its outer pin

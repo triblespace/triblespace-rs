@@ -190,8 +190,9 @@ durable append point.
 ## What a persisted summary means
 
 The automaton is part of the recipe identity. Two `PathRollup`s with different
-automata have different fingerprints, range cores, and artifact nodes even when
-they cover the same commits.
+automata have different fingerprints and artifact nodes even when they cover
+the same commits. Their recipe-scoped pin sets may reuse the same canonical
+range core because that core identifies only the covered commit region.
 
 Each nonempty range stores a canonical `PathSummaryBlob` containing only:
 

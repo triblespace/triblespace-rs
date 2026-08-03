@@ -85,8 +85,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   identity includes its source-content attribute. HNSW identity includes its
   source-embedding attribute and dimension; graph construction uses one fixed
   deterministic seed rather than a recipe knob. Parameter-distinct recipes
-  remain isolated by their immutable range cores while sharing the same
-  canonical physical blob encodings.
+  remain isolated by their rollup-pin identities while equal commit regions
+  reuse the same recipe-neutral range core and canonical physical blob
+  encodings.
 - Empty projections now produce zero physical artifacts while retaining their
   logical range record. Repeated typed facts are conjunctive physical shards
   within one complete node; distinct nodes remain atomic alternatives.

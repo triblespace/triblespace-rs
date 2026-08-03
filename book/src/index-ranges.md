@@ -68,10 +68,14 @@ range start.
 
 ## Stable cores and atomic nodes
 
-A `RangeRecord` has an intrinsic entity id derived from
-`(index_recipe, commit_start*, commit_end*)`. The recipe identifies the question
-and its source parameters: for example a path automaton fingerprint, a BM25
-content attribute, or an HNSW source attribute and dimension.
+A `RangeRecord` has an intrinsic entity id derived only from
+`(commit_start*, commit_end*)`. The same canonical core can therefore be reused
+for every rollup over that exact source region. Recipe identity instead lives
+once in the rollup pin descriptor `(source branch, recipe)`, which partitions
+the grow-only assertion sets before their `(core,node)` pairs reach the range
+loader. A recipe identifies the question and its source parameters: for
+example a path automaton fingerprint, a BM25 content attribute, or an HNSW
+source attribute and dimension.
 
 One published rollup alternative is a pair of content-addressed archives:
 
@@ -87,11 +91,13 @@ Derived bytes therefore remain optional and evictable without a permanent
 weak-pin assertion. A completed-empty projection is the degenerate case
 `node == core`.
 
-A distinct node does not repeat `index_recipe`, `commit_start`, or `commit_end`.
-The signed `(core,node)` pair is already the association, and the artifact facts
-must all use the core's intrinsic range entity as their subject. Loading parses
-and validates the core once, then rejects an empty node or any node containing
-another subject or range-control attribute before kind-specific thaw.
+A distinct node does not repeat `commit_start` or `commit_end`. The signed
+`(core,node)` pair is already the association, and the artifact facts must all
+use the core's intrinsic range entity as their subject. Loading parses and
+validates the recipe-neutral core once, then rejects an empty node or any node
+containing another subject or range-control attribute before kind-specific
+thaw. Recipe admission is not re-proved from duplicate core metadata: callers
+obtain the pairs from the already recipe-scoped pin projection.
 
 The archive boundary is semantic:
 
@@ -121,7 +127,8 @@ merge(&[A]) -> Option<A>             compact within one recipe
 A kind may derive that id with a private intrinsic `entity!` literal, but only
 the id crosses the interface. Recipe facts are not durable metadata: the
 runtime kind already owns the parameters needed to build and interpret an
-artifact, while the range core and rollup descriptor need only its stable id.
+artifact. Only the rollup descriptor needs its stable id; the range core is
+independent of the recipe.
 
 `build` and `merge` return `None` for the canonical empty projection. Each
 present artifact freezes to one nonempty `Fragment` rooted at the range entity.
@@ -162,10 +169,11 @@ The common layer does not claim one universal byte-level merge law:
   the artifact independent of source and compaction input order without a
   recipe tuning knob.
 
-Recipe identity and representation are orthogonal. The recipe says what
-question is answered; typed attributes such as `seg_succinct`, `seg_bm25`, or
-`seg_hnsw` say how this node represents its answer. Cover homogeneity is by
-recipe, not merely by artifact attribute.
+Recipe identity, range identity, and representation are orthogonal. The pin
+descriptor says what question is answered; the reusable core says which source
+commits are covered; typed attributes such as `seg_succinct`, `seg_bm25`, or
+`seg_hnsw` say how this node represents its answer. Cover homogeneity is by the
+recipe-scoped assertion projection, not merely by core or artifact attribute.
 
 ## Read-time cover and residual
 

@@ -712,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_range_roundtrips_and_checks_runtime_recipe() {
+    fn standalone_range_roundtrips_and_checks_typed_artifact() {
         let rollup = PathRollup::new(plus_label(metadata::tag.id().into()));
         let mut storage = MemoryRepo::default();
         let source = edge_facts(1, 2);

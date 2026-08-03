@@ -1,9 +1,9 @@
-//! Artifact-neutral commit ranges for derived rollup nodes.
+//! Recipe- and artifact-neutral commit ranges for derived rollup nodes.
 //!
 //! A range record is a stable canonical entity whose identity is the intrinsic
-//! core `(index_recipe, commit_start*, commit_end*)`. Derived artifacts live in
-//! separate archives paired with this core by a signed rollup assertion; they
-//! are not facts preserved by the range record itself.
+//! core `(commit_start*, commit_end*)`. Derived artifacts live in separate
+//! archives paired with this core by a recipe-scoped signed rollup assertion;
+//! neither recipe nor artifact facts are preserved by the range record itself.
 //!
 //! For start antichain `S` and end antichain `E`, the represented commit set is
 //! the union of closed intervals
@@ -30,9 +30,6 @@ use crate::repo::{commit, BlobStoreGet, CommitHandle};
 use crate::trible::TribleSet;
 
 attributes! {
-    /// Index recipe owning one independent range cover. Minted with
-    /// `trible genid` on 2026-07-13.
-    "8DB05C6453156E9F3424A2B4BE924513" as pub index_recipe: crate::inline::encodings::genid::GenId;
     /// Inclusive minimal commit frontier of a derived-index range.
     /// Repeated values form an antichain. Minted with `trible genid` on
     /// 2026-07-13.
@@ -48,9 +45,7 @@ attributes! {
 pub enum RangeRecordError {
     /// A start or end frontier was empty.
     EmptyFrontier,
-    /// A stored range record did not have exactly one recipe.
-    RecipeCardinality { entity: Id },
-    /// A stored entity did not equal the intrinsic `(recipe, range)` id.
+    /// A stored entity did not equal the intrinsic range id.
     NonCanonicalEntity { stored: Id, expected: Id },
 }
 
@@ -58,12 +53,6 @@ impl fmt::Display for RangeRecordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyFrontier => write!(f, "commit range frontiers must be nonempty"),
-            Self::RecipeCardinality { entity } => {
-                write!(
-                    f,
-                    "range entity {entity:x} must have exactly one index recipe"
-                )
-            }
             Self::NonCanonicalEntity { stored, expected } => write!(
                 f,
                 "range entity {stored:x} does not match canonical identity {expected:x}"
@@ -297,37 +286,22 @@ fn canonicalise_boundary(boundary: &mut Vec<CommitHandle>) -> Result<(), RangeRe
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeRecord {
     entity: Id,
-    recipe: Id,
     range: CommitRange,
 }
 
 impl RangeRecord {
-    /// Create the canonical `(recipe, range)` record. Artifact handles never
+    /// Create the canonical range record. Recipe and artifact identity never
     /// participate in its intrinsic id.
-    pub fn new(recipe: Id, range: CommitRange) -> Self {
-        let fragment = Self::core_fragment(recipe, &range);
+    pub fn new(range: CommitRange) -> Self {
+        let fragment = Self::core_fragment(&range);
         let entity = fragment
             .root()
-            .expect("recipe and nonempty frontiers export one entity");
-        Self {
-            entity,
-            recipe,
-            range,
-        }
+            .expect("nonempty frontiers export one entity");
+        Self { entity, range }
     }
 
     /// Parse one canonical range entity from `set`.
     pub fn parse(set: &TribleSet, entity: Id) -> Result<Self, RangeRecordError> {
-        let mut recipes = find!(
-            recipe: Id,
-            pattern!(set, [{ entity @ index_recipe: ?recipe }])
-        );
-        let Some(recipe) = recipes.next() else {
-            return Err(RangeRecordError::RecipeCardinality { entity });
-        };
-        if recipes.next().is_some() {
-            return Err(RangeRecordError::RecipeCardinality { entity });
-        }
         let start = find!(
             commit: CommitHandle,
             pattern!(set, [{ entity @ commit_start: ?commit }])
@@ -339,27 +313,23 @@ impl RangeRecord {
         )
         .collect();
         let range = CommitRange::new(start, end)?;
-        let expected = Self::core_fragment(recipe, &range)
+        let expected = Self::core_fragment(&range)
             .root()
-            .expect("recipe and nonempty frontiers export one entity");
+            .expect("nonempty frontiers export one entity");
         if entity != expected {
             return Err(RangeRecordError::NonCanonicalEntity {
                 stored: entity,
                 expected,
             });
         }
-        Ok(Self {
-            entity,
-            recipe,
-            range,
-        })
+        Ok(Self { entity, range })
     }
 
     /// Discover every entity bearing both range attributes.
     pub fn discover(set: &TribleSet) -> Result<Vec<Self>, RangeRecordError> {
         let mut entities: Vec<Id> = find!(
             entity: Id,
-            pattern!(set, [{ ?entity @ index_recipe: _?recipe, commit_start: _?start, commit_end: _?end }])
+            pattern!(set, [{ ?entity @ commit_start: _?start, commit_end: _?end }])
         )
         .collect();
         entities.sort_unstable();
@@ -375,11 +345,6 @@ impl RangeRecord {
         self.entity
     }
 
-    /// Recipe owning this independent range cover.
-    pub fn recipe(&self) -> Id {
-        self.recipe
-    }
-
     /// Inclusive range boundaries.
     pub fn range(&self) -> &CommitRange {
         &self.range
@@ -387,14 +352,13 @@ impl RangeRecord {
 
     /// Serialise exactly the canonical range facts.
     pub fn to_tribles(&self) -> TribleSet {
-        let core = Self::core_fragment(self.recipe, &self.range);
+        let core = Self::core_fragment(&self.range);
         assert_eq!(core.root(), Some(self.entity));
         core.into_facts()
     }
 
-    fn core_fragment(recipe: Id, range: &CommitRange) -> crate::trible::Fragment {
+    fn core_fragment(range: &CommitRange) -> crate::trible::Fragment {
         entity! {
-            index_recipe: recipe,
             commit_start*: range.start.iter().copied(),
             commit_end*: range.end.iter().copied(),
         }
@@ -902,7 +866,6 @@ impl CommitDag for HashMap<CommitHandle, Vec<CommitHandle>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::fucid;
     use crate::inline::Inline;
     use proptest::prelude::*;
 
@@ -979,9 +942,8 @@ mod tests {
         let canonical = CommitRange::new(vec![a], vec![b]).unwrap();
         assert_eq!(repeated, canonical);
 
-        let recipe = fucid();
-        let repeated_record = RangeRecord::new(*recipe, repeated);
-        let canonical_record = RangeRecord::new(*recipe, canonical);
+        let repeated_record = RangeRecord::new(repeated);
+        let canonical_record = RangeRecord::new(canonical);
         assert_eq!(repeated_record.entity(), canonical_record.entity());
         assert_eq!(repeated_record.to_tribles(), canonical_record.to_tribles());
 
@@ -1213,21 +1175,14 @@ mod tests {
     #[test]
     fn range_record_serializes_only_its_canonical_core() {
         let a = commit(1);
-        let recipe = fucid();
-        let record = RangeRecord::new(*recipe, CommitRange::leaf(a));
+        let record = RangeRecord::new(CommitRange::leaf(a));
         let entity = record.entity();
 
         let encoded = record.to_tribles();
         let parsed = RangeRecord::parse(&encoded, entity).unwrap();
         assert_eq!(parsed.entity(), entity);
-        assert_eq!(parsed.recipe(), *recipe);
         assert_eq!(parsed.to_tribles(), encoded);
         assert_eq!(RangeRecord::discover(&encoded).unwrap(), vec![parsed]);
-
-        let other_recipe = fucid();
-        let other_record = RangeRecord::new(*other_recipe, CommitRange::leaf(a));
-        assert_ne!(other_record.entity(), entity);
-        assert_eq!(other_record.range(), record.range());
     }
 
     #[test]

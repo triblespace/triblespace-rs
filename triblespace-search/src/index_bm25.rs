@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_distinct_bm25_recipes_have_independent_range_cores() {
+    fn parameter_distinct_bm25_recipes_share_the_same_range_core() {
         let mut storage = MemoryRepo::default();
         let document = *fucid();
         let source_a = stage(&mut storage, content.id(), document, "alpha");
@@ -778,9 +778,9 @@ mod tests {
         let node_a = store_range(&mut storage, &kind_a, range.clone(), Some(artifact_a)).unwrap();
         let node_b = store_range(&mut storage, &kind_b, range, Some(artifact_b)).unwrap();
 
-        assert_ne!(node_a.core().recipe(), node_b.core().recipe());
-        assert_ne!(node_a.core().entity(), node_b.core().entity());
-        assert_ne!(node_a.core().handle(), node_b.core().handle());
+        assert_ne!(kind_a.recipe_id(), kind_b.recipe_id());
+        assert_eq!(node_a.core().entity(), node_b.core().entity());
+        assert_eq!(node_a.core().handle(), node_b.core().handle());
         assert_ne!(node_a.handle(), node_b.handle());
         assert!(node_a.artifact().is_some());
         assert!(node_b.artifact().is_some());

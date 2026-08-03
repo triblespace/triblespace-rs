@@ -806,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_distinct_hnsw_recipes_have_independent_range_cores() {
+    fn parameter_distinct_hnsw_recipes_share_the_same_range_core() {
         let mut storage = MemoryRepo::default();
         let (source_a, _) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let (source_b, _) = stage(&mut storage, alternate_emb.id(), *fucid(), vec![0.0, 1.0]);
@@ -819,9 +819,9 @@ mod tests {
         let node_a = store_range(&mut storage, &kind_a, range.clone(), Some(artifact_a)).unwrap();
         let node_b = store_range(&mut storage, &kind_b, range, Some(artifact_b)).unwrap();
 
-        assert_ne!(node_a.core().recipe(), node_b.core().recipe());
-        assert_ne!(node_a.core().entity(), node_b.core().entity());
-        assert_ne!(node_a.core().handle(), node_b.core().handle());
+        assert_ne!(kind_a.recipe_id(), kind_b.recipe_id());
+        assert_eq!(node_a.core().entity(), node_b.core().entity());
+        assert_eq!(node_a.core().handle(), node_b.core().handle());
         assert_ne!(node_a.handle(), node_b.handle());
         assert!(node_a.artifact().is_some());
         assert!(node_b.artifact().is_some());
