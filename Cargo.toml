@@ -143,5 +143,5 @@ name = "portable_bench"
 harness = false
 
 [[bench]]
-name = "portable_bench_lsm"
+name = "portable_bench_rollup"
 harness = false

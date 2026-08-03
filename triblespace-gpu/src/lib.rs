@@ -192,7 +192,7 @@ mod tests {
 
     #[cfg(feature = "wgpu")]
     #[test]
-    fn wgpu_rollup_is_send_and_sync_for_repository_hooks() {
+    fn wgpu_rollup_is_send_and_sync_for_parallel_maintenance() {
         use triblespace_core::repo::index_home::AcceleratedSuccinctRollup;
 
         fn assert_send_sync<T: Send + Sync>() {}

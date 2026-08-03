@@ -2,7 +2,7 @@
 //!
 //! The stable attribute identifiers in this module were minted with
 //! `trible genid` on 2026-07-13. Artifact attributes intentionally carry
-//! their exact blob encodings: search manifests never erase these handles to
+//! their exact blob encodings: rollup nodes never erase these handles to
 //! `UnknownBlob`.
 
 use triblespace_core::inline::encodings::genid::GenId;

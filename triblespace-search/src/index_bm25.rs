@@ -8,13 +8,12 @@
 //! every `archive index` run: a fresh index entity minted each time,
 //! the whole corpus re-tokenised, the old index left as orphaned
 //! exhaust. [`Bm25Rollup`] persists exact-typed artifacts on inclusive
-//! commit ranges instead. [`append_range`] appends a logical source range,
-//! including certified-empty projections, and size-tiered compaction bounds
-//! the read fan-out while preserving the exact DAG cover.
+//! commit ranges instead. Each completed range is a standalone immutable
+//! node; compaction merges selected nodes and publishes another node without
+//! mutating or superseding its inputs.
 //!
 //! [`SuccinctRollup`]: triblespace_core::repo::index_home::SuccinctRollup
 //! [`HnswRollup`]: crate::index_hnsw::HnswRollup
-//! [`append_range`]: triblespace_core::repo::index_home::append_range
 //!
 //! # Where the text lives
 //!
@@ -25,13 +24,13 @@
 //! `Bm25Rollup` holds a blob reader to resolve those handles into the
 //! strings [`crate::tokens::hash_tokens`] tokenises. The reader is used
 //! only by [`build`](IndexKind::build); merge operates directly on the
-//! persisted succinct segments, and [`attach`](IndexKind::attach) is
-//! zero-copy (it decodes only the stored succinct blob).
+//! persisted succinct segments, and [`thaw`](IndexKind::thaw) decodes only
+//! the stored succinct blobs.
 //!
 //! # Multi-segment query semantics (cross-segment IDF caveat)
 //!
-//! An LSMT holds several segments (one per maintenance step, plus
-//! merged tiers). BM25 scores are **per-segment**: a term's IDF is
+//! A selected range cover can hold several segments. BM25 scores are
+//! **per-segment**: a term's IDF is
 //! computed against the documents *in that segment*, and document
 //! lengths are normalised against that segment's average. A query over
 //! the union ([`query_across`]) runs the bag-of-words query on each
@@ -39,8 +38,8 @@
 //! Because IDF is local, scores from different segments are only
 //! approximately comparable — a term that is rare globally but common
 //! within one small segment is scored lower there than a single index
-//! over the whole corpus would score it. The size-tiered [`merge`]
-//! counters this by streaming the persisted segments through a
+//! over the whole corpus would score it. Range compaction through [`merge`]
+//! counters this by streaming the selected segments through a
 //! bounded-memory union builder. IDF is recomputed over the merged
 //! corpus, so the bulk of the documents end up in a segment with
 //! corpus-wide statistics. Exact cross-segment IDF would require a global
@@ -55,7 +54,7 @@ use std::collections::HashMap;
 use anybytes::View;
 
 use triblespace_core::blob::encodings::longstring::LongString;
-use triblespace_core::blob::{Blob, IntoBlob, TryFromBlob};
+use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -63,7 +62,7 @@ use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::metadata;
 use triblespace_core::prelude::{entity, pattern};
 use triblespace_core::repo::index_home::{ArtifactError, IndexKind};
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
+use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::trible::{Fragment, TribleSet};
 
 use crate::bm25::BM25Builder;
@@ -82,9 +81,9 @@ type Seg = SuccinctBM25Index<GenId, WordHash>;
 ///
 /// Parameterised by the blob reader `R` used to resolve those content
 /// handles into text during [`build`](IndexKind::build) /
-/// [`merge`](IndexKind::merge). Attach and query need no reader — the
-/// stored succinct index is self-contained (terms are hashed at build
-/// time).
+/// [`merge`](IndexKind::merge). Freeze and query need no reader, while thaw
+/// receives the node's blob reader explicitly; the stored succinct index is
+/// self-contained (terms are hashed at build time).
 #[derive(Clone)]
 pub struct Bm25Rollup<R> {
     reader: R,
@@ -105,7 +104,7 @@ impl<R> Bm25Rollup<R> {
     /// Stable kind id — minted via `trible genid`
     /// (`11430BC8836BED33509173D454496A3C`). Distinct from
     /// `SuccinctRollup`'s and `HnswRollup`'s so all three kinds have
-    /// distinct immutable manifest identities.
+    /// distinct immutable recipe identities.
     pub const KIND_ID_HEX: &'static str = "11430BC8836BED33509173D454496A3C";
 }
 
@@ -124,10 +123,10 @@ where
         Ok(view.as_ref().to_owned())
     }
 
-    /// Build a succinct BM25 blob from an iterator of `(doc_key,
+    /// Build a succinct BM25 segment from an iterator of `(doc_key,
     /// tokens)` rows. Used by `build` and by materialized-oracle tests for
     /// the streaming merge.
-    fn build_blob<I>(&self, rows: I) -> Blob<SuccinctBM25Blob>
+    fn build_segment<I>(&self, rows: I) -> Seg
     where
         I: IntoIterator<Item = (Inline<GenId>, Vec<Inline<WordHash>>)>,
     {
@@ -135,8 +134,7 @@ where
         for (key, tokens) in rows {
             builder.insert(key, tokens);
         }
-        let idx: Seg = builder.build();
-        (&idx).to_blob()
+        builder.build()
     }
 }
 
@@ -145,8 +143,6 @@ where
     R: BlobStoreGet,
 {
     type Segment = Seg;
-    type PreparedArtifact = Blob<SuccinctBM25Blob>;
-    type StoredArtifact = Inline<Handle<SuccinctBM25Blob>>;
 
     fn recipe_fragment(&self) -> Fragment {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid algorithm id");
@@ -156,7 +152,7 @@ where
         }
     }
 
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
+    fn build(&self, source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError> {
         // Extract `entity -> Handle<LongString>` tribles under our
         // content attribute and tokenise each resolved string. An entity can
         // carry several content values in one commit. Treat those values as a
@@ -201,52 +197,34 @@ where
         if rows.is_empty() {
             Ok(Vec::new())
         } else {
-            Ok(vec![self.build_blob(rows)])
+            Ok(vec![self.build_segment(rows)])
         }
     }
 
-    fn put<S: BlobStorePut>(
-        &self,
-        storage: &mut S,
-        artifact: Self::PreparedArtifact,
-    ) -> Result<Self::StoredArtifact, ArtifactError> {
-        storage
-            .put(artifact)
-            .map_err(|error| Box::new(error) as ArtifactError)
+    fn freeze(&self, entity: Id, segment: &Self::Segment) -> Result<Fragment, ArtifactError> {
+        Ok(entity! { ExclusiveId::force_ref(&entity) @ seg_bm25: segment })
     }
 
-    fn emit(&self, entity: Id, artifact: &Self::StoredArtifact) -> TribleSet {
-        entity! { ExclusiveId::force_ref(&entity) @ seg_bm25: *artifact }.into_facts()
-    }
-
-    fn parse<B: BlobStoreGet>(
+    fn thaw<B: BlobStoreGet>(
         &self,
-        _reader: &B,
+        reader: &B,
         facts: &TribleSet,
         entity: Id,
-    ) -> Result<Vec<Self::StoredArtifact>, ArtifactError> {
-        Ok(triblespace_core::find!(
+    ) -> Result<Vec<Self::Segment>, ArtifactError> {
+        triblespace_core::find!(
             handle: Inline<Handle<SuccinctBM25Blob>>,
             pattern!(facts, [{ entity @ seg_bm25: ?handle }])
         )
-        .collect())
+        .map(|handle| {
+            let blob: Blob<SuccinctBM25Blob> = reader
+                .get(handle)
+                .map_err(|error| Box::new(error) as ArtifactError)?;
+            SuccinctBM25Index::try_from_blob(blob).map_err(|error| Box::new(error) as ArtifactError)
+        })
+        .collect()
     }
 
-    fn attach<B: BlobStoreGet>(
-        &self,
-        reader: &B,
-        artifact: &Self::StoredArtifact,
-    ) -> Result<Self::Segment, ArtifactError> {
-        let blob: Blob<SuccinctBM25Blob> = reader
-            .get(*artifact)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        SuccinctBM25Index::try_from_blob(blob).map_err(|error| Box::new(error) as ArtifactError)
-    }
-
-    fn merge(
-        &self,
-        segments: &[Self::Segment],
-    ) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
+    fn merge(&self, segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError> {
         if segments.is_empty() {
             return Ok(Vec::new());
         }
@@ -259,7 +237,7 @@ where
         if merged.doc_count() == 0 {
             Ok(Vec::new())
         } else {
-            Ok(vec![(&merged).to_blob()])
+            Ok(vec![merged])
         }
     }
 }
@@ -303,9 +281,7 @@ mod tests {
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::Inline;
     use triblespace_core::prelude::{attributes, entity};
-    use triblespace_core::repo::index_home::{
-        append_stored_range, load_manifest, store_manifest, IndexKind, Manifest,
-    };
+    use triblespace_core::repo::index_home::{store_range, IndexKind};
     use triblespace_core::repo::index_range::CommitRange;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{BlobStore, BlobStorePut};
@@ -344,11 +320,11 @@ mod tests {
     }
 
     fn build_segment(kind: &Bm25Rollup<impl BlobStoreGet>, source: &TribleSet) -> Seg {
-        decode(kind.build(source).unwrap().pop().unwrap())
+        kind.build(source).unwrap().pop().unwrap()
     }
 
     fn merge_segment(kind: &Bm25Rollup<impl BlobStoreGet>, segments: &[Seg]) -> Seg {
-        decode(kind.merge(segments).unwrap().pop().unwrap())
+        kind.merge(segments).unwrap().pop().unwrap()
     }
 
     fn synthetic(n: usize) -> Vec<(Id, String)> {
@@ -463,9 +439,7 @@ mod tests {
         let mut storage = MemoryRepo::default();
         let source = stage_many(&mut storage, &pairs);
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let artifact = kind.build(&source).unwrap().pop().unwrap();
-        let reloaded = Blob::<SuccinctBM25Blob>::new(artifact.bytes.clone());
-        let segment = decode(reloaded);
+        let segment = kind.build(&source).unwrap().pop().unwrap();
         assert_eq!(segment.doc_count(), pairs.len());
 
         for query in [
@@ -635,24 +609,22 @@ mod tests {
     }
 
     #[test]
-    fn typed_fact_roundtrip_attaches_and_queries() {
+    fn frozen_fragment_thaws_and_queries() {
         let mut storage = MemoryRepo::default();
         let document = *fucid();
         let source = stage(&mut storage, content.id(), document, "alpha beta alpha");
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let artifact = kind.build(&source).unwrap().pop().unwrap();
-        let stored = kind.put(&mut storage, artifact).unwrap();
+        let segment = kind.build(&source).unwrap().pop().unwrap();
         let range_entity = *fucid();
-        let facts = kind.emit(range_entity, &stored);
+        let frozen = kind.freeze(range_entity, &segment).unwrap();
 
-        assert!(facts.iter().all(|fact| fact.a() == &seg_bm25.id()));
-        let reader = storage.reader().unwrap();
-        assert_eq!(
-            kind.parse(&reader, &facts, range_entity).unwrap(),
-            vec![stored]
-        );
-        let attached = kind.attach(&reader, &stored).unwrap();
-        let hits: HashSet<_> = query_across(&[attached], &hash_tokens("alpha"))
+        assert!(frozen.iter().all(|fact| fact.a() == &seg_bm25.id()));
+        assert_eq!(frozen.blobs().len(), 1);
+        let mut blobs = frozen.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let thawed = kind.thaw(&reader, frozen.facts(), range_entity).unwrap();
+        assert_eq!(thawed.len(), 1);
+        let hits: HashSet<_> = query_across(&thawed, &hash_tokens("alpha"))
             .into_iter()
             .map(|(key, _)| key.raw)
             .collect();
@@ -703,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_distinct_bm25_recipes_have_independent_manifest_handles() {
+    fn parameter_distinct_bm25_recipes_have_independent_range_cores() {
         let mut storage = MemoryRepo::default();
         let document = *fucid();
         let source_a = stage(&mut storage, content.id(), document, "alpha");
@@ -711,73 +683,50 @@ mod tests {
         let reader = storage.reader().unwrap();
         let kind_a = Bm25Rollup::new(reader.clone(), content.id());
         let kind_b = Bm25Rollup::new(reader, alternate_content.id());
-        let artifact_a = kind_a.build(&source_a).unwrap().pop().unwrap();
-        let artifact_b = kind_b.build(&source_b).unwrap().pop().unwrap();
-        let stored_a = kind_a.put(&mut storage, artifact_a).unwrap();
-        let stored_b = kind_b.put(&mut storage, artifact_b).unwrap();
-        let mut facts_a = TribleSet::new();
-        let mut facts_b = TribleSet::new();
+        let segment_a = kind_a.build(&source_a).unwrap().pop().unwrap();
+        let segment_b = kind_b.build(&source_b).unwrap().pop().unwrap();
+        let range = CommitRange::leaf(commit(1));
+        let node_a = store_range(&mut storage, &kind_a, range.clone(), vec![segment_a]).unwrap();
+        let node_b = store_range(&mut storage, &kind_b, range, vec![segment_b]).unwrap();
 
-        append_stored_range(
-            &mut storage,
-            &kind_a,
-            CommitRange::leaf(commit(1)),
-            vec![stored_a],
-            &mut facts_a,
-        )
-        .unwrap();
-        append_stored_range(
-            &mut storage,
-            &kind_b,
-            CommitRange::leaf(commit(1)),
-            vec![stored_b],
-            &mut facts_b,
-        )
-        .unwrap();
-
-        let reader = storage.reader().unwrap();
-        let manifest_a = Manifest::from_tribles(&facts_a, &reader, &kind_a).unwrap();
-        let manifest_b = Manifest::from_tribles(&facts_b, &reader, &kind_b).unwrap();
-        let handle_a = store_manifest(&mut storage, &manifest_a).unwrap();
-        let handle_b = store_manifest(&mut storage, &manifest_b).unwrap();
-        assert_ne!(handle_a, handle_b);
-        let reader = storage.reader().unwrap();
-        let manifest_a = load_manifest(&reader, &kind_a, handle_a).unwrap();
-        let manifest_b = load_manifest(&reader, &kind_b, handle_b).unwrap();
-        assert_ne!(manifest_a.recipe(), manifest_b.recipe());
-        assert_eq!(manifest_a.ranges().len(), 1);
-        assert_eq!(manifest_b.ranges().len(), 1);
-        assert_eq!(manifest_a.ranges()[0].artifacts(), &[stored_a]);
-        assert_eq!(manifest_b.ranges()[0].artifacts(), &[stored_b]);
+        assert_ne!(node_a.core().recipe(), node_b.core().recipe());
+        assert_ne!(node_a.core().entity(), node_b.core().entity());
+        assert_ne!(node_a.core().handle(), node_b.core().handle());
+        assert_ne!(node_a.handle(), node_b.handle());
+        assert_eq!(node_a.segments().len(), 1);
+        assert_eq!(node_b.segments().len(), 1);
     }
 
     #[test]
-    fn repeated_typed_facts_are_physical_artifacts_and_bad_bytes_fail_attach() {
+    fn repeated_frozen_segments_thaw_atomically_and_bad_bytes_fail() {
         let mut storage = MemoryRepo::default();
         let source_a = stage(&mut storage, content.id(), *fucid(), "alpha");
         let source_b = stage(&mut storage, content.id(), *fucid(), "beta");
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let stored_a = kind
-            .put(&mut storage, kind.build(&source_a).unwrap().pop().unwrap())
-            .unwrap();
-        let stored_b = kind
-            .put(&mut storage, kind.build(&source_b).unwrap().pop().unwrap())
-            .unwrap();
+        let segment_a = kind.build(&source_a).unwrap().pop().unwrap();
+        let segment_b = kind.build(&source_b).unwrap().pop().unwrap();
         let entity = *fucid();
-        let mut facts = kind.emit(entity, &stored_a);
-        facts += kind.emit(entity, &stored_b);
-        let reader = storage.reader().unwrap();
-        let parsed: HashSet<_> = kind
-            .parse(&reader, &facts, entity)
-            .unwrap()
-            .into_iter()
-            .collect();
-        assert_eq!(parsed, HashSet::from([stored_a, stored_b]));
+        let mut frozen = kind.freeze(entity, &segment_a).unwrap();
+        frozen += kind.freeze(entity, &segment_b).unwrap();
+        let mut blobs = frozen.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let thawed = kind.thaw(&reader, frozen.facts(), entity).unwrap();
+        assert_eq!(thawed.len(), 2);
+        assert_eq!(query_across(&thawed, &hash_tokens("alpha beta")).len(), 2);
 
-        let malformed = Blob::<SuccinctBM25Blob>::new(Bytes::from(vec![0u8; 8]));
-        let malformed_handle = storage.put(malformed).unwrap();
-        let reader = storage.reader().unwrap();
-        assert!(kind.attach(&reader, &malformed_handle).is_err());
+        let missing = Inline::<Handle<SuccinctBM25Blob>>::new([0xA5; 32]);
+        let mut incomplete = frozen.clone();
+        incomplete += entity! { ExclusiveId::force_ref(&entity) @ seg_bm25: missing };
+        let mut blobs = incomplete.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        assert!(kind.thaw(&reader, incomplete.facts(), entity).is_err());
+
+        let malformed_blob = Blob::<SuccinctBM25Blob>::new(Bytes::from(vec![0u8; 8]));
+        let malformed = entity! { ExclusiveId::force_ref(&entity) @ seg_bm25: malformed_blob };
+        frozen += malformed;
+        let mut blobs = frozen.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        assert!(kind.thaw(&reader, frozen.facts(), entity).is_err());
     }
 
     #[test]
@@ -786,9 +735,9 @@ mod tests {
         let first = stage(&mut storage, content.id(), *fucid(), "alpha");
         let second = stage(&mut storage, content.id(), *fucid(), "beta");
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let left = decode(kind.build(&first).unwrap().pop().unwrap());
-        let right = decode(kind.build(&second).unwrap().pop().unwrap());
-        let merged = decode(kind.merge(&[left, right]).unwrap().pop().unwrap());
+        let left = kind.build(&first).unwrap().pop().unwrap();
+        let right = kind.build(&second).unwrap().pop().unwrap();
+        let merged = kind.merge(&[left, right]).unwrap().pop().unwrap();
         assert_eq!(merged.doc_count(), 2);
         assert_eq!(query_across(&[merged], &hash_tokens("alpha beta")).len(), 2);
     }

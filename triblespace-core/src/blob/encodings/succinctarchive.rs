@@ -119,7 +119,8 @@ impl SuccinctArchiveRank9IndexBlob {
     /// Read the canonical raw-archive handle embedded at offset zero.
     ///
     /// This deliberately performs only the small, format-level header check
-    /// needed to pair unordered manifest handles. Full native-ABI and Rank9
+    /// needed to pair unordered artifact handles in one complete rollup node.
+    /// Full native-ABI and Rank9
     /// validation remains the responsibility of
     /// [`SuccinctArchive::from_blob_pair`].
     pub fn source_handle(

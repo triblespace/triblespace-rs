@@ -62,7 +62,7 @@ pub mod capability;
 pub mod commit;
 /// Storage adapter that delegates blobs and signed assertions to separate backends.
 pub mod hybridstore;
-/// Range-native derived-index manifests and typed artifacts.
+/// Range-native derived rollup nodes and typed artifacts.
 pub mod index_home;
 pub mod index_range;
 /// No-network lazy reader: local get, durable want on miss ([`lazy::Lazy`]).

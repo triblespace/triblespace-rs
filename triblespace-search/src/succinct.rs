@@ -500,7 +500,7 @@ fn width_for(n: usize) -> usize {
 /// Invert a stored BM25 posting score back to an integer term
 /// frequency (`>= 1`). Used by
 /// [`SuccinctBM25Index::reconstruct_docs`] to rebuild the source
-/// token multisets for a range-manifest segment merge.
+/// token multisets for a rollup segment merge.
 ///
 /// The build-time score is
 /// `idf * tf * (k1 + 1) / (tf + k1 * norm)`; solving for `tf` gives
@@ -977,8 +977,8 @@ impl SuccinctHNSWIndex {
 
     /// The content-addressed embedding handle of node `i`, or `None`
     /// if out of range. Lets callers enumerate a stored graph's nodes
-    /// (e.g. to union + rebuild several segments in a range-manifest
-    /// merge) without attaching a blob store.
+    /// (e.g. to union + rebuild several rollup segments) without attaching a
+    /// blob store.
     pub fn handle(&self, i: usize) -> Option<Inline<EmbHandle>> {
         self.handles.get(i).map(|raw| Inline::new(*raw))
     }
@@ -1722,7 +1722,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
 
     /// Approximately reconstruct the per-document token multisets this
     /// index was built from. This remains useful for diagnostics and
-    /// compatibility tests; production range-manifest merges use
+    /// compatibility tests; production rollup merges use
     /// [`Self::merge_segments`] so they never materialize all token bags.
     ///
     /// Returns one `(doc_key, tokens)` row per document, `doc_key`
@@ -1735,7 +1735,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// regime and approximate in the saturated tail. A BM25 index
     /// rebuilt from the union of several segments' reconstructions
     /// therefore has exact global document frequencies and lengths and
-    /// recomputes IDF over the union — the LSMT merge is lossless in
+    /// recomputes IDF over the union — the segment merge is lossless in
     /// everything the score's monotone part depends on.
     ///
     pub fn reconstruct_docs(&self) -> Vec<(RawInline, Vec<RawInline>)> {
@@ -1798,9 +1798,9 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// and final serialization. In particular, there is no `O(total token
     /// multiplicity)` token-bag materialization or corpus-sized in-memory
     /// posting cache.
-    /// Fallible merge entry point used by range maintenance. Failure leaves
-    /// the previous manifest intact rather than certifying an incomplete
-    /// compacted range.
+    /// Fallible merge entry point used by range maintenance. Failure publishes
+    /// no replacement node rather than certifying an incomplete compacted
+    /// range.
     pub(crate) fn try_merge_segments(
         segments: &[Self],
         k1: f32,

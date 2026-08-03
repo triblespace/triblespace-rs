@@ -9,22 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Added standalone typed range-node storage: a hard core-only range archive is
-  paired with one complete artifact-node archive, loaded and validated without
-  unioning alternative nodes that share the same intrinsic range.
-- Removed the unused mutable-manifest range replacement helpers and monotone
-  commit-batch guard. Range records retain their immutable open-fact model;
-  pool cover selection derives freshness from the authoritative frontier.
-- Added deterministic `select_range_cover` with source-data residuals for
-  merged grow-only rollup pools. Selection is keyed by standalone record blob
-  handle, excludes off-frontier ranges, isolates invalid candidates, and uses
-  canonical commit metadata rather than accepting arbitrary parent facts.
-- Added a typed, grow-only `RollupPinDescriptor` keyed by source branch and
-  index recipe. Each signed assertion pairs a hard core-only range-record
-  value with one complete unowned artifact-node handle in its opaque label.
-  This keeps coverage metadata durable without turning every historical
-  derived payload into permanent weak-pin demand; equal-range nodes remain
-  atomic alternatives rather than being fact-unioned.
+- Derived indexes use a five-operation `IndexKind` algebra over one queryable
+  `Segment` type: an intrinsic recipe descriptor, `build`, `freeze`, `thaw`,
+  and `merge`. Each frozen segment is a self-contained `Fragment`; generic
+  storage persists its typed facts and owned blobs as one standalone node over
+  a canonical artifact-neutral range core.
+- A typed grow-only `RollupPinDescriptor` identifies each source branch and
+  recipe. Every signed assertion pairs a hard core-only range-record value with
+  one complete unowned node in its opaque label. Nodes sharing a core remain
+  atomic alternatives, while repeated typed facts inside one node are
+  conjunctive segments. Completed-empty ranges use their core as the node.
+- `select_range_cover` deterministically admits fully resident standalone
+  nodes against the authoritative source frontier and returns every uncovered
+  commit as an exact source-data residual. Off-frontier, overlapping, missing,
+  malformed, and foreign-recipe offers cannot omit source commits. Compaction
+  convex-unions explicitly selected victims and publishes another immutable
+  pair without durable levels, sequences, replacement, or supersession state;
+  exact query equivalence under repartition remains a kind-specific law.
 - Hard retention is now an explicit `StrongPinDescriptor` decorator rather
   than a branch-special case in Yard. The canonical V1 wrapper contains an
   exact inner descriptor handle; authentic assertions sharing its outer pin
@@ -32,13 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and every distinct value. `BranchPinDescriptor` is a clean-break aligned V2
   inner descriptor, and repository publication flushes both descriptor layers
   before appending the newly bound assertion.
-- Removed the scalar `IndexHome` catalog and its `PinStore` dependency.
-  Derived-index snapshots are exact, immutable `SimpleArchive` values stored
-  and loaded by content handle. Standalone loading rejects arbitrary empty
-  archives, branch wrappers, unrelated facts, and bundled recipes; attachment
-  rechecks the runtime recipe identity. Source freshness is now compared with
-  an authoritative head supplied by the caller rather than self-claimed branch
-  metadata inside the cache blob.
 - Removed `AsyncPinStore`, its adapter implementations, and
   `ObjectStoreRemote`'s legacy `pins/` CAS namespace. The remote backend now
   stores content-addressed blobs only; it does not pretend that object-store

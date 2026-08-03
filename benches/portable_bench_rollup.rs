@@ -1,35 +1,28 @@
-//! Portable engine benchmark v2 — LSM range-manifest arm.
+//! Portable engine benchmark v3 — asserted range-rollup arm.
 //!
-//! A SEPARATE bench target on purpose: the range-manifest API
-//! (`append_range` / `SuccinctRollup` / `Manifest` / `UnionArchive`) is
-//! tip-era surface that does not exist at older sweep commits. Keeping it in
-//! its own `[[bench]]` gives it an INDEPENDENT compilation fate — at commits
-//! where the API differs this target BUILD-FAILs honestly while
-//! `portable_bench` keeps running. Never fold this file into the main bench.
+//! This remains a separate bench target because the asserted-rollup API is
+//! intentionally tip-era surface. It measures the actual monotone algebra,
+//! with no manifest, automatic carry, level, sequence, or FANOUT policy:
 //!
-//! WHAT IT MEASURES:
-//!   build_lsm  — streaming commit ranges into physical succinct leaves via
-//!                `repo::index_home::append_range` (leaf build + blob puts +
-//!                ordered size-tiered carry merges, FANOUT=4), against a
-//!                scratch in-memory blob store seeded with the commit-DAG
-//!                metadata (merges validate convex range unions against the
-//!                DAG). The SOURCE pile is never written — reads only.
-//!   q<N>_union — the same wired query matrix as the main bench (q3 = q3b
-//!                union-under-join, q5 = q5b witness semijoin — keep
-//!                `measure_queries` + the q3b/q5b fns byte-identical with
-//!                portable_bench.rs or `q<N>_union` stops being comparable
-//!                with `q<N>_set`/`q<N>_arch`), executed over the
-//!                `UnionArchive` of the built leaves (per-shard confirm +
-//!                cross-shard dedup). q2 is `path!`-based and
-//!                TribleSet-only, so it has no union arm.
+//! - `leaf_store`: build and store one immutable typed node per source commit;
+//! - `compact_store`: deliberately choose a convex prefix of those leaves,
+//!   merge its segments, and store one additional immutable node;
+//! - `cover`: resolve locally usable asserted node offers against the current
+//!   source frontier, deriving the exact uncovered commit residual;
+//! - `q<N>_mixed`: run the main benchmark's wired query matrix over a true
+//!   heterogeneous source: selected resident Succinct segments OR the plain
+//!   residual `TribleSet`, at every triple pattern. Joins may therefore cross
+//!   the resident/residual boundary.
 //!
-//! Workload identity: the union-arm counts are gated against the same
-//! queries run over the plain unioned TribleSet (untimed) — union-of-leaves
-//! must be indistinguishable from the set at the interface.
+//! The final source commit is deliberately withheld from the offer pool, so a
+//! multi-commit run exercises both sides of the read law. The compacted prefix
+//! is the resident side; the final commit is source fallback. For a one-commit
+//! run the cover is empty and the entire source is residual. Workload counts
+//! are gated against the complete plain `TribleSet`.
 //!
 //! DATASET MODES (mirrors the main bench):
 //!   --pile <path>  first k commits of the data branch for the rung target.
-//!                  ALWAYS chunk-aligned: the rung SNAPS to the nearest
+//!                  Always chunk-aligned: the rung SNAPS to the nearest
 //!                  cumulative-commit boundary (leaves are per-commit
 //!                  physical artifacts, a carved prefix has no commit
 //!                  identity to hang a `CommitRange` on) via the SAME
@@ -38,16 +31,15 @@
 //!                  count are printed so sweeps record actual-vs-nominal.
 //!                  Opens the pile READ-ONLY (no Repository, no puts).
 //!   (no --pile)    the synthetic DBLP-shaped set, split into --chunks
-//!                  synthetic commits with real parent-linked metadata in
-//!                  the scratch store.
+//!                  synthetic commits with an explicit direct-parent map.
 //!
 //! USAGE:
-//!   cargo bench --bench portable_bench_lsm -- [--pile P] [--branch B]
+//!   cargo bench --bench portable_bench_rollup -- [--pile P] [--branch B]
 //!     [--rung 1M] [--iters 12] [--warmup 3] [--build-iters 8]
 //!     [--build-warmup 2] [--chunks 16] [--range-min 2]
 //!
 //! Crash isolation mirrors the main bench: every query measure and every
-//! panic-prone phase (build_lsm, manifest attach) runs under `catch_unwind`
+//! panic-prone phase (leaf store, compaction, cover resolution) runs under `catch_unwind`
 //! with the panic hook silenced; a panicking measure reports
 //! `  <key>  PANIC (<msg>)`, joins a `PANIC    :` summary line, contributes
 //! a `usize::MAX` sentinel to the identity tuple, and is EXCLUDED from the
@@ -58,6 +50,8 @@
 //! violation, 4 no measure had signal. BUILD-FAIL is expressed by
 //! compilation (the design point of this file), never emulated at runtime.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use triblespace_core::blob::encodings::longstring::LongString;
@@ -67,10 +61,14 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
 use triblespace_core::prelude::*;
-use triblespace_core::repo::index_home::{append_range, IndexKind, Manifest, SuccinctRollup};
-use triblespace_core::repo::index_range::CommitRange;
+use triblespace_core::query::unionconstraint::UnionConstraint;
+use triblespace_core::query::{Constraint, Term};
+use triblespace_core::repo::index_home::{
+    resolve_resident_range_cover, store_range, IndexKind, SuccinctRollup, UnionArchive,
+};
+use triblespace_core::repo::index_range::{convex_union, CommitRange};
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{self, PinStore};
+use triblespace_core::repo::{self, BlobStore, PinStore};
 
 // ---------------------------------------------------------------------------
 // DBLP vocabulary + content-derived attributes (identical derivation to the
@@ -359,6 +357,55 @@ fn measure_queries<S: TriblePattern>(
     (keyed, final_counts)
 }
 
+/// Query view for the exact read-time law: every triple pattern is evaluated
+/// against either a selected resident Succinct shard or the uncovered source
+/// facts. The boxed union is intentionally local to the benchmark; it lets a
+/// multi-clause query join values across the storage boundary instead of
+/// running two whole queries and incorrectly unioning their final rows.
+struct ResidentResidual {
+    resident: Option<UnionArchive<OrderedUniverse>>,
+    residual: TribleSet,
+}
+
+impl ResidentResidual {
+    fn new(segments: Vec<SuccinctArchive<OrderedUniverse>>, residual: TribleSet) -> Self {
+        assert!(
+            !segments.is_empty() || !residual.is_empty(),
+            "resident+residual source cannot be empty"
+        );
+        Self {
+            resident: (!segments.is_empty()).then(|| SuccinctRollup::union(&segments)),
+            residual,
+        }
+    }
+}
+
+impl TriblePattern for ResidentResidual {
+    type PatternConstraint<'a>
+        = Arc<UnionConstraint<Box<dyn Constraint<'a> + Send + Sync + 'a>>>
+    where
+        Self: 'a;
+
+    fn pattern<'a, V: InlineEncoding>(
+        &'a self,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
+    ) -> Self::PatternConstraint<'a> {
+        let e = e.into();
+        let a = a.into();
+        let v = v.into();
+        let mut sources: Vec<Box<dyn Constraint<'a> + Send + Sync + 'a>> = Vec::with_capacity(2);
+        if let Some(resident) = &self.resident {
+            sources.push(Box::new(resident.pattern(e, a, v)));
+        }
+        if !self.residual.is_empty() {
+            sources.push(Box::new(self.residual.pattern(e, a, v)));
+        }
+        Arc::new(UnionConstraint::new(sources))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic DBLP-shaped dataset (same generator as the main bench).
 // ---------------------------------------------------------------------------
@@ -437,11 +484,11 @@ fn build_dblp_shaped(target: usize, qa: &DblpAttrs) -> TribleSet {
 
 type CommitHandle = Inline<Handle<SimpleArchive>>;
 
-/// One logical range's worth of input: the commit handle, its metadata facts
-/// (for the scratch store's DAG), and its content set (the leaf source).
+/// One logical range's worth of input: the commit handle, its direct parents,
+/// and its content set (the leaf source).
 struct Chunk {
     handle: CommitHandle,
-    meta: TribleSet,
+    parents: Vec<CommitHandle>,
     content: TribleSet,
 }
 
@@ -482,14 +529,11 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
             .find(|(_, n, _)| n == want)
             .unwrap_or_else(|| panic!("no branch named {want:?} in pile")),
         None => {
-            let mut data: Vec<_> = named
-                .into_iter()
-                .filter(|(_, n, _)| n != "manifest")
-                .collect();
+            let mut data = named;
             match data.len() {
                 1 => data.remove(0),
                 n => panic!(
-                    "cannot auto-pick a data branch ({n} non-manifest branches: {:?}) — pass --branch",
+                    "cannot auto-pick a data branch ({n} named branches: {:?}) — pass --branch",
                     data.iter().map(|(_, n, _)| n.clone()).collect::<Vec<_>>()
                 ),
             }
@@ -507,7 +551,7 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     };
 
     // Oldest-first linear chain walk.
-    let mut chain: Vec<(CommitHandle, TribleSet)> = Vec::new();
+    let mut chain: Vec<(CommitHandle, TribleSet, Vec<CommitHandle>)> = Vec::new();
     let mut cursor = Some(head);
     while let Some(handle) = cursor {
         let meta: TribleSet = reader.get(handle).expect("read commit metadata");
@@ -517,12 +561,12 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         )
         .map(|(p,)| p)
         .collect();
-        chain.push((handle, meta));
         cursor = match parents[..] {
             [] => None,
             [p] => Some(p),
             _ => panic!("merge commit in data branch (expected a linear chain)"),
         };
+        chain.push((handle, meta, parents));
     }
     chain.reverse();
 
@@ -531,10 +575,10 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     // main bench uses, no deserialization on the walk), then SNAP to the
     // nearest chunk boundary. Always chunk-aligned: leaves are per-commit
     // physical artifacts, so sub-chunk rungs cannot be carved here.
-    let mut entries: Vec<(CommitHandle, TribleSet, CommitHandle)> = Vec::new();
+    let mut entries: Vec<(CommitHandle, Vec<CommitHandle>, CommitHandle)> = Vec::new();
     let mut cum: Vec<usize> = Vec::new();
     let mut total = 0usize;
-    for (handle, meta) in chain {
+    for (handle, meta, parents) in chain {
         let contents: Vec<CommitHandle> = find!(
             (c: Inline<Handle<SimpleArchive>>),
             pattern!(&meta, [{ repo::content: ?c }])
@@ -545,7 +589,7 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         let blob: Blob<SimpleArchive> = reader.get(content).expect("read content blob");
         total += blob.bytes.len() / 64;
         cum.push(total);
-        entries.push((handle, meta, content));
+        entries.push((handle, parents, content));
     }
     assert!(
         !entries.is_empty(),
@@ -560,11 +604,11 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     let chunks: Vec<Chunk> = entries
         .into_iter()
         .take(k)
-        .map(|(handle, meta, content)| {
+        .map(|(handle, parents, content)| {
             let set: TribleSet = reader.get(content).expect("read commit content");
             Chunk {
                 handle,
-                meta,
+                parents,
                 content: set,
             }
         })
@@ -575,10 +619,10 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     chunks
 }
 
-/// Synthetic commit chain: split the DBLP-shaped set into `n` chunks and
-/// mint parent-linked commit metadata for each (content-addressed handles,
-/// no store required to NAME them — the scratch store is seeded per
-/// iteration).
+/// Synthetic commit chain: split the DBLP-shaped set into `n` chunks and mint
+/// content-addressed commit tokens plus an explicit direct-parent map. The
+/// benchmark keeps DAG traversal separate from artifact storage so leaf and
+/// compaction timings contain only the asserted-rollup work under test.
 fn synthetic_chunks(target: usize, n: usize, qa: &DblpAttrs) -> Vec<Chunk> {
     let set = build_dblp_shaped(target, qa);
     let per = set.len().div_ceil(n.max(1));
@@ -589,15 +633,16 @@ fn synthetic_chunks(target: usize, n: usize, qa: &DblpAttrs) -> Vec<Chunk> {
     let mut flush = |content: TribleSet, parent: &mut Option<CommitHandle>| {
         let content_handle = content.clone().to_blob().get_handle();
         let cid = ids.mint();
-        let mut meta: TribleSet = entity! { &cid @ repo::content: content_handle }.into();
+        let mut identity: TribleSet = entity! { &cid @ repo::content: content_handle }.into();
+        let parents = parent.iter().copied().collect();
         if let Some(p) = *parent {
-            meta += entity! { &cid @ repo::parent: p };
+            identity += entity! { &cid @ repo::parent: p };
         }
-        let handle = meta.clone().to_blob().get_handle();
+        let handle = identity.to_blob().get_handle();
         *parent = Some(handle);
         Chunk {
             handle,
-            meta,
+            parents,
             content,
         }
     };
@@ -727,7 +772,7 @@ fn main() {
         i += 1;
     }
 
-    println!("engine   : current (query), LSM range-manifest arm");
+    println!("engine   : current (query), asserted range-rollup arm");
     println!(
         "config   : rung={rung} iters={iters} warmup={warmup} build_iters={build_iters} build_warmup={build_warmup} chunks={n_chunks} range_min={range_min}"
     );
@@ -737,129 +782,247 @@ fn main() {
         Some(path) => pile_chunks(path, branch.as_deref(), rung),
         None => synthetic_chunks(rung, n_chunks, &qa),
     };
+    let frontier = [chunks.last().expect("at least one source commit").handle];
+    let commit_dag: HashMap<CommitHandle, Vec<CommitHandle>> = chunks
+        .iter()
+        .map(|chunk| (chunk.handle, chunk.parents.clone()))
+        .collect();
+    let mut full = TribleSet::new();
+    for chunk in &chunks {
+        full.union(chunk.content.clone());
+    }
+    let full_len = full.len();
 
-    // -- BUILD-LSM ---------------------------------------------------------
-    // Per iteration: a fresh scratch store seeded with the commit metadata
-    // (untimed), then the timed streaming loop — leaf build, artifact puts,
-    // and carry merges all inside `append_range`. Guarded: at commits where
-    // the range-manifest surface panics (rather than failing to compile) this
-    // records a PANIC outcome instead of a dead bench.
+    // -- LEAF BUILD/STORE + DELIBERATE COMPACTION -------------------------
+    // Each iteration starts with a fresh artifact store and the same untimed
+    // direct-parent map. Leaf construction has no hidden policy. Compaction explicitly
+    // chooses the oldest prefix, proves its union convex, merges its segments,
+    // and stores one additional immutable node. Victim offers remain beside
+    // the replacement, as required by monotone publication.
     let kind = SuccinctRollup::new();
     let mut all: Vec<(String, Outcome)> = Vec::new();
     let built = quiet_catch(|| {
-        let mut samples = Vec::new();
-        let mut kept: Option<(MemoryBlobStore, TribleSet)> = None;
-        let mut ident: Option<usize> = None;
+        let mut leaf_samples = Vec::new();
+        let mut compact_samples = Vec::new();
+        let mut kept = None;
+        let mut ident = None;
         for i in 0..(build_warmup + build_iters) {
             let recording = i >= build_warmup;
             let mut store = MemoryBlobStore::default();
+
+            let t = Instant::now();
+            let mut leaves = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
-                let stored: CommitHandle =
-                    store.put(chunk.meta.clone()).expect("seed commit metadata");
-                assert_eq!(
-                    stored, chunk.handle,
-                    "commit metadata handle drifted between pile and scratch store"
+                let segments = kind.build(&chunk.content).expect("build leaf segments");
+                leaves.push(
+                    store_range(&mut store, &kind, CommitRange::leaf(chunk.handle), segments)
+                        .expect("store leaf range"),
                 );
             }
-            let t = Instant::now();
-            let mut head_set = TribleSet::new();
-            for chunk in &chunks {
-                append_range(
-                    &mut store,
-                    &kind,
-                    &chunk.content,
-                    CommitRange::leaf(chunk.handle),
-                    &mut head_set,
-                )
-                .expect("append range");
-            }
             if recording {
-                samples.push(t.elapsed().as_secs_f64() * 1000.0);
+                leaf_samples.push(t.elapsed().as_secs_f64() * 1000.0);
             }
-            match ident {
-                None => ident = Some(head_set.len()),
-                Some(expected) if expected != head_set.len() => {
+
+            // Preserve the newest commit as a deliberate source residual.
+            // A one-commit run still exercises merge/store but offers no node.
+            let victim_count = if leaves.len() > 1 {
+                leaves.len() - 1
+            } else {
+                1
+            };
+            let mut dag = commit_dag.clone();
+            let t = Instant::now();
+            let ranges: Vec<_> = leaves[..victim_count]
+                .iter()
+                .map(|node| node.core().range().clone())
+                .collect();
+            let merged_range =
+                convex_union(&mut dag, &ranges).expect("victim ranges form a convex prefix");
+            let victim_segments: Vec<_> = leaves[..victim_count]
+                .iter()
+                .flat_map(|node| node.segments().iter().cloned())
+                .collect();
+            let merged_segments = kind.merge(&victim_segments).expect("merge victim segments");
+            let compacted = store_range(&mut store, &kind, merged_range, merged_segments)
+                .expect("store compacted range");
+            if recording {
+                compact_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            let leaf_records: Vec<_> = leaves.iter().map(|node| node.rollup_record()).collect();
+            let current_ident = (leaf_records.clone(), compacted.rollup_record());
+            match &ident {
+                None => ident = Some(current_ident),
+                Some(expected) if expected != &current_ident => {
                     println!(
-                        "WORKLOAD IDENTITY VIOLATION (build_lsm): iter {i} manifest has {} tribles, expected {expected}",
-                        head_set.len()
+                        "WORKLOAD IDENTITY VIOLATION (rollup materialization): iter {i} produced different content handles"
                     );
                     std::process::exit(3);
                 }
                 _ => {}
             }
-            kept = Some((store, head_set));
+
+            let offered = if leaves.len() > 1 {
+                let mut records = leaf_records[..victim_count].to_vec();
+                records.push(compacted.rollup_record());
+                records
+            } else {
+                Vec::new()
+            };
+            kept = Some((
+                store,
+                offered,
+                leaves.len(),
+                victim_count,
+                compacted.segments().len(),
+            ));
         }
-        let (store, head_set) = kept.expect("at least one build iteration");
-        (samples, store, head_set, ident.unwrap_or(0))
+        let (store, offered, leaf_count, victim_count, compacted_segments) =
+            kept.expect("at least one build iteration");
+        (
+            leaf_samples,
+            compact_samples,
+            store,
+            offered,
+            leaf_count,
+            victim_count,
+            compacted_segments,
+        )
     });
 
     // Identity-tuple state (PANIC sentinels when a phase never produced it).
-    let mut union_counts = [PANIC_COUNT; 4];
-    let mut full_len = PANIC_COUNT;
-    let mut manifest_ident = PANIC_COUNT;
+    let mut mixed_counts = [PANIC_COUNT; 4];
+    let mut leaf_ident = PANIC_COUNT;
+    let mut selected_ident = PANIC_COUNT;
+    let mut residual_ident = PANIC_COUNT;
 
     match built {
-        Ok((samples, mut store, head_set, ident)) => {
-            all.push(("build_lsm".to_owned(), Outcome::Samples(samples)));
-            manifest_ident = ident;
+        Ok((
+            leaf_samples,
+            compact_samples,
+            mut store,
+            offered,
+            leaf_count,
+            victim_count,
+            compacted_segments,
+        )) => {
+            all.push(("leaf_store".to_owned(), Outcome::Samples(leaf_samples)));
+            all.push((
+                "compact_store".to_owned(),
+                Outcome::Samples(compact_samples),
+            ));
+            leaf_ident = leaf_count;
 
-            // -- attach + q<N>_union ---------------------------------------
+            // Resolution reloads and atomically thaws each offer on every
+            // sample; it is not timing a cached in-memory candidate list.
             match quiet_catch(|| {
-                let reader = store.reader().expect("scratch store reader");
-                let manifest: Manifest<SuccinctRollup> =
-                    Manifest::from_tribles(&head_set, &reader, &kind).expect("parse manifest");
-                let mut segments: Vec<SuccinctArchive<OrderedUniverse>> = Vec::new();
-                for entry in manifest.ranges() {
-                    for artifact in entry.artifacts() {
-                        segments.push(kind.attach(&reader, artifact).expect("attach segment"));
+                let mut samples = Vec::new();
+                let mut kept_cover = None;
+                let mut ident = None;
+                let mut dag = commit_dag.clone();
+                for i in 0..(warmup + iters) {
+                    let recording = i >= warmup;
+                    let reader = store.reader().expect("scratch store reader");
+                    let t = Instant::now();
+                    let cover =
+                        resolve_resident_range_cover(&reader, &mut dag, &kind, &offered, &frontier)
+                            .expect("resolve resident range cover");
+                    if recording {
+                        samples.push(t.elapsed().as_secs_f64() * 1000.0);
                     }
-                }
-                (manifest.ranges().len(), segments)
-            }) {
-                Ok((n_ranges, segments)) => {
-                    println!(
-                        "lsm      : {} logical ranges, {} physical segments",
-                        n_ranges,
-                        segments.len()
+                    let current_ident = (
+                        cover
+                            .selected()
+                            .iter()
+                            .map(|node| node.handle())
+                            .collect::<Vec<_>>(),
+                        cover.residual().to_vec(),
                     );
-                    let union = SuccinctRollup::union(&segments);
-                    let (union_outcomes, counts) =
-                        measure_queries(&union, "union", &qa, range_min, iters, warmup);
-                    union_counts = counts;
-                    all.extend(union_outcomes);
-
-                    // Identity gate: union-of-leaves must equal the plain set
-                    // at the interface (untimed reference run; PANIC
-                    // sentinels are skipped — a query that panicked on
-                    // either side has no count to disagree with).
-                    let mut full = TribleSet::new();
-                    for chunk in &chunks {
-                        full.union(chunk.content.clone());
+                    match &ident {
+                        None => ident = Some(current_ident),
+                        Some(expected) if expected != &current_ident => {
+                            println!(
+                                "WORKLOAD IDENTITY VIOLATION (cover): iter {i} selected a different cover/residual"
+                            );
+                            std::process::exit(3);
+                        }
+                        _ => {}
                     }
-                    full_len = full.len();
+                    kept_cover = Some(cover);
+                }
+                (samples, kept_cover.expect("at least one cover iteration"))
+            }) {
+                Ok((cover_samples, cover)) => {
+                    all.push(("cover".to_owned(), Outcome::Samples(cover_samples)));
+                    selected_ident = cover.selected().len();
+                    residual_ident = cover.residual().len();
+
+                    let resident_segments: Vec<_> = cover
+                        .selected()
+                        .iter()
+                        .flat_map(|node| node.segments().iter().cloned())
+                        .collect();
+                    let residual_handles: std::collections::HashSet<_> =
+                        cover.residual().iter().copied().collect();
+                    let mut residual = TribleSet::new();
+                    for chunk in &chunks {
+                        if residual_handles.contains(&chunk.handle) {
+                            residual.union(chunk.content.clone());
+                        }
+                    }
+                    assert_eq!(
+                        chunks
+                            .iter()
+                            .filter(|chunk| residual_handles.contains(&chunk.handle))
+                            .count(),
+                        residual_handles.len(),
+                        "every residual commit maps to source facts"
+                    );
+
+                    println!(
+                        "rollup   : {leaf_count} leaf nodes, {victim_count} deliberate victims, {} retained offers, {} selected nodes / {} resident segments, {} residual commits / {} residual tribles, {compacted_segments} compacted segments",
+                        offered.len(),
+                        cover.selected().len(),
+                        resident_segments.len(),
+                        cover.residual().len(),
+                        residual.len(),
+                    );
+
+                    let mixed = ResidentResidual::new(resident_segments, residual);
+                    let (mixed_outcomes, counts) =
+                        measure_queries(&mixed, "mixed", &qa, range_min, iters, warmup);
+                    mixed_counts = counts;
+                    all.extend(mixed_outcomes);
+
                     let (_, set_counts) = measure_queries(&full, "set-ref", &qa, range_min, 1, 0);
-                    if !counts_match(union_counts, set_counts) {
+                    if !counts_match(mixed_counts, set_counts) {
                         println!(
-                            "WORKLOAD IDENTITY VIOLATION (union vs set): union returned {union_counts:?}, set returned {set_counts:?}"
+                            "WORKLOAD IDENTITY VIOLATION (resident+residual vs set): mixed returned {mixed_counts:?}, set returned {set_counts:?}"
                         );
                         std::process::exit(3);
                     }
                 }
                 Err(msg) => {
-                    all.push(("attach".to_owned(), Outcome::Panic(msg)));
-                    println!("note     : manifest attach panicked — no union arm");
+                    all.push(("cover".to_owned(), Outcome::Panic(msg)));
+                    println!("note     : cover resolution panicked — no mixed query arm");
                 }
             }
         }
         Err(msg) => {
-            all.push(("build_lsm".to_owned(), Outcome::Panic(msg)));
-            println!("note     : build_lsm panicked — no leaves to query");
+            all.push(("leaf_store".to_owned(), Outcome::Panic(msg.clone())));
+            all.push(("compact_store".to_owned(), Outcome::Panic(msg)));
+            println!("note     : rollup materialization panicked — no cover to query");
         }
     }
 
     println!(
-        "identity : tribles={} q[1,3,4,5]={:?} manifest={}  (runs comparable ONLY if ALL match; {} = PANIC sentinel)",
-        full_len, union_counts, manifest_ident, PANIC_COUNT
+        "identity : tribles={} q[1,3,4,5]={:?} leaves={} selected={} residual={}  (runs comparable ONLY if ALL match; {} = PANIC sentinel)",
+        full_len,
+        mixed_counts,
+        leaf_ident,
+        selected_ident,
+        residual_ident,
+        PANIC_COUNT
     );
 
     let mut signal: Vec<String> = Vec::new();

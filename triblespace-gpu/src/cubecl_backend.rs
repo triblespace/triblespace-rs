@@ -142,7 +142,7 @@ fn stable_scatter(
 
 /// Reusable CubeCL wavelet-freeze backend.
 ///
-/// Construct it once and reuse it across LSM compactions so CubeCL's runtime,
+/// Construct it once and reuse it across rollup compactions so CubeCL's runtime,
 /// shader cache, and allocator survive between merges. Each rotation performs
 /// one upload, keeps all stable partitions device-resident, explicitly
 /// synchronizes queued work, and then performs one final readback.

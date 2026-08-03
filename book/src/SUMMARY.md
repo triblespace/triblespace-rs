@@ -25,7 +25,7 @@
 - [Architecture](architecture.md)
 - [Patterns & Recipes](patterns-and-recipes.md)
 - [Repository Workflows](repository-workflows.md)
-- [Range-Native Derived Indexes](index-ranges.md)
+- [Range-Native Rollups](index-ranges.md)
 - [Commit Selectors](commit-selectors.md)
 - [Garbage Collection](garbage-collection.md)
 - [Distributed Sync](distributed-sync.md)

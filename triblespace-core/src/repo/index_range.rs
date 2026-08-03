@@ -1,4 +1,4 @@
-//! Artifact-neutral commit ranges for derived index manifests.
+//! Artifact-neutral commit ranges for derived rollup nodes.
 //!
 //! A range record is a stable entity whose identity is the intrinsic core
 //! `(index_recipe, commit_start*, commit_end*)`, independent of mutable
@@ -476,7 +476,7 @@ where
     // Every victim has already been expanded to its exact member set.  For an
     // order-convex union, its poset minima/maxima are therefore exactly the
     // vertices with no direct parent/child inside that union.  Deriving those
-    // induced boundaries avoids walking from a late carry all the way back to
+    // induced boundaries avoids walking from a late range union all the way back to
     // genesis merely to rediscover the same frontier.
     //
     // A non-convex union can have a hidden ancestry relation through commits
@@ -1295,51 +1295,6 @@ mod tests {
     }
 
     #[test]
-    fn base_four_carry_preserves_a_seventeen_commit_cover() {
-        const FANOUT: usize = 4;
-        let mut graph = HashMap::new();
-        let mut commits = Vec::new();
-        for byte in 1..=17 {
-            let current = commit(byte);
-            let parents = commits.last().copied().into_iter().collect();
-            graph.insert(current, parents);
-            commits.push(current);
-        }
-
-        let mut levels: Vec<(usize, CommitRange)> = Vec::new();
-        for current in commits.iter().copied() {
-            levels.push((0, CommitRange::leaf(current)));
-            let mut level = 0;
-            loop {
-                let victim_indices: Vec<_> = levels
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, (candidate, _))| (*candidate == level).then_some(index))
-                    .collect();
-                if victim_indices.len() < FANOUT {
-                    break;
-                }
-                let victims: Vec<_> = victim_indices
-                    .iter()
-                    .map(|index| levels[*index].1.clone())
-                    .collect();
-                let merged = convex_union(&mut graph, &victims).unwrap();
-                for index in victim_indices.into_iter().rev() {
-                    levels.remove(index);
-                }
-                levels.push((level + 1, merged));
-                level += 1;
-            }
-
-            let active: Vec<_> = levels.iter().map(|(_, range)| range.clone()).collect();
-            validate_exact_cover(&mut graph, &active, Some(current)).unwrap();
-        }
-
-        assert!(levels.iter().any(|(level, _)| *level == 2));
-        assert!(levels.len() < commits.len());
-    }
-
-    #[test]
     fn ten_thousand_commit_chain_stays_linear_and_iterative() {
         const COUNT: u64 = 10_000;
         let mut graph = HashMap::new();
@@ -1371,66 +1326,6 @@ mod tests {
         graph.reads = 0;
         validate_exact_cover(&mut graph, &[range], Some(numbered_commit(COUNT - 1))).unwrap();
         assert!(graph.reads <= COUNT as usize);
-    }
-
-    #[test]
-    fn repeated_base_four_carries_read_only_their_victim_members() {
-        const FANOUT: usize = 4;
-        const COUNT: u64 = 4_096;
-        let mut commits = Vec::with_capacity(COUNT as usize);
-        let mut graph = HashMap::with_capacity(COUNT as usize);
-        for number in 0..COUNT {
-            let current = numbered_commit(number);
-            graph.insert(
-                current,
-                (number > 0)
-                    .then(|| numbered_commit(number - 1))
-                    .into_iter()
-                    .collect(),
-            );
-            commits.push(current);
-        }
-
-        let mut graph = CountingDag { graph, reads: 0 };
-        let mut levels: Vec<(usize, CommitRange, usize)> = Vec::new();
-        let mut carries = 0usize;
-        for current in commits.iter().copied() {
-            levels.push((0, CommitRange::leaf(current), 1));
-            let mut level = 0usize;
-            loop {
-                let victim_indices: Vec<_> = levels
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, (candidate, _, _))| (*candidate == level).then_some(index))
-                    .collect();
-                if victim_indices.len() < FANOUT {
-                    break;
-                }
-                let victims: Vec<_> = victim_indices
-                    .iter()
-                    .map(|index| levels[*index].1.clone())
-                    .collect();
-                let victim_members: usize =
-                    victim_indices.iter().map(|index| levels[*index].2).sum();
-                let reads_before = graph.reads;
-                let merged = convex_union(&mut graph, &victims).unwrap();
-                let carry_reads = graph.reads - reads_before;
-                assert!(
-                    carry_reads <= victim_members,
-                    "level {level} carry over {victim_members} members read {carry_reads} parents"
-                );
-                for index in victim_indices.into_iter().rev() {
-                    levels.remove(index);
-                }
-                levels.push((level + 1, merged, victim_members));
-                level += 1;
-                carries += 1;
-            }
-        }
-
-        assert!(carries > COUNT as usize / FANOUT);
-        assert_eq!(levels.len(), 1);
-        assert_eq!(levels[0].2, COUNT as usize);
     }
 
     proptest! {

@@ -190,7 +190,7 @@ durable append point.
 ## What a persisted summary means
 
 The automaton is part of the recipe identity. Two `PathRollup`s with different
-automata have different fingerprints, manifests, and range artifacts even when
+automata have different fingerprints, range cores, and artifact nodes even when
 they cover the same commits.
 
 Each nonempty range stores a canonical `PathSummaryBlob` containing only:
@@ -199,12 +199,14 @@ Each nonempty range stores a canonical `PathSummaryBlob` containing only:
 - the sorted direct arcs of the graph × automaton product.
 
 Those summaries are sparse constructional data, not independently closed path
-relations. Compaction is canonical set union. At attachment,
-`PathRollup::attach_exact` unions every live range summary and computes the
-accepted endpoint relation once over the whole union. That order is essential:
-one path may take its first edge from range A, its next edge from range B, and
-later re-enter A. Unioning closures built independently per range would miss
-such paths.
+relations. Compaction is canonical set union. At read time the rollup resolver
+selects a disjoint cover of locally attachable summary nodes and returns the
+uncovered source commits as a residual. The caller checks out those residual
+facts, builds one more constructional summary, unions it with every selected
+summary, and computes the accepted endpoint relation once over the whole
+union. That order is essential: one path may take its first edge from range A,
+its next edge from range B, and later re-enter A. Unioning closures built
+independently per range would miss such paths.
 
 This design also makes merge order irrelevant. `PathSummary::merge` is
 associative, commutative, and idempotent for one fixed automaton; closure is
@@ -225,21 +227,25 @@ then maps that relation back into the full universe and adds the diagonal.
 Unrelated attributes therefore do not widen the quadratic closure workspace.
 
 An entirely empty source has no graph terms and therefore no identity pairs. Its
-range still exists as a certified contentless record, but it has no
-`PathSummaryBlob` handle. “Covered and empty” is distinct from “not indexed.”
+range still exists as a completed-empty core where the asserted node handle is
+the same as the core handle. “Covered and empty” is distinct from “not
+resident”: the former covers commits without a `PathSummaryBlob`; the latter
+returns those commits as residual work.
 
 ## Freshness and the trust boundary
 
-A durable consumer must bind a manifest to the exact complete source frontier
-it covered, validate every summary's canonical bytes and automaton fingerprint,
-and reject stale coverage. `PathRollup::attach_exact` therefore takes an
-already-loaded immutable manifest plus the authoritative source head obtained
-from branch resolution; the cache blob cannot claim its own authority through
-wrapper metadata. Imported or manually assembled manifests should be checked
-with `Manifest::audit_exact_cover` against a blob reader before they are trusted,
-or rebuilt. See [Range-Native Derived Indexes](index-ranges.md) for the inclusive
-frontier and exact-cover rules. This audit belongs to the derived-index workflow;
-source branch assertions remain the independent source of truth.
+The authoritative source frontier always comes from branch resolution, never
+from a cache blob. Each rollup assertion names one immutable range core and one
+complete summary node. The reader validates and attaches every locally usable
+node, selects a disjoint cover inside the current frontier's ancestor closure,
+and evaluates every gap from source. A lagging or evicted cache is therefore
+slower, not stale or incorrect; an empty cover is a full source build.
+
+The source branch's author certifies that the summary is a truthful derivation
+of its recipe and range. Canonical decoding and the embedded automaton
+fingerprint validate physical compatibility, but do not recompute provenance.
+See [Range-Native Rollups](index-ranges.md) for the inclusive range,
+atomic-node, cover, residual, trust, and retention rules.
 
 ## Cost model: sparse input, potentially dense answer
 

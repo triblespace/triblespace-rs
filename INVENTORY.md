@@ -207,12 +207,8 @@ prioritized for efficient zero-copy access.
   handles. BM25 preserves the union of their term presence, while result
   materialisation currently selects one matching body; either make the schema
   cardinality explicit or make resolution deterministic and test it.
-- Extend immutable manifest maintenance testing with an interrupted bootstrap
-  over a true merge DAG, an actual commit above the physical shard threshold
-  proving all shards share one atomic coverage advance, and explicit
-  backward/divergent source-frontier rejection.
 - Property-test BM25 max-union compaction across randomized segment
-  permutations, repeated multi-level FANOUT merges, and high term frequencies
+  permutations, varied explicit merge trees, and high term frequencies
   near score-quantization saturation.
 - The optional CubeCL succinct-merge backend's per-level block-prefix scan is
   still one serial device thread. Packed CPU reduced the measured WGPU gain to

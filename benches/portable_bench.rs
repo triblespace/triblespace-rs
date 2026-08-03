@@ -9,8 +9,9 @@
 //!   `or!`, `and!`, `temp!`, `value_range`, `Pile`, `Repository`,
 //!   `Workspace::checkout`, `SuccinctArchive` — every item verified present
 //!   at both 739fd05c (2026-07-03) and 6a6a94f1 (2026-07-24). Everything
-//!   that drifted this month lives outside this surface. The LSM range-manifest
-//!   path is deliberately NOT here — it lives in `portable_bench_lsm.rs`
+//!   that drifted this month lives outside this surface. The asserted
+//!   range-rollup path is deliberately NOT here — it lives in
+//!   `portable_bench_rollup.rs`
 //!   with an independent compilation fate.
 //! * *Raw samples, never a bare mean.* Minima reproduce to 0.2–1.7%; means
 //!   drift 6–15%; maxima swing 3x. We print min/p50/p95/max so the floor and
@@ -41,7 +42,7 @@
 //!                Sub-first-chunk rungs checkout commit 1 and carve a sorted
 //!                prefix in-process. With `--chunk-aligned` the rung SNAPS to
 //!                the nearest cumulative-commit boundary instead (no carving)
-//!                — the alignment the LSM bench always applies — and the
+//!                — the alignment the rollup bench always applies — and the
 //!                snapped rung is printed so sweeps record actual-vs-nominal.
 //!                SKIP when no pile is given.
 //!   build_ram  — `SuccinctArchive<OrderedUniverse>::from(&set)`, gated on
@@ -121,7 +122,7 @@ use triblespace_gpu::WgpuSuccinctArchive;
 // ---------------------------------------------------------------------------
 // Crash isolation: panics are a fourth outcome (SIGNAL / NO-SIGNAL / SKIP /
 // PANIC), never a dead process. Keep these helpers IDENTICAL in
-// portable_bench_lsm.rs.
+// portable_bench_rollup.rs.
 // ---------------------------------------------------------------------------
 
 /// Outcome of one measure across a run: samples to report, or the first line

@@ -8,8 +8,9 @@ use triblespace_core::macros::entity;
 use triblespace_core::metadata;
 use triblespace_core::query::{Binding, Query, Variable};
 use triblespace_core::repo::index_home::{
-    append_range, load_manifest, set_index_head, store_manifest, CommitRange, Manifest,
+    resolve_resident_range_cover, store_range, CommitRange, IndexKind,
 };
+use triblespace_core::repo::index_range::StoredCommitDag;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStore, Repository};
 use triblespace_core::trible::TribleSet;
@@ -101,30 +102,29 @@ fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
     let source_head = workspace.head().unwrap();
     repo.push(&mut workspace).unwrap();
 
-    let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
-    append_range(
+    let node = store_range(
         repo.storage_mut(),
         &rollup,
-        &graph,
         CommitRange::leaf(source_head),
-        &mut manifest,
+        rollup.build(&graph).unwrap(),
     )
     .unwrap();
-    set_index_head(
-        repo.storage_mut(),
+    let reader = repo.storage_mut().reader().unwrap();
+    let mut dag = StoredCommitDag::new(&reader);
+    let cover = resolve_resident_range_cover(
+        &reader,
+        &mut dag,
         &rollup,
-        &mut manifest,
-        Some(source_head),
+        &[node.rollup_record()],
+        &[source_head],
     )
     .unwrap();
-    let reader = repo.storage_mut().reader().unwrap();
-    let manifest = Manifest::from_tribles(&manifest, &reader, &rollup).unwrap();
-    let manifest_handle = store_manifest(repo.storage_mut(), &manifest).unwrap();
-    let reader = repo.storage_mut().reader().unwrap();
-    let manifest = load_manifest(&reader, &rollup, manifest_handle).unwrap();
-
+    assert!(cover.residual().is_empty());
     let index = rollup
-        .attach_exact(&reader, &manifest, Some(source_head))
+        .finalize(
+            cover.selected().iter().flat_map(|node| node.segments()),
+            &TribleSet::new(),
+        )
         .unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));

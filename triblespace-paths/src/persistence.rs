@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 
 use triblespace_core::blob::{Blob, BlobEncoding};
 use triblespace_core::id::{ExclusiveId, Id};
@@ -9,10 +8,8 @@ use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::{attributes, entity, pattern};
-use triblespace_core::repo::index_home::{
-    attach_manifest, ArtifactError, CoverageMismatch, IndexError, IndexKind, Manifest,
-};
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CommitHandle};
+use triblespace_core::repo::index_home::{ArtifactError, IndexKind};
+use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::trible::{Fragment, TribleSet};
 use triblespace_core::{find, id_hex};
 
@@ -371,48 +368,32 @@ impl PathRollup {
         &self.automaton
     }
 
-    /// Attach the exact current source snapshot, globally union all live
-    /// direct-product summaries, and close once.
+    /// Materialize one exact path relation from resident summaries and the
+    /// source-data residual of the authoritative frontier.
     ///
-    /// This hot path trusts the manifest's certified frontier, as maintained
-    /// by an audited derived-data workflow. It does not repeat the O(history)
-    /// exact-cover audit on every attachment.
-    pub fn attach_exact<R>(
+    /// Resident summaries are constructional product arcs, not independently
+    /// closed relations. The residual is lowered to one summary, every summary
+    /// is unioned, and [`PathIndex::from_summary`] performs closure exactly
+    /// once. This preserves paths whose edges cross range-node boundaries.
+    /// Cache freshness is deliberately absent from this pure operation: cover
+    /// selection determines the exact residual before calling it.
+    pub fn finalize<'a>(
         &self,
-        reader: &R,
-        manifest: &Manifest<PathRollup>,
-        expected_source_head: Option<CommitHandle>,
-    ) -> Result<Arc<PathIndex>, IndexError>
-    where
-        R: BlobStoreGet,
-    {
-        if !manifest.claims_head(expected_source_head) {
-            return Err(IndexError::StaleCoverage(CoverageMismatch {
-                recipe: manifest.recipe(),
-                expected: expected_source_head,
-                actual: manifest.frontier().to_vec(),
-            }));
-        }
-        let summaries = attach_manifest(reader, self, manifest)?;
-        let summary = if summaries.is_empty() {
-            PathSummary::from_edges(self.automaton.clone(), [])
-        } else {
-            PathSummary::merge_all(summaries.iter())
-                .map_err(|error| IndexError::Merge(Box::new(error)))?
-        };
-        let index = PathIndex::from_summary(summary).map_err(path_index_error)?;
-        Ok(Arc::new(index))
+        resident: impl IntoIterator<Item = &'a PathSummary>,
+        residual: &TribleSet,
+    ) -> Result<PathIndex, PathError> {
+        // Collect references so the locally built residual can join the same
+        // borrowed slice without cloning any summary payload.
+        let resident = resident.into_iter().collect::<Vec<_>>();
+        let residual = PathSummary::from_tribles(self.automaton.clone(), residual.iter());
+        let summary =
+            PathSummary::merge_all(resident.iter().copied().chain(std::iter::once(&residual)))?;
+        PathIndex::from_summary(summary)
     }
-}
-
-fn path_index_error(error: PathError) -> IndexError {
-    IndexError::Artifact(Box::new(error))
 }
 
 impl IndexKind for PathRollup {
     type Segment = PathSummary;
-    type PreparedArtifact = PathSummary;
-    type StoredArtifact = Inline<Handle<PathSummaryBlob>>;
 
     fn recipe_fragment(&self) -> Fragment {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid minted algorithm id");
@@ -423,7 +404,7 @@ impl IndexKind for PathRollup {
         }
     }
 
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
+    fn build(&self, source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError> {
         let summary = PathSummary::from_tribles(self.automaton.clone(), source.iter());
         if summary.vertices().is_empty() {
             Ok(Vec::new())
@@ -432,65 +413,40 @@ impl IndexKind for PathRollup {
         }
     }
 
-    fn put<S: BlobStorePut>(
-        &self,
-        storage: &mut S,
-        artifact: Self::PreparedArtifact,
-    ) -> Result<Self::StoredArtifact, ArtifactError> {
-        if artifact.automaton() != &self.automaton {
+    fn freeze(&self, range_entity: Id, segment: &Self::Segment) -> Result<Fragment, ArtifactError> {
+        if segment.automaton() != &self.automaton {
             return Err(Box::new(PathSummaryBlobError::DifferentAutomaton));
         }
-        let blob = PathSummaryBlob::encode(&artifact)?;
-        storage
-            .put(blob)
-            .map_err(|error| Box::new(error) as ArtifactError)
+        let blob = PathSummaryBlob::encode(segment)?;
+        Ok(entity! { ExclusiveId::force_ref(&range_entity) @
+            seg_path_summary: blob,
+        })
     }
 
-    fn emit(&self, range_entity: Id, artifact: &Self::StoredArtifact) -> TribleSet {
-        entity! { ExclusiveId::force_ref(&range_entity) @
-            seg_path_summary: *artifact,
-        }
-        .into_facts()
-    }
-
-    fn parse<R: BlobStoreGet>(
+    fn thaw<R: BlobStoreGet>(
         &self,
         reader: &R,
         facts: &TribleSet,
         range_entity: Id,
-    ) -> Result<Vec<Self::StoredArtifact>, ArtifactError> {
-        let handles = find!(
+    ) -> Result<Vec<Self::Segment>, ArtifactError> {
+        let mut handles = find!(
             handle: Inline<Handle<PathSummaryBlob>>,
             pattern!(facts, [{ range_entity @ seg_path_summary: ?handle }])
         )
         .collect::<Vec<_>>();
-        let handle = match handles.as_slice() {
-            [] => return Ok(Vec::new()),
-            [handle] => *handle,
-            _ => return Err("path range has more than one summary handle".into()),
-        };
-        let blob: Blob<PathSummaryBlob> = reader
-            .get(handle)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        validate_header(blob.bytes.as_ref(), &self.automaton)?;
-        Ok(vec![handle])
+        handles.sort_unstable_by_key(|handle| handle.raw);
+        handles
+            .into_iter()
+            .map(|handle| {
+                let blob: Blob<PathSummaryBlob> = reader
+                    .get(handle)
+                    .map_err(|error| Box::new(error) as ArtifactError)?;
+                PathSummaryBlob::decode(blob, &self.automaton).map_err(Into::into)
+            })
+            .collect()
     }
 
-    fn attach<R: BlobStoreGet>(
-        &self,
-        reader: &R,
-        artifact: &Self::StoredArtifact,
-    ) -> Result<Self::Segment, ArtifactError> {
-        let blob: Blob<PathSummaryBlob> = reader
-            .get(*artifact)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        PathSummaryBlob::decode(blob, &self.automaton).map_err(Into::into)
-    }
-
-    fn merge(
-        &self,
-        segments: &[Self::Segment],
-    ) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
+    fn merge(&self, segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError> {
         if segments.is_empty() {
             return Ok(Vec::new());
         }
@@ -504,19 +460,16 @@ impl IndexKind for PathRollup {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use ed25519_dalek::SigningKey;
-    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::blob::IntoBlob;
     use triblespace_core::id::ufoid;
     use triblespace_core::inline::RawInline;
     use triblespace_core::repo::index_home::{
-        append_range, load_manifest, set_index_head, store_manifest, CommitRange, Manifest,
-        ManifestError, FANOUT,
+        load_range, resolve_resident_range_cover, store_range, CommitRange,
     };
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::Repository;
-    use triblespace_core::repo::{self, BlobStore, BlobStorePut, CommitHandle};
+    use triblespace_core::repo::{BlobStore, CommitHandle};
 
     use crate::{GraphEdge, Transition};
 
@@ -559,31 +512,8 @@ mod tests {
         entity! { ExclusiveId::force_ref(&source) @ metadata::tag: target }.into_facts()
     }
 
-    fn store_commit(
-        storage: &mut MemoryRepo,
-        source: &TribleSet,
-        parent: Option<CommitHandle>,
-    ) -> CommitHandle {
-        let content_handle = storage.put(source.to_blob()).unwrap();
-        let commit_entity = ufoid();
-        let mut commit = entity! { &commit_entity @ repo::content: content_handle }.into_facts();
-        if let Some(parent) = parent {
-            commit += entity! { &commit_entity @ repo::parent: parent }.into_facts();
-        }
-        storage.put(commit.to_blob()).unwrap()
-    }
-
-    fn persist_manifest(
-        storage: &mut MemoryRepo,
-        rollup: &PathRollup,
-        facts: &TribleSet,
-    ) -> (Inline<Handle<SimpleArchive>>, Manifest<PathRollup>) {
-        let reader = storage.reader().unwrap();
-        let manifest = Manifest::from_tribles(facts, &reader, rollup).unwrap();
-        let handle = store_manifest(storage, &manifest).unwrap();
-        let reader = storage.reader().unwrap();
-        let loaded = load_manifest(&reader, rollup, handle).unwrap();
-        (handle, loaded)
+    fn commit(byte: u8) -> CommitHandle {
+        Inline::new([byte; 32])
     }
 
     #[test]
@@ -729,316 +659,183 @@ mod tests {
     }
 
     #[test]
-    fn artifact_roundtrip_rejects_duplicate_and_foreign_handles() {
+    fn frozen_segments_compose_and_reject_foreign_summaries() {
         let rollup = PathRollup::new(plus(9));
-        let mut storage = MemoryRepo::default();
         let first = PathSummary::from_edges(rollup.automaton().clone(), [edge(1, 9, 2)]);
         let second = PathSummary::from_edges(rollup.automaton().clone(), [edge(2, 9, 3)]);
-        let first_handle = rollup.put(&mut storage, first.clone()).unwrap();
-        let second_handle = rollup.put(&mut storage, second).unwrap();
         let range_entity = *ufoid();
-        let facts = rollup.emit(range_entity, &first_handle);
-        let reader = storage.reader().unwrap();
+        let frozen = rollup.freeze(range_entity, &first).unwrap();
+        assert_eq!(frozen.blobs().len(), 1);
+        let mut blobs = frozen.blobs().clone();
+        let reader = blobs.reader().unwrap();
         assert_eq!(
-            rollup.parse(&reader, &facts, range_entity).unwrap(),
-            [first_handle]
+            rollup.thaw(&reader, frozen.facts(), range_entity).unwrap(),
+            [first.clone()]
         );
-        assert_eq!(rollup.attach(&reader, &first_handle).unwrap(), first);
 
-        let mut duplicate = facts;
-        duplicate += rollup.emit(range_entity, &second_handle);
-        assert!(rollup.parse(&reader, &duplicate, range_entity).is_err());
+        let mut composed = frozen.clone();
+        composed += rollup.freeze(range_entity, &second).unwrap();
+        let mut blobs = composed.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let thawed = rollup
+            .thaw(&reader, composed.facts(), range_entity)
+            .unwrap();
+        assert_eq!(thawed.len(), 2);
+        assert_eq!(
+            PathSummary::merge_all(thawed.iter()).unwrap(),
+            PathSummary::merge_all([&first, &second]).unwrap()
+        );
 
         let foreign = PathRollup::new(plus(8));
-        let single = rollup.emit(range_entity, &first_handle);
-        assert!(foreign.parse(&reader, &single, range_entity).is_err());
-        assert!(foreign.attach(&reader, &first_handle).is_err());
+        let mut blobs = frozen.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        assert!(foreign.thaw(&reader, frozen.facts(), range_entity).is_err());
     }
 
     #[test]
-    fn fanout_merge_preserves_lineage_and_empty_projection() {
+    fn standalone_range_roundtrips_and_checks_runtime_recipe() {
         let rollup = PathRollup::new(plus_label(metadata::tag.id().into()));
         let mut storage = MemoryRepo::default();
-        let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
-        let mut parent = None;
-        let mut commits = Vec::new();
-        for index in 0..(FANOUT - 1) {
-            let source = edge_facts((index + 1) as u8, (index + 2) as u8);
-            let commit = store_commit(&mut storage, &source, parent);
-            append_range(
-                &mut storage,
-                &rollup,
-                &source,
-                CommitRange::leaf(commit),
-                &mut manifest,
-            )
-            .unwrap();
-            commits.push(commit);
-            parent = Some(commit);
-        }
-        set_index_head(&mut storage, &rollup, &mut manifest, parent).unwrap();
-        let (before_handle, before) = persist_manifest(&mut storage, &rollup, &manifest);
-        assert_eq!(before.ranges().len(), FANOUT - 1);
-
-        let source = edge_facts(FANOUT as u8, (FANOUT + 1) as u8);
-        let commit = store_commit(&mut storage, &source, parent);
-        append_range(
+        let source = edge_facts(1, 2);
+        let [summary] = rollup.build(&source).unwrap().try_into().unwrap();
+        let stored = store_range(
             &mut storage,
             &rollup,
-            &source,
-            CommitRange::leaf(commit),
-            &mut manifest,
+            CommitRange::leaf(commit(1)),
+            vec![summary.clone()],
         )
         .unwrap();
-        commits.push(commit);
-        parent = Some(commit);
-        set_index_head(&mut storage, &rollup, &mut manifest, parent).unwrap();
-        let (after_handle, compacted) = persist_manifest(&mut storage, &rollup, &manifest);
-        assert_ne!(before_handle, after_handle);
-        assert_eq!(compacted.ranges().len(), 1);
-        assert_eq!(compacted.ranges()[0].level(), 1);
-        assert_eq!(compacted.ranges()[0].range().start(), &[commits[0]]);
-        assert_eq!(compacted.ranges()[0].range().end(), &[commits[FANOUT - 1]]);
-        assert_eq!(compacted.ranges()[0].artifacts().len(), 1);
-        let reader = storage.reader().unwrap();
-        compacted.audit_exact_cover(&reader).unwrap();
-        assert_eq!(
-            load_manifest(&reader, &rollup, before_handle)
-                .unwrap()
-                .ranges()
-                .len(),
-            FANOUT - 1
-        );
 
-        let mut unsafe_union = before.to_tribles();
-        unsafe_union += compacted.to_tribles();
-        let unsafe_union_handle = storage
-            .put::<SimpleArchive, _>(unsafe_union.to_blob())
-            .unwrap();
+        assert_ne!(stored.core().handle(), stored.handle());
+        assert_eq!(stored.segments(), std::slice::from_ref(&summary));
         let reader = storage.reader().unwrap();
-        let unsafe_union = load_manifest(&reader, &rollup, unsafe_union_handle).unwrap();
-        assert!(unsafe_union.audit_exact_cover(&reader).is_err());
+        let loaded = load_range(&reader, &rollup, stored.rollup_record()).unwrap();
+        assert_eq!(loaded.segments(), std::slice::from_ref(&summary));
 
-        let empty = TribleSet::new();
-        let empty_projection = store_commit(&mut storage, &empty, parent);
-        append_range(
-            &mut storage,
-            &rollup,
-            &empty,
-            CommitRange::leaf(empty_projection),
-            &mut manifest,
-        )
-        .unwrap();
-        let reader = storage.reader().unwrap();
-        let with_empty = Manifest::from_tribles(&manifest, &reader, &rollup).unwrap();
-        assert_eq!(with_empty.ranges().len(), 2);
-        assert!(with_empty.ranges().iter().any(|range| {
-            range.range().start() == [empty_projection] && range.artifacts().is_empty()
-        }));
+        let foreign = PathRollup::new(plus(8));
+        assert!(load_range(&reader, &foreign, stored.rollup_record()).is_err());
     }
 
     #[test]
-    fn exact_attach_closes_cross_range_paths_and_checks_freshness() {
+    fn residual_suffix_and_resident_ranges_close_globally() {
         let automaton = plus_label(metadata::tag.id().into());
         let rollup = PathRollup::new(automaton);
         let mut storage = MemoryRepo::default();
-        let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
         let first_source = edge_facts(1, 2);
-        let first = store_commit(&mut storage, &first_source, None);
-        append_range(
-            &mut storage,
-            &rollup,
-            &first_source,
-            CommitRange::leaf(first),
-            &mut manifest,
-        )
-        .unwrap();
         let second_source = edge_facts(2, 3);
-        let second = store_commit(&mut storage, &second_source, Some(first));
-        append_range(
+        let first = commit(1);
+        let second = commit(2);
+        let mut dag = HashMap::from([(first, Vec::new()), (second, vec![first])]);
+        let first_node = store_range(
             &mut storage,
             &rollup,
-            &second_source,
+            CommitRange::leaf(first),
+            rollup.build(&first_source).unwrap(),
+        )
+        .unwrap();
+        let second_node = store_range(
+            &mut storage,
+            &rollup,
             CommitRange::leaf(second),
-            &mut manifest,
+            rollup.build(&second_source).unwrap(),
         )
         .unwrap();
-        set_index_head(&mut storage, &rollup, &mut manifest, Some(second)).unwrap();
-        let (_, manifest) = persist_manifest(&mut storage, &rollup, &manifest);
         let reader = storage.reader().unwrap();
 
-        let index = rollup
-            .attach_exact(&reader, &manifest, Some(second))
+        let partial = resolve_resident_range_cover(
+            &reader,
+            &mut dag,
+            &rollup,
+            &[first_node.rollup_record()],
+            &[second],
+        )
+        .unwrap();
+        assert_eq!(partial.residual(), &[second]);
+        let partial_index = rollup
+            .finalize(
+                partial.selected().iter().flat_map(|node| node.segments()),
+                &second_source,
+            )
             .unwrap();
-        assert!(index.contains(
+        assert!(partial_index.contains(
             &RawInline::from(Id::new([1; 16]).unwrap()),
             &RawInline::from(Id::new([3; 16]).unwrap())
         ));
 
-        let stale_rollup = PathRollup::new(plus_label(metadata::tag.id().into()));
-        let mut stale_manifest = Manifest::new(&stale_rollup).unwrap().to_tribles();
-        set_index_head(
-            &mut storage,
-            &stale_rollup,
-            &mut stale_manifest,
-            Some(first),
+        let complete = resolve_resident_range_cover(
+            &reader,
+            &mut dag,
+            &rollup,
+            &[first_node.rollup_record(), second_node.rollup_record()],
+            &[second],
         )
         .unwrap();
-        let (_, stale_manifest) = persist_manifest(&mut storage, &stale_rollup, &stale_manifest);
-        let reader = storage.reader().unwrap();
-        assert!(matches!(
-            stale_rollup.attach_exact(&reader, &stale_manifest, Some(second)),
-            Err(IndexError::StaleCoverage(_))
+        assert!(complete.residual().is_empty());
+        let complete_index = rollup
+            .finalize(
+                complete.selected().iter().flat_map(|node| node.segments()),
+                &TribleSet::new(),
+            )
+            .unwrap();
+        assert!(complete_index.contains(
+            &RawInline::from(Id::new([1; 16]).unwrap()),
+            &RawInline::from(Id::new([3; 16]).unwrap())
         ));
     }
 
     #[test]
-    fn assertion_frontier_supports_exact_paths_and_contentless_coverage() {
+    fn sibling_ranges_and_a_contentless_merge_form_an_exact_path_cover() {
         let rollup = PathRollup::new(plus_label(metadata::tag.id().into()));
-        let mut repo = Repository::new(
-            MemoryRepo::default(),
-            SigningKey::from_bytes(&[7; 32]),
-            TribleSet::new(),
-        )
-        .unwrap();
-        let mut left = repo.create_workspace("paths").unwrap();
-        let mut right = repo.create_workspace("paths").unwrap();
-        let identity = *left.identity();
-        let left_source = edge_facts(1, 2);
-        let right_source = edge_facts(2, 3);
-        left.commit(left_source.clone(), "left edge")
-            .expect("workspace rank has room");
-        right
-            .commit(right_source.clone(), "right edge")
-            .expect("workspace rank has room");
-        let left_head = left.head().unwrap();
-        let right_head = right.head().unwrap();
-        repo.push(&mut left).unwrap();
-        repo.push(&mut right).unwrap();
-
-        // Independent assertions from the same empty base resolve to one
-        // canonical, contentless merge. A no-change push caches that synthetic
-        // commit without adding a third asserted branch-pin value.
-        let mut merged = repo.pull(identity).unwrap();
-        let merge_head = merged.head().unwrap();
-        repo.push(&mut merged).unwrap();
-
-        // Derived index publication is deliberately explicit and separate
-        // from typed branch-pin publication.
-        let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
-        append_range(
-            repo.storage_mut(),
+        let mut storage = MemoryRepo::default();
+        let left = commit(1);
+        let right = commit(2);
+        let merge = commit(3);
+        let mut dag = HashMap::from([
+            (left, Vec::new()),
+            (right, Vec::new()),
+            (merge, vec![left, right]),
+        ]);
+        let left_node = store_range(
+            &mut storage,
             &rollup,
-            &left_source,
-            CommitRange::leaf(left_head),
-            &mut manifest,
+            CommitRange::leaf(left),
+            rollup.build(&edge_facts(1, 2)).unwrap(),
         )
         .unwrap();
-        append_range(
-            repo.storage_mut(),
+        let right_node = store_range(
+            &mut storage,
             &rollup,
-            &right_source,
-            CommitRange::leaf(right_head),
-            &mut manifest,
+            CommitRange::leaf(right),
+            rollup.build(&edge_facts(2, 3)).unwrap(),
         )
         .unwrap();
-        append_range(
-            repo.storage_mut(),
-            &rollup,
-            &TribleSet::new(),
-            CommitRange::leaf(merge_head),
-            &mut manifest,
-        )
-        .unwrap();
-        set_index_head(repo.storage_mut(), &rollup, &mut manifest, Some(merge_head)).unwrap();
-        let (_, manifest) = persist_manifest(repo.storage_mut(), &rollup, &manifest);
-        let reader = repo.storage_mut().reader().unwrap();
+        let merge_node =
+            store_range(&mut storage, &rollup, CommitRange::leaf(merge), Vec::new()).unwrap();
+        assert_eq!(merge_node.core().handle(), merge_node.handle());
 
+        let reader = storage.reader().unwrap();
+        let cover = resolve_resident_range_cover(
+            &reader,
+            &mut dag,
+            &rollup,
+            &[
+                left_node.rollup_record(),
+                right_node.rollup_record(),
+                merge_node.rollup_record(),
+            ],
+            &[merge],
+        )
+        .unwrap();
+        assert!(cover.residual().is_empty());
         let index = rollup
-            .attach_exact(&reader, &manifest, Some(merge_head))
+            .finalize(
+                cover.selected().iter().flat_map(|node| node.segments()),
+                &TribleSet::new(),
+            )
             .unwrap();
         assert!(index.contains(
             &RawInline::from(Id::new([1; 16]).unwrap()),
             &RawInline::from(Id::new([3; 16]).unwrap())
-        ));
-
-        assert_eq!(manifest.ranges().len(), 3);
-        let merge_range = manifest
-            .ranges()
-            .iter()
-            .find(|range| range.range().start() == [merge_head])
-            .unwrap();
-        assert_eq!(merge_range.range().end(), &[merge_head]);
-        assert!(merge_range.artifacts().is_empty());
-    }
-
-    #[test]
-    fn exact_manifest_blob_enforces_standalone_and_runtime_recipe_boundaries() {
-        let rollup = PathRollup::new(plus(9));
-        let mut storage = MemoryRepo::default();
-        let facts = Manifest::new(&rollup).unwrap().to_tribles();
-        let (manifest_handle, manifest) = persist_manifest(&mut storage, &rollup, &facts);
-        let reader = storage.reader().unwrap();
-        let empty = rollup.attach_exact(&reader, &manifest, None).unwrap();
-        assert_eq!(empty.automaton(), rollup.automaton());
-        assert_eq!(empty.vertex_count(), 0);
-        assert_eq!(
-            load_manifest(&reader, &rollup, manifest_handle)
-                .unwrap()
-                .to_tribles(),
-            facts
-        );
-
-        let arbitrary_empty = storage
-            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
-            .unwrap();
-        let reader = storage.reader().unwrap();
-        assert!(matches!(
-            load_manifest(&reader, &rollup, arbitrary_empty),
-            Err(IndexError::Manifest(ManifestError::NotStandalone { .. }))
-        ));
-
-        let wrapper = ufoid();
-        let mut wrapped = manifest.to_tribles();
-        wrapped += entity! { &wrapper @ repo::branch: *ufoid() }.into_facts();
-        let wrapped_handle = storage.put::<SimpleArchive, _>(wrapped.to_blob()).unwrap();
-        let reader = storage.reader().unwrap();
-        assert!(matches!(
-            load_manifest(&reader, &rollup, wrapped_handle),
-            Err(IndexError::Manifest(ManifestError::NotStandalone { .. }))
-        ));
-
-        let foreign = PathRollup::new(plus(8));
-        let mut bundled = manifest.to_tribles();
-        bundled += Manifest::new(&foreign).unwrap().to_tribles();
-        let bundled_handle = storage.put::<SimpleArchive, _>(bundled.to_blob()).unwrap();
-        let reader = storage.reader().unwrap();
-        assert!(matches!(
-            load_manifest(&reader, &rollup, bundled_handle),
-            Err(IndexError::Manifest(ManifestError::NotStandalone { .. }))
-        ));
-
-        let recipe = manifest.recipe();
-        let extension = *ufoid();
-        let mut extended = manifest.to_tribles();
-        extended += entity! { ExclusiveId::force_ref(&recipe) @
-            metadata::tag: extension,
-        }
-        .into_facts();
-        let extended_handle = storage
-            .put::<SimpleArchive, _>(extended.clone().to_blob())
-            .unwrap();
-        let reader = storage.reader().unwrap();
-        assert_eq!(
-            load_manifest(&reader, &rollup, extended_handle)
-                .unwrap()
-                .to_tribles(),
-            extended
-        );
-
-        assert!(matches!(
-            attach_manifest(&reader, &foreign, &manifest),
-            Err(IndexError::Manifest(ManifestError::RecipeMismatch { .. }))
         ));
     }
 

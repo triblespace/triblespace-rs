@@ -54,23 +54,23 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Range-native typed search artifacts
 
-- Ported `Bm25Rollup` and `HnswRollup` to the fallible, range-native
-  `IndexKind` contract. Prepared and stored artifacts now retain their exact
-  `SuccinctBM25Blob` / `SuccinctHNSWBlob` types throughout put, manifest,
-  parse, and attach paths; the search recipes no longer erase blobs through
-  `UnknownBlob`.
+- Reduced `Bm25Rollup` and `HnswRollup` to the range-native `IndexKind`
+  algebra: build and merge return queryable segments directly, `freeze`
+  turns one segment into a self-contained typed `Fragment`, and `thaw`
+  reconstructs every segment in one complete standalone node.
 - Added stable typed artifact attributes plus intrinsic recipe descriptors.
   BM25 identity includes its source-content attribute. HNSW identity includes
   its source-embedding attribute, dimension, and deterministic seed, so
-  parameter-distinct recipes persist safely under independent immutable
-  manifest handles.
+  parameter-distinct recipes remain isolated by their immutable range cores
+  while sharing the same canonical physical blob encodings.
 - Empty projections now produce zero physical artifacts while retaining their
-  logical range record. Repeated typed handle facts represent repeated physical
-  artifacts on one logical range.
+  logical range record. Repeated typed facts are conjunctive physical shards
+  within one complete node; distinct nodes remain atomic alternatives.
 - Builds now fail closed on unreadable source content, unreadable embeddings,
-  and embedding dimension mismatches. HNSW compaction also fails when a source
-  embedding can no longer be resolved instead of certifying an incomplete
-  merged range.
+  and embedding dimension mismatches. Thaw validates HNSW dimensions, and
+  both kinds reject a whole node atomically if any typed blob is missing or
+  malformed. HNSW compaction also fails when a source embedding can no longer
+  be resolved instead of certifying an incomplete merged range.
 
 ## [0.41.4] - 2026-05-17
 
