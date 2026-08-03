@@ -24,8 +24,8 @@ use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::find;
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::Inline;
 use crate::prelude::{attributes, entity, pattern};
+use crate::repo::rollup_pin::RollupRecord;
 use crate::repo::{commit, BlobStoreGet, CommitHandle};
 use crate::trible::TribleSet;
 
@@ -169,34 +169,33 @@ pub struct CommitRange {
     end: Vec<CommitHandle>,
 }
 
-/// One locally usable standalone artifact-node archive offered to cover
+/// One locally usable asserted range-core/artifact-node pair offered to cover
 /// commits at read time.
 ///
-/// The archive handle, rather than the intrinsic range entity id, is the
-/// candidate identity. Two independent builds may describe the same range
-/// entity while carrying different complete artifact bundles; keeping their
-/// archive handles distinct lets selection choose one canonical alternative
-/// without fact-unioning the standalone nodes.
+/// The exact asserted pair is the candidate identity. Two independent builds
+/// may describe the same range while carrying different complete artifact
+/// nodes, and one range-neutral node may legitimately be asserted for several
+/// cores. Keeping both handles lets selection distinguish both cases without
+/// fact-unioning alternatives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeCoverCandidate {
-    node: Inline<Handle<SimpleArchive>>,
+    record: RollupRecord,
     range: CommitRange,
 }
 
 impl RangeCoverCandidate {
-    /// Pair one complete standalone artifact node with its hard range core.
+    /// Pair one asserted hard-core/artifact-node identity with its range.
     ///
     /// Core/node association validation, typed artifact parsing, and local
     /// availability are deliberately the caller's responsibility. A canonical
-    /// empty projection has the same archive handle for both roles and remains
-    /// a valid candidate.
-    pub fn new(node: Inline<Handle<SimpleArchive>>, range: CommitRange) -> Self {
-        Self { node, range }
+    /// empty projection uses the shared empty `SimpleArchive` as its node.
+    pub fn new(record: RollupRecord, range: CommitRange) -> Self {
+        Self { record, range }
     }
 
-    /// Exact complete artifact-node archive asserted by the rollup pin label.
-    pub const fn node(&self) -> Inline<Handle<SimpleArchive>> {
-        self.node
+    /// Exact asserted hard-core/artifact-node pair.
+    pub const fn record(&self) -> RollupRecord {
+        self.record
     }
 
     /// Exact commit region certified by the parsed record.
@@ -213,13 +212,13 @@ impl RangeCoverCandidate {
 /// grow-only assertion never poisons the rest of the pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeCoverSelection {
-    selected: Vec<Inline<Handle<SimpleArchive>>>,
+    selected: Vec<RollupRecord>,
     residual: Vec<CommitHandle>,
 }
 
 impl RangeCoverSelection {
-    /// Canonically ordered, pairwise-disjoint standalone artifact nodes.
-    pub fn selected(&self) -> &[Inline<Handle<SimpleArchive>>] {
+    /// Canonically ordered, pairwise-disjoint asserted rollup pairs.
+    pub fn selected(&self) -> &[RollupRecord] {
         &self.selected
     }
 
@@ -503,8 +502,8 @@ where
 /// claimed by an index record. Candidates are independent immutable facts from
 /// one recipe's asserted G-set. A candidate is eligible only when its exact
 /// validated member set lies inside the target. Eligible candidates are tried
-/// by descending coverage size and then by standalone archive handle, and are
-/// accepted only when disjoint from everything already selected.
+/// by descending coverage size, node handle, and core handle, and are accepted
+/// only when disjoint from everything already selected.
 ///
 /// This greedy order is an optimization policy, not a correctness invariant.
 /// Merged replicas may contain overlapping or alternative compactions, and an
@@ -545,7 +544,7 @@ where
 
         match view.range_members(&candidate.range) {
             Ok(members) if members.is_subset(&target) => {
-                eligible.push((candidate.node, members));
+                eligible.push((candidate.record, members));
             }
             Ok(_) => {}
             Err(RangeValidationError::Graph(error)) => {
@@ -558,21 +557,22 @@ where
         }
     }
 
-    eligible.sort_unstable_by(|(left_node, left_members), (right_node, right_members)| {
+    eligible.sort_unstable_by(|(left, left_members), (right, right_members)| {
         right_members
             .len()
             .cmp(&left_members.len())
-            .then_with(|| left_node.raw.cmp(&right_node.raw))
+            .then_with(|| left.node().raw.cmp(&right.node().raw))
+            .then_with(|| left.range_record().raw.cmp(&right.range_record().raw))
     });
 
     let mut remaining = target;
     let mut selected = Vec::new();
-    for (node, members) in eligible {
+    for (record, members) in eligible {
         if members.iter().all(|commit| remaining.contains(commit)) {
             for commit in members {
                 remaining.remove(&commit);
             }
-            selected.push(node);
+            selected.push(record);
         }
     }
 
@@ -879,8 +879,12 @@ mod tests {
         Inline::new(raw)
     }
 
+    fn rollup(core: u8, node: u8) -> RollupRecord {
+        RollupRecord::new(Inline::new([core; 32]), Inline::new([node; 32]))
+    }
+
     fn cover_candidate(byte: u8, range: CommitRange) -> RangeCoverCandidate {
-        RangeCoverCandidate::new(Inline::new([byte; 32]), range)
+        RangeCoverCandidate::new(rollup(byte, byte), range)
     }
 
     fn chain() -> (HashMap<CommitHandle, Vec<CommitHandle>>, [CommitHandle; 3]) {
@@ -1077,10 +1081,7 @@ mod tests {
 
         let mut forward_graph = graph.clone();
         let forward = select_range_cover(&mut forward_graph, &candidates, &[c]).unwrap();
-        assert_eq!(
-            forward.selected(),
-            &[Inline::new([7; 32]), Inline::new([9; 32])]
-        );
+        assert_eq!(forward.selected(), &[rollup(7, 7), rollup(9, 9)]);
         assert!(forward.residual().is_empty());
 
         let mut reversed = candidates;
@@ -1113,7 +1114,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selection.selected(), &[Inline::new([2; 32])]);
+        assert_eq!(selection.selected(), &[rollup(2, 2)]);
         assert!(selection.residual().is_empty());
     }
 
@@ -1128,7 +1129,26 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selection.selected(), &[Inline::new([3; 32])]);
+        assert_eq!(selection.selected(), &[rollup(3, 3)]);
+        assert!(selection.residual().is_empty());
+    }
+
+    #[test]
+    fn one_range_neutral_node_can_cover_several_distinct_cores() {
+        let (mut graph, [a, b, _c]) = chain();
+        let first = rollup(7, 3);
+        let second = rollup(9, 3);
+        let selection = select_range_cover(
+            &mut graph,
+            &[
+                RangeCoverCandidate::new(first, CommitRange::leaf(a)),
+                RangeCoverCandidate::new(second, CommitRange::leaf(b)),
+            ],
+            &[b],
+        )
+        .unwrap();
+
+        assert_eq!(selection.selected(), &[first, second]);
         assert!(selection.residual().is_empty());
     }
 
@@ -1144,7 +1164,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selection.selected(), &[Inline::new([2; 32])]);
+        assert_eq!(selection.selected(), &[rollup(2, 2)]);
         assert!(selection.residual().is_empty());
     }
 

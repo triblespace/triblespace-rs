@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recipe. Every signed assertion pairs a hard core-only range-record value with
   one complete unowned node in its opaque label. Nodes sharing a core remain
   atomic alternatives, while repeated typed facts inside one node are
-  conjunctive segments. Completed-empty ranges use their core as the node.
+  conjunctive segments. Completed-empty ranges share the canonical empty
+  `SimpleArchive` node.
 - `select_range_cover` deterministically admits fully resident standalone
   nodes against the authoritative source frontier and returns every uncovered
   commit as an exact source-data residual. The typed rollup-pin projection is

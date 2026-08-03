@@ -228,10 +228,10 @@ then maps that relation back into the full universe and adds the diagonal.
 Unrelated attributes therefore do not widen the quadratic closure workspace.
 
 An entirely empty source has no graph terms and therefore no identity pairs. Its
-range still exists as a completed-empty core where the asserted node handle is
-the same as the core handle. “Covered and empty” is distinct from “not
-resident”: the former covers commits without a `PathSummaryBlob`; the latter
-returns those commits as residual work.
+range still exists with the canonical empty `SimpleArchive` as its asserted
+node. “Covered and empty” is distinct from “not resident”: the former covers
+commits without a `PathSummaryBlob`; the latter returns those commits as
+residual work.
 
 ## Freshness and the trust boundary
 

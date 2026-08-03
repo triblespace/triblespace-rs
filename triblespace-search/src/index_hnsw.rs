@@ -48,7 +48,7 @@ use std::collections::HashSet;
 use anybytes::View;
 
 use triblespace_core::blob::{Blob, TryFromBlob};
-use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata;
@@ -207,22 +207,21 @@ where
         }
     }
 
-    fn freeze(&self, entity: Id, artifact: &Self::Artifact) -> Result<Fragment, ArtifactError> {
+    fn freeze(&self, artifact: &Self::Artifact) -> Result<Fragment, ArtifactError> {
         self.validate_dimension()?;
         self.validate_artifact(artifact)?;
-        Ok(entity! { ExclusiveId::force_ref(&entity) @ seg_hnsw: artifact })
+        Ok(entity! { seg_hnsw: artifact })
     }
 
     fn thaw<B: BlobStoreGet>(
         &self,
         reader: &B,
         facts: &TribleSet,
-        entity: Id,
     ) -> Result<Self::Artifact, ArtifactError> {
         self.validate_dimension()?;
         let handles = triblespace_core::find!(
             handle: Inline<Handle<SuccinctHNSWBlob>>,
-            pattern!(facts, [{ entity @ seg_hnsw: ?handle }])
+            pattern!(facts, [{ _?artifact @ seg_hnsw: ?handle }])
         )
         .collect::<Vec<_>>();
         let [handle] = handles.as_slice() else {
@@ -645,14 +644,13 @@ mod tests {
         let (source, handle) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
         let artifact = kind.build(&source).unwrap().unwrap();
-        let range_entity = *fucid();
-        let frozen = kind.freeze(range_entity, &artifact).unwrap();
+        let frozen = kind.freeze(&artifact).unwrap();
 
         assert!(frozen.iter().all(|fact| fact.a() == &seg_hnsw.id()));
         assert_eq!(frozen.blobs().len(), 1);
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
-        let thawed = kind.thaw(&reader, frozen.facts(), range_entity).unwrap();
+        let thawed = kind.thaw(&reader, frozen.facts()).unwrap();
         assert_eq!(thawed.doc_count(), 1);
         assert_eq!(
             nearest_across(
@@ -683,13 +681,12 @@ mod tests {
         let mut storage = MemoryRepo::default();
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
         let empty = HNSWBuilder::new(2).with_seed(DEFAULT_SEED).build();
-        let entity = *fucid();
-        assert!(kind.freeze(entity, &empty).is_err());
+        assert!(kind.freeze(&empty).is_err());
 
-        let frozen = entity! { ExclusiveId::force_ref(&entity) @ seg_hnsw: &empty };
+        let frozen = entity! { seg_hnsw: &empty };
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
-        assert!(kind.thaw(&reader, frozen.facts(), entity).is_err());
+        assert!(kind.thaw(&reader, frozen.facts()).is_err());
     }
 
     #[test]
@@ -835,26 +832,25 @@ mod tests {
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
         let artifact_a = kind.build(&source_a).unwrap().unwrap();
         let artifact_b = kind.build(&source_b).unwrap().unwrap();
-        let entity = *fucid();
-        let mut frozen = kind.freeze(entity, &artifact_a).unwrap();
-        frozen += kind.freeze(entity, &artifact_b).unwrap();
+        let mut frozen = kind.freeze(&artifact_a).unwrap();
+        frozen += kind.freeze(&artifact_b).unwrap();
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
-        assert!(kind.thaw(&reader, frozen.facts(), entity).is_err());
+        assert!(kind.thaw(&reader, frozen.facts()).is_err());
 
         let missing = Inline::<Handle<SuccinctHNSWBlob>>::new([0xA5; 32]);
         let mut incomplete = frozen.clone();
-        incomplete += entity! { ExclusiveId::force_ref(&entity) @ seg_hnsw: missing };
+        incomplete += entity! { seg_hnsw: missing };
         let mut blobs = incomplete.blobs().clone();
         let reader = blobs.reader().unwrap();
-        assert!(kind.thaw(&reader, incomplete.facts(), entity).is_err());
+        assert!(kind.thaw(&reader, incomplete.facts()).is_err());
 
         let malformed_blob = Blob::<SuccinctHNSWBlob>::new(Bytes::from(vec![0u8; 8]));
-        let malformed = entity! { ExclusiveId::force_ref(&entity) @ seg_hnsw: malformed_blob };
+        let malformed = entity! { seg_hnsw: malformed_blob };
         frozen += malformed;
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
-        assert!(kind.thaw(&reader, frozen.facts(), entity).is_err());
+        assert!(kind.thaw(&reader, frozen.facts()).is_err());
     }
 
     #[test]
@@ -863,15 +859,11 @@ mod tests {
         let (source, _) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0, 0.0]);
         let three = HnswRollup::new(storage.reader().unwrap(), 3, emb.id());
         let artifact = three.build(&source).unwrap().unwrap();
-        let entity = *fucid();
-        let frozen = three.freeze(entity, &artifact).unwrap();
+        let frozen = three.freeze(&artifact).unwrap();
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
         let two = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
-        let error = two
-            .thaw(&reader, frozen.facts(), entity)
-            .unwrap_err()
-            .to_string();
+        let error = two.thaw(&reader, frozen.facts()).unwrap_err().to_string();
         assert!(error.contains("dimension 3, expected 2"));
     }
 

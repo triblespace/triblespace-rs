@@ -223,13 +223,13 @@ fn node_from_label(label: SubsumptionLabel) -> Inline<Handle<SimpleArchive>> {
 /// One atomic rollup alternative over a fixed logical source range.
 ///
 /// `range_record` names the canonical core-only [`RangeRecord`](super::index_range::RangeRecord)
-/// archive. `node` names one complete standalone archive containing only the
-/// conjunctive typed artifact components for the alternative, rooted at the
-/// core's intrinsic entity; the signed pair supplies their association. The
-/// range core is recipe-neutral: the surrounding pin descriptor supplies the
-/// sole `(source branch, recipe)` partition. Distinct nodes may share one range
-/// record; they remain disjunctive alternatives and must never be fact-unioned
-/// merely because their intrinsic range entity is equal.
+/// archive. `node` names one complete range-neutral archive containing only
+/// the conjunctive typed artifact components for the alternative. The signed
+/// pair supplies its association with the core. The range core is recipe-
+/// neutral: the surrounding pin descriptor supplies the sole `(source branch,
+/// recipe)` partition. Distinct nodes may share one range record, and one
+/// identical node may be paired with several cores; alternatives remain
+/// atomic and must never be fact-unioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RollupRecord {
     range_record: Inline<Handle<SimpleArchive>>,
@@ -385,8 +385,9 @@ where
 /// Project one source branch and recipe's exact rollup-alternative set.
 ///
 /// Exact duplicate pairs are deduplicated. The same range core paired with two
-/// node handles remains two alternatives. Other authors, source branches, and
-/// recipes remain in the generic snapshot but do not enter this typed view.
+/// node handles remains two alternatives, while one range-neutral node may be
+/// paired with several cores. Other authors, source branches, and recipes
+/// remain in the generic snapshot but do not enter this typed view.
 pub fn rollup_records_in_snapshot(
     snapshot: &PinAssertionSnapshot,
     source: &BranchIdentity,

@@ -415,29 +415,22 @@ impl IndexKind for PathRollup {
         }
     }
 
-    fn freeze(
-        &self,
-        range_entity: Id,
-        artifact: &Self::Artifact,
-    ) -> Result<Fragment, ArtifactError> {
+    fn freeze(&self, artifact: &Self::Artifact) -> Result<Fragment, ArtifactError> {
         if artifact.automaton() != &self.automaton {
             return Err(Box::new(PathSummaryBlobError::DifferentAutomaton));
         }
         let blob = PathSummaryBlob::encode(artifact)?;
-        Ok(entity! { ExclusiveId::force_ref(&range_entity) @
-            seg_path_summary: blob,
-        })
+        Ok(entity! { seg_path_summary: blob })
     }
 
     fn thaw<R: BlobStoreGet>(
         &self,
         reader: &R,
         facts: &TribleSet,
-        range_entity: Id,
     ) -> Result<Self::Artifact, ArtifactError> {
         let handles = find!(
             handle: Inline<Handle<PathSummaryBlob>>,
-            pattern!(facts, [{ range_entity @ seg_path_summary: ?handle }])
+            pattern!(facts, [{ _?artifact @ seg_path_summary: ?handle }])
         )
         .collect::<Vec<_>>();
         let [handle] = handles.as_slice() else {
@@ -474,7 +467,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use triblespace_core::id::ufoid;
     use triblespace_core::inline::RawInline;
     use triblespace_core::repo::index_home::{
         load_range, resolve_resident_range_cover, store_range, CommitRange,
@@ -674,28 +666,22 @@ mod tests {
         let rollup = PathRollup::new(plus(9));
         let first = PathSummary::from_edges(rollup.automaton().clone(), [edge(1, 9, 2)]);
         let second = PathSummary::from_edges(rollup.automaton().clone(), [edge(2, 9, 3)]);
-        let range_entity = *ufoid();
-        let frozen = rollup.freeze(range_entity, &first).unwrap();
+        let frozen = rollup.freeze(&first).unwrap();
         assert_eq!(frozen.blobs().len(), 1);
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
-        assert_eq!(
-            rollup.thaw(&reader, frozen.facts(), range_entity).unwrap(),
-            first
-        );
+        assert_eq!(rollup.thaw(&reader, frozen.facts()).unwrap(), first);
 
         let mut composed = frozen.clone();
-        composed += rollup.freeze(range_entity, &second).unwrap();
+        composed += rollup.freeze(&second).unwrap();
         let mut blobs = composed.blobs().clone();
         let reader = blobs.reader().unwrap();
-        assert!(rollup
-            .thaw(&reader, composed.facts(), range_entity)
-            .is_err());
+        assert!(rollup.thaw(&reader, composed.facts()).is_err());
 
         let foreign = PathRollup::new(plus(8));
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
-        assert!(foreign.thaw(&reader, frozen.facts(), range_entity).is_err());
+        assert!(foreign.thaw(&reader, frozen.facts()).is_err());
     }
 
     #[test]
@@ -708,7 +694,7 @@ mod tests {
             .merge(std::slice::from_ref(&empty))
             .unwrap()
             .is_none());
-        assert!(rollup.freeze(*ufoid(), &empty).is_err());
+        assert!(rollup.freeze(&empty).is_err());
     }
 
     #[test]
@@ -833,7 +819,7 @@ mod tests {
         .unwrap();
         let merge_node =
             store_range(&mut storage, &rollup, CommitRange::leaf(merge), None).unwrap();
-        assert_eq!(merge_node.core().handle(), merge_node.handle());
+        assert_ne!(merge_node.core().handle(), merge_node.handle());
 
         let reader = storage.reader().unwrap();
         let cover = resolve_resident_range_cover(

@@ -81,23 +81,25 @@ One published rollup alternative is a pair of content-addressed archives:
 
 ```text
 core = SimpleArchive(core-only RangeRecord)
-node = SimpleArchive(one complete typed artifact, rooted at the range entity)
+node = SimpleArchive(empty, or one complete range-neutral typed artifact)
 ```
 
 The generic signed assertion stores `core` as its value and `node` as its
 opaque label. The rollup descriptor is wrapped by a strong-pin descriptor, so
 generic retention follows the small core but does not follow the node label.
 Derived bytes therefore remain optional and evictable without a permanent
-weak-pin assertion. A completed-empty projection is the degenerate case
-`node == core`.
+weak-pin assertion. A completed-empty projection uses the canonical empty
+`SimpleArchive`, whose handle is shared by every empty artifact.
 
-A distinct node does not repeat `commit_start` or `commit_end`. The signed
-`(core,node)` pair is already the association, and the artifact facts must all
-use the core's intrinsic range entity as their subject. Loading parses and
-validates the recipe-neutral core once, then rejects an empty node or any node
-containing another subject or range-control attribute before kind-specific
-thaw. Recipe admission is not re-proved from duplicate core metadata: callers
-obtain the pairs from the already recipe-scoped pin projection.
+A node does not repeat `commit_start` or `commit_end`. The signed `(core,node)`
+pair is already the association. Nonempty artifact facts use one deterministic
+subject independent of the range, so identical physical artifacts deduplicate
+even when several cores assert them. Loading parses and validates the recipe-
+neutral core once, accepts the canonical empty archive as no artifact, and
+rejects a nonempty node with several subjects or any range-control attribute
+before kind-specific thaw. Recipe admission is not re-proved from duplicate
+core metadata: callers obtain the pairs from the already recipe-scoped pin
+projection.
 
 The archive boundary is semantic:
 
@@ -105,9 +107,10 @@ The archive boundary is semantic:
 - different node archives for the same core are disjunctive complete
   alternatives.
 
-Never fact-union alternative nodes merely because their intrinsic range entity
-ids match. Doing so could mix a raw Succinct archive from one alternative with
-a Rank9 sidecar from another or combine two complete Path, BM25, or HNSW
+Never fact-union alternative nodes merely because they share a range core or
+artifact subject. Doing so could mix a raw Succinct archive from one
+alternative with a Rank9 sidecar from another or combine two complete Path,
+BM25, or HNSW
 artifacts into an accidental bundle. Content
 addressing still deduplicates replicas that produce exactly the same node.
 
@@ -131,18 +134,21 @@ artifact. Only the rollup descriptor needs its stable id; the range core is
 independent of the recipe.
 
 `build` and `merge` return `None` for the canonical empty projection. Each
-present artifact freezes to one nonempty `Fragment` rooted at the range entity.
+present artifact freezes to one nonempty `Fragment` with a deterministic,
+range-neutral root.
 An artifact can still own several conjunctive typed blobs—for example one raw
 Succinct archive plus its source-bound Rank9 sidecar—but a node never carries a
 vector of independently queryable artifacts. That cardinality is represented
 by several selected range nodes at read time, where it belongs.
 
-`thaw` is all-or-error and returns exactly one artifact for a distinct node, so
-an empty node or a missing, duplicate, or malformed required component never
+`freeze` and `thaw` receive no range entity; the artifact node is a pure
+physical value. `thaw` is all-or-error and returns exactly one artifact for a
+nonempty node, so a missing, duplicate, or malformed required component never
 enters a cover. The node remains an open fact set: additional same-subject,
 non-control facts are harmless unless the kind assigns them stricter meaning.
-A completed-empty node bypasses `thaw` entirely: its core is structurally known
-to contain no artifact facts.
+The canonical empty archive bypasses `thaw` entirely and denotes no artifact;
+unlike the old contextual `node == core` convention, its identity is independent
+of both range and recipe.
 
 The trait deliberately does not assert one universal merge homomorphism.
 Coverage is exact for every kind; observable query equivalence under a changed
@@ -185,9 +191,11 @@ candidates.
 
 `select_range_cover` validates each candidate's exact members against the
 commit DAG, ignores ranges outside `T(H)`, then greedily selects pairwise-
-disjoint candidates by descending coverage size and node handle. The policy is
-deterministic but not a source-coverage invariant. Whatever it does not select
-is returned as an exact list of residual commits:
+disjoint candidates by descending coverage size and exact `(core,node)` pair.
+The pair, rather than the node alone, is the candidate identity because one
+range-neutral node may back several disjoint cores. The policy is deterministic
+but not a source-coverage invariant. Whatever it does not select is returned as
+an exact list of residual commits:
 
 ```text
 covered commits union residual commits == T(H)

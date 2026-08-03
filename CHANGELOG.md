@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Rollup artifact nodes are range-neutral.** `IndexKind::freeze` and `thaw`
+  no longer receive a range entity; each kind persists one deterministic
+  artifact-rooted fragment instead. Identical physical artifacts can therefore
+  share one node archive across several range cores. Cover selection keys a
+  candidate by the exact asserted `(core, node)` pair so that reuse cannot
+  collapse distinct source ranges. The empty `SimpleArchive` is the canonical
+  range- and recipe-neutral node for a completed-empty projection.
 - **The speculative adaptive Succinct rollup wrapper is gone.** Core retains
   the stateless `WaveletMatrixFreezeBackend` and
   `merge_ordered_archives_with_backend` experiment seams, but no longer mixes
@@ -200,8 +207,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and merge operations. Recipe identity is a direct `Id`; private intrinsic
   entity literals may derive it, but their transient facts are neither stored
   nor part of the generic contract. Build and merge return `Option<Artifact>`;
-  a distinct node thaws exactly one complete artifact, while `node == core`
-  canonically represents no artifact. This removes the unused
+  a nonempty node thaws exactly one complete artifact, while the canonical
+  empty `SimpleArchive` represents no artifact. This removes the unused
   vector-of-artifacts shape inside one node without changing the
   several-selected-nodes read model. A distinct soft node is artifact-only:
   the signed pair already associates it with the hard core, so it no longer
