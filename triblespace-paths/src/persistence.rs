@@ -395,13 +395,15 @@ impl PathRollup {
 impl IndexKind for PathRollup {
     type Artifact = PathSummary;
 
-    fn recipe_fragment(&self) -> Fragment {
+    fn recipe_id(&self) -> Id {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid minted algorithm id");
         let fingerprint = automaton_fingerprint(&self.automaton);
         entity! { _ @
             metadata::tag: algorithm,
             path_automaton_fingerprint: fingerprint,
         }
+        .root()
+        .expect("the Path recipe has one intrinsic root")
     }
 
     fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {

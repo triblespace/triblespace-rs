@@ -50,7 +50,7 @@ fn main() {
     // core plus one complete typed node; publication merely adds their signed
     // pair to this branch and recipe's grow-only rollup set.
     let rollup = SuccinctRollup::new();
-    let recipe = rollup.recipe_fragment().root().expect("one recipe root");
+    let recipe = rollup.recipe_id();
     let artifact = rollup.build(&people).expect("build Succinct artifact");
     let stored = store_range(
         repository.storage_mut(),

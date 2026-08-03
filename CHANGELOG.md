@@ -174,13 +174,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sharing a core remain atomic alternatives; read-time selection admits only
   fully resident nodes and returns every uncovered source commit as an exact
   residual. `IndexKind` is one `Artifact` type plus recipe, build, freeze, thaw,
-  and merge operations. Build and merge return `Option<Artifact>`; a distinct
-  node thaws exactly one complete artifact, while `node == core` canonically
-  represents no artifact. This removes the unused vector-of-artifacts shape
-  inside one node without changing the several-selected-nodes read model. A
-  distinct soft node is artifact-only: the signed pair already associates it
-  with the hard core, so it no longer duplicates recipe or range-boundary
-  facts. `RangeRecord` consequently serializes canonical core facts only.
+  and merge operations. Recipe identity is a direct `Id`; private intrinsic
+  entity literals may derive it, but their transient facts are neither stored
+  nor part of the generic contract. Build and merge return `Option<Artifact>`;
+  a distinct node thaws exactly one complete artifact, while `node == core`
+  canonically represents no artifact. This removes the unused
+  vector-of-artifacts shape inside one node without changing the
+  several-selected-nodes read model. A distinct soft node is artifact-only:
+  the signed pair already associates it with the hard core, so it no longer
+  duplicates recipe or range-boundary facts. `RangeRecord` consequently
+  serializes canonical core facts only.
   Compaction publishes another immutable pair and never mutates or supersedes
   its victims. Succinct artifacts pair raw archives with source-bound Rank9
   blobs; BM25 rejects empty or noncanonical-tuning artifacts; HNSW rejects

@@ -10,10 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Derived indexes use a five-operation `IndexKind` algebra over one queryable
-  `Segment` type: an intrinsic recipe descriptor, `build`, `freeze`, `thaw`,
-  and `merge`. Each frozen segment is a self-contained `Fragment`; generic
-  storage persists its typed facts and owned blobs as one standalone node over
-  a canonical artifact-neutral range core.
+  `Artifact` type: a direct recipe id, `build`, `freeze`, `thaw`, and `merge`.
+  Private intrinsic entity literals may derive recipe ids, but their transient
+  facts are not persisted or exposed by the generic lifecycle. Each frozen
+  artifact is a self-contained `Fragment`; generic storage persists its typed
+  facts and owned blobs as one standalone node over a canonical
+  artifact-neutral range core.
 - A typed grow-only `RollupPinDescriptor` identifies each source branch and
   recipe. Every signed assertion pairs a hard core-only range-record value with
   one complete unowned node in its opaque label. Nodes sharing a core remain

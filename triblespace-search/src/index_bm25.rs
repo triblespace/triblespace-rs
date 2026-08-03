@@ -156,12 +156,14 @@ where
 {
     type Artifact = Bm25Artifact;
 
-    fn recipe_fragment(&self) -> Fragment {
+    fn recipe_id(&self) -> Id {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid algorithm id");
         entity! { _ @
             metadata::tag: algorithm,
             index_source_attribute: self.content_attr,
         }
+        .root()
+        .expect("the BM25 recipe has one intrinsic root")
     }
 
     fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
@@ -757,11 +759,8 @@ mod tests {
         let same = Bm25Rollup::new(right_store.reader().unwrap(), content.id());
         let other = Bm25Rollup::new(right_store.reader().unwrap(), alternate_content.id());
 
-        assert_eq!(left.recipe_fragment().root(), same.recipe_fragment().root());
-        assert_ne!(
-            left.recipe_fragment().root(),
-            other.recipe_fragment().root()
-        );
+        assert_eq!(left.recipe_id(), same.recipe_id());
+        assert_ne!(left.recipe_id(), other.recipe_id());
     }
 
     #[test]

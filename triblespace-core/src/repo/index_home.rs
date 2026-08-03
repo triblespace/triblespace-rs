@@ -65,9 +65,9 @@ pub trait IndexKind {
     /// One complete queryable physical artifact.
     type Artifact;
 
-    /// Deterministic recipe descriptor with exactly one exported root. All
-    /// descriptor facts must be attached directly to that root.
-    fn recipe_fragment(&self) -> Fragment;
+    /// Deterministic identity of the logical question and its source
+    /// parameters. Physical execution policy does not participate.
+    fn recipe_id(&self) -> Id;
 
     /// Build the physical artifact for one logical source range.
     /// A canonical empty projection returns `None`.
@@ -82,8 +82,9 @@ pub trait IndexKind {
     ) -> Result<Fragment, ArtifactError>;
 
     /// Thaw the one complete physical artifact carried by a distinct node.
-    /// Implementations must reject empty, missing, duplicate, or foreign
-    /// components.
+    /// Implementations must reject empty, missing, duplicate, or malformed
+    /// required components. Additional same-subject, non-control facts may be
+    /// ignored.
     fn thaw<R: BlobStoreGet>(
         &self,
         reader: &R,
@@ -99,8 +100,6 @@ pub trait IndexKind {
 /// Structural validation failure for one standalone rollup node.
 #[derive(Debug)]
 pub enum RangeNodeError {
-    /// The recipe descriptor was not one rooted, blob-free entity.
-    InvalidRecipeFragment,
     /// A core archive did not contain exactly one range record.
     CoreRecordCardinality {
         /// Number of range records discovered in the archive.
@@ -108,7 +107,8 @@ pub enum RangeNodeError {
     },
     /// The asserted core archive contained facts beyond its canonical core.
     CoreNotStandalone { entity: Id },
-    /// The artifact-node archive was empty or contained unrelated/control facts.
+    /// The artifact-node archive was empty, used another subject, or contained
+    /// range-control facts.
     NodeNotStandalone { entity: Id },
     /// The stored range belongs to another runtime recipe.
     RecipeMismatch { expected: Id, actual: Id },
@@ -121,9 +121,6 @@ pub enum RangeNodeError {
 impl fmt::Display for RangeNodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRecipeFragment => {
-                write!(f, "index recipe must be one rooted, blob-free entity")
-            }
             Self::CoreRecordCardinality { actual } => write!(
                 f,
                 "standalone range core contains {actual} range records, expected one"
@@ -135,7 +132,7 @@ impl fmt::Display for RangeNodeError {
             Self::NodeNotStandalone { entity } => {
                 write!(
                     f,
-                    "artifact node for range {entity:x} is empty or contains unrelated/control facts"
+                    "artifact node for range {entity:x} is empty, uses another subject, or contains range-control facts"
                 )
             }
             Self::RecipeMismatch { expected, actual } => write!(
@@ -254,21 +251,6 @@ impl<S> StoredRangeNode<S> {
     }
 }
 
-fn recipe_id<K: IndexKind>(kind: &K) -> Result<Id, RangeNodeError> {
-    let fragment = kind.recipe_fragment();
-    if !fragment.blobs().is_empty() {
-        return Err(RangeNodeError::InvalidRecipeFragment);
-    }
-    let recipe = fragment
-        .root()
-        .ok_or(RangeNodeError::InvalidRecipeFragment)?;
-    let facts = fragment.into_facts();
-    if facts.iter().any(|fact| *fact.e() != recipe) {
-        return Err(RangeNodeError::InvalidRecipeFragment);
-    }
-    Ok(recipe)
-}
-
 /// Derived-index range operation failure.
 #[derive(Debug)]
 pub enum IndexError {
@@ -347,7 +329,7 @@ pub fn store_range<S: BlobStore, K: IndexKind>(
     range: CommitRange,
     artifact: Option<K::Artifact>,
 ) -> Result<StoredRangeNode<K::Artifact>, IndexError> {
-    let recipe = recipe_id(kind)?;
+    let recipe = kind.recipe_id();
     let core_record = RangeRecord::new(recipe, range);
     let entity = core_record.entity();
     let core_facts = core_record.to_tribles();
@@ -398,7 +380,7 @@ pub fn load_range_core<R: BlobStoreGet, K: IndexKind>(
     kind: &K,
     handle: Inline<Handle<SimpleArchive>>,
 ) -> Result<StoredRangeCore, IndexError> {
-    let expected_recipe = recipe_id(kind)?;
+    let expected_recipe = kind.recipe_id();
     let core_facts = reader
         .get::<TribleSet, SimpleArchive>(handle)
         .map_err(storage_error)?;
@@ -541,9 +523,11 @@ impl SuccinctRollup {
     }
 }
 
-fn succinct_recipe_fragment() -> Fragment {
+fn succinct_recipe_id() -> Id {
     let algorithm = Id::from_hex(SuccinctRollup::KIND_ID_HEX).expect("valid algorithm id");
     entity! { _ @ metadata::tag: algorithm }
+        .root()
+        .expect("the Succinct recipe has one intrinsic root")
 }
 
 fn freeze_succinct_artifact(
@@ -614,8 +598,8 @@ fn thaw_succinct_artifact<R: BlobStoreGet>(
 impl IndexKind for SuccinctRollup {
     type Artifact = SuccinctArchive<OrderedUniverse>;
 
-    fn recipe_fragment(&self) -> Fragment {
-        succinct_recipe_fragment()
+    fn recipe_id(&self) -> Id {
+        succinct_recipe_id()
     }
 
     fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
@@ -695,8 +679,8 @@ where
 {
     type Artifact = SuccinctArchive<OrderedUniverse>;
 
-    fn recipe_fragment(&self) -> Fragment {
-        succinct_recipe_fragment()
+    fn recipe_id(&self) -> Id {
+        succinct_recipe_id()
     }
 
     fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
@@ -907,8 +891,8 @@ mod tests {
     impl IndexKind for SilentArtifactKind {
         type Artifact = ();
 
-        fn recipe_fragment(&self) -> Fragment {
-            succinct_recipe_fragment()
+        fn recipe_id(&self) -> Id {
+            succinct_recipe_id()
         }
 
         fn build(&self, _source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {

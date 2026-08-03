@@ -81,11 +81,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   algebra: build and merge return queryable segments directly, `freeze`
   turns one segment into a self-contained typed `Fragment`, and `thaw`
   reconstructs every segment in one complete standalone node.
-- Added stable typed artifact attributes plus intrinsic recipe descriptors.
-  BM25 identity includes its source-content attribute. HNSW identity includes
-  its source-embedding attribute, dimension, and deterministic seed, so
-  parameter-distinct recipes remain isolated by their immutable range cores
-  while sharing the same canonical physical blob encodings.
+- Added stable typed artifact attributes plus intrinsic recipe ids. BM25
+  identity includes its source-content attribute. HNSW identity includes its
+  source-embedding attribute and dimension; graph construction uses one fixed
+  deterministic seed rather than a recipe knob. Parameter-distinct recipes
+  remain isolated by their immutable range cores while sharing the same
+  canonical physical blob encodings.
 - Empty projections now produce zero physical artifacts while retaining their
   logical range record. Repeated typed facts are conjunctive physical shards
   within one complete node; distinct nodes remain atomic alternatives.

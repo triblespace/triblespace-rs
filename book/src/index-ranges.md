@@ -111,12 +111,17 @@ addressing still deduplicates replicas that produce exactly the same node.
 `Artifact`, and five operations:
 
 ```text
-recipe_fragment()                    identify the question and parameters
+recipe_id() -> Id                    identify the question and parameters
 build(source facts) -> Option<A>     derive one leaf artifact
 freeze(artifact) -> Fragment         canonical typed facts plus owned blobs
 thaw(distinct node) -> A             validate and attach exactly one artifact
 merge(&[A]) -> Option<A>             compact within one recipe
 ```
+
+A kind may derive that id with a private intrinsic `entity!` literal, but only
+the id crosses the interface. Recipe facts are not durable metadata: the
+runtime kind already owns the parameters needed to build and interpret an
+artifact, while the range core and rollup descriptor need only its stable id.
 
 `build` and `merge` return `None` for the canonical empty projection. Each
 present artifact freezes to one nonempty `Fragment` rooted at the range entity.
@@ -126,9 +131,11 @@ vector of independently queryable artifacts. That cardinality is represented
 by several selected range nodes at read time, where it belongs.
 
 `thaw` is all-or-error and returns exactly one artifact for a distinct node, so
-a missing, duplicate, foreign, or empty physical representation never enters a
-cover. A completed-empty node bypasses `thaw` entirely: its core is
-structurally known to contain no artifact facts.
+an empty node or a missing, duplicate, or malformed required component never
+enters a cover. The node remains an open fact set: additional same-subject,
+non-control facts are harmless unless the kind assigns them stricter meaning.
+A completed-empty node bypasses `thaw` entirely: its core is structurally known
+to contain no artifact facts.
 
 The trait deliberately does not assert one universal merge homomorphism.
 Coverage is exact for every kind; observable query equivalence under a changed

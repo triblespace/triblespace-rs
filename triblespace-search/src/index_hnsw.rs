@@ -175,13 +175,15 @@ where
 {
     type Artifact = SuccinctHNSWIndex;
 
-    fn recipe_fragment(&self) -> Fragment {
+    fn recipe_id(&self) -> Id {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid algorithm id");
         entity! { _ @
             metadata::tag: algorithm,
             index_source_attribute: self.attr,
             index_dimension: self.dim as u64,
         }
+        .root()
+        .expect("the HNSW recipe has one intrinsic root")
     }
 
     fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
@@ -797,10 +799,10 @@ mod tests {
         let source = HnswRollup::new(right_store.reader().unwrap(), 2, alternate_emb.id());
         let dimension = HnswRollup::new(right_store.reader().unwrap(), 3, emb.id());
 
-        let root = left.recipe_fragment().root();
-        assert_eq!(root, same.recipe_fragment().root());
-        assert_ne!(root, source.recipe_fragment().root());
-        assert_ne!(root, dimension.recipe_fragment().root());
+        let recipe = left.recipe_id();
+        assert_eq!(recipe, same.recipe_id());
+        assert_ne!(recipe, source.recipe_id());
+        assert_ne!(recipe, dimension.recipe_id());
     }
 
     #[test]
