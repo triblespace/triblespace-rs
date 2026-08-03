@@ -56,9 +56,9 @@ blake3 = "1"
 unicode-properties = "0.1.4"
 # 1.13 raised its MSRV to 1.85; this crate still promises Rust 1.80.
 unicode-segmentation = "=1.12.0"
-# Segment merge spools recovered postings to an anonymous temporary file so
-# exact canonical score quantization needs only one source-postings recovery
-# pass without retaining a corpus-sized posting cache in memory.
+# Segment merge spools exact joined postings to an anonymous temporary file so
+# canonical serialization needs one source-postings pass without retaining a
+# corpus-sized posting cache in memory.
 tempfile = { version = "3", optional = true }
 
 [features]

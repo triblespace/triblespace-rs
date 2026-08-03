@@ -124,15 +124,15 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
 
     println!("BM25 single-term query  [n={n_docs}, vocab={vocab}, avg_len={doc_len}]:");
     time_single("naive", &|q| {
-        let _: Vec<_> = naive.query_term(q).collect();
+        let hits: Vec<_> = naive.query_term(q).collect();
+        std::hint::black_box(hits);
     });
     time_single("SB25", &|q| {
-        let _: Vec<_> = succinct.query_term(q).collect();
+        let hits: Vec<_> = succinct.query_term(q).collect();
+        std::hint::black_box(hits);
     });
 
-    // 3-term OR query via query_multi (naive only — succinct
-    // doesn't currently expose query_multi; sum-of-query_term is
-    // equivalent).
+    // 3-term OR query via the same query_multi surface on both backends.
     let multi_reps = 10;
     let tri_queries: Vec<Vec<Inline<WordHash>>> = (0..100)
         .map(|i| {
@@ -145,26 +145,34 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
         .collect();
     // Warm
     for q in &tri_queries {
-        let _ = naive.query_multi(q);
+        std::hint::black_box(naive.query_multi(q));
+        std::hint::black_box(succinct.query_multi(q));
     }
-    let mut samples: Vec<u128> = Vec::new();
-    for _ in 0..multi_reps {
-        for q in &tri_queries {
-            let t0 = Instant::now();
-            let _ = naive.query_multi(q);
-            samples.push(t0.elapsed().as_nanos());
+    let time_multi = |tag: &str, f: &dyn Fn(&[Inline<WordHash>])| {
+        let mut samples: Vec<u128> = Vec::new();
+        for _ in 0..multi_reps {
+            for q in &tri_queries {
+                let t0 = Instant::now();
+                f(q);
+                samples.push(t0.elapsed().as_nanos());
+            }
         }
-    }
-    samples.sort_unstable();
-    let avg = samples.iter().sum::<u128>() / samples.len() as u128;
-    println!(
-        "  {:<14} avg {:<9}  p50 {:<9}  p99 {:<9}  (n={})",
-        "naive 3-term",
-        fmt_ns(avg),
-        fmt_ns(percentile(&samples, 0.5)),
-        fmt_ns(percentile(&samples, 0.99)),
-        samples.len(),
-    );
+        samples.sort_unstable();
+        let avg = samples.iter().sum::<u128>() / samples.len() as u128;
+        println!(
+            "  {tag:<14} avg {:<9}  p50 {:<9}  p99 {:<9}  (n={})",
+            fmt_ns(avg),
+            fmt_ns(percentile(&samples, 0.5)),
+            fmt_ns(percentile(&samples, 0.99)),
+            samples.len(),
+        );
+    };
+    time_multi("naive 3-term", &|q| {
+        std::hint::black_box(naive.query_multi(q));
+    });
+    time_multi("SB25 3-term", &|q| {
+        std::hint::black_box(succinct.query_multi(q));
+    });
     // Keep the compiler honest about the built indexes.
     let _ = naive.doc_count();
     let _: &BM25Index = &naive;

@@ -128,7 +128,12 @@ fn main() {
         }
     }
     let mut ranked: Vec<_> = acc.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     for (d, s) in ranked.iter().take(3) {
         let text = text_for(&corpus, d);
         println!("  {d}  score={s:.3}  {text}");

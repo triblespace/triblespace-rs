@@ -20,7 +20,7 @@ use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::repo::index_home::IndexKind;
 use triblespace_core::repo::BlobStore;
 use triblespace_search::bm25::BM25Builder;
-use triblespace_search::index_bm25::Bm25Rollup;
+use triblespace_search::index_bm25::{query_across, Bm25Rollup};
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::WordHash;
 
@@ -169,5 +169,33 @@ fn main() {
         fmt_bytes(extra_heap),
         fmt_bytes(merged_blob.bytes.len()),
         digest.to_hex(),
+    );
+
+    // Exact fragmented reads join sufficient statistics before scoring;
+    // compacted reads score the already-joined carrier directly. Keeping both
+    // timings here makes the fragmentation tax visible without comparing the
+    // exact path to the retired per-segment-score approximation.
+    let query = [term_from_u64(1), term_from_u64(2), term_from_u64(3)];
+    std::hint::black_box(query_across(&segments, &query).expect("fragmented exact query"));
+    std::hint::black_box(merged_blob.query_multi(&query));
+
+    let fragmented_repetitions = if segment_count == 1 { 100 } else { 3 };
+    let started = Instant::now();
+    for _ in 0..fragmented_repetitions {
+        std::hint::black_box(query_across(&segments, &query).expect("fragmented exact query"));
+    }
+    let fragmented_ns = started.elapsed().as_nanos() / fragmented_repetitions as u128;
+
+    let compacted_repetitions = 1_000;
+    let started = Instant::now();
+    for _ in 0..compacted_repetitions {
+        std::hint::black_box(merged_blob.query_multi(&query));
+    }
+    let compacted_ns = started.elapsed().as_nanos() / compacted_repetitions as u128;
+    println!(
+        "exact query: fragmented {:.3} ms; compacted {:.3} us; tax {:.1}x",
+        fragmented_ns as f64 / 1_000_000.0,
+        compacted_ns as f64 / 1_000.0,
+        fragmented_ns as f64 / compacted_ns.max(1) as f64,
     );
 }

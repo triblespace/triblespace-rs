@@ -189,8 +189,8 @@ and slice.
 ### Why fixed score (not a variable)
 
 The caller almost never gets a meaningful `score` from somewhere else in the
-query. A fixed floor keeps the predicate boolean and avoids score
-quantization/bookkeeping inside joins.
+query. A fixed floor keeps the predicate boolean and avoids carrying ranking
+bookkeeping through joins.
 
 ### Cardinality
 

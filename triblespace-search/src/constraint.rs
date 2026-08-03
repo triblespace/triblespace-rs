@@ -96,13 +96,9 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
 /// parameter set at construction time. This mirrors how
 /// search filtering handles scores: filter on a fixed floor inside the
 /// engine, recompute the precise score afterwards via the `score` inherent
-/// helper if you need it for ranking. Two reasons:
-///
-/// - Quantisation bookkeeping disappears. The lossy f32-on-disk
-///   score lives only in the index storage; the engine sees
-///   docs only.
-/// - One less variable per BM25 clause in the planner — joins
-///   stay tight, and there's no Cartesian-blowup dedupe to do.
+/// helper if you need it for ranking. Keeping relevance as a filter parameter
+/// rather than another query variable leaves joins tight and avoids a
+/// Cartesian score-binding dimension.
 ///
 /// Pre-aggregated at construction: walk every term's posting
 /// list once, sum scores into a `HashMap<doc, f32>`, drop
@@ -150,7 +146,9 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
 ///         (id, idx.score(&v, &terms))
 ///     })
 ///     .collect();
-/// ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+/// ranked.sort_unstable_by(|left, right| {
+///     right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+/// });
 /// assert_eq!(ranked.len(), 2);
 /// ```
 pub struct BM25Filter<S = GenId>
@@ -223,14 +221,10 @@ where
 /// identical filtering behaviour.
 ///
 /// **The output is distinct by construction**: every doc key is a
-/// `HashMap` key here, so a doc that appears under several query terms
-/// — or twice inside one posting list — is one entry with the summed
-/// score. That last case is not hypothetical: `BM25Builder::insert`
-/// appends to a doc-keyed `Vec` without collapsing repeats, so the
-/// naive index's `keys` table can hold the same key at two doc indices
-/// and `query_term` then yields it twice for a single term. The
-/// aggregation is what makes the constraint's input a set — nothing at
-/// the index layer guarantees it.
+/// `HashMap` key here, so a doc that appears under several query terms is one
+/// entry with the summed score. Both index backends already canonicalize
+/// duplicate document keys; this aggregation is about combining query terms,
+/// while its keyed shape also keeps the filter boundary defensively set-like.
 fn aggregate_above<I: BM25Queryable + ?Sized>(
     index: &I,
     terms: &[RawInline],
@@ -266,9 +260,8 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
     /// in at least one posting list" (BM25 scores are
     /// non-negative).
     ///
-    /// Recompute precise per-result scores via [`Self::score`]
-    /// when you need them for ranking — keeps the engine path
-    /// quantisation-free.
+    /// Recompute per-result scores via [`Self::score`] when you need them for
+    /// ranking.
     pub fn matches(
         &self,
         doc: Variable<D>,
@@ -281,9 +274,6 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
 
     /// Summed BM25 score for `doc` across `terms`. Returns
     /// `0.0` for docs that don't appear in any posting list.
-    /// Lossless on the naive index; on the succinct index the
-    /// score reflects the stored u16 quantisation but at f32
-    /// precision (no engine-side equality bookkeeping).
     pub fn score(&self, doc: &Inline<D>, terms: &[Inline<T>]) -> f32 {
         let mut sum = 0.0;
         for term in terms {
@@ -355,8 +345,8 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
     }
 }
 
-/// Word-hash convenience for the succinct path — same shape as the
-/// naive-index sugar, picks up the u16-quantised scoring transparently.
+/// Word-hash convenience for the succinct path — same shape and exact scoring
+/// semantics as the naive-index sugar.
 #[cfg(feature = "succinct")]
 impl<D: triblespace_core::inline::InlineEncoding>
     crate::succinct::SuccinctBM25Index<D, crate::tokens::WordHash>
@@ -1483,14 +1473,11 @@ mod tests {
     // source repeating itself. These two tests pin down which producers can
     // repeat and prove the interface property holds either way.
 
-    /// `BM25Builder::insert` appends one row per call without collapsing a
-    /// repeated doc key, so the naive index can hold the same key at two doc
-    /// indices and one term's posting list then yields it twice. Distinctness
-    /// is restored by `aggregate_above` keying its score sum by doc — not by
-    /// anything at the index layer — which is exactly why `matches` may hand
-    /// `BM25Filter::from_entries` an input it has already made distinct.
+    /// Both BM25 backends canonicalize duplicate document keys before scoring;
+    /// a posting list and the resulting constraint therefore each expose one
+    /// raw set member for the key.
     #[test]
-    fn bm25_aggregate_collapses_a_doc_key_repeated_in_one_posting_list() {
+    fn bm25_backends_and_filter_canonicalize_duplicate_document_keys() {
         fn corpus() -> BM25Builder {
             let mut b: BM25Builder = BM25Builder::new();
             b.insert(id(1), hash_tokens("the quick brown fox"));
@@ -1501,11 +1488,10 @@ mod tests {
         let fox = hash_tokens("fox");
         let naive = corpus().build_naive();
 
-        // The raw posting-list walk really does repeat the doc key.
+        // Within-row repetitions sum, but the two rows join by max and retain
+        // one document key.
         let postings: Vec<_> = naive.query_term(&fox[0]).collect();
-        assert_eq!(postings.len(), 2, "two doc indices share one key");
-        let distinct: HashSet<RawInline> = postings.iter().map(|(k, _)| k.raw).collect();
-        assert_eq!(distinct.len(), 1);
+        assert_eq!(postings.len(), 1);
 
         // The constraint denotes the set, so the query head sees one row.
         let rows: Vec<Id> = triblespace_core::find!(
@@ -1518,9 +1504,6 @@ mod tests {
 
         #[cfg(feature = "succinct")]
         {
-            // The succinct backend sorts + dedups doc keys into a
-            // `CompressedUniverse` and accumulates tf by universe code, so its
-            // posting list is already distinct one layer earlier. Same rows.
             let succinct = corpus().build();
             assert_eq!(succinct.query_term(&fox[0]).count(), 1);
             let rows: Vec<Id> = triblespace_core::find!(

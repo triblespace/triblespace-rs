@@ -6,15 +6,38 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Succinct BM25 stores exact mergeable term frequencies
+
+- Replaced u16-quantized persisted scores with bit-packed raw `u32` term
+  frequencies. BM25 is now derived at query time from exact frequencies,
+  document lengths, global document frequency, average length, `k1`, and `b`.
+- Canonicalized both naive and succinct builders under the same `(Docs, F)`
+  carrier: within-row repetitions sum, duplicate document rows join by
+  pointwise max, empty documents remain in `Docs`, and document lengths derive
+  from joined frequencies.
+- Segment merge is an associative, commutative, idempotent max-join with exact
+  canonical bytes. It rejects mixed `k1`/`b` recipes at the merge primitive.
+  Multi-segment queries use zero/singleton fast paths and otherwise merge before
+  scoring, making BM25 rank independent of range-cover shape.
+- Ranked query results now break equal-score ties by raw document key. Deleted
+  score quantization, inverse frequency recovery, the merge score-sizing pass,
+  tolerance APIs/tests, and plan-sensitive per-segment scoring prose. Multi-term
+  aggregation stays in canonical document-code space until final decoding,
+  making deterministic ties cheaper than the retired raw-key aggregation.
+- Rotated the unpublished exact-TF identities minted with `trible genid`:
+  `SuccinctBM25Blob=DAFEEEC9350D072B83E32DBBBBB66039`,
+  `Bm25Rollup=881C9D0DAC43814CB4E80897E420B67B`, and
+  `seg_bm25=9B286B90C6F25B5FB6DE6A7176241940`. Persisted score indexes are rebuilt;
+  no compatibility reader remains.
+
 ### Candidate distinctness is proven at its source
 
 - `aggregate_above` sums each query term's postings into a `HashMap` keyed by
   doc, so its output is distinct by construction and all four `matches` /
   `matches_text` entry points inherit that. A `debug_assert!` pins the property
-  where it is established. Nothing at the index layer supplies it:
-  `BM25Builder::insert` appends one row per call, so the naive index can hold
-  one doc key at two doc indices and a single term's posting list then yields it
-  twice.
+  where it is established. Both index layers also canonicalize duplicate
+  document keys; the aggregation remains the load-bearing sum across distinct
+  query terms and a defensive set boundary.
 - `SimilarTo::from_candidates` keeps its collapse because the crate's own
   producers can repeat. Embedding handles are content-addressed, so two entities
   embedding to the same vector share one handle, and neither `FlatBuilder` nor

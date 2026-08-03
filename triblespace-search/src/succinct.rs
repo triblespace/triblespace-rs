@@ -219,16 +219,13 @@ pub(crate) fn pack_byte_table<const N: usize>(
 ///   `ceil(log2(n_docs + 1))`.
 /// - `offsets`: per-term cumulative offsets into `doc_idx`, width
 ///   `ceil(log2(total + 1))`.
-/// - `scores`: u16-quantized score bucket per posting, width 16.
+/// - `term_frequencies`: exact raw `u32` term frequency per posting,
+///   bit-packed to the width required by the largest frequency.
 ///
-/// Quantization: each original f32 score is mapped to a u16
-/// bucket via `q = round(s / max_score * 65535)`, and dequantized
-/// back to f32 via `q * max_score / 65535`. The `max_score`
-/// scalar is stored in [`SuccinctPostingsMeta`]. The
-/// half-bucket error floor is `max_score / 2 * 65535`, and the
-/// `scale_for_equality = max_score / 65534` value is what
-/// callers should use as an equality tolerance against a
-/// bound score variable.
+/// Keeping frequencies rather than corpus-relative scores makes the
+/// representation a lossless, mergeable sufficient statistic. BM25 scores
+/// are derived at query time from these frequencies and the joined corpus's
+/// document statistics.
 ///
 /// [`build`] returns the combined `Bytes` plus metadata. The
 /// caller decides where it lands in the final blob.
@@ -238,8 +235,7 @@ pub(crate) fn pack_byte_table<const N: usize>(
 pub(crate) struct SuccinctPostings {
     doc_idx: CompactVector,
     offsets: CompactVector,
-    scores: CompactVector,
-    max_score: f32,
+    term_frequencies: CompactVector,
     n_terms: usize,
 }
 
@@ -259,49 +255,19 @@ pub(crate) struct SuccinctPostingsMeta {
     pub doc_idx: CompactVectorMeta,
     /// Meta for the `offsets` CompactVector.
     pub offsets: CompactVectorMeta,
-    /// Meta for the `scores` CompactVector (u16-quantized).
-    pub scores: CompactVectorMeta,
-    /// Quantization scale: the largest original score in the
-    /// corpus. Zero when no postings or all zeros.
-    pub max_score: f32,
-    /// Padding to keep this struct's size a multiple of 8.
-    _pad: u32,
-}
-
-/// u16 quantization width.
-const SCORE_WIDTH: usize = 16;
-/// Highest u16 value.
-const SCORE_MAX_Q: u32 = u16::MAX as u32;
-
-/// Quantize a single f32 score to its u16 bucket given the
-/// corpus `max_score`. When `max_score == 0` (empty corpus, all
-/// scores zero) the bucket is always zero.
-fn quantize_score(s: f32, max_score: f32) -> u16 {
-    if max_score <= 0.0 {
-        return 0;
-    }
-    // Clamp in case of tiny numerical drift above max_score.
-    let ratio = (s / max_score).clamp(0.0, 1.0);
-    (ratio * SCORE_MAX_Q as f32).round() as u16
-}
-
-/// Dequantize a u16 bucket back to an approximate f32 score.
-fn dequantize_score(q: u16, max_score: f32) -> f32 {
-    if max_score <= 0.0 {
-        return 0.0;
-    }
-    (q as f32 / SCORE_MAX_Q as f32) * max_score
+    /// Meta for the exact, bit-packed `term_frequencies` CompactVector.
+    pub term_frequencies: CompactVectorMeta,
 }
 
 impl SuccinctPostings {
     /// Test-only slice-based wrapper around `build_with_into`.
-    /// Computes `total` + `max_score` from the materialised
+    /// Computes `total` + `max_tf` from the materialised
     /// `lists` and delegates. Production code computes those
     /// scalars directly from the corpus state and calls
     /// `build_with_into` with no closure recursion.
     #[cfg(test)]
     pub(crate) fn build(
-        lists: &[Vec<(u32, f32)>],
+        lists: &[Vec<(u32, u32)>],
         n_docs: u32,
     ) -> Result<(Bytes, SuccinctPostingsMeta), SuccinctDocLensError> {
         Self::build_with(n_docs, lists.len(), |t, buf| {
@@ -311,7 +277,7 @@ impl SuccinctPostings {
 
     /// Test-only closure-based wrapper around `build_with_into`.
     /// Drives a sizing pass that calls `materialize_term` once
-    /// per term to discover `total` and `max_score`, then hands
+    /// per term to discover `total` and `max_tf`, then hands
     /// off to [`Self::build_with_into`]. Production code
     /// computes those scalars from corpus state directly.
     #[cfg(test)]
@@ -321,19 +287,17 @@ impl SuccinctPostings {
         mut materialize_term: F,
     ) -> Result<(Bytes, SuccinctPostingsMeta), SuccinctDocLensError>
     where
-        F: FnMut(usize, &mut Vec<(u32, f32)>),
+        F: FnMut(usize, &mut Vec<(u32, u32)>),
     {
-        let mut buf: Vec<(u32, f32)> = Vec::new();
+        let mut buf: Vec<(u32, u32)> = Vec::new();
         let mut total: usize = 0;
-        let mut max_score = 0.0f32;
+        let mut max_tf = 0u32;
         for t in 0..n_terms {
             buf.clear();
             materialize_term(t, &mut buf);
             total += buf.len();
-            for &(_, s) in &buf {
-                if s > max_score {
-                    max_score = s;
-                }
+            for &(_, tf) in &buf {
+                max_tf = max_tf.max(tf);
             }
         }
 
@@ -344,7 +308,7 @@ impl SuccinctPostings {
             n_docs,
             n_terms,
             total,
-            max_score,
+            max_tf,
             |term, buf| {
                 materialize_term(term, buf);
                 Ok(())
@@ -356,7 +320,7 @@ impl SuccinctPostings {
 
     /// Single-pass streaming build into a caller-owned
     /// [`SectionWriter`]. The three [`CompactVector`] sections
-    /// (`doc_idx`, `offsets`, `scores`) land in the shared
+    /// (`doc_idx`, `offsets`, `term_frequencies`) land in the shared
     /// [`ByteArea`] alongside other blob sections; returns just
     /// the metadata; the caller drives `area.freeze()`.
     ///
@@ -367,11 +331,9 @@ impl SuccinctPostings {
     ///   (`ceil(log₂(total + 1))`). Bit-packing is silent on
     ///   overflow, so an undersized `total` corrupts the
     ///   blob — get this right.
-    /// - `max_score` = max f32 score the closure will write.
-    ///   Used as the u16 quantization scale: each `f32` score
-    ///   becomes `round(score / max_score · 65535)`. Scores
-    ///   above this clip to `u16::MAX`. Always supply the true
-    ///   corpus max, not an estimate.
+    /// - `max_tf` = largest term frequency the closure will write. Used to
+    ///   select the exact bit width of the term-frequency vector. Always
+    ///   supply the true maximum; undersizing silently corrupts packed values.
     ///
     /// Crate-private while the canonical-bytes composition path
     /// is still settling.
@@ -380,11 +342,11 @@ impl SuccinctPostings {
         n_docs: u32,
         n_terms: usize,
         total: usize,
-        max_score: f32,
+        max_tf: u32,
         mut materialize_term: F,
     ) -> Result<SuccinctPostingsMeta, SuccinctDocLensError>
     where
-        F: FnMut(usize, &mut Vec<(u32, f32)>) -> Result<(), SuccinctDocLensError>,
+        F: FnMut(usize, &mut Vec<(u32, u32)>) -> Result<(), SuccinctDocLensError>,
     {
         let doc_idx_width = width_for(n_docs as usize + 1);
         let offsets_width = width_for(total + 1);
@@ -392,17 +354,22 @@ impl SuccinctPostings {
         let mut doc_idx_b = CompactVectorBuilder::with_capacity(total, doc_idx_width, sections)?;
         let mut offsets_b =
             CompactVectorBuilder::with_capacity(n_terms + 1, offsets_width, sections)?;
-        let mut scores_b = CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, sections)?;
+        let tf_width = match max_tf {
+            0 => 1,
+            _ => 32 - max_tf.leading_zeros() as usize,
+        };
+        let mut term_frequencies_b =
+            CompactVectorBuilder::with_capacity(total, tf_width, sections)?;
         offsets_b.set_int(0, 0)?;
 
-        let mut buf: Vec<(u32, f32)> = Vec::new();
+        let mut buf: Vec<(u32, u32)> = Vec::new();
         let mut pos = 0usize;
         for t in 0..n_terms {
             buf.clear();
             materialize_term(t, &mut buf)?;
-            for &(idx, s) in &buf {
+            for &(idx, tf) in &buf {
                 doc_idx_b.set_int(pos, idx as usize)?;
-                scores_b.set_int(pos, quantize_score(s, max_score) as usize)?;
+                term_frequencies_b.set_int(pos, tf as usize)?;
                 pos += 1;
             }
             offsets_b.set_int(t + 1, pos)?;
@@ -414,15 +381,13 @@ impl SuccinctPostings {
 
         let doc_idx_meta = doc_idx_b.freeze().metadata();
         let offsets_meta = offsets_b.freeze().metadata();
-        let scores_meta = scores_b.freeze().metadata();
+        let term_frequencies_meta = term_frequencies_b.freeze().metadata();
 
         Ok(SuccinctPostingsMeta {
             n_terms: n_terms as u64,
             doc_idx: doc_idx_meta,
             offsets: offsets_meta,
-            scores: scores_meta,
-            max_score,
-            _pad: 0,
+            term_frequencies: term_frequencies_meta,
         })
     }
 
@@ -433,12 +398,11 @@ impl SuccinctPostings {
     ) -> Result<Self, SuccinctDocLensError> {
         let doc_idx = CompactVector::from_bytes(meta.doc_idx, bytes.clone())?;
         let offsets = CompactVector::from_bytes(meta.offsets, bytes.clone())?;
-        let scores = CompactVector::from_bytes(meta.scores, bytes)?;
+        let term_frequencies = CompactVector::from_bytes(meta.term_frequencies, bytes)?;
         Ok(Self {
             doc_idx,
             offsets,
-            scores,
-            max_score: meta.max_score,
+            term_frequencies,
             n_terms: meta.n_terms as usize,
         })
     }
@@ -448,17 +412,6 @@ impl SuccinctPostings {
     #[cfg(test)]
     pub(crate) fn term_count(&self) -> usize {
         self.n_terms
-    }
-
-    /// Equality tolerance callers should use when matching a
-    /// bound score variable against stored values. Derived from
-    /// the quantization bucket size: `max_score / 65534`.
-    pub fn score_tolerance(&self) -> f32 {
-        if self.max_score <= 0.0 {
-            f32::EPSILON
-        } else {
-            self.max_score / 65534.0
-        }
     }
 
     /// Number of postings for term `t`. `None` if out of range.
@@ -471,19 +424,17 @@ impl SuccinctPostings {
         Some(end - start)
     }
 
-    /// Iterate `(doc_idx, score)` postings for term `t`. Scores
-    /// are dequantized from their u16 buckets.
-    pub fn postings_for(&self, t: usize) -> Option<impl Iterator<Item = (u32, f32)> + '_> {
+    /// Iterate exact `(doc_idx, term_frequency)` postings for term `t`.
+    pub fn postings_for(&self, t: usize) -> Option<impl Iterator<Item = (u32, u32)> + '_> {
         if t >= self.n_terms {
             return None;
         }
         let start = self.offsets.get_int(t)?;
         let end = self.offsets.get_int(t + 1)?;
-        let max = self.max_score;
         Some((start..end).map(move |i| {
             let idx = self.doc_idx.get_int(i).unwrap() as u32;
-            let q = self.scores.get_int(i).unwrap() as u16;
-            (idx, dequantize_score(q, max))
+            let tf = self.term_frequencies.get_int(i).unwrap() as u32;
+            (idx, tf)
         }))
     }
 }
@@ -497,46 +448,38 @@ fn width_for(n: usize) -> usize {
     }
 }
 
-/// Invert a stored BM25 posting score back to an integer term
-/// frequency (`>= 1`). Used by
-/// [`SuccinctBM25Index::reconstruct_docs`] to rebuild the source
-/// token multisets for a rollup segment merge.
-///
-/// The build-time score is
-/// `idf * tf * (k1 + 1) / (tf + k1 * norm)`; solving for `tf` gives
-/// `tf = s * k1 * norm / (k1 + 1 - s)` where `s = score / idf`. All
-/// of `idf`, `norm`, and `k1` are recomputed losslessly from the
-/// segment, so the only error is the u16 score quantisation — which
-/// is far smaller than the score gap between successive integer `tf`
-/// values in the small-`tf` regime, so recovery is exact there and
-/// only drifts once `tf` saturates (a token repeated many times in
-/// one document, where the exact count barely moves the score).
-fn recover_tf(score: f32, idf: f32, norm: f32, k1: f32) -> u32 {
-    if score <= 0.0 || idf <= 0.0 {
-        return 1;
-    }
-    let s = score / idf;
-    let denom = (k1 + 1.0) - s;
-    if denom <= 0.0 {
-        // Saturated tail: the quantised score sits at/above the
-        // `tf -> inf` asymptote. The exact count is immaterial here
-        // (the score is flat), so cap at a large-but-finite value.
-        return 1_024;
-    }
-    let tf = (s * k1 * norm) / denom;
-    (tf.round() as i64).max(1) as u32
+/// Standard Robertson-smoothed BM25 contribution for one posting.
+fn bm25_score(
+    n_docs: usize,
+    doc_frequency: usize,
+    term_frequency: u32,
+    doc_len: u32,
+    avg_doc_len: f32,
+    k1: f32,
+    b: f32,
+) -> f32 {
+    let n = n_docs as f32;
+    let df = doc_frequency as f32;
+    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+    let tf = term_frequency as f32;
+    let norm = if avg_doc_len > 0.0 {
+        1.0 - b + b * (doc_len as f32 / avg_doc_len)
+    } else {
+        1.0
+    };
+    idf * (tf * (k1 + 1.0)) / (tf + k1 * norm)
 }
 
-/// Write one recovered posting to the merge spool. The scratch format is
+/// Write one exact posting to the merge spool. The scratch format is
 /// deliberately tiny and private: two little-endian `u32`s, sorted by
 /// `(term, merged document code)` through the order in which callers append.
-fn write_recovered_posting(writer: &mut impl Write, code: u32, tf: u32) -> std::io::Result<()> {
+fn write_spooled_posting(writer: &mut impl Write, code: u32, tf: u32) -> std::io::Result<()> {
     let packed = u64::from(code) | (u64::from(tf) << 32);
     writer.write_all(&packed.to_le_bytes())
 }
 
-/// Read one recovered posting written by [`write_recovered_posting`].
-fn read_recovered_posting(reader: &mut impl Read) -> std::io::Result<(u32, u32)> {
+/// Read one exact posting written by [`write_spooled_posting`].
+fn read_spooled_posting(reader: &mut impl Read) -> std::io::Result<(u32, u32)> {
     let mut raw = [0u8; 8];
     reader.read_exact(&mut raw)?;
     let packed = u64::from_le_bytes(raw);
@@ -1328,16 +1271,15 @@ pub struct SuccinctBM25Meta {
 /// [`anybytes::Bytes`] region without copying.
 ///
 /// For 100k wiki fragments the naive blob is ~157 MiB; this
-/// representation cuts it to ~86 MiB via bit-packed doc_idx
-/// and u16-quantized scores. The quantization step is
-/// internal — query-time scoring goes through
-/// [`SuccinctBM25Index::score`], which returns the f32 sum
-/// derived from the stored postings.
+/// representation cuts it substantially via bit-packed document indices,
+/// lengths, and exact term frequencies. Query-time scoring derives BM25 from
+/// those sufficient statistics, so persisted segments can be joined without
+/// losing term-frequency information.
 ///
 /// Built directly via
 /// [`BM25Builder::build`][crate::bm25::BM25Builder::build]:
 /// the builder sorts + dedups the keys into a
-/// `CompressedUniverse` first, then accumulates tf and scores
+/// `CompressedUniverse` first, then accumulates exact term frequencies
 /// keyed by the universe code from the start — no
 /// insertion-order intermediate. The naive
 /// [`crate::bm25::BM25Index`] is kept as a reference oracle.
@@ -1403,6 +1345,32 @@ pub struct SuccinctBM25Index<
     _phantom: std::marker::PhantomData<(D, T)>,
 }
 
+/// Error returned when BM25 segments from different scoring recipes are
+/// presented to the exact frequency join.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bm25TuningMismatch {
+    /// `k1` selected by the first segment.
+    pub expected_k1: f32,
+    /// `b` selected by the first segment.
+    pub expected_b: f32,
+    /// Conflicting segment's `k1`.
+    pub actual_k1: f32,
+    /// Conflicting segment's `b`.
+    pub actual_b: f32,
+}
+
+impl std::fmt::Display for Bm25TuningMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BM25 segment tuning mismatch: expected k1={} b={}, found k1={} b={}",
+            self.expected_k1, self.expected_b, self.actual_k1, self.actual_b
+        )
+    }
+}
+
+impl std::error::Error for Bm25TuningMismatch {}
+
 impl<D: InlineEncoding, T: InlineEncoding> std::fmt::Debug for SuccinctBM25Index<D, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SuccinctBM25Index")
@@ -1452,23 +1420,40 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         let keys_meta = build_universe.metadata();
         let n_universe = build_universe.len();
 
-        // ── 2. tf accumulation keyed by universe_code from the
-        // start; doc_lens indexed by code. Last-write-wins for
-        // duplicate keys, matching the naive+remap flow's
-        // semantics. ───────────────────────────────────────────────
-        let mut doc_lens_vec = vec![0u32; n_universe];
+        // ── 2. Exact `(document, term) -> frequency` join keyed by
+        // universe code. Repetitions within one inserted row add; rows with
+        // the same document key join by pointwise max. The latter makes
+        // duplicate keys idempotent and agrees with range-rollup union.
+        // Empty-token documents remain in `build_universe`, so the carrier is
+        // `(Docs, F)`, not just the sparse frequency map. ───────────────────
         let mut term_to_tfs: HashMap<RawInline, HashMap<u32, u32>> = HashMap::new();
         for (key, terms) in docs {
             let code = build_universe
                 .search(&key)
                 .expect("key just inserted into universe") as u32;
-            doc_lens_vec[code as usize] = terms.len() as u32;
+            let mut row_tfs: HashMap<RawInline, u32> = HashMap::new();
             for term in terms {
-                *term_to_tfs
+                let slot = row_tfs.entry(term).or_default();
+                *slot = slot
+                    .checked_add(1)
+                    .expect("BM25 term frequency exceeds u32::MAX");
+            }
+            for (term, tf) in row_tfs {
+                term_to_tfs
                     .entry(term)
                     .or_default()
                     .entry(code)
-                    .or_insert(0) += 1;
+                    .and_modify(|old| *old = (*old).max(tf))
+                    .or_insert(tf);
+            }
+        }
+        let mut doc_lens_vec = vec![0u32; n_universe];
+        for tfs in term_to_tfs.values() {
+            for (&code, &tf) in tfs {
+                let slot = &mut doc_lens_vec[code as usize];
+                *slot = slot
+                    .checked_add(tf)
+                    .expect("BM25 document length exceeds u32::MAX");
             }
         }
         // Done with the build-time universe — its sections are
@@ -1491,57 +1476,27 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         let n_terms = term_rows.len();
         let terms_handle = pack_byte_table::<32>(&mut sections, &term_rows).expect("build terms");
 
-        // ── 5. per-term scored postings, streamed into the
-        // shared area. We pre-compute `total` and `max_score`
-        // here (the BM25-specific path) so `build_with_into` can
-        // run as a single pass — invoking the closure once per
-        // term instead of twice.
-        //
-        // - `total` is a free walk over outer-HashMap sizes
-        //   (no inner traversal beyond reading lengths).
-        // - `max_score` is a per-term scan that mirrors the
-        //   BM25 formula but skips the per-term sort that the
-        //   write-pass closure does. Same per-posting work,
-        //   half the per-term work, no Vec materialisation.
-        //
-        // Peak temp stays ~one term's postings (~400 KB at 100 k
-        // docs / Heaps-law) instead of ~144 MB Vec<Vec<...>>. ──────
-        let n = n_universe as f32;
-        let bm25_score = |df: f32, idf: f32, tf: u32, code: u32| -> f32 {
-            let tf_f = tf as f32;
-            let dl = doc_lens_vec[code as usize] as f32;
-            let norm = if avg_doc_len > 0.0 {
-                1.0 - b + b * (dl / avg_doc_len)
-            } else {
-                1.0
-            };
-            let _ = df;
-            idf * (tf_f * (k1 + 1.0)) / (tf_f + k1 * norm)
-        };
-
+        // ── 5. Exact per-term frequencies, streamed into the shared area.
+        // Scores are deliberately absent from the artifact and are computed
+        // against corpus statistics at query time. Peak temporary memory is
+        // one term's postings, rather than a corpus-sized posting cache. ────
         let total: usize = term_to_tfs.values().map(|m| m.len()).sum();
-        let max_score: f32 = term_rows.iter().fold(0.0f32, |acc, term| {
-            let tfs = &term_to_tfs[term];
-            let df = tfs.len() as f32;
-            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            tfs.iter()
-                .fold(acc, |m, (&code, &tf)| m.max(bm25_score(df, idf, tf, code)))
-        });
+        let max_tf = term_to_tfs
+            .values()
+            .flat_map(|tfs| tfs.values())
+            .copied()
+            .max()
+            .unwrap_or(0);
 
         let postings_meta = SuccinctPostings::build_with_into(
             &mut sections,
             n_universe as u32,
             n_terms,
             total,
-            max_score,
+            max_tf,
             |t, buf| {
                 let tfs = &term_to_tfs[&term_rows[t]];
-                let df = tfs.len() as f32;
-                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-                buf.extend(
-                    tfs.iter()
-                        .map(|(&code, &tf)| (code, bm25_score(df, idf, tf, code))),
-                );
+                buf.extend(tfs.iter().map(|(&code, &tf)| (code, tf)));
                 buf.sort_unstable_by_key(|&(code, _)| code);
                 Ok(())
             },
@@ -1665,16 +1620,6 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         self.doc_lens.get(i)
     }
 
-    /// Equality tolerance for bound-score matching, derived from
-    /// the stored quantization scale. Postings store u16-bucket
-    /// quantized scores, so equality checks against a recomputed
-    /// f32 score should accept anything within one bucket
-    /// (`max_score / 65534` for non-empty corpora,
-    /// `f32::EPSILON` for empty).
-    pub fn score_tolerance(&self) -> f32 {
-        self.postings.score_tolerance()
-    }
-
     /// Number of documents containing `term`.
     pub fn doc_frequency(&self, term: &Inline<T>) -> usize {
         match self.terms.binary_search(&term.raw) {
@@ -1691,10 +1636,23 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     ) -> Box<dyn Iterator<Item = (Inline<D>, f32)> + 'a> {
         match self.terms.binary_search(&term.raw) {
             Ok(t) => match self.postings.postings_for(t) {
-                Some(iter) => Box::new(iter.map(move |(doc_idx, score)| {
-                    let key = self.keys.access(doc_idx as usize);
-                    (Inline::<D>::new(key), score)
-                })),
+                Some(iter) => {
+                    let doc_frequency = self.postings.posting_count(t).unwrap_or(0);
+                    Box::new(iter.map(move |(doc_idx, tf)| {
+                        let doc_len = self.doc_lens.get(doc_idx as usize).unwrap_or(0);
+                        let score = bm25_score(
+                            self.doc_count(),
+                            doc_frequency,
+                            tf,
+                            doc_len,
+                            self.avg_doc_len,
+                            self.k1,
+                            self.b,
+                        );
+                        let key = self.keys.access(doc_idx as usize);
+                        (Inline::<D>::new(key), score)
+                    }))
+                }
                 None => Box::new(std::iter::empty()),
             },
             Err(_) => Box::new(std::iter::empty()),
@@ -1703,61 +1661,67 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
 
     /// Score a multi-term query as the sum of per-term BM25
     /// weights (standard OR-like bag-of-words). Returned
-    /// `(Inline<D>, f32)` pairs are sorted descending by score;
-    /// no top-k truncation — caller slices what they need.
+    /// `(Inline<D>, f32)` pairs are sorted descending by score, then ascending
+    /// by raw document key for ties; no top-k truncation — caller slices what
+    /// they need.
     pub fn query_multi(&self, terms: &[Inline<T>]) -> Vec<(Inline<D>, f32)> {
-        let mut acc: std::collections::HashMap<RawInline, f32> = std::collections::HashMap::new();
+        // CompressedUniverse codes follow canonical raw-key order. Aggregate
+        // and tie-break in that compact domain, decoding each winning key only
+        // once after ranking.
+        let mut acc: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
         for term in terms {
-            for (key, score) in self.query_term(term) {
-                *acc.entry(key.raw).or_insert(0.0) += score;
+            let Ok(term_index) = self.terms.binary_search(&term.raw) else {
+                continue;
+            };
+            let doc_frequency = self.postings.posting_count(term_index).unwrap_or(0);
+            let Some(postings) = self.postings.postings_for(term_index) else {
+                continue;
+            };
+            for (doc_code, tf) in postings {
+                let doc_len = self.doc_lens.get(doc_code as usize).unwrap_or(0);
+                let score = bm25_score(
+                    self.doc_count(),
+                    doc_frequency,
+                    tf,
+                    doc_len,
+                    self.avg_doc_len,
+                    self.k1,
+                    self.b,
+                );
+                *acc.entry(doc_code).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(Inline<D>, f32)> = acc
+        let mut ranked: Vec<(u32, f32)> = acc.into_iter().collect();
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked
             .into_iter()
-            .map(|(raw, s)| (Inline::<D>::new(raw), s))
-            .collect();
-        out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        out
+            .map(|(doc_code, score)| (Inline::<D>::new(self.keys.access(doc_code as usize)), score))
+            .collect()
     }
 
-    /// Approximately reconstruct the per-document token multisets this
-    /// index was built from. This remains useful for diagnostics and
-    /// compatibility tests; production rollup merges use
-    /// [`Self::merge_segments`] so they never materialize all token bags.
+    /// Exactly reconstruct the joined per-document token multisets represented
+    /// by this index. Production rollup merges stream the same raw frequencies
+    /// directly and never materialize all token bags.
     ///
     /// Returns one `(doc_key, tokens)` row per document, `doc_key`
-    /// being the raw `Inline<D>` bytes and `tokens` the recovered
-    /// `Inline<T>` term bag (with multiplicity). Document *presence*
-    /// of a term (hence its document frequency) and every document's
-    /// *length* are stored losslessly and reproduced exactly; only the
-    /// per-posting term frequency is inferred from the u16-quantised
-    /// score via `recover_tf`, so it is exact in the common small-tf
-    /// regime and approximate in the saturated tail. A BM25 index
-    /// rebuilt from the union of several segments' reconstructions
-    /// therefore has exact global document frequencies and lengths and
-    /// recomputes IDF over the union — the segment merge is lossless in
-    /// everything the score's monotone part depends on.
+    /// being the raw `Inline<D>` bytes and `tokens` the exact `Inline<T>` term
+    /// bag (with multiplicity). Empty documents are included as empty bags.
     ///
     pub fn reconstruct_docs(&self) -> Vec<(RawInline, Vec<RawInline>)> {
         let n = self.doc_count();
-        let nf = n as f32;
         // Per-doc token accumulator, indexed by universe code (== the
         // postings' doc_idx). Docs with no indexed terms keep an empty
         // bag but still round-trip as a row.
         let mut docs: Vec<Vec<RawInline>> = (0..n).map(|_| Vec::new()).collect();
         for t in 0..self.terms.len() {
             let term_raw: RawInline = self.terms[t];
-            let df = self.postings.posting_count(t).unwrap_or(0) as f32;
-            let idf = ((nf - df + 0.5) / (df + 0.5) + 1.0).ln();
             if let Some(iter) = self.postings.postings_for(t) {
-                for (code, score) in iter {
-                    let dl = self.doc_lens.get(code as usize).unwrap_or(0) as f32;
-                    let norm = if self.avg_doc_len > 0.0 {
-                        1.0 - self.b + self.b * (dl / self.avg_doc_len)
-                    } else {
-                        1.0
-                    };
-                    let tf = recover_tf(score, idf, norm, self.k1);
+                for (code, tf) in iter {
                     let slot = &mut docs[code as usize];
                     for _ in 0..tf {
                         slot.push(term_raw);
@@ -1784,18 +1748,18 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// - duplicate document keys retain every term, taking the maximum term
     ///   frequency seen for that document and term;
     /// - exact duplicate segments are therefore idempotent;
-    /// - term frequencies are recovered from the quantized source scores;
-    /// - document lengths, global document frequencies, IDF, and scores are
-    ///   recomputed over the union; and
-    /// - the resulting bytes use the unchanged [`SuccinctBM25Blob`] format.
+    /// - empty documents survive through the separate document-key universe;
+    /// - raw term frequencies are copied exactly from source postings; and
+    /// - document lengths and average length are recomputed from the joined
+    ///   frequencies. IDF and scores are derived only when queried.
     ///
     /// The persistent source segments stay zero-copy. Temporary memory is
     /// `O(total_segment_docs + union_docs + union_terms + max_source_term_postings)`:
     /// a compact local-to-union code map for each segment, the merged document
-    /// lengths and term table, and one term's recovered source postings. The
-    /// recovered union is streamed once to an anonymous scratch file (eight
-    /// bytes per output posting), then read sequentially for exact score sizing
-    /// and final serialization. In particular, there is no `O(total token
+    /// lengths and term table, and one term's joined source postings. The
+    /// exact union is streamed once to an anonymous scratch file (eight bytes
+    /// per output posting), then read sequentially for final serialization. In
+    /// particular, there is no `O(total token
     /// multiplicity)` token-bag materialization or corpus-sized in-memory
     /// posting cache.
     /// Fallible merge entry point used by range maintenance. Failure publishes
@@ -1803,21 +1767,22 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// range.
     pub(crate) fn try_merge_segments(
         segments: &[Self],
-        k1: f32,
-        b: f32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::try_merge_segments_observed(segments, k1, b, |_| {})
-    }
+        let Some(first) = segments.first() else {
+            return Ok(Self::from_builder(crate::bm25::BM25Builder::new()));
+        };
+        let (k1, b) = (first.k1, first.b);
+        for segment in &segments[1..] {
+            if segment.k1.to_bits() != k1.to_bits() || segment.b.to_bits() != b.to_bits() {
+                return Err(Box::new(Bm25TuningMismatch {
+                    expected_k1: k1,
+                    expected_b: b,
+                    actual_k1: segment.k1,
+                    actual_b: segment.b,
+                }));
+            }
+        }
 
-    /// Merge implementation with phase callbacks used by the ignored
-    /// microbenchmark. The production wrapper passes an inline no-op closure,
-    /// so phase accounting adds no runtime state to normal compactions.
-    pub(crate) fn try_merge_segments_observed(
-        segments: &[Self],
-        k1: f32,
-        b: f32,
-        mut phase_finished: impl FnMut(&'static str),
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut area = ByteArea::new()?;
         let mut sections = area.sections();
 
@@ -1867,33 +1832,20 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
             }
             code_maps.push(map);
         }
-        phase_finished("keys + code maps");
-
-        // Reconstruct one term's `(merged_doc_code, tf)` postings. Source
-        // postings are lossless in document presence; recover_tf has the same
-        // saturated-tail approximation as reconstruct_docs(). When a document
-        // occurs in several segments, compact adjacent codes with max(tf):
+        // Join one term's exact `(merged_doc_code, tf)` postings. When a
+        // document occurs in several segments, compact adjacent codes with
+        // max(tf):
         // every distinct term survives, while exact duplicate segments do not
         // inflate either frequency or document length.
-        let recover_term = |term: &RawInline, out: &mut Vec<(u32, u32)>| {
+        let join_term = |term: &RawInline, out: &mut Vec<(u32, u32)>| {
             out.clear();
             for (segment_index, segment) in segments.iter().enumerate() {
                 let Ok(term_index) = segment.terms.binary_search(term) else {
                     continue;
                 };
-                let source_df = segment.postings.posting_count(term_index).unwrap_or(0) as f32;
-                let source_n = segment.doc_count() as f32;
-                let source_idf = ((source_n - source_df + 0.5) / (source_df + 0.5) + 1.0).ln();
                 if let Some(postings) = segment.postings.postings_for(term_index) {
-                    for (local_code, score) in postings {
+                    for (local_code, tf) in postings {
                         let merged_code = code_maps[segment_index][local_code as usize];
-                        let dl = segment.doc_lens.get(local_code as usize).unwrap_or(0) as f32;
-                        let norm = if segment.avg_doc_len > 0.0 {
-                            1.0 - segment.b + segment.b * (dl / segment.avg_doc_len)
-                        } else {
-                            1.0
-                        };
-                        let tf = recover_tf(score, source_idf, norm, segment.k1);
                         out.push((merged_code, tf));
                     }
                 }
@@ -1912,20 +1864,19 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
             out.truncate(write);
         };
 
-        // ── 2. K-way term union + the only source-postings recovery pass.
+        // ── 2. K-way term union + the only source-postings join pass.
         // Rebuild document lengths from the per-term max union and spool the
-        // sorted recovered `(merged_code, tf)` rows. Exact score quantization
-        // needs final document lengths before it can determine the global
-        // maximum, so a strictly single-pass encoder would have to retain all
-        // recovered postings in RAM. The anonymous sequential spool keeps RAM
-        // bounded while avoiding two further source decodes and term sorts.
+        // exact sorted `(merged_code, tf)` rows. The anonymous sequential
+        // spool keeps RAM bounded while avoiding another source decode and
+        // term sort before the CompactVectors can be allocated.
         let mut term_positions = vec![0usize; segments.len()];
         let mut term_rows: Vec<RawInline> = Vec::new();
         let mut posting_counts: Vec<usize> = Vec::new();
         let mut doc_lens_vec = vec![0u32; n_docs];
-        let mut recovered: Vec<(u32, u32)> = Vec::new();
-        let mut recovered_spool = tempfile::tempfile()?;
-        let mut spool_writer = BufWriter::new(&mut recovered_spool);
+        let mut joined: Vec<(u32, u32)> = Vec::new();
+        let mut max_tf = 0u32;
+        let mut posting_spool = tempfile::tempfile()?;
+        let mut spool_writer = BufWriter::new(&mut posting_spool);
         loop {
             let Some(next) = segments
                 .iter()
@@ -1941,23 +1892,23 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
                 }
             }
 
-            recover_term(&next, &mut recovered);
-            if recovered.is_empty() {
+            join_term(&next, &mut joined);
+            if joined.is_empty() {
                 continue;
             }
-            for &(code, tf) in &recovered {
+            for &(code, tf) in &joined {
                 let slot = &mut doc_lens_vec[code as usize];
                 *slot = slot
                     .checked_add(tf)
-                    .expect("recovered document length exceeds u32::MAX");
-                write_recovered_posting(&mut spool_writer, code, tf)?;
+                    .expect("BM25 document length exceeds u32::MAX");
+                max_tf = max_tf.max(tf);
+                write_spooled_posting(&mut spool_writer, code, tf)?;
             }
             term_rows.push(next);
-            posting_counts.push(recovered.len());
+            posting_counts.push(joined.len());
         }
         spool_writer.flush()?;
         drop(spool_writer);
-        phase_finished("recover + spool");
 
         let avg_doc_len = if n_docs == 0 {
             0.0
@@ -1966,61 +1917,28 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         };
         let doc_lens_meta = SuccinctDocLens::build_into(&mut sections, &doc_lens_vec)?;
         let terms_handle = pack_byte_table::<32>(&mut sections, &term_rows)?;
-        phase_finished("doc/term sections");
 
-        // ── 3. Score sizing pass over the sequential recovered-postings
-        // spool. The output CompactVectors require the exact posting count and
-        // maximum score before their sections can be reserved.
+        // ── 3. Stream the exact spool into the canonical CompactVectors.
+        // The join pass already supplied both sizing values (`total` and
+        // `max_tf`), so no corpus-relative score-sizing pass remains.
         let total: usize = posting_counts.iter().sum();
-        let n = n_docs as f32;
-        let score = |df: f32, tf: u32, code: u32| -> f32 {
-            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            let tf = tf as f32;
-            let dl = doc_lens_vec[code as usize] as f32;
-            let norm = if avg_doc_len > 0.0 {
-                1.0 - b + b * (dl / avg_doc_len)
-            } else {
-                1.0
-            };
-            idf * (tf * (k1 + 1.0)) / (tf + k1 * norm)
-        };
-        let mut max_score = 0.0f32;
-        recovered_spool.seek(SeekFrom::Start(0))?;
-        let mut spool_reader = BufReader::new(&mut recovered_spool);
-        for (term_index, &posting_count) in posting_counts.iter().enumerate() {
-            let df = posting_counts[term_index] as f32;
-            for _ in 0..posting_count {
-                let (code, tf) = read_recovered_posting(&mut spool_reader)?;
-                max_score = max_score.max(score(df, tf, code));
-            }
-        }
-        drop(spool_reader);
-        phase_finished("score sizing spool");
-
-        // ── 4. Final sequential spool pass, streamed into the canonical
-        // area. `build_with_into` still receives one term-sized buffer, but it
-        // is filled from fixed-width scratch rows rather than recovering and
-        // sorting the persisted source postings for a third time.
-        recovered_spool.seek(SeekFrom::Start(0))?;
-        let mut spool_reader = BufReader::new(&mut recovered_spool);
+        posting_spool.seek(SeekFrom::Start(0))?;
+        let mut spool_reader = BufReader::new(&mut posting_spool);
         let postings_meta = SuccinctPostings::build_with_into(
             &mut sections,
             n_docs as u32,
             term_rows.len(),
             total,
-            max_score,
+            max_tf,
             |term_index, buf| {
-                let df = posting_counts[term_index] as f32;
                 for _ in 0..posting_counts[term_index] {
-                    let (code, tf) = read_recovered_posting(&mut spool_reader)?;
-                    buf.push((code, score(df, tf, code)));
+                    buf.push(read_spooled_posting(&mut spool_reader)?);
                 }
                 Ok(())
             },
         )?;
-        phase_finished("write postings spool");
 
-        // ── 5. Unchanged suffix metadata / canonical blob format.
+        // ── 4. Suffix metadata / canonical blob format.
         let meta = SuccinctBM25Meta {
             n_docs: n_docs as u64,
             n_terms: term_rows.len() as u64,
@@ -2042,9 +1960,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         drop(build_universe);
         drop(sections);
         let bytes = area.freeze()?;
-        let merged = Self::from_bytes(meta, bytes)?;
-        phase_finished("metadata + freeze");
-        Ok(merged)
+        Ok(Self::from_bytes(meta, bytes)?)
     }
 }
 
@@ -2082,12 +1998,15 @@ impl std::error::Error for SuccinctLoadError {}
 /// [`IntoBlob`](triblespace_core::blob::IntoBlob) is an `O(1)` refcounted clone.
 ///
 /// Schema id minted fresh via `trible genid`:
-/// `DA527A8FF09A3709B2AC6425CD5AF7A8`. Any breaking layout
+/// `DAFEEEC9350D072B83E32DBBBBB66039`. Any breaking layout
 /// change mints a new id; the compiler treats a different id
 /// as a different type, so readers can't accidentally
 /// deserialize a mismatched layout.
 ///
 /// Retired ids:
+/// - `DA527A8FF09A3709B2AC6425CD5AF7A8` — canonical-byte
+///   score-posting layout; retired when persisted scores became exact raw
+///   term frequencies.
 /// - `68C03764D04D05DF65E49589FBBA1441` — original layout
 ///   (magic + version preamble + custom 264 B header).
 /// - `5A1EF3FFD638B15E3EBEAA1E92660441` — same custom-header
@@ -2105,10 +2024,10 @@ impl BlobEncoding for SuccinctBM25Blob {}
 // that the schema can't describe itself.
 impl MetaDescribe for SuccinctBM25Blob {
     fn describe() -> Fragment {
-        let id = id_hex!("DA527A8FF09A3709B2AC6425CD5AF7A8");
+        let id = id_hex!("DAFEEEC9350D072B83E32DBBBBB66039");
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name:        "SuccinctBM25Blob",
-            metadata::description: "Canonical-bytes blob format for the succinct BM25 index. The index *is* its blob: term-id table, postings, document-frequency table, and an `SuccinctBM25Meta` suffix all share one `anybytes::ByteArea`.",
+            metadata::description: "Canonical-bytes blob format for the succinct BM25 index. The index *is* its blob: document-key and term tables, document lengths, exact bit-packed term-frequency postings, and a `SuccinctBM25Meta` suffix all share one `anybytes::ByteArea`.",
             metadata::tag:         metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -2344,10 +2263,10 @@ mod tests {
     #[test]
     fn postings_roundtrip_simple() {
         let lists = vec![
-            vec![(0u32, 1.5f32), (3, 0.75), (7, 2.0)],
-            vec![(1, 0.5), (2, 3.25)],
+            vec![(0u32, 1u32), (3, 7), (7, 65_537)],
+            vec![(1, 2), (2, u32::MAX)],
             vec![],
-            vec![(4, 9.0)],
+            vec![(4, 9)],
         ];
         let (bytes, meta) = SuccinctPostings::build(&lists, 8).unwrap();
         let view = SuccinctPostings::from_bytes(meta, bytes).unwrap();
@@ -2358,25 +2277,15 @@ mod tests {
         assert_eq!(view.posting_count(3), Some(1));
         assert_eq!(view.posting_count(4), None);
 
-        // Quantization is lossy: doc_idx round-trips exactly,
-        // scores match within one bucket (= max_score / 65534).
-        let tol = view.score_tolerance();
         for (t, expected) in lists.iter().enumerate() {
-            let got: Vec<(u32, f32)> = view.postings_for(t).unwrap().collect();
-            assert_eq!(got.len(), expected.len(), "term {t} length");
-            for ((gd, gs), (ed, es)) in got.iter().zip(expected.iter()) {
-                assert_eq!(gd, ed, "term {t} doc idx");
-                assert!(
-                    (gs - es).abs() <= tol,
-                    "term {t} score drift {gs} vs {es} exceeds tol {tol}"
-                );
-            }
+            let got: Vec<(u32, u32)> = view.postings_for(t).unwrap().collect();
+            assert_eq!(&got, expected, "term {t} exact postings");
         }
     }
 
     #[test]
     fn postings_empty_corpus() {
-        let (bytes, meta) = SuccinctPostings::build(&[] as &[Vec<(u32, f32)>], 0).unwrap();
+        let (bytes, meta) = SuccinctPostings::build(&[] as &[Vec<(u32, u32)>], 0).unwrap();
         let view = SuccinctPostings::from_bytes(meta, bytes).unwrap();
         assert_eq!(view.term_count(), 0);
         assert!(view.postings_for(0).is_none());
@@ -2386,10 +2295,10 @@ mod tests {
     fn build_with_streaming_matches_lists_build() {
         // Same fixture as `postings_roundtrip_simple`.
         let lists = vec![
-            vec![(0u32, 1.5f32), (3, 0.75), (7, 2.0)],
-            vec![(1, 0.5), (2, 3.25)],
+            vec![(0u32, 1u32), (3, 7), (7, 65_537)],
+            vec![(1, 2), (2, 3_250)],
             vec![],
-            vec![(4, 9.0)],
+            vec![(4, 9)],
         ];
         let (bytes_a, meta_a) = SuccinctPostings::build(&lists, 8).unwrap();
         // Streaming closure: caller materializes one term at a
@@ -2401,7 +2310,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(bytes_a.as_ref(), bytes_b.as_ref(), "byte-identical output");
-        assert_eq!(meta_a.max_score, meta_b.max_score);
         assert_eq!(meta_a.n_terms, meta_b.n_terms);
     }
 
@@ -2429,9 +2337,8 @@ mod tests {
         assert_eq!(succinct.b(), naive.b());
         assert!((succinct.avg_doc_len() - naive.avg_doc_len()).abs() < 1e-6);
 
-        // Every stored term must produce matching postings. Scores
-        // match within the succinct index's quantization tolerance.
-        let tol = succinct.score_tolerance();
+        // Every stored term must produce bit-identical BM25 scores: both
+        // implementations evaluate the same formula over exact frequencies.
         for term_raw in naive.terms_slice() {
             let term: Inline<crate::tokens::WordHash> = Inline::new(*term_raw);
             let n: Vec<_> = naive.query_term(&term).collect();
@@ -2443,10 +2350,7 @@ mod tests {
             );
             for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
                 assert_eq!(n_id.raw, s_id.raw);
-                assert!(
-                    (n_s - s_s).abs() <= tol,
-                    "score drift for {n_id:?}: naive={n_s} succinct={s_s} > tol {tol}"
-                );
+                assert_eq!(n_s.to_bits(), s_s.to_bits(), "score for {n_id:?}");
             }
             assert_eq!(naive.doc_frequency(&term), succinct.doc_frequency(&term));
         }
@@ -2469,9 +2373,29 @@ mod tests {
     }
 
     #[test]
+    fn succinct_bm25_preserves_high_term_frequency_exactly() {
+        use crate::bm25::BM25Builder;
+        use crate::tokens::hash_tokens;
+        use triblespace_core::id::Id;
+
+        let term = hash_tokens("saturated")[0];
+        let mut b: BM25Builder = BM25Builder::new();
+        b.insert(
+            Id::new([1; 16]).unwrap(),
+            std::iter::repeat_n(term, 100_003),
+        );
+        let idx = b.build();
+        assert_eq!(idx.doc_len(0), Some(100_003));
+        let docs = idx.reconstruct_docs();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].1.len(), 100_003);
+        assert!(docs[0].1.iter().all(|stored| *stored == term.raw));
+    }
+
+    #[test]
     fn succinct_bm25_query_multi_matches_naive() {
-        // Multi-term aggregate ranking must agree with the naive
-        // implementation (within the quantization tolerance).
+        // Multi-term aggregate ranking must agree exactly with the naive
+        // implementation.
         // Use docs of DIFFERENT lengths so matching docs produce
         // distinct BM25 scores — otherwise tied docs can come
         // out in either order and the comparison flaps.
@@ -2497,13 +2421,9 @@ mod tests {
 
         assert_eq!(a.len(), b.len());
         // Distinct scores → ranking is deterministic, so a.i = b.i.
-        let tol = succinct.score_tolerance() * 2.0; // two terms summed.
         for ((a_id, a_s), (b_id, b_s)) in a.iter().zip(b.iter()) {
             assert_eq!(a_id, b_id, "ranking order mismatch");
-            assert!(
-                (a_s - b_s).abs() <= tol,
-                "score drift: naive={a_s} succinct={b_s} > tol {tol}"
-            );
+            assert_eq!(a_s.to_bits(), b_s.to_bits(), "score for {a_id:?}");
         }
         assert_eq!(b.len(), 2);
     }
@@ -2537,11 +2457,8 @@ mod tests {
         assert_eq!(reloaded.b(), original.b());
         assert!((reloaded.avg_doc_len() - original.avg_doc_len()).abs() < 1e-6);
 
-        // Every term's posting list must round-trip. Both
-        // copies were quantized with the same scale so buckets
-        // are deterministic — scores match within a single ULP,
-        // well under the quantization tolerance.
-        let tol = original.score_tolerance().max(1e-5);
+        // Every term's exact frequencies and corpus statistics round-trip, so
+        // derived scores are bit-identical.
         for word in ["the", "fox", "quick", "brown", "dog"] {
             let term = hash_tokens(word)[0];
             let a: Vec<_> = original.query_term(&term).collect();
@@ -2549,10 +2466,7 @@ mod tests {
             assert_eq!(a.len(), b.len(), "term '{word}' count mismatch");
             for ((a_id, a_s), (b_id, b_s)) in a.iter().zip(b.iter()) {
                 assert_eq!(a_id, b_id);
-                assert!(
-                    (a_s - b_s).abs() <= tol,
-                    "term '{word}': score drift {a_s} vs {b_s} > tol {tol}"
-                );
+                assert_eq!(a_s.to_bits(), b_s.to_bits(), "term '{word}' score");
             }
         }
     }
@@ -2952,7 +2866,7 @@ mod tests {
         for t in 0..500 {
             let mut l = Vec::new();
             for j in 0..3 {
-                l.push(((t * 3 + j) as u32 % 1000, 1.0 + j as f32));
+                l.push(((t * 3 + j) as u32 % 1000, 1 + j as u32));
             }
             lists.push(l);
         }
@@ -2961,11 +2875,11 @@ mod tests {
         // Naive layout would be:
         //   doc_idx  = 4 B × total_postings
         //   offsets  = 4 B × (n_terms + 1)
-        //   scores   = 4 B × total_postings (f32)
+        //   term frequencies = 4 B × total_postings (u32)
         // = total × 8 + (n_terms + 1) × 4
         // The succinct single-region body packs all three into
         // bit-packed CompactVectors (doc_idx 10 bits, offsets
-        // 11 bits, scores 16 bits at this scale) plus tiny
+        // 11 bits, frequencies 2 bits at this scale) plus tiny
         // per-CompactVector overhead — strictly smaller.
         let naive = total * 4 + (lists.len() + 1) * 4 + total * 4;
         assert!(

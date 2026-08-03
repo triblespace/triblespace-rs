@@ -75,7 +75,12 @@ fn main() {
     )
     .map(|(d,)| (d, reloaded.score_text(&(&d).to_inline(), "fragment wiki")))
     .collect();
-    hits.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    hits.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     for (doc, score) in hits.into_iter().take(3) {
         println!("  {doc}  score={score:.3}");
     }

@@ -136,10 +136,10 @@ The common layer does not claim one universal byte-level merge law:
 - **Path** unions constructional summaries. Accepted-path closure happens once
   after resident and residual summaries have all been combined, so paths may
   cross range boundaries repeatedly.
-- **BM25** owns segment statistics, scoring, and its merge semantics. The
-  current implementation uses per-segment IDF and average document length, so
-  cover changes can change scores, ranking, and score-threshold membership even
-  though document coverage remains complete.
+- **BM25** stores the lossless carrier `(Docs, F)`: document keys join by set
+  union (preserving empty documents), while raw `(document, term)` frequencies
+  join by pointwise max. Document lengths, global IDF, and scores are derived
+  after the join, so cover and compaction shape do not change exact rankings.
 - **HNSW** owns graph rebuilding, candidate union, and exact rescoring. Rescore
   is exact only over each graph's approximate candidate set, so graph
   repartition can change recall while source-embedding coverage remains exact.
@@ -173,10 +173,10 @@ smaller resident node. DAG failures and invalid caller frontiers still fail:
 without a trustworthy target set, an exact residual cannot be computed.
 
 Those equations certify complete input coverage, not universal plan
-equivalence. Succinct union and Path summary union satisfy the stronger exact
-law. Current BM25 and HNSW treat the selected segmentation as part of ranking or
-approximation quality; applications that require stable ranked outputs must not
-mistake residual exactness for score invariance.
+equivalence. Succinct union, Path summary union, and BM25's raw-frequency join
+satisfy the stronger exact law. HNSW still treats selected segmentation as part
+of approximation quality; applications must not mistake exact source coverage
+for recall invariance.
 
 An optional warmer may select a preferred cover from hard cores before nodes
 are resident. That is cache policy, not durable query state. Permanent Wants,

@@ -8,19 +8,17 @@ the same invariants:
 1. **Content-addressed.** Same corpus → same blob hash. Rebuilds
    are free when nothing has changed; same content embedded with
    the same model yields the same blob everywhere in the pile.
-2. **Rebuild-and-replace, no mutation.** `build(corpus) -> Handle`
-   returns a fresh blob. The caller persists the handle wherever
-   it belongs (branch metadata, commit metadata, a plain trible).
-   Old index blobs stop being referenced on rebuild; squash
-   reclaims them eventually.
+2. **Immutable range artifacts, no mutation.** A build or merge returns a
+   fresh content-addressed segment. Range rollups publish complete standalone
+   alternatives without replacing prior nodes; direct callers may also persist
+   the handle in ordinary tribles.
 3. **Zero-copy views via jerky.** The blob is a self-contained
    byte buffer; a `try_from_blob` produces a view that holds an
    `anybytes::Bytes` backing and answers queries without copying.
 4. **Unordered-query shape.** Both indexes expose their query
    primitive as a triblespace constraint, and both follow the
    same rule: doc/handle is the only bound variable, score is
-   a fixed parameter (no quantisation bookkeeping in the
-   engine path).
+   a fixed parameter rather than another query variable.
      `bm25.matches(?doc, &terms, score_floor: f32)` — multi-
      term BM25 filter. Binds `doc` to documents whose summed
      BM25 across `terms` is `>= score_floor`. Recompute exact
@@ -47,33 +45,19 @@ tokenized words but never forces it on the schema. Downstream uses:
 | `hash(n-gram)`                    | Phrase search via query rewrite.      |
 | fragment `Id`                     | "Docs citing this fragment."          |
 
-The BM25 index is therefore a general `(doc: Id, term: Inline, score)`
-relation with IDF and length-normalized scoring baked in at build
-time.
+The BM25 artifact is therefore a general lossless carrier `(Docs, F)`, where
+`Docs` is the document-key set (including empty documents) and
+`F(doc, term) -> u32` is sparse term frequency. IDF, average document length,
+and BM25 scores are derived from that carrier at query time.
 
 ## `SuccinctBM25Index` — SB25 blob layout
 
-Self-contained blob, zero-copy via `anybytes::Bytes`, bit-packed
-via jerky. Schema id: `5A1EF3FFD638B15E3EBEAA1E92660441` (see
-`succinct::SuccinctBM25Blob`). The typed `BlobEncoding` handle is
-the identity — no magic bytes, no version field in the blob.
-A breaking format change mints a new schema id.
+Self-contained canonical blob, zero-copy via `anybytes::Bytes`, bit-packed via
+jerky. The exact schema identity is `SuccinctBM25Blob::ID`; there are no magic
+bytes or in-band versions. Every breaking layout or semantic change rotates
+that schema id.
 
 ```
-[header              ] 264 B (fixed)
-  avg_doc_len             f32    ; for length normalization
-  k1                      f32    ; BM25 tuning (default 1.5)
-  b                       f32    ; BM25 tuning (default 0.75)
-  max_score               f32    ; u16-quantization scale
-  n_docs                  u64
-  n_terms                 u64
-  doc_lens_meta           32 B   ; CompactVectorMetaOnDisk
-  postings_doc_idx_meta   32 B   ; CompactVectorMetaOnDisk
-  postings_offsets_meta   32 B   ; CompactVectorMetaOnDisk
-  postings_scores_meta    32 B   ; CompactVectorMetaOnDisk
-  keys_meta               40 B   ; CompressedUniverseMetaOnDisk
-  (section_offset, section_len) × 4 = 64 B
-
 [keys                ] variable         ; CompressedUniverse view:
                                         ; 4-byte fragment dictionary
                                         ; (sorted, deduped) + DACs-byte
@@ -90,22 +74,16 @@ A breaking format change mints a new schema id.
                                         ;     stores universe codes, not
                                         ;     insertion indexes)
                                         ;   offsets (width log2(total+1))
-                                        ;   scores  (width 16, u16-quantized)
+                                        ;   term_frequencies (width
+                                        ;     log2(max_tf+1), exact u32)
+[meta suffix         ] fixed            ; n_docs, n_terms, avg_doc_len,
+                                        ; k1, b, and zero-copy handles/metas
+                                        ; for every preceding section
 ```
 
-Every body section starts on an 8-byte boundary; the header's
-264-byte length is already a multiple of 8, so no tail padding
-is needed. `CompactVector` reinterprets its backing buffer as
-`[u64]`, so misalignment would panic at load time.
-
-The four `CompactVectorMetaOnDisk` structs are a
-[`zerocopy::IntoBytes`]-deriveable mirror of jerky's
-`CompactVectorMeta` (jerky's upstream derives only `FromBytes`).
-Four `u64` fields, 32 bytes each, `#[repr(C)]`. The
-`CompressedUniverseMetaOnDisk` is the same trick for
-`triblespace::core::blob::encodings::succinctarchive::CompressedUniverseMeta`
-— five `u64` fields, 40 bytes, `#[repr(C)]`. Static asserts in
-`succinct.rs` lock the size and layout equivalence.
+All sections share one `ByteArea`; its section writer supplies the alignment
+required by jerky. The `SuccinctBM25Meta` suffix is a zerocopy load token whose
+section handles reconstruct views into those same canonical bytes.
 
 Lookup algorithm:
 1. Binary-search the term in `terms` (typed
@@ -115,9 +93,30 @@ Lookup algorithm:
    CompactVector.
 3. For each *i* in that range, read `doc_idx[i]` (a
    `CompressedUniverse` code) from the postings doc_idx
-   CompactVector and `score[i]` from the quantized score
-   section; decode the external key via
-   `keys.access(doc_idx)`.
+   CompactVector and exact `tf[i]` from the frequency section;
+   decode the external key via `keys.access(doc_idx)`.
+4. Derive Robertson-smoothed IDF from `(n_docs, posting_count)`, then compute
+   standard BM25 from `tf`, `doc_lens[doc_idx]`, `avg_doc_len`, `k1`, and `b`.
+
+### Canonical build and merge law
+
+One inserted row counts repeated terms by addition. Rows or persisted segments
+that share a document key join their frequency maps pointwise with `max`;
+document keys themselves join by set union. Document lengths are the sums of
+the joined frequencies, not independent input fields. This preserves empty
+documents and gives an associative, commutative, idempotent carrier:
+
+```text
+(Docs₁, F₁) ⊔ (Docs₂, F₂)
+  = (Docs₁ ∪ Docs₂, pointwise_max(F₁, F₂))
+```
+
+The canonical document/term ordering makes equivalent merge trees produce the
+same bytes. `k1` and `b` are recipe parameters rather than members of that
+join, so merging segments with bitwise-different tuning is an error. A query
+over several range artifacts exact-merges them before scoring; zero and one
+artifact are fast paths. Consequently range-cover shape cannot change BM25
+scores or ranking.
 
 ### What's already compressed (as of the current impl)
 
@@ -127,12 +126,9 @@ Lookup algorithm:
 - `postings.doc_idx` → bit-packed to `ceil(log2(n_docs + 1))`.
   At 100k docs, 17 bits instead of 32 — 1.9× savings.
 - `postings.offsets` → bit-packed likewise.
-- `postings.scores` → u16-quantized via global `max_score`
-  scale. Half-bucket error bound = `max_score / 2 × 65535`;
-  `score_tolerance` on the index returns the full bucket
-  `max_score / 65534` for constraint equality. 2× savings
-  vs. f32 on the score section, top-10 preservation verified
-  at 1k scale.
+- `postings.term_frequencies` → exact raw `u32` values bit-packed to
+  `ceil(log2(max_tf + 1))`. Common low-frequency corpora typically use only a
+  few bits per posting without losing the high-frequency tail.
 
 ### What's still flat (deliberately)
 
@@ -172,11 +168,6 @@ Lookup algorithm:
   compress further via Simple16 / ELF / VByte. Roughly halves
   the `doc_idx` section at Heaps-law corpora. This is the
   next-biggest win to chase — postings dominate the blob.
-- **Non-uniform score quantization** — current u16 quantization
-  uses a linear global `max_score` scale. A log-space or per-
-  term scale would preserve more precision in the high-df
-  (common-term) tail at the cost of a bigger header. Only
-  worth it if ranking drift bites at larger corpora.
 - **Wavelet matrix on the term table** — would let rank/select
   queries hit terms without a linear-compare binary search.
   For identification-only lookups the current
@@ -369,8 +360,7 @@ an `Embedding<const D: usize>` schema they control.
 Sizing exercise for the canonical downstream: indexing a Liora
 pile of ≈ 100 k typst wiki fragments, average ≈ 180 words each
 (≈ 300 raw tokens with punctuation). Numbers are back-of-envelope
-for the *naive* (current) layout — the jerky succinct pass will
-shrink the term-heavy sections.
+for contrasting the naive flat representation with the succinct layout.
 
 ### BM25 — size estimate
 
@@ -384,36 +374,36 @@ Assume after `hash_tokens`:
 Two columns: a theoretical "naive flat-array" layout (the
 pre-jerky baseline this crate started from — reported by
 [`BM25Index::byte_size`], no actual serializer ships) and the
-landed SB25 format (`SuccinctBM25Index::to_bytes`) with
-bit-packing + score quantization.
+landed SB25 format with exact bit-packed term frequencies.
 
 | Section            | Per-entry | Count      | Naive bytes | SB25 bytes  |
 | :----------------- | --------: | ---------: | ----------: | ----------: |
-| header             | —         | —          |       20 B  |     264 B   |
+| metadata           | —         | —          |       20 B  | small fixed suffix |
 | keys               |    32 B   | 100 000    |   3.2 MiB   | ~1.5–3.2 MiB|
 | doc_lens           |     4 B   | 100 000    |   0.4 MiB   | ~0.12 MiB   |
 | terms (sorted)     |    32 B   | 300 000    |   9.6 MiB   |  9.6 MiB    |
 | postings_offsets   |     4 B   | 300 001    |   1.2 MiB   | ~0.6 MiB    |
 | postings.doc_idx   |     4 B   | 18 000 000 |    72 MiB   | ~38 MiB     |
-| postings.score     |     4 B   | 18 000 000 |    72 MiB   |    36 MiB   |
-| **Total**          |           |            | **~159 MiB**| **~86 MiB** |
+| postings.tf        |     4 B   | 18 000 000 |    72 MiB   | depends on max tf |
+| **Total**          |           |            | **~159 MiB**| corpus-dependent |
 
 Every row computed the same way: the bit-packed sections use
 `ceil(log2(n + 1))` bits per entry (doc_idx → 17 bits ≈ 2.12 B;
 doc_lens at max ≈ 1024 → 10 bits ≈ 1.25 B; offsets at 18M max →
-25 bits ≈ 3.1 B), and u16-quantized scores drop from 4 B to 2 B.
+25 bits ≈ 3.1 B). Exact frequencies use
+`ceil(log2(max_tf + 1))` bits: a maximum within-document frequency of 255
+uses one byte per posting, while larger values widen losslessly.
 
 The `keys` range covers the fragment-dictionary compression
 spread: near-worst-case (random 32-byte values, no shared 4-byte
 fragments) ≈ raw 3.2 MiB plus a small DACs overhead; typical
 GenId-keyed corpora with 16 bytes of zero padding and structured
-trible bytes compress toward ~1.5 MiB. Neither end moves the
-blob total noticeably — keys are ~2 % of the 86 MiB.
+trible bytes compress toward ~1.5 MiB. Neither end moves the blob total much
+because postings dominate.
 
-The **postings dominate** at 85 %+ of either blob. SB25's bit-
-packed `doc_idx` plus u16 scores halves that section — the rest
-of the footprint (keys, terms, docs_lens) is already as small as
-the data allows without additional structure.
+The **postings dominate** either blob. SB25 bit-packs both `doc_idx` and exact
+term frequency; the remaining keys, terms, and document lengths are already
+close to their direct representation.
 
 Term table is the second-largest chunk (9.6 MiB of 32-byte
 Blake3 hashes). Phase 2a tried fragment-dictionary compression
@@ -431,10 +421,11 @@ On current laptop hardware:
   Blake3 is ~3 GB/s on short inputs → ~0.5 s.
 - Hashmap inserts: ~100 ns each × 18 M ≈ 1.8 s.
 - Term sort: 300 k × log₂(300 k) × 32-byte compare ≈ 50 ms.
-- Score computation: 18 M FMA-ish float ops ≈ 50 ms.
+- BM25 score computation is absent from the build; queries derive scores only
+  for postings they visit.
 
 So **~3 s single-threaded** for the full corpus.
-`BM25Builder::build_with_threads(n)` shards docs across `n`
+`BM25Builder::build_naive_with_threads(n)` shards canonicalized docs across `n`
 scoped threads (std::thread::scope, no rayon dep) and merges
 per-shard tf maps at the end. Observed speedups at 4 threads
 on a laptop: ~1.2× at 10 k docs, ~1.3× at 50 k — the merge
@@ -450,23 +441,25 @@ hardware (10 k / 50 k docs with Zipf-ish vocab):
 
 | Corpus              | Path   | p50     | avg     | p99     |
 | :------------------ | :----- | ------: | ------: | ------: |
-| 10 k × 64 tokens    | naive  |  125 ns |  162 ns |  459 ns |
-| 10 k × 64 tokens    | SB25   |  875 ns | 1.06 µs | 4.04 µs |
-| 50 k × 96 tokens    | naive  |  292 ns |  417 ns | 2.29 µs |
-| 50 k × 96 tokens    | SB25   | 2.00 µs | 2.82 µs | 6.21 µs |
+| 10 k × 64 tokens    | naive  |  167 ns |  203 ns |  875 ns |
+| 10 k × 64 tokens    | SB25   | 4.94 µs | 6.15 µs | 12.3 µs |
+| 50 k × 96 tokens    | naive  |  333 ns |  500 ns | 1.50 µs |
+| 50 k × 96 tokens    | SB25   | 18.7 µs | 26.0 µs | 48.3 µs |
 
-Single-term queries stay comfortably under 3 µs on the succinct
-path even at 50 k docs — the original design estimate was a
-generous upper bound. The naive path is ~6-7× faster than SB25
-(flat `Vec` read + pre-baked `f32` vs. bit-unpacking a
-`CompactVector` + dequantizing a u16 score); SB25 trades that
-latency for ~2× smaller blobs on disk.
+The harness now black-boxes materialized results; earlier sub-3-µs figures did
+not and were compiler-sensitive. SB25 pays to unpack compact document/frequency
+vectors and derive BM25, while the naive oracle reads pre-baked scores.
 
-3-term `query_multi` (OR of independent posting lists):
-~207 µs p50 at 50 k docs, dominated by the aggregation
-`HashMap<Id, f32>`. For latency-critical multi-term queries an
-`and!` via the engine is cheaper — merge-join size is
-`min(|postings|)`, not `sum(|postings|)`.
+For 3-term `query_multi`, canonical document-code aggregation avoids hashing
+and comparing 32-byte keys until final decoding. Measured p50 is 35.6 / 67.9 µs
+(naive / SB25) at 10 k and 161 / 370 µs at 50 k. This is about 28–29% faster on
+SB25 than the retired baked-score implementation despite deriving exact scores.
+
+Exact multi-segment reads expose compaction as a latency boundary. With 16 k
+documents split across 2–8 disjoint segments, joining `(Docs, F)` afresh takes
+roughly 52–60 ms, while querying the already-compacted carrier takes 17–19 µs.
+The rollup reader should therefore prefer the widest resident exact node;
+fragmented joining is a correctness fallback, not the steady-state hot path.
 
 ### HNSW — size estimate
 
@@ -527,11 +520,11 @@ measurements.
 
 ### Takeaways
 
-- Naive BM25 blob is ~1.5 KiB per doc — already shippable as a
-  scaffold; SB25 halves that.
-- Postings are the biggest lever; bit-packing + u16 scores
-  already claimed it. The next step (delta-encoded `doc_idx`,
-  wavelet-matrix term table) is incremental, not transformative.
+- The naive BM25 layout remains a useful speed and correctness oracle; SB25 is
+  the persisted, losslessly mergeable representation.
+- Postings are the biggest lever; exact bit-packed term frequencies claim much
+  of it without making cover shape observable. Delta-encoded `doc_idx` remains
+  a plausible next compression step.
 - For HNSW, the interesting compression sits in *caller-owned*
   embedding bytes — this crate's pass is about graph compactness
   and graph-walk speed, not bulk size.

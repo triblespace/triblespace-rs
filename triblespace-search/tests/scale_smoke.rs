@@ -196,9 +196,7 @@ fn succinct_bm25_1k_docs_matches_naive() {
         if term.is_empty() {
             continue;
         }
-        // Query result order is unspecified — succinct sorts by
-        // CompressedUniverse code, naive by insertion order — so
-        // compare as sets by sorting by key first.
+        // Compare by canonical document key.
         let mut a: Vec<_> = naive.query_term(&term[0]).collect();
         let mut b: Vec<_> = succinct.query_term(&term[0]).collect();
         a.sort_by_key(|(k, _)| *k);
@@ -210,13 +208,9 @@ fn succinct_bm25_1k_docs_matches_naive() {
             a.len(),
             b.len()
         );
-        let tol = succinct.score_tolerance();
         for ((id_a, s_a), (id_b, s_b)) in a.iter().zip(b.iter()) {
             assert_eq!(id_a, id_b);
-            assert!(
-                (s_a - s_b).abs() <= tol,
-                "term {term_text}: score drift {s_a} vs {s_b} > tol {tol}"
-            );
+            assert_eq!(s_a.to_bits(), s_b.to_bits(), "term {term_text} score");
         }
     }
 
@@ -234,10 +228,9 @@ fn succinct_bm25_1k_docs_matches_naive() {
     a.sort_by_key(|(k, _)| *k);
     b.sort_by_key(|(k, _)| *k);
     assert_eq!(a.len(), b.len());
-    let tol = reloaded.score_tolerance().max(1e-5);
     for ((id_a, s_a), (id_b, s_b)) in a.iter().zip(b.iter()) {
         assert_eq!(id_a, id_b);
-        assert!((s_a - s_b).abs() <= tol);
+        assert_eq!(s_a.to_bits(), s_b.to_bits());
     }
 }
 
@@ -311,113 +304,6 @@ fn succinct_bm25_blob_smaller_than_naive_at_1k() {
         succinct_size < naive_size,
         "succinct blob {succinct_size} should be < naive baseline {naive_size}"
     );
-}
-
-/// Exploratory: establish whether u16 quantization of BM25
-/// scores would preserve top-k ranking on a real corpus, before
-/// we commit to changing the SB25 wire format. Builds a 1k-doc
-/// index, scans the actual score range, simulates quantize /
-/// dequantize, and checks that top-10 for a dozen queries is
-/// preserved after the lossy round-trip.
-///
-/// The finding this test locks in: on typical BM25 score
-/// distributions (scores ∈ [0, ~5] for standard k1/b), the
-/// absolute error after u16 quantization is bounded by
-/// `max_score / 65535` and top-10 ranking is preserved across
-/// all sampled queries. See `docs/DESIGN.md` → "Open compression
-/// directions" for the outstanding constraint-tolerance work
-/// that gates the actual format change.
-#[test]
-fn bm25_quantization_preserves_top10() {
-    let mut rng = SplitMix64(0x513E3C);
-    let mut builder: BM25Builder = BM25Builder::new();
-    for i in 0..1_000 {
-        let doc = fake_document(&mut rng, 400, 24);
-        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
-    }
-    // Uses raw f32 scores, so build the naive reference — the
-    // succinct form already quantizes internally.
-    let idx = builder.build_naive();
-
-    // Walk every term, record the global max score and the
-    // per-query top-10 on both the raw and the quantized copies.
-    let all_scores: Vec<f32> = (0..idx.term_count())
-        .flat_map(|t| idx.postings_for(t).iter().map(|&(_, s)| s))
-        .collect();
-    let max_s = all_scores.iter().copied().fold(0.0f32, |a, b| a.max(b));
-    assert!(max_s > 0.0, "non-trivial corpus");
-
-    // Quantize a score to u16 and dequantize back to f32.
-    let quantize = |s: f32| -> f32 {
-        let q = ((s / max_s) * (u16::MAX as f32)).round() as u16;
-        (q as f32 / u16::MAX as f32) * max_s
-    };
-
-    // Round-trip every score and measure max absolute error.
-    let max_err = all_scores
-        .iter()
-        .map(|&s| (s - quantize(s)).abs())
-        .fold(0.0f32, |a, b| a.max(b));
-    // Bound: each bucket is max_s / 65535 wide, rounding is at
-    // most half a bucket.
-    let bound = max_s / 65534.0;
-    assert!(
-        max_err <= bound,
-        "quantization error {max_err} > theoretical bound {bound}"
-    );
-
-    // Sample a dozen queries; top-10 must be stable under the
-    // quantize/dequantize round-trip of the aggregated score.
-    let queries = [
-        "w0 w1",
-        "w10 w20",
-        "w42",
-        "w99 w100 w101",
-        "w200 w250",
-        "w300",
-        "w50 w60 w70",
-        "w75 w5",
-        "w0 w100 w200 w300",
-        "w12 w24 w36 w48",
-        "w7",
-        "w18 w29",
-    ];
-    for q_text in &queries {
-        let terms = hash_tokens(q_text);
-        if terms.is_empty() {
-            continue;
-        }
-
-        let mut raw_scores: Vec<(triblespace_core::inline::RawInline, f32)> = Vec::new();
-        let mut q_scores: Vec<(triblespace_core::inline::RawInline, f32)> = Vec::new();
-        for term in &terms {
-            for (d, s) in idx.query_term(term) {
-                let d_raw = d.raw;
-                match raw_scores.iter_mut().find(|(dd, _)| *dd == d_raw) {
-                    Some(e) => e.1 += s,
-                    None => raw_scores.push((d_raw, s)),
-                }
-                let qs = quantize(s);
-                match q_scores.iter_mut().find(|(dd, _)| *dd == d_raw) {
-                    Some(e) => e.1 += qs,
-                    None => q_scores.push((d_raw, qs)),
-                }
-            }
-        }
-        raw_scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        q_scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        // Compare top-10 set (not order — quantization can
-        // legitimately swap ties).
-        use std::collections::HashSet;
-        let raw_top: HashSet<_> = raw_scores.iter().take(10).map(|(d, _)| *d).collect();
-        let q_top: HashSet<_> = q_scores.iter().take(10).map(|(d, _)| *d).collect();
-        let overlap = raw_top.intersection(&q_top).count();
-        assert!(
-            overlap >= 9,
-            "top-10 overlap for query {q_text:?}: {overlap} < 9"
-        );
-    }
 }
 
 #[test]

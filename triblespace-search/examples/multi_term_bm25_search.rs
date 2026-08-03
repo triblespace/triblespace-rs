@@ -93,7 +93,12 @@ fn main() {
     )
     .map(|(b,)| (b, idx.score(&b.to_inline(), &query_terms)))
     .collect();
-    standalone.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    standalone.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     for (b, s) in &standalone {
         let title = title_for(&titles, *b);
         println!("  {s:6.3}  {b}  {title}");
@@ -113,7 +118,12 @@ fn main() {
     )
     .map(|(b,)| (b, idx.score(&b.to_inline(), &query_terms)))
     .collect();
-    matches.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    matches.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     for (b, s) in &matches {
         let title = title_for(&titles, *b);
         println!("  {s:6.3}  {b}  {title}");

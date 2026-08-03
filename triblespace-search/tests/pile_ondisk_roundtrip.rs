@@ -68,10 +68,9 @@ fn succinct_bm25_survives_pile_round_trip() {
     let a: Vec<_> = original.query_term(&fox).collect();
     let r: Vec<_> = reloaded.query_term(&fox).collect();
     assert_eq!(a.len(), r.len());
-    let tol = reloaded.score_tolerance().max(1e-5);
     for ((a_id, a_s), (r_id, r_s)) in a.iter().zip(r.iter()) {
         assert_eq!(a_id, r_id);
-        assert!((a_s - r_s).abs() <= tol);
+        assert_eq!(a_s.to_bits(), r_s.to_bits());
     }
 }
 

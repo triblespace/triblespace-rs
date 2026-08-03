@@ -57,8 +57,10 @@ use triblespace_core::inline::{Inline, InlineEncoding, IntoInline, RawInline};
 const DEFAULT_K1: f32 = 1.5;
 const DEFAULT_B: f32 = 0.75;
 
-/// Accumulator for documents to be indexed. Call [`insert`] once
-/// per doc, then [`build`] to produce a [`BM25Index`].
+/// Accumulator for documents to be indexed. Add rows with [`insert`], then
+/// [`build`] to produce a [`BM25Index`]. Repeated document keys join
+/// canonically: occurrences within one row sum, while per-term frequencies
+/// across rows take their maximum.
 ///
 /// Generic over `D` (the doc-key [`InlineEncoding`]) and `T` (the
 /// term [`InlineEncoding`]). Typical shapes:
@@ -148,14 +150,16 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
         self
     }
 
-    /// Add a document. `key` is anything that converts to a
+    /// Add one document row. `key` is anything that converts to a
     /// `Inline<D>` — pass a `Inline<GenId>` directly, an
     /// `&Id` for entity-keyed indexes, or any user type that
     /// implements `IntoInline<D>`. `terms` is the caller's
     /// tokenization under schema `T` (see
     /// [`crate::tokens::hash_tokens`] for the usual token-handle
     /// default). Order of terms is irrelevant; duplicates
-    /// contribute to term frequency.
+    /// contribute to this row's term frequency. If several rows use the same
+    /// key, each term's final frequency is the maximum across those row-local
+    /// counts. An empty row still preserves its document key.
     ///
     /// Accepts any `IntoIterator<Item = Inline<T>>`, so a
     /// `Vec<Inline<T>>` from `hash_tokens(...)` works directly,
@@ -184,9 +188,9 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
         crate::succinct::SuccinctBM25Index::from_builder(self)
     }
 
-    /// Naive insertion-order reference index. Runs BM25 scoring
-    /// in the simplest possible way (insertion-order doc ids,
-    /// flat `Vec<(doc_idx, score)>` postings) — useful as a
+    /// Naive canonical reference index. Runs BM25 scoring in the simplest
+    /// possible way (sorted document keys, flat `Vec<(doc_idx, score)>`
+    /// postings) — useful as a
     /// correctness oracle when validating the succinct form, or
     /// when benchmarking the scoring cost independent of jerky
     /// encoding overhead. Most callers want [`build`][Self::build].
@@ -201,11 +205,12 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
     /// for the production path.
     pub fn build_naive_with_threads(self, threads: usize) -> BM25Index<D, T> {
         let Self {
-            docs,
+            docs: input_docs,
             k1,
             b,
             _phantom,
         } = self;
+        let docs = canonicalize_docs(input_docs);
         let n_docs = docs.len();
 
         // Per-doc token count; average doc length for normalization.
@@ -331,6 +336,46 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
     }
 }
 
+/// Canonicalize builder rows under the same `(Docs, F)` join used by the
+/// succinct representation and range rollups. Repetitions within one row sum;
+/// rows sharing a document key join by pointwise max. Document keys are kept
+/// even when their joined token bag is empty and sorted for deterministic
+/// internal codes.
+fn canonicalize_docs(docs: Vec<(RawInline, Vec<RawInline>)>) -> Vec<(RawInline, Vec<RawInline>)> {
+    let mut joined: HashMap<RawInline, HashMap<RawInline, u32>> = HashMap::new();
+    for (key, terms) in docs {
+        let mut row_tfs: HashMap<RawInline, u32> = HashMap::new();
+        for term in terms {
+            let slot = row_tfs.entry(term).or_default();
+            *slot = slot
+                .checked_add(1)
+                .expect("BM25 term frequency exceeds u32::MAX");
+        }
+        let doc_tfs = joined.entry(key).or_default();
+        for (term, tf) in row_tfs {
+            doc_tfs
+                .entry(term)
+                .and_modify(|old| *old = (*old).max(tf))
+                .or_insert(tf);
+        }
+    }
+
+    let mut rows: Vec<_> = joined
+        .into_iter()
+        .map(|(key, tfs)| {
+            let mut tfs: Vec<_> = tfs.into_iter().collect();
+            tfs.sort_unstable_by_key(|(term, _)| *term);
+            let terms = tfs
+                .into_iter()
+                .flat_map(|(term, tf)| std::iter::repeat_n(term, tf as usize))
+                .collect();
+            (key, terms)
+        })
+        .collect();
+    rows.sort_unstable_by_key(|(key, _)| *key);
+    rows
+}
+
 /// Accumulate token-frequency counts for one doc into `m`.
 fn accumulate_tfs(
     m: &mut HashMap<RawInline, HashMap<u32, u32>>,
@@ -432,21 +477,34 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Index<D, T> {
     /// Score a multi-term query as the sum of per-term BM25
     /// weights (standard OR-like bag-of-words).
     ///
-    /// Returned `(Inline<D>, f32)` pairs are sorted descending by
-    /// score. No top-k truncation — caller slices what they need.
+    /// Returned `(Inline<D>, f32)` pairs are sorted descending by score, then
+    /// ascending by raw document key for ties. No top-k truncation — caller
+    /// slices what they need.
     pub fn query_multi(&self, terms: &[Inline<T>]) -> Vec<(Inline<D>, f32)> {
-        let mut acc: HashMap<RawInline, f32> = HashMap::new();
+        // Internal document codes follow canonical raw-key order. Keeping
+        // aggregation and tie-breaking in that compact domain avoids hashing
+        // and repeatedly comparing 32-byte keys without changing identity.
+        let mut acc: HashMap<u32, f32> = HashMap::new();
         for term in terms {
-            for (doc, score) in self.query_term(term) {
-                *acc.entry(doc.raw).or_insert(0.0) += score;
+            let Ok(term_index) = self.terms.binary_search(&term.raw) else {
+                continue;
+            };
+            let range = self.offsets[term_index] as usize..self.offsets[term_index + 1] as usize;
+            for &(doc_code, score) in &self.postings[range] {
+                *acc.entry(doc_code).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(Inline<D>, f32)> = acc
+        let mut ranked: Vec<(u32, f32)> = acc.into_iter().collect();
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked
             .into_iter()
-            .map(|(raw, s)| (Inline::<D>::new(raw), s))
-            .collect();
-        out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        out
+            .map(|(doc_code, score)| (Inline::<D>::new(self.keys[doc_code as usize]), score))
+            .collect()
     }
 
     /// Number of documents containing this term.
@@ -579,6 +637,71 @@ mod tests {
         assert_eq!(idx.term_count(), 0);
         let term: Inline<crate::tokens::WordHash> = Inline::new([0u8; 32]);
         assert!(idx.query_term(&term).next().is_none());
+    }
+
+    #[test]
+    fn duplicate_rows_join_by_max_and_preserve_empty_documents() {
+        let alpha = hash_tokens("alpha")[0];
+        let beta = hash_tokens("beta")[0];
+        let gamma = hash_tokens("gamma")[0];
+        let mut b: BM25Builder = BM25Builder::new();
+        b.insert(id(1), std::iter::empty());
+        b.insert(id(2), [alpha, alpha, beta]);
+        b.insert(id(2), [alpha, beta, beta, beta, gamma]);
+
+        let naive = b.clone().build_naive();
+        let succinct = b.build();
+        assert_eq!(naive.doc_count(), 2);
+        assert_eq!(succinct.doc_count(), 2);
+
+        let empty = naive
+            .keys()
+            .iter()
+            .position(|key| *key == id_key(1))
+            .unwrap();
+        let joined = naive
+            .keys()
+            .iter()
+            .position(|key| *key == id_key(2))
+            .unwrap();
+        assert_eq!(naive.doc_lens()[empty], 0);
+        assert_eq!(naive.doc_lens()[joined], 6); // max(2,1)+max(1,3)+max(0,1)
+
+        let reconstructed = succinct.reconstruct_docs();
+        let (_, empty_terms) = reconstructed
+            .iter()
+            .find(|(key, _)| *key == id_key(1))
+            .unwrap();
+        let (_, joined_terms) = reconstructed
+            .iter()
+            .find(|(key, _)| *key == id_key(2))
+            .unwrap();
+        assert!(empty_terms.is_empty());
+        let frequencies = joined_terms.iter().fold(HashMap::new(), |mut acc, term| {
+            *acc.entry(*term).or_insert(0u32) += 1;
+            acc
+        });
+        assert_eq!(frequencies[&alpha.raw], 2);
+        assert_eq!(frequencies[&beta.raw], 3);
+        assert_eq!(frequencies[&gamma.raw], 1);
+    }
+
+    #[test]
+    fn equal_scores_use_raw_document_key_as_tie_break() {
+        let mut b: BM25Builder = BM25Builder::new();
+        b.insert(id(3), hash_tokens("same terms"));
+        b.insert(id(1), hash_tokens("same terms"));
+        b.insert(id(2), hash_tokens("same terms"));
+        let terms = hash_tokens("same");
+
+        for ranked in [
+            b.clone().build_naive().query_multi(&terms),
+            b.build().query_multi(&terms),
+        ] {
+            let keys: Vec<_> = ranked.iter().map(|(key, _)| key.raw).collect();
+            assert_eq!(keys, [id_key(1), id_key(2), id_key(3)]);
+            assert!(ranked.windows(2).all(|pair| pair[0].1 == pair[1].1));
+        }
     }
 
     #[test]

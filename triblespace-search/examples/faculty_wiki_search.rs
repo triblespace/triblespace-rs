@@ -57,18 +57,16 @@ mod wiki {
             as pub title: inlineencodings::ShortString;
         "512F2ABC687A4E42916C19E6A552B285"
             as pub body: inlineencodings::Handle<blobencodings::LongString>;
-        // `index` rotated 2026-05-05 alongside the
-        // `SuccinctBM25Blob` schema id rotation
-        // (`5A1EF3FFD638B15E3EBEAA1E92660441` →
-        // `DA527A8FF09A3709B2AC6425CD5AF7A8`). Old triples under
-        // the previous attribute id `768BFF023339F236B4174BDF2DC35F2B`
-        // were written against the retired blob layout and can't be
-        // loaded by the current code; the rotation makes that
-        // incompatibility explicit at the trible level rather than
-        // letting old/new bytes collide under one attribute. See
+        // `index` rotated again 2026-08-03 alongside the
+        // `SuccinctBM25Blob` schema id rotation from score postings
+        // (`DA527A8FF09A3709B2AC6425CD5AF7A8`) to exact raw term
+        // frequencies (`DAFEEEC9350D072B83E32DBBBBB66039`). Old triples
+        // under attribute id `EBDECCC621ABA8DA8C81D48A9B19347C`
+        // cannot be loaded by the current code; the rotation makes that
+        // incompatibility explicit at the trible level. See
         // `docs/FACULTY_INTEGRATION.md` § "What the caller has to
         // rotate" for the migration recipe.
-        "EBDECCC621ABA8DA8C81D48A9B19347C"
+        "75C8930CB8E9C3E8D2CAC2C8DE6489A4"
             as pub index: inlineencodings::Handle<SuccinctBM25Blob>;
     }
 
@@ -197,7 +195,12 @@ fn query(
     )
     .map(|(doc, title)| (doc, idx.score(&doc.to_inline(), &tokens), title))
     .collect();
-    rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     rows.truncate(top_k);
     Ok(rows)
 }

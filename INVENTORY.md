@@ -204,12 +204,9 @@ prioritized for efficient zero-copy access.
   `triblespace-search` before the next crates.io release. The git pin is an
   intentional integration bridge, not the final publishable dependency.
 - Define archive-message semantics when one entity carries multiple content
-  handles. BM25 preserves the union of their term presence, while result
+  handles. BM25 joins their per-value term frequencies by pointwise max, while result
   materialisation currently selects one matching body; either make the schema
   cardinality explicit or make resolution deterministic and test it.
-- Property-test BM25 max-union compaction across randomized segment
-  permutations, varied explicit merge trees, and high term frequencies
-  near score-quantization saturation.
 - The optional CubeCL succinct-merge backend's per-level block-prefix scan is
   still one serial device thread. Packed CPU reduced the measured WGPU gain to
   5–8% on large Apple Metal tiers; investigate a hierarchical device scan and

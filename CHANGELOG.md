@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **BM25 rollups are exact under repartition.** Succinct BM25 blobs now persist
+  exact bit-packed raw term frequencies rather than quantized scores. Builders
+  and rollup compaction share the `(Docs union, pointwise-max TF)` algebra,
+  preserve empty documents, derive lengths and corpus statistics after join,
+  reject mixed tuning, and merge multi-segment covers before scoring. Equal
+  scores use raw document keys as deterministic tie-breaks.
+
 ### Added
 
 - **Generic asserted pins replace kind-specific replicated cells.**

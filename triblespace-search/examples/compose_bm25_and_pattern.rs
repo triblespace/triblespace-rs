@@ -125,7 +125,12 @@ fn main() {
     )
     .map(|(b,)| (b, idx.score(&b.to_inline(), &fox)))
     .collect();
-    scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    scored.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     for (b, s) in &scored {
         let title = titles
             .iter()

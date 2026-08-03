@@ -25,10 +25,9 @@
 //! via `BM25Builder::build_naive()` / `HNSWBuilder::build_naive()`
 //! / `FlatBuilder::build()`.
 //!
-//! Both indexes are rebuilt-and-replaced (no mutation); the
-//! caller persists the resulting handle wherever appropriate
-//! (branch metadata, commit metadata, a plain trible, or an
-//! in-memory cache).
+//! Both indexes are immutable content-addressed artifacts. Range-native rollup
+//! kinds build and merge them without mutating or superseding earlier nodes;
+//! callers may also persist a handle directly in ordinary tribles.
 //!
 //! # Query surface
 //!
@@ -76,7 +75,7 @@
 //! b.insert(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
 //! b.insert(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
 //!
-//! // 2. Build a succinct BM25 index in a single pass.
+//! // 2. Build a succinct BM25 index directly.
 //! let idx: SuccinctBM25Index = b.build();
 //!
 //! // 3. Filter through the engine — constraint binds `doc`
@@ -116,7 +115,7 @@ pub mod tokens;
 
 /// Reference implementations for tests and benchmarks.
 ///
-/// The types re-exported here are naive (insertion-order,
+/// The types re-exported here are naive (canonical flat,
 /// non-packed) forms that exist only to validate the succinct
 /// builds and to measure "how much does jerky packing actually
 /// save at this scale." They are not a production persistence

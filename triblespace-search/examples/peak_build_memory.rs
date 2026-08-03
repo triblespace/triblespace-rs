@@ -6,11 +6,10 @@
 //! - Build peaks (naive and succinct) are dominated by the
 //!   `term_to_tfs: HashMap<RawInline, HashMap<u32, u32>>`
 //!   accumulator — at 50 k docs / 20 k vocab that's ~150 MiB
-//!   alone. The streaming `SuccinctPostings::build_with` refactor
-//!   trims a smaller-but-real `Vec<Vec<(u32, f32)>>` intermediate
-//!   that is *masked* by `term_to_tfs` at modest scales; the win
-//!   becomes visible at 100 k+ docs where the intermediate hits
-//!   ~144 MiB and matters versus the HashMap's ~360 MiB.
+//!   alone. The streaming `SuccinctPostings::build_with_into` path
+//!   avoids a corpus-wide postings intermediate; only one term's exact
+//!   `(doc_code, tf)` rows are materialized while the packed sections are
+//!   written.
 //! - `to_blob` peak should be near zero — under the
 //!   canonical-bytes pattern the index *is* its blob, so
 //!   `to_blob` is a refcounted `Bytes::clone`. The phase peak
@@ -164,7 +163,7 @@ fn run(n_docs: usize, vocab: usize, doc_len: usize) {
     });
 
     // Direct-to-succinct build via streaming SuccinctPostings::
-    // build_with — the path the previous two commits restructured.
+    // build_with_into.
     // Peak should be smaller than the naive intermediate plus the
     // returned succinct index.
     let succinct = measure("BM25Builder::build (streaming succinct)", || {
