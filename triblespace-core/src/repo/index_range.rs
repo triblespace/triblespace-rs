@@ -225,14 +225,12 @@ impl RangeCoverCandidate {
 ///
 /// `selected` contains pairwise-disjoint, locally usable artifact nodes.
 /// `residual` contains every target commit not covered by them and must be
-/// evaluated from source data. `invalid` names candidate nodes whose
-/// boundaries looked relevant but failed individual range validation; one bad
+/// evaluated from source data. Invalid candidates are ignored, so one bad
 /// grow-only assertion never poisons the rest of the pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeCoverSelection {
     selected: Vec<Inline<Handle<SimpleArchive>>>,
     residual: Vec<CommitHandle>,
-    invalid: Vec<Inline<Handle<SimpleArchive>>>,
 }
 
 impl RangeCoverSelection {
@@ -244,11 +242,6 @@ impl RangeCoverSelection {
     /// Canonically ordered target commits that must be read from source.
     pub fn residual(&self) -> &[CommitHandle] {
         &self.residual
-    }
-
-    /// Canonically ordered candidate nodes rejected by range validation.
-    pub fn invalid(&self) -> &[Inline<Handle<SimpleArchive>>] {
-        &self.invalid
     }
 }
 
@@ -581,7 +574,6 @@ where
     }
 
     let mut eligible = Vec::new();
-    let mut invalid = Vec::new();
     for candidate in candidates {
         // Every member of an eligible range lies between its boundaries, so a
         // boundary outside the target proves irrelevance without loading an
@@ -607,7 +599,7 @@ where
             Err(RangeValidationError::CyclicGraph) => {
                 return Err(RangeValidationError::CyclicGraph);
             }
-            Err(_) => invalid.push(candidate.node),
+            Err(_) => {}
         }
     }
 
@@ -631,14 +623,7 @@ where
 
     let mut residual: Vec<_> = remaining.into_iter().collect();
     residual.sort_unstable_by_key(|commit| commit.raw);
-    invalid.sort_unstable_by_key(|node| node.raw);
-    invalid.dedup();
-
-    Ok(RangeCoverSelection {
-        selected,
-        residual,
-        invalid,
-    })
+    Ok(RangeCoverSelection { selected, residual })
 }
 
 struct DagView<'a, D: CommitDag> {
@@ -1139,7 +1124,6 @@ mod tests {
             &[Inline::new([7; 32]), Inline::new([9; 32])]
         );
         assert!(forward.residual().is_empty());
-        assert!(forward.invalid().is_empty());
 
         let mut reversed = candidates;
         reversed.reverse();
@@ -1173,7 +1157,6 @@ mod tests {
 
         assert_eq!(selection.selected(), &[Inline::new([2; 32])]);
         assert!(selection.residual().is_empty());
-        assert!(selection.invalid().is_empty());
     }
 
     #[test]
@@ -1205,7 +1188,6 @@ mod tests {
 
         assert_eq!(selection.selected(), &[Inline::new([2; 32])]);
         assert!(selection.residual().is_empty());
-        assert_eq!(selection.invalid(), &[Inline::new([1; 32])]);
     }
 
     #[test]
