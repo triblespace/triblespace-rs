@@ -1,11 +1,9 @@
 //! Artifact-neutral commit ranges for derived rollup nodes.
 //!
-//! A range record is a stable entity whose identity is the intrinsic core
-//! `(index_recipe, commit_start*, commit_end*)`, independent of mutable
-//! artifact handles. Artifact attributes are deliberately open facts on that entity:
-//! a raw Succinct archive, its Rank9 accelerator, or another materialization
-//! can be attached without changing record identity. This module does not
-//! prescribe those artifact attributes.
+//! A range record is a stable canonical entity whose identity is the intrinsic
+//! core `(index_recipe, commit_start*, commit_end*)`. Derived artifacts live in
+//! separate archives paired with this core by a signed rollup assertion; they
+//! are not facts preserved by the range record itself.
 //!
 //! For start antichain `S` and end antichain `E`, the represented commit set is
 //! the union of closed intervals
@@ -311,13 +309,12 @@ fn canonicalise_boundary(
     Ok(())
 }
 
-/// A lossless, artifact-neutral range entity.
+/// A canonical, artifact-neutral range entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeRecord {
     entity: Id,
     recipe: Id,
     range: CommitRange,
-    facts: TribleSet,
 }
 
 impl RangeRecord {
@@ -328,21 +325,18 @@ impl RangeRecord {
         let entity = fragment
             .root()
             .expect("recipe and nonempty frontiers export one entity");
-        let facts = fragment.into_facts();
         Self {
             entity,
             recipe,
             range,
-            facts,
         }
     }
 
-    /// Parse one real entity from `set`, retaining every fact attached to it.
+    /// Parse one canonical range entity from `set`.
     pub fn parse(set: &TribleSet, entity: Id) -> Result<Self, RangeRecordError> {
-        let facts = entity_facts(set, entity);
         let mut recipes = find!(
             recipe: Id,
-            pattern!(&facts, [{ entity @ index_recipe: ?recipe }])
+            pattern!(set, [{ entity @ index_recipe: ?recipe }])
         );
         let Some(recipe) = recipes.next() else {
             return Err(RangeRecordError::RecipeCardinality { entity });
@@ -352,12 +346,12 @@ impl RangeRecord {
         }
         let start = find!(
             commit: CommitHandle,
-            pattern!(&facts, [{ entity @ commit_start: ?commit }])
+            pattern!(set, [{ entity @ commit_start: ?commit }])
         )
         .collect();
         let end = find!(
             commit: CommitHandle,
-            pattern!(&facts, [{ entity @ commit_end: ?commit }])
+            pattern!(set, [{ entity @ commit_end: ?commit }])
         )
         .collect();
         let range = CommitRange::new(start, end)?;
@@ -374,7 +368,6 @@ impl RangeRecord {
             entity,
             recipe,
             range,
-            facts,
         })
     }
 
@@ -408,33 +401,11 @@ impl RangeRecord {
         &self.range
     }
 
-    /// Every fact attached to this entity, including unknown artifact facts.
-    pub fn facts(&self) -> &TribleSet {
-        &self.facts
-    }
-
-    /// Mutable open facts for attaching typed artifact attributes.
-    ///
-    /// Callers must not mutate `commit_start` or `commit_end`; serialisation
-    /// always refreshes those two owned attributes from [`range`](Self::range).
-    pub fn facts_mut(&mut self) -> &mut TribleSet {
-        &mut self.facts
-    }
-
-    /// Serialise canonical range facts plus all opaque facts verbatim.
+    /// Serialise exactly the canonical range facts.
     pub fn to_tribles(&self) -> TribleSet {
-        let mut out = TribleSet::new();
-        for trible in self.facts.iter().filter(|trible| {
-            trible.a() != &index_recipe.id()
-                && trible.a() != &commit_start.id()
-                && trible.a() != &commit_end.id()
-        }) {
-            out.insert(trible);
-        }
         let core = Self::core_fragment(self.recipe, &self.range);
         assert_eq!(core.root(), Some(self.entity));
-        out += core;
-        out
+        core.into_facts()
     }
 
     fn core_fragment(recipe: Id, range: &CommitRange) -> crate::trible::Fragment {
@@ -444,14 +415,6 @@ impl RangeRecord {
             commit_end*: range.end.iter().copied(),
         }
     }
-}
-
-fn entity_facts(set: &TribleSet, entity: Id) -> TribleSet {
-    let mut facts = TribleSet::new();
-    for trible in set.iter().filter(|trible| *trible.e() == entity) {
-        facts.insert(trible);
-    }
-    facts
 }
 
 /// Merge pairwise-disjoint victim ranges if and only if their union is one
@@ -963,9 +926,8 @@ impl CommitDag for HashMap<CommitHandle, Vec<CommitHandle>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::{fucid, ExclusiveId};
+    use crate::id::fucid;
     use crate::inline::Inline;
-    use crate::metadata;
     use proptest::prelude::*;
 
     fn commit(byte: u8) -> CommitHandle {
@@ -1271,15 +1233,11 @@ mod tests {
     }
 
     #[test]
-    fn range_identity_ignores_and_preserves_open_artifact_facts() {
+    fn range_record_serializes_only_its_canonical_core() {
         let a = commit(1);
         let recipe = fucid();
-        let mut record = RangeRecord::new(*recipe, CommitRange::leaf(a));
+        let record = RangeRecord::new(*recipe, CommitRange::leaf(a));
         let entity = record.entity();
-        let artifact = fucid();
-        *record.facts_mut() += entity! { ExclusiveId::force_ref(&entity) @
-            metadata::tag: &artifact,
-        };
 
         let encoded = record.to_tribles();
         let parsed = RangeRecord::parse(&encoded, entity).unwrap();

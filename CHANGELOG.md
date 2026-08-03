@@ -177,7 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and merge operations. Build and merge return `Option<Artifact>`; a distinct
   node thaws exactly one complete artifact, while `node == core` canonically
   represents no artifact. This removes the unused vector-of-artifacts shape
-  inside one node without changing the several-selected-nodes read model.
+  inside one node without changing the several-selected-nodes read model. A
+  distinct soft node is artifact-only: the signed pair already associates it
+  with the hard core, so it no longer duplicates recipe or range-boundary
+  facts. `RangeRecord` consequently serializes canonical core facts only.
   Compaction publishes another immutable pair and never mutates or supersedes
   its victims. Succinct artifacts pair raw archives with source-bound Rank9
   blobs; BM25 rejects empty or noncanonical-tuning artifacts; HNSW rejects
@@ -1383,7 +1386,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same action.
 - **Rollup nodes use artifact-neutral commit-DAG ranges.**
   `repo::index_range` models inclusive repeated start/end antichains, stable
-  intrinsic range-record identities, lossless open facts, deterministic
+  intrinsic range-record identities, canonical core facts, deterministic
   cover/residual selection, and convexity-checked range union. The `commit_start` id
   `FC67FFBAD460A96D07EBA341CD4127E7` and `commit_end` id
   `FAD9B5F3ABA90AC846D08C787A831C7D`, plus the `index_recipe` id

@@ -77,7 +77,7 @@ One published rollup alternative is a pair of content-addressed archives:
 
 ```text
 core = SimpleArchive(core-only RangeRecord)
-node = SimpleArchive(the same RangeRecord + one complete typed artifact)
+node = SimpleArchive(one complete typed artifact, rooted at the range entity)
 ```
 
 The generic signed assertion stores `core` as its value and `node` as its
@@ -86,6 +86,12 @@ generic retention follows the small core but does not follow the node label.
 Derived bytes therefore remain optional and evictable without a permanent
 weak-pin assertion. A completed-empty projection is the degenerate case
 `node == core`.
+
+A distinct node does not repeat `index_recipe`, `commit_start`, or `commit_end`.
+The signed `(core,node)` pair is already the association, and the artifact facts
+must all use the core's intrinsic range entity as their subject. Loading parses
+and validates the core once, then rejects an empty node or any node containing
+another subject or range-control attribute before kind-specific thaw.
 
 The archive boundary is semantic:
 
