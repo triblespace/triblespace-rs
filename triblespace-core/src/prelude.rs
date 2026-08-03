@@ -76,6 +76,7 @@ pub use crate::repo::filter;
 pub use crate::repo::history_of;
 pub use crate::repo::intersect;
 pub use crate::repo::lazy::Lazy;
+pub use crate::repo::materialize_commit_contents;
 pub use crate::repo::memoryrepo::MemoryRepo;
 pub use crate::repo::nth_ancestors;
 pub use crate::repo::parents;

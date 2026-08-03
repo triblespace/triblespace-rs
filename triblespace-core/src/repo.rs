@@ -131,6 +131,7 @@ where
 }
 
 use crate::macros::pattern;
+use std::borrow::Borrow;
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
@@ -1161,6 +1162,60 @@ pub type CommitHandle = Inline<Handle<SimpleArchive>>;
 type MetadataHandle = Inline<Handle<SimpleArchive>>;
 /// A set of commit handles, used by [`CommitSelector`] and [`Checkout`].
 pub type CommitSet = PATCH<INLINE_LEN, IdentitySchema, ()>;
+
+/// Materialize the set union of the content carried by exactly `commits`.
+///
+/// This is the read-only counterpart of [`Workspace::checkout`] for callers
+/// that already have an exact commit selection. It performs no ancestry walk,
+/// branch resolution, assertion snapshot, or workspace construction. Commits
+/// without content (such as authorless merge commits) contribute the empty
+/// set. A missing or undecodable commit/content blob remains a storage error,
+/// while ambiguous commit content metadata is reported as
+/// [`WorkspaceCheckoutError::BadCommitMetadata`].
+///
+/// Both owned iterators and borrowed slices are accepted. Repeated or
+/// overlapping commit contents collapse through [`TribleSet`] set union.
+pub fn materialize_commit_contents<R, I>(
+    blobs: &R,
+    commits: I,
+) -> Result<TribleSet, WorkspaceCheckoutError<R::GetError<UnarchiveError>>>
+where
+    R: BlobStoreGet,
+    I: IntoIterator,
+    I::Item: Borrow<CommitHandle>,
+{
+    materialize_commit_contents_with(commits, |handle| blobs.get(handle))
+}
+
+fn materialize_commit_contents_with<I, E, F>(
+    commits: I,
+    mut get: F,
+) -> Result<TribleSet, WorkspaceCheckoutError<E>>
+where
+    I: IntoIterator,
+    I::Item: Borrow<CommitHandle>,
+    E: Error,
+    F: FnMut(CommitHandle) -> Result<TribleSet, E>,
+{
+    let mut result = TribleSet::new();
+    for commit in commits {
+        let meta = get(*commit.borrow()).map_err(WorkspaceCheckoutError::Storage)?;
+
+        // Some commits (for example merge commits) intentionally do not carry
+        // a content blob. They are the identity element for materialization.
+        let content_opt =
+            match find!((c: Inline<_>), pattern!(&meta, [{ content: ?c }])).at_most_one() {
+                Ok(Some((content_handle,))) => Some(content_handle),
+                Ok(None) => None,
+                Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
+            };
+
+        if let Some(content_handle) = content_opt {
+            result += get(content_handle).map_err(WorkspaceCheckoutError::Storage)?;
+        }
+    }
+    Ok(result)
+}
 
 /// The result of a [`Workspace::checkout`] operation: a [`TribleSet`] paired
 /// with the set of commits that produced it. Pass the commit set as the start
@@ -2354,68 +2409,18 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                 let base = self.base_blobs.clone();
                 return commits
                     .into_par_iter()
-                    .map_with(
-                        (local, base),
-                        |(local, base), commit| -> Result<TribleSet, _> {
-                            let meta: TribleSet = local
-                                .get(commit)
-                                .or_else(|_| base.get(commit))
-                                .map_err(WorkspaceCheckoutError::Storage)?;
-                            let content_opt = match find!(
-                                (c: Inline<_>),
-                                pattern!(&meta, [{ content: ?c }])
-                            )
-                            .at_most_one()
-                            {
-                                Ok(Some((c,))) => Some(c),
-                                Ok(None) => None,
-                                Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
-                            };
-                            if let Some(c) = content_opt {
-                                let set: TribleSet = local
-                                    .get(c)
-                                    .or_else(|_| base.get(c))
-                                    .map_err(WorkspaceCheckoutError::Storage)?;
-                                Ok(set)
-                            } else {
-                                Ok(TribleSet::new())
-                            }
-                        },
-                    )
+                    .map_with((local, base), |(local, base), commit| {
+                        materialize_commit_contents_with([commit], |handle| {
+                            local.get(handle).or_else(|_| base.get(handle))
+                        })
+                    })
                     .try_reduce(TribleSet::new, |a, b| Ok(a + b));
             }
         }
 
-        let mut result = TribleSet::new();
-        for commit in commits {
-            let meta: TribleSet = local
-                .get(commit)
-                .or_else(|_| self.base_blobs.get(commit))
-                .map_err(WorkspaceCheckoutError::Storage)?;
-
-            // Some commits (for example merge commits) intentionally do not
-            // carry a content blob. Treat those as no-ops during checkout so
-            // callers can request ancestor ranges without failing when a
-            // merge commit is encountered.
-            let content_opt =
-                match find!((c: Inline<_>), pattern!(&meta, [{ content: ?c }])).at_most_one() {
-                    Ok(Some((c,))) => Some(c),
-                    Ok(None) => None,
-                    Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
-                };
-
-            if let Some(c) = content_opt {
-                let set: TribleSet = local
-                    .get(c)
-                    .or_else(|_| self.base_blobs.get(c))
-                    .map_err(WorkspaceCheckoutError::Storage)?;
-                result += set;
-            } else {
-                // No content for this commit (e.g. merge-only commit); skip it.
-                continue;
-            }
-        }
-        Ok(result)
+        materialize_commit_contents_with(commits, |handle| {
+            local.get(handle).or_else(|_| self.base_blobs.get(handle))
+        })
     }
 
     fn checkout_commits_metadata<I>(
