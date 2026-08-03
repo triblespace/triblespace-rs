@@ -223,8 +223,9 @@ fn node_from_label(label: SubsumptionLabel) -> Inline<Handle<SimpleArchive>> {
 /// One atomic rollup alternative over a fixed logical source range.
 ///
 /// `range_record` names the canonical core-only [`RangeRecord`](super::index_range::RangeRecord)
-/// archive. `node` names one complete standalone archive containing that same
-/// core plus all conjunctive typed artifact components for the alternative.
+/// archive. `node` names one complete standalone archive containing only the
+/// conjunctive typed artifact components for the alternative, rooted at the
+/// core's intrinsic entity; the signed pair supplies their association.
 /// Distinct nodes may share one range record; they remain disjunctive
 /// alternatives and must never be fact-unioned merely because their intrinsic
 /// range entity is equal.
