@@ -48,8 +48,6 @@ attributes! {
 pub enum RangeRecordError {
     /// A start or end frontier was empty.
     EmptyFrontier,
-    /// A caller supplied the same boundary value more than once.
-    DuplicateBoundary { frontier: &'static str },
     /// A stored range record did not have exactly one recipe.
     RecipeCardinality { entity: Id },
     /// A stored entity did not equal the intrinsic `(recipe, range)` id.
@@ -60,9 +58,6 @@ impl fmt::Display for RangeRecordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyFrontier => write!(f, "commit range frontiers must be nonempty"),
-            Self::DuplicateBoundary { frontier } => {
-                write!(f, "commit range {frontier} frontier contains a duplicate")
-            }
             Self::RecipeCardinality { entity } => {
                 write!(
                     f,
@@ -246,15 +241,16 @@ impl RangeCoverSelection {
 }
 
 impl CommitRange {
-    /// Construct a byte-canonical range. Frontiers are sorted; duplicates and
-    /// emptiness are rejected. Ancestry-antichain validation is performed by
+    /// Construct a byte-canonical range. Frontiers are mathematical sets, so
+    /// caller order and duplicate values are discarded; empty sets are
+    /// rejected. Ancestry-antichain validation is performed by
     /// [`members`](Self::members), because it requires the commit DAG.
     pub fn new(
         mut start: Vec<CommitHandle>,
         mut end: Vec<CommitHandle>,
     ) -> Result<Self, RangeRecordError> {
-        canonicalise_boundary("start", &mut start)?;
-        canonicalise_boundary("end", &mut end)?;
+        canonicalise_boundary(&mut start)?;
+        canonicalise_boundary(&mut end)?;
         Ok(Self { start, end })
     }
 
@@ -288,17 +284,12 @@ impl CommitRange {
     }
 }
 
-fn canonicalise_boundary(
-    name: &'static str,
-    boundary: &mut Vec<CommitHandle>,
-) -> Result<(), RangeRecordError> {
+fn canonicalise_boundary(boundary: &mut Vec<CommitHandle>) -> Result<(), RangeRecordError> {
     if boundary.is_empty() {
         return Err(RangeRecordError::EmptyFrontier);
     }
     boundary.sort_unstable_by_key(|commit| commit.raw);
-    if boundary.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(RangeRecordError::DuplicateBoundary { frontier: name });
-    }
+    boundary.dedup();
     Ok(())
 }
 
@@ -982,12 +973,17 @@ mod tests {
     }
 
     #[test]
-    fn boundaries_reject_duplicates_comparability_and_disconnection() {
+    fn boundaries_are_sets_and_reject_comparability_and_disconnection() {
         let (mut graph, [a, b, c]) = chain();
-        assert!(matches!(
-            CommitRange::new(vec![a, a], vec![b]),
-            Err(RangeRecordError::DuplicateBoundary { frontier: "start" })
-        ));
+        let repeated = CommitRange::new(vec![a, a], vec![b, b]).unwrap();
+        let canonical = CommitRange::new(vec![a], vec![b]).unwrap();
+        assert_eq!(repeated, canonical);
+
+        let recipe = fucid();
+        let repeated_record = RangeRecord::new(*recipe, repeated);
+        let canonical_record = RangeRecord::new(*recipe, canonical);
+        assert_eq!(repeated_record.entity(), canonical_record.entity());
+        assert_eq!(repeated_record.to_tribles(), canonical_record.to_tribles());
 
         let comparable = CommitRange::new(vec![a, b], vec![c]).unwrap();
         assert!(matches!(
