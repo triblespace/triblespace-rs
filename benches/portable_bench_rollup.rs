@@ -6,11 +6,11 @@
 //!
 //! - `leaf_store`: build and store one immutable typed node per source commit;
 //! - `compact_store`: deliberately choose a convex prefix of those leaves,
-//!   merge its segments, and store one additional immutable node;
+//!   merge its artifacts, and store one additional immutable node;
 //! - `cover`: resolve locally usable asserted node offers against the current
 //!   source frontier, deriving the exact uncovered commit residual;
 //! - `q<N>_mixed`: run the main benchmark's wired query matrix over a true
-//!   heterogeneous source: selected resident Succinct segments OR the plain
+//!   heterogeneous source: selected resident Succinct artifacts OR the plain
 //!   residual `TribleSet`, at every triple pattern. Joins may therefore cross
 //!   the resident/residual boundary.
 //!
@@ -368,13 +368,13 @@ struct ResidentResidual {
 }
 
 impl ResidentResidual {
-    fn new(segments: Vec<SuccinctArchive<OrderedUniverse>>, residual: TribleSet) -> Self {
+    fn new(artifacts: Vec<SuccinctArchive<OrderedUniverse>>, residual: TribleSet) -> Self {
         assert!(
-            !segments.is_empty() || !residual.is_empty(),
+            !artifacts.is_empty() || !residual.is_empty(),
             "resident+residual source cannot be empty"
         );
         Self {
-            resident: (!segments.is_empty()).then(|| SuccinctRollup::union(&segments)),
+            resident: (!artifacts.is_empty()).then(|| SuccinctRollup::union(&artifacts)),
             residual,
         }
     }
@@ -796,7 +796,7 @@ fn main() {
     // -- LEAF BUILD/STORE + DELIBERATE COMPACTION -------------------------
     // Each iteration starts with a fresh artifact store and the same untimed
     // direct-parent map. Leaf construction has no hidden policy. Compaction explicitly
-    // chooses the oldest prefix, proves its union convex, merges its segments,
+    // chooses the oldest prefix, proves its union convex, merges its artifacts,
     // and stores one additional immutable node. Victim offers remain beside
     // the replacement, as required by monotone publication.
     let kind = SuccinctRollup::new();
@@ -813,9 +813,9 @@ fn main() {
             let t = Instant::now();
             let mut leaves = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
-                let segments = kind.build(&chunk.content).expect("build leaf segments");
+                let artifact = kind.build(&chunk.content).expect("build leaf artifact");
                 leaves.push(
-                    store_range(&mut store, &kind, CommitRange::leaf(chunk.handle), segments)
+                    store_range(&mut store, &kind, CommitRange::leaf(chunk.handle), artifact)
                         .expect("store leaf range"),
                 );
             }
@@ -838,12 +838,14 @@ fn main() {
                 .collect();
             let merged_range =
                 convex_union(&mut dag, &ranges).expect("victim ranges form a convex prefix");
-            let victim_segments: Vec<_> = leaves[..victim_count]
+            let victim_artifacts: Vec<_> = leaves[..victim_count]
                 .iter()
-                .flat_map(|node| node.segments().iter().cloned())
+                .filter_map(|node| node.artifact().cloned())
                 .collect();
-            let merged_segments = kind.merge(&victim_segments).expect("merge victim segments");
-            let compacted = store_range(&mut store, &kind, merged_range, merged_segments)
+            let merged_artifact = kind
+                .merge(&victim_artifacts)
+                .expect("merge victim artifacts");
+            let compacted = store_range(&mut store, &kind, merged_range, merged_artifact)
                 .expect("store compacted range");
             if recording {
                 compact_samples.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -874,10 +876,10 @@ fn main() {
                 offered,
                 leaves.len(),
                 victim_count,
-                compacted.segments().len(),
+                usize::from(compacted.artifact().is_some()),
             ));
         }
-        let (store, offered, leaf_count, victim_count, compacted_segments) =
+        let (store, offered, leaf_count, victim_count, compacted_artifacts) =
             kept.expect("at least one build iteration");
         (
             leaf_samples,
@@ -886,7 +888,7 @@ fn main() {
             offered,
             leaf_count,
             victim_count,
-            compacted_segments,
+            compacted_artifacts,
         )
     });
 
@@ -904,7 +906,7 @@ fn main() {
             offered,
             leaf_count,
             victim_count,
-            compacted_segments,
+            compacted_artifacts,
         )) => {
             all.push(("leaf_store".to_owned(), Outcome::Samples(leaf_samples)));
             all.push((
@@ -957,10 +959,10 @@ fn main() {
                     selected_ident = cover.selected().len();
                     residual_ident = cover.residual().len();
 
-                    let resident_segments: Vec<_> = cover
+                    let resident_artifacts: Vec<_> = cover
                         .selected()
                         .iter()
-                        .flat_map(|node| node.segments().iter().cloned())
+                        .filter_map(|node| node.artifact().cloned())
                         .collect();
                     let residual_handles: std::collections::HashSet<_> =
                         cover.residual().iter().copied().collect();
@@ -980,15 +982,15 @@ fn main() {
                     );
 
                     println!(
-                        "rollup   : {leaf_count} leaf nodes, {victim_count} deliberate victims, {} retained offers, {} selected nodes / {} resident segments, {} residual commits / {} residual tribles, {compacted_segments} compacted segments",
+                        "rollup   : {leaf_count} leaf nodes, {victim_count} deliberate victims, {} retained offers, {} selected nodes / {} resident artifacts, {} residual commits / {} residual tribles, {compacted_artifacts} compacted artifacts",
                         offered.len(),
                         cover.selected().len(),
-                        resident_segments.len(),
+                        resident_artifacts.len(),
                         cover.residual().len(),
                         residual.len(),
                     );
 
-                    let mixed = ResidentResidual::new(resident_segments, residual);
+                    let mixed = ResidentResidual::new(resident_artifacts, residual);
                     let (mixed_outcomes, counts) =
                         measure_queries(&mixed, "mixed", &qa, range_min, iters, warmup);
                     mixed_counts = counts;

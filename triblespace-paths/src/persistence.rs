@@ -393,7 +393,7 @@ impl PathRollup {
 }
 
 impl IndexKind for PathRollup {
-    type Segment = PathSummary;
+    type Artifact = PathSummary;
 
     fn recipe_fragment(&self) -> Fragment {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid minted algorithm id");
@@ -404,20 +404,24 @@ impl IndexKind for PathRollup {
         }
     }
 
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError> {
+    fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
         let summary = PathSummary::from_tribles(self.automaton.clone(), source.iter());
         if summary.vertices().is_empty() {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![summary])
+            Ok(Some(summary))
         }
     }
 
-    fn freeze(&self, range_entity: Id, segment: &Self::Segment) -> Result<Fragment, ArtifactError> {
-        if segment.automaton() != &self.automaton {
+    fn freeze(
+        &self,
+        range_entity: Id,
+        artifact: &Self::Artifact,
+    ) -> Result<Fragment, ArtifactError> {
+        if artifact.automaton() != &self.automaton {
             return Err(Box::new(PathSummaryBlobError::DifferentAutomaton));
         }
-        let blob = PathSummaryBlob::encode(segment)?;
+        let blob = PathSummaryBlob::encode(artifact)?;
         Ok(entity! { ExclusiveId::force_ref(&range_entity) @
             seg_path_summary: blob,
         })
@@ -428,36 +432,37 @@ impl IndexKind for PathRollup {
         reader: &R,
         facts: &TribleSet,
         range_entity: Id,
-    ) -> Result<Vec<Self::Segment>, ArtifactError> {
-        let mut handles = find!(
+    ) -> Result<Self::Artifact, ArtifactError> {
+        let handles = find!(
             handle: Inline<Handle<PathSummaryBlob>>,
             pattern!(facts, [{ range_entity @ seg_path_summary: ?handle }])
         )
         .collect::<Vec<_>>();
-        handles.sort_unstable_by_key(|handle| handle.raw);
-        handles
-            .into_iter()
-            .map(|handle| {
-                let blob: Blob<PathSummaryBlob> = reader
-                    .get(handle)
-                    .map_err(|error| Box::new(error) as ArtifactError)?;
-                PathSummaryBlob::decode(blob, &self.automaton).map_err(Into::into)
-            })
-            .collect()
+        let [handle] = handles.as_slice() else {
+            return Err("a path artifact requires exactly one summary blob".into());
+        };
+        let blob: Blob<PathSummaryBlob> = reader
+            .get(*handle)
+            .map_err(|error| Box::new(error) as ArtifactError)?;
+        let artifact = PathSummaryBlob::decode(blob, &self.automaton)?;
+        if artifact.vertices().is_empty() {
+            return Err("an empty path projection has no physical artifact".into());
+        }
+        Ok(artifact)
     }
 
-    fn merge(&self, segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError> {
-        if segments.is_empty() {
-            return Ok(Vec::new());
+    fn merge(&self, artifacts: &[Self::Artifact]) -> Result<Option<Self::Artifact>, ArtifactError> {
+        if artifacts.is_empty() {
+            return Ok(None);
         }
-        let summary = PathSummary::merge_all(segments.iter())?;
+        let summary = PathSummary::merge_all(artifacts.iter())?;
         if summary.automaton() != &self.automaton {
             return Err(Box::new(PathSummaryBlobError::DifferentAutomaton));
         }
         if summary.vertices().is_empty() {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![summary])
+            Ok(Some(summary))
         }
     }
 }
@@ -615,10 +620,10 @@ mod tests {
     #[test]
     fn unmatched_nonnullable_is_absent_but_nullable_identity_persists() {
         let rollup = PathRollup::new(plus(7));
-        assert!(rollup.build(&TribleSet::new()).unwrap().is_empty());
+        assert!(rollup.build(&TribleSet::new()).unwrap().is_none());
 
         let source = edge_facts(1, 2);
-        assert!(rollup.build(&source).unwrap().is_empty());
+        assert!(rollup.build(&source).unwrap().is_none());
 
         let noncanonical = PathSummary::from_canonical_ordinals(
             rollup.automaton().clone(),
@@ -645,7 +650,7 @@ mod tests {
 
         let nullable = Automaton::new(1, [0], [0], []).unwrap();
         let nullable_rollup = PathRollup::new(nullable);
-        let [summary] = nullable_rollup.build(&source).unwrap().try_into().unwrap();
+        let summary = nullable_rollup.build(&source).unwrap().unwrap();
         assert_eq!(summary.vertices().len(), 2);
         assert_eq!(summary.direct_arc_count(), 0);
         let decoded = PathSummaryBlob::decode(
@@ -663,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_segments_compose_and_reject_foreign_summaries() {
+    fn frozen_artifact_rejects_duplicate_and_foreign_summaries() {
         let rollup = PathRollup::new(plus(9));
         let first = PathSummary::from_edges(rollup.automaton().clone(), [edge(1, 9, 2)]);
         let second = PathSummary::from_edges(rollup.automaton().clone(), [edge(2, 9, 3)]);
@@ -674,21 +679,16 @@ mod tests {
         let reader = blobs.reader().unwrap();
         assert_eq!(
             rollup.thaw(&reader, frozen.facts(), range_entity).unwrap(),
-            [first.clone()]
+            first
         );
 
         let mut composed = frozen.clone();
         composed += rollup.freeze(range_entity, &second).unwrap();
         let mut blobs = composed.blobs().clone();
         let reader = blobs.reader().unwrap();
-        let thawed = rollup
+        assert!(rollup
             .thaw(&reader, composed.facts(), range_entity)
-            .unwrap();
-        assert_eq!(thawed.len(), 2);
-        assert_eq!(
-            PathSummary::merge_all(thawed.iter()).unwrap(),
-            PathSummary::merge_all([&first, &second]).unwrap()
-        );
+            .is_err());
 
         let foreign = PathRollup::new(plus(8));
         let mut blobs = frozen.blobs().clone();
@@ -697,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_zero_normalizes_to_no_segment() {
+    fn physical_zero_normalizes_to_no_artifact() {
         let rollup = PathRollup::new(plus(9));
         let empty =
             PathSummary::from_edges(rollup.automaton().clone(), std::iter::empty::<GraphEdge>());
@@ -705,7 +705,7 @@ mod tests {
         assert!(rollup
             .merge(std::slice::from_ref(&empty))
             .unwrap()
-            .is_empty());
+            .is_none());
         assert!(rollup.freeze(*ufoid(), &empty).is_err());
     }
 
@@ -714,20 +714,20 @@ mod tests {
         let rollup = PathRollup::new(plus_label(metadata::tag.id().into()));
         let mut storage = MemoryRepo::default();
         let source = edge_facts(1, 2);
-        let [summary] = rollup.build(&source).unwrap().try_into().unwrap();
+        let summary = rollup.build(&source).unwrap().unwrap();
         let stored = store_range(
             &mut storage,
             &rollup,
             CommitRange::leaf(commit(1)),
-            vec![summary.clone()],
+            Some(summary.clone()),
         )
         .unwrap();
 
         assert_ne!(stored.core().handle(), stored.handle());
-        assert_eq!(stored.segments(), std::slice::from_ref(&summary));
+        assert_eq!(stored.artifact(), Some(&summary));
         let reader = storage.reader().unwrap();
         let loaded = load_range(&reader, &rollup, stored.rollup_record()).unwrap();
-        assert_eq!(loaded.segments(), std::slice::from_ref(&summary));
+        assert_eq!(loaded.artifact(), Some(&summary));
 
         let foreign = PathRollup::new(plus(8));
         assert!(load_range(&reader, &foreign, stored.rollup_record()).is_err());
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(partial.residual(), &[second]);
         let partial_index = rollup
             .finalize(
-                partial.selected().iter().flat_map(|node| node.segments()),
+                partial.selected().iter().filter_map(|node| node.artifact()),
                 &second_source,
             )
             .unwrap();
@@ -790,7 +790,10 @@ mod tests {
         assert!(complete.residual().is_empty());
         let complete_index = rollup
             .finalize(
-                complete.selected().iter().flat_map(|node| node.segments()),
+                complete
+                    .selected()
+                    .iter()
+                    .filter_map(|node| node.artifact()),
                 &TribleSet::new(),
             )
             .unwrap();
@@ -827,7 +830,7 @@ mod tests {
         )
         .unwrap();
         let merge_node =
-            store_range(&mut storage, &rollup, CommitRange::leaf(merge), Vec::new()).unwrap();
+            store_range(&mut storage, &rollup, CommitRange::leaf(merge), None).unwrap();
         assert_eq!(merge_node.core().handle(), merge_node.handle());
 
         let reader = storage.reader().unwrap();
@@ -846,7 +849,7 @@ mod tests {
         assert!(cover.residual().is_empty());
         let index = rollup
             .finalize(
-                cover.selected().iter().flat_map(|node| node.segments()),
+                cover.selected().iter().filter_map(|node| node.artifact()),
                 &TribleSet::new(),
             )
             .unwrap();

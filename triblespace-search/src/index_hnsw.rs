@@ -1,4 +1,4 @@
-//! [`HnswRollup`]: an [`IndexKind`] whose segments are persisted
+//! [`HnswRollup`]: an [`IndexKind`] whose artifacts are persisted
 //! succinct HNSW graphs over a branch's embeddings.
 //!
 //! # The waste this removes
@@ -28,14 +28,15 @@
 //! blob reader to resolve those handles into the `[f32]` vectors the
 //! graph build compares. The reader is held on the kind (a cheap
 //! [`Clone`] snapshot of the same store that receives the immutable
-//! segments), so [`build`](IndexKind::build) and
+//! artifacts), so [`build`](IndexKind::build) and
 //! [`merge`](IndexKind::merge) can fetch vectors while
 //! [`thaw`](IndexKind::thaw) decodes only the stored graph blob; embeddings
 //! are resolved lazily at query time by the attached view.
 //!
-//! # Multi-segment query semantics
+//! # Multi-artifact query semantics
 //!
-//! A selected range cover can hold several segments. Each graph proposes
+//! A selected range cover can hold several nodes, each with one artifact.
+//! Each graph proposes
 //! candidates independently; the read path unions and deduplicates those
 //! handles, then ranks the union by exact cosine. The final scores are exact
 //! for the proposed candidates, but HNSW recall remains approximate and can
@@ -61,11 +62,11 @@ use crate::index_schema::{index_dimension, index_seed, index_source_attribute, s
 use crate::schemas::{EmbHandle, Embedding};
 use crate::succinct::{SuccinctHNSWBlob, SuccinctHNSWIndex};
 
-/// Default deterministic level-sampling seed for segment builds.
+/// Default deterministic level-sampling seed for artifact builds.
 /// Fixed so a rebuild of the same source produces the same graph.
 pub const DEFAULT_SEED: u64 = 42;
 
-/// An [`IndexKind`] whose segments are [`SuccinctHNSWIndex`] graphs
+/// An [`IndexKind`] whose artifacts are [`SuccinctHNSWIndex`] graphs
 /// over the embeddings a branch's entities point at.
 ///
 /// Parameterised by the blob reader `R` used to resolve
@@ -144,13 +145,17 @@ where
         Ok(v)
     }
 
-    /// Build a succinct HNSW segment from an iterator of `(handle,
+    /// Build a succinct HNSW artifact from an iterator of `(handle,
     /// vector)` pairs. Shared by `build` (over source tribles) and
-    /// `merge` (over the segments' node handles).
-    fn build_segment<I>(&self, pairs: I) -> Result<SuccinctHNSWIndex, ArtifactError>
+    /// `merge` (over the artifacts' node handles). Sorting by intrinsic
+    /// handle makes seeded level assignment independent of source or merge
+    /// order.
+    fn build_artifact<I>(&self, pairs: I) -> Result<SuccinctHNSWIndex, ArtifactError>
     where
         I: IntoIterator<Item = (Inline<EmbHandle>, Vec<f32>)>,
     {
+        let mut pairs: Vec<_> = pairs.into_iter().collect();
+        pairs.sort_unstable_by_key(|(handle, _)| handle.raw);
         let mut builder = HNSWBuilder::new(self.dim).with_seed(self.seed);
         for (h, v) in pairs {
             builder
@@ -159,13 +164,28 @@ where
         }
         Ok(builder.build())
     }
+
+    fn validate_artifact(&self, artifact: &SuccinctHNSWIndex) -> Result<(), ArtifactError> {
+        if artifact.dim() != self.dim {
+            return Err(format!(
+                "HNSW artifact has dimension {}, expected {}",
+                artifact.dim(),
+                self.dim
+            )
+            .into());
+        }
+        if artifact.doc_count() == 0 {
+            return Err("an empty HNSW projection has no physical artifact".into());
+        }
+        Ok(())
+    }
 }
 
 impl<R> IndexKind for HnswRollup<R>
 where
     R: BlobStoreGet,
 {
-    type Segment = SuccinctHNSWIndex;
+    type Artifact = SuccinctHNSWIndex;
 
     fn recipe_fragment(&self) -> Fragment {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid algorithm id");
@@ -177,7 +197,7 @@ where
         }
     }
 
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError> {
+    fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
         self.validate_dimension()?;
         // Extract `entity -> Handle<Embedding>` tribles under our
         // attribute, dedup by handle (two entities can share one
@@ -192,14 +212,16 @@ where
             pairs.push((handle, self.vector_of(handle)?));
         }
         if pairs.is_empty() {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![self.build_segment(pairs)?])
+            Ok(Some(self.build_artifact(pairs)?))
         }
     }
 
-    fn freeze(&self, entity: Id, segment: &Self::Segment) -> Result<Fragment, ArtifactError> {
-        Ok(entity! { ExclusiveId::force_ref(&entity) @ seg_hnsw: segment })
+    fn freeze(&self, entity: Id, artifact: &Self::Artifact) -> Result<Fragment, ArtifactError> {
+        self.validate_dimension()?;
+        self.validate_artifact(artifact)?;
+        Ok(entity! { ExclusiveId::force_ref(&entity) @ seg_hnsw: artifact })
     }
 
     fn thaw<B: BlobStoreGet>(
@@ -207,53 +229,40 @@ where
         reader: &B,
         facts: &TribleSet,
         entity: Id,
-    ) -> Result<Vec<Self::Segment>, ArtifactError> {
-        let segments: Vec<SuccinctHNSWIndex> = triblespace_core::find!(
+    ) -> Result<Self::Artifact, ArtifactError> {
+        self.validate_dimension()?;
+        let handles = triblespace_core::find!(
             handle: Inline<Handle<SuccinctHNSWBlob>>,
             pattern!(facts, [{ entity @ seg_hnsw: ?handle }])
         )
-        .map(|handle| {
-            let blob: Blob<SuccinctHNSWBlob> = reader
-                .get(handle)
-                .map_err(|error| Box::new(error) as ArtifactError)?;
-            let segment = SuccinctHNSWIndex::try_from_blob(blob)
-                .map_err(|error| Box::new(error) as ArtifactError)?;
-            if segment.dim() != self.dim {
-                return Err(format!(
-                    "HNSW artifact has dimension {}, expected {}",
-                    segment.dim(),
-                    self.dim
-                )
-                .into());
-            }
-            Ok(segment)
-        })
-        .collect::<Result<_, ArtifactError>>()?;
-        Ok(segments)
+        .collect::<Vec<_>>();
+        let [handle] = handles.as_slice() else {
+            return Err("an HNSW artifact requires exactly one graph blob".into());
+        };
+        let blob: Blob<SuccinctHNSWBlob> = reader
+            .get(*handle)
+            .map_err(|error| Box::new(error) as ArtifactError)?;
+        let artifact = SuccinctHNSWIndex::try_from_blob(blob)
+            .map_err(|error| Box::new(error) as ArtifactError)?;
+        self.validate_artifact(&artifact)?;
+        Ok(artifact)
     }
 
-    fn merge(&self, segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError> {
+    fn merge(&self, artifacts: &[Self::Artifact]) -> Result<Option<Self::Artifact>, ArtifactError> {
         self.validate_dimension()?;
-        if segments.is_empty() {
-            return Ok(Vec::new());
+        if artifacts.is_empty() {
+            return Ok(None);
         }
         // CPU union-then-rebuild (mirrors `SuccinctRollup::merge`):
-        // gather every segment's node handles, dedup, resolve to
+        // gather every artifact's node handles, dedup, resolve to
         // vectors, and rebuild one graph. The GPU-merge seam drops in
         // behind this method exactly as it does for the rollup.
         let mut seen = HashSet::new();
         let mut pairs: Vec<(Inline<EmbHandle>, Vec<f32>)> = Vec::new();
-        for seg in segments {
-            if seg.dim() != self.dim {
-                return Err(format!(
-                    "HNSW artifact has dimension {}, expected {}",
-                    seg.dim(),
-                    self.dim
-                )
-                .into());
-            }
-            for i in 0..seg.doc_count() {
-                let h = seg.handle(i).expect("node in range");
+        for artifact in artifacts {
+            self.validate_artifact(artifact)?;
+            for i in 0..artifact.doc_count() {
+                let h = artifact.handle(i).expect("node in range");
                 if !seen.insert(h.raw) {
                     continue;
                 }
@@ -261,9 +270,9 @@ where
             }
         }
         if pairs.is_empty() {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![self.build_segment(pairs)?])
+            Ok(Some(self.build_artifact(pairs)?))
         }
     }
 }
@@ -278,7 +287,7 @@ where
 /// unreadable, wrong-width, or non-finite vector is an error; incomplete
 /// rankings are never returned as successes.
 pub fn nearest_across<B>(
-    segments: &[SuccinctHNSWIndex],
+    artifacts: &[SuccinctHNSWIndex],
     store: &B,
     query_handle: Inline<EmbHandle>,
     floor: f32,
@@ -299,15 +308,15 @@ where
     if query.iter().any(|value| !value.is_finite()) {
         return Err("HNSW query contains a non-finite value".into());
     }
-    for segment in segments {
-        if segment.dim() == 0 {
+    for artifact in artifacts {
+        if artifact.dim() == 0 {
             return Err("HNSW artifact dimension must be greater than zero".into());
         }
-        if segment.dim() != query.len() {
+        if artifact.dim() != query.len() {
             return Err(format!(
                 "HNSW query dimension {}, artifact dimension {}",
                 query.len(),
-                segment.dim()
+                artifact.dim()
             )
             .into());
         }
@@ -315,8 +324,8 @@ where
 
     let mut seen = HashSet::new();
     let mut rows = Vec::new();
-    for segment in segments {
-        let attached = segment.attach(store);
+    for artifact in artifacts {
+        let attached = artifact.attach(store);
         let candidates = attached
             .candidates_above(query_handle, floor)
             .map_err(|error| Box::new(error) as ArtifactError)?;
@@ -409,18 +418,18 @@ mod tests {
         (source, handle)
     }
 
-    fn build_segment(
+    fn build_artifact(
         kind: &HnswRollup<impl BlobStoreGet>,
         source: &TribleSet,
     ) -> SuccinctHNSWIndex {
-        kind.build(source).unwrap().pop().unwrap()
+        kind.build(source).unwrap().unwrap()
     }
 
-    fn merge_segment(
+    fn merge_artifact(
         kind: &HnswRollup<impl BlobStoreGet>,
-        segments: &[SuccinctHNSWIndex],
+        artifacts: &[SuccinctHNSWIndex],
     ) -> SuccinctHNSWIndex {
-        kind.merge(segments).unwrap().pop().unwrap()
+        kind.merge(artifacts).unwrap().unwrap()
     }
 
     fn unit(mut vector: Vec<f32>) -> Vec<f32> {
@@ -485,11 +494,11 @@ mod tests {
         let mut storage = MemoryRepo::default();
         let (source, table) = stage_many(&mut storage, &synthetic(40, 8));
         let kind = HnswRollup::new(storage.reader().unwrap(), 8, emb.id());
-        let segment = kind.build(&source).unwrap().pop().unwrap();
-        assert_eq!(segment.doc_count(), table.len());
+        let artifact = kind.build(&source).unwrap().unwrap();
+        assert_eq!(artifact.doc_count(), table.len());
         let (_, probe, vector) = &table[7];
         let reader = storage.reader().unwrap();
-        let ranked = nearest_across(&[segment], &reader, *probe, 0.0).unwrap();
+        let ranked = nearest_across(&[artifact], &reader, *probe, 0.0).unwrap();
         assert_eq!(ranked[0].1, *probe);
         assert_eq!(ranked[0].1, brute_top1(&table, vector));
     }
@@ -501,8 +510,8 @@ mod tests {
         let (right_source, right_handle) = stage(&mut storage, emb.id(), *fucid(), vec![0.8, -0.6]);
         let query = put_embedding(&mut storage, vec![1.0, 0.0]).unwrap();
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
-        let left = build_segment(&kind, &left_source);
-        let right = build_segment(&kind, &right_source);
+        let left = build_artifact(&kind, &left_source);
+        let right = build_artifact(&kind, &right_source);
         let reload = |segment: &SuccinctHNSWIndex| {
             SuccinctHNSWIndex::try_from_blob(Blob::new(segment.bytes.clone())).unwrap()
         };
@@ -538,11 +547,11 @@ mod tests {
         let (source_b, table_b) = stage_many(&mut storage, &second);
         table.extend(table_b);
         let kind = HnswRollup::new(storage.reader().unwrap(), 12, emb.id());
-        let merged = merge_segment(
+        let merged = merge_artifact(
             &kind,
             &[
-                build_segment(&kind, &source_a),
-                build_segment(&kind, &source_b),
+                build_artifact(&kind, &source_a),
+                build_artifact(&kind, &source_b),
             ],
         );
         assert_eq!(merged.doc_count(), table.len());
@@ -573,16 +582,16 @@ mod tests {
         let (source_b, table_b) = stage_many(&mut storage, &second);
         table.extend(table_b);
         let kind = HnswRollup::new(storage.reader().unwrap(), 10, emb.id());
-        let segments = vec![
-            build_segment(&kind, &source_a),
-            build_segment(&kind, &source_b),
+        let artifacts = vec![
+            build_artifact(&kind, &source_a),
+            build_artifact(&kind, &source_b),
         ];
         let reader = storage.reader().unwrap();
         let agreement = table
             .iter()
             .take(8)
             .filter(|(_, probe, vector)| {
-                nearest_across(&segments, &reader, *probe, 0.0)
+                nearest_across(&artifacts, &reader, *probe, 0.0)
                     .unwrap()
                     .first()
                     .map(|row| row.1)
@@ -593,21 +602,21 @@ mod tests {
     }
 
     #[test]
-    fn multi_segment_merge_preserves_all_nodes_and_query_recall() {
+    fn multi_artifact_merge_preserves_all_nodes_and_query_recall() {
         const SEGMENTS: usize = 5;
 
         let mut storage = MemoryRepo::default();
         let rows = synthetic(SEGMENTS, 8);
         let mut table = Vec::new();
-        let mut segments = Vec::new();
+        let mut artifacts = Vec::new();
         for row in &rows {
             let (source, mut staged) = stage_many(&mut storage, std::slice::from_ref(row));
             table.append(&mut staged);
             let kind = HnswRollup::new(storage.reader().unwrap(), 8, emb.id());
-            segments.push(build_segment(&kind, &source));
+            artifacts.push(build_artifact(&kind, &source));
         }
         let kind = HnswRollup::new(storage.reader().unwrap(), 8, emb.id());
-        let merged = merge_segment(&kind, &segments);
+        let merged = merge_artifact(&kind, &artifacts);
         assert_eq!(merged.doc_count(), table.len());
         let reader = storage.reader().unwrap();
         let (_, probe, vector) = &table[0];
@@ -618,23 +627,53 @@ mod tests {
     }
 
     #[test]
+    fn merge_artifact_is_canonical_under_input_permutation() {
+        let mut storage = MemoryRepo::default();
+        let mut inputs = Vec::new();
+        for vector in [vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]] {
+            let (source, _) = stage(&mut storage, emb.id(), *fucid(), vector);
+            let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
+            inputs.push(build_artifact(&kind, &source));
+        }
+        let reload = |artifact: &SuccinctHNSWIndex| {
+            SuccinctHNSWIndex::try_from_blob(Blob::new(artifact.bytes.clone())).unwrap()
+        };
+        let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
+        let forward = merge_artifact(
+            &kind,
+            &[reload(&inputs[0]), reload(&inputs[1]), reload(&inputs[2])],
+        );
+        let reverse = merge_artifact(
+            &kind,
+            &[reload(&inputs[2]), reload(&inputs[1]), reload(&inputs[0])],
+        );
+        assert_eq!(forward.bytes.as_ref(), reverse.bytes.as_ref());
+    }
+
+    #[test]
     fn frozen_fragment_thaws_and_queries() {
         let mut storage = MemoryRepo::default();
         let (source, handle) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
-        let segment = kind.build(&source).unwrap().pop().unwrap();
+        let artifact = kind.build(&source).unwrap().unwrap();
         let range_entity = *fucid();
-        let frozen = kind.freeze(range_entity, &segment).unwrap();
+        let frozen = kind.freeze(range_entity, &artifact).unwrap();
 
         assert!(frozen.iter().all(|fact| fact.a() == &seg_hnsw.id()));
         assert_eq!(frozen.blobs().len(), 1);
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
         let thawed = kind.thaw(&reader, frozen.facts(), range_entity).unwrap();
-        assert_eq!(thawed.len(), 1);
-        assert_eq!(thawed[0].doc_count(), 1);
+        assert_eq!(thawed.doc_count(), 1);
         assert_eq!(
-            nearest_across(&thawed, &storage.reader().unwrap(), handle, 0.0).unwrap()[0].1,
+            nearest_across(
+                std::slice::from_ref(&thawed),
+                &storage.reader().unwrap(),
+                handle,
+                0.0,
+            )
+            .unwrap()[0]
+                .1,
             handle
         );
     }
@@ -643,11 +682,25 @@ mod tests {
     fn canonical_empty_projection_and_merge_have_no_artifacts() {
         let mut storage = MemoryRepo::default();
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
-        assert!(kind.build(&TribleSet::new()).unwrap().is_empty());
-        assert!(kind.merge(&[]).unwrap().is_empty());
+        assert!(kind.build(&TribleSet::new()).unwrap().is_none());
+        assert!(kind.merge(&[]).unwrap().is_none());
 
         let (unrelated, _) = stage(&mut storage, alternate_emb.id(), *fucid(), vec![1.0, 0.0]);
-        assert!(kind.build(&unrelated).unwrap().is_empty());
+        assert!(kind.build(&unrelated).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_physical_artifact_is_rejected_by_freeze_and_thaw() {
+        let mut storage = MemoryRepo::default();
+        let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
+        let empty = HNSWBuilder::new(2).with_seed(DEFAULT_SEED).build();
+        let entity = *fucid();
+        assert!(kind.freeze(entity, &empty).is_err());
+
+        let frozen = entity! { ExclusiveId::force_ref(&entity) @ seg_hnsw: &empty };
+        let mut blobs = frozen.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        assert!(kind.thaw(&reader, frozen.facts(), entity).is_err());
     }
 
     #[test]
@@ -701,17 +754,17 @@ mod tests {
         let mut source_storage = MemoryRepo::default();
         let (source, _) = stage(&mut source_storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let source_kind = HnswRollup::new(source_storage.reader().unwrap(), 2, emb.id());
-        let segment = build_segment(&source_kind, &source);
+        let artifact = build_artifact(&source_kind, &source);
 
         let mut query_storage = MemoryRepo::default();
         let query = put_embedding(&mut query_storage, vec![0.0, 1.0]).unwrap();
         let reader = query_storage.reader().unwrap();
-        assert!(nearest_across(std::slice::from_ref(&segment), &reader, query, 0.0).is_err());
+        assert!(nearest_across(std::slice::from_ref(&artifact), &reader, query, 0.0).is_err());
 
         let wrong_width = put_embedding(&mut query_storage, vec![0.0, 1.0, 0.0]).unwrap();
         let reader = query_storage.reader().unwrap();
         assert!(
-            nearest_across(std::slice::from_ref(&segment), &reader, wrong_width, 0.0,)
+            nearest_across(std::slice::from_ref(&artifact), &reader, wrong_width, 0.0,)
                 .unwrap_err()
                 .to_string()
                 .contains("query dimension")
@@ -720,13 +773,13 @@ mod tests {
         let non_finite = put_embedding(&mut query_storage, vec![f32::NAN, 0.0]).unwrap();
         let reader = query_storage.reader().unwrap();
         assert!(
-            nearest_across(std::slice::from_ref(&segment), &reader, non_finite, 0.0,)
+            nearest_across(std::slice::from_ref(&artifact), &reader, non_finite, 0.0,)
                 .unwrap_err()
                 .to_string()
                 .contains("non-finite")
         );
         assert!(nearest_across(
-            std::slice::from_ref(&segment),
+            std::slice::from_ref(&artifact),
             &reader,
             non_finite,
             f32::NAN,
@@ -741,11 +794,11 @@ mod tests {
         let mut source_storage = MemoryRepo::default();
         let (source, _) = stage(&mut source_storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let source_kind = HnswRollup::new(source_storage.reader().unwrap(), 2, emb.id());
-        let segment = build_segment(&source_kind, &source);
+        let artifact = build_artifact(&source_kind, &source);
 
         let mut empty_storage = MemoryRepo::default();
         let incomplete_kind = HnswRollup::new(empty_storage.reader().unwrap(), 2, emb.id());
-        assert!(incomplete_kind.merge(&[segment]).is_err());
+        assert!(incomplete_kind.merge(&[artifact]).is_err());
     }
 
     #[test]
@@ -774,42 +827,34 @@ mod tests {
         let reader = storage.reader().unwrap();
         let kind_a = HnswRollup::new(reader.clone(), 2, emb.id()).with_seed(7);
         let kind_b = HnswRollup::new(reader, 2, alternate_emb.id()).with_seed(7);
-        let segment_a = kind_a.build(&source_a).unwrap().pop().unwrap();
-        let segment_b = kind_b.build(&source_b).unwrap().pop().unwrap();
+        let artifact_a = kind_a.build(&source_a).unwrap().unwrap();
+        let artifact_b = kind_b.build(&source_b).unwrap().unwrap();
         let range = CommitRange::leaf(commit(1));
-        let node_a = store_range(&mut storage, &kind_a, range.clone(), vec![segment_a]).unwrap();
-        let node_b = store_range(&mut storage, &kind_b, range, vec![segment_b]).unwrap();
+        let node_a = store_range(&mut storage, &kind_a, range.clone(), Some(artifact_a)).unwrap();
+        let node_b = store_range(&mut storage, &kind_b, range, Some(artifact_b)).unwrap();
 
         assert_ne!(node_a.core().recipe(), node_b.core().recipe());
         assert_ne!(node_a.core().entity(), node_b.core().entity());
         assert_ne!(node_a.core().handle(), node_b.core().handle());
         assert_ne!(node_a.handle(), node_b.handle());
-        assert_eq!(node_a.segments().len(), 1);
-        assert_eq!(node_b.segments().len(), 1);
+        assert!(node_a.artifact().is_some());
+        assert!(node_b.artifact().is_some());
     }
 
     #[test]
-    fn repeated_frozen_segments_thaw_atomically_and_bad_bytes_fail() {
+    fn repeated_frozen_artifacts_are_rejected_and_bad_bytes_fail() {
         let mut storage = MemoryRepo::default();
         let (source_a, _) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let (source_b, _) = stage(&mut storage, emb.id(), *fucid(), vec![0.0, 1.0]);
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
-        let segment_a = kind.build(&source_a).unwrap().pop().unwrap();
-        let segment_b = kind.build(&source_b).unwrap().pop().unwrap();
+        let artifact_a = kind.build(&source_a).unwrap().unwrap();
+        let artifact_b = kind.build(&source_b).unwrap().unwrap();
         let entity = *fucid();
-        let mut frozen = kind.freeze(entity, &segment_a).unwrap();
-        frozen += kind.freeze(entity, &segment_b).unwrap();
+        let mut frozen = kind.freeze(entity, &artifact_a).unwrap();
+        frozen += kind.freeze(entity, &artifact_b).unwrap();
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
-        let thawed = kind.thaw(&reader, frozen.facts(), entity).unwrap();
-        assert_eq!(thawed.len(), 2);
-        assert_eq!(
-            thawed
-                .iter()
-                .map(SuccinctHNSWIndex::doc_count)
-                .sum::<usize>(),
-            2
-        );
+        assert!(kind.thaw(&reader, frozen.facts(), entity).is_err());
 
         let missing = Inline::<Handle<SuccinctHNSWBlob>>::new([0xA5; 32]);
         let mut incomplete = frozen.clone();
@@ -831,9 +876,9 @@ mod tests {
         let mut storage = MemoryRepo::default();
         let (source, _) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0, 0.0]);
         let three = HnswRollup::new(storage.reader().unwrap(), 3, emb.id());
-        let segment = three.build(&source).unwrap().pop().unwrap();
+        let artifact = three.build(&source).unwrap().unwrap();
         let entity = *fucid();
-        let frozen = three.freeze(entity, &segment).unwrap();
+        let frozen = three.freeze(entity, &artifact).unwrap();
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
         let two = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
@@ -850,9 +895,9 @@ mod tests {
         let (first, _) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, 0.0]);
         let (second, _) = stage(&mut storage, emb.id(), *fucid(), vec![0.0, 1.0]);
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
-        let left = kind.build(&first).unwrap().pop().unwrap();
-        let right = kind.build(&second).unwrap().pop().unwrap();
-        let merged = kind.merge(&[left, right]).unwrap().pop().unwrap();
+        let left = kind.build(&first).unwrap().unwrap();
+        let right = kind.build(&second).unwrap().unwrap();
+        let merged = kind.merge(&[left, right]).unwrap().unwrap();
         assert_eq!(merged.doc_count(), 2);
     }
 }

@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact bit-packed raw term frequencies rather than quantized scores. Builders
   and rollup compaction share the `(Docs union, pointwise-max TF)` algebra,
   preserve empty documents, derive lengths and corpus statistics after join,
-  reject mixed tuning, and merge multi-segment covers before scoring. Equal
+  reject mixed tuning, and merge multi-artifact covers before scoring. Equal
   scores use raw document keys as deterministic tie-breaks.
 
 ### Added
@@ -173,13 +173,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hard artifact-neutral range core with one complete but unowned node. Nodes
   sharing a core remain atomic alternatives; read-time selection admits only
   fully resident nodes and returns every uncovered source commit as an exact
-  residual. `IndexKind` is one `Segment` type plus recipe, build, freeze, thaw,
-  and merge operations; `Fragment` carries each segment's typed facts and owned
-  blobs without a prepared/stored/attached state ladder. Compaction publishes
-  another immutable pair and never mutates or supersedes its victims. Succinct
-  nodes pair raw archives with source-bound Rank9 artifacts, optionally using
-  the accelerated merge backend; BM25, HNSW, and Path own their distinct merge
-  semantics on the same storage algebra.
+  residual. `IndexKind` is one `Artifact` type plus recipe, build, freeze, thaw,
+  and merge operations. Build and merge return `Option<Artifact>`; a distinct
+  node thaws exactly one complete artifact, while `node == core` canonically
+  represents no artifact. This removes the unused vector-of-artifacts shape
+  inside one node without changing the several-selected-nodes read model.
+  Compaction publishes another immutable pair and never mutates or supersedes
+  its victims. Succinct artifacts pair raw archives with source-bound Rank9
+  blobs; BM25 rejects empty or noncanonical-tuning artifacts; HNSW rejects
+  empty artifacts and sorts handles before seeded rebuilds; and Path owns its
+  distinct exact-summary merge semantics on the same storage algebra.
 - **The remote scalar-pin compatibility island is removed.**
   `AsyncPinStore`, its sync/async adapter implementations, the object-store
   `pins/` CAS namespace, and `trible store pin` are deleted. Remote object

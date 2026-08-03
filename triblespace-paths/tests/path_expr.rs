@@ -122,7 +122,7 @@ fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
     assert!(cover.residual().is_empty());
     let index = rollup
         .finalize(
-            cover.selected().iter().flat_map(|node| node.segments()),
+            cover.selected().iter().filter_map(|node| node.artifact()),
             &TribleSet::new(),
         )
         .unwrap();

@@ -77,7 +77,7 @@ One published rollup alternative is a pair of content-addressed archives:
 
 ```text
 core = SimpleArchive(core-only RangeRecord)
-node = SimpleArchive(the same RangeRecord + one complete typed artifact bundle)
+node = SimpleArchive(the same RangeRecord + one complete typed artifact)
 ```
 
 The generic signed assertion stores `core` as its value and `node` as its
@@ -89,45 +89,45 @@ weak-pin assertion. A completed-empty projection is the degenerate case
 
 The archive boundary is semantic:
 
-- handles inside one node are conjunctive components or shards;
+- handles inside one artifact are conjunctive components of that representation;
 - different node archives for the same core are disjunctive complete
   alternatives.
 
 Never fact-union alternative nodes merely because their intrinsic range entity
 ids match. Doing so could mix a raw Succinct archive from one alternative with
-a Rank9 sidecar from another, combine two complete path summaries, or turn
-alternative BM25/HNSW segments into one accidental shard bundle. Content
+a Rank9 sidecar from another or combine two complete Path, BM25, or HNSW
+artifacts into an accidental bundle. Content
 addressing still deduplicates replicas that produce exactly the same node.
 
 ## The rollup kind algebra
 
 `repo::index_home::IndexKind` keeps only one semantic associated type,
-`Segment`, and five operations:
+`Artifact`, and five operations:
 
 ```text
-recipe_fragment()                 identify the question and parameters
-build(source facts) -> segments   derive leaves
-freeze(segment) -> Fragment       canonical typed facts plus owned blobs
-thaw(node) -> segments            atomically validate and attach a bundle
-merge(segments) -> segments       compact within one recipe
+recipe_fragment()                    identify the question and parameters
+build(source facts) -> Option<A>     derive one leaf artifact
+freeze(artifact) -> Fragment         canonical typed facts plus owned blobs
+thaw(distinct node) -> A             validate and attach exactly one artifact
+merge(&[A]) -> Option<A>             compact within one recipe
 ```
 
-`build` and `merge` return an empty vector for the canonical empty projection.
-Each nonempty segment freezes to a nonempty `Fragment` rooted at the range
-entity. Generic storage folds those fragments with `+=`, so facts, exports, and
-blob stores compose without a prepared/stored/attached state ladder. `thaw` is
-all-or-error: a partially resident bundle never enters a cover.
+`build` and `merge` return `None` for the canonical empty projection. Each
+present artifact freezes to one nonempty `Fragment` rooted at the range entity.
+An artifact can still own several conjunctive typed blobs—for example one raw
+Succinct archive plus its source-bound Rank9 sidecar—but a node never carries a
+vector of independently queryable artifacts. That cardinality is represented
+by several selected range nodes at read time, where it belongs.
 
-`freeze` is intentionally per segment while `thaw` sees the complete node.
-Fragment composition erases segment boundaries, and only the kind knows how
-several typed facts form one segment—for example, which raw Succinct archive
-pairs with which Rank9 sidecar. A completed-empty node bypasses `thaw`
-entirely: its core is structurally known to contain no segment facts.
+`thaw` is all-or-error and returns exactly one artifact for a distinct node, so
+a missing, duplicate, foreign, or empty physical representation never enters a
+cover. A completed-empty node bypasses `thaw` entirely: its core is
+structurally known to contain no artifact facts.
 
 The trait deliberately does not assert one universal merge homomorphism.
 Coverage is exact for every kind; observable query equivalence under a changed
 cover is a stronger, kind-specific law. A kind must document whether its
-segments are exact representations or quality-bearing physical plans.
+artifacts are exact representations or quality-bearing physical plans.
 
 The common layer does not claim one universal byte-level merge law:
 
@@ -140,9 +140,13 @@ The common layer does not claim one universal byte-level merge law:
   union (preserving empty documents), while raw `(document, term)` frequencies
   join by pointwise max. Document lengths, global IDF, and scores are derived
   after the join, so cover and compaction shape do not change exact rankings.
+  Freeze and thaw reject artifacts whose scoring parameters differ from the
+  recipe's canonical tuning.
 - **HNSW** owns graph rebuilding, candidate union, and exact rescoring. Rescore
   is exact only over each graph's approximate candidate set, so graph
   repartition can change recall while source-embedding coverage remains exact.
+  Rebuild sorts embedding handles before seeded insertion, making the artifact
+  independent of source and compaction input order.
 
 Recipe identity and representation are orthogonal. The recipe says what
 question is answered; typed attributes such as `seg_succinct`, `seg_bm25`, or
@@ -154,7 +158,7 @@ recipe, not merely by artifact attribute.
 Resolve the source branch to its authoritative frontier `H` and let `T(H)` be
 the union of every tip's ancestor closure. Load independently signed rollup
 pairs for that branch and recipe. Only nodes whose core is valid, whose complete
-bundle is locally present, and whose segments fully thaw are resident
+artifact is locally present and fully thaws are resident
 candidates.
 
 `select_range_cover` validates each candidate's exact members against the
@@ -185,13 +189,13 @@ negative assertions, and replacement records are unnecessary.
 ## Monotone compaction
 
 Compaction chooses pairwise-disjoint victim nodes whose commit-set union is
-order-convex, attaches their segments, invokes the kind-specific merge, and
+order-convex, attaches their artifacts, invokes the kind-specific merge, and
 publishes one new `(core,node)` pair for the union. Victim assertions are never
 deleted:
 
 ```text
 disjoint convex victim ranges
-    -> merge their attached segments
+    -> merge their attached artifacts
     -> freeze one complete replacement node
     -> add one rollup assertion
 ```
@@ -227,7 +231,7 @@ therefore retains its boundary commits and reachable source ancestry. That is
 redundant while the source branch is already strong, but it guarantees that the
 residual fallback remains available.
 
-Rollup caching requires no transaction over a bundle: partially downloaded
+Rollup caching requires no transaction over an artifact: partially downloaded
 blobs are inert until the whole node thaws. Stores with garbage collection do
 need a freshly derived ephemeral keep set for the currently desired node and
 its exact typed components. This process policy must not be persisted as

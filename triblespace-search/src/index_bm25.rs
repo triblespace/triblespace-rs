@@ -1,4 +1,4 @@
-//! [`Bm25Rollup`]: an [`IndexKind`] whose segments are persisted
+//! [`Bm25Rollup`]: an [`IndexKind`] whose artifacts are persisted
 //! succinct BM25 indexes over a branch's message-content tribles.
 //!
 //! # The waste this removes
@@ -24,15 +24,16 @@
 //! `Bm25Rollup` holds a blob reader to resolve those handles into the
 //! strings [`crate::tokens::hash_tokens`] tokenises. The reader is used
 //! only by [`build`](IndexKind::build); merge operates directly on the
-//! persisted succinct segments, and [`thaw`](IndexKind::thaw) decodes only
+//! persisted succinct artifacts, and [`thaw`](IndexKind::thaw) decodes only
 //! the stored succinct blobs.
 //!
-//! # Multi-segment query semantics
+//! # Multi-artifact query semantics
 //!
-//! A selected range cover can hold several segments. Persisted postings carry
-//! exact raw term frequencies, so [`query_across`] joins those segments into
+//! A selected range cover can hold several nodes, each with one artifact.
+//! Persisted postings carry exact raw term frequencies, so [`query_across`]
+//! joins those artifacts into
 //! one logical corpus before deriving IDF, average document length, and BM25
-//! scores. Zero and one segments avoid the merge. More than one segment uses
+//! scores. Zero and one artifacts avoid the merge. More than one artifact uses
 //! the same pointwise-max `(document, term) -> frequency` join as range
 //! compaction, so cover shape cannot change scores or ranking.
 //!
@@ -61,12 +62,12 @@ pub use crate::succinct::Bm25TuningMismatch;
 use crate::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
 use crate::tokens::WordHash;
 
-/// The document-key / term schemas of the BM25 segments this kind
+/// The document-key / term schemas of the BM25 artifacts this kind
 /// builds: entity-keyed documents, word-hash terms — the classic
 /// text-search shape and the one `archive search` uses.
-type Seg = SuccinctBM25Index<GenId, WordHash>;
+type Bm25Artifact = SuccinctBM25Index<GenId, WordHash>;
 
-/// An [`IndexKind`] whose segments are [`SuccinctBM25Index`]es over the
+/// An [`IndexKind`] whose artifacts are [`SuccinctBM25Index`]es over the
 /// `Handle<LongString>` content a branch's entities point at, keyed by
 /// entity id.
 ///
@@ -117,7 +118,7 @@ where
     /// Build a succinct BM25 segment from an iterator of `(doc_key,
     /// tokens)` rows. Used by `build` and by materialized-oracle tests for
     /// the streaming merge.
-    fn build_segment<I>(&self, rows: I) -> Seg
+    fn build_artifact<I>(&self, rows: I) -> Bm25Artifact
     where
         I: IntoIterator<Item = (Inline<GenId>, Vec<Inline<WordHash>>)>,
     {
@@ -127,13 +128,33 @@ where
         }
         builder.build()
     }
+
+    fn validate_artifact(&self, artifact: &Bm25Artifact) -> Result<(), ArtifactError> {
+        if artifact.doc_count() == 0 {
+            return Err("an empty BM25 projection has no physical artifact".into());
+        }
+        let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
+        if artifact.k1().to_bits() != defaults.k1.to_bits()
+            || artifact.b().to_bits() != defaults.b.to_bits()
+        {
+            return Err(format!(
+                "BM25 artifact tuning does not match its recipe: expected k1={} b={}, found k1={} b={}",
+                defaults.k1,
+                defaults.b,
+                artifact.k1(),
+                artifact.b()
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 impl<R> IndexKind for Bm25Rollup<R>
 where
     R: BlobStoreGet,
 {
-    type Segment = Seg;
+    type Artifact = Bm25Artifact;
 
     fn recipe_fragment(&self) -> Fragment {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid algorithm id");
@@ -143,7 +164,7 @@ where
         }
     }
 
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError> {
+    fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
         // Extract `entity -> Handle<LongString>` tribles under our
         // content attribute and tokenise each resolved string. An entity can
         // carry several content values in one commit. Treat those values as a
@@ -186,14 +207,15 @@ where
             .collect();
         rows.sort_unstable_by_key(|(key, _)| key.raw);
         if rows.is_empty() {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![self.build_segment(rows)])
+            Ok(Some(self.build_artifact(rows)))
         }
     }
 
-    fn freeze(&self, entity: Id, segment: &Self::Segment) -> Result<Fragment, ArtifactError> {
-        Ok(entity! { ExclusiveId::force_ref(&entity) @ seg_bm25: segment })
+    fn freeze(&self, entity: Id, artifact: &Self::Artifact) -> Result<Fragment, ArtifactError> {
+        self.validate_artifact(artifact)?;
+        Ok(entity! { ExclusiveId::force_ref(&entity) @ seg_bm25: artifact })
     }
 
     fn thaw<B: BlobStoreGet>(
@@ -201,32 +223,39 @@ where
         reader: &B,
         facts: &TribleSet,
         entity: Id,
-    ) -> Result<Vec<Self::Segment>, ArtifactError> {
-        triblespace_core::find!(
+    ) -> Result<Self::Artifact, ArtifactError> {
+        let handles = triblespace_core::find!(
             handle: Inline<Handle<SuccinctBM25Blob>>,
             pattern!(facts, [{ entity @ seg_bm25: ?handle }])
         )
-        .map(|handle| {
-            let blob: Blob<SuccinctBM25Blob> = reader
-                .get(handle)
-                .map_err(|error| Box::new(error) as ArtifactError)?;
-            SuccinctBM25Index::try_from_blob(blob).map_err(|error| Box::new(error) as ArtifactError)
-        })
-        .collect()
+        .collect::<Vec<_>>();
+        let [handle] = handles.as_slice() else {
+            return Err("a BM25 artifact requires exactly one index blob".into());
+        };
+        let blob: Blob<SuccinctBM25Blob> = reader
+            .get(*handle)
+            .map_err(|error| Box::new(error) as ArtifactError)?;
+        let artifact = SuccinctBM25Index::try_from_blob(blob)
+            .map_err(|error| Box::new(error) as ArtifactError)?;
+        self.validate_artifact(&artifact)?;
+        Ok(artifact)
     }
 
-    fn merge(&self, segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError> {
-        if segments.is_empty() {
-            return Ok(Vec::new());
+    fn merge(&self, artifacts: &[Self::Artifact]) -> Result<Option<Self::Artifact>, ArtifactError> {
+        if artifacts.is_empty() {
+            return Ok(None);
         }
         // The exact join validates one shared scoring recipe at its own
         // boundary and retains all duplicate-key content without a
         // corpus-sized token-bag intermediate.
-        let merged = SuccinctBM25Index::try_merge_segments(segments)?;
+        for artifact in artifacts {
+            self.validate_artifact(artifact)?;
+        }
+        let merged = SuccinctBM25Index::try_merge_segments(artifacts)?;
         if merged.doc_count() == 0 {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![merged])
+            Ok(Some(merged))
         }
     }
 }
@@ -236,20 +265,20 @@ where
 /// deterministic tie-break.
 ///
 /// Empty and singleton covers are zero-copy fast paths. Larger covers first
-/// join exact term frequencies and only then compute BM25. Segments with
+/// join exact term frequencies and only then compute BM25. Artifacts with
 /// different `k1`/`b` values are rejected instead of silently mixing recipes.
 pub fn query_across(
-    segments: &[Seg],
+    artifacts: &[Bm25Artifact],
     terms: &[Inline<WordHash>],
 ) -> Result<Vec<(Inline<GenId>, f32)>, ArtifactError> {
-    let Some(first) = segments.first() else {
+    let Some(first) = artifacts.first() else {
         return Ok(Vec::new());
     };
-    if segments.len() == 1 {
+    if artifacts.len() == 1 {
         return Ok(first.query_multi(terms));
     }
 
-    let joined = SuccinctBM25Index::try_merge_segments(segments)?;
+    let joined = SuccinctBM25Index::try_merge_segments(artifacts)?;
     Ok(joined.query_multi(terms))
 }
 
@@ -294,20 +323,23 @@ mod tests {
         source
     }
 
-    fn decode(blob: Blob<SuccinctBM25Blob>) -> Seg {
+    fn decode(blob: Blob<SuccinctBM25Blob>) -> Bm25Artifact {
         SuccinctBM25Index::try_from_blob(blob).unwrap()
     }
 
-    fn reload(segment: &Seg) -> Seg {
-        decode(Blob::new(segment.bytes.clone()))
+    fn reload(artifact: &Bm25Artifact) -> Bm25Artifact {
+        decode(Blob::new(artifact.bytes.clone()))
     }
 
-    fn build_segment(kind: &Bm25Rollup<impl BlobStoreGet>, source: &TribleSet) -> Seg {
-        kind.build(source).unwrap().pop().unwrap()
+    fn build_artifact(kind: &Bm25Rollup<impl BlobStoreGet>, source: &TribleSet) -> Bm25Artifact {
+        kind.build(source).unwrap().unwrap()
     }
 
-    fn merge_segment(kind: &Bm25Rollup<impl BlobStoreGet>, segments: &[Seg]) -> Seg {
-        kind.merge(segments).unwrap().pop().unwrap()
+    fn merge_artifact(
+        kind: &Bm25Rollup<impl BlobStoreGet>,
+        artifacts: &[Bm25Artifact],
+    ) -> Bm25Artifact {
+        kind.merge(artifacts).unwrap().unwrap()
     }
 
     fn synthetic(n: usize) -> Vec<(Id, String)> {
@@ -384,10 +416,10 @@ mod tests {
         Inline::new(raw)
     }
 
-    fn materialized_max_union(segments: &[Seg], k1: f32, b: f32) -> Seg {
+    fn materialized_max_union(artifacts: &[Bm25Artifact], k1: f32, b: f32) -> Bm25Artifact {
         let mut union: HashMap<RawInline, HashMap<RawInline, u32>> = HashMap::new();
-        for segment in segments {
-            for (key, tokens) in segment.reconstruct_docs() {
+        for artifact in artifacts {
+            for (key, tokens) in artifact.reconstruct_docs() {
                 let mut source_tfs: HashMap<RawInline, u32> = HashMap::new();
                 for term in tokens {
                     *source_tfs.entry(term).or_default() += 1;
@@ -422,8 +454,8 @@ mod tests {
         let mut storage = MemoryRepo::default();
         let source = stage_many(&mut storage, &pairs);
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let segment = kind.build(&source).unwrap().pop().unwrap();
-        assert_eq!(segment.doc_count(), pairs.len());
+        let artifact = kind.build(&source).unwrap().unwrap();
+        assert_eq!(artifact.doc_count(), pairs.len());
 
         for query in [
             "alpha",
@@ -432,7 +464,7 @@ mod tests {
             "theta zeta",
         ] {
             let got: HashMap<_, _> =
-                query_across(std::slice::from_ref(&segment), &hash_tokens(query))
+                query_across(std::slice::from_ref(&artifact), &hash_tokens(query))
                     .unwrap()
                     .into_iter()
                     .map(|(document, score)| (document.raw, score))
@@ -463,32 +495,32 @@ mod tests {
             "alpha beta second_value",
         );
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let segment = build_segment(&kind, &source);
-        assert_eq!(segment.doc_count(), 1);
-        assert_eq!(segment.doc_len(0), Some(5));
+        let artifact = build_artifact(&kind, &source);
+        assert_eq!(artifact.doc_count(), 1);
+        assert_eq!(artifact.doc_len(0), Some(5));
         for term in ["alpha", "beta", "first_value", "second_value"] {
-            assert_eq!(segment.query_multi(&hash_tokens(term)).len(), 1);
+            assert_eq!(artifact.query_multi(&hash_tokens(term)).len(), 1);
         }
     }
 
     #[test]
-    fn multi_segment_query_matches_monolithic_ranking_exactly() {
+    fn multi_artifact_query_matches_monolithic_ranking_exactly() {
         let mut storage = MemoryRepo::default();
         let first = synthetic(60);
         let second = synthetic(60);
         let source_a = stage_many(&mut storage, &first);
         let source_b = stage_many(&mut storage, &second);
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let segments = [
-            build_segment(&kind, &source_a),
-            build_segment(&kind, &source_b),
+        let artifacts = [
+            build_artifact(&kind, &source_a),
+            build_artifact(&kind, &source_b),
         ];
-        let merged = merge_segment(&kind, &segments);
+        let merged = merge_artifact(&kind, &artifacts);
         let mut union = first;
         union.extend(second);
         assert_eq!(merged.doc_count(), union.len());
         for query in ["memory pile", "alpha beta gamma", "index search rollup"] {
-            let got: Vec<_> = query_across(&segments, &hash_tokens(query))
+            let got: Vec<_> = query_across(&artifacts, &hash_tokens(query))
                 .unwrap()
                 .into_iter()
                 .map(|(document, score)| (document.raw, score.to_bits()))
@@ -529,17 +561,17 @@ mod tests {
             ],
         );
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let left = build_segment(&kind, &source_a);
-        let right = build_segment(&kind, &source_b);
+        let left = build_artifact(&kind, &source_a);
+        let right = build_artifact(&kind, &source_b);
         let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
         let expected =
             materialized_max_union(&[reload(&left), reload(&right)], defaults.k1, defaults.b);
-        let direct = merge_segment(&kind, &[reload(&left), reload(&right)]);
-        let reversed = merge_segment(&kind, &[reload(&right), reload(&left)]);
+        let direct = merge_artifact(&kind, &[reload(&left), reload(&right)]);
+        let reversed = merge_artifact(&kind, &[reload(&right), reload(&left)]);
         assert_eq!(direct.bytes.as_ref(), expected.bytes.as_ref());
         assert_eq!(direct.bytes.as_ref(), reversed.bytes.as_ref());
 
-        let duplicate = merge_segment(&kind, &[reload(&left), left]);
+        let duplicate = merge_artifact(&kind, &[reload(&left), left]);
         assert_eq!(duplicate.doc_count(), 2);
         let shared_key: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(&shared);
         let code = duplicate
@@ -648,17 +680,16 @@ mod tests {
         let document = *fucid();
         let source = stage(&mut storage, content.id(), document, "alpha beta alpha");
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let segment = kind.build(&source).unwrap().pop().unwrap();
+        let artifact = kind.build(&source).unwrap().unwrap();
         let range_entity = *fucid();
-        let frozen = kind.freeze(range_entity, &segment).unwrap();
+        let frozen = kind.freeze(range_entity, &artifact).unwrap();
 
         assert!(frozen.iter().all(|fact| fact.a() == &seg_bm25.id()));
         assert_eq!(frozen.blobs().len(), 1);
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
         let thawed = kind.thaw(&reader, frozen.facts(), range_entity).unwrap();
-        assert_eq!(thawed.len(), 1);
-        let hits: HashSet<_> = query_across(&thawed, &hash_tokens("alpha"))
+        let hits: HashSet<_> = query_across(std::slice::from_ref(&thawed), &hash_tokens("alpha"))
             .unwrap()
             .into_iter()
             .map(|(key, _)| key.raw)
@@ -671,12 +702,36 @@ mod tests {
     fn canonical_empty_projection_and_merge_have_no_artifacts() {
         let mut storage = MemoryRepo::default();
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        assert!(kind.build(&TribleSet::new()).unwrap().is_empty());
-        assert!(kind.merge(&[]).unwrap().is_empty());
+        assert!(kind.build(&TribleSet::new()).unwrap().is_none());
+        assert!(kind.merge(&[]).unwrap().is_none());
 
         let unrelated = entity! { _ @ alternate_content: storage.put::<LongString, _>("x".to_owned()).unwrap() }
             .into_facts();
-        assert!(kind.build(&unrelated).unwrap().is_empty());
+        assert!(kind.build(&unrelated).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_and_foreign_tuning_artifacts_are_rejected_by_freeze_and_thaw() {
+        let mut storage = MemoryRepo::default();
+        let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
+        let entity = *fucid();
+
+        let empty: BM25Builder<GenId, WordHash> = BM25Builder::new();
+        let empty = empty.build();
+        assert!(kind.freeze(entity, &empty).is_err());
+        let frozen_empty = entity! { ExclusiveId::force_ref(&entity) @ seg_bm25: &empty };
+        let mut blobs = frozen_empty.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        assert!(kind.thaw(&reader, frozen_empty.facts(), entity).is_err());
+
+        let mut tuned: BM25Builder<GenId, WordHash> = BM25Builder::new().k1(2.0);
+        tuned.insert(merge_doc(1), [merge_term(1)]);
+        let tuned = tuned.build();
+        assert!(kind.freeze(entity, &tuned).is_err());
+        let frozen_tuned = entity! { ExclusiveId::force_ref(&entity) @ seg_bm25: &tuned };
+        let mut blobs = frozen_tuned.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        assert!(kind.thaw(&reader, frozen_tuned.facts(), entity).is_err());
     }
 
     #[test]
@@ -718,41 +773,34 @@ mod tests {
         let reader = storage.reader().unwrap();
         let kind_a = Bm25Rollup::new(reader.clone(), content.id());
         let kind_b = Bm25Rollup::new(reader, alternate_content.id());
-        let segment_a = kind_a.build(&source_a).unwrap().pop().unwrap();
-        let segment_b = kind_b.build(&source_b).unwrap().pop().unwrap();
+        let artifact_a = kind_a.build(&source_a).unwrap().unwrap();
+        let artifact_b = kind_b.build(&source_b).unwrap().unwrap();
         let range = CommitRange::leaf(commit(1));
-        let node_a = store_range(&mut storage, &kind_a, range.clone(), vec![segment_a]).unwrap();
-        let node_b = store_range(&mut storage, &kind_b, range, vec![segment_b]).unwrap();
+        let node_a = store_range(&mut storage, &kind_a, range.clone(), Some(artifact_a)).unwrap();
+        let node_b = store_range(&mut storage, &kind_b, range, Some(artifact_b)).unwrap();
 
         assert_ne!(node_a.core().recipe(), node_b.core().recipe());
         assert_ne!(node_a.core().entity(), node_b.core().entity());
         assert_ne!(node_a.core().handle(), node_b.core().handle());
         assert_ne!(node_a.handle(), node_b.handle());
-        assert_eq!(node_a.segments().len(), 1);
-        assert_eq!(node_b.segments().len(), 1);
+        assert!(node_a.artifact().is_some());
+        assert!(node_b.artifact().is_some());
     }
 
     #[test]
-    fn repeated_frozen_segments_thaw_atomically_and_bad_bytes_fail() {
+    fn repeated_frozen_artifacts_are_rejected_and_bad_bytes_fail() {
         let mut storage = MemoryRepo::default();
         let source_a = stage(&mut storage, content.id(), *fucid(), "alpha");
         let source_b = stage(&mut storage, content.id(), *fucid(), "beta");
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let segment_a = kind.build(&source_a).unwrap().pop().unwrap();
-        let segment_b = kind.build(&source_b).unwrap().pop().unwrap();
+        let artifact_a = kind.build(&source_a).unwrap().unwrap();
+        let artifact_b = kind.build(&source_b).unwrap().unwrap();
         let entity = *fucid();
-        let mut frozen = kind.freeze(entity, &segment_a).unwrap();
-        frozen += kind.freeze(entity, &segment_b).unwrap();
+        let mut frozen = kind.freeze(entity, &artifact_a).unwrap();
+        frozen += kind.freeze(entity, &artifact_b).unwrap();
         let mut blobs = frozen.blobs().clone();
         let reader = blobs.reader().unwrap();
-        let thawed = kind.thaw(&reader, frozen.facts(), entity).unwrap();
-        assert_eq!(thawed.len(), 2);
-        assert_eq!(
-            query_across(&thawed, &hash_tokens("alpha beta"))
-                .unwrap()
-                .len(),
-            2
-        );
+        assert!(kind.thaw(&reader, frozen.facts(), entity).is_err());
 
         let missing = Inline::<Handle<SuccinctBM25Blob>>::new([0xA5; 32]);
         let mut incomplete = frozen.clone();
@@ -775,9 +823,9 @@ mod tests {
         let first = stage(&mut storage, content.id(), *fucid(), "alpha");
         let second = stage(&mut storage, content.id(), *fucid(), "beta");
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
-        let left = kind.build(&first).unwrap().pop().unwrap();
-        let right = kind.build(&second).unwrap().pop().unwrap();
-        let merged = kind.merge(&[left, right]).unwrap().pop().unwrap();
+        let left = kind.build(&first).unwrap().unwrap();
+        let right = kind.build(&second).unwrap().unwrap();
+        let merged = kind.merge(&[left, right]).unwrap().unwrap();
         assert_eq!(merged.doc_count(), 2);
         assert_eq!(
             query_across(&[merged], &hash_tokens("alpha beta"))

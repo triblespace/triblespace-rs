@@ -54,40 +54,46 @@ pub type ArtifactError = Box<dyn Error + Send + Sync>;
 
 /// A typed derived-index recipe.
 ///
-/// The algebra deliberately has one physical type: an attached `Segment`.
-/// `freeze` makes a segment into a rooted, self-contained graph fragment;
+/// The algebra deliberately has one physical type: an attached `Artifact`.
+/// `freeze` makes an artifact into a rooted, self-contained graph fragment;
 /// `thaw` performs the inverse from one complete standalone node. Storage and
-/// typed-handle bookkeeping therefore stay outside every index kind. The trait
-/// guarantees exact source-range coverage, not that every kind's ranked or
-/// approximate query result is invariant under segment repartitioning.
+/// typed-handle bookkeeping therefore stay outside every index kind. Empty
+/// projections have no physical artifact and use the canonical range core as
+/// their node. The trait guarantees exact source-range coverage, not that every
+/// kind's ranked or approximate query result is invariant under repartitioning.
 pub trait IndexKind {
-    /// One queryable physical segment.
-    type Segment;
+    /// One complete queryable physical artifact.
+    type Artifact;
 
     /// Deterministic recipe descriptor with exactly one exported root. All
     /// descriptor facts must be attached directly to that root.
     fn recipe_fragment(&self) -> Fragment;
 
-    /// Build zero or more physical segments from one logical source range.
-    /// A canonical empty projection returns an empty vector.
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError>;
+    /// Build the physical artifact for one logical source range.
+    /// A canonical empty projection returns `None`.
+    fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError>;
 
-    /// Freeze one segment as a nonempty, self-contained fragment rooted at
+    /// Freeze one artifact as a nonempty, self-contained fragment rooted at
     /// `range_entity`. Every emitted fact must have that entity as subject.
-    fn freeze(&self, range_entity: Id, segment: &Self::Segment) -> Result<Fragment, ArtifactError>;
+    fn freeze(
+        &self,
+        range_entity: Id,
+        artifact: &Self::Artifact,
+    ) -> Result<Fragment, ArtifactError>;
 
-    /// Thaw every complete physical segment carried by one standalone node.
-    /// Implementations must reject missing, duplicate, or foreign components.
+    /// Thaw the one complete physical artifact carried by a distinct node.
+    /// Implementations must reject empty, missing, duplicate, or foreign
+    /// components.
     fn thaw<R: BlobStoreGet>(
         &self,
         reader: &R,
         facts: &TribleSet,
         range_entity: Id,
-    ) -> Result<Vec<Self::Segment>, ArtifactError>;
+    ) -> Result<Self::Artifact, ArtifactError>;
 
-    /// Merge attached physical segments, possibly producing no segment for
+    /// Merge attached physical artifacts, possibly producing no artifact for
     /// an empty canonical projection.
-    fn merge(&self, segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError>;
+    fn merge(&self, artifacts: &[Self::Artifact]) -> Result<Option<Self::Artifact>, ArtifactError>;
 }
 
 /// Structural validation failure for one standalone rollup node.
@@ -110,10 +116,8 @@ pub enum RangeNodeError {
     RecipeMismatch { expected: Id, actual: Id },
     /// The node's intrinsic range core differs from the asserted hard core.
     CoreMismatch { core: Id, node: Id },
-    /// A segment froze to an empty, unrooted, foreign, or control-bearing fragment.
-    InvalidSegmentFragment { entity: Id },
-    /// A distinct node archive contained no complete typed segment.
-    SegmentlessNode,
+    /// An artifact froze to an empty, unrooted, foreign, or control-bearing fragment.
+    InvalidArtifactFragment { entity: Id },
     /// A range record was structurally invalid.
     Range(RangeRecordError),
 }
@@ -143,13 +147,10 @@ impl fmt::Display for RangeNodeError {
                 f,
                 "range node core {node:x} does not match asserted core {core:x}"
             ),
-            Self::InvalidSegmentFragment { entity } => write!(
+            Self::InvalidArtifactFragment { entity } => write!(
                 f,
-                "index recipe froze an invalid segment fragment for range {entity:x}"
+                "index recipe froze an invalid artifact fragment for range {entity:x}"
             ),
-            Self::SegmentlessNode => {
-                write!(f, "a distinct range node must contain a typed segment")
-            }
             Self::Range(error) => error.fmt(f),
         }
     }
@@ -209,7 +210,7 @@ impl StoredRangeCore {
 pub struct StoredRangeNode<S> {
     core: StoredRangeCore,
     handle: Inline<Handle<SimpleArchive>>,
-    segments: Vec<S>,
+    artifact: Option<S>,
 }
 
 /// Exact read-time cover formed only from locally usable rollup nodes.
@@ -220,7 +221,7 @@ pub struct ResidentRangeCover<S> {
 }
 
 impl<S> ResidentRangeCover<S> {
-    /// Deterministically selected, pairwise-disjoint resident node bundles.
+    /// Deterministically selected, pairwise-disjoint resident nodes.
     pub fn selected(&self) -> &[StoredRangeNode<S>] {
         &self.selected
     }
@@ -242,9 +243,9 @@ impl<S> StoredRangeNode<S> {
         self.handle
     }
 
-    /// Attached physical segments carried atomically by this node.
-    pub fn segments(&self) -> &[S] {
-        &self.segments
+    /// Attached physical artifact, absent only for a completed-empty node.
+    pub const fn artifact(&self) -> Option<&S> {
+        self.artifact.as_ref()
     }
 
     /// Exact asserted pair used to publish or reload this alternative.
@@ -313,7 +314,7 @@ fn storage_error(error: impl Error + Send + Sync + 'static) -> IndexError {
     IndexError::Storage(Box::new(error))
 }
 
-fn segment_facts_are_valid(entity: Id, facts: &TribleSet) -> bool {
+fn artifact_facts_are_valid(entity: Id, facts: &TribleSet) -> bool {
     facts.iter().all(|fact| {
         *fact.e() == entity
             && !matches!(
@@ -340,33 +341,35 @@ fn one_range_record(
     Ok(records.pop().expect("one range record was checked"))
 }
 
-/// Persist one canonical hard range core and one complete segment node.
+/// Persist one canonical hard range core and one complete artifact node.
 ///
-/// Every segment freezes to a nonempty, self-contained fragment rooted at the
+/// A present artifact freezes to a nonempty, self-contained fragment rooted at the
 /// intrinsic range entity. Fragment blobs are persisted before either archive;
 /// the core contains only `(recipe, commit_start*, commit_end*)`, while the
-/// node adds all segment facts. Empty ranges use the core itself as their node.
+/// node adds the artifact facts. Empty projections use the core itself as their node.
 /// The returned value has been reloaded through [`load_range`], so cover
 /// selection cannot observe a node before structural and typed thaw succeeds.
 pub fn store_range<S: BlobStore, K: IndexKind>(
     storage: &mut S,
     kind: &K,
     range: CommitRange,
-    segments: Vec<K::Segment>,
-) -> Result<StoredRangeNode<K::Segment>, IndexError> {
+    artifact: Option<K::Artifact>,
+) -> Result<StoredRangeNode<K::Artifact>, IndexError> {
     let recipe = recipe_id(kind)?;
     let core_record = RangeRecord::new(recipe, range);
     let entity = core_record.entity();
     let core_facts = core_record.to_tribles();
     let mut node_record = core_record.clone();
 
-    for segment in &segments {
-        let fragment = kind.freeze(entity, segment).map_err(IndexError::Artifact)?;
+    if let Some(artifact) = &artifact {
+        let fragment = kind
+            .freeze(entity, artifact)
+            .map_err(IndexError::Artifact)?;
         if fragment.root() != Some(entity)
             || fragment.facts().is_empty()
-            || !segment_facts_are_valid(entity, fragment.facts())
+            || !artifact_facts_are_valid(entity, fragment.facts())
         {
-            return Err(RangeNodeError::InvalidSegmentFragment { entity }.into());
+            return Err(RangeNodeError::InvalidArtifactFragment { entity }.into());
         }
         let (facts, mut blobs) = fragment.into_facts_and_blobs();
         let reader = blobs
@@ -379,8 +382,8 @@ pub fn store_range<S: BlobStore, K: IndexKind>(
     }
 
     let node_facts = node_record.to_tribles();
-    if !segments.is_empty() && node_facts == core_facts {
-        return Err(RangeNodeError::InvalidSegmentFragment { entity }.into());
+    if artifact.is_some() && node_facts == core_facts {
+        return Err(RangeNodeError::InvalidArtifactFragment { entity }.into());
     }
 
     let core = storage
@@ -434,17 +437,17 @@ pub fn load_range_core<R: BlobStoreGet, K: IndexKind>(
     })
 }
 
-/// Load and validate one asserted hard-core/segment-node pair atomically.
+/// Load and validate one asserted hard-core/artifact-node pair atomically.
 ///
 /// Neither archive is fact-unioned with another node, even when two nodes have
 /// the same intrinsic range entity. The hard value must be exactly one
 /// core-only record. The label must be exactly one full record with that same
-/// intrinsic core and the runtime recipe's complete typed segment relation.
+/// intrinsic core and the runtime recipe's one complete typed artifact.
 pub fn load_range<R: BlobStoreGet, K: IndexKind>(
     reader: &R,
     kind: &K,
     rollup: RollupRecord,
-) -> Result<StoredRangeNode<K::Segment>, IndexError> {
+) -> Result<StoredRangeNode<K::Artifact>, IndexError> {
     let core = load_range_core(reader, kind, rollup.range_record())?;
     let expected_recipe = core.recipe();
 
@@ -478,22 +481,19 @@ pub fn load_range<R: BlobStoreGet, K: IndexKind>(
         .into());
     }
 
-    let segments = if completed_empty {
-        Vec::new()
+    let artifact = if completed_empty {
+        None
     } else {
-        let segments = kind
+        let artifact = kind
             .thaw(reader, node_record.facts(), node_record.entity())
             .map_err(IndexError::Artifact)?;
-        if segments.is_empty() {
-            return Err(RangeNodeError::SegmentlessNode.into());
-        }
-        segments
+        Some(artifact)
     };
 
     Ok(StoredRangeNode {
         core,
         handle: rollup.node(),
-        segments,
+        artifact,
     })
 }
 
@@ -515,7 +515,7 @@ pub fn resolve_resident_range_cover<R, D, K>(
     kind: &K,
     rollups: &[RollupRecord],
     frontier: &[CommitHandle],
-) -> Result<ResidentRangeCover<K::Segment>, RangeValidationError<D::Error>>
+) -> Result<ResidentRangeCover<K::Artifact>, RangeValidationError<D::Error>>
 where
     R: BlobStoreGet,
     D: CommitDag,
@@ -566,10 +566,11 @@ impl SuccinctRollup {
         Self
     }
 
-    /// Union-query several attached physical shards (shards are Arc-cheap
+    /// Union-query several attached physical artifacts (the underlying
+    /// archives are Arc-cheap
     /// view clones — no data copies).
-    pub fn union(segments: &[SuccinctArchive<OrderedUniverse>]) -> UnionArchive<OrderedUniverse> {
-        UnionArchive::new(segments.to_vec())
+    pub fn union(artifacts: &[SuccinctArchive<OrderedUniverse>]) -> UnionArchive<OrderedUniverse> {
+        UnionArchive::new(artifacts.to_vec())
     }
 }
 
@@ -578,19 +579,19 @@ fn succinct_recipe_fragment() -> Fragment {
     entity! { _ @ metadata::tag: algorithm }
 }
 
-fn freeze_succinct_segment(
+fn freeze_succinct_artifact(
     entity: Id,
-    segment: &SuccinctArchive<OrderedUniverse>,
+    artifact: &SuccinctArchive<OrderedUniverse>,
 ) -> Result<Fragment, ArtifactError> {
-    if segment.eav_c.len() == 0 {
-        return Err("an empty Succinct projection has no physical segment".into());
+    if artifact.eav_c.len() == 0 {
+        return Err("an empty Succinct projection has no physical artifact".into());
     }
-    let (raw_blob, rank9_blob) = segment.to_blob_pair();
+    let (raw_blob, rank9_blob) = artifact.to_blob_pair();
     let raw_handle = raw_blob.get_handle();
     let source = SuccinctArchiveRank9IndexBlob::source_handle(&rank9_blob)
         .map_err(|error| Box::new(error) as ArtifactError)?;
     if source != raw_handle {
-        return Err("Succinct Rank9 segment refers to a different raw archive".into());
+        return Err("Succinct Rank9 artifact refers to a different raw archive".into());
     }
 
     let mut fragment = Fragment::rooted(entity, TribleSet::new());
@@ -603,12 +604,12 @@ fn freeze_succinct_segment(
     Ok(fragment)
 }
 
-fn thaw_succinct_segments<R: BlobStoreGet>(
+fn thaw_succinct_artifact<R: BlobStoreGet>(
     reader: &R,
     facts: &TribleSet,
     entity: Id,
-) -> Result<Vec<SuccinctArchive<OrderedUniverse>>, ArtifactError> {
-    let mut raw: Vec<Inline<Handle<SuccinctArchiveBlob>>> = find!(
+) -> Result<SuccinctArchive<OrderedUniverse>, ArtifactError> {
+    let raw: Vec<Inline<Handle<SuccinctArchiveBlob>>> = find!(
         handle: Inline<Handle<SuccinctArchiveBlob>>,
         pattern!(facts, [{ entity @ seg_succinct: ?handle }])
     )
@@ -618,60 +619,47 @@ fn thaw_succinct_segments<R: BlobStoreGet>(
         pattern!(facts, [{ entity @ seg_succinct_rank9: ?handle }])
     )
     .collect();
-    raw.sort_unstable_by_key(|handle| handle.raw);
-
-    let raw_set: HashSet<_> = raw.iter().copied().collect();
-    let mut by_source = HashMap::new();
-    for handle in rank9 {
-        let blob: Blob<SuccinctArchiveRank9IndexBlob> = reader
-            .get(handle)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        let source = SuccinctArchiveRank9IndexBlob::source_handle(&blob)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        if !raw_set.contains(&source) {
-            return Err(format!(
-                "Rank9 artifact {:?} refers to foreign raw archive {:?}",
-                handle, source
-            )
-            .into());
-        }
-        if by_source.insert(source, (handle, blob)).is_some() {
-            return Err(format!("raw archive {:?} has duplicate Rank9 artifacts", source).into());
-        }
+    let [raw_handle] = raw.as_slice() else {
+        return Err("a Succinct artifact requires exactly one raw archive".into());
+    };
+    let [rank9_handle] = rank9.as_slice() else {
+        return Err("a Succinct artifact requires exactly one Rank9 index".into());
+    };
+    let raw: Blob<SuccinctArchiveBlob> = reader
+        .get(*raw_handle)
+        .map_err(|error| Box::new(error) as ArtifactError)?;
+    let rank9: Blob<SuccinctArchiveRank9IndexBlob> = reader
+        .get(*rank9_handle)
+        .map_err(|error| Box::new(error) as ArtifactError)?;
+    let source = SuccinctArchiveRank9IndexBlob::source_handle(&rank9)
+        .map_err(|error| Box::new(error) as ArtifactError)?;
+    if source != *raw_handle {
+        return Err("Succinct Rank9 artifact refers to a different raw archive".into());
     }
-    if by_source.len() != raw.len() {
-        return Err("Succinct raw/Rank9 artifact cardinality mismatch".into());
+    let artifact = SuccinctArchive::from_blob_pair(raw, rank9)
+        .map_err(|error| Box::new(error) as ArtifactError)?;
+    if artifact.eav_c.len() == 0 {
+        return Err("an empty Succinct projection has no physical artifact".into());
     }
-    raw.into_iter()
-        .map(|raw_handle| {
-            let raw: Blob<SuccinctArchiveBlob> = reader
-                .get(raw_handle)
-                .map_err(|error| Box::new(error) as ArtifactError)?;
-            let (_rank9_handle, rank9) = by_source
-                .remove(&raw_handle)
-                .expect("cardinality and source membership were checked");
-            SuccinctArchive::from_blob_pair(raw, rank9)
-                .map_err(|error| Box::new(error) as ArtifactError)
-        })
-        .collect()
+    Ok(artifact)
 }
 
 impl IndexKind for SuccinctRollup {
-    type Segment = SuccinctArchive<OrderedUniverse>;
+    type Artifact = SuccinctArchive<OrderedUniverse>;
 
     fn recipe_fragment(&self) -> Fragment {
         succinct_recipe_fragment()
     }
 
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError> {
+    fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
         if source.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        Ok(vec![source.into()])
+        Ok(Some(source.into()))
     }
 
-    fn freeze(&self, entity: Id, segment: &Self::Segment) -> Result<Fragment, ArtifactError> {
-        freeze_succinct_segment(entity, segment)
+    fn freeze(&self, entity: Id, artifact: &Self::Artifact) -> Result<Fragment, ArtifactError> {
+        freeze_succinct_artifact(entity, artifact)
     }
 
     fn thaw<R: BlobStoreGet>(
@@ -679,19 +667,19 @@ impl IndexKind for SuccinctRollup {
         reader: &R,
         facts: &TribleSet,
         entity: Id,
-    ) -> Result<Vec<Self::Segment>, ArtifactError> {
-        thaw_succinct_segments(reader, facts, entity)
+    ) -> Result<Self::Artifact, ArtifactError> {
+        thaw_succinct_artifact(reader, facts, entity)
     }
 
-    fn merge(&self, segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError> {
-        if segments.is_empty() {
-            return Ok(Vec::new());
+    fn merge(&self, artifacts: &[Self::Artifact]) -> Result<Option<Self::Artifact>, ArtifactError> {
+        if artifacts.is_empty() {
+            return Ok(None);
         }
-        let archive = merge_ordered_archives(segments);
+        let archive = merge_ordered_archives(artifacts);
         if archive.eav_c.len() == 0 {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![archive])
+            Ok(Some(archive))
         }
     }
 }
@@ -738,18 +726,18 @@ impl<B> IndexKind for AcceleratedSuccinctRollup<B>
 where
     B: WaveletMatrixFreezeBackend,
 {
-    type Segment = SuccinctArchive<OrderedUniverse>;
+    type Artifact = SuccinctArchive<OrderedUniverse>;
 
     fn recipe_fragment(&self) -> Fragment {
         succinct_recipe_fragment()
     }
 
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError> {
+    fn build(&self, source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
         SuccinctRollup.build(source)
     }
 
-    fn freeze(&self, entity: Id, segment: &Self::Segment) -> Result<Fragment, ArtifactError> {
-        SuccinctRollup.freeze(entity, segment)
+    fn freeze(&self, entity: Id, artifact: &Self::Artifact) -> Result<Fragment, ArtifactError> {
+        SuccinctRollup.freeze(entity, artifact)
     }
 
     fn thaw<R: BlobStoreGet>(
@@ -757,70 +745,70 @@ where
         reader: &R,
         facts: &TribleSet,
         entity: Id,
-    ) -> Result<Vec<Self::Segment>, ArtifactError> {
+    ) -> Result<Self::Artifact, ArtifactError> {
         SuccinctRollup.thaw(reader, facts, entity)
     }
 
-    fn merge(&self, segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError> {
-        if segments.is_empty() {
-            return Ok(Vec::new());
+    fn merge(&self, artifacts: &[Self::Artifact]) -> Result<Option<Self::Artifact>, ArtifactError> {
+        if artifacts.is_empty() {
+            return Ok(None);
         }
-        let input_rows = segments.iter().fold(0usize, |sum, segment| {
-            sum.saturating_add(segment.eav_c.len())
+        let input_rows = artifacts.iter().fold(0usize, |sum, artifact| {
+            sum.saturating_add(artifact.eav_c.len())
         });
         let archive = if input_rows >= self.min_input_rows && self.accelerator_enabled() {
-            match merge_ordered_archives_with_backend(segments, &self.backend) {
+            match merge_ordered_archives_with_backend(artifacts, &self.backend) {
                 Ok(archive) => archive,
                 Err(_) => {
                     self.accelerator_enabled.store(false, Ordering::Relaxed);
-                    merge_ordered_archives(segments)
+                    merge_ordered_archives(artifacts)
                 }
             }
         } else {
-            merge_ordered_archives(segments)
+            merge_ordered_archives(artifacts)
         };
         if archive.eav_c.len() == 0 {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![archive])
+            Ok(Some(archive))
         }
     }
 }
 
-/// A [`TriblePattern`] view that unions several Succinct archive shards.
+/// A [`TriblePattern`] view that unions several Succinct archive artifacts.
 ///
-/// Owns its shard list (`Arc<[SuccinctArchive]>` — the archives underneath
-/// are `Bytes`/`Arc`-backed views, so cloning shards in is a handful of
+/// Owns its archive list (`Arc<[SuccinctArchive]>` — the archives underneath
+/// are `Bytes`/`Arc`-backed views, so cloning them in is a handful of
 /// refcount bumps, never a data copy). Ownership makes the union `'static`
 /// wherever its universe is, so it can flow into type-erased consumers —
 /// notably `path!`'s generic source lane — without borrowed-slice gymnastics.
 #[derive(Clone)]
 pub struct UnionArchive<U> {
-    segments: Arc<[SuccinctArchive<U>]>,
+    archives: Arc<[SuccinctArchive<U>]>,
 }
 
 impl<U> UnionArchive<U> {
-    /// Wrap attached physical shards.
+    /// Wrap attached physical artifacts.
     ///
     /// # Panics
     ///
-    /// Panics when `segments` is empty. A physical union requires at least
-    /// one shard; use a different constraint to represent an empty relation.
-    pub fn new(segments: impl Into<Arc<[SuccinctArchive<U>]>>) -> Self {
-        let segments = segments.into();
+    /// Panics when `archives` is empty. A physical union requires at least
+    /// one artifact; use a different constraint to represent an empty relation.
+    pub fn new(archives: impl Into<Arc<[SuccinctArchive<U>]>>) -> Self {
+        let archives = archives.into();
         assert!(
-            !segments.is_empty(),
-            "UnionArchive requires at least one physical shard"
+            !archives.is_empty(),
+            "UnionArchive requires at least one physical artifact"
         );
-        Self { segments }
+        Self { archives }
     }
 
-    /// Number of physical Succinct shards behind this logical union.
+    /// Number of physical Succinct artifacts behind this logical union.
     ///
     /// This is storage provenance, not a logical cardinality: compaction may
     /// change it without changing the relation exposed by [`TriblePattern`].
-    pub fn segment_count(&self) -> usize {
-        self.segments.len()
+    pub fn artifact_count(&self) -> usize {
+        self.archives.len()
     }
 }
 
@@ -904,7 +892,7 @@ where
         let a: Term<GenId> = a.into();
         let v: Term<V> = v.into();
         UnionArchiveConstraint::new(
-            self.segments
+            self.archives
                 .iter()
                 .map(|segment| segment.pattern(e, a, v))
                 .collect(),
@@ -947,20 +935,24 @@ mod tests {
         }
     }
 
-    struct SilentSegmentKind;
+    struct SilentArtifactKind;
 
-    impl IndexKind for SilentSegmentKind {
-        type Segment = ();
+    impl IndexKind for SilentArtifactKind {
+        type Artifact = ();
 
         fn recipe_fragment(&self) -> Fragment {
             succinct_recipe_fragment()
         }
 
-        fn build(&self, _source: &TribleSet) -> Result<Vec<Self::Segment>, ArtifactError> {
-            Ok(Vec::new())
+        fn build(&self, _source: &TribleSet) -> Result<Option<Self::Artifact>, ArtifactError> {
+            Ok(None)
         }
 
-        fn freeze(&self, entity: Id, _segment: &Self::Segment) -> Result<Fragment, ArtifactError> {
+        fn freeze(
+            &self,
+            entity: Id,
+            _artifact: &Self::Artifact,
+        ) -> Result<Fragment, ArtifactError> {
             Ok(Fragment::rooted(entity, TribleSet::new()))
         }
 
@@ -969,12 +961,15 @@ mod tests {
             _reader: &R,
             _facts: &TribleSet,
             _entity: Id,
-        ) -> Result<Vec<Self::Segment>, ArtifactError> {
+        ) -> Result<Self::Artifact, ArtifactError> {
             panic!("completed-empty nodes are resolved without kind-specific thaw")
         }
 
-        fn merge(&self, _segments: &[Self::Segment]) -> Result<Vec<Self::Segment>, ArtifactError> {
-            Ok(Vec::new())
+        fn merge(
+            &self,
+            _artifacts: &[Self::Artifact],
+        ) -> Result<Option<Self::Artifact>, ArtifactError> {
+            Ok(None)
         }
     }
 
@@ -993,8 +988,8 @@ mod tests {
         source: &TribleSet,
         range: CommitRange,
     ) -> StoredRangeNode<SuccinctArchive<OrderedUniverse>> {
-        let segments = kind.build(source).unwrap();
-        store_range(storage, kind, range, segments).unwrap()
+        let artifact = kind.build(source).unwrap();
+        store_range(storage, kind, range, artifact).unwrap()
     }
 
     #[test]
@@ -1007,8 +1002,7 @@ mod tests {
 
         assert_ne!(stored.core().handle(), stored.handle());
         assert_eq!(stored.core().range(), &range);
-        assert_eq!(stored.segments().len(), 1);
-        assert_eq!(TribleSet::from(&stored.segments()[0]), source);
+        assert_eq!(TribleSet::from(stored.artifact().unwrap()), source);
         assert_eq!(stored.candidate().node(), stored.handle());
 
         let reader = storage.reader().unwrap();
@@ -1017,50 +1011,49 @@ mod tests {
         let loaded = load_range(&reader, &kind, stored.rollup_record()).unwrap();
         assert_eq!(loaded.core(), stored.core());
         assert_eq!(loaded.handle(), stored.handle());
-        assert_eq!(loaded.segments().len(), 1);
-        assert_eq!(TribleSet::from(&loaded.segments()[0]), source);
+        assert_eq!(TribleSet::from(loaded.artifact().unwrap()), source);
     }
 
     #[test]
     fn standalone_empty_range_uses_its_core_as_the_node() {
         let mut storage = MemoryBlobStore::new();
-        let kind = SilentSegmentKind;
+        let kind = SilentArtifactKind;
         let range = CommitRange::leaf(commit(1));
-        let stored = store_range(&mut storage, &kind, range.clone(), Vec::new()).unwrap();
+        let stored = store_range(&mut storage, &kind, range.clone(), None).unwrap();
 
         assert_eq!(stored.core().handle(), stored.handle());
         assert_eq!(stored.core().range(), &range);
-        assert!(stored.segments().is_empty());
+        assert!(stored.artifact().is_none());
 
         let reader = storage.reader().unwrap();
         let loaded = load_range(&reader, &kind, stored.rollup_record()).unwrap();
-        assert!(loaded.segments().is_empty());
+        assert!(loaded.artifact().is_none());
     }
 
     #[test]
-    fn succinct_physical_zero_normalizes_to_no_segment() {
+    fn succinct_physical_zero_normalizes_to_no_artifact() {
         let kind = SuccinctRollup::new();
         let empty_source = TribleSet::new();
         let empty: SuccinctArchive<OrderedUniverse> = (&empty_source).into();
 
-        assert!(kind.merge(std::slice::from_ref(&empty)).unwrap().is_empty());
+        assert!(kind.merge(std::slice::from_ref(&empty)).unwrap().is_none());
         assert!(kind.freeze(*fucid(), &empty).is_err());
     }
 
     #[test]
-    fn standalone_range_rejects_each_silent_segment() {
+    fn standalone_range_rejects_a_silent_artifact() {
         let mut storage = MemoryBlobStore::new();
         let error = store_range(
             &mut storage,
-            &SilentSegmentKind,
+            &SilentArtifactKind,
             CommitRange::leaf(commit(1)),
-            vec![()],
+            Some(()),
         )
         .unwrap_err();
 
         assert!(matches!(
             error,
-            IndexError::RangeNode(RangeNodeError::InvalidSegmentFragment { .. })
+            IndexError::RangeNode(RangeNodeError::InvalidArtifactFragment { .. })
         ));
     }
 
@@ -1095,16 +1088,10 @@ mod tests {
     }
 
     #[test]
-    fn standalone_distinct_node_requires_a_typed_segment() {
+    fn standalone_distinct_node_requires_a_typed_artifact() {
         let mut storage = MemoryBlobStore::new();
         let kind = SuccinctRollup::new();
-        let stored = store_range(
-            &mut storage,
-            &kind,
-            CommitRange::leaf(commit(1)),
-            Vec::new(),
-        )
-        .unwrap();
+        let stored = store_range(&mut storage, &kind, CommitRange::leaf(commit(1)), None).unwrap();
         let entity = stored.core().entity();
         let mut annotated = stored.core().record().to_tribles();
         annotated += entity! { ExclusiveId::force_ref(&entity) @
@@ -1119,10 +1106,7 @@ mod tests {
             RollupRecord::new(stored.core().handle(), node),
         )
         .unwrap_err();
-        assert!(matches!(
-            error,
-            IndexError::RangeNode(RangeNodeError::SegmentlessNode)
-        ));
+        assert!(matches!(error, IndexError::Artifact(_)));
     }
 
     #[test]
@@ -1139,36 +1123,8 @@ mod tests {
         assert_ne!(first.handle(), second.handle());
         assert_ne!(first.candidate().node(), second.candidate().node());
 
-        assert_eq!(TribleSet::from(&first.segments()[0]), first_source);
-        assert_eq!(TribleSet::from(&second.segments()[0]), second_source);
-    }
-
-    #[test]
-    fn one_node_keeps_all_of_its_segments_atomic() {
-        let mut storage = MemoryBlobStore::new();
-        let kind = SuccinctRollup::new();
-        let first = source("Ada");
-        let second = source("Grace");
-        let mut expected = first.clone();
-        expected += second.clone();
-        let segments = vec![
-            kind.build(&first).unwrap().pop().unwrap(),
-            kind.build(&second).unwrap().pop().unwrap(),
-        ];
-
-        let stored =
-            store_range(&mut storage, &kind, CommitRange::leaf(commit(1)), segments).unwrap();
-        assert_ne!(stored.core().handle(), stored.handle());
-        assert_eq!(stored.segments().len(), 2);
-
-        let reader = storage.reader().unwrap();
-        let loaded = load_range(&reader, &kind, stored.rollup_record()).unwrap();
-        assert_eq!(loaded.segments().len(), 2);
-        let mut actual = TribleSet::new();
-        for segment in loaded.segments() {
-            actual += TribleSet::from(segment);
-        }
-        assert_eq!(actual, expected);
+        assert_eq!(TribleSet::from(first.artifact().unwrap()), first_source);
+        assert_eq!(TribleSet::from(second.artifact().unwrap()), second_source);
     }
 
     #[test]
@@ -1188,7 +1144,7 @@ mod tests {
             &mut storage,
             &kind,
             CommitRange::new(vec![first], vec![third]).unwrap(),
-            Vec::new(),
+            None,
         )
         .unwrap();
         let missing_large = RollupRecord::new(
@@ -1215,9 +1171,8 @@ mod tests {
 
         assert_eq!(cover.selected().len(), 1);
         assert_eq!(cover.selected()[0].handle(), small.handle());
-        assert_eq!(cover.selected()[0].segments().len(), 1);
         assert_eq!(
-            TribleSet::from(&cover.selected()[0].segments()[0]),
+            TribleSet::from(cover.selected()[0].artifact().unwrap()),
             small_source
         );
         assert_eq!(cover.residual(), &[third]);
@@ -1257,13 +1212,13 @@ mod tests {
         assert_eq!(cover.selected().len(), 1);
         assert_eq!(cover.residual(), &[second]);
 
-        let segments = cover
+        let artifacts = cover
             .selected()
             .iter()
-            .flat_map(|node| node.segments().iter().cloned())
+            .filter_map(|node| node.artifact().cloned())
             .collect::<Vec<_>>();
         let mixed = ResidentResidual {
-            resident: SuccinctRollup::union(&segments),
+            resident: SuccinctRollup::union(&artifacts),
             residual: residual.clone(),
         };
         let mut monolithic = resident;
@@ -1323,10 +1278,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(loaded.handle(), annotated_handle);
-        assert_eq!(loaded.segments().len(), 1);
         assert_eq!(
-            TribleSet::from(&loaded.segments()[0]),
-            TribleSet::from(&stored.segments()[0])
+            TribleSet::from(loaded.artifact().unwrap()),
+            TribleSet::from(stored.artifact().unwrap())
         );
     }
 }

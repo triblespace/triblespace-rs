@@ -51,12 +51,12 @@ fn main() {
     // pair to this branch and recipe's grow-only rollup set.
     let rollup = SuccinctRollup::new();
     let recipe = rollup.recipe_fragment().root().expect("one recipe root");
-    let segments = rollup.build(&people).expect("build Succinct segment");
+    let artifact = rollup.build(&people).expect("build Succinct artifact");
     let stored = store_range(
         repository.storage_mut(),
         &rollup,
         CommitRange::leaf(source_head),
-        segments,
+        artifact,
     )
     .expect("store standalone range");
     publish_rollup_record(
@@ -83,12 +83,12 @@ fn main() {
         .expect("resolve resident cover");
     assert!(cover.residual().is_empty());
 
-    let segments: Vec<_> = cover
+    let artifacts: Vec<_> = cover
         .selected()
         .iter()
-        .flat_map(|node| node.segments().iter().cloned())
+        .filter_map(|node| node.artifact().cloned())
         .collect();
-    let union = SuccinctRollup::union(&segments);
+    let union = SuccinctRollup::union(&artifacts);
     let mut names: Vec<String> = find!(
         (name: Inline<_>),
         pattern!(&union, [{ _?p @ literature::firstname: ?name }])
