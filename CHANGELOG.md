@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The collection calculus has a wire-format-neutral executable test oracle.**
+  The bounded reference model folds accepted grow-only `ADD`, exact `MERGE`, and
+  canonical `DERIVE` relations to their least membership closure, induced
+  subsumption order, and maximal known frontier. Declared join
+  homomorphisms close commuting squares in either direction and reject
+  construction paths that claim different canonical results. Local blob
+  residency remains outside the replicated equations: a separate physical
+  cover search can use a resident compacted result or recursively fall back to
+  resident exact inputs, while reporting genuinely uncovered frontier
+  obligations. Exhaustive finite-set tests pin ACI reconciliation, pending
+  relation activation, structural canonical-function conflicts, and
+  path-independent derivation before a pile record format is chosen.
 - **Demand-curve receipts render as explicit performance fingerprints.** The
   feature-gated `tribleset-bench` GORBIE notebook normalizes fragmented TSV
   axes in memory and gives every engine/storage/execution subject the same
