@@ -40,8 +40,10 @@
 //! `(attribute, value)` pairs. Two bnodes with the same outgoing facts
 //! collapse to a single entity automatically — the bnode IS the entity
 //! that has these facts. Orphan bnodes (referenced but never appear as
-//! subject) get a per-import salt so they're distinct existentials
-//! across separate ingest calls. Cyclic blank-node graphs return
+//! subject) are skolemised from the immutable source-document content
+//! hash and their literal label. Retrying byte-identical input therefore
+//! reproduces the same ids, while different documents and labels remain
+//! distinct. Cyclic blank-node graphs return
 //! [`IngestError::BnodeCycle`] — there's no fixed-point id assignment
 //! without symmetry-breaking, and we'd rather refuse than guess.
 //!
@@ -98,6 +100,14 @@ use crate::trible::{Fragment, Trible, TribleSet};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
+/// Blake3 derive-key context for document-scoped orphan blank-node ids.
+///
+/// This deliberately keeps skolem ids in a domain separate from both raw
+/// document hashes and intrinsic entity ids. Changing it changes the identity
+/// protocol.
+const ORPHAN_BNODE_ID_CONTEXT: &str =
+    "triblespace N-Triples document-scoped orphan blank-node id v1";
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 /// Error returned by [`ingest_ntriples`] when the input cannot be
@@ -140,9 +150,11 @@ impl std::error::Error for IngestError {}
 // to the same id automatically, which is what RDF semantics promise.
 //
 // For bnodes with no outgoing facts (only referenced from elsewhere),
-// we skolemise with a per-import salt so they're treated as distinct
-// existentials across separate ingest calls. Same call, same label →
-// same id; different calls, same label → different ids.
+// we retain a separate skolem protocol. Its scope is the byte-exact source
+// document: `derive_key(document_content_hash || literal_label)`. Thus a
+// retry of identical content converges, while distinct source documents and
+// distinct labels remain distinct. This does not route factless nodes through
+// the intrinsic empty-entity identity.
 //
 // Cycles in the bnode reference graph produce `IngestError::BnodeCycle`
 // — there is no fixed point to assign without arbitrarily breaking
@@ -176,22 +188,17 @@ struct BnodeBuffer {
     outgoing: HashMap<View<str>, Vec<OutgoingFact>>,
     /// Triples whose object is a bnode (subject is already resolved).
     incoming: Vec<IncomingFact>,
-    /// Per-import salt for orphan-bnode skolemisation.
-    salt: [u8; 16],
+    /// Hash of the immutable, byte-exact source document. This scopes orphan
+    /// blank-node labels without making retries produce fresh identities.
+    document_hash: [u8; 32],
 }
 
 impl BnodeBuffer {
-    fn new() -> Self {
-        // Random salt → orphans differ across ingest calls, matching
-        // their "fresh existential" RDF semantics. Within a call, the
-        // salt is constant so the same orphan label always produces
-        // the same id.
-        let mut salt = [0u8; 16];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut salt[..]);
+    fn new(document_hash: [u8; 32]) -> Self {
         Self {
             outgoing: HashMap::new(),
             incoming: Vec::new(),
-            salt,
+            document_hash,
         }
     }
 
@@ -243,7 +250,7 @@ impl BnodeBuffer {
         //    are already in `resolved`.
         let mut resolved: HashMap<View<str>, Id> = HashMap::new();
         for label in order {
-            let id = resolve_bnode_id(&label, &self.outgoing, &resolved, &self.salt);
+            let id = resolve_bnode_id(&label, &self.outgoing, &resolved, &self.document_hash);
             resolved.insert(label, id);
         }
 
@@ -286,13 +293,14 @@ impl BnodeBuffer {
 /// pairs, dedupe consecutive duplicates, hash with Blake3, and take the
 /// last 16 bytes as the id.
 ///
-/// For orphans (no outgoing facts), falls back to skolemisation:
-/// `Blake3(salt || label)[16..]`.
+/// For orphans (no outgoing facts), falls back to a distinct, domain-separated
+/// skolem protocol:
+/// `Blake3::derive_key(context, document_content_hash || literal_label)[16..]`.
 fn resolve_bnode_id(
     label: &View<str>,
     outgoing: &HashMap<View<str>, Vec<OutgoingFact>>,
     resolved: &HashMap<View<str>, Id>,
-    salt: &[u8; 16],
+    document_hash: &[u8; 32],
 ) -> Id {
     let pairs: Vec<(Id, RawInline)> = outgoing
         .get(label)
@@ -317,14 +325,14 @@ fn resolve_bnode_id(
         .unwrap_or_default();
 
     if pairs.is_empty() {
-        // Orphan: skolemise via salt.
-        let mut hasher = Hasher::new();
-        hasher.update(salt);
+        // Orphan: skolemise inside the byte-exact source-document scope.
+        let mut hasher = Hasher::new_derive_key(ORPHAN_BNODE_ID_CONTEXT);
+        hasher.update(document_hash);
         hasher.update(label.as_ref().as_bytes());
         let digest = hasher.finalize();
         let mut raw = [0u8; ID_LEN];
         raw.copy_from_slice(&digest.as_bytes()[digest.as_bytes().len() - ID_LEN..]);
-        return Id::new(raw).expect("non-nil from random salt");
+        return Id::new(raw).expect("document-scoped orphan id is non-nil");
     }
 
     let mut pairs = pairs;
@@ -971,9 +979,14 @@ pub struct NtImport {
 /// result fragments carry their own blobs, so no workspace or blob
 /// store is needed (or touched) during parsing.
 pub fn import_bytes(mut bytes: Bytes) -> Result<NtImport, IngestError> {
+    // Hash before parsing advances the view. `Bytes::as_ref()` is exactly the
+    // caller-provided document slice, including otherwise insignificant
+    // whitespace and comments: identical serialized content is one
+    // content-addressed document regardless of how often it is ingested.
+    let document_hash = *blake3::hash(bytes.as_ref()).as_bytes();
     let mut facts = Fragment::empty();
     let mut meta = Fragment::empty();
-    let mut bnodes = BnodeBuffer::new();
+    let mut bnodes = BnodeBuffer::new(document_hash);
     let mut count = 0;
     let mut attr_cache = NTriplesAttrCache::default();
 

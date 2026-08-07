@@ -475,45 +475,102 @@ _:b <http://ex/p> _:a .
     }
 }
 
+fn ex_p_genid_objects(facts: &TribleSet) -> Vec<Id> {
+    let attr = Attribute::<inlineencodings::GenId>::from(entity! {
+        metadata::iri: "http://ex/p".to_blob().get_handle(),
+        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
+    });
+    let mut ids: Vec<Id> = find!(
+        (id: Id),
+        pattern!(facts, [{ _?subject @ attr: ?id }])
+    )
+    .map(|(id,)| id)
+    .collect();
+    ids.sort_unstable();
+    ids
+}
+
 #[test]
-fn orphan_bnode_skolemizes_per_import() {
+fn orphan_bnode_skolemizes_by_document_content() {
     // An orphan _:b1 (referenced as object but never appears as subject)
-    // gets a per-import salt, so two separate ingest calls produce
-    // *different* ids for the same label. This matches RDF's existential
-    // semantics — orphan bnodes in different documents are distinct
-    // "some-things."
+    // is scoped by the immutable document-content hash. Retrying the exact
+    // same source bytes therefore reproduces its id instead of creating a
+    // duplicate existential.
     let data = br#"
 <http://ex/s> <http://ex/p> _:b1 .
 "#;
-    let facts_a = ingest_ntriples(Cursor::new(&data[..]))
-        .expect("clean ntriples")
-        .facts
-        .into_facts();
-    let facts_b = ingest_ntriples(Cursor::new(&data[..]))
-        .expect("clean ntriples")
-        .facts
-        .into_facts();
+    let first = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
+    let retry = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
+    let first_ids = ex_p_genid_objects(first.facts.facts());
+    let retry_ids = ex_p_genid_objects(retry.facts.facts());
 
-    let p = Attribute::<inlineencodings::GenId>::from(entity! {
-        metadata::iri:          "http://ex/p".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
-    });
-    let (id_a,) = find!(
-        (id: Id),
-        pattern!(&facts_a, [{ _?s @ p: ?id }])
-    )
-    .next()
-    .expect("import A emits an orphan bnode");
-    let (id_b,) = find!(
-        (id: Id),
-        pattern!(&facts_b, [{ _?s @ p: ?id }])
-    )
-    .next()
-    .expect("import B emits an orphan bnode");
-    assert_ne!(
-        id_a, id_b,
-        "orphan bnodes in separate ingests must not collide"
+    assert_eq!(first.triples, 1);
+    assert_eq!(first.facts.facts(), retry.facts.facts());
+    assert_eq!(first_ids, retry_ids);
+    assert_eq!(
+        format!("{:X}", first_ids[0]),
+        "FD417D856173A99E6A3F296B16F41DB7",
+        "the document-scoped skolem protocol is a stable identity epoch",
     );
+}
+
+#[test]
+fn orphan_bnode_scope_uses_exact_document_content() {
+    let first_data = b"<http://ex/s> <http://ex/p> _:b1 .\n";
+    // This comment leaves the parsed RDF graph unchanged but changes the
+    // byte-exact source document and therefore its blank-node scope.
+    let second_data = concat!(
+        "# a distinct serialized document\n",
+        "<http://ex/s> <http://ex/p> _:b1 .\n",
+    )
+    .as_bytes();
+
+    let first = ingest_ntriples(Cursor::new(first_data)).expect("clean ntriples");
+    let second = ingest_ntriples(Cursor::new(second_data)).expect("clean ntriples");
+    let first_ids = ex_p_genid_objects(first.facts.facts());
+    let second_ids = ex_p_genid_objects(second.facts.facts());
+
+    assert_eq!(first.triples, 1);
+    assert_eq!(second.triples, 1);
+    assert_ne!(first_ids, second_ids);
+}
+
+#[test]
+fn distinct_orphan_bnode_labels_remain_distinct_within_document() {
+    let data = concat!(
+        "<http://ex/s> <http://ex/p> _:left .\n",
+        "<http://ex/s> <http://ex/p> _:right .\n",
+    )
+    .as_bytes();
+
+    let import = ingest_ntriples(Cursor::new(data)).expect("clean ntriples");
+    let ids = ex_p_genid_objects(import.facts.facts());
+
+    assert_eq!(import.triples, 2);
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
+fn non_orphan_bnode_identity_remains_independent_of_document_scope() {
+    let first_data = concat!(
+        "_:node <http://ex/name> \"value\" .\n",
+        "<http://ex/s> <http://ex/p> _:node .\n",
+    )
+    .as_bytes();
+    let second_data = concat!(
+        "# a distinct serialized document\n",
+        "_:node <http://ex/name> \"value\" .\n",
+        "<http://ex/s> <http://ex/p> _:node .\n",
+    )
+    .as_bytes();
+
+    let first = ingest_ntriples(Cursor::new(first_data)).expect("clean ntriples");
+    let second = ingest_ntriples(Cursor::new(second_data)).expect("clean ntriples");
+
+    assert_eq!(first.triples, 2);
+    assert_eq!(second.triples, 2);
+    assert_eq!(first.facts.facts(), second.facts.facts());
 }
 
 // ─── W3C N-Triples test-suite spot checks ──────────────────────────────
