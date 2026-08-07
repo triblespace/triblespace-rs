@@ -3330,6 +3330,7 @@ where
     /// Build an archive partition under a receipt already shared by an
     /// aggregate. Retaining `owner` is idempotent when it is already the
     /// receipt's latest member, preserving the shared cover Arc.
+    #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn from_archive_partition_with_guard(
         keys: &[[u8; KEY_LEN]],
         hashes: &[u128],
@@ -3367,7 +3368,9 @@ where
             return result;
         }
 
-        let (root, _) = unsafe { Self::build_archive_partition_head(keys, hashes, rows, 0) };
+        let leaf_for_row =
+            |row: usize| unsafe { Head::new_local_leaf(0, NonNull::from(&keys[row])) };
+        let (root, _) = unsafe { Self::build_partition_head(keys, hashes, rows, 0, &leaf_for_row) };
         let result = Self {
             root: Some(root.with_start(0)),
             owners,
@@ -3376,25 +3379,63 @@ where
         result
     }
 
-    /// Representative-LCP plus in-place MSD-radix worker for
-    /// [`Self::from_archive_partition`].
+    /// Builds a canonical PATCH bottom-up from shared heap entries.
+    ///
+    /// # Safety
+    ///
+    /// - `rows` must contain every valid index exactly once.
+    /// - `keys`, `hashes`, and `entries` must have identical lengths.
+    /// - Every `entries[row]` key must equal `keys[row]`.
+    /// - `keys` must contain no duplicates.
+    /// - `hashes[row]` must be the PATCH key hash of `keys[row]`.
+    pub(crate) unsafe fn from_entry_partition(
+        keys: &[[u8; KEY_LEN]],
+        hashes: &[u128],
+        rows: &mut [u32],
+        entries: &[Entry<KEY_LEN>],
+    ) -> Self {
+        init_hash_keys();
+        assert_eq!(keys.len(), hashes.len());
+        assert_eq!(keys.len(), rows.len());
+        assert_eq!(keys.len(), entries.len());
+        assert!(
+            u32::try_from(rows.len()).is_ok(),
+            "entry row ordinals must fit the partition metadata",
+        );
+        if rows.is_empty() {
+            return Self::new();
+        }
+
+        let leaf_for_row = |row: usize| entries[row].leaf::<O>();
+        let (root, _) = unsafe { Self::build_partition_head(keys, hashes, rows, 0, &leaf_for_row) };
+        let result = Self {
+            root: Some(root.with_start(0)),
+            owners: None,
+        };
+        result.debug_check_owner_invariant();
+        result
+    }
+
+    /// Representative-LCP plus in-place MSD-radix worker shared by archive
+    /// LocalLeaves and ordinary shared heap leaves.
     ///
     /// Trie construction is ownership-neutral. One deduplicated conservative
     /// owner cover on the returned PATCH guards every LocalLeaf regardless of
     /// later reshaping.
-    unsafe fn build_archive_partition_head(
+    unsafe fn build_partition_head<F>(
         keys: &[[u8; KEY_LEN]],
         hashes: &[u128],
         rows: &mut [u32],
         depth: usize,
-    ) -> (Head<KEY_LEN, O, ()>, u128) {
+        leaf_for_row: &F,
+    ) -> (Head<KEY_LEN, O, ()>, u128)
+    where
+        F: Fn(usize) -> Head<KEY_LEN, O, ()>,
+    {
         debug_assert!(!rows.is_empty());
         if rows.len() == 1 {
             let row = rows[0] as usize;
-            let ptr = NonNull::from(&keys[row]);
-            // SAFETY: the outer constructor installs its owner cover before
-            // returning this LocalLeaf to safe code.
-            let head = unsafe { Head::new_local_leaf(0, ptr) };
+            let head = leaf_for_row(row);
             return (head, hashes[row]);
         }
 
@@ -3485,15 +3526,22 @@ where
 
         let first_end = ends[first_bucket as usize] as usize;
         let (first_head, first_hash) = unsafe {
-            Self::build_archive_partition_head(keys, hashes, &mut rows[..first_end], end_depth + 1)
+            Self::build_partition_head(
+                keys,
+                hashes,
+                &mut rows[..first_end],
+                end_depth + 1,
+                leaf_for_row,
+            )
         };
         let second_end = ends[second_bucket as usize] as usize;
         let (second_head, second_hash) = unsafe {
-            Self::build_archive_partition_head(
+            Self::build_partition_head(
                 keys,
                 hashes,
                 &mut rows[first_end..second_end],
                 end_depth + 1,
+                leaf_for_row,
             )
         };
 
@@ -3527,11 +3575,12 @@ where
         loop {
             let range_end = ends[byte as usize] as usize;
             let (child, child_hash) = unsafe {
-                Self::build_archive_partition_head(
+                Self::build_partition_head(
                     keys,
                     hashes,
                     &mut rows[range_start..range_end],
                     end_depth + 1,
+                    leaf_for_row,
                 )
             };
             hash ^= child_hash;

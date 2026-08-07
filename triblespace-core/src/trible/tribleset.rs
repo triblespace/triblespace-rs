@@ -35,26 +35,13 @@ use std::ops::AddAssign;
 use std::sync::Arc;
 use zerocopy::IntoBytes;
 
-/// Stable owner for canonical intrinsic rows retained by PATCH LocalLeaves.
-struct IntrinsicEntityRows(Vec<IntrinsicEntityRow>);
-
-impl IntrinsicEntityRows {
-    fn raw_rows(&self) -> &[[u8; TRIBLE_LEN]] {
-        // SAFETY: IntrinsicEntityRow has the same size as RawTrible, its data
-        // field starts at offset zero, and the slice length is unchanged.
-        unsafe {
-            std::slice::from_raw_parts(self.0.as_ptr().cast::<[u8; TRIBLE_LEN]>(), self.0.len())
-        }
-    }
-}
-
 /// Canonicalizes and stores the facts of one content-derived entity.
 ///
 /// Each input row has the shape `NIL || attribute || value`. Rows are sorted
 /// and deduplicated, then their complete contiguous 64-byte representations
 /// are hashed with BLAKE3. The final 16 digest bytes become the entity id and
-/// are written into every row in place. The same owned aligned allocation then
-/// backs all six PATCH indexes, which are constructed bottom-up.
+/// are written into every row in place. One shared heap leaf is then created
+/// per row and reused while all six PATCH indexes are constructed bottom-up.
 ///
 /// The leading NIL bytes deliberately participate in the hash. Consequently
 /// this identity scheme is not compatible with the historical `A || V`
@@ -77,18 +64,26 @@ pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleS
         return (id, TribleSet::new());
     }
 
-    let rows = Arc::new(IntrinsicEntityRows(rows));
-    let owner: Arc<dyn ArchiveOwner> = rows.clone();
-    let raw_rows = rows.raw_rows();
+    if rows.len() == 1 {
+        let mut set = TribleSet::new();
+        set.insert(Trible::as_transmute_raw_unchecked(rows[0].raw()));
+        return (id, set);
+    }
+
+    let raw_rows: &[[u8; TRIBLE_LEN]] = unsafe {
+        // SAFETY: IntrinsicEntityRow has the same size as RawTrible, its data
+        // field starts at offset zero, and the slice length is unchanged.
+        std::slice::from_raw_parts(rows.as_ptr().cast(), rows.len())
+    };
     let hashes: Vec<u128> = raw_rows
         .iter()
         .map(|row| crate::patch::hash_key(row))
         .collect();
+    let entries: Vec<Entry<TRIBLE_LEN>> = raw_rows.iter().map(Entry::new).collect();
 
-    // SAFETY: IntrinsicEntityRow is 16-byte aligned and exactly 64 bytes, the
-    // rows are immutable, sorted, and duplicate-free after canonicalization,
-    // `hashes` corresponds index-for-index, and `owner` retains the allocation.
-    let set = unsafe { TribleSet::from_archive_partition(raw_rows, &hashes, &owner) };
+    // SAFETY: rows are sorted and duplicate-free after canonicalization, every
+    // entry owns the corresponding row bytes, and hashes match index-for-index.
+    let set = unsafe { TribleSet::from_entry_partition(raw_rows, &hashes, &entries) };
 
     (id, set)
 }
@@ -460,6 +455,7 @@ impl TribleSet {
     /// Every row must be 16-byte aligned, immutable, duplicate-free, and kept
     /// alive by `owner`. `hashes[row]` must be the PATCH key hash of
     /// `rows[row]`.
+    #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn from_archive_partition(
         rows: &[[u8; TRIBLE_LEN]],
         hashes: &[u128],
@@ -502,6 +498,62 @@ impl TribleSet {
                         &mut permutation,
                         owner,
                         &owner_guard,
+                    )
+                }
+            }};
+        }
+
+        let eav = build_index!(EAVOrder);
+        let aev = build_index!(AEVOrder);
+        let vae = build_index!(VAEOrder);
+        let eva = build_index!(EVAOrder);
+        let vea = build_index!(VEAOrder);
+        let ave = build_index!(AVEOrder);
+
+        Self {
+            eav,
+            eva,
+            aev,
+            ave,
+            vea,
+            vae,
+        }
+    }
+
+    /// Builds all six indexes bottom-up over shared heap leaves.
+    ///
+    /// # Safety
+    ///
+    /// `rows`, `hashes`, and `entries` must correspond index-for-index; rows
+    /// must be canonical and duplicate-free.
+    unsafe fn from_entry_partition(
+        rows: &[[u8; TRIBLE_LEN]],
+        hashes: &[u128],
+        entries: &[Entry<TRIBLE_LEN>],
+    ) -> Self {
+        assert_eq!(rows.len(), hashes.len());
+        assert_eq!(rows.len(), entries.len());
+        assert!(
+            u32::try_from(rows.len()).is_ok(),
+            "entity row ordinals must fit the partition metadata",
+        );
+
+        let mut permutation = vec![0u32; rows.len()];
+        fn reset(permutation: &mut [u32]) {
+            for (row, slot) in permutation.iter_mut().enumerate() {
+                *slot = row as u32;
+            }
+        }
+
+        macro_rules! build_index {
+            ($order:ty) => {{
+                reset(&mut permutation);
+                unsafe {
+                    PATCH::<TRIBLE_LEN, $order>::from_entry_partition(
+                        rows,
+                        hashes,
+                        &mut permutation,
+                        entries,
                     )
                 }
             }};
@@ -802,7 +854,7 @@ mod tests {
             assert_eq!(&raw[E_START..=E_END], &id[..]);
             assert!(Trible::force_raw(*raw).is_some());
         }
-        assert_shared_owner_guard(&set, 1);
+        assert_shared_owner_guard(&set, 0);
     }
 
     #[test]
@@ -824,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_owned_rows_survive_clone_drop_and_union() {
+    fn intrinsic_shared_leaves_survive_clone_drop_and_union() {
         let rows_a = many_intrinsic_rows(1, 256);
         let rows_b = many_intrinsic_rows(2, 256);
         let (_, expected_a) = expected_intrinsic_entity(rows_a.clone());
@@ -840,7 +892,7 @@ mod tests {
         let noise = vec![0xabu8; 256 * TRIBLE_LEN * 4];
         std::hint::black_box(&noise);
         assert_all_indexes(&union, &expected);
-        assert_shared_owner_guard(&union, 2);
+        assert_shared_owner_guard(&union, 0);
 
         let same_rows = many_intrinsic_rows(3, 256);
         let (_, same_expected) = expected_intrinsic_entity(same_rows.clone());

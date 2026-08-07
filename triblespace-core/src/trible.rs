@@ -88,7 +88,6 @@ impl IntrinsicEntityRow {
         self.data[E_START..=E_END].copy_from_slice(&entity[..]);
     }
 
-    #[cfg(test)]
     fn raw(&self) -> &RawTrible {
         &self.data
     }
