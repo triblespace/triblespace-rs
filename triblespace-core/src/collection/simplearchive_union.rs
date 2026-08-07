@@ -23,14 +23,15 @@ use anybytes::{Bytes, View};
 use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
-use crate::blob::Blob;
+use crate::blob::encodings::UnknownBlob;
+use crate::blob::{Blob, MemoryBlobStore};
 use crate::id::Id;
 use crate::id_hex;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
-use crate::repo::{BlobStorePut, StorageFlush};
-use crate::trible::{Trible, TRIBLE_LEN};
+use crate::repo::{BlobStore, BlobStorePut, StorageFlush};
+use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::{CollectionCommit, CollectionData, CollectionDefinition, CollectionMerge};
 
@@ -151,6 +152,15 @@ pub enum PublicationError<PutError, FlushError> {
     Validation(SimpleArchiveUnionValidationError),
     /// Commit metadata is not a canonical `SimpleArchive`.
     InvalidMetadata(UnarchiveError),
+    /// An embedded fragment blob is not stored under its actual byte identity.
+    InvalidEmbeddedBlob {
+        /// Type-erased identity used as the `MemoryBlobStore` key.
+        store_key: CollectionData,
+        /// Type-erased identity cached inside the stored `Blob`.
+        cached_handle: CollectionData,
+        /// Fresh Blake3 identity recomputed from the blob bytes.
+        actual: CollectionData,
+    },
     /// A definition, element, result, or metadata write failed.
     DependencyPut(PutError),
     /// The dependency durability barrier failed; no record write was attempted.
@@ -175,6 +185,17 @@ where
                     "commit metadata is not a canonical SimpleArchive: {error}"
                 )
             }
+            Self::InvalidEmbeddedBlob {
+                store_key,
+                cached_handle,
+                actual,
+            } => write!(
+                f,
+                "embedded blob store key {} and cached handle {} do not both match byte identity {}",
+                hex::encode_upper(store_key.raw),
+                hex::encode_upper(cached_handle.raw),
+                hex::encode_upper(actual.raw),
+            ),
             Self::DependencyPut(error) => {
                 write!(f, "failed to write a collection dependency: {error}")
             }
@@ -196,6 +217,7 @@ where
         match self {
             Self::Validation(error) => Some(error),
             Self::InvalidMetadata(error) => Some(error),
+            Self::InvalidEmbeddedBlob { .. } => None,
             Self::DependencyPut(error) | Self::RecordPut(error) => Some(error),
             Self::DependencyFlush(error) | Self::RecordFlush(error) => Some(error),
         }
@@ -358,6 +380,66 @@ where
     Ok(commit)
 }
 
+/// Publish a self-contained fact fragment as a signed membership root.
+///
+/// `content` and `metadata` may each carry blobs referenced by handles in their
+/// facts. Before touching `store`, this boundary recomputes every embedded
+/// blob's identity and requires both its [`MemoryBlobStore`] key and cached
+/// [`Blob`] handle to match the bytes. A mismatch is rejected rather than
+/// normalized because the fragment facts may name the forged identity.
+///
+/// Fragment exports are not serialized. Their fact sets become canonical
+/// `SimpleArchive` data and metadata elements. Valid embedded blobs are written
+/// first, then [`publish_commit`] writes the definition and archives; its
+/// dependency flush therefore covers all of them before the signed record is
+/// written. The same backend-recovery boundary documented by
+/// [`PublicationError`] applies.
+pub fn publish_fragment_commit<S>(
+    store: &mut S,
+    definition: &CollectionDefinition,
+    content: impl Into<Fragment>,
+    metadata: impl Into<Fragment>,
+    signing_key: &SigningKey,
+) -> Result<CollectionCommit, PublicationError<S::PutError, <S as StorageFlush>::Error>>
+where
+    S: BlobStorePut + StorageFlush,
+{
+    let (content_facts, content_blobs) = content.into().into_facts_and_blobs();
+    let (metadata_facts, metadata_blobs) = metadata.into().into_facts_and_blobs();
+
+    let mut embedded =
+        checked_embedded_blobs(content_blobs).map_err(|(store_key, cached_handle, actual)| {
+            PublicationError::InvalidEmbeddedBlob {
+                store_key,
+                cached_handle,
+                actual,
+            }
+        })?;
+    embedded.extend(checked_embedded_blobs(metadata_blobs).map_err(
+        |(store_key, cached_handle, actual)| PublicationError::InvalidEmbeddedBlob {
+            store_key,
+            cached_handle,
+            actual,
+        },
+    )?);
+    embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
+    embedded.dedup_by_key(|blob| blob.get_handle().raw);
+
+    // `publish_commit` performs this check again, but doing it before the
+    // embedded puts preserves its validation-before-write boundary here.
+    validate_definition(definition).map_err(PublicationError::Validation)?;
+
+    let content: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(content_facts);
+    let metadata: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(metadata_facts);
+    for blob in embedded {
+        store
+            .put::<UnknownBlob, _>(blob)
+            .map_err(PublicationError::DependencyPut)?;
+    }
+
+    publish_commit(store, definition, &content, &metadata, signing_key)
+}
+
 /// Publish an exact merge after its definition, inputs, and result are durable.
 ///
 /// Input blobs are normalized from their bytes, ordered by their freshly
@@ -503,6 +585,28 @@ fn normalize_blob(blob: &Blob<SimpleArchive>) -> Blob<SimpleArchive> {
     Blob::new(blob.bytes.clone())
 }
 
+fn checked_embedded_blobs(
+    mut blobs: MemoryBlobStore,
+) -> Result<Vec<Blob<UnknownBlob>>, (CollectionData, CollectionData, CollectionData)> {
+    let reader = blobs
+        .reader()
+        .expect("MemoryBlobStore::reader is infallible");
+    let mut checked = Vec::with_capacity(reader.len());
+    for (store_key, blob) in reader {
+        let cached_handle = blob.get_handle();
+        let actual = Blob::<UnknownBlob>::new(blob.bytes.clone()).get_handle();
+        if store_key != actual || cached_handle != actual {
+            return Err((
+                Handle::<UnknownBlob>::to_hash(store_key),
+                Handle::<UnknownBlob>::to_hash(cached_handle),
+                Handle::<UnknownBlob>::to_hash(actual),
+            ));
+        }
+        checked.push(blob);
+    }
+    Ok(checked)
+}
+
 fn normalized_data_identity(blob: &Blob<SimpleArchive>) -> CollectionData {
     Handle::<SimpleArchive>::to_hash(blob.get_handle())
 }
@@ -620,12 +724,25 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hex_literal::hex;
 
+    use crate::blob::encodings::longstring::LongString;
+    use crate::blob::encodings::rawbytes::RawBytes;
     use crate::blob::{BlobEncoding, IntoBlob};
     use crate::collection::{discover_collection_records, empty_metadata_handle};
     use crate::inline::InlineEncoding;
+    use crate::macros::entity;
     use crate::repo::pile::Pile;
     use crate::repo::{BlobStore, BlobStoreGet};
     use crate::trible::TribleSet;
+
+    mod fragment_ns {
+        use crate::prelude::*;
+
+        attributes! {
+            // Test-only sentinel attributes; these are not protocol ids.
+            "DD00000000000000DD00000000000031" as pub text: inlineencodings::Handle<blobencodings::LongString>;
+            "DD00000000000000DD00000000000032" as pub payload: inlineencodings::Handle<blobencodings::RawBytes>;
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct ProbeFailure(usize);
@@ -744,8 +861,29 @@ mod tests {
         }
     }
 
-    fn put_event(blob: &Blob<SimpleArchive>) -> ProbeEvent {
+    fn put_event<S>(blob: &Blob<S>) -> ProbeEvent
+    where
+        S: BlobEncoding,
+        Handle<S>: InlineEncoding,
+    {
         ProbeEvent::Put(blob.get_handle().raw)
+    }
+
+    fn fragment_fixture() -> (
+        Fragment,
+        Fragment,
+        Inline<Handle<LongString>>,
+        Inline<Handle<RawBytes>>,
+    ) {
+        let text: Blob<LongString> = String::from("a self-contained content blob").to_blob();
+        let text_handle = text.get_handle();
+        let content = entity! { fragment_ns::text: text };
+
+        let payload: Blob<RawBytes> = vec![0, 1, 2, 3, 0xFE, 0xFF].to_blob();
+        let payload_handle = payload.get_handle();
+        let metadata = entity! { fragment_ns::payload: payload };
+
+        (content, metadata, text_handle, payload_handle)
     }
 
     fn commit_fixture() -> (
@@ -823,6 +961,133 @@ mod tests {
         assert_eq!(store.durable, expected_handles);
         assert!(store.pending.is_empty());
         assert!(!store.known.contains(&bogus.get_handle().raw));
+    }
+
+    #[test]
+    fn fragment_commit_puts_embedded_dependencies_before_record_and_replays_idempotently() {
+        let definition = definition(id(1));
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let (content, metadata, text_handle, payload_handle) = fragment_fixture();
+        let content_archive: Blob<SimpleArchive> = content.facts().clone().to_blob();
+        let metadata_archive: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
+        let expected = CollectionCommit::sign(
+            &signing_key,
+            definition.id(),
+            data(&content_archive),
+            metadata_archive.get_handle(),
+        );
+        let definition_blob = CollectionDefinition::to_blob(&definition);
+        let record_blob = CollectionCommit::to_blob(&expected);
+
+        let mut embedded = vec![text_handle.raw, payload_handle.raw];
+        embedded.sort_unstable();
+        let sequence = vec![
+            ProbeEvent::Put(embedded[0]),
+            ProbeEvent::Put(embedded[1]),
+            put_event(&definition_blob),
+            put_event(&content_archive),
+            put_event(&metadata_archive),
+            ProbeEvent::Flush,
+            put_event(&record_blob),
+            ProbeEvent::Flush,
+        ];
+
+        let mut store = ProbeStore::default();
+        let first = publish_fragment_commit(
+            &mut store,
+            &definition,
+            content.clone(),
+            metadata.clone(),
+            &signing_key,
+        )
+        .unwrap();
+        let second =
+            publish_fragment_commit(&mut store, &definition, content, metadata, &signing_key)
+                .unwrap();
+
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+        let mut expected_events = sequence.clone();
+        expected_events.extend(sequence);
+        assert_eq!(store.events, expected_events);
+
+        let expected_handles = BTreeSet::from([
+            text_handle.raw,
+            payload_handle.raw,
+            definition_blob.get_handle().raw,
+            content_archive.get_handle().raw,
+            metadata_archive.get_handle().raw,
+            record_blob.get_handle().raw,
+        ]);
+        assert_eq!(store.known, expected_handles);
+        assert_eq!(store.durable, expected_handles);
+        assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn fragment_commit_rejects_forged_embedded_identities_before_writing() {
+        let definition = definition(id(1));
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+
+        // This is the exact forged-cache shape that `entity!` deliberately
+        // preserves: both the fact and MemoryBlobStore key name the bogus
+        // cached handle even though the bytes hash elsewhere.
+        let bogus_text_handle = Inline::<Handle<LongString>>::new([0xAA; 32]);
+        let forged_text = Blob::<LongString>::with_handle(
+            Bytes::from(b"bytes behind a forged cached handle".to_vec()),
+            bogus_text_handle,
+        );
+        let actual_text_handle = Blob::<LongString>::new(forged_text.bytes.clone()).get_handle();
+        let forged_content = entity! { fragment_ns::text: forged_text };
+        let mut store = ProbeStore::default();
+        let error = publish_fragment_commit(
+            &mut store,
+            &definition,
+            forged_content,
+            Fragment::empty(),
+            &signing_key,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PublicationError::InvalidEmbeddedBlob {
+                store_key,
+                cached_handle,
+                actual,
+            } if store_key == Handle::<LongString>::to_hash(bogus_text_handle)
+                && cached_handle == Handle::<LongString>::to_hash(bogus_text_handle)
+                && actual == Handle::<LongString>::to_hash(actual_text_handle)
+        ));
+        assert!(store.events.is_empty());
+
+        // `MemoryBlobStore::from_iter` can independently forge its PATCH key
+        // even when the Blob's own cache is correct. Reject that shape too.
+        let payload: Blob<RawBytes> = vec![9, 8, 7].to_blob();
+        let actual_payload_handle: Inline<Handle<UnknownBlob>> = payload.get_handle().transmute();
+        let bogus_store_key = Inline::<Handle<UnknownBlob>>::new([0xBB; 32]);
+        let embedded: MemoryBlobStore =
+            std::iter::once((bogus_store_key, payload.transmute())).collect();
+        let forged_content = Fragment::from_facts_and_blobs(TribleSet::new(), embedded);
+        let mut store = ProbeStore::default();
+        let error = publish_fragment_commit(
+            &mut store,
+            &definition,
+            forged_content,
+            Fragment::empty(),
+            &signing_key,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PublicationError::InvalidEmbeddedBlob {
+                store_key,
+                cached_handle,
+                actual,
+            } if store_key == Handle::<UnknownBlob>::to_hash(bogus_store_key)
+                && cached_handle == Handle::<UnknownBlob>::to_hash(actual_payload_handle)
+                && actual == Handle::<UnknownBlob>::to_hash(actual_payload_handle)
+        ));
+        assert!(store.events.is_empty());
     }
 
     #[test]
@@ -1071,6 +1336,52 @@ mod tests {
         validate_commit(&definition, &commit, &fetched_left).unwrap();
         let (low, high) = ordered_inputs(&fetched_left, &fetched_right);
         validate_merge(&definition, &merge, low, high, &fetched_result).unwrap();
+
+        drop(reader);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn fragment_commit_roundtrips_embedded_blobs_through_a_reopened_pile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fragment-commit.pile");
+        std::fs::File::create(&path).unwrap();
+
+        let definition = definition(id(1));
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let (content, metadata, text_handle, payload_handle) = fragment_fixture();
+        let expected_content: Blob<SimpleArchive> = content.facts().clone().to_blob();
+        let expected_metadata: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
+
+        let commit = {
+            let mut pile = Pile::open(&path).unwrap();
+            let commit =
+                publish_fragment_commit(&mut pile, &definition, content, metadata, &signing_key)
+                    .unwrap();
+            pile.close().unwrap();
+            commit
+        };
+
+        let mut reopened = Pile::open(&path).unwrap();
+        let reader = reopened.reader().unwrap();
+        let discovered = discover_collection_records(&reader).unwrap();
+        assert_eq!(discovered.definitions(), &[definition.clone()]);
+        assert_eq!(discovered.commits(), &[commit.clone()]);
+        assert!(discovered.merges().is_empty());
+        assert!(discovered.derives().is_empty());
+        assert!(discovered.diagnostics().is_empty());
+
+        let content_handle: Inline<Handle<SimpleArchive>> = commit.data().transmute();
+        let fetched_content: Blob<SimpleArchive> = reader.get(content_handle).unwrap();
+        let fetched_metadata: Blob<SimpleArchive> = reader.get(commit.metadata()).unwrap();
+        assert_eq!(fetched_content, expected_content);
+        assert_eq!(fetched_metadata, expected_metadata);
+        validate_commit(&definition, &commit, &fetched_content).unwrap();
+
+        let fetched_text: View<str> = reader.get::<View<str>, LongString>(text_handle).unwrap();
+        let fetched_payload: Bytes = reader.get::<Bytes, RawBytes>(payload_handle).unwrap();
+        assert_eq!(&*fetched_text, "a self-contained content blob");
+        assert_eq!(&*fetched_payload, &[0, 1, 2, 3, 0xFE, 0xFF]);
 
         drop(reader);
         reopened.close().unwrap();

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Self-contained fragments can be published directly into a collection.**
+  The `SimpleArchive` union kind absorbs every blob embedded by content and
+  metadata `Fragment`s, archives their facts, and places those dependencies
+  behind the existing pre-`COMMIT` durability barrier. Publication first
+  recomputes every embedded byte identity and rejects forged store keys or
+  cached blob handles before writing, so it never normalizes a handle that the
+  fragment's facts may still name.
 - **Canonical collection records can be published with explicit crash-order
   barriers.** The concrete `SimpleArchive` union kind now normalizes and
   validates supplied bytes, flushes definitions and element dependencies
