@@ -15,6 +15,8 @@ pub mod attribute;
 pub mod blob;
 /// Attribute definition and usage metadata.
 pub mod clock;
+/// Canonical records and discovery for the typed collection calculus.
+pub mod collection;
 /// Export utilities for serialising trible data.
 pub mod export;
 /// Identifier types and generation strategies.

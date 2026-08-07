@@ -1,4 +1,4 @@
-//! Canonical `SimpleArchive` records for the typed collection calculus.
+//! Canonical `SimpleArchive` records for the top-level collection calculus.
 //!
 //! A record is exactly one intrinsically identified entity. The entity's
 //! complete fact set is its wire representation; there are no packed side
@@ -33,7 +33,7 @@ use crate::inline::{Inline, InlineEncoding};
 use crate::metadata;
 use crate::prelude::{attributes, entity};
 use crate::repo::{metadata as commit_metadata, signature_r, signature_s, signed_by};
-use crate::trible::{Fragment, TribleSet};
+use crate::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
 /// Tag identifying a canonical collection definition.
 ///
@@ -52,8 +52,17 @@ pub const KIND_COLLECTION_MERGE: Id = id_hex!("501E44F9920BAA749CB32646339C9553"
 /// Minted with `trible genid` on 2026-08-07.
 pub const KIND_COLLECTION_DERIVE: Id = id_hex!("930966C2E9C138CF19E2215B048E9814");
 
+/// Byte length of a canonical collection-definition `SimpleArchive`.
+pub const COLLECTION_DEFINITION_ARCHIVE_LEN: u64 = (4 * TRIBLE_LEN) as u64;
+/// Byte length of a canonical signed-commit `SimpleArchive`.
+pub const COLLECTION_COMMIT_ARCHIVE_LEN: u64 = (7 * TRIBLE_LEN) as u64;
+/// Byte length of a canonical merge-claim `SimpleArchive`.
+pub const COLLECTION_MERGE_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
+/// Byte length of a canonical derive-claim `SimpleArchive`.
+pub const COLLECTION_DERIVE_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
+
 attributes! {
-    /// Stable extrinsic dataset/scope shared by related representations.
+    /// Stable extrinsic dataset scope shared by related representations.
     /// Minted with `trible genid` on 2026-08-07.
     "D3418873C70392E3ADAA05C00E11A583" as pub collection_scope: GenId;
     /// Blob representation carried by the elements of this collection.
@@ -212,7 +221,7 @@ impl Error for CommitVerificationError {}
 
 /// Intrinsic definition of one concrete typed collection.
 ///
-/// `scope` is an extrinsic dataset/branch anchor shared by related
+/// `scope` is an extrinsic dataset anchor shared by related
 /// representations. The collection root itself is intrinsic and is returned as
 /// a plain [`Id`]; constructing this descriptor never manufactures an
 /// [`crate::id::ExclusiveId`] for either identity.
@@ -263,7 +272,7 @@ impl CollectionDefinition {
         self.root
     }
 
-    /// Extrinsic dataset/branch scope shared by related collections.
+    /// Extrinsic dataset scope shared by related collections.
     pub fn scope(&self) -> Id {
         self.scope
     }
@@ -380,6 +389,9 @@ impl CollectionCommit {
     }
 
     /// Strictly verify the Ed25519 signature over the canonical transcript.
+    ///
+    /// This proves only that the embedded public key signed the record. Key
+    /// authorization is a separate caller policy.
     pub fn verify_strict(&self) -> Result<(), CommitVerificationError> {
         let public_key = VerifyingKey::from_bytes(&self.public_key.raw)
             .map_err(|_| CommitVerificationError::InvalidPublicKey)?;
@@ -606,6 +618,62 @@ impl CollectionDerive {
     }
 }
 
+/// A structurally canonical collection record classified by its
+/// [`metadata::tag`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectionRecord {
+    /// Intrinsic definition of a typed collection.
+    Definition(CollectionDefinition),
+    /// Signed membership assertion whose embedded signature can be verified.
+    Commit(CollectionCommit),
+    /// Unsigned exact join equation.
+    Merge(CollectionMerge),
+    /// Unsigned exact mapping equation.
+    Derive(CollectionDerive),
+}
+
+impl CollectionRecord {
+    /// Decode a candidate archive once, then dispatch by its record-kind tag.
+    ///
+    /// Archives without a recognized collection tag return `Ok(None)` so a
+    /// heterogeneous blob store can be scanned without treating unrelated
+    /// records as errors. A recognized tag selects the exact structural
+    /// decoder for that kind.
+    pub fn decode(blob: &Blob<SimpleArchive>) -> Result<Option<Self>, RecordDecodeError> {
+        let facts = decode_archive(blob)?;
+        Self::from_tribles(&facts)
+    }
+
+    /// Classify and decode an already parsed fact set by its record-kind tag.
+    pub fn from_tribles(facts: &TribleSet) -> Result<Option<Self>, RecordDecodeError> {
+        let Some(kind) = known_record_kind(facts) else {
+            return Ok(None);
+        };
+
+        let record = if kind == KIND_COLLECTION {
+            Self::Definition(CollectionDefinition::from_tribles(facts)?)
+        } else if kind == KIND_COLLECTION_COMMIT {
+            Self::Commit(CollectionCommit::from_tribles(facts)?)
+        } else if kind == KIND_COLLECTION_MERGE {
+            Self::Merge(CollectionMerge::from_tribles(facts)?)
+        } else {
+            debug_assert_eq!(kind, KIND_COLLECTION_DERIVE);
+            Self::Derive(CollectionDerive::from_tribles(facts)?)
+        };
+        Ok(Some(record))
+    }
+
+    /// Intrinsic id of the decoded record entity.
+    pub fn id(&self) -> Id {
+        match self {
+            Self::Definition(record) => record.id(),
+            Self::Commit(record) => record.id(),
+            Self::Merge(record) => record.id(),
+            Self::Derive(record) => record.id(),
+        }
+    }
+}
+
 fn collection_fragment(scope: Id, representation: Id, recipe: Id) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION,
@@ -706,6 +774,27 @@ fn record_root_and_kind(facts: &TribleSet, expected: Id) -> Result<Id, RecordDec
         return Err(RecordDecodeError::WrongKind { expected, actual });
     }
     Ok(root)
+}
+
+fn known_record_kind(facts: &TribleSet) -> Option<Id> {
+    facts
+        .iter()
+        .filter(|fact| fact.a() == &metadata::tag.id())
+        .filter_map(|fact| {
+            (*fact.v::<GenId>())
+                .try_from_inline::<Id>()
+                .map_err(|_: IdParseError| ())
+                .ok()
+        })
+        .find(|kind| {
+            matches!(
+                *kind,
+                KIND_COLLECTION
+                    | KIND_COLLECTION_COMMIT
+                    | KIND_COLLECTION_MERGE
+                    | KIND_COLLECTION_DERIVE
+            )
+        })
 }
 
 fn one_id(
@@ -1003,9 +1092,32 @@ mod tests {
 
     #[test]
     fn transcript_and_record_roots_are_golden() {
+        let definition = CollectionDefinition::new(id(1), id(2), id(3));
         let commit = CollectionCommit::sign(&fixture_key(), id(1), hash(2), Inline::new([3; 32]));
         let merge = CollectionMerge::new(id(1), hash(2), hash(3), hash(4));
         let derive = CollectionDerive::new(id(1), id(2), hash(3), hash(4));
+
+        assert_eq!(definition.id(), id_hex!("D28DF8A2FAAABEDCD2943FD73920EECD"));
+        assert_eq!(
+            definition.to_blob().get_handle().raw,
+            hex!("51F16FDE006E9A38C68B939A20B4255BC049C1795597BF05D499634AF3CCAA9F")
+        );
+        assert_eq!(
+            definition.to_blob().bytes.len() as u64,
+            COLLECTION_DEFINITION_ARCHIVE_LEN
+        );
+        assert_eq!(
+            commit.to_blob().bytes.len() as u64,
+            COLLECTION_COMMIT_ARCHIVE_LEN
+        );
+        assert_eq!(
+            merge.to_blob().bytes.len() as u64,
+            COLLECTION_MERGE_ARCHIVE_LEN
+        );
+        assert_eq!(
+            derive.to_blob().bytes.len() as u64,
+            COLLECTION_DERIVE_ARCHIVE_LEN
+        );
 
         assert_eq!(commit.signing_transcript().len(), COMMIT_TRANSCRIPT_LEN);
         assert_eq!(commit.id(), id_hex!("1617B0DBF0B10E15C061790CC8DF0AB5"));

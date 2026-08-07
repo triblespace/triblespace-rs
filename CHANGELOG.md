@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed collection records can be discovered without a catalog or storage
+  extension.** The top-level `triblespace_core::collection` module publishes
+  the canonical archive lengths and scans ordinary `BlobStoreList` metadata,
+  fetching only candidate sizes before one `SimpleArchive` decode dispatches
+  by `metadata::tag`. Definitions and unsigned `MERGE`/`DERIVE` claims are
+  returned in intrinsic-id order; signed `COMMIT` records are included only
+  after strict Ed25519 self-signature verification, leaving key authorization
+  to caller policy. Unknown kinds and unrelated blob noise remain invisible,
+  while malformed candidate-sized known kinds and invalid signatures carry
+  handle-addressed diagnostics and list/get failures remain hard errors.
 - **The collection calculus has a wire-format-neutral executable test oracle.**
   The bounded reference model folds accepted signed `COMMIT` leaves, exact
   unsigned `MERGE`, and canonical unsigned `DERIVE` relations to their least

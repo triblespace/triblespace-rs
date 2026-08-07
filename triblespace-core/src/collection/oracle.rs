@@ -1,4 +1,4 @@
-//! Reference semantics for grow-only typed collections.
+//! Test-only reference semantics for grow-only typed collections.
 //!
 //! Signed `COMMIT` records are the only exogenous membership roots. Their
 //! authentication is deliberately opaque here: collection-specific code must
