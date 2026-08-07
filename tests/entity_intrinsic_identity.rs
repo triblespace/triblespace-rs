@@ -3,6 +3,8 @@ use triblespace::core::inline::RawInline;
 use triblespace::prelude::inlineencodings::ShortString;
 use triblespace::prelude::*;
 
+use std::collections::BTreeSet;
+
 mod fields {
     use triblespace::prelude::inlineencodings::ShortString;
     use triblespace::prelude::*;
@@ -122,4 +124,52 @@ fn explicit_entity_identity_is_unchanged() {
 fn short_string_encoding_used_by_the_oracle_is_exact() {
     let expected: Inline<ShortString> = ShortString::inline_from("alpha");
     assert_eq!(encoded("alpha"), expected.raw);
+}
+
+fn repeated_fragment(namespace: &str, count: usize) -> Fragment {
+    let values: Vec<String> = (0..count)
+        .map(|index| format!("{namespace}-{index:03}"))
+        .collect();
+    entity! {
+        fields::alpha*: values.iter().map(String::as_str),
+    }
+}
+
+fn raw_facts(set: &TribleSet) -> BTreeSet<[u8; 64]> {
+    set.iter().map(|trible| trible.data).collect()
+}
+
+fn assert_all_indexes(set: &TribleSet, expected: &BTreeSet<[u8; 64]>) {
+    for actual in [
+        set.eav.iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.eva.iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.aev.iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.ave.iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.vea.iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.vae.iter_ordered().copied().collect::<BTreeSet<_>>(),
+    ] {
+        assert_eq!(&actual, expected);
+    }
+}
+
+#[test]
+fn intrinsic_shared_leaves_survive_clone_drop_and_union() {
+    let first: TribleSet = repeated_fragment("first", 256).into_facts();
+    let second: TribleSet = repeated_fragment("second", 256).into_facts();
+    let first_raw = raw_facts(&first);
+    let second_raw = raw_facts(&second);
+    let expected: BTreeSet<_> = first_raw.union(&second_raw).copied().collect();
+
+    let surviving_clone = first.clone();
+    drop(first);
+    let union = surviving_clone + second;
+
+    let noise = vec![0xabu8; 256 * 64 * 4];
+    std::hint::black_box(&noise);
+    assert_all_indexes(&union, &expected);
+
+    let same_left: TribleSet = repeated_fragment("same", 256).into_facts();
+    let same_right: TribleSet = repeated_fragment("same", 256).into_facts();
+    let same_expected = raw_facts(&same_left);
+    assert_all_indexes(&(same_left + same_right), &same_expected);
 }
