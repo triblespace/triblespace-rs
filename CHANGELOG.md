@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Discovered collection records now resolve through a stateless production
+  semantic layer.** Callers select eligible self-signed commits and validate
+  definition-matched `COMMIT`, `MERGE`, and `DERIVE` claims through one narrow
+  callback. Accepted equations are checked for deterministic functional
+  conflicts before a least membership fixed point produces members, maximal
+  frontiers, and on-demand supporting-commit provenance without a persistent
+  registry or full transitive order matrix. A separate pure physical-cover
+  query uses active merge lineage and current residency, including overlapping
+  compactions, while never substituting source-representation bytes across a
+  derivation.
 - **The first production collection kind is canonical `SimpleArchive`
   TribleSet union.** `collection::simplearchive_union` constructs definitions,
   validates commit and merge endpoints against freshly computed Blake3
