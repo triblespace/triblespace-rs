@@ -115,6 +115,10 @@ name = "tribles_insert"
 harness = false
 
 [[bench]]
+name = "entity_intrinsic"
+harness = false
+
+[[bench]]
 name = "number_format"
 harness = false
 
