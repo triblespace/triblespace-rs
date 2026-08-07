@@ -286,6 +286,7 @@ fn lazy_store_eviction_is_safe_and_refetches() {
                 .unwrap()
                 .blobs()
                 .filter_map(Result::ok)
+                .map(|info| info.handle)
                 .filter(|h| h.raw != blobs[0].1)
                 .collect();
             store.keep(retained);

@@ -580,27 +580,22 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
     }
 }
 
-/// Payload and metadata recovered from the immutable record named by one
-/// in-memory blob index entry.
-struct IndexedBlobRecord {
-    bytes: Bytes,
-    #[cfg(test)]
-    payload_offset: usize,
+/// Header metadata recovered from the immutable record named by one in-memory
+/// blob index entry.
+struct IndexedBlobHeader {
     timestamp: u64,
+    data_offset: usize,
+    data_len: usize,
 }
 
-/// Resolves an offset-only index entry through the canonical record decoder.
-///
-/// Entries are created only after `decode_record` accepted the complete record,
-/// and `covered_len` is the exact accepted prefix captured with this mapping.
-/// A failure here therefore means bytes below an applied boundary changed,
-/// which violates Pile's append-only safety contract.
-fn indexed_blob_record(
+/// Resolves an offset-only index entry through the canonical record decoder
+/// without touching or hashing its payload.
+fn indexed_blob_header(
     mmap: &Arc<MmapRaw>,
     covered_len: usize,
     entry: IndexEntry,
     expected: &Inline<Hash<Blake3>>,
-) -> IndexedBlobRecord {
+) -> IndexedBlobHeader {
     assert!(
         entry.record_offset < covered_len,
         "blob index offset lies outside its accepted pile prefix"
@@ -632,8 +627,37 @@ fn indexed_blob_record(
         hash, *expected,
         "blob index key no longer matches its record header"
     );
+    IndexedBlobHeader {
+        timestamp,
+        data_offset,
+        data_len,
+    }
+}
+
+/// Payload and metadata recovered from the immutable record named by one
+/// in-memory blob index entry.
+struct IndexedBlobRecord {
+    bytes: Bytes,
+    #[cfg(test)]
+    payload_offset: usize,
+    timestamp: u64,
+}
+
+/// Resolves an offset-only index entry through the canonical record decoder.
+///
+/// Entries are created only after `decode_record` accepted the complete record,
+/// and `covered_len` is the exact accepted prefix captured with this mapping.
+/// A failure here therefore means bytes below an applied boundary changed,
+/// which violates Pile's append-only safety contract.
+fn indexed_blob_record(
+    mmap: &Arc<MmapRaw>,
+    covered_len: usize,
+    entry: IndexEntry,
+    expected: &Inline<Hash<Blake3>>,
+) -> IndexedBlobRecord {
+    let header = indexed_blob_header(mmap, covered_len, entry, expected);
     let bytes = unsafe {
-        let slice = slice_from_raw_parts(mmap.as_ptr().add(data_offset), data_len)
+        let slice = slice_from_raw_parts(mmap.as_ptr().add(header.data_offset), header.data_len)
             .as_ref()
             .unwrap();
         Bytes::from_raw_parts(slice, mmap.clone())
@@ -641,8 +665,8 @@ fn indexed_blob_record(
     IndexedBlobRecord {
         bytes,
         #[cfg(test)]
-        payload_offset: data_offset,
-        timestamp,
+        payload_offset: header.data_offset,
+        timestamp: header.timestamp,
     }
 }
 
@@ -812,6 +836,20 @@ impl PileReader {
             lookup,
             validations: self.validations.clone(),
         }
+    }
+
+    /// Returns unvalidated listing metadata for a resident blob.
+    ///
+    /// This reads only the already-accepted pile record header. Callers that
+    /// consume the payload must still use [`BlobStoreGet::get`].
+    pub(crate) fn blob_info(&self, handle: Inline<Handle<UnknownBlob>>) -> Option<super::BlobInfo> {
+        let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
+        let entry = *self.blobs.get(&hash.raw)?;
+        let header = indexed_blob_header(&self.mmap, self.covered_len, entry, hash);
+        Some(super::BlobInfo {
+            handle,
+            length: header.data_len as u64,
+        })
     }
 
     // metadata moved into BlobStoreMeta impl below
@@ -1349,6 +1387,7 @@ impl crate::repo::StorageFlush for Pile {
     }
 }
 
+use super::BlobInfo;
 use super::BlobStore;
 use super::BlobStoreGet;
 use super::BlobStoreList;
@@ -1398,18 +1437,22 @@ impl Iterator for PileBlobStoreIter {
     }
 }
 
-/// Adapter that yields only the blob handles from an owned PATCH snapshot.
+/// Adapter that yields blob information from an owned PATCH snapshot.
 pub struct PileBlobStoreListIter {
+    reader: PileReader,
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
 }
 
 impl Iterator for PileBlobStoreListIter {
-    type Item = Result<Inline<Handle<UnknownBlob>>, GetBlobError<Infallible>>;
+    type Item = Result<BlobInfo, GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.inner.next()?;
         let hash = Inline::<Hash<Blake3>>::new(key);
-        Some(Ok(hash.into()))
+        let handle = hash.into();
+        Some(Ok(self.reader.blob_info(handle).expect(
+            "key from PATCH iterator must resolve in the same snapshot",
+        )))
     }
 }
 
@@ -1419,6 +1462,7 @@ impl BlobStoreList for PileReader {
 
     fn blobs(&self) -> Self::Iter<'_> {
         PileBlobStoreListIter {
+            reader: self.clone(),
             inner: self.blobs.clone().into_iter(),
         }
     }
@@ -1426,6 +1470,7 @@ impl BlobStoreList for PileReader {
     /// Cheap PATCH-level set difference between two immutable reader snapshots.
     fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
         PileBlobStoreListIter {
+            reader: self.clone(),
             inner: self.blobs.difference(&old.blobs).into_iter(),
         }
     }
@@ -2665,7 +2710,7 @@ mod tests {
         let current = pile.reader().unwrap();
         let diffed: HashSet<Inline<Handle<UnknownBlob>>> = current
             .blobs_diff(&baseline)
-            .map(|r| r.expect("infallible diff iter"))
+            .map(|r| r.expect("infallible diff iter").handle)
             .collect();
 
         // Diff should equal exactly the new blobs — none of the baseline ones.
@@ -2677,7 +2722,7 @@ mod tests {
         // Round-trip sanity: diffing a reader against itself yields nothing.
         let empty: HashSet<_> = current
             .blobs_diff(&current)
-            .map(|r| r.expect("infallible"))
+            .map(|r| r.expect("infallible").handle)
             .collect();
         assert!(empty.is_empty());
 
@@ -2707,6 +2752,32 @@ mod tests {
             .unwrap()
             .as_millis() as u64;
         assert!(metadata.timestamp >= before && metadata.timestamp <= after);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn listing_reports_header_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
+
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        let first = pile
+            .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(vec![1u8; 3])))
+            .unwrap();
+        let second = pile
+            .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(vec![2u8; 17])))
+            .unwrap();
+        let reader = pile.reader().unwrap();
+        let listed: HashMap<_, _> = reader
+            .blobs()
+            .map(|result| {
+                let info = result.expect("infallible listing");
+                (info.handle, info.length)
+            })
+            .collect();
+
+        assert_eq!(listed.get(&first), Some(&3));
+        assert_eq!(listed.get(&second), Some(&17));
         pile.close().unwrap();
     }
 

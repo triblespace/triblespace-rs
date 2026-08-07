@@ -98,8 +98,8 @@ use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
 };
 use super::{
-    BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult, StorageFlush,
-    WeakPinStore,
+    BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
+    StorageFlush, WeakPinStore,
 };
 
 /// Fixed cadence at which a suspended async read re-checks the store
@@ -700,9 +700,7 @@ where
     // Not an `async fn`: the desugared form would drop the explicit
     // `Send` bound the trait contract requires.
     #[allow(clippy::manual_async_fn)]
-    fn blobs(
-        &self,
-    ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send {
+    fn blobs(&self) -> impl Future<Output = Vec<Result<BlobInfo, Self::Err>>> + Send {
         async move { self.local.blobs().collect() }
     }
 }
@@ -1205,7 +1203,13 @@ mod tests {
             .into_iter()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(listed, vec![handle]);
+        assert_eq!(
+            listed,
+            vec![BlobInfo {
+                handle,
+                length: b"through the async surface".len() as u64,
+            }]
+        );
     }
 
     // Statically assert the futures are `Send` — required by the RPITIT

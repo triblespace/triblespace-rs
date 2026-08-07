@@ -31,7 +31,10 @@ use triblespace_net::tracking::{MergeOutcome, ensure_tracking_pin, merge_trackin
 fn copy_all_blobs(src: &mut Repository<MemoryRepo>, dst: &mut Repository<MemoryRepo>) {
     use triblespace_core::blob::encodings::UnknownBlob;
     let reader = src.storage_mut().reader().expect("src reader");
-    let handles: Vec<_> = reader.blobs().filter_map(|r| r.ok()).collect();
+    let handles: Vec<_> = reader
+        .blobs()
+        .filter_map(|r| r.ok().map(|info| info.handle))
+        .collect();
     for handle in handles {
         let bytes: anybytes::Bytes = reader
             .get::<anybytes::Bytes, UnknownBlob>(handle)

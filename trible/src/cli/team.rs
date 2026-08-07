@@ -639,7 +639,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
         use triblespace_core::blob::TryFromBlob;
         for handle_result in reader.blobs() {
             let handle = match handle_result {
-                Ok(h) => h,
+                Ok(info) => info.handle,
                 Err(_) => continue,
             };
             let typed_handle: Inline<Handle<SimpleArchive>> = Inline::new(handle.raw);

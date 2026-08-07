@@ -11,7 +11,7 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     use triblespace::core::blob::Bytes;
     use triblespace::core::repo::async_store::Blocking;
     use triblespace::core::repo::objectstore::ObjectStoreRemote;
-    use triblespace::core::repo::{BlobStoreForget, BlobStoreMeta};
+    use triblespace::core::repo::{BlobStoreForget, BlobStoreList, BlobStoreMeta};
 
     use triblespace::prelude::BlobStorePut;
 
@@ -32,6 +32,10 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     assert!(meta.is_some());
     let meta = meta.unwrap();
     assert_eq!(meta.length, contents.len() as u64);
+    let listed: Vec<_> = reader.blobs().collect::<Result<_, _>>()?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].handle, handle);
+    assert_eq!(listed[0].length, contents.len() as u64);
 
     // forget removes the blob and is idempotent
     remote.forget(handle)?;

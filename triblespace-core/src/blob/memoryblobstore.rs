@@ -6,6 +6,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::INLINE_LEN;
 use crate::patch::{Entry, IdentitySchema, PATCH};
+use crate::repo::BlobInfo;
 use crate::repo::BlobStore;
 use crate::repo::BlobStoreGet;
 use crate::repo::BlobStoreKeep;
@@ -265,17 +266,20 @@ impl Iterator for MemoryBlobStoreIter {
     }
 }
 
-/// Adapter over [`MemoryBlobStoreIter`] that yields only blob handles.
+/// Adapter over [`MemoryBlobStoreIter`] that yields blob information.
 pub struct MemoryBlobStoreListIter {
     inner: MemoryBlobStoreIter,
 }
 
 impl Iterator for MemoryBlobStoreListIter {
-    type Item = Result<Inline<Handle<UnknownBlob>>, Infallible>;
+    type Item = Result<BlobInfo, Infallible>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (handle, _) = self.inner.next()?;
-        Some(Ok(handle))
+        let (handle, blob) = self.inner.next()?;
+        Some(Ok(BlobInfo {
+            handle,
+            length: blob.bytes.len() as u64,
+        }))
     }
 }
 
@@ -400,6 +404,28 @@ mod tests {
         // A fresh reader sees both.
         let fresh = store.reader().unwrap();
         assert_eq!(fresh.len(), 2);
+    }
+
+    #[test]
+    fn listing_reports_stored_lengths() {
+        let mut store = MemoryBlobStore::new();
+        let handle = store
+            .put::<LongString, _>(Bytes::from_source("hello".to_string()).view().unwrap())
+            .unwrap();
+
+        let listed: Vec<_> = store
+            .reader()
+            .unwrap()
+            .blobs()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            listed,
+            vec![crate::repo::BlobInfo {
+                handle: handle.transmute(),
+                length: 5,
+            }]
+        );
     }
 
     /// `union` structurally merges two stores; handles round-trip.

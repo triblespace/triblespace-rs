@@ -64,8 +64,9 @@ pub fn run(cmd: Command) -> Result<()> {
                 let reader = pile
                     .reader()
                     .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
-                for handle in reader.blobs() {
-                    let handle: triblespace_core::inline::Inline<Handle<UnknownBlob>> = handle?;
+                for info in reader.blobs() {
+                    let handle: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
+                        info?.handle;
                     let hash: triblespace_core::inline::Inline<Hash<Blake3>> =
                         Handle::to_hash(handle);
                     let string: String = hash.from_inline();

@@ -49,8 +49,8 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     let mut replica = MemoryRepo::default();
     {
         let src = repo_a.storage_mut().reader().expect("source reader");
-        for handle in src.blobs() {
-            let handle = handle.expect("blob handle");
+        for info in src.blobs() {
+            let handle = info.expect("blob handle").handle;
             if handle.raw == content_handle.raw {
                 continue; // withhold the content blob
             }

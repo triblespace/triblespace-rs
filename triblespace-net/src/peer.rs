@@ -442,14 +442,14 @@ where
             if self.direction != SyncDirection::ReadOnly {
                 match self.last_blob_reader.as_ref() {
                     Some(baseline) => {
-                        for handle in current.blobs_diff(baseline).flatten() {
-                            self.sender.announce(handle.raw);
+                        for info in current.blobs_diff(baseline).flatten() {
+                            self.sender.announce(info.handle.raw);
                         }
                     }
                     None => {
                         use triblespace_core::repo::BlobStoreList;
-                        for handle in current.blobs().filter_map(Result::ok) {
-                            self.sender.announce(handle.raw);
+                        for info in current.blobs().filter_map(Result::ok) {
+                            self.sender.announce(info.handle.raw);
                         }
                     }
                 }

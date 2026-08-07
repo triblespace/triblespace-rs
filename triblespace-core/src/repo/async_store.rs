@@ -30,13 +30,12 @@ use std::fmt::Debug;
 use std::future::Future;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
-    BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
+    BlobInfo, BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
     BlobStorePut, PinStore, PushResult,
 };
 // Only used by the `object-store`-gated `Blocking` impls below.
@@ -106,10 +105,8 @@ pub trait AsyncBlobStoreList {
     /// Error type for listing operations.
     type Err: Error + Debug + Send + Sync + 'static;
 
-    /// List all blob handles in the store.
-    fn blobs(
-        &self,
-    ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send;
+    /// List lightweight information for every blob in the store.
+    fn blobs(&self) -> impl Future<Output = Vec<Result<BlobInfo, Self::Err>>> + Send;
 }
 
 /// Async counterpart of [`BlobStore`]: combined
@@ -280,9 +277,7 @@ where
 {
     type Err = S::Err;
 
-    fn blobs(
-        &self,
-    ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send {
+    fn blobs(&self) -> impl Future<Output = Vec<Result<BlobInfo, Self::Err>>> + Send {
         // The borrowed iterator is created and drained inside the
         // future (no await), so only `&self` (Send iff S: Sync) is held.
         async move { self.0.blobs().collect() }
@@ -475,7 +470,7 @@ impl<A: AsyncBlobStoreGet> BlobStoreGet for Blocking<A> {
 #[cfg(feature = "object-store")]
 impl<A: AsyncBlobStoreList> BlobStoreList for Blocking<A> {
     type Iter<'a>
-        = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, A::Err>>
+        = std::vec::IntoIter<Result<BlobInfo, A::Err>>
     where
         A: 'a;
     type Err = A::Err;
@@ -637,7 +632,7 @@ mod tests {
         let listed: Vec<_> = block_on(reader.blobs())
             .into_iter()
             .filter_map(Result::ok)
-            .map(|h| h.raw)
+            .map(|info| info.handle.raw)
             .collect();
         assert!(listed.contains(&h1.raw) && listed.contains(&h2.raw));
     }
@@ -671,7 +666,7 @@ mod tests {
         let listed: Vec<_> = reader
             .blobs()
             .filter_map(Result::ok)
-            .map(|h| h.raw)
+            .map(|info| info.handle.raw)
             .collect();
         assert!(listed.contains(&h.raw));
     }

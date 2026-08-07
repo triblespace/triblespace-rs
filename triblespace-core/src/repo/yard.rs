@@ -28,8 +28,8 @@ use crate::prelude::blobencodings::SimpleArchive;
 
 use super::pile::{GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError};
 use super::{
-    reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    PinStore, PushResult, StorageClose, TransferError, WeakPinStore,
+    reachable, transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList,
+    BlobStorePut, PinStore, PushResult, StorageClose, TransferError, WeakPinStore,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -925,22 +925,27 @@ impl BlobStoreList for YardReader {
     fn blobs(&self) -> Self::Iter<'_> {
         YardListIter {
             inner: self.live_set().into_iter(),
+            generations: self.generations.clone(),
         }
     }
 }
 
 pub struct YardListIter {
     inner: crate::patch::PATCHIntoIterator<INLINE_LEN, IdentitySchema, ()>,
+    generations: Vec<YardGenerationReader>,
 }
 
 impl Iterator for YardListIter {
-    type Item = Result<Inline<Handle<UnknownBlob>>, Infallible>;
+    type Item = Result<BlobInfo, Infallible>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(Inline::<Handle<UnknownBlob>>::new)
-            .map(Ok)
+        let handle = Inline::<Handle<UnknownBlob>>::new(self.inner.next()?);
+        let info = self
+            .generations
+            .iter()
+            .find_map(|generation| generation.reader.blob_info(handle))
+            .expect("live Yard handle must resolve in one generation snapshot");
+        Some(Ok(info))
     }
 }
 
@@ -950,13 +955,11 @@ fn update_err_io(err: PileWriteError) -> YardOpenError {
     }
 }
 
-fn collect_list<E>(
-    iter: impl IntoIterator<Item = Result<Inline<Handle<UnknownBlob>>, E>>,
-) -> Result<HandleSet, E> {
+fn collect_list<E>(iter: impl IntoIterator<Item = Result<BlobInfo, E>>) -> Result<HandleSet, E> {
     let mut set = HandleSet::new();
     for result in iter {
-        let handle = result?;
-        set.insert(&Entry::new(&handle.raw));
+        let info = result?;
+        set.insert(&Entry::new(&info.handle.raw));
     }
     Ok(set)
 }
@@ -1218,6 +1221,14 @@ mod tests {
         let reader = yard.reader().unwrap();
 
         assert_eq!(get_raw(&reader, old).unwrap(), raw_blob(b"old generation"));
+        let info = reader
+            .blobs()
+            .find_map(|result| {
+                let info = result.unwrap();
+                (info.handle.raw == old.raw).then_some(info)
+            })
+            .expect("older generation is listed");
+        assert_eq!(info.length, b"old generation".len() as u64);
     }
 
     #[test]

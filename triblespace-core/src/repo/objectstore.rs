@@ -19,7 +19,6 @@ use url::Url;
 
 use hex::FromHex;
 
-use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
@@ -36,8 +35,8 @@ use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
     AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncPinStore,
 };
-use super::BlobMetadata;
 use super::PushResult;
+use super::{BlobInfo, BlobMetadata};
 
 const BRANCH_INFIX: &str = "branches";
 const BLOB_INFIX: &str = "blobs";
@@ -404,9 +403,7 @@ impl AsyncBlobStoreGet for ObjectStoreReader {
 impl AsyncBlobStoreList for ObjectStoreReader {
     type Err = ListBlobsErr;
 
-    fn blobs(
-        &self,
-    ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send {
+    fn blobs(&self) -> impl Future<Output = Vec<Result<BlobInfo, Self::Err>>> + Send {
         async move {
             let prefix = self.prefix.child(BLOB_INFIX);
             let stream = self.store.list(Some(&prefix)).map(|r| match r {
@@ -417,7 +414,10 @@ impl AsyncBlobStoreList for ObjectStoreReader {
                         .ok_or(ListBlobsErr::NotAFile("no filename"))?;
                     let digest =
                         RawInline::from_hex(blob_name).map_err(ListBlobsErr::BadNameHex)?;
-                    Ok(Inline::new(digest))
+                    Ok(BlobInfo {
+                        handle: Inline::new(digest),
+                        length: meta.size,
+                    })
                 }
                 Err(e) => Err(ListBlobsErr::List(e)),
             });

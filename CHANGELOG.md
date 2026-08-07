@@ -73,6 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: blob enumeration now returns lightweight handle-and-length
+  metadata.** Sync and async `BlobStoreList` implementations yield `BlobInfo`
+  values containing the content handle and storage-observed payload length.
+  Memory stores reuse their resident byte length, piles read `data_len` from
+  accepted record headers without hashing payloads, and object stores reuse
+  LIST response sizes without issuing one HEAD per object. The length is an
+  unvalidated enumeration hint; accepting typed content still requires
+  `BlobStoreGet`, while point `BlobStoreMeta` semantics remain unchanged.
+
 - **Breaking: Identity Epoch 2 redefines every implicit entity root from its
   canonical trible rows.** `entity!`, the JSON object importer, and non-orphan
   N-Triples blank nodes now share one protocol: encode each defining fact as

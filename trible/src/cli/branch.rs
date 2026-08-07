@@ -53,7 +53,13 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
                 // The transfer API now takes an explicit iterator of handles to
                 // copy. Use the reader's blobs() listing and filter out any
                 // listing errors so we have a plain iterator of handles.
-                for r in repo::transfer(&reader, &mut remote, reader.blobs().filter_map(|r| r.ok()))
+                for r in repo::transfer(
+                    &reader,
+                    &mut remote,
+                    reader
+                        .blobs()
+                        .filter_map(|r| r.ok().map(|info| info.handle)),
+                )
                 // TODO: We should log these errors to stderr.
                 {
                     r?;
@@ -100,7 +106,13 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
                 // Copy all blobs reported by the remote reader into the local
                 // pile. Ignore transient listing errors and rely on transfer()
                 // to surface actual copy failures.
-                for r in repo::transfer(&reader, &mut pile, reader.blobs().filter_map(|r| r.ok())) {
+                for r in repo::transfer(
+                    &reader,
+                    &mut pile,
+                    reader
+                        .blobs()
+                        .filter_map(|r| r.ok().map(|info| info.handle)),
+                ) {
                     // TODO: We should log these errors to stderr.
                     r?;
                 }

@@ -319,7 +319,7 @@ async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunRep
     let mut b_blobs: Vec<[u8; 32]> = reader
         .blobs()
         .filter_map(|r| r.ok())
-        .map(|h| h.raw)
+        .map(|info| info.handle.raw)
         .collect();
     b_blobs.sort();
 

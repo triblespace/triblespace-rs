@@ -71,12 +71,12 @@ pub fn run(cmd: Command) -> Result<()> {
 
             for item_res in reader.blobs() {
                 match item_res {
-                    Ok(handle_val) => {
+                    Ok(info) => {
                         let hash: triblespace_core::inline::Inline<
                             triblespace_core::inline::encodings::hash::Hash<
                                 triblespace_core::inline::encodings::hash::Blake3,
                             >,
-                        > = Handle::to_hash(handle_val);
+                        > = Handle::to_hash(info.handle);
                         let string: String = hash.from_inline();
                         println!("{}", string);
                     }

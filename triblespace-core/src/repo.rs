@@ -288,10 +288,23 @@ fn carried_head_facts(base_meta: &TribleSet, branch_id: Id) -> TribleSet {
         .expect("branch metadata was validated before rebuild")
 }
 
+/// Lightweight information returned while enumerating a blob store.
+///
+/// `length` is storage-observed metadata, not proof that the bytes decode to
+/// the encoding named by a subsequently typed handle. Consumers that accept a
+/// blob as data must still retrieve and validate it through [`BlobStoreGet`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobInfo {
+    /// Content-addressed handle recorded by the store.
+    pub handle: Inline<Handle<UnknownBlob>>,
+    /// Stored payload length in bytes.
+    pub length: u64,
+}
+
 /// The `ListBlobs` trait is used to list all blobs in a repository.
 pub trait BlobStoreList {
-    /// Iterator over blob handles in the store.
-    type Iter<'a>: Iterator<Item = Result<Inline<Handle<UnknownBlob>>, Self::Err>>
+    /// Iterator over lightweight blob information in the store.
+    type Iter<'a>: Iterator<Item = Result<BlobInfo, Self::Err>>
     where
         Self: 'a;
     /// Error type for listing operations.
@@ -1483,8 +1496,8 @@ where
     ) -> Result<Option<Workspace<Storage>>, PushError<Storage>> {
         // 1. Sync `workspace.staged` to repository's BlobStore.
         let workspace_reader = workspace.staged.reader().unwrap();
-        for handle in workspace_reader.blobs() {
-            let handle = handle.expect("infallible blob enumeration");
+        for info in workspace_reader.blobs() {
+            let handle = info.expect("infallible blob enumeration").handle;
             let blob: Blob<UnknownBlob> =
                 workspace_reader.get(handle).expect("infallible blob read");
             self.storage
@@ -2643,7 +2656,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         //    branch state.
         let other_local = other.staged.reader().unwrap();
         for r in other_local.blobs() {
-            let handle = r.expect("infallible blob enumeration");
+            let handle = r.expect("infallible blob enumeration").handle;
             let blob: Blob<UnknownBlob> = other_local.get(handle).expect("infallible blob read");
             self.staged
                 .put::<UnknownBlob, _>(blob)
