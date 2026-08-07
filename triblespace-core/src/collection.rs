@@ -7,6 +7,8 @@
 
 pub mod discovery;
 pub mod records;
+/// Canonical `SimpleArchive` set-union collection kind.
+pub mod simplearchive_union;
 
 pub use discovery::*;
 pub use records::*;

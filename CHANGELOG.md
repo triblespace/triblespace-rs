@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The first production collection kind is canonical `SimpleArchive`
+  TribleSet union.** `collection::simplearchive_union` constructs definitions,
+  validates commit and merge endpoints against freshly computed Blake3
+  identities, and validates or computes exact set unions directly over sorted
+  64-byte rows without constructing PATCH indexes. The version-1 recipe ID
+  `6D64C5F4B9E9B73F57C5F8702AB7FE45` was minted with `trible genid` on
+  2026-08-07 and names the union law independently of this implementation.
 - **Typed collection records can be discovered without a catalog or storage
   extension.** The top-level `triblespace_core::collection` module publishes
   the canonical archive lengths and scans ordinary `BlobStoreList` metadata,
