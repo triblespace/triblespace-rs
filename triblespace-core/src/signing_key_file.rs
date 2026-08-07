@@ -13,12 +13,20 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use zeroize::Zeroizing;
 
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::mem::MaybeUninit;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -29,8 +37,8 @@ pub const KEY_PATH_ENV: &str = "TRIBLESPACE_KEY";
 pub const DEFAULT_KEY_FILE_NAME: &str = "self.key";
 
 const ENCODED_SEED_LEN: usize = 64;
+const TEMP_NONCE_LEN: usize = 16;
 const TEMP_ATTEMPTS: u64 = 128;
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Filesystem operation associated with an [`Error::Io`] failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,21 +199,12 @@ pub fn resolve_path(explicit: Option<&Path>, pile: &Path) -> PathBuf {
 /// grant no permissions to group or world. Missing files are ordinary typed
 /// I/O errors; this function never creates or substitutes a key.
 pub fn load_existing(path: &Path) -> Result<SigningKey, Error> {
-    let path_metadata =
-        fs::symlink_metadata(path).map_err(|source| Error::io(Operation::Inspect, path, source))?;
-    if !path_metadata.file_type().is_file() {
-        return Err(Error::NotRegularFile {
-            path: path.to_owned(),
-        });
-    }
+    let (parent_path, file_name) = destination_parts(path)?;
+    let parent = ParentDirectory::open(parent_path, path)?;
+    parent.load_existing(file_name, path)
+}
 
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let mut file = options
-        .open(path)
-        .map_err(|source| Error::io(Operation::Open, path, source))?;
+fn decode_signing_key(mut file: File, path: &Path) -> Result<SigningKey, Error> {
     let metadata = file
         .metadata()
         .map_err(|source| Error::io(Operation::Inspect, path, source))?;
@@ -232,7 +231,7 @@ pub fn load_existing(path: &Path) -> Result<SigningKey, Error> {
         });
     }
 
-    let mut encoded = [0u8; ENCODED_SEED_LEN + 1];
+    let mut encoded = Zeroizing::new([0u8; ENCODED_SEED_LEN + 1]);
     let mut length = 0;
     while length < encoded.len() {
         let read = file
@@ -244,23 +243,18 @@ pub fn load_existing(path: &Path) -> Result<SigningKey, Error> {
         length += read;
     }
     if length != ENCODED_SEED_LEN {
-        encoded.fill(0);
         return Err(Error::InvalidFormat {
             path: path.to_owned(),
         });
     }
 
-    let mut seed = [0u8; 32];
-    if hex::decode_to_slice(&encoded[..ENCODED_SEED_LEN], &mut seed).is_err() {
-        encoded.fill(0);
-        seed.fill(0);
+    let mut seed = Zeroizing::new([0u8; 32]);
+    if hex::decode_to_slice(&encoded[..ENCODED_SEED_LEN], &mut seed[..]).is_err() {
         return Err(Error::InvalidFormat {
             path: path.to_owned(),
         });
     }
-    encoded.fill(0);
     let key = SigningKey::from_bytes(&seed);
-    seed.fill(0);
     Ok(key)
 }
 
@@ -270,50 +264,309 @@ pub fn load_existing(path: &Path) -> Result<SigningKey, Error> {
 /// written to a same-directory mode-0600 temporary file and synced before an
 /// atomic hard-link installation. Concurrent initializers race only at that
 /// no-replace installation point; losers discard their temporary file, sync
-/// the parent directory, and strictly load the winner.
+/// the parent directory, and strictly load the winner. On Unix, initialization
+/// opens the lexical parent once and performs every child operation relative to
+/// that stable directory handle, so a concurrent rename or symlink retarget
+/// cannot redirect later stages of the transaction.
 pub fn init(path: &Path) -> Result<SigningKey, Error> {
-    match load_existing(path) {
-        Ok(key) => return Ok(key),
+    init_with_hook(path, |_| {})
+}
+
+fn init_with_hook<F>(path: &Path, before_install: F) -> Result<SigningKey, Error>
+where
+    F: FnOnce(&OsStr),
+{
+    let (parent_path, file_name) = destination_parts(path)?;
+    let parent = ParentDirectory::open(parent_path, path)?;
+
+    match parent.load_existing(file_name, path) {
+        Ok(key) => {
+            parent
+                .sync()
+                .map_err(|source| Error::io(Operation::SyncParent, path, source))?;
+            return Ok(key);
+        }
         Err(error) if error.is_not_found() => {}
         Err(error) => return Err(error),
     }
 
-    let (parent, file_name) = destination_parts(path)?;
-    let mut seed = [0u8; 32];
+    let mut seed = Zeroizing::new([0u8; 32]);
     OsRng
-        .try_fill_bytes(&mut seed)
+        .try_fill_bytes(&mut seed[..])
         .map_err(|source| Error::Entropy { source })?;
-    let key = SigningKey::from_bytes(&seed);
-    let mut encoded = [0u8; ENCODED_SEED_LEN];
+    let mut encoded = Zeroizing::new([0u8; ENCODED_SEED_LEN]);
     encode_hex(&seed, &mut encoded);
-    seed.fill(0);
+    drop(seed);
 
-    let (mut temporary, mut guard) = create_temporary(path, parent, file_name)?;
-    temporary
-        .write_all(&encoded)
-        .map_err(|source| Error::io(Operation::WriteTemporary, path, source))?;
-    encoded.fill(0);
-    temporary
-        .sync_all()
-        .map_err(|source| Error::io(Operation::SyncTemporary, path, source))?;
+    let (mut temporary, guard) = create_temporary(path, &parent, file_name)?;
+    let write_result = temporary
+        .write_all(&encoded[..])
+        .map_err(|source| Error::io(Operation::WriteTemporary, path, source));
+    drop(encoded);
+    if let Err(error) = write_result {
+        drop(temporary);
+        return cleanup_after_error(error, guard, &parent, path);
+    }
+
+    if let Err(source) = temporary.sync_all() {
+        drop(temporary);
+        return cleanup_after_error(
+            Error::io(Operation::SyncTemporary, path, source),
+            guard,
+            &parent,
+            path,
+        );
+    }
     drop(temporary);
 
-    let installed = match fs::hard_link(guard.path(), path) {
-        Ok(()) => true,
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => false,
-        Err(source) => return Err(Error::io(Operation::Install, path, source)),
+    before_install(guard.name());
+
+    match parent.install(guard.name(), file_name) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return cleanup_after_error(
+                Error::io(Operation::Install, path, source),
+                guard,
+                &parent,
+                path,
+            );
+        }
     };
 
-    guard
-        .remove()
-        .map_err(|source| Error::io(Operation::RemoveTemporary, path, source))?;
-    sync_parent(parent, path)?;
+    cleanup_temporary(guard, &parent, path)?;
 
-    if installed {
-        Ok(key)
-    } else {
-        load_existing(path)
+    // Reload through the same parent handle for both the creator and a racing
+    // loser. Besides applying the strict loader uniformly, this ensures the
+    // returned key is the one actually installed at the stable destination.
+    parent.load_existing(file_name, path)
+}
+
+/// An opened parent directory used as the stable authority for child names.
+///
+/// On Unix, every child lookup and mutation is relative to `file`, so replacing
+/// or retargeting the lexical parent after this handle is opened cannot redirect
+/// any later stage of initialization.
+struct ParentDirectory {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl ParentDirectory {
+    fn open(parent: &Path, destination: &Path) -> Result<Self, Error> {
+        let directory_path = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+
+        #[cfg(unix)]
+        {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
+            let file = options
+                .open(directory_path)
+                .map_err(|source| Error::io(Operation::OpenParent, destination, source))?;
+            Ok(Self { file })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let metadata = fs::metadata(directory_path)
+                .map_err(|source| Error::io(Operation::OpenParent, destination, source))?;
+            if !metadata.is_dir() {
+                return Err(Error::io(
+                    Operation::OpenParent,
+                    destination,
+                    io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        "parent path is not a directory",
+                    ),
+                ));
+            }
+            Ok(Self {
+                path: directory_path.to_owned(),
+            })
+        }
     }
+
+    fn load_existing(&self, file_name: &OsStr, destination: &Path) -> Result<SigningKey, Error> {
+        #[cfg(unix)]
+        {
+            let file_name = unix_name(file_name)
+                .map_err(|source| Error::io(Operation::Inspect, destination, source))?;
+            let mut status = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `file_name` is NUL-terminated, `status` points to writable
+            // storage, and `self.file` owns a live directory descriptor.
+            let result = unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    file_name.as_ptr(),
+                    status.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == -1 {
+                return Err(Error::io(
+                    Operation::Inspect,
+                    destination,
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: a successful `fstatat` initialized `status`.
+            let status = unsafe { status.assume_init() };
+            if status.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return Err(Error::NotRegularFile {
+                    path: destination.to_owned(),
+                });
+            }
+
+            // SAFETY: the arguments remain valid for the duration of the call.
+            let descriptor = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    file_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )
+            };
+            if descriptor == -1 {
+                let source = io::Error::last_os_error();
+                if source.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(Error::NotRegularFile {
+                        path: destination.to_owned(),
+                    });
+                }
+                return Err(Error::io(Operation::Open, destination, source));
+            }
+            // SAFETY: `openat` returned a new owned descriptor.
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            decode_signing_key(file, destination)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(file_name);
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| Error::io(Operation::Inspect, destination, source))?;
+            if !metadata.file_type().is_file() {
+                return Err(Error::NotRegularFile {
+                    path: destination.to_owned(),
+                });
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|source| Error::io(Operation::Open, destination, source))?;
+            decode_signing_key(file, destination)
+        }
+    }
+
+    fn create_new(&self, file_name: &OsStr) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            let file_name = unix_name(file_name)?;
+            // SAFETY: the arguments remain valid for the duration of the call.
+            let descriptor = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    file_name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+            if descriptor == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `openat` returned a new owned descriptor.
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.path.join(file_name))
+        }
+    }
+
+    fn install(&self, temporary_name: &OsStr, destination_name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let temporary_name = unix_name(temporary_name)?;
+            let destination_name = unix_name(destination_name)?;
+            // SAFETY: both names are NUL-terminated and the directory
+            // descriptor stays live across the call.
+            let result = unsafe {
+                libc::linkat(
+                    self.file.as_raw_fd(),
+                    temporary_name.as_ptr(),
+                    self.file.as_raw_fd(),
+                    destination_name.as_ptr(),
+                    0,
+                )
+            };
+            if result == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::hard_link(
+                self.path.join(temporary_name),
+                self.path.join(destination_name),
+            )
+        }
+    }
+
+    fn remove(&self, file_name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let file_name = unix_name(file_name)?;
+            // SAFETY: `file_name` is NUL-terminated and the directory
+            // descriptor stays live across the call.
+            let result = unsafe { libc::unlinkat(self.file.as_raw_fd(), file_name.as_ptr(), 0) };
+            if result == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::remove_file(self.path.join(file_name))
+        }
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.file.sync_all()
+        }
+
+        #[cfg(not(unix))]
+        {
+            File::open(&self.path)?.sync_all()
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_name(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL"))
 }
 
 fn destination_parts(path: &Path) -> Result<(&Path, &OsStr), Error> {
@@ -322,35 +575,43 @@ fn destination_parts(path: &Path) -> Result<(&Path, &OsStr), Error> {
             path: path.to_owned(),
         });
     };
+    #[cfg(unix)]
+    if file_name.as_bytes().contains(&0) {
+        return Err(Error::InvalidPath {
+            path: path.to_owned(),
+        });
+    }
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     Ok((parent, file_name))
 }
 
-fn create_temporary(
+fn create_temporary<'a>(
     destination: &Path,
-    parent: &Path,
+    parent: &'a ParentDirectory,
     file_name: &OsStr,
-) -> Result<(File, TemporaryGuard), Error> {
+) -> Result<(File, TemporaryGuard<'a>), Error> {
     for _ in 0..TEMP_ATTEMPTS {
-        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let mut nonce = Zeroizing::new([0u8; TEMP_NONCE_LEN]);
+        OsRng
+            .try_fill_bytes(&mut nonce[..])
+            .map_err(|source| Error::Entropy { source })?;
         let mut temporary_name = OsString::from(".");
         temporary_name.push(file_name);
-        temporary_name.push(format!(".tmp.{}.{serial}", std::process::id()));
-        let temporary_path = parent.join(temporary_name);
+        temporary_name.push(format!(".tmp.{}.", std::process::id()));
+        temporary_name.push(hex::encode(&nonce[..]));
 
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        match options.open(&temporary_path) {
+        match parent.create_new(&temporary_name) {
             Ok(file) => {
+                let mut guard = TemporaryGuard::new(parent, temporary_name);
                 #[cfg(unix)]
-                file.set_permissions(fs::Permissions::from_mode(0o600))
-                    .map_err(|source| {
-                        let _ = fs::remove_file(&temporary_path);
-                        Error::io(Operation::SetPermissions, destination, source)
-                    })?;
-                return Ok((file, TemporaryGuard::new(temporary_path)));
+                if let Err(source) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    drop(file);
+                    let _ = guard.remove();
+                    drop(guard);
+                    let _ = parent.sync();
+                    return Err(Error::io(Operation::SetPermissions, destination, source));
+                }
+                return Ok((file, guard));
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
@@ -363,17 +624,36 @@ fn create_temporary(
     })
 }
 
-fn sync_parent(parent: &Path, destination: &Path) -> Result<(), Error> {
-    let directory_path = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    let directory = File::open(directory_path)
-        .map_err(|source| Error::io(Operation::OpenParent, destination, source))?;
-    directory
-        .sync_all()
-        .map_err(|source| Error::io(Operation::SyncParent, destination, source))
+fn cleanup_after_error<T>(
+    original: Error,
+    guard: TemporaryGuard<'_>,
+    parent: &ParentDirectory,
+    destination: &Path,
+) -> Result<T, Error> {
+    match cleanup_temporary(guard, parent, destination) {
+        Ok(()) => Err(original),
+        Err(cleanup) => Err(cleanup),
+    }
+}
+
+fn cleanup_temporary(
+    mut guard: TemporaryGuard<'_>,
+    parent: &ParentDirectory,
+    destination: &Path,
+) -> Result<(), Error> {
+    let removal = guard
+        .remove()
+        .map_err(|source| Error::io(Operation::RemoveTemporary, destination, source));
+
+    // If the reported removal failed, let Drop retry while the same directory
+    // handle is still live. Sync only after that retry so any successful
+    // cleanup is itself durable.
+    drop(guard);
+    let sync = parent
+        .sync()
+        .map_err(|source| Error::io(Operation::SyncParent, destination, source));
+
+    removal.and(sync)
 }
 
 fn encode_hex(seed: &[u8; 32], encoded: &mut [u8; ENCODED_SEED_LEN]) {
@@ -384,31 +664,36 @@ fn encode_hex(seed: &[u8; 32], encoded: &mut [u8; ENCODED_SEED_LEN]) {
     }
 }
 
-struct TemporaryGuard {
-    path: PathBuf,
+struct TemporaryGuard<'a> {
+    parent: &'a ParentDirectory,
+    name: OsString,
     armed: bool,
 }
 
-impl TemporaryGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+impl<'a> TemporaryGuard<'a> {
+    fn new(parent: &'a ParentDirectory, name: OsString) -> Self {
+        Self {
+            parent,
+            name,
+            armed: true,
+        }
     }
 
-    fn path(&self) -> &Path {
-        &self.path
+    fn name(&self) -> &OsStr {
+        &self.name
     }
 
     fn remove(&mut self) -> io::Result<()> {
-        fs::remove_file(&self.path)?;
+        self.parent.remove(&self.name)?;
         self.armed = false;
         Ok(())
     }
 }
 
-impl Drop for TemporaryGuard {
+impl Drop for TemporaryGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = fs::remove_file(&self.path);
+            let _ = self.parent.remove(&self.name);
         }
     }
 }
@@ -570,6 +855,45 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_keeps_one_parent_when_lexical_symlink_is_retargeted() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let redirected = directory.path().join("redirected");
+        let lexical = directory.path().join("lexical");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&redirected).unwrap();
+        symlink(&original, &lexical).unwrap();
+
+        let lexical_key = lexical.join("retargeted.key");
+        let initialized = init_with_hook(&lexical_key, |_| {
+            fs::remove_file(&lexical).unwrap();
+            symlink(&redirected, &lexical).unwrap();
+        })
+        .unwrap();
+
+        let original_key = original.join("retargeted.key");
+        assert_eq!(
+            initialized.to_bytes(),
+            load_existing(&original_key).unwrap().to_bytes()
+        );
+        assert!(!redirected.join("retargeted.key").exists());
+        assert!(!lexical_key.exists());
+
+        for parent in [&original, &redirected] {
+            assert!(fs::read_dir(parent).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+            }));
+        }
     }
 
     #[test]

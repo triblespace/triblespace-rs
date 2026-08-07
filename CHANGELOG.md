@@ -14,8 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a pile without following symlinks during resolution; load only regular,
   exact 64-hex seed files with private Unix permissions; and explicitly
   initialize a mode-0600 file through a synced same-directory temporary and an
-  atomic no-replace install. Concurrent initializers load the winning key,
-  while ordinary loads never create or silently substitute an identity.
+  atomic no-replace install. Unix initialization pins one parent-directory
+  handle across creation, installation, cleanup, and winner loading, so a
+  concurrent rename or symlink retarget cannot redirect the transaction.
+  Concurrent initializers load the winning key, while ordinary loads never
+  create or silently substitute an identity.
 - **Self-contained fragments can be published directly into a collection.**
   The `SimpleArchive` union kind absorbs every blob embedded by content and
   metadata `Fragment`s, archives their facts, and places those dependencies
