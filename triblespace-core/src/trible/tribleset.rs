@@ -8,7 +8,9 @@ use crate::inline::Inline;
 use crate::query::TriblePattern;
 
 use crate::id::Id;
+use crate::id::RawId;
 use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::Blake3;
 use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
@@ -20,6 +22,7 @@ use crate::trible::AEVOrder;
 use crate::trible::AVEOrder;
 use crate::trible::EAVOrder;
 use crate::trible::EVAOrder;
+use crate::trible::IntrinsicEntityRow;
 use crate::trible::Trible;
 use crate::trible::VAEOrder;
 use crate::trible::VEAOrder;
@@ -30,6 +33,40 @@ use std::iter::Map;
 use std::ops::Add;
 use std::ops::AddAssign;
 use std::sync::Arc;
+use zerocopy::IntoBytes;
+
+/// Canonicalizes and stores the facts of one content-derived entity.
+///
+/// Each input row has the shape `NIL || attribute || value`. Rows are sorted
+/// and deduplicated, then their complete contiguous 64-byte representations
+/// are hashed with BLAKE3. The final 16 digest bytes become the entity id and
+/// are written into every row in place before ordinary shared PATCH leaves are
+/// constructed from the canonical rows.
+///
+/// The leading NIL bytes deliberately participate in the hash. Consequently
+/// this identity scheme is not compatible with the historical `A || V`
+/// stream used by `entity!`.
+#[doc(hidden)]
+pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleSet) {
+    rows.sort_unstable();
+    rows.dedup();
+
+    let digest = Blake3::digest(rows.as_slice().as_bytes());
+    let mut raw_id: RawId = [0; crate::id::ID_LEN];
+    raw_id.copy_from_slice(&digest[digest.len() - crate::id::ID_LEN..]);
+    let id = Id::new(raw_id).expect("BLAKE3-derived entity ids must be non-nil");
+
+    for row in &mut rows {
+        row.fill_entity(id);
+    }
+
+    let mut set = TribleSet::new();
+    for row in &rows {
+        set.insert(Trible::as_transmute_raw_unchecked(row.raw()));
+    }
+
+    (id, set)
+}
 
 /// A collection of [`Trible`]s.
 ///

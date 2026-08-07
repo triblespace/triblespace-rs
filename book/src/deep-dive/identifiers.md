@@ -210,7 +210,7 @@ use triblespace::examples::literature;
 use triblespace::prelude::*;
 
 // Intrinsic identity (default): the id is derived deterministically from the
-// attribute/value pairs, so identical record literals unify.
+// canonical fact rows, so identical record literals unify.
 let record = entity! {
     literature::firstname: "Frank",
     literature::lastname: "Herbert",
@@ -242,6 +242,19 @@ let with_repeated = entity! { _ @
     literature::alias*: aliases,
 };
 ```
+
+For the intrinsic form, `entity!` first represents every encoded fact as
+`NIL || attribute || value`, using the ordinary 64-byte trible layout with an
+empty entity column. It sorts and deduplicates those rows, hashes the complete
+contiguous sequence with BLAKE3, takes the final 16 digest bytes as the entity
+id, and fills that id into every row. Identity therefore depends on the raw
+projected facts, not source order or Rust conversion history. An explicit
+entity id bypasses this derivation.
+
+This canonical-row protocol deliberately defines a new intrinsic-identity
+epoch relative to the historical hash of concatenated `attribute || value`
+pairs. Existing persisted intrinsic ids must be migrated or re-ingested when
+adopting this epoch; the implementation must never silently mix both schemes.
 
 ## Embeddings as Semantic Intrinsic Identifiers
 
