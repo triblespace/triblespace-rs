@@ -46,3 +46,47 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
 
     Ok(())
 }
+
+#[test]
+fn objectstore_get_rejects_bytes_that_do_not_match_the_path_hash(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tempfile::tempdir;
+
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::blob::{Blob, Bytes};
+    use triblespace::core::inline::encodings::hash::{Blake3, Hash};
+    use triblespace::core::inline::Inline;
+    use triblespace::core::repo::async_store::Blocking;
+    use triblespace::core::repo::objectstore::{GetBlobErr, ObjectStoreRemote};
+    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+
+    let dir = tempdir()?;
+    let expected_blob = Blob::<UnknownBlob>::new(Bytes::from(b"expected".to_vec()));
+    let expected_handle = expected_blob.get_handle();
+    let expected_hash: Inline<Hash<Blake3>> = expected_handle.into();
+    let blob_dir = dir.path().join("blobs");
+    std::fs::create_dir(&blob_dir)?;
+    std::fs::write(
+        blob_dir.join(Hash::<Blake3>::to_hex(&expected_hash).to_ascii_lowercase()),
+        b"tampered",
+    )?;
+
+    let url = Url::parse(&format!("file://{}", dir.path().display()))?;
+    let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
+    let reader = remote.reader()?;
+    let err = reader
+        .get::<Bytes, UnknownBlob>(expected_handle)
+        .expect_err("wrong bytes at a content-addressed path must be rejected");
+
+    let actual_hash: Inline<Hash<Blake3>> =
+        Blob::<UnknownBlob>::new(Bytes::from(b"tampered".to_vec()))
+            .get_handle()
+            .into();
+    assert!(matches!(
+        err,
+        GetBlobErr::HashMismatch { expected, actual }
+            if expected == expected_hash && actual == actual_hash
+    ));
+
+    Ok(())
+}

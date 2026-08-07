@@ -37,9 +37,9 @@ and which key material needs to be distributed between collaborators. 【F:src/r
 ### Repository migration helpers
 `repo::transfer` rewrites whichever handles you feed it and returns the old and
 new identifiers so callers can update references. A migration recipe could show
-how to collect handles from `BlobStoreList::blobs()` for full copies or from
-`reachable` when only live data should be duplicated. Highlight how the helper
-fits into a scripted maintenance window. 【F:src/repo.rs†L394-L516】
+how to project each `BlobInfo::handle` from `BlobStoreList::blobs()` for full
+copies or use `reachable` when only live data should be duplicated. Highlight
+how the helper fits into a scripted maintenance window. 【F:src/repo.rs†L394-L516】
 
 ### Conservative GC tooling
 The garbage-collection chapter covers the high-level approach, but it should

@@ -25,7 +25,7 @@ use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::Id;
 use crate::id::RawId;
-use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
@@ -395,6 +395,11 @@ impl AsyncBlobStoreGet for ObjectStoreReader {
             let bytes = object.bytes().await?;
             let bytes: Bytes = bytes.into();
             let blob: Blob<S> = Blob::new(bytes);
+            let expected = Inline::<Hash<Blake3>>::new(raw);
+            let actual = blob.get_handle().into();
+            if actual != expected {
+                return Err(GetBlobErr::HashMismatch { expected, actual });
+            }
             blob.try_from_blob().map_err(GetBlobErr::Conversion)
         }
     }
@@ -461,6 +466,13 @@ impl AsyncBlobStoreMeta for ObjectStoreReader {
 pub enum GetBlobErr<E: Error> {
     /// The underlying object store operation failed.
     Store(object_store::Error),
+    /// The fetched object's bytes did not hash to the requested content address.
+    HashMismatch {
+        /// Digest encoded by the requested object path.
+        expected: Inline<Hash<Blake3>>,
+        /// Digest computed from the fetched bytes.
+        actual: Inline<Hash<Blake3>>,
+    },
     /// The blob bytes could not be converted to the requested type.
     Conversion(E),
 }
@@ -469,6 +481,12 @@ impl<E: Error> fmt::Display for GetBlobErr<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(e) => write!(f, "object store error: {e}"),
+            Self::HashMismatch { expected, actual } => write!(
+                f,
+                "object content hash mismatch: expected {}, got {}",
+                Hash::<Blake3>::to_hex(expected),
+                Hash::<Blake3>::to_hex(actual)
+            ),
             Self::Conversion(e) => write!(f, "conversion error: {e}"),
         }
     }
@@ -478,7 +496,7 @@ impl<E: Error> Error for GetBlobErr<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(e) => Some(e),
-            Self::Conversion(_) => None,
+            Self::HashMismatch { .. } | Self::Conversion(_) => None,
         }
     }
 }

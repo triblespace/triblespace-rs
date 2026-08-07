@@ -466,8 +466,9 @@ embedded handles remain 32‑aligned.
 >   for the supplied handles. Feed it the `reachable` iterator when you only
 >   want live blobs, the output of
 >   [`potential_handles`](https://docs.rs/triblespace/latest/triblespace/repo/fn.potential_handles.html)
->   when scanning metadata, or a collected list from
->   `BlobStoreList::blobs()` when duplicating an entire store.
+>   when scanning metadata, or the `.handle` values projected from
+>   `BlobInfo` items returned by `BlobStoreList::blobs()` when duplicating an
+>   entire store.
 > - `MemoryBlobStore::keep` (and other `BlobStoreKeep` implementations) retain
 >   whichever handles you stream to them, making it easy to drop unreachable
 >   blobs once you've walked your roots.

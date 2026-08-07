@@ -716,6 +716,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Object-store reads now verify fetched bytes against their requested
+  content address before decoding.** A mismatched object returns the expected
+  and computed BLAKE3 digests through `GetBlobErr::HashMismatch` instead of
+  accepting bytes solely because they occupy a hash-shaped path.
+
 - **PATCH removal commits structure before reclaiming values or archive owners.**
   Heap leaves are retired until every ancestor has repaired its aggregates and
   collapsed unary branches; the final owner cover is detached only after an
