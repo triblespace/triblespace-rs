@@ -10,16 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **The collection calculus has a wire-format-neutral executable test oracle.**
-  The bounded reference model folds accepted grow-only `ADD`, exact `MERGE`, and
-  canonical `DERIVE` relations to their least membership closure, induced
+  The bounded reference model folds accepted signed `COMMIT` leaves, exact
+  unsigned `MERGE`, and canonical unsigned `DERIVE` relations to their least
+  membership closure, induced
   subsumption order, and maximal known frontier. Declared join
   homomorphisms close commuting squares in either direction and reject
   construction paths that claim different canonical results. Local blob
   residency remains outside the replicated equations: a separate physical
   cover search can use a resident compacted result or recursively fall back to
   resident exact inputs, while reporting genuinely uncovered frontier
-  obligations. Exhaustive finite-set tests pin ACI reconciliation, pending
-  relation activation, structural canonical-function conflicts, and
+  obligations. Authentication remains an opaque, externally validated witness;
+  data alone enters each typed lattice while supporting commit metadata and
+  provenance accumulate by outer set union without synthesizing merged commits.
+  Exhaustive finite-set tests pin ACI reconciliation, idempotent retries,
+  concurrent headless commits, pending relation activation, structural
+  canonical-function conflicts, deterministic cover proofs, and
   path-independent derivation before a pile record format is chosen.
 - **Demand-curve receipts render as explicit performance fingerprints.** The
   feature-gated `tribleset-bench` GORBIE notebook normalizes fragmented TSV

@@ -1,14 +1,22 @@
 //! Reference semantics for grow-only typed collections.
 //!
-//! The input facts are accepted equations: collection-specific code must first
-//! validate that each element is canonical and each claimed merge/derivation is
-//! exact. This generic fold cannot prove those properties from opaque ids. It
-//! computes their least membership closure, catches two outputs claimed for one
-//! canonical operation, closes declared join homomorphisms, and derives the
-//! known subsumption frontier.
+//! Signed `COMMIT` records are the only exogenous membership roots. Their
+//! authentication is deliberately opaque here: collection-specific code must
+//! validate it before admitting a record. Likewise, collection-specific code
+//! must validate that each element is canonical and each unsigned
+//! `MERGE`/`DERIVE` equation is exact. This generic fold cannot prove those
+//! properties from opaque ids. It computes their least membership closure,
+//! catches two outputs claimed for one canonical operation, closes declared
+//! join homomorphisms, and derives the known subsumption frontier.
 //! Homomorphisms are trusted, prevalidated direct descriptor laws; this model
 //! intentionally does not assume that an `S -> U -> T` path equals a separately
 //! declared `S -> T` map.
+//!
+//! Only committed data enters the typed lattice. Commit metadata and opaque
+//! authentication evidence remain provenance on the outside and accumulate by
+//! set union along every accepted construction path. A merge or derivation
+//! never synthesizes a new signed commit. The model never reads a clock;
+//! timestamps can occur only inside metadata explicitly supplied to `COMMIT`.
 //!
 //! Local blob residency is deliberately separate. Equations survive garbage
 //! collection; [`Closure::physical_cover`] merely asks whether a changing set
@@ -16,12 +24,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// An externally authenticated, immutable membership root.
+///
+/// `authentication` is an opaque witness retained for provenance. The oracle
+/// assumes the caller has already checked it against the canonical
+/// `(collection, data, metadata)` statement.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-enum Fact<C, E> {
-    Add {
-        collection: C,
-        element: E,
-    },
+struct Commit<C, E, M, A> {
+    collection: C,
+    data: E,
+    metadata: M,
+    authentication: A,
+}
+
+/// An accepted canonical equation over collection data.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum Equation<C, E> {
     Merge {
         collection: C,
         left: E,
@@ -36,7 +54,7 @@ enum Fact<C, E> {
     },
 }
 
-impl<C, E: Ord> Fact<C, E> {
+impl<C, E: Ord> Equation<C, E> {
     fn merge(collection: C, mut left: E, mut right: E, result: E) -> Self {
         if right < left {
             std::mem::swap(&mut left, &mut right);
@@ -69,39 +87,44 @@ enum Conflict<C, E> {
     },
 }
 
-/// Grow-only accepted `ADD`, `MERGE`, and `DERIVE` equations.
+/// Grow-only accepted signed `COMMIT` leaves and unsigned canonical equations.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CollectionGraph<C, E> {
-    facts: BTreeSet<Fact<C, E>>,
+struct CollectionGraph<C, E, M, A> {
+    commits: BTreeSet<Commit<C, E, M, A>>,
+    equations: BTreeSet<Equation<C, E>>,
 }
 
-impl<C, E> Default for CollectionGraph<C, E> {
+impl<C, E, M, A> Default for CollectionGraph<C, E, M, A> {
     fn default() -> Self {
         Self {
-            facts: BTreeSet::new(),
+            commits: BTreeSet::new(),
+            equations: BTreeSet::new(),
         }
     }
 }
 
-impl<C: Clone + Ord, E: Clone + Ord> CollectionGraph<C, E> {
+impl<C: Clone + Ord, E: Clone + Ord, M: Clone + Ord, A: Clone + Ord> CollectionGraph<C, E, M, A> {
     fn new() -> Self {
         Self::default()
     }
 
-    fn add(&mut self, collection: C, element: E) {
-        self.facts.insert(Fact::Add {
+    /// Admit a signed commit whose authentication was validated by the caller.
+    fn commit(&mut self, collection: C, data: E, metadata: M, authentication: A) {
+        self.commits.insert(Commit {
             collection,
-            element,
+            data,
+            metadata,
+            authentication,
         });
     }
 
     fn merge(&mut self, collection: C, left: E, right: E, result: E) {
-        self.facts
-            .insert(Fact::merge(collection, left, right, result));
+        self.equations
+            .insert(Equation::merge(collection, left, right, result));
     }
 
     fn derive(&mut self, source: C, target: C, input: E, output: E) {
-        self.facts.insert(Fact::Derive {
+        self.equations.insert(Equation::Derive {
             source,
             target,
             input,
@@ -111,24 +134,32 @@ impl<C: Clone + Ord, E: Clone + Ord> CollectionGraph<C, E> {
 
     /// Outer ACI join; no selected head or arrival order participates.
     fn union(&mut self, other: Self) {
-        self.facts.extend(other.facts);
+        self.commits.extend(other.commits);
+        self.equations.extend(other.equations);
     }
 
     /// Resolve against immutable descriptor laws supplied by the caller.
-    fn resolve(&self, homomorphisms: &BTreeSet<(C, C)>) -> Result<Closure<C, E>, Conflict<C, E>> {
-        functional(&self.facts)?;
+    fn resolve(
+        &self,
+        homomorphisms: &BTreeSet<(C, C)>,
+    ) -> Result<Closure<C, E, M, A>, Conflict<C, E>> {
+        functional(&self.equations)?;
 
-        let mut members = BTreeSet::new();
+        let mut members: BTreeSet<_> = self
+            .commits
+            .iter()
+            .map(|commit| (commit.collection.clone(), commit.data.clone()))
+            .collect();
         let mut active = BTreeSet::new();
         loop {
-            let mut changed = activate(&self.facts, &mut members, &mut active);
+            let mut changed = activate(&self.equations, &mut members, &mut active);
             let joins = merge_outputs(&active);
             let maps = derive_outputs(&active);
             let mut theorems = Vec::new();
 
             for (source, target) in homomorphisms {
                 for fact in &active {
-                    let Fact::Merge {
+                    let Equation::Merge {
                         collection,
                         left,
                         right,
@@ -156,7 +187,7 @@ impl<C: Clone + Ord, E: Clone + Ord> CollectionGraph<C, E> {
                                 joins.get(&(target.clone(), a.clone(), b.clone()))
                             {
                                 theorems.extend(outputs.iter().cloned().map(|output| {
-                                    Fact::Derive {
+                                    Equation::Derive {
                                         source: source.clone(),
                                         target: target.clone(),
                                         input: result.clone(),
@@ -168,7 +199,7 @@ impl<C: Clone + Ord, E: Clone + Ord> CollectionGraph<C, E> {
                                 maps.get(&(source.clone(), target.clone(), result.clone()))
                             {
                                 theorems.extend(outputs.iter().cloned().map(|output| {
-                                    Fact::merge(
+                                    Equation::merge(
                                         target.clone(),
                                         left_output.clone(),
                                         right_output.clone(),
@@ -189,29 +220,34 @@ impl<C: Clone + Ord, E: Clone + Ord> CollectionGraph<C, E> {
             }
         }
 
-        let mut claims = self.facts.clone();
+        let mut claims = self.equations.clone();
         claims.extend(active.iter().cloned());
         functional(&claims)?;
         let leq = close_order(&members, &active, homomorphisms);
+        let supports = close_supports(&self.commits, &active);
         Ok(Closure {
-            asserted: self.facts.clone(),
+            commits: self.commits.clone(),
+            asserted: self.equations.clone(),
             active,
             members,
             leq,
+            supports,
         })
     }
 }
 
 /// Least semantic closure of one accepted fact set.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Closure<C, E> {
-    asserted: BTreeSet<Fact<C, E>>,
-    active: BTreeSet<Fact<C, E>>,
+struct Closure<C, E, M, A> {
+    commits: BTreeSet<Commit<C, E, M, A>>,
+    asserted: BTreeSet<Equation<C, E>>,
+    active: BTreeSet<Equation<C, E>>,
     members: BTreeSet<(C, E)>,
     leq: BTreeSet<(C, E, E)>,
+    supports: BTreeMap<(C, E), BTreeSet<Commit<C, E, M, A>>>,
 }
 
-impl<C: Clone + Ord, E: Clone + Ord> Closure<C, E> {
+impl<C: Clone + Ord, E: Clone + Ord, M: Clone + Ord, A: Clone + Ord> Closure<C, E, M, A> {
     fn contains(&self, collection: &C, element: &E) -> bool {
         self.members
             .contains(&(collection.clone(), element.clone()))
@@ -219,6 +255,23 @@ impl<C: Clone + Ord, E: Clone + Ord> Closure<C, E> {
 
     fn pending_len(&self) -> usize {
         self.asserted.difference(&self.active).count()
+    }
+
+    /// Exact signed leaves supporting this semantic member through every known
+    /// accepted construction path.
+    fn supporting_commits(&self, collection: &C, data: &E) -> BTreeSet<Commit<C, E, M, A>> {
+        self.supports
+            .get(&(collection.clone(), data.clone()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Metadata is an outer provenance set, not an input to the data lattice.
+    fn supporting_metadata(&self, collection: &C, data: &E) -> BTreeSet<M> {
+        self.supporting_commits(collection, data)
+            .into_iter()
+            .map(|commit| commit.metadata)
+            .collect()
     }
 
     fn subsumes(&self, collection: &C, lower: &E, upper: &E) -> bool {
@@ -268,7 +321,7 @@ impl<C: Clone + Ord, E: Clone + Ord> Closure<C, E> {
             .collect();
         let mut joins: BTreeMap<E, Vec<(E, E)>> = BTreeMap::new();
         for fact in &self.active {
-            if let Fact::Merge {
+            if let Equation::Merge {
                 collection: candidate,
                 left,
                 right,
@@ -342,21 +395,14 @@ impl<C: Clone + Ord, E: Clone + Ord> Closure<C, E> {
 }
 
 fn activate<C: Clone + Ord, E: Clone + Ord>(
-    facts: &BTreeSet<Fact<C, E>>,
+    equations: &BTreeSet<Equation<C, E>>,
     members: &mut BTreeSet<(C, E)>,
-    active: &mut BTreeSet<Fact<C, E>>,
+    active: &mut BTreeSet<Equation<C, E>>,
 ) -> bool {
     let mut changed = false;
-    for fact in facts {
-        let grounded = match fact {
-            Fact::Add {
-                collection,
-                element,
-            } => {
-                changed |= members.insert((collection.clone(), element.clone()));
-                true
-            }
-            Fact::Merge {
+    for equation in equations {
+        let grounded = match equation {
+            Equation::Merge {
                 collection,
                 left,
                 right,
@@ -367,7 +413,7 @@ fn activate<C: Clone + Ord, E: Clone + Ord>(
                 changed |= members.insert((collection.clone(), result.clone()));
                 true
             }
-            Fact::Derive {
+            Equation::Derive {
                 source,
                 target,
                 input,
@@ -379,10 +425,74 @@ fn activate<C: Clone + Ord, E: Clone + Ord>(
             _ => false,
         };
         if grounded {
-            changed |= active.insert(fact.clone());
+            changed |= active.insert(equation.clone());
         }
     }
     changed
+}
+
+/// Propagate signed provenance independently of semantic membership.
+///
+/// The result member of an equation receives the outer union of all commit
+/// leaves supporting its inputs. No equation creates a commit of its own.
+fn close_supports<C: Clone + Ord, E: Clone + Ord, M: Clone + Ord, A: Clone + Ord>(
+    commits: &BTreeSet<Commit<C, E, M, A>>,
+    active: &BTreeSet<Equation<C, E>>,
+) -> BTreeMap<(C, E), BTreeSet<Commit<C, E, M, A>>> {
+    let mut supports: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for commit in commits {
+        supports
+            .entry((commit.collection.clone(), commit.data.clone()))
+            .or_default()
+            .insert(commit.clone());
+    }
+
+    loop {
+        let snapshot = supports.clone();
+        let mut changed = false;
+        for equation in active {
+            let (output, inherited) = match equation {
+                Equation::Merge {
+                    collection,
+                    left,
+                    right,
+                    result,
+                } => {
+                    let mut inherited = snapshot
+                        .get(&(collection.clone(), left.clone()))
+                        .cloned()
+                        .unwrap_or_default();
+                    inherited.extend(
+                        snapshot
+                            .get(&(collection.clone(), right.clone()))
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    ((collection.clone(), result.clone()), inherited)
+                }
+                Equation::Derive {
+                    source,
+                    target,
+                    input,
+                    output,
+                } => (
+                    (target.clone(), output.clone()),
+                    snapshot
+                        .get(&(source.clone(), input.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            };
+            let output_supports = supports.entry(output).or_default();
+            let old_len = output_supports.len();
+            output_supports.extend(inherited);
+            changed |= output_supports.len() != old_len;
+        }
+        if !changed {
+            return supports;
+        }
+    }
 }
 
 fn ordered<E: Ord>(mut left: E, mut right: E) -> (E, E) {
@@ -393,16 +503,16 @@ fn ordered<E: Ord>(mut left: E, mut right: E) -> (E, E) {
 }
 
 fn merge_outputs<C: Clone + Ord, E: Clone + Ord>(
-    facts: &BTreeSet<Fact<C, E>>,
+    equations: &BTreeSet<Equation<C, E>>,
 ) -> BTreeMap<(C, E, E), BTreeSet<E>> {
     let mut index: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-    for fact in facts {
-        if let Fact::Merge {
+    for equation in equations {
+        if let Equation::Merge {
             collection,
             left,
             right,
             result,
-        } = fact
+        } = equation
         {
             index
                 .entry((collection.clone(), left.clone(), right.clone()))
@@ -414,16 +524,16 @@ fn merge_outputs<C: Clone + Ord, E: Clone + Ord>(
 }
 
 fn derive_outputs<C: Clone + Ord, E: Clone + Ord>(
-    facts: &BTreeSet<Fact<C, E>>,
+    equations: &BTreeSet<Equation<C, E>>,
 ) -> BTreeMap<(C, C, E), BTreeSet<E>> {
     let mut index: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-    for fact in facts {
-        if let Fact::Derive {
+    for equation in equations {
+        if let Equation::Derive {
             source,
             target,
             input,
             output,
-        } = fact
+        } = equation
         {
             index
                 .entry((source.clone(), target.clone(), input.clone()))
@@ -435,9 +545,9 @@ fn derive_outputs<C: Clone + Ord, E: Clone + Ord>(
 }
 
 fn functional<C: Clone + Ord, E: Clone + Ord>(
-    facts: &BTreeSet<Fact<C, E>>,
+    equations: &BTreeSet<Equation<C, E>>,
 ) -> Result<(), Conflict<C, E>> {
-    for ((collection, left, right), outputs) in merge_outputs(facts) {
+    for ((collection, left, right), outputs) in merge_outputs(equations) {
         if outputs.len() > 1 {
             let mut outputs = outputs.into_iter();
             return Err(Conflict::Merge {
@@ -449,7 +559,7 @@ fn functional<C: Clone + Ord, E: Clone + Ord>(
             });
         }
     }
-    for ((source, target, input), outputs) in derive_outputs(facts) {
+    for ((source, target, input), outputs) in derive_outputs(equations) {
         if outputs.len() > 1 {
             let mut outputs = outputs.into_iter();
             return Err(Conflict::Derive {
@@ -466,7 +576,7 @@ fn functional<C: Clone + Ord, E: Clone + Ord>(
 
 fn close_order<C: Clone + Ord, E: Clone + Ord>(
     members: &BTreeSet<(C, E)>,
-    active: &BTreeSet<Fact<C, E>>,
+    active: &BTreeSet<Equation<C, E>>,
     homomorphisms: &BTreeSet<(C, C)>,
 ) -> BTreeSet<(C, E, E)> {
     let mut leq: BTreeSet<_> = members
@@ -474,7 +584,7 @@ fn close_order<C: Clone + Ord, E: Clone + Ord>(
         .map(|(collection, element)| (collection.clone(), element.clone(), element.clone()))
         .collect();
     for fact in active {
-        if let Fact::Merge {
+        if let Equation::Merge {
             collection,
             left,
             right,
@@ -539,6 +649,36 @@ mod tests {
         Rollup(u8),
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    struct Metadata {
+        provenance: u8,
+        observed_at: Option<u64>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    enum Authentication {
+        Fixture,
+        Alice,
+        Bob,
+    }
+
+    type Graph = CollectionGraph<C, E, Metadata, Authentication>;
+
+    fn graph() -> Graph {
+        CollectionGraph::new()
+    }
+
+    fn metadata(provenance: u8) -> Metadata {
+        Metadata {
+            provenance,
+            observed_at: None,
+        }
+    }
+
+    fn commit(graph: &mut Graph, collection: C, data: E) {
+        graph.commit(collection, data, metadata(0), Authentication::Fixture);
+    }
+
     fn raw(bits: u8) -> E {
         E::Raw(bits)
     }
@@ -553,15 +693,15 @@ mod tests {
 
     #[test]
     fn pending_relations_activate_from_later_membership() {
-        let mut graph = CollectionGraph::new();
+        let mut graph = graph();
         graph.merge(C::Raw, raw(1), raw(2), raw(3));
         graph.derive(C::Raw, C::Rollup, raw(3), rollup(3));
         let closure = graph.resolve(&BTreeSet::new()).unwrap();
         assert_eq!(closure.pending_len(), 2);
         assert!(!closure.contains(&C::Raw, &raw(3)));
 
-        graph.add(C::Raw, raw(1));
-        graph.add(C::Raw, raw(2));
+        commit(&mut graph, C::Raw, raw(1));
+        commit(&mut graph, C::Raw, raw(2));
         let closure = graph.resolve(&BTreeSet::new()).unwrap();
         assert_eq!(closure.pending_len(), 0);
         assert!(closure.contains(&C::Raw, &raw(3)));
@@ -570,7 +710,7 @@ mod tests {
 
     #[test]
     fn conflicting_pending_claims_are_rejected_immediately() {
-        let mut graph = CollectionGraph::new();
+        let mut graph = graph();
         graph.merge(C::Raw, raw(1), raw(2), raw(3));
         graph.merge(C::Raw, raw(1), raw(2), raw(7));
         assert!(matches!(
@@ -581,22 +721,23 @@ mod tests {
 
     #[test]
     fn merge_order_is_commutative_and_frontier_is_induced() {
-        let mut graph = CollectionGraph::new();
-        graph.add(C::Raw, raw(1));
-        graph.add(C::Raw, raw(2));
+        let mut graph = graph();
+        commit(&mut graph, C::Raw, raw(1));
+        commit(&mut graph, C::Raw, raw(2));
         graph.merge(C::Raw, raw(2), raw(1), raw(3));
         graph.merge(C::Raw, raw(1), raw(2), raw(3));
         let closure = graph.resolve(&BTreeSet::new()).unwrap();
         assert!(closure.subsumes(&C::Raw, &raw(1), &raw(3)));
         assert_eq!(closure.known_frontier(&C::Raw), BTreeSet::from([raw(3)]));
-        assert_eq!(graph.facts.len(), 3);
+        assert_eq!(graph.commits.len(), 2);
+        assert_eq!(graph.equations.len(), 1);
     }
 
     #[test]
     fn semantic_closure_is_independent_of_residency() {
-        let mut graph = CollectionGraph::new();
-        graph.add(C::Raw, raw(1));
-        graph.add(C::Raw, raw(2));
+        let mut graph = graph();
+        commit(&mut graph, C::Raw, raw(1));
+        commit(&mut graph, C::Raw, raw(2));
         graph.merge(C::Raw, raw(1), raw(2), raw(3));
         let closure = graph.resolve(&BTreeSet::new()).unwrap();
 
@@ -615,9 +756,9 @@ mod tests {
 
     #[test]
     fn overlapping_resident_merges_cover_each_other() {
-        let mut graph = CollectionGraph::new();
+        let mut graph = graph();
         for element in [raw(1), raw(2), raw(4)] {
-            graph.add(C::Raw, element);
+            commit(&mut graph, C::Raw, element);
         }
         graph.merge(C::Raw, raw(1), raw(2), raw(3));
         graph.merge(C::Raw, raw(2), raw(4), raw(6));
@@ -633,8 +774,8 @@ mod tests {
 
     #[test]
     fn idempotent_self_edge_does_not_fake_a_physical_cover() {
-        let mut graph = CollectionGraph::new();
-        graph.add(C::Raw, raw(1));
+        let mut graph = graph();
+        commit(&mut graph, C::Raw, raw(1));
         graph.merge(C::Raw, raw(1), raw(1), raw(1));
         let closure = graph.resolve(&BTreeSet::new()).unwrap();
         let (_, missing) = closure.physical_cover(&C::Raw, &BTreeSet::new());
@@ -643,9 +784,9 @@ mod tests {
 
     #[test]
     fn sibling_cover_proofs_may_share_a_nonresident_submerge() {
-        let mut graph = CollectionGraph::new();
+        let mut graph = graph();
         for element in [raw(1), raw(2), raw(4), raw(8)] {
-            graph.add(C::Raw, element);
+            commit(&mut graph, C::Raw, element);
         }
         graph.merge(C::Raw, raw(1), raw(2), raw(3));
         graph.merge(C::Raw, raw(3), raw(4), raw(7));
@@ -660,9 +801,9 @@ mod tests {
 
     #[test]
     fn complete_three_bit_lattice_matches_set_inclusion_and_every_residency_view() {
-        let mut graph = CollectionGraph::new();
+        let mut graph = graph();
         for element in 0_u8..8 {
-            graph.add(C::Raw, raw(element));
+            commit(&mut graph, C::Raw, raw(element));
         }
         for left in 0_u8..8 {
             for right in 0_u8..8 {
@@ -708,30 +849,30 @@ mod tests {
             for b in 0_u8..16 {
                 let c = a | b;
 
-                let mut derive_first = CollectionGraph::new();
-                derive_first.add(C::Raw, raw(a));
-                derive_first.add(C::Raw, raw(b));
+                let mut derive_first = graph();
+                commit(&mut derive_first, C::Raw, raw(a));
+                commit(&mut derive_first, C::Raw, raw(b));
                 derive_first.merge(C::Raw, raw(a), raw(b), raw(c));
                 derive_first.derive(C::Raw, C::Rollup, raw(a), rollup(a));
                 derive_first.derive(C::Raw, C::Rollup, raw(b), rollup(b));
                 derive_first.derive(C::Raw, C::Rollup, raw(c), rollup(c));
                 let closure = derive_first.resolve(&laws()).unwrap();
-                assert!(closure.active.contains(&Fact::merge(
+                assert!(closure.active.contains(&Equation::merge(
                     C::Rollup,
                     rollup(a),
                     rollup(b),
                     rollup(c),
                 )));
 
-                let mut merge_first = CollectionGraph::new();
-                merge_first.add(C::Raw, raw(a));
-                merge_first.add(C::Raw, raw(b));
+                let mut merge_first = graph();
+                commit(&mut merge_first, C::Raw, raw(a));
+                commit(&mut merge_first, C::Raw, raw(b));
                 merge_first.merge(C::Raw, raw(a), raw(b), raw(c));
                 merge_first.derive(C::Raw, C::Rollup, raw(a), rollup(a));
                 merge_first.derive(C::Raw, C::Rollup, raw(b), rollup(b));
                 merge_first.merge(C::Rollup, rollup(a), rollup(b), rollup(c));
                 let closure = merge_first.resolve(&laws()).unwrap();
-                assert!(closure.active.contains(&Fact::Derive {
+                assert!(closure.active.contains(&Equation::Derive {
                     source: C::Raw,
                     target: C::Rollup,
                     input: raw(c),
@@ -743,9 +884,9 @@ mod tests {
 
     #[test]
     fn commuting_square_theorem_exposes_a_conflicting_construction_path() {
-        let mut graph = CollectionGraph::new();
-        graph.add(C::Raw, raw(1));
-        graph.add(C::Raw, raw(2));
+        let mut graph = graph();
+        commit(&mut graph, C::Raw, raw(1));
+        commit(&mut graph, C::Raw, raw(2));
         graph.merge(C::Raw, raw(1), raw(2), raw(3));
         graph.derive(C::Raw, C::Rollup, raw(1), rollup(1));
         graph.derive(C::Raw, C::Rollup, raw(2), rollup(2));
@@ -759,13 +900,138 @@ mod tests {
     }
 
     #[test]
+    fn identical_commit_retry_is_idempotent() {
+        let mut graph = graph();
+        let metadata = Metadata {
+            provenance: 7,
+            observed_at: Some(1_786_035_600),
+        };
+        graph.commit(C::Raw, raw(1), metadata, Authentication::Alice);
+        graph.commit(C::Raw, raw(1), metadata, Authentication::Alice);
+
+        let closure = graph.resolve(&BTreeSet::new()).unwrap();
+        assert_eq!(graph.commits.len(), 1);
+        assert_eq!(closure.supporting_commits(&C::Raw, &raw(1)).len(), 1);
+        assert_eq!(closure.known_frontier(&C::Raw), BTreeSet::from([raw(1)]));
+    }
+
+    #[test]
+    fn concurrent_commits_coexist_without_a_selected_head_or_cas() {
+        let mut alice = graph();
+        alice.commit(C::Raw, raw(1), metadata(1), Authentication::Alice);
+        let mut bob = graph();
+        bob.commit(C::Raw, raw(2), metadata(2), Authentication::Bob);
+
+        let mut alice_then_bob = alice.clone();
+        alice_then_bob.union(bob.clone());
+        let mut bob_then_alice = bob;
+        bob_then_alice.union(alice);
+
+        assert_eq!(alice_then_bob, bob_then_alice);
+        let closure = alice_then_bob.resolve(&BTreeSet::new()).unwrap();
+        assert_eq!(closure.commits.len(), 2);
+        assert!(closure.contains(&C::Raw, &raw(1)));
+        assert!(closure.contains(&C::Raw, &raw(2)));
+        assert_eq!(
+            closure.known_frontier(&C::Raw),
+            BTreeSet::from([raw(1), raw(2)])
+        );
+    }
+
+    #[test]
+    fn same_data_retains_every_provenance_leaf_and_explicit_timestamp() {
+        let mut graph = graph();
+        let early = Metadata {
+            provenance: 1,
+            observed_at: Some(10),
+        };
+        let late = Metadata {
+            provenance: 2,
+            observed_at: Some(20),
+        };
+        graph.commit(C::Raw, raw(1), late, Authentication::Bob);
+        graph.commit(C::Raw, raw(1), early, Authentication::Alice);
+
+        let closure = graph.resolve(&BTreeSet::new()).unwrap();
+        assert_eq!(closure.commits.len(), 2);
+        assert_eq!(closure.supporting_commits(&C::Raw, &raw(1)).len(), 2);
+        assert_eq!(
+            closure.supporting_metadata(&C::Raw, &raw(1)),
+            BTreeSet::from([early, late])
+        );
+        assert_eq!(closure.known_frontier(&C::Raw), BTreeSet::from([raw(1)]));
+    }
+
+    #[test]
+    fn metadata_accumulates_outside_data_joins_without_synthesizing_a_commit() {
+        let left_metadata = metadata(1);
+        let right_metadata = metadata(2);
+        let mut source_graph = graph();
+        source_graph.commit(C::Raw, raw(1), left_metadata, Authentication::Alice);
+        source_graph.commit(C::Raw, raw(2), right_metadata, Authentication::Bob);
+        source_graph.merge(C::Raw, raw(1), raw(2), raw(3));
+
+        let closure = source_graph.resolve(&BTreeSet::new()).unwrap();
+        assert_eq!(closure.known_frontier(&C::Raw), BTreeSet::from([raw(3)]));
+        assert_eq!(
+            closure.supporting_metadata(&C::Raw, &raw(3)),
+            BTreeSet::from([left_metadata, right_metadata])
+        );
+        assert_eq!(closure.supporting_commits(&C::Raw, &raw(3)).len(), 2);
+        assert_eq!(closure.commits.len(), 2);
+        assert!(closure.commits.iter().all(|commit| commit.data != raw(3)));
+
+        let mut different_provenance = graph();
+        different_provenance.commit(C::Raw, raw(1), metadata(8), Authentication::Bob);
+        different_provenance.commit(C::Raw, raw(2), metadata(9), Authentication::Alice);
+        different_provenance.merge(C::Raw, raw(1), raw(2), raw(3));
+        let other = different_provenance.resolve(&BTreeSet::new()).unwrap();
+        assert_eq!(closure.members, other.members);
+        assert_eq!(closure.leq, other.leq);
+        assert_eq!(
+            closure.known_frontier(&C::Raw),
+            other.known_frontier(&C::Raw)
+        );
+    }
+
+    #[test]
+    fn cover_closure_is_deterministic_across_commit_and_equation_order() {
+        let mut forward = graph();
+        forward.commit(C::Raw, raw(1), metadata(1), Authentication::Alice);
+        forward.commit(C::Raw, raw(2), metadata(2), Authentication::Bob);
+        forward.commit(C::Raw, raw(4), metadata(3), Authentication::Alice);
+        forward.merge(C::Raw, raw(1), raw(2), raw(3));
+        forward.merge(C::Raw, raw(3), raw(4), raw(7));
+
+        let mut reverse = graph();
+        reverse.merge(C::Raw, raw(3), raw(4), raw(7));
+        reverse.merge(C::Raw, raw(2), raw(1), raw(3));
+        reverse.commit(C::Raw, raw(4), metadata(3), Authentication::Alice);
+        reverse.commit(C::Raw, raw(2), metadata(2), Authentication::Bob);
+        reverse.commit(C::Raw, raw(1), metadata(1), Authentication::Alice);
+
+        let forward = forward.resolve(&BTreeSet::new()).unwrap();
+        let reverse = reverse.resolve(&BTreeSet::new()).unwrap();
+        let resident = BTreeSet::from([raw(1), raw(2), raw(4)]);
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward.physical_cover(&C::Raw, &resident),
+            reverse.physical_cover(&C::Raw, &resident)
+        );
+        assert_eq!(
+            forward.supporting_metadata(&C::Raw, &raw(7)),
+            BTreeSet::from([metadata(1), metadata(2), metadata(3)])
+        );
+    }
+
+    #[test]
     fn outer_union_is_associative_commutative_and_idempotent() {
-        let mut a = CollectionGraph::new();
-        a.add(C::Raw, raw(1));
+        let mut a = graph();
+        commit(&mut a, C::Raw, raw(1));
         a.merge(C::Raw, raw(1), raw(2), raw(3));
-        let mut b = CollectionGraph::new();
-        b.add(C::Raw, raw(2));
-        let mut c = CollectionGraph::new();
+        let mut b = graph();
+        commit(&mut b, C::Raw, raw(2));
+        let mut c = graph();
         c.derive(C::Raw, C::Rollup, raw(3), rollup(3));
 
         let mut left = a.clone();
