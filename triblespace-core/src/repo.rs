@@ -182,7 +182,7 @@ where
 }
 
 use crate::macros::pattern;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::Debug;
@@ -424,6 +424,95 @@ pub trait BlobStoreKeep {
     fn keep<I>(&mut self, handles: I)
     where
         I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>;
+}
+
+/// Explicit roots for one retention pass.
+///
+/// Retention has two different edge meanings which must not be conflated:
+///
+/// - **direct** roots retain exactly the named blob and do not inspect its
+///   payload; and
+/// - **recursive** roots own their resident descendants, discovered through
+///   [`reachable`].
+///
+/// The distinction matters for self-describing ledgers. A collection record
+/// contains hashes that describe algebraic inputs, but those hashes are not
+/// ownership edges. Treating the record as a recursive root would pin every
+/// historical physical input and defeat collection compaction. The record
+/// itself is therefore a direct root while selected data and metadata are
+/// recursive roots.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RetentionRoots {
+    direct: BTreeSet<[u8; INLINE_LEN]>,
+    recursive: BTreeSet<[u8; INLINE_LEN]>,
+}
+
+impl RetentionRoots {
+    /// Construct an empty retention policy result.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retain exactly `handle`, without interpreting its bytes as ownership
+    /// edges.
+    pub fn retain_direct<S>(&mut self, handle: Inline<Handle<S>>)
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.direct.insert(handle.raw);
+    }
+
+    /// Retain `handle` and every resident descendant reached through the
+    /// store's conservative child traversal.
+    pub fn retain_recursive<S>(&mut self, handle: Inline<Handle<S>>)
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.recursive.insert(handle.raw);
+    }
+
+    /// Merge another policy result into this one.
+    pub fn union(&mut self, other: Self) {
+        self.direct.extend(other.direct);
+        self.recursive.extend(other.recursive);
+    }
+
+    /// Direct roots in deterministic handle order.
+    pub fn direct(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> + '_ {
+        self.direct
+            .iter()
+            .copied()
+            .map(Inline::<Handle<UnknownBlob>>::new)
+    }
+
+    /// Recursive roots in deterministic handle order.
+    pub fn recursive(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> + '_ {
+        self.recursive
+            .iter()
+            .copied()
+            .map(Inline::<Handle<UnknownBlob>>::new)
+    }
+
+    /// Expand this policy against a reader into the exact resident keep set.
+    ///
+    /// Direct roots are inserted without calling [`BlobChildren::children`].
+    /// Recursive roots use [`reachable`], whose existing missing-child
+    /// behavior remains conservative for the blobs that are locally present.
+    pub fn expanded<R>(&self, reader: &R) -> BTreeSet<Inline<Handle<UnknownBlob>>>
+    where
+        R: BlobChildren,
+    {
+        let mut keep: BTreeSet<_> = self.direct().collect();
+        keep.extend(reachable(reader, self.recursive()));
+        keep
+    }
+
+    /// Whether neither kind of root is present.
+    pub fn is_empty(&self) -> bool {
+        self.direct.is_empty() && self.recursive.is_empty()
+    }
 }
 
 /// Trait for stores that can enumerate a blob's child references.

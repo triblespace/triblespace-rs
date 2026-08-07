@@ -192,6 +192,18 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
+- Wire collection retention into a higher-level compaction owner with a durable
+  local policy for selected collection scopes and authorized commit signers.
+  `RetentionRoots` is intentionally an ephemeral pure plan; until every future
+  Pile/Yard collection pass recomputes and supplies the body collection's roots,
+  migration must keep its final legacy strong pin rather than CAS-tombstoning
+  the only independently recurring root.
+- Persist exact positive collection-claim verdicts in a durable policy artifact
+  before using them to collect validation endpoints. The retention planner can
+  consume such evidence, but an ephemeral in-process set is not sufficient:
+  every later resolver and rewrite must authenticate and consume the same
+  `COMMIT`, `MERGE`, and `DERIVE` verdicts. Until that representation exists,
+  production rewrites should use `RetainAllEndpoints`.
 - Add an executor-local shadow observer at the residual action-task boundary.
   It should quote critical-path and total service cost for the exact
   `(action, bound schema, batch geometry)` without giving planning-only Ready

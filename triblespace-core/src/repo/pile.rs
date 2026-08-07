@@ -1887,6 +1887,158 @@ impl crate::repo::BlobStoreMeta for PileReader {
     }
 }
 
+/// How a source pile's active weak wants participate in a retained rewrite.
+///
+/// Weak wants are demand markers, not ownership roots. Preserving them copies
+/// the marker into the destination but does not retain or copy the requested
+/// blob unless an explicit or strong-pin root reaches it independently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WeakWantRewritePolicy {
+    /// Recreate every active weak-want marker without promoting its target.
+    Preserve,
+    /// Omit weak-want markers from the destination.
+    Drop,
+}
+
+/// Deterministic accounting for one retained pile rewrite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PileRewriteStats {
+    /// Exact number of resident blobs selected and copied.
+    pub retained_blobs: usize,
+    /// Number of active legacy strong-pin mappings recreated.
+    pub strong_pins: usize,
+    /// Number of weak-want markers recreated.
+    pub weak_wants: usize,
+}
+
+/// Failure while copying one policy-selected pile state into another pile.
+#[derive(Debug)]
+pub enum PileRewriteError {
+    /// The source could not produce a coherent reader snapshot.
+    Source(ReadError),
+    /// A selected blob was absent, invalid, or could not be stored.
+    Transfer(super::TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
+    /// A strong-pin mapping could not be appended to the destination.
+    StrongPin(PileWriteError),
+    /// The destination already maps a retained pin id to another head.
+    StrongPinConflict {
+        /// Conflicting pin id.
+        id: Id,
+        /// Head already present in the destination.
+        current: Option<Inline<Handle<SimpleArchive>>>,
+    },
+    /// A preserved weak-want marker could not be appended.
+    WeakWant(PileWriteError),
+    /// The completed destination state could not be made durable.
+    Flush(FlushError),
+}
+
+impl std::fmt::Display for PileRewriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Source(error) => write!(f, "failed to snapshot source pile: {error}"),
+            Self::Transfer(error) => write!(f, "failed to copy a retained blob: {error}"),
+            Self::StrongPin(error) => write!(f, "failed to recreate a strong pin: {error}"),
+            Self::StrongPinConflict { id, current } => write!(
+                f,
+                "destination has conflicting strong pin {id:X} at {current:?}"
+            ),
+            Self::WeakWant(error) => write!(f, "failed to recreate a weak want: {error}"),
+            Self::Flush(error) => write!(f, "failed to flush rewritten pile: {error}"),
+        }
+    }
+}
+
+impl Error for PileRewriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::Transfer(error) => Some(error),
+            Self::StrongPin(error) | Self::WeakWant(error) => Some(error),
+            Self::Flush(error) => Some(error),
+            Self::StrongPinConflict { .. } => None,
+        }
+    }
+}
+
+impl Pile {
+    /// Copy a policy-selected state into another append-only pile.
+    ///
+    /// `explicit` is normally produced by a higher-level policy such as
+    /// collection resolution. This byte-copy boundary deliberately knows
+    /// nothing about collection authorization and does not persist the policy;
+    /// callers must recompute and supply its roots on every later rewrite. It
+    /// additionally treats every active legacy strong-pin head as a recursive
+    /// ownership root and recreates the exact pin mapping, allowing collection
+    /// and branch models to coexist during migration.
+    ///
+    /// The source is refreshed once; blobs, strong pins, and weak wants are
+    /// then taken from that coherent applied-prefix snapshot. The destination
+    /// may already contain identical blobs and identical strong-pin mappings,
+    /// making retries idempotent, but a differently mapped pin is an error.
+    /// Missing or invalid selected blobs fail the rewrite rather than silently
+    /// producing a partial destination. One final flush makes blobs and marker
+    /// records durable in append order.
+    pub fn rewrite_retained_into(
+        &mut self,
+        destination: &mut Pile,
+        explicit: &super::RetentionRoots,
+        weak_wants: WeakWantRewritePolicy,
+    ) -> Result<PileRewriteStats, PileRewriteError> {
+        let reader = self.reader().map_err(PileRewriteError::Source)?;
+        let strong_pins = self.branches.clone();
+        let source_weak_wants = self.weak_pins.clone();
+
+        let mut roots = explicit.clone();
+        for raw in &strong_pins {
+            let head = *strong_pins
+                .get(raw)
+                .expect("pin key from snapshot must retain its value");
+            roots.retain_recursive(head);
+        }
+        let keep = roots.expanded(&reader);
+        let retained_blobs = keep.len();
+
+        for copied in super::transfer(&reader, destination, keep) {
+            copied.map_err(PileRewriteError::Transfer)?;
+        }
+
+        for raw in &strong_pins {
+            let id = Id::new(*raw).expect("Pile never stores a nil strong-pin id");
+            let head = *strong_pins
+                .get(raw)
+                .expect("pin key from snapshot must retain its value");
+            match destination
+                .update(id, None, Some(head))
+                .map_err(PileRewriteError::StrongPin)?
+            {
+                PushResult::Success() => {}
+                PushResult::Conflict(Some(current)) if current == head => {}
+                PushResult::Conflict(current) => {
+                    return Err(PileRewriteError::StrongPinConflict { id, current });
+                }
+            }
+        }
+
+        let mut preserved_weak_wants = 0usize;
+        if weak_wants == WeakWantRewritePolicy::Preserve {
+            for raw in source_weak_wants.into_iter_ordered() {
+                destination
+                    .pin_weak(Inline::<Handle<UnknownBlob>>::new(raw))
+                    .map_err(PileRewriteError::WeakWant)?;
+                preserved_weak_wants += 1;
+            }
+        }
+
+        destination.flush().map_err(PileRewriteError::Flush)?;
+        Ok(PileRewriteStats {
+            retained_blobs,
+            strong_pins: strong_pins.len() as usize,
+            weak_wants: preserved_weak_wants,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1899,13 +2051,102 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use tempfile;
 
-    use crate::repo::BlobStoreMeta;
-    use crate::repo::PushResult;
+    use crate::repo::{BlobStoreMeta, PushResult, RetentionRoots};
 
     fn fresh_empty_pile_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         let path = dir.path().join(name);
         std::fs::File::create(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn retained_rewrite_composes_explicit_roots_strong_pins_and_weak_wants() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+
+        let legacy_attachment = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"legacy attachment".to_vec()))
+            .unwrap();
+        let legacy_head = source
+            .put::<SimpleArchive, _>(Blob::<SimpleArchive>::new(Bytes::from_source(
+                legacy_attachment.raw.to_vec(),
+            )))
+            .unwrap();
+        let pin_id = Id::new([9; 16]).unwrap();
+        assert!(matches!(
+            source.update(pin_id, None, Some(legacy_head)).unwrap(),
+            PushResult::Success()
+        ));
+
+        let collection_attachment = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"collection attachment".to_vec()))
+            .unwrap();
+        let collection_data = source
+            .put::<UnknownBlob, _>(Bytes::from_source(collection_attachment.raw.to_vec()))
+            .unwrap();
+
+        let obsolete_input = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"obsolete input".to_vec()))
+            .unwrap();
+        let collection_record = source
+            .put::<UnknownBlob, _>(Bytes::from_source(obsolete_input.raw.to_vec()))
+            .unwrap();
+        let weak_target = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"weak target".to_vec()))
+            .unwrap();
+        source.pin_weak(weak_target).unwrap();
+        let orphan = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"orphan".to_vec()))
+            .unwrap();
+        source.flush().unwrap();
+
+        let mut explicit = RetentionRoots::new();
+        explicit.retain_recursive(collection_data);
+        // Record hashes are algebraic descriptions, not ownership edges: the
+        // record survives but its obsolete input does not.
+        explicit.retain_direct(collection_record);
+
+        let stats = source
+            .rewrite_retained_into(&mut destination, &explicit, WeakWantRewritePolicy::Preserve)
+            .unwrap();
+        assert_eq!(
+            stats,
+            PileRewriteStats {
+                retained_blobs: 5,
+                strong_pins: 1,
+                weak_wants: 1,
+            }
+        );
+
+        let reader = destination.reader().unwrap();
+        for retained in [
+            legacy_attachment,
+            legacy_head.transmute(),
+            collection_attachment,
+            collection_data,
+            collection_record,
+        ] {
+            assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
+        }
+        for collected in [obsolete_input, weak_target, orphan] {
+            assert!(reader.get::<Blob<UnknownBlob>, _>(collected).is_err());
+        }
+        assert_eq!(destination.head(pin_id).unwrap(), Some(legacy_head));
+        assert_eq!(
+            destination
+                .weak_pins()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![weak_target]
+        );
+
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
     }
 
     fn append_v3_blob_candidate(

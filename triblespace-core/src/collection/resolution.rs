@@ -210,6 +210,7 @@ impl<E: Error + 'static> Error for CollectionResolutionError<E> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionResolution<D> {
     semantics: CollectionSemantics,
+    admitted_claims: BTreeSet<Id>,
     validation_pending: BTreeSet<Id>,
     activation_pending: BTreeSet<Id>,
     rejected: BTreeMap<Id, D>,
@@ -224,6 +225,16 @@ impl<D> CollectionResolution<D> {
     /// Consume the report and retain only resolved semantics.
     pub fn into_semantics(self) -> CollectionSemantics {
         self.semantics
+    }
+
+    /// Claims that received a positive concrete validation verdict.
+    ///
+    /// This includes accepted equations whose membership prerequisites are
+    /// not active yet. Unauthorized commits are absent, as are pending and
+    /// rejected claims. Retention policies use this set to distinguish
+    /// admitted ledger records from arbitrary append noise.
+    pub fn admitted_claims(&self) -> &BTreeSet<Id> {
+        &self.admitted_claims
     }
 
     /// Claims awaiting an exact definition or a positive callback verdict.
@@ -535,6 +546,13 @@ where
     check_functional(&accepted_merges, &accepted_derives)
         .map_err(CollectionResolutionError::Conflict)?;
 
+    let admitted_claims = accepted_commits
+        .iter()
+        .map(|claim| claim.id())
+        .chain(accepted_merges.iter().map(|claim| claim.id()))
+        .chain(accepted_derives.iter().map(|claim| claim.id()))
+        .collect();
+
     let mut members: BTreeMap<Id, BTreeSet<CollectionData>> = BTreeMap::new();
     let mut commit_ids_by_member: BTreeMap<MemberKey, BTreeSet<Id>> = BTreeMap::new();
     for commit in accepted_commits {
@@ -625,6 +643,7 @@ where
 
     Ok(CollectionResolution {
         semantics,
+        admitted_claims,
         validation_pending,
         activation_pending,
         rejected,

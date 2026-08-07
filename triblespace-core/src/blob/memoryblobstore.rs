@@ -292,6 +292,27 @@ impl BlobStoreList for MemoryBlobStoreReader {
     }
 }
 
+impl crate::repo::BlobStoreMeta for MemoryBlobStoreReader {
+    type MetaError = Infallible;
+
+    fn metadata<S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: crate::inline::InlineEncoding,
+    {
+        Ok(self
+            .blobs
+            .get(&handle.raw)
+            .map(|blob| crate::repo::BlobMetadata {
+                timestamp: 0,
+                length: blob.bytes.len() as u64,
+            }))
+    }
+}
+
 impl BlobStoreGet for MemoryBlobStoreReader {
     type GetError<E: Error + Send + Sync + 'static> = MemoryStoreGetError<E>;
 

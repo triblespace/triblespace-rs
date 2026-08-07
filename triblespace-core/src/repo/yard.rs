@@ -8,6 +8,7 @@
 //! also be physically removed from disk.
 
 use std::cmp::Reverse;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -28,8 +29,8 @@ use crate::prelude::blobencodings::SimpleArchive;
 
 use super::pile::{GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError};
 use super::{
-    reachable, transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList,
-    BlobStorePut, PinStore, PushResult, StorageClose, TransferError, WeakPinStore,
+    transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
+    PinStore, PushResult, RetentionRoots, StorageClose, TransferError, WeakPinStore,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -61,10 +62,6 @@ impl WeakState {
 
     fn unpin(&mut self, raw: &[u8; INLINE_LEN]) {
         self.pins.remove(raw);
-    }
-
-    fn contains(&self, raw: &[u8; INLINE_LEN]) -> bool {
-        self.pins.get(raw).is_some()
     }
 
     fn trim_to_present_budget(&mut self, present: &HandleSet, budget: usize) -> HandleSet {
@@ -369,8 +366,21 @@ impl Yard {
 
     /// Recompute the keep set and logically collect cold weak pins and orphans.
     pub fn collect(&mut self) -> Result<(), YardCollectError> {
+        self.collect_with_retention(&RetentionRoots::new())
+    }
+
+    /// Recompute the keep set with additional explicit policy roots.
+    ///
+    /// The supplied roots are strong for this pass. Direct roots retain only
+    /// themselves; recursive roots retain their resident descendants. Callers
+    /// must supply the same policy on every later collection pass for the
+    /// corresponding data to remain live.
+    pub fn collect_with_retention(
+        &mut self,
+        retention: &RetentionRoots,
+    ) -> Result<(), YardCollectError> {
         let reader = self.reader().map_err(YardCollectError::Reader)?;
-        let strong_keep = self.strong_keep_set(&reader);
+        let strong_keep = self.strong_keep_set(&reader, retention);
         let present = reader.live_set();
         let weak_keep = self
             .weak_state
@@ -393,13 +403,21 @@ impl Yard {
     /// Strong survivors descend when a level exceeds its strong budget. Weak
     /// pins are only retained in the young generation and never copied down.
     pub fn compact(&mut self) -> Result<(), YardCollectError> {
-        self.collect()?;
+        self.compact_with_retention(&RetentionRoots::new())
+    }
+
+    /// Run one compaction pass with additional explicit policy roots.
+    pub fn compact_with_retention(
+        &mut self,
+        retention: &RetentionRoots,
+    ) -> Result<(), YardCollectError> {
+        self.collect_with_retention(retention)?;
         let last = self.generations.len().saturating_sub(1);
         let mut dumped = Vec::new();
 
         {
             let reader = self.reader().map_err(YardCollectError::Reader)?;
-            let strong_keep = self.strong_keep_set(&reader);
+            let strong_keep = self.strong_keep_set(&reader, retention);
 
             for level in 0..last {
                 let strong_here = self.generations[level].segments[0]
@@ -468,7 +486,7 @@ impl Yard {
             }
         }
 
-        self.collect()
+        self.collect_with_retention(retention)
     }
 
     /// Physically rewrite each generation's pile to contain only its live set.
@@ -543,22 +561,34 @@ impl Yard {
         self.config.strong_level_budget.saturating_mul(multiplier)
     }
 
-    fn strong_keep_set(&self, reader: &YardReader) -> HandleSet {
-        let weak_state = self.weak_state.lock().expect("weak pin mutex poisoned");
+    fn strong_keep_set(&self, reader: &YardReader, retention: &RetentionRoots) -> HandleSet {
+        let weak_pins = self
+            .weak_state
+            .lock()
+            .expect("weak pin mutex poisoned")
+            .pins
+            .clone();
         let roots: Vec<_> = (&self.strong_pins)
             .into_iter()
             .filter_map(|pin| self.strong_pins.get(pin).copied())
-            .filter(|handle| !weak_state.contains(&handle.raw))
             .collect();
-        drop(weak_state);
 
         let mut keep = HandleSet::new();
-        for handle in reachable(reader, roots) {
-            let weak_state = self.weak_state.lock().expect("weak pin mutex poisoned");
-            if weak_state.contains(&handle.raw) {
+        let mut queue = VecDeque::from(roots);
+        while let Some(handle) = queue.pop_front() {
+            // Weak wants veto legacy strong-pin ownership and prune that whole
+            // subtree. This policy belongs to the collector, not to the
+            // structural BlobChildren view used by explicit retention.
+            if weak_pins.get(&handle.raw).is_some() || keep.get(&handle.raw).is_some() {
                 continue;
             }
-            drop(weak_state);
+            keep.insert(&Entry::new(&handle.raw));
+            queue.extend(reader.children(handle));
+        }
+        // Explicit policy roots are not weak cache wants. They remain strong
+        // even if the same handle or an owned descendant also has a stale weak
+        // marker.
+        for handle in retention.expanded(reader) {
             keep.insert(&Entry::new(&handle.raw));
         }
         keep
@@ -887,7 +917,9 @@ impl BlobStoreGet for YardReader {
 impl BlobChildren for YardReader {
     fn children(&self, handle: Inline<Handle<UnknownBlob>>) -> Vec<Inline<Handle<UnknownBlob>>> {
         // Structural scan: use the non-minting read so reference
-        // discovery never floods the weak set with speculative wants.
+        // discovery never floods the weak set with speculative wants. Weak
+        // cache policy is intentionally absent here: callers such as explicit
+        // retention need the complete resident ownership graph.
         let Some(Ok(blob)) = self.get_local::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
             return Vec::new();
         };
@@ -897,16 +929,6 @@ impl BlobChildren for YardReader {
         while offset + INLINE_LEN <= bytes.len() {
             let mut raw = [0u8; INLINE_LEN];
             raw.copy_from_slice(&bytes[offset..offset + INLINE_LEN]);
-
-            if self
-                .weak_state
-                .lock()
-                .expect("weak pin mutex poisoned")
-                .contains(&raw)
-            {
-                offset += INLINE_LEN;
-                continue;
-            }
 
             let candidate = Inline::<Handle<UnknownBlob>>::new(raw);
             if matches!(self.get_local::<Bytes, UnknownBlob>(candidate), Some(Ok(_))) {
@@ -1288,6 +1310,53 @@ mod tests {
             reader.get::<Blob<UnknownBlob>, UnknownBlob>(child),
             Err(YardGetError::NotFound)
         ));
+    }
+
+    #[test]
+    fn explicit_retention_distinguishes_owned_and_descriptive_edges() {
+        let (_dir, mut yard) = yard_with(
+            1,
+            YardConfig {
+                weak_budget: 0,
+                ..YardConfig::default()
+            },
+        );
+        let owned_child =
+            Blob::<UnknownBlob>::new(Bytes::from_source(b"owned child".to_vec())).get_handle();
+        // Even an evictable weak-cache marker cannot veto an explicit policy
+        // root: collection retention has already decided this edge is owned.
+        yard.pin_weak(owned_child).unwrap();
+        yard.put::<UnknownBlob, _>(Bytes::from_source(b"owned child".to_vec()))
+            .unwrap();
+        let owned_parent = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(owned_child.raw.to_vec()))
+            .unwrap();
+
+        let described_input = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"described input".to_vec()))
+            .unwrap();
+        let ledger_record = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(described_input.raw.to_vec()))
+            .unwrap();
+        let orphan = yard
+            .put::<UnknownBlob, _>(Bytes::from_source(b"orphan".to_vec()))
+            .unwrap();
+
+        let mut roots = RetentionRoots::new();
+        roots.retain_recursive(owned_parent);
+        roots.retain_direct(ledger_record);
+        yard.collect_with_retention(&roots).unwrap();
+        let reader = yard.reader().unwrap();
+
+        for retained in [owned_parent, owned_child, ledger_record] {
+            assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
+        }
+        for collected in [described_input, orphan] {
+            assert!(matches!(
+                reader.get::<Blob<UnknownBlob>, _>(collected),
+                Err(YardGetError::NotFound)
+            ));
+        }
     }
 
     #[test]

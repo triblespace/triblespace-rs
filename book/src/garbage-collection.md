@@ -28,6 +28,52 @@ and load each branch head, or read the subset of metadata relevant to the
 retention policy you are enforcing. Everything reachable from those handles
 will be retained by the traversal; everything else is eligible for forgetting.
 
+## Direct and Recursive Policy Roots
+
+Not every hash written inside a retained blob is an ownership edge. Collection
+ledger records are the important counterexample: a `MERGE` names its inputs and
+result to state an algebraic equation, but retaining that record should not by
+itself pin every historical physical input forever. `RetentionRoots` therefore
+has two sorts:
+
+- a **direct** root retains exactly the named blob; and
+- a **recursive** root retains the blob and all resident descendants found by
+  conservative traversal.
+
+Collection definitions and admitted `COMMIT`, `MERGE`, and `DERIVE` records are
+direct roots. Accepted commit metadata, the selected physical cover, validation
+endpoints, and their attachments are recursive roots. This division keeps the
+ledger available without silently turning descriptive hashes into ownership.
+Only claims admitted by the caller's authorization and validation policy can
+create roots, so unrelated self-signed records in an append-only pile do not
+retain arbitrary data.
+
+Validation adds one necessary conservative seam. Resolution is stateless: if a
+claim was accepted by examining endpoint bytes, a later reader cannot repeat
+that verdict after those bytes have been collected. The default
+`ValidationRetentionPolicy::RetainAllEndpoints` therefore retains the endpoint
+bytes of every admitted claim. `DurableValidationEvidence` permits an exact
+claim's obsolete inputs to disappear only when the caller has persistent
+positive evidence and all future readers consume that same evidence. An
+in-memory set used for one rewrite is not durable evidence.
+
+The resulting roots compose with both storage paths. Yard's
+`collect_with_retention` and `compact_with_retention` treat them as explicit
+policy roots. `Pile::rewrite_retained_into` copies the selected state into
+another append-only pile and also recursively retains and recreates every active
+legacy strong-pin mapping, which allows pinned branches and collection scopes to
+coexist during migration. Weak wants are an explicit rewrite choice. Preserving
+them copies their demand markers but does not promote the requested blob to an
+ownership root; dropping them omits the markers entirely.
+
+`RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
+scope registry. Every later collection or rewrite must rediscover the locally
+selected collections, apply the local signer/authorization policy, resolve the
+claims, and supply a fresh plan. Do not remove the last legacy strong pin for a
+dataset until a higher-level service durably owns that recurring policy. It is
+safe to publish and validate the collection while leaving the pin in place
+during this transition; both root sources compose idempotently.
+
 ## Conservative Reachability
 
 Every commit and branch metadata record is stored as a `SimpleArchive`. The
