@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Canonical collection records can be published with explicit crash-order
+  barriers.** The concrete `SimpleArchive` union kind now normalizes and
+  validates supplied bytes, flushes definitions and element dependencies
+  before writing a signed `COMMIT` or exact `MERGE`, and flushes the record
+  before returning. Completed operation prefixes leave only inert dependencies
+  or a record whose dependencies were already durable. Replay after any
+  backend-required I/O recovery is content-addressed and idempotent, without a
+  repository transaction layer.
 - **The first production collection kind is canonical `SimpleArchive`
   TribleSet union.** `collection::simplearchive_union` constructs definitions,
   validates commit and merge endpoints against freshly computed Blake3
