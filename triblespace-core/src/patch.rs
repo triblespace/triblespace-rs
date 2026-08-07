@@ -570,7 +570,6 @@ pub(crate) fn blind_root_hash(root_hash: Option<u128>) -> Option<u128> {
 /// Bulk archive construction calls this once per source row and shares the
 /// result across all six index builds. Initializing here is important because
 /// that path hashes before it constructs its first [`PATCH`].
-#[cfg(any(test, feature = "parallel"))]
 #[inline]
 pub(crate) fn hash_key(bytes: &[u8]) -> u128 {
     hash_leaf_bytes(bytes)
@@ -3331,7 +3330,6 @@ where
     /// Build an archive partition under a receipt already shared by an
     /// aggregate. Retaining `owner` is idempotent when it is already the
     /// receipt's latest member, preserving the shared cover Arc.
-    #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn from_archive_partition_with_guard(
         keys: &[[u8; KEY_LEN]],
         hashes: &[u128],
@@ -3384,7 +3382,6 @@ where
     /// Trie construction is ownership-neutral. One deduplicated conservative
     /// owner cover on the returned PATCH guards every LocalLeaf regardless of
     /// later reshaping.
-    #[cfg(any(test, feature = "parallel"))]
     unsafe fn build_archive_partition_head(
         keys: &[[u8; KEY_LEN]],
         hashes: &[u128],
