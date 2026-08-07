@@ -112,6 +112,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     /// already hashes each row once and carries the XOR aggregate through its
     /// recursion, so re-reading direct `LocalLeaf` children here would repeat
     /// that work for every index.
+    #[cfg(any(test, feature = "parallel"))]
     pub fn finish_bulk_aggregates(&mut self, known_hash: u128) {
         unsafe {
             Branch::finish_bulk_aggregates(&mut self.branch_nn, known_hash);
@@ -296,6 +297,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// wider Branches begin at the smallest power-of-two capacity that can
     /// hold their known fanout and grow only if cuckoo placement still needs
     /// it.
+    #[cfg(any(test, feature = "parallel"))]
     pub(super) fn new_with_child_hashes_capacity(
         end_depth: usize,
         lchild: Head<KEY_LEN, O, V>,
@@ -693,6 +695,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
     /// Rebuild structural aggregates after a batch of child installations and
     /// install a caller-proven exact hash without traversing child hashes.
+    #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn finish_bulk_aggregates(branch_nn: &mut NonNull<Self>, known_hash: u128) {
         let branch = branch_nn.as_ptr();
         let end_depth = (*branch).end_depth as usize;
