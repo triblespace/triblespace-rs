@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resolved `SimpleArchive` collections have one narrow read-side
+  materializer.** It probes residency only for known semantic members, selects
+  the deterministic overlap-aware physical cover, reports uncovered frontier
+  obligations before fetching, and decodes the selected archives into one
+  `TribleSet`. Definition, metadata, fetch, missing-cover, and archive failures
+  remain distinct without reintroducing repositories, heads, catalogs, or
+  authorization policy.
 - **Durable Ed25519 key files now have one strict core utility.** Callers can
   resolve an explicit path, `TRIBLESPACE_KEY`, or the lexical `self.key` beside
   a pile without following symlinks during resolution; load only regular,

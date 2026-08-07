@@ -35,6 +35,9 @@ use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::{CollectionCommit, CollectionData, CollectionDefinition, CollectionMerge};
 
+mod materialize;
+pub use materialize::*;
+
 /// Canonical TribleSet set-union recipe, version 1.
 ///
 /// This identifies the semantic law independently of its direct-stream
