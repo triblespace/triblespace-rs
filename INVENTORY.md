@@ -219,6 +219,10 @@ prioritized for efficient zero-copy access.
   BM25 content attribute/tokenizer version and HNSW dimensions/metric so
   incompatible segment families cannot share one manifest or coverage
   certificate.
+- Wire the portable exact-TF BM25 carrier into collection derivation only once
+  the source attribute and tokenizer recipe have an explicit identity. The
+  carrier deliberately accepts exact typed counts and does not silently choose
+  an Archive field or tokenization policy.
 - Define archive-message semantics when one entity carries multiple content
   handles. BM25 preserves the union of their term presence, while result
   materialisation currently selects one matching body; either make the schema

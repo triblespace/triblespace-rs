@@ -1,15 +1,20 @@
 //! Content-addressed BM25 + HNSW indexes on top of triblespace
 //! piles. See `docs/DESIGN.md` for the full design rationale.
 //!
-//! Two canonical blob types, loaded zero-copy via [`anybytes`]
-//! with bit-packed bodies via [`jerky`]:
+//! Three content-addressed BM25/HNSW blob types:
+//! - [`portable_bm25::PortableBM25Index`] (schema
+//!   [`portable_bm25::PortableBM25Blob`]) — an architecture-independent,
+//!   canonical BM25 carrier containing exact term frequencies. Its resident
+//!   view validates the bytes and derives scores without changing identity.
 //! - [`succinct::SuccinctBM25Index`] (schema
 //!   [`succinct::SuccinctBM25Blob`]) — term → doc retrieval
 //!   where terms are 32-byte triblespace `Inline`s (text tokens,
-//!   entity ids, tags, anything).
+//!   entity ids, tags, anything), loaded zero-copy via [`anybytes`] with a
+//!   bit-packed [`jerky`] body.
 //! - [`succinct::SuccinctHNSWIndex`] (schema
 //!   [`succinct::SuccinctHNSWBlob`]) — approximate
-//!   k-nearest-neighbour over caller-supplied embeddings.
+//!   k-nearest-neighbour over caller-supplied embeddings, likewise using a
+//!   native succinct query accelerator.
 //!
 //! [`bm25::BM25Builder::build`] goes direct-to-succinct
 //! (sorts keys into a `CompressedUniverse` first, then
@@ -107,6 +112,7 @@ pub mod index_bm25;
 pub mod index_hnsw;
 #[cfg(feature = "succinct")]
 pub mod index_schema;
+pub mod portable_bm25;
 #[cfg(feature = "succinct")]
 pub mod ring;
 pub mod schemas;
@@ -148,8 +154,9 @@ pub mod testing {
 }
 
 // Versioning policy: breaking byte-layout changes mint a new
-// `BlobEncoding` id (see `SuccinctBM25Blob` / `SuccinctHNSWBlob`
-// in `succinct.rs`). That metadata identity feeds derived typed
+// `BlobEncoding` id (see `PortableBM25Blob` in `portable_bm25.rs` and
+// `SuccinctBM25Blob` / `SuccinctHNSWBlob` in `succinct.rs`). That metadata
+// identity feeds derived typed
 // schemas, but it is not an in-band runtime guard and does not
 // make the Rust marker a new type. Persisted attributes/manifests
 // that route handles to a reader must rotate with it. There is no

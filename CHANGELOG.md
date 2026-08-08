@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **BM25 now has a portable exact-frequency carrier distinct from its native
+  succinct accelerator.** The new blob stores only the canonical document set
+  and positive exact `u32` `(document, term)` frequencies in a fixed-width,
+  gapless little-endian grammar. Empty documents are first-class; merge is
+  document union plus pointwise maximum; scores and document statistics are
+  reproducibly derived by the attached query view. Strict byte/hash goldens and
+  malformed-spelling tests pin the fresh representation identity
+  `A5B5F53351B46DECAED496E567D12F4F` (minted with `trible genid` on
+  2026-08-08).
+
 - **CPU and GPU wavelet backends now share the portable codec's minimal
   alphabet width.** Jerky and the CubeCL freeze geometry use
   `max(1, bit_length(D - 1))`, including `D=0/1` and exact power-of-two

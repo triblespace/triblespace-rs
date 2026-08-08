@@ -6,6 +6,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Portable exact-TF BM25 carrier
+
+- Added a new architecture-independent BM25 blob whose canonical logical value
+  is the document set plus positive exact `u32` term frequencies. Its gapless
+  little-endian grammar stores sorted 32-byte document and term domains,
+  term-major `(u32 document ordinal, u32 frequency)` postings, cumulative
+  `u64` posting ends, and a two-count footer—without persisted scores, lengths,
+  floats, native `usize`, padding, or redundant tables.
+- Attachment strictly validates the one canonical spelling and derives document
+  statistics in memory. Portable segments merge by document union and
+  pointwise maximum frequency, preserving empty documents and producing
+  byte-identical output across permutations, duplicates, and arbitrary merge
+  trees. The resident view implements the existing BM25 query constraint
+  surface without adopting an ambient tokenizer.
+
 ### Succinct BM25 is exact and LSM-cover invariant
 
 - Succinct postings now persist exact, bit-packed `u32` term frequencies

@@ -46,7 +46,8 @@ use crate::schemas::Embedding;
 /// Minimum surface a BM25 index must expose for the
 /// [`BM25Filter`] constraint to work against it. Implemented
 /// for both the naive [`crate::bm25::BM25Index`] and the
-/// succinct [`crate::succinct::SuccinctBM25Index`] so either
+/// succinct [`crate::succinct::SuccinctBM25Index`], as well as the portable
+/// exact-TF [`crate::portable_bm25::PortableBM25Index`], so each
 /// can plug into `find!` / `pattern!` without changes at the
 /// engine layer.
 pub trait BM25Queryable {
@@ -71,6 +72,21 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
         // — the typed API inside the index expects `&Inline<T>`.
         let term_val = Inline::<T>::new(*term);
         Box::new(self.query_term(&term_val).map(|(v, s)| (v.raw, s)))
+    }
+}
+
+impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
+    BM25Queryable for crate::portable_bm25::PortableBM25Index<D, T>
+{
+    fn query_term_boxed<'a>(
+        &'a self,
+        term: &RawInline,
+    ) -> Box<dyn Iterator<Item = (RawInline, f32)> + 'a> {
+        let term_val = Inline::<T>::new(*term);
+        Box::new(
+            self.query_term(&term_val)
+                .map(|(value, score)| (value.raw, score)),
+        )
     }
 }
 
@@ -256,6 +272,35 @@ fn aggregate_above<I: BM25Queryable + ?Sized>(
         "aggregate_above must key by doc, so its output is distinct"
     );
     out
+}
+
+impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
+    crate::portable_bm25::PortableBM25Index<D, T>
+{
+    /// Build a query-engine filter from this portable exact-TF corpus.
+    pub fn matches(
+        &self,
+        doc: Variable<D>,
+        terms: &[Inline<T>],
+        score_floor: f32,
+    ) -> BM25Filter<D> {
+        let raw_terms: Vec<RawInline> = terms.iter().map(|term| term.raw).collect();
+        BM25Filter::from_entries(doc, aggregate_above(self, &raw_terms, score_floor))
+    }
+
+    /// Summed BM25 score for one document across the supplied typed terms.
+    pub fn score(&self, doc: &Inline<D>, terms: &[Inline<T>]) -> f32 {
+        let mut sum = 0.0;
+        for term in terms {
+            for (candidate, score) in self.query_term(term) {
+                if candidate.raw == doc.raw {
+                    sum += score;
+                    break;
+                }
+            }
+        }
+        sum
+    }
 }
 
 impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
