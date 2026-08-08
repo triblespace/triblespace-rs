@@ -250,29 +250,47 @@ impl Serializable for OrderedUniverse {
     }
 }
 
-/// Universe that splits each 32-byte value into eight 4-byte fragments,
-/// frequency-sorts them, and stores indices via a DACs byte sequence.
+/// Universe that splits each 32-byte value into fixed-width byte fragments,
+/// frequency-sorts them, and stores dictionary indices via a DACs byte
+/// sequence.
 ///
-/// This yields significantly better compression than [`OrderedUniverse`]
-/// when many values share common 4-byte fragments (e.g. sequential IDs).
+/// `FRAGMENT_BYTES` must be a non-zero divisor of 32. Fragments stay byte
+/// arrays rather than being interpreted as native integers, so construction,
+/// ordering, and persisted runtime bytes are endian-independent. Wider
+/// fragments reduce the number of DAC lookups needed to reconstruct intrinsic
+/// IDs; narrower fragments can exploit sharing inside short or numeric values.
 #[derive(Debug, Clone)]
-pub struct CompressedUniverse {
-    fragments: View<[[u8; 4]]>,
-    fragments_handle: SectionHandle<[u8; 4]>,
+struct FragmentedUniverse<const FRAGMENT_BYTES: usize> {
+    fragments: View<[[u8; FRAGMENT_BYTES]]>,
+    fragments_handle: SectionHandle<[u8; FRAGMENT_BYTES]>,
     data: DacsByte,
 }
 
-impl Universe for CompressedUniverse {
+impl<const FRAGMENT_BYTES: usize> FragmentedUniverse<FRAGMENT_BYTES> {
+    fn fragments_per_value() -> Result<usize, jerky::error::Error> {
+        if FRAGMENT_BYTES == 0 || 32 % FRAGMENT_BYTES != 0 {
+            return Err(super::invalid_rank9_metadata(format!(
+                "compressed-universe fragment width {FRAGMENT_BYTES} is not a non-zero divisor of 32"
+            )));
+        }
+        Ok(32 / FRAGMENT_BYTES)
+    }
+}
+
+impl<const FRAGMENT_BYTES: usize> Universe for FragmentedUniverse<FRAGMENT_BYTES> {
     fn with_sorted_dedup<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
     where
         I: Iterator<Item = RawInline>,
     {
-        let mut data_fragments: Vec<[u8; 4]> = Vec::new();
-        let mut frequency: HashMap<[u8; 4], u64> = HashMap::new();
+        let fragments_per_value = Self::fragments_per_value()
+            .expect("compressed-universe fragment width must divide RawInline");
+        let mut data_fragments: Vec<[u8; FRAGMENT_BYTES]> = Vec::new();
+        let mut frequency: HashMap<[u8; FRAGMENT_BYTES], u64> = HashMap::new();
 
         for value in iter {
-            for i in 0..8 {
-                let fragment = value[i * 4..i * 4 + 4].try_into().unwrap();
+            for i in 0..fragments_per_value {
+                let start = i * FRAGMENT_BYTES;
+                let fragment = value[start..start + FRAGMENT_BYTES].try_into().unwrap();
                 *frequency.entry(fragment).or_insert(0) += 1;
                 data_fragments.push(fragment);
             }
@@ -281,24 +299,26 @@ impl Universe for CompressedUniverse {
         let mut fragments: Vec<_> = frequency.keys().copied().collect();
         fragments.sort_unstable_by_key(|fragment| (Reverse(frequency.get(fragment)), *fragment));
 
-        let fragment_index: HashMap<[u8; 4], u32> = fragments
+        let fragment_index: HashMap<[u8; FRAGMENT_BYTES], usize> = fragments
             .iter()
             .enumerate()
-            .map(|(pos, value)| (*value, pos as u32))
+            .map(|(pos, value)| (*value, pos))
             .collect();
 
-        let data: Vec<u32> = data_fragments
+        let data: Vec<usize> = data_fragments
             .into_iter()
             .map(|fragment| fragment_index.get(&fragment).copied().unwrap())
             .collect();
 
         let data = DacsByte::from_slice(&data, sections).unwrap();
 
-        let mut section = sections.reserve::<[u8; 4]>(fragments.len()).unwrap();
+        let mut section = sections
+            .reserve::<[u8; FRAGMENT_BYTES]>(fragments.len())
+            .unwrap();
         section.as_mut_slice().copy_from_slice(&fragments);
         let fragments_handle = section.handle();
         let bytes = section.freeze().unwrap();
-        let fragments = bytes.view::<[[u8; 4]]>().expect("view");
+        let fragments = bytes.view::<[[u8; FRAGMENT_BYTES]]>().expect("view");
 
         Self {
             fragments,
@@ -312,6 +332,7 @@ impl Universe for CompressedUniverse {
         bytes: &Bytes,
         limit: usize,
     ) -> Result<(), jerky::error::Error> {
+        Self::fragments_per_value()?;
         if limit > bytes.len() {
             return Err(super::invalid_rank9_metadata(format!(
                 "compressed-universe prefix limit {limit} exceeds {} bytes",
@@ -378,10 +399,14 @@ impl Universe for CompressedUniverse {
 
     fn access(&self, pos: usize) -> RawInline {
         let mut v: RawInline = [0; 32];
+        let fragments_per_value = Self::fragments_per_value()
+            .expect("compressed-universe fragment width was checked at construction");
 
-        for i in 0..8 {
-            v[i * 4..i * 4 + 4]
-                .copy_from_slice(&self.fragments[self.data.access((pos * 8) + i).unwrap()]);
+        for i in 0..fragments_per_value {
+            let start = i * FRAGMENT_BYTES;
+            v[start..start + FRAGMENT_BYTES].copy_from_slice(
+                &self.fragments[self.data.access((pos * fragments_per_value) + i).unwrap()],
+            );
         }
 
         v
@@ -398,9 +423,61 @@ impl Universe for CompressedUniverse {
 
     #[inline]
     fn len(&self) -> usize {
-        self.data.num_vals() / 8
+        let fragments_per_value = Self::fragments_per_value()
+            .expect("compressed-universe fragment width was checked at construction");
+        self.data.num_vals() / fragments_per_value
     }
 }
+
+/// Serialisation metadata header for a [`FragmentedUniverse`].
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
+struct FragmentedUniverseMeta<const FRAGMENT_BYTES: usize> {
+    /// Section handle pointing to the fragment dictionary.
+    pub fragments: SectionHandle<[u8; FRAGMENT_BYTES]>,
+    /// DACs byte metadata for the fragment-index sequence.
+    pub data: DacsByteMeta,
+}
+
+impl<const FRAGMENT_BYTES: usize> Serializable for FragmentedUniverse<FRAGMENT_BYTES> {
+    type Meta = FragmentedUniverseMeta<FRAGMENT_BYTES>;
+    type Error = jerky::error::Error;
+
+    fn metadata(&self) -> Self::Meta {
+        FragmentedUniverseMeta {
+            fragments: self.fragments_handle,
+            data: self.data.metadata(),
+        }
+    }
+
+    fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
+        let fragments_per_value = Self::fragments_per_value()?;
+        let fragments = meta.fragments.view(&bytes).map_err(Self::Error::from)?;
+        let data = DacsByte::from_bytes(meta.data, bytes)?;
+        if data.num_vals() % fragments_per_value != 0 {
+            return Err(super::invalid_rank9_metadata(format!(
+                "compressed-universe DAC contains {} fragments, not a whole number of {fragments_per_value}-fragment values",
+                data.num_vals()
+            )));
+        }
+        Ok(Self {
+            fragments,
+            fragments_handle: meta.fragments,
+            data,
+        })
+    }
+}
+
+/// Universe that splits each 32-byte value into eight 4-byte fragments,
+/// frequency-sorts them, and stores dictionary indices via a DACs byte
+/// sequence.
+///
+/// The concrete width remains part of this existing persisted representation.
+/// Wider widths are evaluated by a private release-mode matrix rather than
+/// exposed as runtime tuning knobs; a production width change must rotate any
+/// enclosing persisted formats atomically.
+#[derive(Debug, Clone)]
+pub struct CompressedUniverse(FragmentedUniverse<4>);
 
 /// Serialisation metadata header for a [`CompressedUniverse`].
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
@@ -412,25 +489,63 @@ pub struct CompressedUniverseMeta {
     pub data: DacsByteMeta,
 }
 
+impl Universe for CompressedUniverse {
+    fn with_sorted_dedup<I>(values: I, sections: &mut SectionWriter<'_>) -> Self
+    where
+        I: Iterator<Item = RawInline>,
+    {
+        Self(FragmentedUniverse::with_sorted_dedup(values, sections))
+    }
+
+    fn validate_metadata_prefix(
+        meta: &Self::Meta,
+        bytes: &Bytes,
+        limit: usize,
+    ) -> Result<(), jerky::error::Error> {
+        FragmentedUniverse::<4>::validate_metadata_prefix(
+            &FragmentedUniverseMeta {
+                fragments: meta.fragments,
+                data: meta.data,
+            },
+            bytes,
+            limit,
+        )
+    }
+
+    fn access(&self, pos: usize) -> RawInline {
+        self.0.access(pos)
+    }
+
+    fn search(&self, value: &RawInline) -> Option<usize> {
+        self.0.search(value)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 impl Serializable for CompressedUniverse {
     type Meta = CompressedUniverseMeta;
     type Error = jerky::error::Error;
 
     fn metadata(&self) -> Self::Meta {
+        let meta = self.0.metadata();
         CompressedUniverseMeta {
-            fragments: self.fragments_handle,
-            data: self.data.metadata(),
+            fragments: meta.fragments,
+            data: meta.data,
         }
     }
 
     fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
-        let fragments = meta.fragments.view(&bytes).map_err(Self::Error::from)?;
-        let data = DacsByte::from_bytes(meta.data, bytes)?;
-        Ok(Self {
-            fragments,
-            fragments_handle: meta.fragments,
-            data,
-        })
+        FragmentedUniverse::from_bytes(
+            FragmentedUniverseMeta {
+                fragments: meta.fragments,
+                data: meta.data,
+            },
+            bytes,
+        )
+        .map(Self)
     }
 }
 
@@ -532,11 +647,50 @@ mod tests {
     use crate::id::id_into_value;
     use crate::id::rngid;
     use crate::id::ufoid;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
+    use crate::trible::{Trible, TribleSet};
 
+    use super::super::SuccinctArchive;
     use super::CachedUniverse;
     use super::CompressedUniverse;
     use super::OrderedUniverse;
     use super::Universe;
+
+    fn assert_fragmented_roundtrip<const FRAGMENT_BYTES: usize>() {
+        let mut values = vec![[0; 32], [0x55; 32], [0xaa; 32], [0xff; 32]];
+        values[1][31] = 1;
+        values[2][16] = 2;
+
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let universe = super::FragmentedUniverse::<FRAGMENT_BYTES>::with_sorted_dedup(
+            values.iter().copied(),
+            &mut sections,
+        );
+        let metadata = universe.metadata();
+        drop(sections);
+        let bytes = area.freeze().unwrap();
+        let rebuilt =
+            super::FragmentedUniverse::<FRAGMENT_BYTES>::from_bytes(metadata, bytes).unwrap();
+
+        for (position, value) in values.iter().enumerate() {
+            assert_eq!(rebuilt.access(position), *value);
+            assert_eq!(rebuilt.search(value), Some(position));
+            assert_eq!(rebuilt.search_lower(value), position);
+        }
+    }
+
+    fn frozen_universe_bytes<U>(values: &[crate::inline::RawInline]) -> anybytes::Bytes
+    where
+        U: Universe + Serializable<Error = jerky::error::Error>,
+    {
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let _universe = U::with_sorted_dedup(values.iter().copied(), &mut sections);
+        drop(sections);
+        area.freeze().unwrap()
+    }
 
     #[test]
     fn ids_compressed() {
@@ -642,6 +796,60 @@ mod tests {
     }
 
     #[test]
+    fn eight_byte_fragmented_universe_roundtrips() {
+        assert_fragmented_roundtrip::<8>();
+    }
+
+    #[test]
+    fn sixteen_byte_fragmented_universe_roundtrips() {
+        assert_fragmented_roundtrip::<16>();
+    }
+
+    #[test]
+    fn public_compressed_universe_keeps_the_four_byte_probe_representation() {
+        let mut values = Vec::new();
+        for index in 0..257u64 {
+            let mut value = [0; 32];
+            value[8..16].copy_from_slice(&index.wrapping_mul(17).to_be_bytes());
+            value[24..].copy_from_slice(&index.wrapping_mul(65_537).to_be_bytes());
+            values.push(value);
+        }
+        assert_eq!(
+            frozen_universe_bytes::<CompressedUniverse>(&values),
+            frozen_universe_bytes::<super::FragmentedUniverse<4>>(&values)
+        );
+    }
+
+    #[test]
+    fn detached_rank9_is_independent_of_runtime_universe_width() {
+        let mut set = TribleSet::new();
+        for index in 1..=32u8 {
+            let entity = crate::id::Id::new([index; 16]).unwrap();
+            let attribute = crate::id::Id::new([index.wrapping_add(64); 16]).unwrap();
+            let mut value = [0; 32];
+            value[0] = index;
+            value[31] = index.wrapping_mul(7);
+            set.insert(&Trible::force(
+                &entity,
+                &attribute,
+                &Inline::<UnknownInline>::new(value),
+            ));
+        }
+
+        let four: SuccinctArchive<super::FragmentedUniverse<4>> = (&set).into();
+        let sixteen: SuccinctArchive<super::FragmentedUniverse<16>> = (&set).into();
+        let (raw_four, rank9_four) = four.to_blob_pair();
+        let (raw_sixteen, rank9_sixteen) = sixteen.to_blob_pair();
+
+        assert_eq!(raw_four.bytes, raw_sixteen.bytes);
+        assert_eq!(rank9_four.bytes, rank9_sixteen.bytes);
+        let cross_attached =
+            SuccinctArchive::<super::FragmentedUniverse<16>>::from_blob_pair(raw_four, rank9_four)
+                .unwrap();
+        assert_eq!(cross_attached.iter().count(), set.len());
+    }
+
+    #[test]
     fn cached_universe_empty_search() {
         let mut area = ByteArea::new().unwrap();
         let mut sections = area.sections();
@@ -650,3 +858,6 @@ mod tests {
         assert_eq!(u.search(&[0u8; 32]), None);
     }
 }
+
+#[cfg(test)]
+mod fragment_width_bench;

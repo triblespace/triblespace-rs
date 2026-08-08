@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Compressed-universe fragment width now has a reproducible private
+  representation matrix instead of a public tuning family.** A release-mode
+  ignored test compares ordered, 4-, 8-, and 16-byte byte-array fragments on
+  an exact block-DAG-schema corpus and a mixed reference/numeric/text/hash
+  corpus, separating frozen runtime-arena bytes, construction, access, exact
+  search, lower-bound search, whole-archive construction, and query time. It
+  also proves that canonical raw Succinct and detached Rank9 bytes are
+  independent of the runtime universe width and cross-attach exactly. The
+  existing public 4-byte `CompressedUniverse` representation remains
+  unchanged until the current width-dependent succinct-BM25 carrier can be
+  retired or given a fresh schema identity in one atomic 16-byte cutover.
 - **Direct canonical Succinct construction now keeps its final portable
   artifact out of the Rust heap.** The raw leaf and merge writer reserves one
   exact-size, temporary-file-backed `anybytes::ByteArea` section, fills the
