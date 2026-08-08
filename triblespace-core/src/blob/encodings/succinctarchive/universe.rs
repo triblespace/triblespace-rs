@@ -250,6 +250,486 @@ impl Serializable for OrderedUniverse {
     }
 }
 
+/// Probe universe that elides the zero first half of intrinsic IDs.
+///
+/// Lexicographic sorting makes every value whose first 16 bytes are zero one
+/// contiguous leading range.  The representation therefore needs only the
+/// range length, all second halves, and first halves for the remaining tail.
+/// Access is direct and the payload is exactly `32N - 16Z` bytes for `N`
+/// values and a zero-prefix range of length `Z`.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct ZeroPrefixUniverse {
+    zero_prefix_len: usize,
+    suffixes: View<[[u8; 16]]>,
+    suffixes_handle: SectionHandle<[u8; 16]>,
+    nonzero_prefixes: View<[[u8; 16]]>,
+    nonzero_prefixes_handle: SectionHandle<[u8; 16]>,
+}
+
+#[cfg(test)]
+impl ZeroPrefixUniverse {
+    fn attach(meta: ZeroPrefixUniverseMeta, bytes: Bytes) -> Result<Self, jerky::error::Error> {
+        super::checked_section_range(meta.suffixes, bytes.len(), "zero-prefix universe suffixes")?;
+        super::checked_section_range(
+            meta.nonzero_prefixes,
+            bytes.len(),
+            "zero-prefix universe nonzero prefixes",
+        )?;
+        let suffixes = meta
+            .suffixes
+            .view(&bytes)
+            .map_err(jerky::error::Error::from)?;
+        if meta.zero_prefix_len > suffixes.len() {
+            return Err(super::invalid_rank9_metadata(format!(
+                "zero-prefix universe boundary {} exceeds {} values",
+                meta.zero_prefix_len,
+                suffixes.len()
+            )));
+        }
+        let nonzero_prefixes = meta
+            .nonzero_prefixes
+            .view(&bytes)
+            .map_err(jerky::error::Error::from)?;
+        let expected_nonzero = suffixes.len() - meta.zero_prefix_len;
+        if nonzero_prefixes.len() != expected_nonzero {
+            return Err(super::invalid_rank9_metadata(format!(
+                "zero-prefix universe stores {} nonzero prefixes, expected {expected_nonzero}",
+                nonzero_prefixes.len()
+            )));
+        }
+        if nonzero_prefixes.iter().any(|prefix| *prefix == [0; 16]) {
+            return Err(super::invalid_rank9_metadata(
+                "zero-prefix universe tail contains a zero prefix",
+            ));
+        }
+
+        let universe = Self {
+            zero_prefix_len: meta.zero_prefix_len,
+            suffixes,
+            suffixes_handle: meta.suffixes,
+            nonzero_prefixes,
+            nonzero_prefixes_handle: meta.nonzero_prefixes,
+        };
+        let mut previous = None;
+        for pos in 0..universe.len() {
+            let value = universe.access(pos);
+            if previous.is_some_and(|prior| prior >= value) {
+                return Err(super::invalid_rank9_metadata(
+                    "zero-prefix universe values are not strictly increasing",
+                ));
+            }
+            previous = Some(value);
+        }
+        Ok(universe)
+    }
+
+    #[inline]
+    fn tail_cmp(&self, tail_pos: usize, value: &RawInline) -> std::cmp::Ordering {
+        self.nonzero_prefixes[tail_pos]
+            .as_slice()
+            .cmp(&value[..16])
+            .then_with(|| {
+                self.suffixes[self.zero_prefix_len + tail_pos]
+                    .as_slice()
+                    .cmp(&value[16..])
+            })
+    }
+}
+
+#[cfg(test)]
+impl Universe for ZeroPrefixUniverse {
+    fn with_sorted_dedup<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
+    where
+        I: Iterator<Item = RawInline>,
+    {
+        let values: Vec<_> = iter.collect();
+        debug_assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+        let zero_prefix_len = values.partition_point(|value| value[..16] == [0; 16]);
+
+        let mut suffixes_section = sections.reserve::<[u8; 16]>(values.len()).unwrap();
+        for (suffix, value) in suffixes_section.as_mut_slice().iter_mut().zip(&values) {
+            suffix.copy_from_slice(&value[16..]);
+        }
+        let suffixes_handle = suffixes_section.handle();
+        let suffixes_bytes = suffixes_section.freeze().unwrap();
+        let suffixes = suffixes_bytes.view::<[[u8; 16]]>().expect("view");
+
+        let mut prefixes_section = sections
+            .reserve::<[u8; 16]>(values.len() - zero_prefix_len)
+            .unwrap();
+        for (prefix, value) in prefixes_section
+            .as_mut_slice()
+            .iter_mut()
+            .zip(&values[zero_prefix_len..])
+        {
+            prefix.copy_from_slice(&value[..16]);
+        }
+        let nonzero_prefixes_handle = prefixes_section.handle();
+        let prefixes_bytes = prefixes_section.freeze().unwrap();
+        let nonzero_prefixes = prefixes_bytes.view::<[[u8; 16]]>().expect("view");
+
+        Self {
+            zero_prefix_len,
+            suffixes,
+            suffixes_handle,
+            nonzero_prefixes,
+            nonzero_prefixes_handle,
+        }
+    }
+
+    fn validate_metadata_prefix(
+        meta: &Self::Meta,
+        bytes: &Bytes,
+        limit: usize,
+    ) -> Result<(), jerky::error::Error> {
+        if limit > bytes.len() {
+            return Err(super::invalid_rank9_metadata(format!(
+                "zero-prefix universe prefix limit {limit} exceeds {} bytes",
+                bytes.len()
+            )));
+        }
+        super::checked_section_range(meta.suffixes, limit, "zero-prefix universe suffixes")?;
+        super::checked_section_range(
+            meta.nonzero_prefixes,
+            limit,
+            "zero-prefix universe nonzero prefixes",
+        )?;
+        Self::attach(*meta, bytes.clone().slice(0..limit)).map(|_| ())
+    }
+
+    #[inline]
+    fn access(&self, pos: usize) -> RawInline {
+        let mut value = [0; 32];
+        value[16..].copy_from_slice(&self.suffixes[pos]);
+        if pos >= self.zero_prefix_len {
+            value[..16].copy_from_slice(&self.nonzero_prefixes[pos - self.zero_prefix_len]);
+        }
+        value
+    }
+
+    fn search(&self, value: &RawInline) -> Option<usize> {
+        if value[..16] == [0; 16] {
+            return self.suffixes[..self.zero_prefix_len]
+                .binary_search_by(|suffix| suffix.as_slice().cmp(&value[16..]))
+                .ok();
+        }
+        if self.nonzero_prefixes.is_empty() {
+            return None;
+        }
+        (0..=self.nonzero_prefixes.len() - 1)
+            .binary_by(|tail_pos| self.tail_cmp(tail_pos, value))
+            .map(|tail_pos| self.zero_prefix_len + tail_pos)
+            .ok()
+    }
+
+    fn search_lower(&self, value: &RawInline) -> usize {
+        if value[..16] == [0; 16] {
+            return self.suffixes[..self.zero_prefix_len]
+                .partition_point(|suffix| suffix.as_slice() < &value[16..]);
+        }
+        let mut lo = 0usize;
+        let mut hi = self.nonzero_prefixes.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.tail_cmp(mid, value) == std::cmp::Ordering::Less {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        self.zero_prefix_len + lo
+    }
+
+    fn search_upper(&self, value: &RawInline) -> usize {
+        if value[..16] == [0; 16] {
+            return self.suffixes[..self.zero_prefix_len]
+                .partition_point(|suffix| suffix.as_slice() <= &value[16..]);
+        }
+        let mut lo = 0usize;
+        let mut hi = self.nonzero_prefixes.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.tail_cmp(mid, value) != std::cmp::Ordering::Greater {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        self.zero_prefix_len + lo
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.suffixes.len()
+    }
+}
+
+/// Runtime metadata for [`ZeroPrefixUniverse`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
+struct ZeroPrefixUniverseMeta {
+    zero_prefix_len: usize,
+    suffixes: SectionHandle<[u8; 16]>,
+    nonzero_prefixes: SectionHandle<[u8; 16]>,
+}
+
+#[cfg(test)]
+impl Serializable for ZeroPrefixUniverse {
+    type Meta = ZeroPrefixUniverseMeta;
+    type Error = jerky::error::Error;
+
+    fn metadata(&self) -> Self::Meta {
+        ZeroPrefixUniverseMeta {
+            zero_prefix_len: self.zero_prefix_len,
+            suffixes: self.suffixes_handle,
+            nonzero_prefixes: self.nonzero_prefixes_handle,
+        }
+    }
+
+    fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
+        Self::attach(meta, bytes)
+    }
+}
+
+#[cfg(test)]
+mod dacs_probe {
+    use super::*;
+
+    /// Universe that splits each 32-byte value into fixed-width byte fragments,
+    /// frequency-sorts them, and stores dictionary indices via a DACs byte
+    /// sequence.
+    ///
+    /// `FRAGMENT_BYTES` must be a non-zero divisor of 32. Fragments stay byte
+    /// arrays rather than being interpreted as native integers, so construction,
+    /// ordering, and persisted runtime bytes are endian-independent. Wider
+    /// fragments reduce the number of DAC lookups needed to reconstruct intrinsic
+    /// IDs; narrower fragments can exploit sharing inside short or numeric values.
+    #[derive(Debug, Clone)]
+    pub(super) struct FragmentedUniverse<const FRAGMENT_BYTES: usize> {
+        fragments: View<[[u8; FRAGMENT_BYTES]]>,
+        fragments_handle: SectionHandle<[u8; FRAGMENT_BYTES]>,
+        data: DacsByte,
+    }
+
+    impl<const FRAGMENT_BYTES: usize> FragmentedUniverse<FRAGMENT_BYTES> {
+        fn fragments_per_value() -> Result<usize, jerky::error::Error> {
+            if FRAGMENT_BYTES == 0 || 32 % FRAGMENT_BYTES != 0 {
+                return Err(super::super::invalid_rank9_metadata(format!(
+                    "compressed-universe fragment width {FRAGMENT_BYTES} is not a non-zero divisor of 32"
+                )));
+            }
+            Ok(32 / FRAGMENT_BYTES)
+        }
+    }
+
+    impl<const FRAGMENT_BYTES: usize> Universe for FragmentedUniverse<FRAGMENT_BYTES> {
+        fn with_sorted_dedup<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
+        where
+            I: Iterator<Item = RawInline>,
+        {
+            let fragments_per_value = Self::fragments_per_value()
+                .expect("compressed-universe fragment width must divide RawInline");
+            let mut data_fragments: Vec<[u8; FRAGMENT_BYTES]> = Vec::new();
+            let mut frequency: HashMap<[u8; FRAGMENT_BYTES], u64> = HashMap::new();
+
+            for value in iter {
+                for i in 0..fragments_per_value {
+                    let start = i * FRAGMENT_BYTES;
+                    let fragment = value[start..start + FRAGMENT_BYTES].try_into().unwrap();
+                    *frequency.entry(fragment).or_insert(0) += 1;
+                    data_fragments.push(fragment);
+                }
+            }
+
+            let mut fragments: Vec<_> = frequency.keys().copied().collect();
+            fragments
+                .sort_unstable_by_key(|fragment| (Reverse(frequency.get(fragment)), *fragment));
+
+            let fragment_index: HashMap<[u8; FRAGMENT_BYTES], usize> = fragments
+                .iter()
+                .enumerate()
+                .map(|(pos, value)| (*value, pos))
+                .collect();
+
+            let data: Vec<usize> = data_fragments
+                .into_iter()
+                .map(|fragment| fragment_index.get(&fragment).copied().unwrap())
+                .collect();
+
+            let data = DacsByte::from_slice(&data, sections).unwrap();
+
+            let mut section = sections
+                .reserve::<[u8; FRAGMENT_BYTES]>(fragments.len())
+                .unwrap();
+            section.as_mut_slice().copy_from_slice(&fragments);
+            let fragments_handle = section.handle();
+            let bytes = section.freeze().unwrap();
+            let fragments = bytes.view::<[[u8; FRAGMENT_BYTES]]>().expect("view");
+
+            Self {
+                fragments,
+                fragments_handle,
+                data,
+            }
+        }
+
+        fn validate_metadata_prefix(
+            meta: &Self::Meta,
+            bytes: &Bytes,
+            limit: usize,
+        ) -> Result<(), jerky::error::Error> {
+            Self::fragments_per_value()?;
+            if limit > bytes.len() {
+                return Err(super::super::invalid_rank9_metadata(format!(
+                    "compressed-universe prefix limit {limit} exceeds {} bytes",
+                    bytes.len()
+                )));
+            }
+            super::super::checked_section_range(
+                meta.fragments,
+                limit,
+                "compressed-universe fragments",
+            )?;
+
+            let levels = meta.data.num_levels;
+            let max_levels = usize::BITS.div_ceil(8) as usize;
+            if levels == 0 || levels > max_levels {
+                return Err(super::super::invalid_rank9_metadata(format!(
+                    "compressed-universe DAC has invalid level count {levels}"
+                )));
+            }
+            let table = super::super::checked_section_range(
+                meta.data.levels,
+                limit,
+                "compressed-universe DAC level table",
+            )?;
+            let expected_table_len = levels
+                .checked_mul(std::mem::size_of::<LevelMeta>())
+                .ok_or_else(|| {
+                    super::super::invalid_rank9_metadata("DAC level-table length overflow")
+                })?;
+            if table.len() != expected_table_len {
+                return Err(super::super::invalid_rank9_metadata(format!(
+                    "compressed-universe DAC level table has {} bytes, expected {expected_table_len}",
+                    table.len()
+                )));
+            }
+            let infos = meta
+                .data
+                .levels
+                .view(bytes)
+                .map_err(jerky::error::Error::from)?;
+            for (index, info) in infos.iter().enumerate() {
+                super::super::checked_section_range(
+                    info.level,
+                    limit,
+                    &format!("compressed-universe DAC payload level {index}"),
+                )?;
+                let flag_range = super::super::checked_section_range(
+                    info.flag,
+                    limit,
+                    &format!("compressed-universe DAC flag level {index}"),
+                )?;
+                let expected_flag_len = if index + 1 < levels {
+                    info.flag_bits
+                        .checked_add(63)
+                        .map(|bits| bits / 64)
+                        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+                        .ok_or_else(|| {
+                            super::super::invalid_rank9_metadata("DAC flag length overflow")
+                        })?
+                } else {
+                    0
+                };
+                if flag_range.len() != expected_flag_len {
+                    return Err(super::super::invalid_rank9_metadata(format!(
+                        "compressed-universe DAC flag level {index} has {} bytes, expected {expected_flag_len}",
+                        flag_range.len()
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        fn access(&self, pos: usize) -> RawInline {
+            let mut v: RawInline = [0; 32];
+            let fragments_per_value = Self::fragments_per_value()
+                .expect("compressed-universe fragment width was checked at construction");
+
+            for i in 0..fragments_per_value {
+                let start = i * FRAGMENT_BYTES;
+                v[start..start + FRAGMENT_BYTES].copy_from_slice(
+                    &self.fragments[self.data.access((pos * fragments_per_value) + i).unwrap()],
+                );
+            }
+
+            v
+        }
+
+        fn search(&self, v: &RawInline) -> Option<usize> {
+            if self.len() == 0 {
+                return None;
+            }
+            (0..=self.len() - 1)
+                .binary_by(|p| self.access(p).cmp(v))
+                .ok()
+        }
+
+        #[inline]
+        fn len(&self) -> usize {
+            let fragments_per_value = Self::fragments_per_value()
+                .expect("compressed-universe fragment width was checked at construction");
+            self.data.num_vals() / fragments_per_value
+        }
+    }
+
+    /// Serialisation metadata header for a [`FragmentedUniverse`].
+    #[derive(
+        Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
+    )]
+    #[repr(C)]
+    pub(super) struct FragmentedUniverseMeta<const FRAGMENT_BYTES: usize> {
+        /// Section handle pointing to the fragment dictionary.
+        pub fragments: SectionHandle<[u8; FRAGMENT_BYTES]>,
+        /// DACs byte metadata for the fragment-index sequence.
+        pub data: DacsByteMeta,
+    }
+
+    impl<const FRAGMENT_BYTES: usize> Serializable for FragmentedUniverse<FRAGMENT_BYTES> {
+        type Meta = FragmentedUniverseMeta<FRAGMENT_BYTES>;
+        type Error = jerky::error::Error;
+
+        fn metadata(&self) -> Self::Meta {
+            FragmentedUniverseMeta {
+                fragments: self.fragments_handle,
+                data: self.data.metadata(),
+            }
+        }
+
+        fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
+            let fragments_per_value = Self::fragments_per_value()?;
+            let fragments = meta.fragments.view(&bytes).map_err(Self::Error::from)?;
+            let data = DacsByte::from_bytes(meta.data, bytes)?;
+            if data.num_vals() % fragments_per_value != 0 {
+                return Err(super::super::invalid_rank9_metadata(format!(
+                    "compressed-universe DAC contains {} fragments, not a whole number of {fragments_per_value}-fragment values",
+                    data.num_vals()
+                )));
+            }
+            Ok(Self {
+                fragments,
+                fragments_handle: meta.fragments,
+                data,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+use dacs_probe::FragmentedUniverse;
+
 /// Universe that splits each 32-byte value into eight 4-byte fragments,
 /// frequency-sorts them, and stores indices via a DACs byte sequence.
 ///
@@ -526,17 +1006,23 @@ mod tests {
     use std::iter::repeat_with;
 
     use anybytes::area::ByteArea;
+    use anybytes::Bytes;
     use jerky::Serializable;
 
     use crate::id::fucid;
     use crate::id::id_into_value;
     use crate::id::rngid;
     use crate::id::ufoid;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
+    use crate::trible::{Trible, TribleSet};
 
+    use super::super::SuccinctArchive;
     use super::CachedUniverse;
     use super::CompressedUniverse;
     use super::OrderedUniverse;
     use super::Universe;
+    use super::ZeroPrefixUniverse;
 
     #[test]
     fn ids_compressed() {
@@ -642,6 +1128,108 @@ mod tests {
     }
 
     #[test]
+    fn zero_prefix_universe_roundtrips_and_has_exact_payload_size() {
+        let mut values = vec![[0; 32], [0; 32], [0x11; 32], [0x22; 32]];
+        values[1][31] = 7;
+        values[2][16..].fill(0x44);
+        values.sort_unstable();
+        values.dedup();
+        let zero_prefix_len = values.partition_point(|value| value[..16] == [0; 16]);
+
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let universe = ZeroPrefixUniverse::with_sorted_dedup(values.iter().copied(), &mut sections);
+        let metadata = universe.metadata();
+        drop(sections);
+        let bytes = area.freeze().unwrap();
+        assert_eq!(bytes.len(), 32 * values.len() - 16 * zero_prefix_len);
+        ZeroPrefixUniverse::validate_metadata_prefix(&metadata, &bytes, bytes.len()).unwrap();
+
+        let rebuilt = ZeroPrefixUniverse::from_bytes(metadata, bytes).unwrap();
+        for (position, value) in values.iter().enumerate() {
+            assert_eq!(rebuilt.access(position), *value);
+            assert_eq!(rebuilt.search(value), Some(position));
+            assert_eq!(rebuilt.search_lower(value), position);
+            assert_eq!(rebuilt.search_upper(value), position + 1);
+        }
+        assert_eq!(rebuilt.search(&[0xff; 32]), None);
+    }
+
+    #[test]
+    fn zero_prefix_universe_rejects_malformed_metadata() {
+        let mut values = vec![[0; 32], [0x11; 32], [0x22; 32]];
+        values[0][31] = 1;
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let universe = ZeroPrefixUniverse::with_sorted_dedup(values.iter().copied(), &mut sections);
+        let metadata = universe.metadata();
+        drop(sections);
+        let bytes = area.freeze().unwrap();
+
+        let mut boundary = metadata;
+        boundary.zero_prefix_len = values.len() + 1;
+        assert!(ZeroPrefixUniverse::from_bytes(boundary, bytes.clone()).is_err());
+
+        let mut count = metadata;
+        count.nonzero_prefixes.len -= 16;
+        assert!(ZeroPrefixUniverse::from_bytes(count, bytes.clone()).is_err());
+
+        let mut misaligned = metadata;
+        misaligned.suffixes.len -= 1;
+        assert!(ZeroPrefixUniverse::from_bytes(misaligned, bytes.clone()).is_err());
+
+        let mut outside = metadata;
+        outside.nonzero_prefixes.offset = bytes.len() + 16;
+        assert!(ZeroPrefixUniverse::from_bytes(outside, bytes.clone()).is_err());
+
+        let mut corrupt = bytes.as_ref().to_vec();
+        let start = metadata.nonzero_prefixes.offset;
+        corrupt[start..start + 16].fill(0);
+        assert!(ZeroPrefixUniverse::from_bytes(metadata, Bytes::from_source(corrupt)).is_err());
+
+        assert!(
+            ZeroPrefixUniverse::validate_metadata_prefix(&metadata, &bytes, bytes.len() - 1,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn zero_prefix_archive_matches_dacs16_and_ordered_rank9_bytes() {
+        let mut set = TribleSet::new();
+        for index in 1..=32u8 {
+            let entity = crate::id::Id::new([index; 16]).unwrap();
+            let attribute = crate::id::Id::new([index.wrapping_add(64); 16]).unwrap();
+            let mut value = [0; 32];
+            if index % 2 == 0 {
+                value[..16].fill(index);
+            }
+            value[31] = index.wrapping_mul(7);
+            set.insert(&Trible::force(
+                &entity,
+                &attribute,
+                &Inline::<UnknownInline>::new(value),
+            ));
+        }
+
+        let ordered: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let dacs16: SuccinctArchive<super::FragmentedUniverse<16>> = (&set).into();
+        let zero_prefix: SuccinctArchive<ZeroPrefixUniverse> = (&set).into();
+        let (raw_ordered, rank9_ordered) = ordered.to_blob_pair();
+        let (raw_dacs16, rank9_dacs16) = dacs16.to_blob_pair();
+        let (raw_zero, rank9_zero) = zero_prefix.to_blob_pair();
+
+        assert_eq!(raw_ordered.bytes, raw_dacs16.bytes);
+        assert_eq!(raw_dacs16.bytes, raw_zero.bytes);
+        assert_eq!(rank9_ordered.bytes, rank9_dacs16.bytes);
+        assert_eq!(rank9_dacs16.bytes, rank9_zero.bytes);
+
+        let cross_attached =
+            SuccinctArchive::<ZeroPrefixUniverse>::from_blob_pair(raw_dacs16, rank9_dacs16)
+                .unwrap();
+        assert_eq!(cross_attached.iter().collect::<TribleSet>(), set);
+    }
+
+    #[test]
     fn cached_universe_empty_search() {
         let mut area = ByteArea::new().unwrap();
         let mut sections = area.sections();
@@ -650,3 +1238,6 @@ mod tests {
         assert_eq!(u.search(&[0u8; 32]), None);
     }
 }
+
+#[cfg(test)]
+mod zero_prefix_bench;

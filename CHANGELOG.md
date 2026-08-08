@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A private zero-prefix universe probe exploits the sorted domain directly.**
+  It stores the second 16-byte half of every value, the first half only after
+  the leading `[0; 16]` range, and one scalar boundary: `32N - 16Z` payload
+  bytes with direct constant-time access and no dictionary, hashing, DACs, or
+  Rank9 index. A release matrix compares it with flat ordered storage and the
+  private 16-byte DAC probe on block-DAG and mixed-value corpora, including
+  construction, attachment, access, search, whole-archive query, malformed
+  metadata rejection, and byte-identical canonical raw/Rank9 artifacts.
 - **Canonical `SimpleArchive` leaves can now derive raw Succinct artifacts
   without constructing a query runtime.**
   `SuccinctArchiveBlob::build_from_simple_archive` validates the source's
