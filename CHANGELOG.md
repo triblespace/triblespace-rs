@@ -16,8 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rotations through five stable counting-sort passes. It writes prefixes,
   pair-change masks, and minimal-width wavelet planes directly into the final
   portable allocation, constructs no PATCH indexes, Jerky runtime arena, or
-  Rank9 sidecar, and hashes the finished artifact exactly once. The same
-  crate-private raw-section builder is ready for a subsequent raw MERGE path.
+  Rank9 sidecar, and hashes the finished artifact exactly once.
+- **Canonical Succinct artifacts now merge directly as raw blobs.**
+  `SuccinctArchiveBlob::merge` exact-validates every portable input without
+  attaching a query runtime or Rank9 accelerator, unions and remaps their
+  ordered domains, performs a deterministic EAV k-way set union, and emits the
+  result through the shared raw writer with one final hash. Empty inputs,
+  overlap, segment duplication, and input order all preserve canonical bytes.
+  In-place derivation checks cover every prefix run, pair-change bit, and stable
+  wavelet plane without allocating a second portable input payload.
 - **CPU and GPU wavelet backends now share the portable codec's minimal
   alphabet width.** Jerky and the CubeCL freeze geometry use
   `max(1, bit_length(D - 1))`, including `D=0/1` and exact power-of-two

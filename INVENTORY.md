@@ -49,13 +49,10 @@
   `book/src/query-language.md#recursive-traversal`.
 
 ## Desired Functionality
-- Build canonical raw Succinct MERGE directly from exact-validated portable
-  inputs through the shared `u32` EAV/rotation writer, without attaching input
-  query runtimes or Rank9. For pathological single commits or LSM levels that
-  cannot keep the domain, EAV rows, and equal rotation scratch in memory, add a
-  file-backed EAV spool plus stable radix/counting passes into the final
-  portable sink; choose it structurally from representability, not a tuning
-  threshold.
+- For pathological single commits or Succinct LSM levels that cannot keep the
+  domain, EAV rows, and equal rotation scratch in memory, add a file-backed EAV
+  spool plus stable radix/counting passes into the final portable sink; choose
+  it structurally from representability, not a tuning threshold.
 - Reconcile the residual branch's workspace-wide rustfmt baseline (or pin the
   intended formatter toolchain): `cargo fmt --all` currently rewrites many
   unrelated files, obscuring focused query-engine diffs.

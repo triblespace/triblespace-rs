@@ -1,5 +1,5 @@
-//! Compares canonical SimpleArchive -> raw SuccinctArchive construction with
-//! the historical query-runtime/Rank9 path used only to recover the raw blob.
+//! Compares raw-only SuccinctArchive leaf construction and MERGE with the
+//! historical query-runtime/Rank9 paths used only to recover raw blobs.
 //!
 //! The allocation figures are requested-byte proxies from the global allocator:
 //! total bytes requested while the operation ran and maximum additional live
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
+    merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
 };
 use triblespace_core::blob::{Blob, IntoBlob, TryFromBlob};
 
@@ -121,9 +121,9 @@ fn id(prefix: u8, ordinal: u64) -> [u8; 16] {
 /// Eight facts per entity, a small shared attribute set, and unique values.
 /// This gives the domain realistic reuse without making the benchmark depend
 /// on PATCH construction before the measured operation.
-fn source(rows: usize) -> Blob<SimpleArchive> {
+fn source_range(first: usize, rows: usize) -> Blob<SimpleArchive> {
     let mut tribles = Vec::with_capacity(rows);
-    for ordinal in 0..rows {
+    for ordinal in first..first + rows {
         let entity = ordinal / 8;
         let attribute = ordinal % 8;
         let mut row = [0u8; 64];
@@ -136,10 +136,34 @@ fn source(rows: usize) -> Blob<SimpleArchive> {
     Blob::new(Bytes::from(tribles))
 }
 
+fn source(rows: usize) -> Blob<SimpleArchive> {
+    source_range(0, rows)
+}
+
 fn old_runtime_path(source: &Blob<SimpleArchive>) -> Blob<SuccinctArchiveBlob> {
     let archive = SuccinctArchive::<OrderedUniverse>::try_from_blob(source.clone()).unwrap();
     let raw: Blob<SuccinctArchiveBlob> = archive.to_blob();
     raw
+}
+
+fn merge_inputs(total_rows: usize) -> Vec<Blob<SuccinctArchiveBlob>> {
+    let rows_per_segment = total_rows / 4;
+    let stride = rows_per_segment * 3 / 4;
+    (0..4)
+        .map(|segment| {
+            let source = source_range(segment * stride, rows_per_segment);
+            SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap()
+        })
+        .collect()
+}
+
+fn old_runtime_merge_path(inputs: &[Blob<SuccinctArchiveBlob>]) -> Blob<SuccinctArchiveBlob> {
+    let archives = inputs
+        .iter()
+        .cloned()
+        .map(|input| SuccinctArchive::<OrderedUniverse>::try_from_blob(input).unwrap())
+        .collect::<Vec<_>>();
+    merge_ordered_archives(&archives).to_blob()
 }
 
 fn print_measurement(label: &str, rows: usize, measurement: Measurement) {
@@ -178,5 +202,31 @@ fn main() {
             legacy_measurement.peak_live_bytes as f64 / raw_measurement.peak_live_bytes as f64,
         );
         drop((raw, legacy, source));
+    }
+
+    println!("\n=== four-way MERGE with 25% adjacent overlap ===");
+    let warm = merge_inputs(4_096);
+    drop(SuccinctArchiveBlob::merge(&warm).unwrap());
+    drop(old_runtime_merge_path(&warm));
+
+    for input_rows in [10_000usize, 100_000, 500_000] {
+        let inputs = merge_inputs(input_rows);
+        let (raw, raw_measurement) = measure(|| SuccinctArchiveBlob::merge(&inputs).unwrap());
+        let (legacy, legacy_measurement) = measure(|| old_runtime_merge_path(&inputs));
+        assert_eq!(raw.bytes, legacy.bytes);
+        println!(
+            "\nportable bytes: {} ({:.1} B/input-row)",
+            raw.bytes.len(),
+            raw.bytes.len() as f64 / input_rows as f64
+        );
+        print_measurement("raw-merge", input_rows, raw_measurement);
+        print_measurement("runtime", input_rows, legacy_measurement);
+        println!(
+            "       delta  time={:.2}x  requested={:.2}x  peak-live={:.2}x",
+            legacy_measurement.elapsed.as_secs_f64() / raw_measurement.elapsed.as_secs_f64(),
+            legacy_measurement.allocated_bytes as f64 / raw_measurement.allocated_bytes as f64,
+            legacy_measurement.peak_live_bytes as f64 / raw_measurement.peak_live_bytes as f64,
+        );
+        drop((raw, legacy, inputs));
     }
 }

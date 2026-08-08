@@ -188,10 +188,11 @@ pub(crate) struct PortableParts<'a> {
 }
 
 /// A structurally validated, deliberately non-queryable view of portable bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PortableView<'a> {
     bytes: &'a [u8],
     layout: Layout,
+    prefix_counts: [Vec<usize>; PREFIX_COUNT],
 }
 
 /// Owned logical sections used to rebuild a process-local query arena.
@@ -205,6 +206,13 @@ pub(crate) struct RuntimeParts {
     pub(crate) prefixes: [Vec<u64>; PREFIX_COUNT],
     pub(crate) changes: [Vec<u64>; CHANGE_COUNT],
     pub(crate) wavelets: [Vec<u64>; WAVELET_COUNT],
+}
+
+/// Exact, runtime-independent logical content of one canonical portable
+/// archive. Codes are local to `domain`; `rows` are strictly increasing EAV.
+pub(super) struct CanonicalEavU32 {
+    pub(super) domain: Vec<RawInline>,
+    pub(super) rows: Vec<[u32; 3]>,
 }
 
 impl PortableView<'_> {
@@ -246,12 +254,57 @@ impl PortableView<'_> {
         Ok(parts)
     }
 
+    /// Proves exact canonical bytes and returns only the logical EAV source.
+    ///
+    /// Unlike [`Self::prove_canonical`], this path never constructs native
+    /// runtime sections or a second portable payload. It rederives every
+    /// prefix run, pair-change bit, and stable wavelet plane from EAV and
+    /// compares them in place, so valid-looking but inconsistent secondary
+    /// rotations cannot enter raw MERGE.
+    pub(super) fn prove_canonical_eav_u32(&self) -> Result<CanonicalEavU32, PortableError> {
+        if self.layout.triple_count > u32::MAX as usize {
+            return Err(PortableError::new(format!(
+                "archive contains {} rows, exceeding u32 construction offsets",
+                self.layout.triple_count
+            )));
+        }
+        if self.layout.domain_len > u32::MAX as usize {
+            return Err(PortableError::new(format!(
+                "ordered domain contains {} values, exceeding u32 construction codes",
+                self.layout.domain_len
+            )));
+        }
+
+        let rows = self.candidate_eav_codes_as(|code| {
+            u32::try_from(code)
+                .map_err(|_| PortableError::new("archive-local code does not fit a u32 lane"))
+        })?;
+        if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(PortableError::new(
+                "decoded EAV source rows are not strictly increasing",
+            ));
+        }
+        let domain = (0..self.layout.domain_len)
+            .map(|code| self.domain_value(code))
+            .collect::<Vec<_>>();
+
+        verify_canonical_eav_u32(self, &rows)?;
+        Ok(CanonicalEavU32 { domain, rows })
+    }
+
     fn candidate_eav_codes(&self) -> Result<Vec<[usize; 3]>, PortableError> {
-        let prefix_counts = validate_prefixes(self)?;
-        let starts = prefix_counts.map(|counts| {
+        self.candidate_eav_codes_as(Ok)
+    }
+
+    fn candidate_eav_codes_as<T>(
+        &self,
+        mut convert: impl FnMut(usize) -> Result<T, PortableError>,
+    ) -> Result<Vec<[T; 3]>, PortableError> {
+        let starts: [Vec<usize>; PREFIX_COUNT] = std::array::from_fn(|axis| {
             let mut cursor = 0usize;
-            counts
-                .into_iter()
+            self.prefix_counts[axis]
+                .iter()
+                .copied()
                 .map(|count| {
                     let start = cursor;
                     cursor += count;
@@ -307,10 +360,181 @@ impl PortableView<'_> {
                     "AVE wavelet cannot decode rotated row {ave_position}"
                 ))
             })?;
-            candidate.push([entity, attribute, value]);
+            candidate.push([convert(entity)?, convert(attribute)?, convert(value)?]);
         }
         Ok(candidate)
     }
+}
+
+fn verify_canonical_eav_u32(
+    view: &PortableView<'_>,
+    rows: &[[u32; 3]],
+) -> Result<(), PortableError> {
+    let mut work = rows.to_vec();
+    let mut row_scratch = Vec::with_capacity(rows.len());
+    let mut radix_counts = vec![0u32; view.layout.domain_len];
+    let mut sequence = Vec::with_capacity(rows.len());
+    let mut sequence_scratch = Vec::with_capacity(rows.len());
+
+    verify_canonical_rotation(
+        view,
+        &work,
+        [0, 1, 2],
+        Some(PrefixAxis::Entity),
+        ChangeAxis::EntityAttribute,
+        Rotation::Eav,
+        &mut sequence,
+        &mut sequence_scratch,
+    )?;
+    stable_sort_rows_by_component(&mut work, &mut row_scratch, &mut radix_counts, 2)?;
+    verify_canonical_rotation(
+        view,
+        &work,
+        [2, 0, 1],
+        Some(PrefixAxis::Value),
+        ChangeAxis::ValueEntity,
+        Rotation::Vea,
+        &mut sequence,
+        &mut sequence_scratch,
+    )?;
+    stable_sort_rows_by_component(&mut work, &mut row_scratch, &mut radix_counts, 1)?;
+    verify_canonical_rotation(
+        view,
+        &work,
+        [1, 2, 0],
+        Some(PrefixAxis::Attribute),
+        ChangeAxis::AttributeValue,
+        Rotation::Ave,
+        &mut sequence,
+        &mut sequence_scratch,
+    )?;
+    stable_sort_rows_by_component(&mut work, &mut row_scratch, &mut radix_counts, 2)?;
+    verify_canonical_rotation(
+        view,
+        &work,
+        [2, 1, 0],
+        None,
+        ChangeAxis::ValueAttribute,
+        Rotation::Vae,
+        &mut sequence,
+        &mut sequence_scratch,
+    )?;
+    stable_sort_rows_by_component(&mut work, &mut row_scratch, &mut radix_counts, 0)?;
+    verify_canonical_rotation(
+        view,
+        &work,
+        [0, 2, 1],
+        None,
+        ChangeAxis::EntityValue,
+        Rotation::Eva,
+        &mut sequence,
+        &mut sequence_scratch,
+    )?;
+    stable_sort_rows_by_component(&mut work, &mut row_scratch, &mut radix_counts, 1)?;
+    verify_canonical_rotation(
+        view,
+        &work,
+        [1, 0, 2],
+        None,
+        ChangeAxis::AttributeEntity,
+        Rotation::Aev,
+        &mut sequence,
+        &mut sequence_scratch,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_canonical_rotation(
+    view: &PortableView<'_>,
+    rows: &[[u32; 3]],
+    components: [usize; 3],
+    prefix_axis: Option<PrefixAxis>,
+    change_axis: ChangeAxis,
+    rotation: Rotation,
+    sequence: &mut Vec<u32>,
+    sequence_scratch: &mut Vec<u32>,
+) -> Result<(), PortableError> {
+    let [first_component, middle_component, last_component] = components;
+    if let Some(axis) = prefix_axis {
+        let mut position = 0usize;
+        for (code, expected) in view.prefix_counts[axis.index()].iter().copied().enumerate() {
+            let start = position;
+            while rows
+                .get(position)
+                .is_some_and(|row| row[first_component] as usize == code)
+            {
+                position += 1;
+            }
+            if position - start != expected {
+                return Err(PortableError::new(format!(
+                    "{} disagrees with canonical {:?} row runs at code {code}",
+                    axis.name(),
+                    rotation
+                )));
+            }
+        }
+        if position != rows.len() {
+            return Err(PortableError::new(format!(
+                "{} leaves rows outside the ordered domain",
+                axis.name()
+            )));
+        }
+    }
+
+    let change_range = &view.layout.changes[change_axis.index()];
+    let mut previous_pair = None;
+    sequence.clear();
+    for (position, row) in rows.iter().enumerate() {
+        let pair = [row[first_component], row[middle_component]];
+        let expected_change = previous_pair != Some(pair);
+        if bit(view.bytes, change_range, position) != expected_change {
+            return Err(PortableError::new(format!(
+                "{} disagrees with canonical {:?} pair runs at row {position}",
+                change_axis.name(),
+                rotation
+            )));
+        }
+        previous_pair = Some(pair);
+        sequence.push(row[last_component]);
+    }
+
+    sequence_scratch.resize(sequence.len(), 0);
+    for depth in 0..view.layout.alphabet_width {
+        let shift = view.layout.alphabet_width - depth - 1;
+        let mut zeros = 0usize;
+        for (position, code) in sequence.iter().copied().enumerate() {
+            let expected_one = code & (1u32 << shift) != 0;
+            let word = view.wavelet_word(rotation, depth, position / u64::BITS as usize);
+            let actual_one = word & (1u64 << (position % u64::BITS as usize)) != 0;
+            if actual_one != expected_one {
+                return Err(PortableError::new(format!(
+                    "{} disagrees with its canonical source at depth {depth}, row {position}",
+                    rotation.name()
+                )));
+            }
+            if !expected_one {
+                zeros += 1;
+            }
+        }
+
+        if depth + 1 < view.layout.alphabet_width {
+            let (mut zero, mut one) = (0usize, zeros);
+            for code in sequence.iter().copied() {
+                if code & (1u32 << shift) == 0 {
+                    sequence_scratch[zero] = code;
+                    zero += 1;
+                } else {
+                    sequence_scratch[one] = code;
+                    one += 1;
+                }
+            }
+            std::mem::swap(sequence, sequence_scratch);
+        }
+    }
+    sequence.clear();
+    sequence_scratch.clear();
+    Ok(())
 }
 
 fn canonical_bytes_from_eav(
@@ -478,29 +702,29 @@ fn set_bit(words: &mut [u64], position: usize) {
 struct PortableWavelet<'a> {
     view: &'a PortableView<'a>,
     rotation: Rotation,
-    ranks: Vec<Vec<usize>>,
+    ranks: Vec<usize>,
+    rank_stride: usize,
     zero_counts: Vec<usize>,
 }
 
 impl<'a> PortableWavelet<'a> {
     fn new(view: &'a PortableView<'a>, rotation: Rotation) -> Self {
-        let mut ranks = Vec::with_capacity(view.layout.alphabet_width);
-        let mut zero_counts = Vec::with_capacity(view.layout.alphabet_width);
-        for depth in 0..view.layout.alphabet_width {
-            let mut rank = Vec::with_capacity(view.layout.row_words + 1);
-            rank.push(0usize);
+        let rank_stride = view.layout.row_words + 1;
+        let mut ranks = vec![0usize; view.layout.alphabet_width * rank_stride];
+        let mut zero_counts = vec![0usize; view.layout.alphabet_width];
+        for (depth, zero_count) in zero_counts.iter_mut().enumerate() {
+            let base = depth * rank_stride;
             for word in 0..view.layout.row_words {
-                rank.push(
-                    rank[word] + view.wavelet_word(rotation, depth, word).count_ones() as usize,
-                );
+                ranks[base + word + 1] = ranks[base + word]
+                    + view.wavelet_word(rotation, depth, word).count_ones() as usize;
             }
-            zero_counts.push(view.layout.triple_count - rank[view.layout.row_words]);
-            ranks.push(rank);
+            *zero_count = view.layout.triple_count - ranks[base + view.layout.row_words];
         }
         Self {
             view,
             rotation,
             ranks,
+            rank_stride,
             zero_counts,
         }
     }
@@ -508,7 +732,7 @@ impl<'a> PortableWavelet<'a> {
     fn rank1(&self, depth: usize, position: usize) -> usize {
         let word = position / u64::BITS as usize;
         let offset = position % u64::BITS as usize;
-        let complete = self.ranks[depth][word];
+        let complete = self.ranks[depth * self.rank_stride + word];
         if offset == 0 {
             complete
         } else {
@@ -1092,11 +1316,15 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<PortableView<'_>, PortableError> {
     }
     debug_assert_eq!(layout.count_footer.start, footer_start);
 
-    let view = PortableView { bytes, layout };
+    let mut view = PortableView {
+        bytes,
+        layout,
+        prefix_counts: std::array::from_fn(|_| Vec::new()),
+    };
     validate_domain(&view)?;
-    let prefix_counts = validate_prefixes(&view)?;
+    view.prefix_counts = validate_prefixes(&view)?;
     validate_changes(&view)?;
-    validate_wavelets(&view, &prefix_counts)?;
+    validate_wavelets(&view, &view.prefix_counts)?;
     Ok(view)
 }
 
@@ -1252,55 +1480,14 @@ fn validate_wavelets(
 }
 
 fn wavelet_histogram(view: &PortableView<'_>, rotation: Rotation) -> Vec<usize> {
-    let mut ranks = Vec::with_capacity(view.layout.alphabet_width);
-    let mut zero_counts = Vec::with_capacity(view.layout.alphabet_width);
-    for depth in 0..view.layout.alphabet_width {
-        let mut rank = Vec::with_capacity(view.layout.row_words + 1);
-        rank.push(0usize);
-        for word in 0..view.layout.row_words {
-            let next = rank[word] + view.wavelet_word(rotation, depth, word).count_ones() as usize;
-            rank.push(next);
-        }
-        zero_counts.push(view.layout.triple_count - rank[view.layout.row_words]);
-        ranks.push(rank);
-    }
-
-    let mut histogram = Vec::with_capacity(view.layout.domain_len);
-    for code in 0..view.layout.domain_len {
-        let mut start = 0usize;
-        let mut end = view.layout.triple_count;
-        for depth in 0..view.layout.alphabet_width {
-            let shift = view.layout.alphabet_width - depth - 1;
-            let one = code & (1usize << shift) != 0;
-            let start_ones = wavelet_rank1(view, rotation, depth, &ranks[depth], start);
-            let end_ones = wavelet_rank1(view, rotation, depth, &ranks[depth], end);
-            if one {
-                start = zero_counts[depth] + start_ones;
-                end = zero_counts[depth] + end_ones;
-            } else {
-                start -= start_ones;
-                end -= end_ones;
-            }
-        }
-        histogram.push(end - start);
-    }
-    histogram
-}
-
-fn wavelet_rank1(
-    view: &PortableView<'_>,
-    rotation: Rotation,
-    depth: usize,
-    rank: &[usize],
-    position: usize,
-) -> usize {
-    let word = position / u64::BITS as usize;
-    let offset = position % u64::BITS as usize;
-    if offset == 0 {
-        return rank[word];
-    }
-    let mask = (1u64 << offset) - 1;
-    rank[word] + (view.wavelet_word(rotation, depth, word) & mask).count_ones() as usize
+    let wavelet = PortableWavelet::new(view, rotation);
+    (0..view.layout.domain_len)
+        .map(|code| {
+            wavelet
+                .rank(view.layout.triple_count, code)
+                .expect("code belongs to the validated domain")
+        })
+        .collect()
 }
 
 fn validate_tail(

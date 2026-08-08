@@ -147,6 +147,10 @@ The crate also ships with these blob encodings:
   bytes identify the exact raw archive it indexes. The `SuccinctArchive`
   helper exposes high-level iterators, returns both artifacts with
   `to_blob_pair`, and attaches an existing pair with `from_blob_pair`.
+  `SuccinctArchiveBlob::build_from_simple_archive` derives the canonical raw
+  artifact without constructing query indexes, while
+  `SuccinctArchiveBlob::merge` computes an exact-validated raw set union with
+  no runtime or Rank9 attachment.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
 

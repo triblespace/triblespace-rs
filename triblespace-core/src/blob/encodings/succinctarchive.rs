@@ -243,6 +243,39 @@ impl SuccinctArchiveBlob {
             .map_err(|error| SuccinctArchiveRawBuildError::Construction(error.to_string()))?;
         Ok(Blob::new(Bytes::from(portable)))
     }
+
+    /// Computes the canonical set union of portable succinct archive blobs.
+    ///
+    /// Every input is structurally validated and proved to be the exact
+    /// canonical derivation of its EAV source before it participates. Their
+    /// ordered domains are merged once, archive-local EAV codes are remapped,
+    /// and the sorted runs are k-way merged with duplicate rows removed. The
+    /// shared raw writer emits the final portable bytes directly; no input or
+    /// output query runtime, Rank9 accelerator, or intermediate finished blob
+    /// is constructed. [`Blob::new`] hashes the result exactly once.
+    ///
+    /// Input order and duplicate segments do not affect the result. An empty
+    /// slice produces the canonical empty archive. The in-memory path uses
+    /// `u32` codes and row offsets; an external-memory spool remains necessary
+    /// for a single merged artifact exceeding those limits.
+    pub fn merge(segments: &[Blob<Self>]) -> Result<Blob<Self>, SuccinctArchiveError> {
+        let mut decoded = Vec::with_capacity(segments.len());
+        for (index, segment) in segments.iter().enumerate() {
+            let view = portable::parse(segment.bytes.as_ref()).map_err(|error| {
+                raw_merge_error(format!(
+                    "input segment {index} failed structural validation: {error}"
+                ))
+            })?;
+            decoded.push(view.prove_canonical_eav_u32().map_err(|error| {
+                raw_merge_error(format!("input segment {index} is not canonical: {error}"))
+            })?);
+        }
+
+        let (domain, rows) = merge_raw_eav_parts(decoded)?;
+        let bytes = portable::encode_canonical_eav_u32(&domain, rows)
+            .map_err(|error| raw_merge_error(format!("cannot encode merged archive: {error}")))?;
+        Ok(Blob::new(Bytes::from(bytes)))
+    }
 }
 
 /// Persisted Rank9/select accelerator for one exact [`SuccinctArchiveBlob`].
@@ -1559,6 +1592,102 @@ where
         }
         Some((value, source, old_code))
     }
+}
+
+fn raw_merge_error(message: impl Into<String>) -> SuccinctArchiveError {
+    SuccinctArchiveError(invalid_rank9_metadata(message.into()))
+}
+
+/// Merge exact-decoded raw inputs without constructing a query runtime.
+fn merge_raw_eav_parts(
+    parts: Vec<portable::CanonicalEavU32>,
+) -> Result<(Vec<RawInline>, Vec<[u32; 3]>), SuccinctArchiveError> {
+    let mut remaps: Vec<Vec<u32>> = parts
+        .iter()
+        .map(|part| vec![0; part.domain.len()])
+        .collect();
+    let mut domain_heap = BinaryHeap::with_capacity(parts.len());
+    for (source, part) in parts.iter().enumerate() {
+        if let Some(&value) = part.domain.first() {
+            domain_heap.push(Reverse((value, source, 0usize)));
+        }
+    }
+
+    // The largest input domain is a lower bound on the union. Starting there
+    // avoids retaining a sum-sized allocation when the inputs overlap heavily.
+    let domain_capacity = parts
+        .iter()
+        .map(|part| part.domain.len())
+        .max()
+        .unwrap_or(0);
+    let mut domain = Vec::with_capacity(domain_capacity);
+    while let Some(Reverse((value, source, old_code))) = domain_heap.pop() {
+        let new_code = if domain.last() == Some(&value) {
+            domain.len() - 1
+        } else {
+            if domain.len() == u32::MAX as usize {
+                return Err(raw_merge_error(
+                    "merged domain exceeds raw MERGE's u32 code space",
+                ));
+            }
+            domain.push(value);
+            domain.len() - 1
+        };
+        remaps[source][old_code] =
+            u32::try_from(new_code).expect("merged domain length was checked before insertion");
+
+        let next_code = old_code + 1;
+        if let Some(&next) = parts[source].domain.get(next_code) {
+            domain_heap.push(Reverse((next, source, next_code)));
+        }
+    }
+    drop(domain_heap);
+
+    let runs = parts
+        .into_iter()
+        .zip(remaps)
+        .map(|(part, remap)| {
+            let mut rows = part.rows;
+            for row in &mut rows {
+                row[0] = remap[row[0] as usize];
+                row[1] = remap[row[1] as usize];
+                row[2] = remap[row[2] as usize];
+            }
+            debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+            rows
+        })
+        .collect::<Vec<_>>();
+    // Input domains and remap tables are gone before the output writer's
+    // equally-sized rotation scratch appears.
+    domain.shrink_to_fit();
+
+    let row_capacity = runs.iter().map(Vec::len).max().unwrap_or(0);
+    let mut rows = Vec::with_capacity(row_capacity);
+    let mut row_heap = BinaryHeap::with_capacity(runs.len());
+    for (source, run) in runs.iter().enumerate() {
+        if let Some(&row) = run.first() {
+            row_heap.push(Reverse((row, source, 0usize)));
+        }
+    }
+
+    while let Some(Reverse((row, source, position))) = row_heap.pop() {
+        if rows.last() != Some(&row) {
+            if rows.len() == u32::MAX as usize {
+                return Err(raw_merge_error(
+                    "merged archive exceeds raw MERGE's u32 row-offset space",
+                ));
+            }
+            rows.push(row);
+        }
+        let next_position = position + 1;
+        if let Some(&next) = runs[source].get(next_position) {
+            row_heap.push(Reverse((next, source, next_position)));
+        }
+    }
+    drop(row_heap);
+    drop(runs);
+    rows.shrink_to_fit();
+    Ok((domain, rows))
 }
 
 struct MergedRows<'a> {
@@ -3192,7 +3321,7 @@ where
     }
 }
 
-/// Error returned when attaching a raw succinct archive and its Rank9 index.
+/// Error returned when validating, merging, or attaching a raw succinct archive.
 pub struct SuccinctArchiveError(jerky::error::Error);
 
 impl From<jerky::error::Error> for SuccinctArchiveError {
@@ -3473,6 +3602,55 @@ mod tests {
             prop_assert_eq!(raw.bytes.as_ref(), compressed.bytes.as_ref());
             let attached: SuccinctArchive<OrderedUniverse> = raw.try_from_blob().unwrap();
             prop_assert_eq!(TribleSet::from(&attached), set);
+        }
+
+        #[test]
+        fn raw_merge_matches_canonical_set_union_independent_of_input_order(
+            entries in prop::collection::vec(
+                (
+                    any::<[u8; 16]>(),
+                    any::<[u8; 16]>(),
+                    any::<[u8; 32]>(),
+                    1u8..16,
+                ),
+                0..64,
+            )
+        ) {
+            let mut sets: [TribleSet; 4] = std::array::from_fn(|_| TribleSet::new());
+            for (mut entity, mut attribute, value, membership) in entries {
+                entity[0] |= 1;
+                attribute[0] |= 1;
+                let trible = Trible::force(
+                    &Id::new(entity).unwrap(),
+                    &Id::new(attribute).unwrap(),
+                    &Inline::<UnknownInline>::new(value),
+                );
+                for (index, set) in sets.iter_mut().enumerate() {
+                    if membership & (1 << index) != 0 {
+                        set.insert(&trible);
+                    }
+                }
+            }
+
+            let mut segments = sets
+                .iter()
+                .map(|set| {
+                    let source: Blob<SimpleArchive> = set.to_blob();
+                    SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let forward = SuccinctArchiveBlob::merge(&segments).unwrap();
+            segments.reverse();
+            let reverse = SuccinctArchiveBlob::merge(&segments).unwrap();
+            let union = sets.into_iter().fold(TribleSet::new(), |left, right| left + right);
+            let union_source: Blob<SimpleArchive> = (&union).to_blob();
+            let expected = SuccinctArchiveBlob::build_from_simple_archive(&union_source).unwrap();
+
+            prop_assert_eq!(forward.bytes.as_ref(), expected.bytes.as_ref());
+            prop_assert_eq!(reverse.bytes.as_ref(), expected.bytes.as_ref());
+            prop_assert_eq!(forward.get_handle(), expected.get_handle());
+            let attached: SuccinctArchive<OrderedUniverse> = forward.try_from_blob().unwrap();
+            prop_assert_eq!(TribleSet::from(&attached), union);
         }
 
         #[test]
@@ -3784,6 +3962,7 @@ mod tests {
         bytes[changed_start] ^= 1 << 1;
 
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(bytes));
+        assert!(SuccinctArchiveBlob::merge(&[malformed.clone()]).is_err());
         let result: Result<SuccinctArchive<OrderedUniverse>, _> = malformed.try_from_blob();
         assert!(result.is_err());
     }
@@ -3809,8 +3988,38 @@ mod tests {
         // per-axis histograms, so the splice passes raw structural validation.
         portable::parse(&bytes).unwrap();
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(bytes));
+        assert!(SuccinctArchiveBlob::merge(&[malformed.clone()]).is_err());
         let result: Result<SuccinctArchive<OrderedUniverse>, _> = malformed.try_from_blob();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn raw_merge_validation_matches_runtime_oracle_for_all_single_bit_mutations() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&two_by_two_permutation(false)).into();
+        let canonical = archive.bytes.as_ref();
+
+        for byte in 0..canonical.len() {
+            for shift in 0..u8::BITS {
+                let mut mutated = canonical.to_vec();
+                mutated[byte] ^= 1u8 << shift;
+                let candidate = Blob::<SuccinctArchiveBlob>::new(Bytes::from(mutated));
+                let raw = SuccinctArchiveBlob::merge(&[candidate.clone()]);
+                let runtime: Result<SuccinctArchive<OrderedUniverse>, _> =
+                    candidate.clone().try_from_blob();
+
+                assert_eq!(
+                    raw.is_ok(),
+                    runtime.is_ok(),
+                    "validation disagreement at byte {byte}, bit {shift}"
+                );
+                if let Ok(merged) = raw {
+                    assert_eq!(
+                        merged.bytes, candidate.bytes,
+                        "canonical singleton changed at byte {byte}, bit {shift}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4444,6 +4653,85 @@ mod tests {
         let empty = TribleSet::new();
         let rebuilt: SuccinctArchive<OrderedUniverse> = (&empty).into();
         assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref());
+    }
+
+    #[test]
+    fn raw_merge_handles_empty_overlap_and_interleaved_domain_remapping() {
+        fn raw(set: &TribleSet) -> Blob<SuccinctArchiveBlob> {
+            let source: Blob<SimpleArchive> = set.to_blob();
+            SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap()
+        }
+
+        let empty = TribleSet::new();
+        let canonical_empty = raw(&empty);
+        assert_eq!(
+            SuccinctArchiveBlob::merge(&[]).unwrap().bytes,
+            canonical_empty.bytes
+        );
+        assert_eq!(
+            SuccinctArchiveBlob::merge(&[raw(&empty), raw(&empty)])
+                .unwrap()
+                .bytes,
+            canonical_empty.bytes
+        );
+
+        let lower = ordered_id(1);
+        let higher = ordered_id(2);
+        let shared = ordered_id(3);
+        let attribute = ordered_id(10);
+        let low_value = ordered_value(0x20);
+        let shared_value = ordered_value(0x40);
+        let high_value = ordered_value(0x60);
+        let shared_fact = Trible::force(&shared, &attribute, &shared_value);
+
+        let left: TribleSet = [Trible::force(&higher, &attribute, &high_value), shared_fact]
+            .into_iter()
+            .collect();
+        let right: TribleSet = [Trible::force(&lower, &attribute, &low_value), shared_fact]
+            .into_iter()
+            .collect();
+        let mut expected_set = left.clone();
+        expected_set += right.clone();
+
+        let left_raw = raw(&left);
+        let right_raw = raw(&right);
+        let segments = vec![
+            raw(&empty),
+            left_raw.clone(),
+            right_raw.clone(),
+            left_raw.clone(),
+        ];
+        let merged = SuccinctArchiveBlob::merge(&segments).unwrap();
+        let reversed =
+            SuccinctArchiveBlob::merge(&segments.iter().rev().cloned().collect::<Vec<_>>())
+                .unwrap();
+        let expected_raw = raw(&expected_set);
+
+        let runtime_segments = segments
+            .iter()
+            .cloned()
+            .map(|segment| segment.try_from_blob().unwrap())
+            .collect::<Vec<SuccinctArchive<OrderedUniverse>>>();
+        let runtime_raw: Blob<SuccinctArchiveBlob> =
+            merge_ordered_archives(&runtime_segments).to_blob();
+
+        assert_eq!(merged.bytes, expected_raw.bytes);
+        assert_eq!(reversed.bytes, expected_raw.bytes);
+        assert_eq!(runtime_raw.bytes, expected_raw.bytes);
+        assert_eq!(merged.get_handle(), expected_raw.get_handle());
+
+        let left_attached: SuccinctArchive<OrderedUniverse> = left_raw.try_from_blob().unwrap();
+        let merged_attached: SuccinctArchive<OrderedUniverse> = merged.try_from_blob().unwrap();
+        let old_code = left_attached
+            .domain
+            .search(&id_into_value(&higher))
+            .unwrap();
+        let new_code = merged_attached
+            .domain
+            .search(&id_into_value(&higher))
+            .unwrap();
+        assert_ne!(old_code, new_code, "the left domain must be recoded");
+        assert_eq!(TribleSet::from(&merged_attached), expected_set);
     }
 
     #[test]
