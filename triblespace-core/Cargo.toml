@@ -101,3 +101,7 @@ harness = false
 [[bench]]
 name = "memory_absolute"
 harness = false
+
+[[bench]]
+name = "succinct_raw_build"
+harness = false

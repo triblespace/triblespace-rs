@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Canonical `SimpleArchive` leaves can now derive raw Succinct artifacts
+  without constructing a query runtime.**
+  `SuccinctArchiveBlob::build_from_simple_archive` validates the source's
+  existing EAV bytes, builds one ordered domain, and walks the six Ring
+  rotations through five stable counting-sort passes. It writes prefixes,
+  pair-change masks, and minimal-width wavelet planes directly into the final
+  portable allocation, constructs no PATCH indexes, Jerky runtime arena, or
+  Rank9 sidecar, and hashes the finished artifact exactly once. The same
+  crate-private raw-section builder is ready for a subsequent raw MERGE path.
 - **CPU and GPU wavelet backends now share the portable codec's minimal
   alphabet width.** Jerky and the CubeCL freeze geometry use
   `max(1, bit_length(D - 1))`, including `D=0/1` and exact power-of-two

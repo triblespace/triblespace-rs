@@ -96,6 +96,155 @@ impl MetaDescribe for SuccinctArchiveBlob {
     }
 }
 
+/// Failure while deriving a canonical raw [`SuccinctArchiveBlob`] directly
+/// from a [`SimpleArchive`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccinctArchiveRawBuildError {
+    /// The source bytes are not a canonical `SimpleArchive`.
+    Source(UnarchiveError),
+    /// The in-memory raw builder uses `u32` row offsets. Larger individual
+    /// source blobs require the future external-memory construction path.
+    TooManyRows(usize),
+    /// The in-memory raw builder uses `u32` ordered-domain codes. Larger
+    /// domains require the future external-memory construction path.
+    DomainTooWide(usize),
+    /// An internal checked layout or canonical-section invariant failed.
+    Construction(String),
+}
+
+impl From<UnarchiveError> for SuccinctArchiveRawBuildError {
+    fn from(error: UnarchiveError) -> Self {
+        Self::Source(error)
+    }
+}
+
+impl std::fmt::Display for SuccinctArchiveRawBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Source(error) => write!(formatter, "invalid SimpleArchive source: {error}"),
+            Self::TooManyRows(rows) => write!(
+                formatter,
+                "SimpleArchive contains {rows} rows, exceeding the in-memory u32 raw-builder limit"
+            ),
+            Self::DomainTooWide(values) => write!(
+                formatter,
+                "succinct domain contains {values} values, exceeding the in-memory u32 raw-builder limit"
+            ),
+            Self::Construction(message) => {
+                write!(formatter, "cannot construct portable succinct archive: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SuccinctArchiveRawBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::TooManyRows(_) | Self::DomainTooWide(_) | Self::Construction(_) => None,
+        }
+    }
+}
+
+impl SuccinctArchiveBlob {
+    /// Derives the canonical portable Ring artifact directly from one
+    /// canonical `SimpleArchive` blob.
+    ///
+    /// The source is validated in its existing 64-byte EAV order, then mapped
+    /// into one ordered raw-value domain. Five stable counting-sort passes
+    /// derive the remaining Ring rotations while their prefixes, pair-change
+    /// masks, and minimal-width wavelet planes are written directly into the
+    /// final portable allocation. The method constructs neither a six-PATCH
+    /// [`TribleSet`], a native [`SuccinctArchive`] query arena, nor a detached
+    /// Rank9 accelerator. The returned [`Blob`] hashes the completed portable
+    /// bytes exactly once and caches that handle.
+    ///
+    /// The in-memory implementation uses `u32` codes and offsets. A source
+    /// with more than `u32::MAX` rows or domain values is rejected explicitly;
+    /// such pathological single artifacts need an external-memory builder.
+    pub fn build_from_simple_archive(
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<Self>, SuccinctArchiveRawBuildError> {
+        let bytes = source.bytes.as_ref();
+        if bytes.len() % 64 != 0 {
+            return Err(UnarchiveError::BadArchive.into());
+        }
+        let row_count = bytes.len() / 64;
+        if row_count > u32::MAX as usize {
+            return Err(SuccinctArchiveRawBuildError::TooManyRows(row_count));
+        }
+
+        let domain_capacity = row_count.checked_mul(3).ok_or_else(|| {
+            SuccinctArchiveRawBuildError::Construction(
+                "source-domain capacity overflows usize".to_owned(),
+            )
+        })?;
+        let mut domain = Vec::with_capacity(domain_capacity);
+        let mut previous: Option<&[u8]> = None;
+        for chunk in bytes.chunks_exact(64) {
+            let row: &[u8; 64] = chunk.try_into().expect("exact SimpleArchive row");
+            if Trible::as_transmute_force_raw(row).is_none() {
+                return Err(UnarchiveError::BadTrible.into());
+            }
+            if let Some(previous) = previous {
+                if previous == chunk {
+                    return Err(UnarchiveError::BadCanonicalizationRedundancy.into());
+                }
+                if previous > chunk {
+                    return Err(UnarchiveError::BadCanonicalizationOrdering.into());
+                }
+            }
+            previous = Some(chunk);
+
+            let entity: &[u8; 16] = row[..16].try_into().expect("entity width");
+            let attribute: &[u8; 16] = row[16..32].try_into().expect("attribute width");
+            domain.push(id_into_value(entity));
+            domain.push(id_into_value(attribute));
+            domain.push(row[32..].try_into().expect("value width"));
+        }
+        domain.sort_unstable();
+        domain.dedup();
+        domain.shrink_to_fit();
+        if domain.len() > u32::MAX as usize {
+            return Err(SuccinctArchiveRawBuildError::DomainTooWide(domain.len()));
+        }
+
+        let mut eav_rows = Vec::with_capacity(row_count);
+        for chunk in bytes.chunks_exact(64) {
+            let row: &[u8; 64] = chunk.try_into().expect("exact SimpleArchive row");
+            let entity: &[u8; 16] = row[..16].try_into().expect("entity width");
+            let attribute: &[u8; 16] = row[16..32].try_into().expect("attribute width");
+            let entity = id_into_value(entity);
+            let attribute = id_into_value(attribute);
+            let value: RawInline = row[32..].try_into().expect("value width");
+            eav_rows.push([
+                u32::try_from(
+                    domain
+                        .binary_search(&entity)
+                        .expect("source entity was inserted into the domain"),
+                )
+                .expect("domain width checked above"),
+                u32::try_from(
+                    domain
+                        .binary_search(&attribute)
+                        .expect("source attribute was inserted into the domain"),
+                )
+                .expect("domain width checked above"),
+                u32::try_from(
+                    domain
+                        .binary_search(&value)
+                        .expect("source value was inserted into the domain"),
+                )
+                .expect("domain width checked above"),
+            ]);
+        }
+
+        let portable = portable::encode_canonical_eav_u32(&domain, eav_rows)
+            .map_err(|error| SuccinctArchiveRawBuildError::Construction(error.to_string()))?;
+        Ok(Blob::new(Bytes::from(portable)))
+    }
+}
+
 /// Persisted Rank9/select accelerator for one exact [`SuccinctArchiveBlob`].
 ///
 /// The first 32 bytes are the source archive's content handle. Keeping that
@@ -3304,6 +3453,29 @@ mod tests {
         }
 
         #[test]
+        fn raw_simplearchive_builder_matches_both_runtime_universes(
+            entries in prop::collection::vec(any::<[u8; 64]>(), 0..256)
+        ) {
+            let set: TribleSet = entries
+                .into_iter()
+                .map(|mut data| {
+                    data[0] |= 1;
+                    data[16] |= 1;
+                    Trible { data }
+                })
+                .collect();
+            let source: Blob<SimpleArchive> = (&set).to_blob();
+            let raw = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
+            let ordered: SuccinctArchive<OrderedUniverse> = (&set).into();
+            let compressed: SuccinctArchive<CompressedUniverse> = (&set).into();
+
+            prop_assert_eq!(raw.bytes.as_ref(), ordered.bytes.as_ref());
+            prop_assert_eq!(raw.bytes.as_ref(), compressed.bytes.as_ref());
+            let attached: SuccinctArchive<OrderedUniverse> = raw.try_from_blob().unwrap();
+            prop_assert_eq!(TribleSet::from(&attached), set);
+        }
+
+        #[test]
         fn structural_merge_matches_rebuild_for_overlapping_segments(
             entries in prop::collection::vec(
                 (
@@ -4284,5 +4456,64 @@ mod tests {
 
         assert_eq!(direct.bytes.as_ref(), two_step.bytes.as_ref());
         assert_eq!(TribleSet::from(&direct), set);
+    }
+
+    #[test]
+    fn raw_simplearchive_builder_is_canonical_across_layout_boundaries() {
+        for rows in [0usize, 1, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1024] {
+            let set: TribleSet = (0..rows).map(synthetic_trible).collect();
+            let source: Blob<SimpleArchive> = (&set).to_blob();
+            let raw = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
+            let expected: SuccinctArchive<OrderedUniverse> = (&set).into();
+
+            assert_eq!(raw.bytes.as_ref(), expected.bytes.as_ref(), "{rows} rows");
+            assert_eq!(
+                raw.get_handle(),
+                Blob::<SuccinctArchiveBlob>::new(expected.bytes.clone()).get_handle(),
+                "{rows} row handle"
+            );
+            let attached: SuccinctArchive<OrderedUniverse> = raw.try_from_blob().unwrap();
+            assert_eq!(TribleSet::from(&attached), set, "{rows} row roundtrip");
+        }
+    }
+
+    #[test]
+    fn raw_simplearchive_builder_preserves_source_validation_errors() {
+        let bad_length = Blob::<SimpleArchive>::new(Bytes::from(vec![0u8; 63]));
+        assert_eq!(
+            SuccinctArchiveBlob::build_from_simple_archive(&bad_length).unwrap_err(),
+            SuccinctArchiveRawBuildError::Source(UnarchiveError::BadArchive)
+        );
+
+        let nil = Blob::<SimpleArchive>::new(Bytes::from(vec![0u8; 64]));
+        assert_eq!(
+            SuccinctArchiveBlob::build_from_simple_archive(&nil).unwrap_err(),
+            SuccinctArchiveRawBuildError::Source(UnarchiveError::BadTrible)
+        );
+
+        let first = synthetic_trible(1).data;
+        let second = synthetic_trible(2).data;
+        let mut duplicate = Vec::with_capacity(128);
+        duplicate.extend_from_slice(&first);
+        duplicate.extend_from_slice(&first);
+        let duplicate = Blob::<SimpleArchive>::new(Bytes::from(duplicate));
+        assert_eq!(
+            SuccinctArchiveBlob::build_from_simple_archive(&duplicate).unwrap_err(),
+            SuccinctArchiveRawBuildError::Source(UnarchiveError::BadCanonicalizationRedundancy)
+        );
+
+        let (high, low) = if first > second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let mut descending = Vec::with_capacity(128);
+        descending.extend_from_slice(&high);
+        descending.extend_from_slice(&low);
+        let descending = Blob::<SimpleArchive>::new(Bytes::from(descending));
+        assert_eq!(
+            SuccinctArchiveBlob::build_from_simple_archive(&descending).unwrap_err(),
+            SuccinctArchiveRawBuildError::Source(UnarchiveError::BadCanonicalizationOrdering)
+        );
     }
 }

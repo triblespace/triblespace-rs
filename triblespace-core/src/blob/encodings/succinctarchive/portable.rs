@@ -731,6 +731,314 @@ pub(crate) fn encode(parts: PortableParts<'_>) -> Result<Vec<u8>, PortableError>
     Ok(bytes)
 }
 
+/// Writes the canonical portable payload directly from one EAV-sorted row set.
+///
+/// This is the raw construction spine shared by source-format derivation and
+/// future raw archive merges. `rows` contains archive-local ordered-domain
+/// codes and must be a strictly increasing set in EAV order. The function
+/// walks the other five Ring rotations through stable counting-sort passes:
+///
+/// ```text
+/// EAV -> VEA -> AVE -> VAE -> EVA -> AEV
+/// ```
+///
+/// All logical sections are written in place into the final portable byte
+/// allocation. No native query arena, Rank9 directory, or second completed
+/// portable buffer is constructed. Row codes and wavelet partition scratch
+/// stay `u32`; the caller must reject wider domains before entering here.
+pub(super) fn encode_canonical_eav_u32(
+    domain: &[RawInline],
+    mut rows: Vec<[u32; 3]>,
+) -> Result<Vec<u8>, PortableError> {
+    if domain.len() > u32::MAX as usize {
+        return Err(PortableError::new(format!(
+            "ordered domain contains {} values, exceeding u32 construction codes",
+            domain.len()
+        )));
+    }
+    if rows.len() > u32::MAX as usize {
+        return Err(PortableError::new(format!(
+            "archive contains {} rows, exceeding u32 construction offsets",
+            rows.len()
+        )));
+    }
+    if (rows.is_empty()) != (domain.is_empty()) {
+        return Err(PortableError::new(
+            "row set and ordered domain must be empty together",
+        ));
+    }
+    for (code, pair) in domain.windows(2).enumerate() {
+        if pair[0] >= pair[1] {
+            return Err(PortableError::new(format!(
+                "ordered domain is not strictly increasing at code {}",
+                code + 1
+            )));
+        }
+    }
+    for (position, row) in rows.iter().enumerate() {
+        if row.iter().any(|code| *code as usize >= domain.len()) {
+            return Err(PortableError::new(format!(
+                "EAV row {position} contains an out-of-domain code"
+            )));
+        }
+        if id_from_value(&domain[row[0] as usize])
+            .and_then(Id::new)
+            .is_none()
+            || id_from_value(&domain[row[1] as usize])
+                .and_then(Id::new)
+                .is_none()
+        {
+            return Err(PortableError::new(format!(
+                "EAV row {position} contains a non-canonical entity or attribute ID"
+            )));
+        }
+        if position != 0 && rows[position - 1] >= *row {
+            return Err(PortableError::new(format!(
+                "EAV rows are not strictly increasing at position {position}"
+            )));
+        }
+    }
+
+    let layout = Layout::new(rows.len(), domain.len())?;
+    let triple_count = u64::try_from(rows.len())
+        .map_err(|_| PortableError::new("triple count does not fit u64"))?;
+    let domain_len = u64::try_from(domain.len())
+        .map_err(|_| PortableError::new("domain cardinality does not fit u64"))?;
+    let mut bytes = vec![0u8; layout.byte_len];
+    for (code, value) in domain.iter().enumerate() {
+        let start = layout.domain.start + code * RAW_INLINE_LEN;
+        bytes[start..start + RAW_INLINE_LEN].copy_from_slice(value);
+    }
+    bytes[layout.count_footer.start..layout.count_footer.start + WORD_LEN]
+        .copy_from_slice(&triple_count.to_le_bytes());
+    bytes[layout.count_footer.start + WORD_LEN..layout.count_footer.end]
+        .copy_from_slice(&domain_len.to_le_bytes());
+
+    let mut row_scratch = Vec::with_capacity(rows.len());
+    let mut radix_counts = vec![0u32; domain.len()];
+    let mut sequence = Vec::with_capacity(rows.len());
+    let mut sequence_scratch = Vec::with_capacity(rows.len());
+
+    write_canonical_rotation(
+        &mut bytes,
+        &layout,
+        &rows,
+        [0, 1, 2],
+        Some(PrefixAxis::Entity),
+        ChangeAxis::EntityAttribute,
+        Rotation::Eav,
+        &mut sequence,
+        &mut sequence_scratch,
+    );
+    stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 2)?;
+    write_canonical_rotation(
+        &mut bytes,
+        &layout,
+        &rows,
+        [2, 0, 1],
+        Some(PrefixAxis::Value),
+        ChangeAxis::ValueEntity,
+        Rotation::Vea,
+        &mut sequence,
+        &mut sequence_scratch,
+    );
+    stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 1)?;
+    write_canonical_rotation(
+        &mut bytes,
+        &layout,
+        &rows,
+        [1, 2, 0],
+        Some(PrefixAxis::Attribute),
+        ChangeAxis::AttributeValue,
+        Rotation::Ave,
+        &mut sequence,
+        &mut sequence_scratch,
+    );
+    stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 2)?;
+    write_canonical_rotation(
+        &mut bytes,
+        &layout,
+        &rows,
+        [2, 1, 0],
+        None,
+        ChangeAxis::ValueAttribute,
+        Rotation::Vae,
+        &mut sequence,
+        &mut sequence_scratch,
+    );
+    stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 0)?;
+    write_canonical_rotation(
+        &mut bytes,
+        &layout,
+        &rows,
+        [0, 2, 1],
+        None,
+        ChangeAxis::EntityValue,
+        Rotation::Eva,
+        &mut sequence,
+        &mut sequence_scratch,
+    );
+    stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 1)?;
+    write_canonical_rotation(
+        &mut bytes,
+        &layout,
+        &rows,
+        [1, 0, 2],
+        None,
+        ChangeAxis::AttributeEntity,
+        Rotation::Aev,
+        &mut sequence,
+        &mut sequence_scratch,
+    );
+
+    // The construction above owns every bit in the gapless layout. Keep a
+    // debug-only structural oracle close to the writer without charging the
+    // production build path for a second full scan and rank scratch.
+    debug_assert!(parse(&bytes).is_ok());
+    Ok(bytes)
+}
+
+fn stable_sort_rows_by_component(
+    rows: &mut Vec<[u32; 3]>,
+    scratch: &mut Vec<[u32; 3]>,
+    counts: &mut [u32],
+    component: usize,
+) -> Result<(), PortableError> {
+    counts.fill(0);
+    for row in rows.iter() {
+        let count = &mut counts[row[component] as usize];
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| PortableError::new("rotation cardinality exceeds u32"))?;
+    }
+
+    let mut offset = 0u32;
+    for count in counts.iter_mut() {
+        let len = *count;
+        *count = offset;
+        offset = offset
+            .checked_add(len)
+            .ok_or_else(|| PortableError::new("rotation offset exceeds u32"))?;
+    }
+    if offset as usize != rows.len() {
+        return Err(PortableError::new(
+            "rotation counting sort did not cover every row",
+        ));
+    }
+
+    scratch.resize(rows.len(), [0; 3]);
+    for row in rows.iter().copied() {
+        let destination = &mut counts[row[component] as usize];
+        scratch[*destination as usize] = row;
+        *destination += 1;
+    }
+    std::mem::swap(rows, scratch);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_canonical_rotation(
+    bytes: &mut [u8],
+    layout: &Layout,
+    rows: &[[u32; 3]],
+    components: [usize; 3],
+    prefix_axis: Option<PrefixAxis>,
+    change_axis: ChangeAxis,
+    rotation: Rotation,
+    sequence: &mut Vec<u32>,
+    sequence_scratch: &mut Vec<u32>,
+) {
+    let [first_component, middle_component, last_component] = components;
+    let mut previous_first = None;
+    let mut previous_pair = None;
+    sequence.clear();
+
+    for (position, row) in rows.iter().enumerate() {
+        let first = row[first_component] as usize;
+        if let Some(axis) = prefix_axis {
+            if previous_first != Some(first) {
+                let start = previous_first.map_or(0, |last| last + 1);
+                for code in start..=first {
+                    set_range_bit(bytes, &layout.prefixes[axis.index()], position + code);
+                }
+                previous_first = Some(first);
+            }
+        }
+
+        let pair = [row[first_component], row[middle_component]];
+        if previous_pair != Some(pair) {
+            set_range_bit(bytes, &layout.changes[change_axis.index()], position);
+            previous_pair = Some(pair);
+        }
+        sequence.push(row[last_component]);
+    }
+
+    if let Some(axis) = prefix_axis {
+        let start = previous_first.map_or(0, |last| last + 1);
+        for code in start..=layout.domain_len {
+            set_range_bit(
+                bytes,
+                &layout.prefixes[axis.index()],
+                layout.triple_count + code,
+            );
+        }
+    }
+
+    write_wavelet(
+        bytes,
+        &layout.wavelets[rotation.index()],
+        layout.alphabet_width,
+        layout.row_words,
+        sequence,
+        sequence_scratch,
+    );
+}
+
+fn write_wavelet(
+    bytes: &mut [u8],
+    range: &Range<usize>,
+    width: usize,
+    row_words: usize,
+    sequence: &mut Vec<u32>,
+    scratch: &mut Vec<u32>,
+) {
+    scratch.resize(sequence.len(), 0);
+    for depth in 0..width {
+        let shift = width - depth - 1;
+        let plane = range.start + depth * row_words * WORD_LEN
+            ..range.start + (depth + 1) * row_words * WORD_LEN;
+        let mut zeros = 0usize;
+        for (position, code) in sequence.iter().copied().enumerate() {
+            if code & (1u32 << shift) == 0 {
+                zeros += 1;
+            } else {
+                set_range_bit(bytes, &plane, position);
+            }
+        }
+
+        if depth + 1 < width {
+            let (mut zero, mut one) = (0usize, zeros);
+            for code in sequence.iter().copied() {
+                if code & (1u32 << shift) == 0 {
+                    scratch[zero] = code;
+                    zero += 1;
+                } else {
+                    scratch[one] = code;
+                    one += 1;
+                }
+            }
+            std::mem::swap(sequence, scratch);
+        }
+    }
+    sequence.clear();
+    scratch.clear();
+}
+
+fn set_range_bit(bytes: &mut [u8], range: &Range<usize>, position: usize) {
+    debug_assert!(position / 8 < range.len());
+    bytes[range.start + position / 8] |= 1u8 << (position % 8);
+}
+
 fn expect_words(name: &str, actual: &[u64], expected: usize) -> Result<(), PortableError> {
     if actual.len() == expected {
         Ok(())
