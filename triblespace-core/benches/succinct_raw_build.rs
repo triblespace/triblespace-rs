@@ -10,6 +10,7 @@
 //! ```
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -177,10 +178,60 @@ fn print_measurement(label: &str, rows: usize, measurement: Measurement) {
     );
 }
 
+fn print_small_build_latency(rows: usize, iterations: usize) {
+    let source = source(rows);
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let raw = SuccinctArchiveBlob::build_from_simple_archive(black_box(&source)).unwrap();
+        samples.push(start.elapsed());
+        black_box(raw.bytes.as_ref());
+    }
+    samples.sort_unstable();
+    let percentile = |numerator: usize| samples[(samples.len() - 1) * numerator / 100];
+    let total = samples.iter().sum::<Duration>();
+    println!(
+        "small-build N={rows:>4}  iters={iterations:>5}  mean={:>9.1} us  p50={:>9.1} us  p10={:>9.1} us  p90={:>9.1} us",
+        total.as_secs_f64() * 1_000_000.0 / iterations as f64,
+        percentile(50).as_secs_f64() * 1_000_000.0,
+        percentile(10).as_secs_f64() * 1_000_000.0,
+        percentile(90).as_secs_f64() * 1_000_000.0,
+    );
+}
+
 fn main() {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    if arguments.get(1).is_some_and(|arg| arg == "--rss-build") {
+        let rows = arguments
+            .get(2)
+            .expect("--rss-build needs a row count")
+            .parse::<usize>()
+            .expect("row count must be a usize");
+        let source = source(rows);
+        let raw = SuccinctArchiveBlob::build_from_simple_archive(black_box(&source)).unwrap();
+        println!(
+            "rss-build N={rows} source={} payload={}",
+            source.bytes.len(),
+            raw.bytes.len()
+        );
+        black_box((&source, &raw));
+        return;
+    }
+
     let warm = source(1_024);
     drop(SuccinctArchiveBlob::build_from_simple_archive(&warm).unwrap());
     drop(old_runtime_path(&warm));
+
+    println!("=== small-artifact raw-build latency ===");
+    for (rows, iterations) in [
+        (0, 2_000),
+        (1, 2_000),
+        (10, 2_000),
+        (100, 1_000),
+        (1_000, 200),
+    ] {
+        print_small_build_latency(rows, iterations);
+    }
 
     for rows in [10_000usize, 100_000, 500_000] {
         let source = source(rows);

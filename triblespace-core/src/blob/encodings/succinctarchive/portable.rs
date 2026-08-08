@@ -42,6 +42,9 @@
 use std::fmt;
 use std::ops::Range;
 
+use anybytes::area::ByteArea;
+use anybytes::Bytes;
+
 use crate::id::{id_from_value, Id};
 use crate::inline::RawInline;
 
@@ -973,7 +976,7 @@ pub(crate) fn encode(parts: PortableParts<'_>) -> Result<Vec<u8>, PortableError>
 pub(super) fn encode_canonical_eav_u32(
     domain: &[RawInline],
     mut rows: Vec<[u32; 3]>,
-) -> Result<Vec<u8>, PortableError> {
+) -> Result<Bytes, PortableError> {
     if domain.len() > u32::MAX as usize {
         return Err(PortableError::new(format!(
             "ordered domain contains {} values, exceeding u32 construction codes",
@@ -1028,7 +1031,19 @@ pub(super) fn encode_canonical_eav_u32(
         .map_err(|_| PortableError::new("triple count does not fit u64"))?;
     let domain_len = u64::try_from(domain.len())
         .map_err(|_| PortableError::new("domain cardinality does not fit u64"))?;
-    let mut bytes = vec![0u8; layout.byte_len];
+    // The portable payload can be tens of gigabytes even while its bounded
+    // construction scratch remains modest. Keep that final, immutable owner
+    // out of the Rust heap: one fixed-size temporary-file mapping is filled
+    // in place, then frozen into the `Bytes` returned to the blob layer.
+    let mut area = ByteArea::new().map_err(|error| {
+        PortableError::new(format!("cannot create portable byte area: {error}"))
+    })?;
+    let mut bytes = area
+        .sections()
+        .reserve::<u8>(layout.byte_len)
+        .map_err(|error| {
+            PortableError::new(format!("cannot reserve portable byte area: {error}"))
+        })?;
     for (code, value) in domain.iter().enumerate() {
         let start = layout.domain.start + code * RAW_INLINE_LEN;
         bytes[start..start + RAW_INLINE_LEN].copy_from_slice(value);
@@ -1118,7 +1133,16 @@ pub(super) fn encode_canonical_eav_u32(
     // The construction above owns every bit in the gapless layout. Keep a
     // debug-only structural oracle close to the writer without charging the
     // production build path for a second full scan and rank scratch.
-    debug_assert!(parse(&bytes).is_ok());
+    debug_assert!(parse(bytes.as_ref()).is_ok());
+    // Unmap the mutable section, then create the immutable whole-area view.
+    // The mappings are MAP_SHARED, so a second mapping of the same file sees
+    // its dirty page-cache contents without a durability-oriented `msync`.
+    // The artifact is hashed before publication; the temporary file itself is
+    // not the durable copy and disappears after this transition.
+    drop(bytes);
+    let bytes = area
+        .freeze()
+        .map_err(|error| PortableError::new(format!("cannot freeze portable bytes: {error}")))?;
     Ok(bytes)
 }
 

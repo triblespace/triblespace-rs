@@ -241,7 +241,7 @@ impl SuccinctArchiveBlob {
 
         let portable = portable::encode_canonical_eav_u32(&domain, eav_rows)
             .map_err(|error| SuccinctArchiveRawBuildError::Construction(error.to_string()))?;
-        Ok(Blob::new(Bytes::from(portable)))
+        Ok(Blob::new(portable))
     }
 
     /// Computes the canonical set union of portable succinct archive blobs.
@@ -274,7 +274,7 @@ impl SuccinctArchiveBlob {
         let (domain, rows) = merge_raw_eav_parts(decoded)?;
         let bytes = portable::encode_canonical_eav_u32(&domain, rows)
             .map_err(|error| raw_merge_error(format!("cannot encode merged archive: {error}")))?;
-        Ok(Blob::new(Bytes::from(bytes)))
+        Ok(Blob::new(bytes))
     }
 }
 

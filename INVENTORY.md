@@ -49,10 +49,12 @@
   `book/src/query-language.md#recursive-traversal`.
 
 ## Desired Functionality
-- For pathological single commits or Succinct LSM levels that cannot keep the
-  domain, EAV rows, and equal rotation scratch in memory, add a file-backed EAV
-  spool plus stable radix/counting passes into the final portable sink; choose
-  it structurally from representability, not a tuning threshold.
+- Keep individual Succinct artifacts within their explicit `u32` row/domain
+  geometry and scale the collection through bounded LSM segments instead of
+  introducing a monster-artifact format. If a still-representable segment's
+  domain, EAV rows, and rotation scratch cannot fit memory, evaluate a
+  file-backed EAV spool and stable radix passes without changing its canonical
+  bytes.
 - Reconcile the residual branch's workspace-wide rustfmt baseline (or pin the
   intended formatter toolchain): `cargo fmt --all` currently rewrites many
   unrelated files, obscuring focused query-engine diffs.

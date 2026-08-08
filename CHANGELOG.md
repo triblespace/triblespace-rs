@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Direct canonical Succinct construction now keeps its final portable
+  artifact out of the Rust heap.** The raw leaf and merge writer reserves one
+  exact-size, temporary-file-backed `anybytes::ByteArea` section, fills the
+  canonical bytes in place, and freezes that mapping directly into the blob's
+  immutable `Bytes` owner. The portable schema and every emitted byte remain
+  unchanged; row/domain/rotation scratch is deliberately unaffected.
 - **Canonical `SimpleArchive` leaves can now derive raw Succinct artifacts
   without constructing a query runtime.**
   `SuccinctArchiveBlob::build_from_simple_archive` validates the source's
