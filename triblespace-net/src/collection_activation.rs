@@ -24,8 +24,10 @@ use triblespace_core::collection::{
     CollectionPolicy, CollectionRead, CollectionReadAudience, RecordDecodeError,
     collection_read_audience_by_policy_at, descriptor,
 };
+use triblespace_core::inline::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
-use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead};
+use triblespace_core::repo::{BlobStoreGet, BlobStoreList, CapabilityProofRead};
 use triblespace_core::trible::TribleSet;
 
 use crate::collection_delta::{
@@ -239,13 +241,43 @@ pub enum CollectionAuthorizationEvidenceDiscoveryError<ProofsError, GetError> {
     Descriptor(CollectionDescriptorError<GetError>),
     /// The coherent proof-store observation failed.
     Proofs(ProofsError),
+    /// A claim recorded as resident could not be observed or read coherently.
+    Claim(AuthorizationClaimLoadError),
     /// Canonical evidence construction found a proof-id collision.
     Evidence(CollectionAuthorizationEvidenceError),
 }
 
 enum AuthorizationEvidenceBuildError<ProofsError> {
     Proofs(ProofsError),
+    Claim(AuthorizationClaimLoadError),
     Evidence(CollectionAuthorizationEvidenceError),
+}
+
+/// Failure while loading one capability claim recorded as resident in a
+/// frozen store snapshot.
+#[derive(Debug)]
+pub struct AuthorizationClaimLoadError {
+    claim: Inline<Handle<SimpleArchive>>,
+    operation: &'static str,
+    source: Box<dyn Error + Send + Sync + 'static>,
+}
+
+impl fmt::Display for AuthorizationClaimLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "failed to {} resident authorization claim {}: {}",
+            self.operation,
+            hex::encode_upper(self.claim.raw),
+            self.source,
+        )
+    }
+}
+
+impl Error for AuthorizationClaimLoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 impl<ProofsError, GetError> fmt::Display
@@ -258,6 +290,7 @@ where
         match self {
             Self::Descriptor(source) => source.fmt(formatter),
             Self::Proofs(source) => write!(formatter, "enumerate capability proofs: {source}"),
+            Self::Claim(source) => source.fmt(formatter),
             Self::Evidence(source) => source.fmt(formatter),
         }
     }
@@ -273,6 +306,7 @@ where
         match self {
             Self::Descriptor(source) => Some(source),
             Self::Proofs(source) => Some(source),
+            Self::Claim(source) => Some(source),
             Self::Evidence(source) => Some(source),
         }
     }
@@ -285,6 +319,8 @@ pub enum CollectionReadBootstrapError<ProofsError, GetError> {
     Descriptor(CollectionDescriptorError<GetError>),
     /// The coherent proof-store observation failed.
     Proofs(ProofsError),
+    /// A claim recorded as resident could not be observed or read coherently.
+    Claim(AuthorizationClaimLoadError),
     /// More relevant proofs exist than the caller's transport bound permits.
     TooMany {
         /// Exact number of canonical relevant proofs.
@@ -305,6 +341,7 @@ where
         match self {
             Self::Descriptor(source) => source.fmt(formatter),
             Self::Proofs(source) => write!(formatter, "enumerate capability proofs: {source}"),
+            Self::Claim(source) => source.fmt(formatter),
             Self::TooMany { count, limit } => write!(
                 formatter,
                 "collection READ bootstrap has {count} proofs; limit is {limit}",
@@ -323,6 +360,7 @@ where
         match self {
             Self::Descriptor(source) => Some(source),
             Self::Proofs(source) => Some(source),
+            Self::Claim(source) => Some(source),
             Self::TooMany { .. } => None,
             Self::Authorization(source) => Some(source),
         }
@@ -338,6 +376,8 @@ pub enum CollectionRepairOverlayError<RecordsError, ProofsError, GetError> {
     Descriptor(CollectionDescriptorError<GetError>),
     /// The coherent proof-store observation failed.
     Proofs(ProofsError),
+    /// A claim recorded as resident could not be observed or read coherently.
+    Claim(AuthorizationClaimLoadError),
     /// Canonical evidence construction found a proof-id collision.
     Evidence(CollectionAuthorizationEvidenceError),
 }
@@ -354,6 +394,7 @@ where
             Self::Records(source) => source.fmt(formatter),
             Self::Descriptor(source) => source.fmt(formatter),
             Self::Proofs(source) => write!(formatter, "enumerate capability proofs: {source}"),
+            Self::Claim(source) => source.fmt(formatter),
             Self::Evidence(source) => source.fmt(formatter),
         }
     }
@@ -371,6 +412,7 @@ where
             Self::Records(source) => Some(source),
             Self::Descriptor(source) => Some(source),
             Self::Proofs(source) => Some(source),
+            Self::Claim(source) => Some(source),
             Self::Evidence(source) => Some(source),
         }
     }
@@ -392,7 +434,7 @@ pub fn collection_repair_overlay<R>(
     CollectionRepairOverlayError<R::RecordsError, R::ProofsError, R::GetError<Infallible>>,
 >
 where
-    R: BlobStoreGet + CapabilityProofRead + CollectionRead,
+    R: BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
 {
     let policy = load_collection_policy(snapshot, collection)
         .map_err(CollectionRepairOverlayError::Descriptor)?;
@@ -401,6 +443,9 @@ where
             .map_err(|error| match error {
                 AuthorizationEvidenceBuildError::Proofs(source) => {
                     CollectionRepairOverlayError::Proofs(source)
+                }
+                AuthorizationEvidenceBuildError::Claim(source) => {
+                    CollectionRepairOverlayError::Claim(source)
                 }
                 AuthorizationEvidenceBuildError::Evidence(source) => {
                     CollectionRepairOverlayError::Evidence(source)
@@ -446,7 +491,7 @@ pub fn collection_authorization_evidence<R>(
     CollectionAuthorizationEvidenceDiscoveryError<R::ProofsError, R::GetError<Infallible>>,
 >
 where
-    R: BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + BlobStoreList + CapabilityProofRead,
 {
     let policy = load_collection_policy(snapshot, collection)
         .map_err(CollectionAuthorizationEvidenceDiscoveryError::Descriptor)?;
@@ -454,6 +499,9 @@ where
         |error| match error {
             AuthorizationEvidenceBuildError::Proofs(source) => {
                 CollectionAuthorizationEvidenceDiscoveryError::Proofs(source)
+            }
+            AuthorizationEvidenceBuildError::Claim(source) => {
+                CollectionAuthorizationEvidenceDiscoveryError::Claim(source)
             }
             AuthorizationEvidenceBuildError::Evidence(source) => {
                 CollectionAuthorizationEvidenceDiscoveryError::Evidence(source)
@@ -481,7 +529,7 @@ pub fn collection_read_bootstrap_proofs<R>(
     CollectionReadBootstrapError<R::ProofsError, R::GetError<Infallible>>,
 >
 where
-    R: BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + BlobStoreList + CapabilityProofRead,
 {
     collection_read_bootstrap_proofs_at(
         snapshot,
@@ -503,7 +551,7 @@ pub(crate) fn collection_read_bootstrap_proofs_at<R>(
     CollectionReadBootstrapError<R::ProofsError, R::GetError<Infallible>>,
 >
 where
-    R: BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + BlobStoreList + CapabilityProofRead,
 {
     let evidence =
         collection_authorization_evidence(snapshot, collection).map_err(|error| match error {
@@ -512,6 +560,9 @@ where
             }
             CollectionAuthorizationEvidenceDiscoveryError::Proofs(source) => {
                 CollectionReadBootstrapError::Proofs(source)
+            }
+            CollectionAuthorizationEvidenceDiscoveryError::Claim(source) => {
+                CollectionReadBootstrapError::Claim(source)
             }
             CollectionAuthorizationEvidenceDiscoveryError::Evidence(source) => {
                 CollectionReadBootstrapError::Authorization(source)
@@ -568,7 +619,7 @@ fn collection_authorization_evidence_patch_for_policy<R>(
     policy: CollectionPolicy,
 ) -> Result<CollectionAuthorizationEvidencePatch, AuthorizationEvidenceBuildError<R::ProofsError>>
 where
-    R: BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + BlobStoreList + CapabilityProofRead,
 {
     if matches!(policy.read(), AdmissionPolicy::Open)
         && matches!(policy.write(), AdmissionPolicy::Open)
@@ -585,24 +636,36 @@ where
         .proofs()
         .map_err(AuthorizationEvidenceBuildError::Proofs)?;
     let mut bundles = Vec::new();
-    for proof in proofs {
+    'proofs: for proof in proofs {
         let proof = proof.map_err(AuthorizationEvidenceBuildError::Proofs)?;
         if !root_is_relevant(policy.read(), proof.root_key())
             && !root_is_relevant(policy.write(), proof.root_key())
         {
             continue;
         }
-        let Some(claims) = proof
-            .claim_handles()
-            .map(|claim| {
-                snapshot
-                    .get::<Blob<SimpleArchive>, SimpleArchive>(claim)
-                    .ok()
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
-        };
+        let mut claims = Vec::new();
+        for claim in proof.claim_handles() {
+            let resident = snapshot.contains_blob(claim).map_err(|source| {
+                AuthorizationEvidenceBuildError::Claim(AuthorizationClaimLoadError {
+                    claim,
+                    operation: "inspect",
+                    source: Box::new(source),
+                })
+            })?;
+            if !resident {
+                continue 'proofs;
+            }
+            let value = snapshot
+                .get::<Blob<SimpleArchive>, SimpleArchive>(claim)
+                .map_err(|source| {
+                    AuthorizationEvidenceBuildError::Claim(AuthorizationClaimLoadError {
+                        claim,
+                        operation: "read",
+                        source: Box::new(source),
+                    })
+                })?;
+            claims.push(value);
+        }
         bundles.push(CapabilityProofBundle::new(proof, claims));
     }
     canonical_authorization_evidence(collection, policy, bundles)
@@ -693,10 +756,12 @@ pub fn validate_authorization_evidence_bundle(
 
 #[cfg(test)]
 mod tests {
+    use std::marker::PhantomData;
     use std::num::NonZeroUsize;
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
+    use triblespace_core::blob::BlobEncoding;
     use triblespace_core::capability::{
         CapabilityClaim, CapabilityMode, CapabilityRequest, CapabilityValidity,
         capability_quorum_authorizes,
@@ -705,9 +770,9 @@ mod tests {
         CollectionCommit, CollectionData, CollectionDerive, CollectionMerge, CollectionPolicy,
         CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
     };
-    use triblespace_core::inline::Inline;
-    use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
+    use triblespace_core::inline::{Inline, InlineEncoding};
+    use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
+    use triblespace_core::repo::{BlobInfo, BlobStorePut, CapabilityProofStore, SnapshotSource};
 
     use super::*;
 
@@ -752,6 +817,100 @@ mod tests {
             store.put::<SimpleArchive, _>(claim).unwrap();
         }
         store.insert_proof(proof).unwrap();
+    }
+
+    #[derive(Debug)]
+    struct InjectedClaimReadError<E> {
+        source: String,
+        marker: PhantomData<fn() -> E>,
+    }
+
+    impl<E> fmt::Display for InjectedClaimReadError<E> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(&self.source)
+        }
+    }
+
+    impl<E> Error for InjectedClaimReadError<E> where E: Error + Send + Sync + 'static {}
+
+    #[derive(Clone)]
+    struct FailingClaimSnapshot {
+        inner: MemoryRepoSnapshot,
+        fail: [u8; 32],
+    }
+
+    impl BlobStoreGet for FailingClaimSnapshot {
+        type GetError<E: Error + Send + Sync + 'static> = InjectedClaimReadError<E>;
+
+        fn get<T, S>(
+            &self,
+            handle: Inline<Handle<S>>,
+        ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
+        where
+            S: BlobEncoding + 'static,
+            T: TryFromBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            if handle.raw == self.fail {
+                return Err(InjectedClaimReadError {
+                    source: "injected resident claim read failure".to_owned(),
+                    marker: PhantomData,
+                });
+            }
+            self.inner
+                .get(handle)
+                .map_err(|source| InjectedClaimReadError {
+                    source: source.to_string(),
+                    marker: PhantomData,
+                })
+        }
+    }
+
+    impl BlobStoreList for FailingClaimSnapshot {
+        type Iter<'a>
+            = <MemoryRepoSnapshot as BlobStoreList>::Iter<'a>
+        where
+            Self: 'a;
+        type Err = <MemoryRepoSnapshot as BlobStoreList>::Err;
+
+        fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+            self.inner.blobs()
+        }
+
+        fn contains_blob<S>(&self, handle: Inline<Handle<S>>) -> Result<bool, Self::Err>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.contains_blob(handle)
+        }
+
+        fn blob_info<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<BlobInfo>, Self::Err>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.blob_info(handle)
+        }
+    }
+
+    impl CapabilityProofRead for FailingClaimSnapshot {
+        type ProofsError = <MemoryRepoSnapshot as CapabilityProofRead>::ProofsError;
+        type ProofIter<'a>
+            = <MemoryRepoSnapshot as CapabilityProofRead>::ProofIter<'a>
+        where
+            Self: 'a;
+
+        fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+            self.inner.proofs()
+        }
+
+        fn proof(
+            &self,
+            id: CapabilityProofId,
+        ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+            self.inner.proof(id)
+        }
     }
 
     #[test]
@@ -1034,6 +1193,40 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
         let evidence = collection_authorization_evidence(&snapshot, collection.handle()).unwrap();
         assert_eq!(evidence.len(), 1);
+    }
+
+    #[test]
+    fn resident_claim_read_failure_is_not_hidden_as_incomplete_evidence() {
+        let root = key(40);
+        let reader = key(41);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "claim-read-failure",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(root.verifying_key()),
+                    AdmissionPolicy::Open,
+                ),
+            )
+            .unwrap();
+        let bundle = root_bundle(
+            &root,
+            &reader,
+            collection_atom(ACTION_READ, collection.handle()),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let failed_claim = bundle.proof().claim_handles().next().unwrap();
+        store_bundle(&mut store, bundle);
+        let snapshot = FailingClaimSnapshot {
+            inner: store.snapshot().unwrap(),
+            fail: failed_claim.raw,
+        };
+
+        assert!(matches!(
+            collection_authorization_evidence(&snapshot, collection.handle()),
+            Err(CollectionAuthorizationEvidenceDiscoveryError::Claim(_)),
+        ));
     }
 
     #[test]
