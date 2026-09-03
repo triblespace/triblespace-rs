@@ -2086,73 +2086,14 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 
     /// Ensure the currently admitted support in one derived collection.
     ///
-    /// Admission is frozen through one pre-work snapshot, so concurrent
-    /// commits cannot extend the requested support indefinitely. Only missing
-    /// cross-lattice `DERIVE` work is published. The returned store snapshot
-    /// observes everything durably published by this work and by any
-    /// concurrent writer. Call [`CollectionSnapshotExt::collection_at`] on it
-    /// to select the best target realization actually visible at that
-    /// boundary.
-    fn ensure<M>(
-        &mut self,
-        target: Collection<M::Target>,
-    ) -> Result<Self::Snapshot, CollectionRealizationError>
-    where
-        M: CollectionMapping,
-        Self: Store,
-        Handle<M::Target>: InlineEncoding,
-    {
-        let instant = clock::epoch_now();
-        let before = self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("freeze pre-ensure snapshot", error)
-        })?;
-        let mut frontier = OperationFrontier::new(before.clone());
-        let bounded = frontier.view(before);
-        let foundation = super::exact_derived::foundation(&bounded, target)?;
-        let support = foundation
-            .admitted_at(&bounded, instant)
-            .map_err(|error| CollectionRealizationError::storage("admit support", error))?;
-        drop(bounded);
-        super::exact_derived::ensure_exact_in_frontier::<Self, M>(
-            self,
-            target,
-            &support,
-            &mut frontier,
-        )?;
-        self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("freeze post-ensure snapshot", error)
-        })
-    }
-
-    /// Ensure one explicit foundational support in a derived collection.
-    ///
-    /// The target descriptor carries its immediate source, mapping parameters,
-    /// and policy. Existing equations may be reused, but this operation only
-    /// publishes missing `DERIVE` work.
-    fn ensure_exact<M>(
-        &mut self,
-        target: Collection<M::Target>,
-        support: &Support,
-    ) -> Result<Self::Snapshot, CollectionRealizationError>
-    where
-        M: CollectionMapping,
-        Self: Store,
-        Handle<M::Target>: InlineEncoding,
-    {
-        super::exact_derived::ensure_exact::<Self, M>(self, target, support)?;
-        self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("freeze post-ensure snapshot", error)
-        })
-    }
-
-    /// Actively acquire the bounded raw dependencies needed to ensure the
-    /// currently admitted support.
-    ///
     /// The initial record/proof frontier and authorization instant are frozen
     /// once. Exact-H acquisition may make those same records semantically
     /// visible in later blob snapshots; concurrent records never extend this
-    /// operation, and no acquisition emits a durable WANT.
-    fn ensure_async<M>(
+    /// operation, and no acquisition emits a durable WANT. Only missing
+    /// cross-lattice `DERIVE` work is published. The returned store snapshot
+    /// observes everything published by this work and by any concurrent
+    /// writer before that final observation.
+    fn ensure<M>(
         &mut self,
         target: Collection<M::Target>,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
@@ -2169,7 +2110,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             let mut frontier = OperationFrontier::new(before);
             let support =
                 admitted_support_with_acquisition(self, target, &frontier, instant).await?;
-            super::exact_derived::ensure_exact_async_in_frontier::<Self, M>(
+            super::exact_derived::ensure_exact_in_frontier::<Self, M>(
                 self,
                 target,
                 &support,
@@ -2182,8 +2123,13 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         }
     }
 
-    /// Actively acquire exact dependencies and ensure one explicit support.
-    fn ensure_exact_async<M>(
+    /// Ensure one explicit foundational support in a derived collection.
+    ///
+    /// The target descriptor carries its immediate source, mapping parameters,
+    /// and policy. Existing equations may be reused, but this operation only
+    /// publishes missing `DERIVE` work. Any exact missing dependency may be
+    /// acquired by the live store before the operation gives up.
+    fn ensure_exact<M>(
         &mut self,
         target: Collection<M::Target>,
         support: &Support,
@@ -2199,7 +2145,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 CollectionRealizationError::storage("freeze exact ensure frontier", error)
             })?;
             let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::ensure_exact_async_in_frontier::<Self, M>(
+            super::exact_derived::ensure_exact_in_frontier::<Self, M>(
                 self,
                 target,
                 &support,
@@ -2218,62 +2164,9 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// The admitted support is frozen once before work begins. Maintenance has
     /// no caller-visible budget or tuning knob: the encoding's deterministic
     /// size-tier rule runs to its stable LSM fixed point, publishing each
-    /// useful carry independently on the way.
+    /// useful carry independently on the way. The live store may acquire exact
+    /// dependencies while doing so.
     fn maintain<M>(
-        &mut self,
-        target: Collection<M::Target>,
-    ) -> Result<Self::Snapshot, CollectionRealizationError>
-    where
-        M: CollectionMapping,
-        Self: Store,
-        Handle<M::Target>: InlineEncoding,
-    {
-        let instant = clock::epoch_now();
-        let before = self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("freeze pre-maintenance snapshot", error)
-        })?;
-        let mut frontier = OperationFrontier::new(before.clone());
-        let bounded = frontier.view(before);
-        let foundation = super::exact_derived::foundation(&bounded, target)?;
-        let support = foundation
-            .admitted_at(&bounded, instant)
-            .map_err(|error| CollectionRealizationError::storage("admit support", error))?;
-        drop(bounded);
-        super::exact_derived::maintain_exact_in_frontier::<Self, M>(
-            self,
-            target,
-            &support,
-            &mut frontier,
-        )?;
-        self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("freeze post-maintenance snapshot", error)
-        })
-    }
-
-    /// Ensure one explicit foundational support, then maintain its target LSM
-    /// cover.
-    ///
-    /// This is the explicit-support counterpart of [`Self::maintain`] and uses
-    /// the same deterministic fixed-point policy.
-    fn maintain_exact<M>(
-        &mut self,
-        target: Collection<M::Target>,
-        support: &Support,
-    ) -> Result<Self::Snapshot, CollectionRealizationError>
-    where
-        M: CollectionMapping,
-        Self: Store,
-        Handle<M::Target>: InlineEncoding,
-    {
-        super::exact_derived::maintain_exact::<Self, M>(self, target, support)?;
-        self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("freeze post-maintenance snapshot", error)
-        })
-    }
-
-    /// Actively acquire the bounded raw dependencies needed to maintain the
-    /// currently admitted support to its deterministic target fixed point.
-    fn maintain_async<M>(
         &mut self,
         target: Collection<M::Target>,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
@@ -2290,7 +2183,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             let mut frontier = OperationFrontier::new(before);
             let support =
                 admitted_support_with_acquisition(self, target, &frontier, instant).await?;
-            super::exact_derived::maintain_exact_async_in_frontier::<Self, M>(
+            super::exact_derived::maintain_exact_in_frontier::<Self, M>(
                 self,
                 target,
                 &support,
@@ -2303,8 +2196,9 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         }
     }
 
-    /// Actively acquire exact dependencies and maintain one explicit support.
-    fn maintain_exact_async<M>(
+    /// Ensure one explicit foundational support, then maintain its target LSM
+    /// cover to the same deterministic fixed point as [`Self::maintain`].
+    fn maintain_exact<M>(
         &mut self,
         target: Collection<M::Target>,
         support: &Support,
@@ -2320,7 +2214,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 CollectionRealizationError::storage("freeze exact maintenance frontier", error)
             })?;
             let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::maintain_exact_async_in_frontier::<Self, M>(
+            super::exact_derived::maintain_exact_in_frontier::<Self, M>(
                 self,
                 target,
                 &support,

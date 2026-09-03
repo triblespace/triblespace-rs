@@ -690,7 +690,7 @@ fn downstream_ensure_requires_an_existing_immediate_source_realization() {
     store.put::<SimpleArchive, _>(source.clone()).unwrap();
     let support = support(root, std::slice::from_ref(&source));
 
-    let result = ensure_exact::<_, SecondMapping>(&mut store, second, &support);
+    let result = ensure_exact_resident::<_, SecondMapping>(&mut store, second, &support);
     assert!(matches!(
         result,
         Err(CollectionRealizationError::IncompleteCover { .. })
@@ -709,8 +709,8 @@ fn two_hops_reuse_one_invariant_foundational_support() {
     store.put::<SimpleArchive, _>(source.clone()).unwrap();
     let support = support(root, std::slice::from_ref(&source));
 
-    ensure_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
-    ensure_exact::<_, SecondMapping>(&mut store, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
     let snapshot = store.snapshot().unwrap();
     let (observed_support, cover) = attach_collection(&snapshot, second, Some(&support)).unwrap();
 
@@ -739,7 +739,7 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
     publish_root(&mut store, root, &left, 1);
     publish_root(&mut store, root, &right, 2);
     let left_support = support(root, std::slice::from_ref(&left));
-    ensure_exact::<_, FirstMapping>(&mut store, first, &left_support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &left_support).unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let (observed, cover) = attach_collection(&snapshot, first, None).unwrap();
@@ -769,7 +769,7 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
     let support = support(root, &[source]);
     let mut store = GuardStore::new(inner);
 
-    ensure_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
 
     assert_eq!(store.live.load(Ordering::SeqCst), 0);
     let (insert_position, derive) = store
@@ -790,14 +790,14 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
 }
 
 #[test]
-fn exact_async_ensure_acquires_explicit_foundational_support_without_want() {
+fn exact_ensure_acquires_explicit_foundational_support_without_want() {
     let (inner, root, first, _second) = collections();
     let source = archive(1, 1);
     let support = support(root, std::slice::from_ref(&source));
     let mut store = GuardStore::new(inner);
     store.offer(&source);
 
-    let snapshot = block_on(store.ensure_exact_async::<FirstMapping>(first, &support)).unwrap();
+    let snapshot = block_on(store.ensure_exact::<FirstMapping>(first, &support)).unwrap();
 
     assert_eq!(store.acquired, vec![data(&source)]);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
@@ -835,7 +835,7 @@ fn async_ensure_hydrates_only_the_bounded_admitted_commit_frontier() {
         metadata,
     )));
 
-    let snapshot = block_on(store.ensure_async::<FirstMapping>(first)).unwrap();
+    let snapshot = block_on(store.ensure::<FirstMapping>(first)).unwrap();
 
     assert_eq!(store.acquired, vec![data(&source)]);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
@@ -892,7 +892,7 @@ fn async_ensure_hydrates_relevant_proof_before_authorized_commit_payload() {
     }
     store.offer(&source);
 
-    let snapshot = block_on(store.ensure_async::<FirstMapping>(first)).unwrap();
+    let snapshot = block_on(store.ensure::<FirstMapping>(first)).unwrap();
 
     assert_eq!(
         &store.acquired[..claim_members.len()],
@@ -919,11 +919,11 @@ fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge()
         inner.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let support = support(root, &[left, right]);
-    ensure_exact::<_, FirstMapping>(&mut inner, first, &support).unwrap();
-    ensure_exact::<_, SecondMapping>(&mut inner, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut inner, first, &support).unwrap();
+    ensure_exact_resident::<_, SecondMapping>(&mut inner, second, &support).unwrap();
     let mut store = GuardStore::new(inner);
 
-    maintain_exact::<_, SecondMapping>(&mut store, second, &support).unwrap();
+    maintain_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
 
     assert_eq!(store.live.load(Ordering::SeqCst), 0);
     let (insert_position, merge) = store
@@ -955,11 +955,11 @@ fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
         inner.put::<SimpleArchive, _>(member.clone()).unwrap();
     }
     let support = support(root, &members);
-    ensure_exact::<_, FirstMapping>(&mut inner, first, &support).unwrap();
-    ensure_exact::<_, SecondMapping>(&mut inner, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut inner, first, &support).unwrap();
+    ensure_exact_resident::<_, SecondMapping>(&mut inner, second, &support).unwrap();
 
     let mut store = GuardStore::new(inner);
-    maintain_exact::<_, SecondMapping>(&mut store, second, &support).unwrap();
+    maintain_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
 
     let merges = store
         .events
@@ -987,8 +987,8 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
             inner.put::<SimpleArchive, _>(member.clone()).unwrap();
         }
         let support = support(root, &members);
-        ensure_exact::<_, FirstMapping>(&mut inner, first, &support).unwrap();
-        ensure_exact::<_, SecondMapping>(&mut inner, second, &support).unwrap();
+        ensure_exact_resident::<_, FirstMapping>(&mut inner, first, &support).unwrap();
+        ensure_exact_resident::<_, SecondMapping>(&mut inner, second, &support).unwrap();
 
         let mut store = GuardStore::new(inner);
         if fail_insert {
@@ -998,7 +998,7 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
         }
 
         assert!(matches!(
-            maintain_exact::<_, SecondMapping>(&mut store, second, &support),
+            maintain_exact_resident::<_, SecondMapping>(&mut store, second, &support),
             Err(CollectionRealizationError::Storage { .. })
         ));
         assert_eq!(store.live.load(Ordering::SeqCst), 0);
@@ -1030,7 +1030,7 @@ fn later_put_or_insert_failure_preserves_the_published_prefix() {
         }
 
         assert!(matches!(
-            ensure_exact::<_, FirstMapping>(&mut store, first, &support),
+            ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support),
             Err(CollectionRealizationError::Storage { .. })
         ));
         let derives = records(&mut store.inner)
@@ -1052,7 +1052,7 @@ fn missing_mapping_dependency_publishes_nothing() {
     let before = store.snapshot().unwrap();
     FIRST_MAP_MISSING.set(true);
 
-    let result = ensure_exact::<_, FirstMapping>(&mut store, first, &support);
+    let result = ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support);
     FIRST_MAP_MISSING.set(false);
 
     assert!(matches!(
@@ -1084,7 +1084,7 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
     reset_mapping_calls();
     FIRST_MAP_CAPACITY.replace(Some(data(&joined)));
 
-    ensure_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
     FIRST_MAP_CAPACITY.replace(None);
 
     assert_eq!(FIRST_MAP_CALLS.get(), 3);
@@ -1109,11 +1109,11 @@ fn warm_exact_ensure_is_a_zero_write_zero_algebra_observation() {
     let source = archive(1, 1);
     store.put::<SimpleArchive, _>(source.clone()).unwrap();
     let support = support(root, &[source]);
-    ensure_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
 
     reset_mapping_calls();
     let before = store.snapshot().unwrap();
-    ensure_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
     let after = store.snapshot().unwrap();
     assert!(before == after);
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
@@ -1128,11 +1128,11 @@ fn existing_target_support_is_not_mapped_again_when_support_grows() {
         store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let left_support = support(root, std::slice::from_ref(&left));
-    ensure_exact::<_, FirstMapping>(&mut store, first, &left_support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &left_support).unwrap();
 
     reset_mapping_calls();
     let full_support = support(root, &[left, right]);
-    ensure_exact::<_, FirstMapping>(&mut store, first, &full_support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &full_support).unwrap();
     assert_eq!(FIRST_MAP_CALLS.get(), 1);
 }
 
@@ -1145,7 +1145,7 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
         store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let support = support(root, &[left, right]);
-    ensure_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let (_, first_cover) = attach_collection(&snapshot, first, Some(&support)).unwrap();
@@ -1169,7 +1169,7 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
         .unwrap();
 
     reset_mapping_calls();
-    ensure_exact::<_, SecondMapping>(&mut store, second, &support).unwrap();
+    ensure_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
     assert_eq!(SECOND_MAP_CALLS.get(), 1);
     assert!(records(&mut store).iter().any(|record| matches!(
         record,
@@ -1188,13 +1188,13 @@ fn optional_target_dependency_keeps_the_finer_cover() {
     }
     let support = support(root, &[left, right]);
 
-    maintain_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    maintain_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
     let snapshot = store.snapshot().unwrap();
     let (_, cover) = attach_collection(&snapshot, first, Some(&support)).unwrap();
     assert_eq!(cover.len(), 2);
     drop(snapshot);
     let first_result = store.snapshot().unwrap();
-    maintain_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    maintain_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
     assert!(first_result == store.snapshot().unwrap());
     assert!(!records(&mut store).iter().any(|record| matches!(
         record,
@@ -1211,8 +1211,8 @@ fn target_maintenance_publishes_only_horizontal_target_merges() {
         store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let support = support(root, &[left, right]);
-    ensure_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
-    maintain_exact::<_, SecondMapping>(&mut store, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    maintain_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let (_, cover) = attach_collection(&snapshot, second, Some(&support)).unwrap();
@@ -1237,11 +1237,11 @@ fn target_maintenance_is_deterministic_and_repeatedly_idempotent() {
         store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let support = support(root, &[left, right]);
-    ensure_exact::<_, FirstMapping>(&mut store, first, &support).unwrap();
-    maintain_exact::<_, SecondMapping>(&mut store, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
+    maintain_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
     let first_result = store.snapshot().unwrap();
 
-    maintain_exact::<_, SecondMapping>(&mut store, second, &support).unwrap();
+    maintain_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
     let second_result = store.snapshot().unwrap();
     assert!(first_result == second_result);
 }

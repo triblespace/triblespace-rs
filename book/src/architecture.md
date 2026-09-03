@@ -211,16 +211,17 @@ unchanged across every mapping hop. A multi-hop derivation therefore invokes
 each mapping explicitly with the same support rather than passing an
 intermediate physical cover downstream.
 
-`ensure` and `ensure_exact` reuse resident target nodes and stored equations,
-but publish only missing `DERIVE` work for their one immediate mapping; they
-never create a `MERGE` or manufacture an upstream blob. `maintain` and
-`maintain_exact` first perform that same vertical work and then repeatedly join
-target members in the deterministic dyadic serialized-size tiers. A target
-join which cannot use an already-resident immutable dependency leaves a finer
-target cover in place. Different target covers may denote the same join, and
-every lattice position uses the same `Cover<E>` shape while retaining its own
-typed member handles. Missing derived artifacts are cache misses, not missing
-facts.
+`ensure` and `ensure_exact` are live asynchronous store operations. They reuse
+resident target nodes and stored equations, acquire any exact missing blob
+dependencies the store can supply, and publish only missing `DERIVE` work for
+their one immediate mapping; they never create a `MERGE`, manufacture an
+upstream blob, or emit a durable `WANT`. `maintain` and `maintain_exact` first
+perform that same vertical work and then repeatedly join target members in the
+deterministic dyadic serialized-size tiers. A target join whose exact immutable
+dependency cannot be acquired leaves a finer target cover in place. Different
+target covers may denote the same join, and every lattice position uses the
+same `Cover<E>` shape while retaining its own typed member handles. Missing
+derived artifacts are cache misses, not missing facts.
 
 Every store-level ensure or maintain operation returns a fresh
 `StoreSnapshot`. The result is the post-operation temporal boundary, including

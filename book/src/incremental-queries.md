@@ -99,7 +99,7 @@ foundational support, and realized target cover. Their shard-preserving query
 values are reconstructed later with `view`.
 
 For a strict extension, compute `changed_support =
-current_support.additions_since(previous.support())`. Run `ensure_exact` or
+current_support.additions_since(previous.support())`. Await `ensure_exact` or
 `maintain_exact` for that same foundational support through each desired
 mapping edge, then ask the returned store snapshot for
 `collection_exact(target, &changed_support)`. Do the same for complete

@@ -1,4 +1,5 @@
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -101,7 +102,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
         .unwrap();
     let snapshot = store.snapshot().unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
-    let ensured = store.ensure::<SimpleToSuccinctMapping>(target).unwrap();
+    let ensured = block_on(store.ensure::<SimpleToSuccinctMapping>(target)).unwrap();
     let collection = ensured.collection_exact(target, &source_cover).unwrap();
 
     // Later source growth cannot silently change the support paired with the
@@ -120,13 +121,10 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
 
     // The explicit-support ensure and admitted-support maintenance paths share
     // the same immutable snapshot result shape.
-    store
-        .ensure_exact::<SimpleToSuccinctMapping>(target, &source_cover)
-        .unwrap();
-    store.maintain::<SimpleToSuccinctMapping>(target).unwrap();
-    let maintained = store
-        .maintain_exact::<SimpleToSuccinctMapping>(target, &source_cover)
-        .unwrap();
+    block_on(store.ensure_exact::<SimpleToSuccinctMapping>(target, &source_cover)).unwrap();
+    block_on(store.maintain::<SimpleToSuccinctMapping>(target)).unwrap();
+    let maintained =
+        block_on(store.maintain_exact::<SimpleToSuccinctMapping>(target, &source_cover)).unwrap();
     let collection = maintained.collection_exact(target, &source_cover).unwrap();
     assert_eq!(collection.support(), &source_cover);
     assert_eq!(
@@ -159,19 +157,17 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .unwrap();
 
     let support = source.admitted(&store.snapshot().unwrap()).unwrap();
-    store
-        .ensure_exact::<SimpleToSuccinctMapping>(raw, &support)
-        .unwrap();
-    let ensured = store
-        .ensure_exact::<RawToRank9AcceleratedMapping>(accelerated, &support)
-        .unwrap();
+    block_on(store.ensure_exact::<SimpleToSuccinctMapping>(raw, &support)).unwrap();
+    let ensured =
+        block_on(store.ensure_exact::<RawToRank9AcceleratedMapping>(accelerated, &support))
+            .unwrap();
     let observed = ensured.collection_exact(accelerated, &support).unwrap();
     assert_eq!(observed.support(), &support);
     assert_eq!(observed.cover().len(), 1);
 
-    let maintained = store
-        .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support)
-        .unwrap();
+    let maintained =
+        block_on(store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support))
+            .unwrap();
     let materialized = maintained
         .collection_exact(accelerated, &support)
         .unwrap()
@@ -262,9 +258,7 @@ fn collection_at_returns_the_maximal_resident_partial_realization() {
         .commit(source, &authority, Fragment::from(first.clone()))
         .unwrap();
     let first_support = source.admitted(&store.snapshot().unwrap()).unwrap();
-    store
-        .ensure_exact::<SimpleToSuccinctMapping>(target, &first_support)
-        .unwrap();
+    block_on(store.ensure_exact::<SimpleToSuccinctMapping>(target, &first_support)).unwrap();
     store
         .commit(source, &authority, Fragment::from(second))
         .unwrap();

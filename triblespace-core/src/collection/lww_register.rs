@@ -640,6 +640,7 @@ impl TryFromCover<LwwRegisterBlob> for LwwIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
 
     fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
         CollectionPolicy::new(
@@ -1019,9 +1020,8 @@ mod tests {
             .unwrap();
         let support = Support::from_data(source, [identity_commit.data(), order_commit.data()]);
 
-        let snapshot = store
-            .maintain_exact::<RegisterCoordinatesMapping>(target, &support)
-            .unwrap();
+        let snapshot =
+            block_on(store.maintain_exact::<RegisterCoordinatesMapping>(target, &support)).unwrap();
         let ensured: LwwIndex = snapshot
             .collection_exact(target, &support)
             .unwrap()

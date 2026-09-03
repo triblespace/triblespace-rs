@@ -189,7 +189,9 @@ let before = store.snapshot()?;
 let support = source.admitted(&before)?;
 drop(before);
 
-let after = store.maintain_exact::<RegularPathMapping>(paths, &support)?;
+let after = store
+    .maintain_exact::<RegularPathMapping>(paths, &support)
+    .await?;
 let observed = after.collection_exact(paths, &support)?;
 let index: Arc<PathIndex> = observed.view()?;
 ```
@@ -228,12 +230,13 @@ automaton, join the selected summaries, and close them once into the endpoint
 relation. The automaton is descriptor context, not mutable state retained in a
 lifecycle facade.
 
-`CollectionStoreExt::ensure{_exact}` publishes missing `DERIVE` work only;
-`maintain{_exact}` additionally performs deterministic size-tiered target
-`MERGE` work. Both return a fresh store snapshot rather than pretending that
-mutation itself selected one final physical cover. Every successful artifact
-is persisted before its unsigned equation, no implicit durability flush is
-performed, and an unchanged warm call executes no maps or joins.
+`CollectionStoreExt::ensure{_exact}` asynchronously acquires exact missing
+dependencies and publishes missing `DERIVE` work only; `maintain{_exact}`
+additionally performs deterministic size-tiered target `MERGE` work. Both
+return a fresh store snapshot rather than pretending that mutation itself
+selected one final physical cover. Every successful artifact is persisted
+before its unsigned equation, no implicit durability flush or durable `WANT`
+is performed, and an unchanged warm call executes no maps or joins.
 
 An empty cover returns the automaton-indexed bottom relation locally and
 appends nothing.

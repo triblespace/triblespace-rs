@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 #[cfg(feature = "nvfp4-cuda")]
 use mary::nn::nvfp4_cosine::cuda::CudaUpperScanner;
 use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
@@ -64,9 +65,9 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
     let snapshot = store.snapshot().unwrap();
     let support = source.admitted(&snapshot).unwrap();
     drop(snapshot);
-    let snapshot = store
-        .maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support)
-        .unwrap();
+    let snapshot =
+        block_on(store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support))
+            .unwrap();
     let collection = snapshot.collection_exact(target, &support).unwrap();
     let index: NvFp4CosineIndex<Embedding> = collection.view().unwrap();
     let snapshot = collection.snapshot();

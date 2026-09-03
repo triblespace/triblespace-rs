@@ -143,6 +143,7 @@ impl TryFromCover<Rank9AcceleratedSuccinctArchiveBlob> for UnionArchive<OrderedU
 mod tests {
     use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
+    use futures::executor::block_on;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::encodings::succinctarchive::{
@@ -623,12 +624,11 @@ mod tests {
             [Handle::<SimpleArchive>::to_hash(source.get_handle())],
         );
 
-        store
-            .ensure_exact::<SimpleToSuccinctMapping>(raw_collection, &support)
-            .unwrap();
-        let snapshot = store
-            .ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &support)
-            .unwrap();
+        block_on(store.ensure_exact::<SimpleToSuccinctMapping>(raw_collection, &support)).unwrap();
+        let snapshot = block_on(
+            store.ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &support),
+        )
+        .unwrap();
         let attached = snapshot
             .collection_exact(accelerated_collection, &support)
             .unwrap();
@@ -689,11 +689,13 @@ mod tests {
         let first_support = Support::from_data(source_collection, [first.data()]);
         let full_support = Support::from_data(source_collection, [first.data(), second.data()]);
 
-        store
-            .ensure_exact::<SimpleToSuccinctMapping>(raw_collection, &first_support)
+        block_on(store.ensure_exact::<SimpleToSuccinctMapping>(raw_collection, &first_support))
             .unwrap();
-        let snapshot = store
-            .ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &first_support)
+        let snapshot =
+            block_on(store.ensure_exact::<RawToRank9AcceleratedMapping>(
+                accelerated_collection,
+                &first_support,
+            ))
             .unwrap();
         let observed = snapshot
             .collection_at(
@@ -706,11 +708,13 @@ mod tests {
             .collection_exact(accelerated_collection, &full_support)
             .is_err());
 
-        store
-            .ensure_exact::<SimpleToSuccinctMapping>(raw_collection, &full_support)
+        block_on(store.ensure_exact::<SimpleToSuccinctMapping>(raw_collection, &full_support))
             .unwrap();
-        let snapshot = store
-            .ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &full_support)
+        let snapshot =
+            block_on(store.ensure_exact::<RawToRank9AcceleratedMapping>(
+                accelerated_collection,
+                &full_support,
+            ))
             .unwrap();
         let observed = snapshot
             .collection_at(
@@ -733,7 +737,10 @@ mod tests {
         let support = Support::from_data(source_collection, [source_data]);
 
         assert!(matches!(
-            store.ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &support,),
+            block_on(store.ensure_exact::<RawToRank9AcceleratedMapping>(
+                accelerated_collection,
+                &support,
+            )),
             Err(CollectionRealizationError::IncompleteCover { .. })
         ));
         let before_raw = store.snapshot().unwrap();
@@ -749,12 +756,11 @@ mod tests {
                     if derive.collection() == raw_collection.handle()
             )));
 
-        store
-            .ensure_exact::<SimpleToSuccinctMapping>(raw_collection, &support)
-            .unwrap();
-        let snapshot = store
-            .ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &support)
-            .unwrap();
+        block_on(store.ensure_exact::<SimpleToSuccinctMapping>(raw_collection, &support)).unwrap();
+        let snapshot = block_on(
+            store.ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &support),
+        )
+        .unwrap();
         let attached = snapshot
             .collection_exact(accelerated_collection, &support)
             .unwrap();

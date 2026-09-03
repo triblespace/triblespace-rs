@@ -67,6 +67,7 @@
 use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
@@ -782,12 +783,12 @@ fn main() {
             drop(snapshot);
 
             let t = Instant::now();
-            store
-                .maintain_exact::<SimpleToSuccinctMapping>(raw, &support)
+            block_on(store.maintain_exact::<SimpleToSuccinctMapping>(raw, &support))
                 .expect("maintain exact raw Succinct cover");
-            let snapshot = store
-                .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support)
-                .expect("maintain exact accelerated Succinct cover");
+            let snapshot = block_on(
+                store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support),
+            )
+            .expect("maintain exact accelerated Succinct cover");
             let attached = snapshot
                 .collection_exact(accelerated, &support)
                 .expect("observe exact accelerated Succinct cover");

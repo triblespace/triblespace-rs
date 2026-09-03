@@ -7,6 +7,7 @@ use std::error::Error;
 use std::io;
 
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 use rand::rngs::OsRng;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -89,12 +90,13 @@ fn observe(
     // Every mapping edge receives the same foundational support. Maintaining
     // the delta first lets complete maintenance reuse all persisted work.
     if let Some(changed) = changed_support.as_ref() {
-        store.maintain_exact::<SimpleToSuccinctMapping>(raw, changed)?;
-        store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, changed)?;
+        block_on(store.maintain_exact::<SimpleToSuccinctMapping>(raw, changed))?;
+        block_on(store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, changed))?;
     }
-    store.maintain_exact::<SimpleToSuccinctMapping>(raw, &current_support)?;
-    let snapshot =
-        store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &current_support)?;
+    block_on(store.maintain_exact::<SimpleToSuccinctMapping>(raw, &current_support))?;
+    let snapshot = block_on(
+        store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &current_support),
+    )?;
     let next = snapshot.collection_exact(accelerated, &current_support)?;
 
     let titles = match changed_support {

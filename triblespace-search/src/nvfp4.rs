@@ -1298,6 +1298,7 @@ mod tests {
     use super::*;
     use crate::schemas::Embedding;
     use ed25519_dalek::SigningKey;
+    use futures::executor::block_on;
     use mary::nn::nvfp4_cosine::{CpuF64UpperScanner, ScanQuery};
     use std::cell::Cell;
     use std::error::Error;
@@ -1502,9 +1503,10 @@ mod tests {
         let source_snapshot = source_store.snapshot().unwrap();
         let support = source.admitted(&source_snapshot).unwrap();
         drop(source_snapshot);
-        let source_snapshot = source_store
-            .maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support)
-            .unwrap();
+        let source_snapshot = block_on(
+            source_store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support),
+        )
+        .unwrap();
         let collection = source_snapshot.collection_exact(target, &support).unwrap();
         let target_cover = collection.cover().clone();
         let source_snapshot = collection.snapshot();

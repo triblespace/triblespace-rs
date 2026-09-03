@@ -50,6 +50,7 @@ thread_local = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = "0.6.0"
+futures = "0.3"
 fake = "4.3.0"
 im = "15.1.0"
 rayon = "1.7"

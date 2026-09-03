@@ -4,6 +4,7 @@
 //! Run with: `cargo run --example native_succinct_collection`
 
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 use rand::rngs::OsRng;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::collection::succinctarchive_union::{
@@ -64,11 +65,11 @@ fn main() {
     let accelerated = pile
         .derive(raw, RawToRank9AcceleratedMapping, policy)
         .expect("register Rank9-accelerated projection");
-    pile.maintain_exact::<SimpleToSuccinctMapping>(raw, &support)
+    block_on(pile.maintain_exact::<SimpleToSuccinctMapping>(raw, &support))
         .expect("maintain exact raw Succinct collection");
-    let snapshot = pile
-        .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support)
-        .expect("maintain exact Rank9-accelerated collection");
+    let snapshot =
+        block_on(pile.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support))
+            .expect("maintain exact Rank9-accelerated collection");
     let archive = snapshot
         .collection_exact(accelerated, &support)
         .expect("observe exact Rank9-accelerated collection");

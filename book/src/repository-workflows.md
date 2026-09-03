@@ -260,12 +260,11 @@ retained non-blob record strongly retains every directly referenced blob which
 is resident, but does not fetch an absent one. A `WANT` is itself only an
 explicit durable demand record, never automatic cache-miss bookkeeping.
 
-Stores which implement active acquisition expose `ensure_async` and
-`maintain_async` (and their exact-support forms). They may fetch only the exact
-missing handles in the operation's frozen raw frontier, publish derived work,
-and return a fresh snapshot; they never emit `WANT`. The synchronous forms are
-the resident-only runner for local stores: the same plan either completes from
-that store or reports its missing dependency.
+The four live store operations are asynchronous even for local stores. They may
+fetch only exact missing handles in the operation's frozen raw frontier,
+publish derived work, and return a fresh snapshot; they never emit `WANT`.
+Local stores implement the same contract with immediately ready acquisition
+from their resident snapshot, while a networked store may await exact-H fetch.
 
 Exact replay does not need a publishing key, re-run admission, or retain any
 signed commit or metadata. The typed cover names the exact descriptor and
@@ -341,11 +340,13 @@ let support = before.collection_at(source, instant)?.support().clone();
 drop(before);
 
 // Each edge receives the same foundational Support. Work never flows upward.
-storage.maintain_exact::<SimpleToSuccinctMapping>(raw, &support)?;
+storage
+    .maintain_exact::<SimpleToSuccinctMapping>(raw, &support)
+    .await?;
 let after = storage.maintain_exact::<RawToRank9AcceleratedMapping>(
     accelerated,
     &support,
-)?;
+).await?;
 
 let observed = after.collection_exact(accelerated, &support)?;
 let facts: UnionArchive<OrderedUniverse> = observed.view()?;

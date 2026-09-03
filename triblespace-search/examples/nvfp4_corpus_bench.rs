@@ -9,6 +9,7 @@ use std::fs;
 use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 use mary::nn::nvfp4_cosine::CpuF64UpperScanner;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::{BlobEncoding, TryFromBlob};
@@ -200,7 +201,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let construction_start = Instant::now();
     let snapshot =
-        store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support)?;
+        block_on(store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support))?;
     let construction = construction_start.elapsed();
     let collection = snapshot.collection_exact(target, &support)?;
     let snapshot = collection.snapshot();

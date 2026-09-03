@@ -243,9 +243,9 @@ DERIVE(D, c, d)
 
 A node can repair the small semantic overlay and use its resident exact merge
 and derivation results while planning a cover. Missing derived results are
-computed by the ordinary local `ensure` path, which publishes missing
-`DERIVE` work only. Local `maintain` additionally publishes deterministic
-size-tiered `MERGE` work. Those unsigned equations are not remote publication
+computed by the ordinary live `ensure` path, which may acquire exact missing
+dependencies and publishes missing `DERIVE` work only. `maintain` additionally
+publishes deterministic size-tiered `MERGE` work. Those unsigned equations are not remote publication
 authority and are not reused over the network in this release. Evidence and
 computation still converge by union; no central scheduler or query planner is
 required.

@@ -16,6 +16,12 @@
 //! [`Transport`](../../../triblespace_net/transport/trait.Transport.html)
 //! trait, so the returned futures carry a `Send` bound.
 //!
+//! [`AsyncBlobStoreAcquire`] is also the uniform live-store capability used by
+//! collection construction. Local stores answer it immediately from a frozen
+//! resident snapshot; a networked store may fetch and cache the exact handle.
+//! The caller therefore awaits one honest API without choosing between a
+//! resident-only and a remote variant.
+//!
 //! Two adapters bridge the worlds:
 //! - [`SyncAsAsync`](crate::repo::async_store::SyncAsAsync) lifts any sync store into the async traits via
 //!   zero-await futures — so an async consumer can read a local store
@@ -92,6 +98,109 @@ pub trait AsyncBlobStoreAcquire {
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send;
+}
+
+impl<S> AsyncBlobStoreAcquire for &mut S
+where
+    S: AsyncBlobStoreAcquire + ?Sized,
+{
+    type AcquireError = S::AcquireError;
+
+    fn acquire(
+        &mut self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
+        (**self).acquire(handle)
+    }
+}
+
+/// Failure while satisfying live acquisition from a synchronous local store.
+#[derive(Debug)]
+pub struct ResidentBlobAcquireError {
+    operation: &'static str,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl ResidentBlobAcquireError {
+    fn new(operation: &'static str, source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            operation,
+            source: Box::new(source),
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentBlobAcquireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "failed to {operation} while acquiring a resident blob: {source}",
+            operation = self.operation,
+            source = self.source
+        )
+    }
+}
+
+impl Error for ResidentBlobAcquireError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn acquire_resident<S>(
+    store: &mut S,
+    handle: Inline<Handle<UnknownBlob>>,
+) -> Result<Option<Bytes>, ResidentBlobAcquireError>
+where
+    S: SnapshotSource,
+    S::Snapshot: BlobStoreGet + BlobStoreList,
+{
+    let snapshot = store
+        .snapshot()
+        .map_err(|error| ResidentBlobAcquireError::new("freeze a local snapshot", error))?;
+    if !snapshot
+        .contains_blob(handle)
+        .map_err(|error| ResidentBlobAcquireError::new("inspect local residency", error))?
+    {
+        return Ok(None);
+    }
+    snapshot
+        .get::<Bytes, UnknownBlob>(handle)
+        .map(Some)
+        .map_err(|error| ResidentBlobAcquireError::new("read validated local bytes", error))
+}
+
+macro_rules! impl_resident_blob_acquire {
+    ($store:ty) => {
+        impl AsyncBlobStoreAcquire for $store {
+            type AcquireError = ResidentBlobAcquireError;
+
+            fn acquire(
+                &mut self,
+                handle: Inline<Handle<UnknownBlob>>,
+            ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
+                std::future::ready(acquire_resident(self, handle))
+            }
+        }
+    };
+}
+
+impl_resident_blob_acquire!(crate::repo::memoryrepo::MemoryRepo);
+impl_resident_blob_acquire!(crate::repo::pile::Pile);
+impl_resident_blob_acquire!(crate::repo::yard::Yard);
+
+impl<B, R> AsyncBlobStoreAcquire for crate::repo::hybridstore::HybridStore<B, R>
+where
+    B: AsyncBlobStoreAcquire,
+{
+    type AcquireError = B::AcquireError;
+
+    fn acquire(
+        &mut self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
+        self.blobs.acquire(handle)
+    }
 }
 
 /// Async counterpart of [`BlobStorePut`].

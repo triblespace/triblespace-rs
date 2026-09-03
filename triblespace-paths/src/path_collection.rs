@@ -5,8 +5,10 @@
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use futures::executor::block_on;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
+use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::{Blob, BlobEncoding, Bytes, IntoBlob, TryFromBlob};
 use triblespace_core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
     CapabilityProofBundle, CapabilityResource,
@@ -22,6 +24,7 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{InlineEncoding, RawInline};
 use triblespace_core::metadata;
 use triblespace_core::prelude::entity;
+use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
 use triblespace_core::trible::{Fragment, TribleSet};
@@ -54,6 +57,17 @@ impl SnapshotSource for CollectionOnly {
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.0.snapshot()
+    }
+}
+
+impl AsyncBlobStoreAcquire for CollectionOnly {
+    type AcquireError = <MemoryRepo as AsyncBlobStoreAcquire>::AcquireError;
+
+    fn acquire(
+        &mut self,
+        handle: triblespace_core::inline::Inline<Handle<UnknownBlob>>,
+    ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
+        self.0.acquire(handle)
     }
 }
 
@@ -274,9 +288,7 @@ fn empty_support_is_local_bottom_and_writes_nothing() {
     let blobs = store.0.blobs.len();
     let record_count = records(&mut store).len();
     let support = support(&mut store, source, []);
-    let snapshot = store
-        .maintain_exact::<RegularPathMapping>(target, &support)
-        .unwrap();
+    let snapshot = block_on(store.maintain_exact::<RegularPathMapping>(target, &support)).unwrap();
     assert_eq!(index(&snapshot, target, &support).accepted_pair_count(), 0);
     assert_eq!(store.0.blobs.len(), blobs);
     assert_eq!(records(&mut store).len(), record_count);
@@ -302,9 +314,7 @@ fn missing_then_maintain_closes_cross_fragment_path() {
         }) if unsupported_members.len() == 2
     ));
 
-    let after = store
-        .maintain_exact::<RegularPathMapping>(target, &support)
-        .unwrap();
+    let after = block_on(store.maintain_exact::<RegularPathMapping>(target, &support)).unwrap();
     assert_cross_fragment_path(&index(&after, target, &support));
 }
 
@@ -320,9 +330,7 @@ fn exact_old_support_ignores_a_later_commit_and_equation() {
     publish(&mut store, first);
     publish(&mut store, second);
     let old_support = support(&mut store, source, [first, second]);
-    store
-        .maintain_exact::<RegularPathMapping>(target, &old_support)
-        .unwrap();
+    block_on(store.maintain_exact::<RegularPathMapping>(target, &old_support)).unwrap();
 
     let later = put_data(&mut store, &edge(3, 4));
     let third = signed_commit(&mut store, source, 3, &later);
@@ -354,9 +362,7 @@ fn duplicate_payload_provenance_shares_one_derive() {
     publish(&mut store, first);
     publish(&mut store, second);
     let support = support(&mut store, source, [first, first, second]);
-    store
-        .ensure_exact::<RegularPathMapping>(target, &support)
-        .unwrap();
+    block_on(store.ensure_exact::<RegularPathMapping>(target, &support)).unwrap();
     let derives = records(&mut store)
         .into_iter()
         .filter(|record| {
@@ -390,9 +396,7 @@ fn resident_source_merge_is_lowered_once() {
         .unwrap();
     let support = support(&mut store, source, [first, second]);
 
-    let snapshot = store
-        .maintain_exact::<RegularPathMapping>(target, &support)
-        .unwrap();
+    let snapshot = block_on(store.maintain_exact::<RegularPathMapping>(target, &support)).unwrap();
     assert_cross_fragment_path(&index(&snapshot, target, &support));
     let inputs: Vec<_> = records(&mut store)
         .into_iter()

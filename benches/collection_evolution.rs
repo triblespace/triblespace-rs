@@ -38,6 +38,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
@@ -256,12 +257,12 @@ fn maintain_succinct_exact(
     support: &Support,
     collections: &Collections,
 ) -> CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
-    store
-        .maintain_exact::<SimpleToSuccinctMapping>(collections.raw, support)
+    block_on(store.maintain_exact::<SimpleToSuccinctMapping>(collections.raw, support))
         .expect("maintain exact raw Succinct collection");
-    let snapshot = store
-        .maintain_exact::<RawToRank9AcceleratedMapping>(collections.accelerated, support)
-        .expect("maintain exact accelerated Succinct collection");
+    let snapshot = block_on(
+        store.maintain_exact::<RawToRank9AcceleratedMapping>(collections.accelerated, support),
+    )
+    .expect("maintain exact accelerated Succinct collection");
     snapshot
         .collection_exact(collections.accelerated, support)
         .expect("observe exact accelerated Succinct collection")

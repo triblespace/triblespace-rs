@@ -681,7 +681,8 @@ where
 /// maps resident immediate-source members and publishes target `DERIVE`
 /// records. A missing immediate-source cover is an error: downstream ensure
 /// never constructs upstream blobs.
-pub(crate) fn ensure_exact<S, M>(
+#[cfg(test)]
+fn ensure_exact_resident<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -694,10 +695,10 @@ where
         CollectionRealizationError::storage("freeze exact mapping frontier", error)
     })?;
     let mut frontier = OperationFrontier::new(snapshot);
-    ensure_exact_in_frontier::<S, M>(store, target, support, &mut frontier)
+    ensure_exact_resident_in_frontier::<S, M>(store, target, support, &mut frontier)
 }
 
-pub(crate) fn ensure_exact_in_frontier<S, M>(
+fn ensure_exact_resident_in_frontier<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -780,7 +781,8 @@ where
 
 /// Ensure one mapping and then carry its target lattice to the deterministic
 /// LSM fixed point.
-pub(crate) fn maintain_exact<S, M>(
+#[cfg(test)]
+fn maintain_exact_resident<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -793,10 +795,10 @@ where
         CollectionRealizationError::storage("freeze exact maintenance frontier", error)
     })?;
     let mut frontier = OperationFrontier::new(snapshot);
-    maintain_exact_in_frontier::<S, M>(store, target, support, &mut frontier)
+    maintain_exact_resident_in_frontier::<S, M>(store, target, support, &mut frontier)
 }
 
-pub(crate) fn maintain_exact_in_frontier<S, M>(
+fn maintain_exact_resident_in_frontier<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -806,7 +808,7 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    ensure_exact_in_frontier::<S, M>(store, target, support, frontier)?;
+    ensure_exact_resident_in_frontier::<S, M>(store, target, support, frontier)?;
     super::exact_target_compaction::maintain_target(store, target, support, frontier)
 }
 
@@ -830,7 +832,7 @@ where
         .map(|bytes| bytes.is_some())
 }
 
-pub(crate) async fn ensure_exact_async_in_frontier<S, M>(
+pub(crate) async fn ensure_exact_in_frontier<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -842,7 +844,7 @@ where
 {
     let mut attempted = BTreeSet::new();
     loop {
-        match ensure_exact_in_frontier::<S, M>(store, target, support, frontier) {
+        match ensure_exact_resident_in_frontier::<S, M>(store, target, support, frontier) {
             Err(CollectionRealizationError::MissingDependency { member }) => {
                 if !acquire_missing(store, &mut attempted, member).await? {
                     return Err(CollectionRealizationError::MissingDependency { member });
@@ -853,7 +855,7 @@ where
     }
 }
 
-pub(crate) async fn maintain_exact_async_in_frontier<S, M>(
+pub(crate) async fn maintain_exact_in_frontier<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -865,7 +867,7 @@ where
 {
     let mut attempted = BTreeSet::new();
     loop {
-        match maintain_exact_in_frontier::<S, M>(store, target, support, frontier) {
+        match maintain_exact_resident_in_frontier::<S, M>(store, target, support, frontier) {
             Err(CollectionRealizationError::MissingDependency { member }) => {
                 if !acquire_missing(store, &mut attempted, member).await? {
                     return Err(CollectionRealizationError::MissingDependency { member });

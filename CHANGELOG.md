@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations return a fresh immutable `StoreSnapshot`, from which callers
   select a typed `CollectionSnapshot<R, E>` and reconstruct views on demand.
 
+- Make `ensure`, `ensure_exact`, `maintain`, and `maintain_exact` the single
+  asynchronous live-store API. They may acquire exact missing dependencies
+  without recording a durable `WANT`; local stores complete resident
+  acquisition immediately. Remove the duplicate resident-only public methods
+  and the `_async` method-name variants.
+
 - Add a derived segmented pile index over `collection handle || record fingerprint` so
   collection-only selector unions visit only the named descriptors' records
   while preserving the full-width fingerprint index as physical storage and

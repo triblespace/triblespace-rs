@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 use triblespace_core::collection::{
     AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
 };
@@ -112,9 +113,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
 
     let snapshot = store.snapshot().unwrap();
     let support = source.admitted(&snapshot).unwrap();
-    let snapshot = store
-        .maintain_exact::<RegularPathMapping>(target, &support)
-        .unwrap();
+    let snapshot = block_on(store.maintain_exact::<RegularPathMapping>(target, &support)).unwrap();
     let index: Arc<PathIndex> = snapshot
         .collection_exact(target, &support)
         .unwrap()

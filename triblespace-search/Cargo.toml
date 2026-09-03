@@ -21,6 +21,7 @@ exclude = ["target/", "Cargo.lock", ".git/"]
 
 [dev-dependencies]
 ed25519-dalek = "2.1.0"
+futures = "0.3"
 # tempfile — used by integration tests that exercise an on-disk
 # triblespace Pile round-trip. Already in the tree via triblespace
 # transitively; declaring it here keeps the tests building even

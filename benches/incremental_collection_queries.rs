@@ -35,6 +35,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
@@ -149,11 +150,9 @@ fn maintain_succinct(
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     support: &Support,
 ) -> MemoryRepoSnapshot {
-    store
-        .maintain_exact::<SimpleToSuccinctMapping>(raw, support)
+    block_on(store.maintain_exact::<SimpleToSuccinctMapping>(raw, support))
         .expect("maintain exact raw Succinct cover");
-    store
-        .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, support)
+    block_on(store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, support))
         .expect("maintain exact accelerated Succinct cover")
 }
 
