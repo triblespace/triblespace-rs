@@ -29,6 +29,9 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::future::Future;
 
+use anybytes::Bytes;
+
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{CollectionRead, CollectionRecord, CollectionStore};
 use crate::inline::encodings::hash::Handle;
@@ -46,11 +49,10 @@ use crate::repo::{BlobChildren, StorageClose};
 /// `get` returns a `Send` future so it can be driven on a multi-thread
 /// runtime. The output `T` need not be `Send` — it is produced at
 /// completion, not held across an await — so this mirrors the sync
-/// signature's bounds exactly. For a remote or lazy snapshot, explicit
-/// handle retrieval may remain a live operational capability: it may fetch or
-/// wait for immutable content-addressed bytes which were absent from the
-/// snapshot's frozen membership. That does not add the handle to the frozen
-/// listing or alter the snapshot's semantic record observation.
+/// signature's bounds exactly. This is an immutable snapshot read: it may use
+/// asynchronous I/O to read bytes which belong to the frozen observation, but
+/// it must not fetch missing content, wait for later content, mutate storage,
+/// or record durable demand.
 pub trait AsyncBlobStoreGet {
     /// Error type for get operations, parameterised by the
     /// deserialization error (mirrors the sync GAT).
@@ -73,6 +75,23 @@ pub trait AsyncBlobStoreGet {
         S: BlobEncoding + 'static,
         T: TryFromBlob<S>,
         Handle<S>: InlineEncoding;
+}
+
+/// Live exact-handle acquisition into a mutable store.
+///
+/// Unlike snapshot [`AsyncBlobStoreGet`], this operation may fetch and cache
+/// immutable content-addressed bytes. It must validate fetched bytes through
+/// the store's checked insertion path and must not implicitly record a WANT.
+/// `Ok(None)` means that no provider supplied the named bytes.
+pub trait AsyncBlobStoreAcquire {
+    /// Failure while probing, fetching, validating, caching, or refreshing.
+    type AcquireError: Error + Send + Sync + 'static;
+
+    /// Ensure the exact blob is locally resident and return its bytes.
+    fn acquire(
+        &mut self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send;
 }
 
 /// Async counterpart of [`BlobStorePut`].
@@ -116,8 +135,7 @@ pub trait AsyncBlobStoreList {
 ///
 /// The snapshot value uses the same [`StoreSnapshot`] change contract as a
 /// synchronous backend; only freezing it may require asynchronous I/O. Its
-/// semantic records and listings are immutable even when an
-/// [`AsyncBlobStoreGet`] capability can acquire explicitly addressed bytes.
+/// semantic records, listings, and retrievable blob membership are immutable.
 pub trait AsyncSnapshotSource {
     /// Immutable observation returned by this store.
     type Snapshot: StoreSnapshot;

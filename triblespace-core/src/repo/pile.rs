@@ -4883,7 +4883,6 @@ mod tests {
         CollectionStoreExt, Cover,
     };
     use crate::macros::entity;
-    use crate::repo::lazy::Lazy;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
     use crate::repo::{
         BlobStoreMeta, RetentionRoots, SnapshotSource, StorageClose, StoreChanges, StoreSnapshot,
@@ -6281,58 +6280,6 @@ mod tests {
             &records.bytes()[decoded[1].offset..decoded[1].offset + FRAME_MAGIC_LEN],
             FRAME_MAGIC.as_slice()
         );
-    }
-
-    #[test]
-    fn lazy_pile_reads_reopens_and_appends_across_opaque_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "lazy-opaque.pile");
-        std::fs::write(
-            &path,
-            test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN),
-        )
-        .unwrap();
-
-        let first_payload = b"first lazy blob".to_vec();
-        let mut seed = Pile::open(&path).unwrap();
-        let first = seed
-            .put::<UnknownBlob, _>(Bytes::from_source(first_payload.clone()))
-            .unwrap();
-        seed.close().unwrap();
-
-        let mut lazy: Lazy<Pile> = Lazy::new(Pile::open(&path).unwrap());
-        let reader = SnapshotSource::snapshot(&mut lazy).unwrap();
-        let first_read: Blob<UnknownBlob> = reader.get(first).unwrap();
-        assert_eq!(first_read.bytes.as_ref(), first_payload);
-        drop(reader);
-
-        {
-            let mut external = OpenOptions::new().append(true).open(&path).unwrap();
-            external
-                .write_all(&test_envelope_bytes(
-                    TEST_UNKNOWN_KIND_B,
-                    2,
-                    2 * ENVELOPE_BLOCK_LEN,
-                ))
-                .unwrap();
-        }
-        let second_payload = b"second lazy blob".to_vec();
-        let second = BlobStorePut::put::<UnknownBlob, _>(
-            &mut lazy,
-            Bytes::from_source(second_payload.clone()),
-        )
-        .unwrap();
-        lazy.into_store().close().unwrap();
-
-        let mut reopened: Lazy<Pile> = Lazy::new(Pile::open(&path).unwrap());
-        let reader = SnapshotSource::snapshot(&mut reopened).unwrap();
-        let first_read: Blob<UnknownBlob> = reader.get(first).unwrap();
-        let second_read: Blob<UnknownBlob> = reader.get(second).unwrap();
-        assert_eq!(first_read.bytes.as_ref(), first_payload);
-        assert_eq!(second_read.bytes.as_ref(), second_payload);
-        drop(reader);
-        assert_eq!(reopened.store().opaque_record_count().unwrap(), 2);
-        reopened.into_store().close().unwrap();
     }
 
     #[test]

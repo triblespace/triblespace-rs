@@ -12,8 +12,6 @@ pub mod branch;
 pub mod commit;
 /// Storage adapter that delegates blobs and collection records to separate backends.
 pub mod hybridstore;
-/// No-network lazy reader: local get, durable want on miss ([`lazy::Lazy`]).
-pub mod lazy;
 /// Fully in-memory storage implementation for tests and ephemeral use.
 pub mod memoryrepo;
 #[cfg(feature = "object-store")]
@@ -102,7 +100,9 @@ impl StoreChanges {
 ///
 /// A snapshot is its own local revision token. It owns every read capability
 /// needed to interpret the prefix it observed, and compares directly with an
-/// earlier snapshot from the same store lineage. The default is deliberately
+/// earlier snapshot from the same store lineage. Snapshot reads are frozen,
+/// resident-only observations: they never fetch, wait, mutate storage, or
+/// record durable demand. The default is deliberately
 /// conservative for backends that cannot classify changes cheaply.
 pub trait StoreSnapshot: Clone + Send + Sync + 'static {
     /// Conservatively classify changes since `previous`.
@@ -119,9 +119,8 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
 ///
 /// Every semantic read capability implemented by a store shares this one
 /// associated snapshot. This prevents blob bytes, collection records, and
-/// capability proofs from being sampled at subtly different prefixes. A snapshot may additionally carry a live operational
-/// acquisition capability; fetched bytes join only a later observation and
-/// remain outside `changes_since` until then.
+/// capability proofs from being sampled at subtly different prefixes. Active
+/// acquisition belongs on the mutable store and produces a later snapshot.
 pub trait SnapshotSource {
     /// Immutable observation returned by this store.
     type Snapshot: StoreSnapshot;

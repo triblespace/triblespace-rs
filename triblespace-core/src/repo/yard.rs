@@ -1021,10 +1021,7 @@ impl SnapshotSource for Yard {
                 });
             }
         }
-        Ok(YardSnapshot {
-            generations,
-            want_state: self.want_state.clone(),
-        })
+        Ok(YardSnapshot { generations })
     }
 }
 
@@ -1071,7 +1068,6 @@ struct YardGenerationSnapshot {
 #[derive(Debug, Clone)]
 pub struct YardSnapshot {
     generations: Vec<YardGenerationSnapshot>,
-    want_state: Arc<Mutex<WantState>>,
 }
 
 impl YardSnapshot {
@@ -1091,12 +1087,8 @@ impl YardSnapshot {
         live
     }
 
-    /// Union read across generations (young -> old) that does NOT mint a
-    /// demand-born want on a miss; returns `None` on a clean miss.
-    /// Speculative / structural reads (reference discovery via
-    /// `children`) use this so they never pollute the wanted set with
-    /// wants for non-existent hashes. The public `get` layers the
-    /// demand-born want on top of it.
+    /// Union read across the frozen generations (young -> old), returning
+    /// `None` on a clean miss.
     fn get_local<T, S>(
         &self,
         handle: Inline<Handle<S>>,
@@ -1152,19 +1144,8 @@ impl BlobStoreGet for YardSnapshot {
         T: TryFromBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        match self.get_local::<T, S>(handle) {
-            Some(result) => result,
-            None => {
-                // An *intentional* read that missed is a demand-born
-                // "want" — mint the want so the sync daemon can fetch
-                // it. Speculative scans use `get_local` and never land here.
-                self.want_state
-                    .lock()
-                    .expect("want mutex poisoned")
-                    .want(WantRequest::blob(handle));
-                Err(YardGetError::NotFound)
-            }
-        }
+        self.get_local::<T, S>(handle)
+            .unwrap_or(Err(YardGetError::NotFound))
     }
 }
 
@@ -1661,6 +1642,33 @@ mod tests {
             after_collect.changes_since(&after_blob),
             StoreChanges::BLOBS,
         );
+    }
+
+    #[test]
+    fn yard_snapshots_are_frozen_and_misses_do_not_record_wants() {
+        let (_dir, mut yard) = yard_with(1, YardConfig::default());
+        let bytes = raw_blob(b"snapshot boundary");
+        let handle = Blob::<RawBytes>::new(bytes.clone()).get_handle();
+        let before = yard.snapshot().unwrap();
+
+        assert!(matches!(
+            before.get::<Bytes, RawBytes>(handle),
+            Err(YardGetError::NotFound)
+        ));
+        assert!(yard.wants().unwrap().next().is_none());
+
+        assert_eq!(yard.put::<RawBytes, _>(bytes).unwrap(), handle);
+        assert!(matches!(
+            before.get::<Bytes, RawBytes>(handle),
+            Err(YardGetError::NotFound)
+        ));
+
+        let after = yard.snapshot().unwrap();
+        assert_eq!(
+            after.get::<Bytes, RawBytes>(handle).unwrap().as_ref(),
+            b"snapshot boundary"
+        );
+        assert!(yard.wants().unwrap().next().is_none());
     }
 
     #[test]

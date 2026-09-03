@@ -3,8 +3,8 @@
 //! The host runtime repairs immutable per-collection semantic overlays. This
 //! side owns the only mutable store boundary: authenticated leaves are deduplicated,
 //! inserted monotonically, flushed once per drain, and only then exposed in a
-//! replacement serving snapshot. Exact blob reads keep their durable-WANT
-//! semantics independently of broad inventory mirroring.
+//! replacement serving snapshot. Explicit live blob acquisition is separate
+//! from both frozen snapshot reads and durable WANT delegation.
 
 use std::error::Error;
 use std::fmt;
@@ -14,19 +14,18 @@ use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
+use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRead, CollectionStore, next_authorization_change_at,
+    CollectionHandle, CollectionStore, next_authorization_change_at,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, PATCH};
-use triblespace_core::repo::lazy::WantRecordError;
+use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace_core::repo::{
-    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    CapabilityProofRead, CapabilityProofStore, SnapshotSource, StorageFlush, StoreChanges,
-    StoreRead, StoreSnapshot as CoreStoreSnapshot, WantRequest, WantStore,
+    BlobChildren, BlobStore, BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource,
+    StorageFlush, StoreChanges, StoreRead, StoreSnapshot as CoreStoreSnapshot, WantStore,
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
@@ -44,6 +43,18 @@ pub enum PeerOpenError {
     /// The production network thread, runtime, or iroh endpoint could not start.
     HostStartup(anyhow::Error),
 }
+
+/// Failure while actively acquiring and caching an exact blob handle.
+#[derive(Debug)]
+pub struct PeerAcquireError(String);
+
+impl fmt::Display for PeerAcquireError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for PeerAcquireError {}
 
 impl fmt::Display for PeerOpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -471,9 +482,7 @@ where
     pub fn into_store(self) -> S {
         let Self { store, .. } = self;
         Arc::try_unwrap(store)
-            .unwrap_or_else(|_| {
-                panic!("Peer::into_store: an outstanding PeerSnapshot still shares the store")
-            })
+            .unwrap_or_else(|_| panic!("Peer::into_store: store still has an outstanding owner"))
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -485,32 +494,63 @@ where
             .ok()
     }
 
-    /// Local lookup followed by durable bearer-handle discovery and retention.
-    pub async fn get_or_fetch_async(
+    /// Read an exact handle locally or acquire it from the network.
+    ///
+    /// Acquired bytes are checked by the backing store's content-addressed
+    /// `put`, then read from a fresh snapshot. This operation never records a
+    /// WANT; durable delegation is an explicit [`WantStore::want`] operation.
+    pub async fn acquire(
         &mut self,
-        hash: RawHash,
-    ) -> Result<Option<Bytes>, WantRecordError<S::WantError, <S as StorageFlush>::Error>> {
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> Result<Option<Bytes>, PeerAcquireError> {
+        let hash = handle.raw;
         if let Some(bytes) = self.try_local(hash) {
             return Ok(Some(bytes));
-        }
-        {
-            let mut store = self.store.lock().expect("store mutex");
-            store
-                .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
-                .map_err(WantRecordError::Want)?;
-            store.flush().map_err(WantRecordError::Flush)?;
         }
         let Some(raw) = self.fetch_wanted_blob(hash).await else {
             return Ok(None);
         };
-        let bytes = raw;
         {
             let mut store = self.store.lock().expect("store mutex");
-            if let Err(error) = store.put::<UnknownBlob, Bytes>(bytes.clone()) {
-                tracing::warn!(?error, "landing demand-fetched blob failed");
+            let stored = store.put::<UnknownBlob, Bytes>(raw).map_err(|error| {
+                PeerAcquireError(format!("cannot cache acquired blob: {error}"))
+            })?;
+            if stored.raw != hash {
+                return Err(PeerAcquireError(
+                    "peer returned bytes for a different content hash".into(),
+                ));
             }
         }
+        let snapshot = self.snapshot().map_err(|error| {
+            PeerAcquireError(format!("cannot refresh after acquisition: {error}"))
+        })?;
+        let bytes = snapshot
+            .get::<Bytes, UnknownBlob>(Inline::new(hash))
+            .map_err(|error| {
+                PeerAcquireError(format!("cached blob absent from fresh snapshot: {error}"))
+            })?;
         Ok(Some(bytes))
+    }
+}
+
+impl<S> AsyncBlobStoreAcquire for Peer<S>
+where
+    S: BlobStore
+        + CollectionStore
+        + CapabilityProofStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
+    S::Snapshot: StoreRead + BlobChildren,
+{
+    type AcquireError = PeerAcquireError;
+
+    fn acquire(
+        &mut self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
+        Peer::acquire(self, handle)
     }
 }
 
@@ -549,248 +589,13 @@ where
         + 'static,
     S::Snapshot: StoreRead + BlobChildren,
 {
-    type Snapshot = PeerSnapshot<S::Snapshot>;
+    type Snapshot = S::Snapshot;
     type SnapshotError = PeerSnapshotError<S::SnapshotError>;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.try_refresh()?;
         let mut store = self.store.lock().expect("store mutex");
-        let local = store.snapshot().map_err(PeerSnapshotError::Store)?;
-        drop(store);
-        let fetch = Some(FetchCap {
-            sink: Arc::new(SharedStore {
-                store: self.store.clone(),
-            }),
-        });
-        Ok(PeerSnapshot { local, fetch })
-    }
-}
-
-/// A frozen local store observation plus an optional durable-WANT sink.
-///
-/// Synchronous reads and listings remain fixed at `local`. Async retrieval may
-/// acquire explicitly addressed immutable bytes through the swarm and cache
-/// them operationally, but never extends this snapshot's frozen inventory.
-pub struct PeerSnapshot<L> {
-    local: L,
-    fetch: Option<FetchCap>,
-}
-
-#[derive(Clone)]
-struct FetchCap {
-    sink: Arc<dyn StoreSink>,
-}
-
-trait StoreSink: Send + Sync {
-    fn record_want(&self, hash: RawHash) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-}
-
-struct SharedStore<S> {
-    store: Arc<Mutex<S>>,
-}
-
-impl<S> StoreSink for SharedStore<S>
-where
-    S: BlobStorePut + WantStore + StorageFlush + Send + 'static,
-{
-    fn record_want(&self, hash: RawHash) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut store = self.store.lock().expect("store mutex");
-        store
-            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
-            .map_err(|error| {
-                Box::new(WantRecordError::<_, <S as StorageFlush>::Error>::Want(
-                    error,
-                )) as Box<dyn std::error::Error + Send + Sync>
-            })?;
-        store.flush().map_err(|error| {
-            Box::new(WantRecordError::<S::WantError, _>::Flush(error))
-                as Box<dyn std::error::Error + Send + Sync>
-        })
-    }
-}
-
-impl<L: Clone> Clone for PeerSnapshot<L> {
-    fn clone(&self) -> Self {
-        Self {
-            local: self.local.clone(),
-            fetch: self.fetch.clone(),
-        }
-    }
-}
-
-impl<L: PartialEq> PartialEq for PeerSnapshot<L> {
-    fn eq(&self, other: &Self) -> bool {
-        self.local == other.local
-    }
-}
-
-impl<L: Eq> Eq for PeerSnapshot<L> {}
-
-impl<L> CoreStoreSnapshot for PeerSnapshot<L>
-where
-    L: CoreStoreSnapshot,
-{
-    fn changes_since(&self, previous: &Self) -> StoreChanges {
-        self.local.changes_since(&previous.local)
-    }
-}
-
-#[derive(Debug)]
-pub enum PeerSnapshotGetError<E> {
-    Conversion(E),
-    Unavailable,
-    WantRecord(Box<dyn std::error::Error + Send + Sync>),
-}
-
-impl<E: std::error::Error> std::fmt::Display for PeerSnapshotGetError<E> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Conversion(error) => write!(formatter, "blob conversion failed: {error}"),
-            Self::Unavailable => write!(formatter, "blob unavailable"),
-            Self::WantRecord(error) => write!(formatter, "blob WANT not durable: {error}"),
-        }
-    }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for PeerSnapshotGetError<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Conversion(error) => Some(error),
-            Self::Unavailable => None,
-            Self::WantRecord(error) => Some(error.as_ref()),
-        }
-    }
-}
-
-impl<L> BlobStoreGet for PeerSnapshot<L>
-where
-    L: BlobStoreGet,
-{
-    type GetError<E: std::error::Error + Send + Sync + 'static> = L::GetError<E>;
-
-    fn get<T, Sch>(
-        &self,
-        handle: Inline<Handle<Sch>>,
-    ) -> Result<T, Self::GetError<<T as TryFromBlob<Sch>>::Error>>
-    where
-        Sch: BlobEncoding + 'static,
-        T: TryFromBlob<Sch>,
-        Handle<Sch>: InlineEncoding,
-    {
-        self.local.get::<T, Sch>(handle)
-    }
-}
-
-impl<L> BlobStoreList for PeerSnapshot<L>
-where
-    L: BlobStoreList,
-{
-    type Iter<'a>
-        = L::Iter<'a>
-    where
-        L: 'a;
-    type Err = L::Err;
-
-    fn blobs<'a>(&'a self) -> Self::Iter<'a> {
-        self.local.blobs()
-    }
-
-    fn contains_blob<Sch>(&self, handle: Inline<Handle<Sch>>) -> Result<bool, Self::Err>
-    where
-        Sch: BlobEncoding + 'static,
-        Handle<Sch>: InlineEncoding,
-    {
-        self.local.contains_blob(handle)
-    }
-}
-
-impl<L> BlobStoreMeta for PeerSnapshot<L>
-where
-    L: BlobStoreMeta,
-{
-    type MetaError = L::MetaError;
-
-    fn metadata<Sch>(
-        &self,
-        handle: Inline<Handle<Sch>>,
-    ) -> Result<Option<triblespace_core::repo::BlobMetadata>, Self::MetaError>
-    where
-        Sch: BlobEncoding + 'static,
-        Handle<Sch>: InlineEncoding,
-    {
-        self.local.metadata(handle)
-    }
-}
-
-impl<L> CollectionRead for PeerSnapshot<L>
-where
-    L: CollectionRead,
-{
-    type RecordsError = L::RecordsError;
-    type RecordIter<'a>
-        = L::RecordIter<'a>
-    where
-        Self: 'a;
-
-    fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        self.local.records()
-    }
-}
-
-impl<L> CapabilityProofRead for PeerSnapshot<L>
-where
-    L: CapabilityProofRead,
-{
-    type ProofsError = L::ProofsError;
-    type ProofIter<'a>
-        = L::ProofIter<'a>
-    where
-        Self: 'a;
-
-    fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
-        self.local.proofs()
-    }
-}
-
-impl<L> BlobChildren for PeerSnapshot<L> where L: BlobStoreGet {}
-
-impl<L> triblespace_core::repo::async_store::AsyncBlobStoreGet for PeerSnapshot<L>
-where
-    L: BlobStoreGet + Clone + Send + 'static,
-{
-    type GetError<E: std::error::Error + Send + Sync + 'static> = PeerSnapshotGetError<E>;
-
-    fn get<T, Sch>(
-        &self,
-        handle: Inline<Handle<Sch>>,
-    ) -> impl std::future::Future<Output = Result<T, Self::GetError<<T as TryFromBlob<Sch>>::Error>>>
-    + Send
-    where
-        Sch: BlobEncoding + 'static,
-        T: TryFromBlob<Sch>,
-        Handle<Sch>: InlineEncoding,
-    {
-        let raw = handle.raw;
-        let local = self.local.clone();
-        let fetch = self.fetch.clone();
-        async move {
-            let bytes = if let Ok(bytes) =
-                local.get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(raw))
-            {
-                bytes
-            } else if let Some(fetch) = fetch {
-                fetch
-                    .sink
-                    .record_want(raw)
-                    .map_err(PeerSnapshotGetError::WantRecord)?;
-                return Err(PeerSnapshotGetError::Unavailable);
-            } else {
-                return Err(PeerSnapshotGetError::Unavailable);
-            };
-            triblespace_core::blob::Blob::<Sch>::new(bytes)
-                .try_from_blob()
-                .map_err(PeerSnapshotGetError::Conversion)
-        }
+        store.snapshot().map_err(PeerSnapshotError::Store)
     }
 }
 
@@ -803,11 +608,29 @@ mod tests {
         CapabilityResource,
     };
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+    use triblespace_core::repo::CapabilityProofRead;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
     use crate::channel::NetEventBatch;
 
     use super::*;
+
+    #[tokio::test]
+    async fn active_acquire_miss_does_not_record_a_want() {
+        let key = SigningKey::from_bytes(&[90; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(id);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        );
+        let missing = Inline::<Handle<UnknownBlob>>::new([0x5a; 32]);
+
+        assert!(peer.acquire(missing).await.unwrap().is_none());
+        assert!(peer.store().wants().unwrap().next().is_none());
+    }
 
     #[test]
     fn idle_refresh_reuses_the_installed_serving_snapshot() {

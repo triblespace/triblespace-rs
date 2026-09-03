@@ -79,7 +79,6 @@ pub use crate::query::ContainsConstraint;
 pub use crate::query::Term;
 pub use crate::query::TriblePattern;
 pub use crate::query::Variable;
-pub use crate::repo::lazy::Lazy;
 pub use crate::repo::memoryrepo::MemoryRepo;
 pub use crate::repo::pile::{Pile, PileSnapshot};
 pub use crate::repo::BlobChildren;
