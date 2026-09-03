@@ -114,13 +114,6 @@ where
     qos: ReconcileQos,
     active: ActiveCollections,
     active_dirty: bool,
-    /// Active collections whose resident closure gained bytes from a Full
-    /// repair page after the last published serving snapshot.
-    full_dirty: ActiveCollections,
-    /// Dirty Full-replica collections whose repair acquisition crossed its own
-    /// publication checkpoint. Partial pages remain dirty without entering this
-    /// set, so another collection's final page cannot publish them early.
-    full_checkpointed: ActiveCollections,
     /// Network admissions stay outside the advertised snapshot until their
     /// shared durability barrier succeeds. A failed flush is retried on every
     /// refresh without requiring the remote to redeliver the event first.
@@ -191,8 +184,6 @@ where
             qos,
             active: PATCH::new(),
             active_dirty: true,
-            full_dirty: PATCH::new(),
-            full_checkpointed: PATCH::new(),
             pending_network_flush: false,
             last_store_snapshot: None,
             last_authorization_change: None,
@@ -303,8 +294,6 @@ where
         let received_batches = incoming.len();
         let received = incoming.iter().map(|batch| batch.len()).sum::<usize>();
         let mut store = self.store.lock().expect("store mutex");
-        let mut partial_page_acks = Vec::new();
-        let mut final_page_acks = Vec::new();
         for batch in incoming {
             for event in batch.into_events() {
                 match event {
@@ -354,40 +343,6 @@ where
                             }
                         }
                     }
-                    NetEvent::FullPage {
-                        collection,
-                        blobs,
-                        final_page,
-                        ack,
-                    } => {
-                        for (expected, bytes) in blobs {
-                            match store.put::<UnknownBlob, _>(bytes) {
-                                Ok(handle) => {
-                                    self.pending_network_flush = true;
-                                    if handle.raw != expected {
-                                        return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                            "Full page blob hash changed while landing"
-                                        )));
-                                    }
-                                    self.full_dirty.insert(&PatchEntry::new(&collection.raw));
-                                }
-                                Err(error) => {
-                                    return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                        "landing Full page blob failed: {error:?}"
-                                    )));
-                                }
-                            }
-                        }
-                        if final_page {
-                            if self.full_dirty.get(&collection.raw).is_some() {
-                                self.full_checkpointed
-                                    .insert(&PatchEntry::new(&collection.raw));
-                            }
-                            final_page_acks.push(ack);
-                        } else {
-                            partial_page_acks.push(ack);
-                        }
-                    }
                 }
             }
         }
@@ -422,15 +377,6 @@ where
                     return Ok(());
                 }
             };
-            self.sender.update_operational_blobs(snapshot.clone());
-            if !partial_page_acks.is_empty() {
-                for ack in partial_page_acks {
-                    let _ = ack.send(());
-                }
-                if final_page_acks.is_empty() {
-                    return Ok(());
-                }
-            }
             let previous_snapshot = self.sender.current_snapshot();
             let changes = if previous_snapshot.is_none() {
                 StoreChanges::ALL
@@ -450,12 +396,10 @@ where
                     || self
                         .last_authorization_change
                         .is_some_and(|boundary| now >= boundary);
-            let full_ready = self.full_dirty.intersect(&self.full_checkpointed);
             if received == 0
                 && changes == StoreChanges::NONE
                 && !authorization_changed
                 && !self.active_dirty
-                && full_ready.is_empty()
                 && previous_snapshot.is_some()
             {
                 self.last_store_snapshot = Some(snapshot);
@@ -475,14 +419,12 @@ where
             let serving = StoreSnapshot::from_store_changes(
                 snapshot.clone(),
                 &self.active,
-                &full_ready,
                 VerifyingKey::from_bytes(self.sender.id().as_bytes())
                     .expect("endpoint id is an Ed25519 key"),
                 self.last_store_snapshot.as_ref(),
                 previous_snapshot.as_deref(),
                 changes,
                 authorization_changed,
-                matches!(self.qos.blobs, crate::inventory::BlobReplication::Full),
                 next_authorization_change,
                 now,
             )
@@ -501,12 +443,6 @@ where
                 self.serving_snapshot_rebuilds += 1;
             }
             self.active_dirty = false;
-            // `refresh_checked` owns `&mut self` from event drain through
-            // publication, so no routed mark can race this clear. Preserve
-            // dirty-but-uncheckpointed collections until their own final page;
-            // concurrently queued events will be marked by the next drain.
-            self.full_dirty = self.full_dirty.difference(&full_ready);
-            self.full_checkpointed = self.full_checkpointed.difference(&full_ready);
             self.last_store_snapshot = Some(snapshot);
             self.last_authorization_change = next_authorization_change;
             self.last_observed_at = Some(now);
@@ -515,9 +451,6 @@ where
                 &mut self.last_provider_observation,
                 provider_observation,
             );
-            for ack in final_page_acks {
-                let _ = ack.send(());
-            }
         } else {
             // A failed admission flush withholds a new snapshot, but the
             // already-installed prefix remains a valid read lease. Recompute
@@ -935,52 +868,6 @@ mod tests {
             .map(|collection| collection.collection())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(active, collections.into_iter().collect());
-    }
-
-    #[tokio::test]
-    async fn failed_full_page_keeps_its_collection_dirty() {
-        let key = SigningKey::from_bytes(&[93; 32]);
-        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let mut store = MemoryRepo::default();
-        let collection = store.collection("failed-full-page", policy).unwrap();
-        let (sender, receiver, wiring) = host::wire(id);
-        let mut peer = Peer::with_wiring(
-            store,
-            ReconcileQos {
-                direction: ReconcileDirection::Bidirectional,
-                blobs: crate::inventory::BlobReplication::Full,
-            },
-            sender,
-            receiver,
-        );
-        peer.activate_collection(collection.handle());
-
-        let valid_bytes = Bytes::from_source(b"valid prefix before mismatch".to_vec());
-        let valid =
-            triblespace_core::blob::Blob::<UnknownBlob>::new(valid_bytes.clone()).get_handle();
-        let (ack, _acked) = tokio::sync::oneshot::channel();
-        let mut page = NetEventBatch::default();
-        page.try_push(NetEvent::FullPage {
-            collection: collection.handle(),
-            blobs: vec![
-                (valid.raw, valid_bytes),
-                ([0xFF; 32], Bytes::from_source(b"hash mismatch".to_vec())),
-            ],
-            final_page: true,
-            ack,
-        })
-        .unwrap();
-        wiring.send_admission(page).await;
-
-        assert!(peer.try_refresh().is_err());
-        assert!(peer.pending_network_flush);
-        assert!(peer.full_dirty.get(&collection.handle().raw).is_some());
-        assert!(
-            peer.full_checkpointed
-                .get(&collection.handle().raw)
-                .is_none()
-        );
     }
 
     #[tokio::test]

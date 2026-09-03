@@ -3,11 +3,11 @@
 Collection-scoped anti-entropy for TribleSpace over
 [iroh](https://www.iroh.computer). A peer retains an immutable semantic repair
 overlay for each explicitly active collection. One repair stream reconciles
-the exact product of three grow-only PATCHes: signature-valid exact-C COMMITs,
-collection-scoped native READ(C)/WRITE(C) authorization proofs, and the
-optional Full-replica disclosure forest. Record inclusion is independent of
-WRITE admission; each receiver derives its active view locally after records
-and proofs arrive in either order.
+the exact product of two grow-only PATCHes: signature-valid exact-C COMMITs and
+collection-scoped native READ(C)/WRITE(C) authorization proofs. It transfers
+no blob bytes. Record inclusion is independent of WRITE admission; each
+receiver derives its active view locally after records and proofs arrive in
+either order.
 
 The user-facing surface is `Peer<S>`, a synchronous store wrapper backed by an
 async host. `Peer::refresh` drains verified repair events, crosses one storage
@@ -61,10 +61,10 @@ or collection authority. Every collection repair request names exactly one
 collection. The repair client may present bounded native READ(C) proofs for
 cold bootstrap. Same-session admission uses only complete collection-scoped
 READ evidence already pinned in the server's local overlay. An unknown proof
-is ingested inertly, its claim handles enter the ordinary `Blob(H)` demand
-path, and a later retry can succeed after a fresh snapshot validates the
-closure. The server verifies the TLS client before revealing a manifest or
-PATCH leaf; the publisher itself needs no READ(C). Claims and proofs are
+is ingested inertly; if an actual authorization consumer later follows a
+missing claim handle, ordinary exact-H acquisition may obtain it. The server
+verifies the TLS client before revealing a manifest or PATCH leaf; the
+publisher itself needs no READ(C). Claims and proofs are
 non-secret authorization certificates. A caller without READ(C) receives no
 collection manifest, PATCH leaf, record, authorization evidence, or root;
 merely knowing C grants no disclosure.
@@ -86,17 +86,14 @@ by exact GET and remains exclusively the collection-repair disclosure boundary.
 
 Periodic pairwise repair is authoritative anti-entropy. For each active
 collection, the caller opens one bidirectional stream, establishes READ(C),
-pins the returned record, authorization-evidence, and resident roots, and walks
-only missing PATCH nodes. Authorization leaves carry canonical native proof
-bytes only. After a proof lands, each missing claim handle becomes an ordinary
-durable `Blob(H)` WANT and converges through the existing exact-content path;
-there is no authorization-specific claim transport.
+pins the returned record and authorization-evidence roots, and walks only
+missing PATCH nodes. Authorization leaves carry canonical native proof bytes
+only. Claim and collection payload blobs never travel in this stream.
 
 Production iroh peers also subscribe to stock `iroh-gossip` topics keyed by a
-domain-separated one-way image of the 32-byte collection handle. A 177-byte
-nonce-v3 wake contains only version, signed origin endpoint, separate opaque
-semantic and payload roots, and a fresh nonce. Demand peers react only to the
-semantic root; Full peers react to both. A mismatch schedules ordinary
+domain-separated one-way image of the 32-byte collection handle. A 145-byte
+nonce-v4 wake contains only version, signed origin endpoint, one opaque repair
+root, and a fresh nonce. A mismatch schedules ordinary
 READ-authorized repair from that signed origin; the wake itself carries no
 authority or collection state. Missed or lagged wakes are harmless because
 bounded sampled anti-entropy through leased signed wake origins remains active.
@@ -126,9 +123,7 @@ Direction is local policy:
 
 This direction applies only to collection repair. Every mode may publish and
 serve resident exact blobs under bearer handle H, and every mode may service a
-durable `Blob(H)` WANT through the ordinary KDF(H) path. In particular, a
-WriteOnly collection server can resolve the claim handles exposed by a cold
-reader's native bootstrap proof without becoming a collection-repair client.
+durable `Blob(H)` WANT through the ordinary KDF(H) path.
 
 Configured endpoint addresses bootstrap gossip and DHT routing only. Repair
 targets come from signed wake origins or endpoint-bound KDF(C) leases.
@@ -137,15 +132,11 @@ receive C or its proofs.
 
 ## Exact content
 
-`BlobReplication::Demand` keeps exact reads lazy. A bare durable
-`WantRequest::Blob(H)` asks the reconciler to discover and obtain those exact
-bytes through KDF(H). It needs no collection descriptor, activation, or READ
-proof. `BlobReplication::Full` instead walks a third, stream-pinned
-80-byte-key disclosure-forest PATCH inside an admitted collection-repair
-session. Each key commits to depth, parent, aligned chunk index, and child
-handle; the receiver accepts roots only from locally WRITE-admitted COMMITs and
-descendants only after verifying the parent bytes. The same command and byte
-budgets paginate large mirrors across ordinary repair sessions.
+A durable `WantRequest::Blob(H)` asks the reconciler to discover and obtain
+those exact bytes through KDF(H). It needs no collection descriptor,
+activation, or READ proof. Collection repair has no payload-replication mode:
+receiving a record is evidence convergence, not a request to traverse or copy
+its referenced blob graph.
 
 All exact requests share the one `Blob(H)` identity. A successful landing
 satisfies the durable request locally; failed discovery leaves it pending.

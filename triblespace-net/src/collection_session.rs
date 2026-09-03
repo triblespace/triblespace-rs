@@ -1,9 +1,7 @@
 //! READ-authorized, stream-pinned repair of one collection overlay.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anybytes::Bytes;
 use anyhow::{Result, bail};
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -11,16 +9,14 @@ use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace_core::collection::{
     CollectionHandle, CollectionRecord, collection_reader_is_admitted_by_policy_at,
 };
-use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 
 use crate::collection_activation::CollectionRepairOverlay;
 use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{
     CollectionRepairAdmission, CollectionRepairCommand, CollectionRepairComponent,
-    CollectionRepairManifest, recv_repair_admission, recv_repair_blob_response,
-    recv_repair_collection, recv_repair_command, recv_repair_hello, recv_repair_node_response,
-    send_repair_admission, send_repair_blob_request, send_repair_blob_response,
-    send_repair_bootstrap, send_repair_done, send_repair_node_request, send_repair_node_response,
+    CollectionRepairManifest, recv_repair_admission, recv_repair_collection, recv_repair_command,
+    recv_repair_hello, recv_repair_node_response, send_repair_admission, send_repair_bootstrap,
+    send_repair_done, send_repair_node_request, send_repair_node_response,
 };
 use crate::patch_repair::{
     PatchNodeResponse, PatchRepairRequest, PatchRepairWalker, PatchSummary, patch_node_response,
@@ -33,27 +29,7 @@ use crate::transport::Conn;
 pub(crate) struct CollectionRepairDelta {
     pub(crate) records: Vec<CollectionRecord>,
     pub(crate) authorization_evidence: Vec<CapabilityProof>,
-    pub(crate) blobs: Vec<([u8; 32], Bytes)>,
-    pub(crate) full_cursor: Option<FullReplicaCursor>,
     pub(crate) more: bool,
-}
-
-pub(crate) type DisclosureForestPatch = PATCH<80, IdentitySchema, (), Blake3Merkle>;
-
-#[derive(Clone, Debug)]
-pub(crate) struct FullReplicaState {
-    pub(crate) forest: DisclosureForestPatch,
-    pub(crate) direct_roots: HashSet<[u8; 32]>,
-    /// Reachable parents whose resident occurrence could not be read and
-    /// validated while constructing `forest`.
-    pub(crate) unreadable_parents: HashSet<[u8; 32]>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct FullReplicaCursor {
-    pub(crate) remote_semantic: [u8; 32],
-    pub(crate) remote_forest: PatchSummary,
-    pub(crate) seen: DisclosureForestPatch,
 }
 
 const MAX_REPAIR_RECORD_ITEMS: usize = 4_096;
@@ -67,24 +43,21 @@ const MAX_SERVER_NODE_RESPONSE_BYTES: usize = 64 << 20;
 ///
 /// `lookup` must return an immutable overlay. Its lifetime is the stream's
 /// snapshot lease: every manifest and node response comes from the exact same
-/// semantic and resident PATCH roots, so no historical-root cache is needed.
-/// Returned bootstrap proofs are inert inputs for the ordinary store/WANT
-/// boundary; they never authorize this pinned session.
+/// semantic PATCH roots, so no historical-root cache is needed. Returned
+/// bootstrap proofs are inert inputs for a later coherent authorization
+/// observation; they never authorize this pinned session.
 pub(crate) async fn serve_collection_repair<R, W>(
     recv: &mut R,
     send: &mut W,
     remote: VerifyingKey,
-    lookup: impl FnOnce(
-        triblespace_core::collection::CollectionHandle,
-    ) -> Option<(Arc<CollectionRepairOverlay>, Arc<FullReplicaState>)>,
-    disclosed_blob: impl Fn(CollectionHandle, [u8; 32]) -> Option<Bytes>,
+    lookup: impl FnOnce(CollectionHandle) -> Option<Arc<CollectionRepairOverlay>>,
 ) -> Result<Vec<CapabilityProof>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let collection = recv_repair_collection(recv).await?;
-    let Some((overlay, full)) = lookup(collection) else {
+    let Some(overlay) = lookup(collection) else {
         send_repair_admission(send, CollectionRepairAdmission::Unavailable).await?;
         send.shutdown().await?;
         return Ok(Vec::new());
@@ -118,7 +91,7 @@ where
         return Ok(bootstrap);
     }
 
-    let manifest = manifest(&overlay, &full.forest);
+    let manifest = manifest(&overlay);
     send_repair_admission(send, CollectionRepairAdmission::Admitted(manifest)).await?;
     let mut commands = 0_usize;
     let mut response_bytes = 0_usize;
@@ -152,21 +125,12 @@ where
                 if request.prefix().is_empty() && request.expected_digest() != root {
                     bail!("collection repair request does not pin the manifest root");
                 }
-                let response = node_response(&overlay, &full.forest, component, request.prefix())?;
+                let response = node_response(&overlay, component, request.prefix())?;
                 if response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES {
                     bail!("collection repair response budget exhausted");
                 }
                 response_bytes = response_bytes.saturating_add(node_response_wire_len(&response));
                 send_repair_node_response(send, &response, component).await?;
-            }
-            CollectionRepairCommand::Blob(handle) => {
-                if response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES {
-                    bail!("collection repair response budget exhausted");
-                }
-                let bytes = disclosed_blob(collection, handle);
-                response_bytes = response_bytes
-                    .saturating_add(bytes.as_ref().map_or(8, |bytes| 8 + bytes.len()));
-                send_repair_blob_response(send, bytes.as_deref()).await?;
             }
         }
     }
@@ -184,21 +148,16 @@ fn node_response_wire_len(response: &PatchNodeResponse<Vec<u8>>) -> usize {
     }
 }
 
-fn manifest(
-    overlay: &CollectionRepairOverlay,
-    forest: &DisclosureForestPatch,
-) -> CollectionRepairManifest {
+fn manifest(overlay: &CollectionRepairOverlay) -> CollectionRepairManifest {
     CollectionRepairManifest {
         wake_root: overlay.wake_root(),
         records: overlay.records().summary(),
         authorization_evidence: overlay.authorization_evidence().summary(),
-        resident: PatchSummary::from_patch(forest),
     }
 }
 
 fn node_response(
     overlay: &CollectionRepairOverlay,
-    forest: &DisclosureForestPatch,
     component: CollectionRepairComponent,
     prefix: &[u8],
 ) -> Result<PatchNodeResponse<Vec<u8>>> {
@@ -222,9 +181,6 @@ fn node_response(
                 Ok(proof.as_bytes().to_vec())
             },
         ),
-        CollectionRepairComponent::Resident => {
-            patch_node_response(forest, &[], prefix, |_, ()| Ok(Vec::new()))
-        }
     }
 }
 
@@ -236,23 +192,9 @@ pub(crate) async fn pull_collection<C: Conn>(
     conn: &C,
     local: &CollectionRepairOverlay,
     read_bootstrap: Vec<CapabilityProof>,
-    full_state: &FullReplicaState,
-    prior_cursor: Option<&FullReplicaCursor>,
-    parent_blob: impl Fn([u8; 32]) -> Option<Bytes>,
-    full: bool,
 ) -> Result<CollectionRepairDelta> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    pull_collection_stream(
-        &mut send,
-        &mut recv,
-        local,
-        read_bootstrap,
-        full_state,
-        prior_cursor,
-        parent_blob,
-        full,
-    )
-    .await
+    pull_collection_stream(&mut send, &mut recv, local, read_bootstrap).await
 }
 
 async fn pull_collection_stream<W, R>(
@@ -260,10 +202,6 @@ async fn pull_collection_stream<W, R>(
     recv: &mut R,
     local: &CollectionRepairOverlay,
     read_bootstrap: Vec<CapabilityProof>,
-    full_state: &FullReplicaState,
-    prior_cursor: Option<&FullReplicaCursor>,
-    parent_blob: impl Fn([u8; 32]) -> Option<Bytes>,
-    full: bool,
 ) -> Result<CollectionRepairDelta>
 where
     W: AsyncWrite + Unpin,
@@ -300,154 +238,14 @@ where
         &mut response_bytes,
     )
     .await?;
-    let semantic_changed = !authorization_evidence.is_empty() || !records.is_empty();
-    let matching_cursor = prior_cursor.filter(|cursor| {
-        cursor.remote_semantic == remote.wake_root && cursor.remote_forest == remote.resident
-    });
-    let (blobs, seen, forest_more) =
-        if full && !authorization_more && !record_more && !semantic_changed {
-            pull_resident_patch(
-                send,
-                recv,
-                full_state,
-                matching_cursor.map(|cursor| &cursor.seen),
-                parent_blob,
-                remote.resident,
-                &mut remaining_requests,
-                &mut response_bytes,
-            )
-            .await?
-        } else {
-            (
-                Vec::new(),
-                DisclosureForestPatch::new(),
-                full && (authorization_more || record_more || semantic_changed),
-            )
-        };
     send_repair_done(send).await?;
     send.shutdown().await?;
     require_eof(recv).await?;
     Ok(CollectionRepairDelta {
         records,
         authorization_evidence,
-        blobs,
-        full_cursor: full.then(|| FullReplicaCursor {
-            remote_semantic: remote.wake_root,
-            remote_forest: remote.resident,
-            seen,
-        }),
-        more: authorization_more || record_more || forest_more,
+        more: authorization_more || record_more,
     })
-}
-
-async fn pull_resident_patch<W, R>(
-    send: &mut W,
-    recv: &mut R,
-    local: &FullReplicaState,
-    prior_seen: Option<&DisclosureForestPatch>,
-    parent_blob: impl Fn([u8; 32]) -> Option<Bytes>,
-    remote: PatchSummary,
-    remaining_requests: &mut usize,
-    response_bytes: &mut usize,
-) -> Result<(Vec<([u8; 32], Bytes)>, DisclosureForestPatch, bool)>
-where
-    W: AsyncWrite + Unpin,
-    R: AsyncRead + Unpin,
-{
-    let component = CollectionRepairComponent::Resident;
-    let mut walker = PatchRepairWalker::new(component, remote, component.key_len())?;
-    let mut blobs = Vec::new();
-    let mut seen = prior_seen.cloned().unwrap_or_default();
-    let mut known = local.forest.clone();
-    known.union(seen.clone());
-    let mut complete = false;
-    let mut trusted_depth = known
-        .iter_ordered()
-        .map(|key| {
-            (
-                <[u8; 32]>::try_from(&key[48..]).unwrap(),
-                u64::from_be_bytes(key[..8].try_into().unwrap()),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    for root in &local.direct_roots {
-        trusted_depth.entry(*root).or_insert(0);
-    }
-    loop {
-        if *remaining_requests < 2 || *response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES {
-            break;
-        }
-        let request = walker.next_request(|_, prefix| {
-            known.merkle_node(prefix).map(|node| {
-                PatchSummary::new(Some(node.digest()), node.leaf_count())
-                    .expect("a PATCH node is nonempty")
-            })
-        })?;
-        let Some(request) = request else {
-            walker.finish()?;
-            complete = true;
-            break;
-        };
-        *remaining_requests -= 1;
-        send_repair_node_request(send, &request, component).await?;
-        let response = recv_repair_node_response(recv, component).await?;
-        *response_bytes = response_bytes.saturating_add(node_response_wire_len(&response));
-        validate_response(&request, component, &response, |_key, value| {
-            if !value.is_empty() {
-                bail!("disclosure forest PATCH leaf value must be empty");
-            }
-            Ok(())
-        })?;
-        if let Some(leaf) = walker.accept(&request, response, |_, key| {
-            <[u8; 80]>::try_from(key).is_ok_and(|key| known.get(&key).is_some())
-        })? {
-            let key = <[u8; 80]>::try_from(leaf.key.as_slice())
-                .map_err(|_| anyhow::anyhow!("disclosure forest key has wrong width"))?;
-            let depth = u64::from_be_bytes(key[..8].try_into().unwrap());
-            let parent: [u8; 32] = key[8..40].try_into().unwrap();
-            let index = u64::from_be_bytes(key[40..48].try_into().unwrap());
-            let handle: [u8; 32] = key[48..].try_into().unwrap();
-            let trusted = if depth == 0 {
-                parent == handle && index == u64::MAX && local.direct_roots.contains(&handle)
-            } else {
-                let resident_parent = parent_blob(parent);
-                let parent_bytes = blobs
-                    .iter()
-                    .find_map(|(hash, bytes)| (*hash == parent).then_some(bytes))
-                    .or(resident_parent.as_ref());
-                trusted_depth
-                    .get(&parent)
-                    .is_some_and(|parent_depth| parent_depth.checked_add(1) == Some(depth))
-                    && parent_bytes.is_some_and(|bytes| {
-                        usize::try_from(index)
-                            .ok()
-                            .and_then(|index| bytes.chunks_exact(32).nth(index))
-                            == Some(handle.as_slice())
-                    })
-            };
-            if !trusted {
-                continue;
-            }
-            seen.insert(&triblespace_core::patch::Entry::new(&key));
-            known.insert(&triblespace_core::patch::Entry::new(&key));
-            trusted_depth.insert(handle, depth);
-            if parent_blob(handle).is_some() {
-                continue;
-            }
-            *remaining_requests -= 1;
-            send_repair_blob_request(send, handle).await?;
-            let Some(bytes) = recv_repair_blob_response(recv).await? else {
-                bail!("authenticated disclosure-forest handle is not resident on provider");
-            };
-            if *blake3::hash(&bytes).as_bytes() != handle {
-                bail!("resident blob response does not match requested handle");
-            }
-            blobs.push((handle, bytes));
-            *response_bytes =
-                response_bytes.saturating_add(8 + blobs.last().expect("just pushed").1.len());
-        }
-    }
-    Ok((blobs, seen, !complete))
 }
 
 async fn pull_record_patch<W, R>(
@@ -672,12 +470,6 @@ mod tests {
         let client_snapshot = client_store.snapshot().unwrap();
         let client =
             collection_repair_overlay(&client_snapshot, client_collection.handle()).unwrap();
-        let empty_full = FullReplicaState {
-            forest: DisclosureForestPatch::new(),
-            direct_roots: HashSet::new(),
-            unreadable_parents: HashSet::new(),
-        };
-
         let (server_io, client_io) = tokio::io::duplex(1 << 20);
         let (mut server_recv, mut server_send) = tokio::io::split(server_io);
         let (mut client_recv, mut client_send) = tokio::io::split(client_io);
@@ -690,35 +482,18 @@ mod tests {
                 &mut server_recv,
                 &mut server_send,
                 SigningKey::from_bytes(&[8; 32]).verifying_key(),
-                |collection| {
-                    (collection == server.collection()).then_some((server, Arc::new(empty_full)))
-                },
-                |_, _| None,
+                |collection| (collection == server.collection()).then_some(server),
             )
             .await
             .unwrap();
             assert!(bootstrap.is_empty());
         });
 
-        let delta = pull_collection_stream(
-            &mut client_send,
-            &mut client_recv,
-            &client,
-            vec![],
-            &FullReplicaState {
-                forest: DisclosureForestPatch::new(),
-                direct_roots: HashSet::new(),
-                unreadable_parents: HashSet::new(),
-            },
-            None,
-            |_| None,
-            false,
-        )
-        .await
-        .unwrap();
+        let delta = pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![])
+            .await
+            .unwrap();
         assert_eq!(delta.records.len(), 1);
         assert!(delta.authorization_evidence.is_empty());
-        assert!(delta.blobs.is_empty());
         server_task.await.unwrap();
     }
 
@@ -756,11 +531,6 @@ mod tests {
         let client_snapshot = client_store.snapshot().unwrap();
         let client =
             collection_repair_overlay(&client_snapshot, client_collection.handle()).unwrap();
-        let empty_full = FullReplicaState {
-            forest: DisclosureForestPatch::new(),
-            direct_roots: HashSet::new(),
-            unreadable_parents: HashSet::new(),
-        };
         let (server_io, client_io) = tokio::io::duplex(1 << 20);
         let (mut server_recv, mut server_send) = tokio::io::split(server_io);
         let (mut client_recv, mut client_send) = tokio::io::split(client_io);
@@ -773,35 +543,18 @@ mod tests {
                 &mut server_recv,
                 &mut server_send,
                 reader.verifying_key(),
-                |collection| {
-                    (collection == server.collection()).then_some((server, Arc::new(empty_full)))
-                },
-                |_, _| None,
+                |collection| (collection == server.collection()).then_some(server),
             )
             .await
             .unwrap();
             assert!(bootstrap.is_empty());
         });
 
-        let delta = pull_collection_stream(
-            &mut client_send,
-            &mut client_recv,
-            &client,
-            vec![],
-            &FullReplicaState {
-                forest: DisclosureForestPatch::new(),
-                direct_roots: HashSet::new(),
-                unreadable_parents: HashSet::new(),
-            },
-            None,
-            |_| None,
-            false,
-        )
-        .await
-        .unwrap();
+        let delta = pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![])
+            .await
+            .unwrap();
         assert_eq!(delta.authorization_evidence, [bundle.proof().clone()]);
         assert!(delta.records.is_empty());
-        assert!(delta.blobs.is_empty());
         server_task.await.unwrap();
     }
 
@@ -855,11 +608,6 @@ mod tests {
         let client_snapshot = client_store.snapshot().unwrap();
         let client =
             collection_repair_overlay(&client_snapshot, client_collection.handle()).unwrap();
-        let empty_full = FullReplicaState {
-            forest: DisclosureForestPatch::new(),
-            direct_roots: HashSet::new(),
-            unreadable_parents: HashSet::new(),
-        };
         let (server_io, client_io) = tokio::io::duplex(1 << 20);
         let (mut server_recv, mut server_send) = tokio::io::split(server_io);
         let (mut client_recv, mut client_send) = tokio::io::split(client_io);
@@ -872,10 +620,7 @@ mod tests {
                 &mut server_recv,
                 &mut server_send,
                 reader.verifying_key(),
-                |collection| {
-                    (collection == server.collection()).then_some((server, Arc::new(empty_full)))
-                },
-                |_, _| None,
+                |collection| (collection == server.collection()).then_some(server),
             )
             .await
             .unwrap()
@@ -886,14 +631,6 @@ mod tests {
             &mut client_recv,
             &client,
             vec![proof.clone(), other_proof],
-            &FullReplicaState {
-                forest: DisclosureForestPatch::new(),
-                direct_roots: HashSet::new(),
-                unreadable_parents: HashSet::new(),
-            },
-            None,
-            |_| None,
-            false,
         )
         .await
         .unwrap_err();

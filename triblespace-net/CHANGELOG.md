@@ -11,19 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add collection-scoped anti-entropy over one direct stream. Each request
   may carry native READ(C) bootstrap proofs and, once admitted from pinned
-  local closure, pins the exact product of
-  the native record, collection-scoped authorization-evidence, and resident
-  disclosure PATCHes. Authorization repair carries native proof bytes only;
-  missing claim handles become ordinary durable `Blob(H)` requests. The record
-  PATCH contains signature-valid exact-C COMMITs independent of WRITE
-  admission, while Full disclosure roots remain locally WRITE-admitted.
+  local closure, pins the exact product of the native record and
+  collection-scoped authorization-evidence PATCHes. Authorization repair
+  carries native proof bytes only and collection repair never transfers blob
+  bytes. The record PATCH contains signature-valid exact-C COMMITs independent
+  of WRITE admission.
 - Add stock `iroh-gossip` wake subscriptions keyed by a domain-separated image
-  of the collection handle. A 177-byte nonce-v3 signed origin wake carries
-  separate opaque semantic and payload roots and accelerates the same bounded participant
-  repair path; sampled periodic anti-entropy remains authoritative.
-- Add local `Demand | Full` payload QoS. Full repair pins a canonical 80-byte
-  disclosure-forest PATCH and accepts only locally authenticated roots and
-  parent-byte-verified edges, with bounded partial progress on the same session.
+  of the collection handle. A 145-byte nonce-v4 signed origin wake carries one
+  opaque repair root and accelerates the same bounded participant repair path;
+  sampled periodic anti-entropy remains authoritative.
 - Service durable `Blob(H)` requests through collection-independent exact
   provider lookup. Discovery uses the full-width domain-separated locator
   KDF(H), while H-bound endpoint tokens reject forged directory entries before
@@ -33,25 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Make `ReconcileDirection` govern collection repair only. Native `Blob(H)`
   discovery, provider publication, exact serving, and durable WANT service are
-  orthogonal bearer operations available in every direction; this lets a
-  WriteOnly server acquire a cold ReadOnly requester's proof claims without an
-  authorization-specific transport.
-- Rebuild only Full-replica forests selected by the exact resident-blob delta.
-  Additions scan each distinct prior reachable parent once against a compact
-  added-handle matcher, removals project reachable handles from the canonical
-  forests, and retained unreadable-parent evidence scopes repaired-duplicate
-  retries to its owning collections. Physical duplicate no-ops reuse unaffected
-  forests. Forests rebuilt from one immutable snapshot still share resident
-  aligned-child discovery while keeping collection-local reachability; one
-  frozen resident-handle set turns that discovery into a hash semijoin instead
-  of one persistent occurrence-PATCH probe per candidate word.
+  orthogonal bearer operations available in every direction.
 - Replace team-scoped connection authorization and global inventory with
   immutable per-collection repair overlays. Collection repair discovery
   uses one endpoint-bound KDF(C) lease per active served collection. Exact
   content has a separate global KDF(H) directory populated from resident
   blobs; exact GET consults neither collection identity nor READ(C).
 - Move the incompatible direct protocol to ALPN
-  `/triblespace/pile-sync/21`. Anti-entropy is receiver-authorized by READ(C).
+  `/triblespace/pile-sync/22`. Anti-entropy is receiver-authorized by READ(C).
   Exact bearer GET instead uses a provider-first, requester-second mutual
   proof of H bound to both authenticated endpoint identities; raw H never
   crosses TLS, and returned bytes must hash to H. Unsigned remote derived
@@ -69,8 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - Remove CONNECT/SYNC_TEAM exchanges, `StoreScope`, durable PEER routing,
-  broad blob mirroring, and the global PEER/record/proof/blob inventory wire
-  protocol from the network host.
+  broad blob mirroring, the collection-scoped Full/disclosure forest, inline
+  collection-repair blob transfer, and the global PEER/record/proof/blob
+  inventory wire protocol from the network host.
 
 ### Superseded during development
 

@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::capability::{
@@ -20,7 +19,6 @@ use triblespace_core::collection::{
     CollectionHandle, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
     CollectionStoreExt, empty_metadata_handle,
 };
-use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -28,9 +26,8 @@ use triblespace_core::repo::{
     BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource, StorageFlush,
     WantRequest, WantStore,
 };
-use triblespace_core::trible::{Fragment, Trible, TribleSet};
 use triblespace_net::host::{self, PeerConfig};
-use triblespace_net::inventory::{BlobReplication, ReconcileDirection, ReconcileQos};
+use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
 use triblespace_net::reconcile::{ReconcileStats, Reconciler};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
@@ -95,29 +92,11 @@ fn bring_up(
     peers: Vec<[u8; 32]>,
     direction: ReconcileDirection,
 ) -> Peer<MemoryRepo> {
-    bring_up_with_payload(
-        net,
-        endpoint,
-        store,
-        peers,
-        direction,
-        BlobReplication::Demand,
-    )
-}
-
-fn bring_up_with_payload(
-    net: &SimNet,
-    endpoint: &SigningKey,
-    store: MemoryRepo,
-    peers: Vec<[u8; 32]>,
-    direction: ReconcileDirection,
-    blobs: BlobReplication,
-) -> Peer<MemoryRepo> {
     let id = endpoint.verifying_key().to_bytes();
     let harness = net.join(endpoint);
     let (sender, receiver, wiring) =
         host::wire(EndpointId::from_bytes(&id).expect("valid endpoint id"));
-    let qos = ReconcileQos { direction, blobs };
+    let qos = ReconcileQos { direction };
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
@@ -394,203 +373,6 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
             writer_snapshot.records().unwrap().count(),
             0,
             "WRITE(C) without READ(C) must not learn even the collection manifest"
-        );
-    }));
-}
-
-#[test]
-fn restricted_full_replica_progresses_parent_first_without_orphan_disclosure() {
-    let _guard = test_guard();
-    let clock = virtual_clock();
-    clock.reset();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    let local = tokio::task::LocalSet::new();
-    runtime.block_on(local.run_until(async {
-        let net = SimNet::new(0xC011_EC73, SimConfig::default());
-        let server_key = key(21);
-        let reader_key = key(22);
-        let unauthorized_key = key(23);
-        let unrelated_key = key(25);
-        let read_root = key(24);
-        let policy = CollectionPolicy::new(
-            AdmissionPolicy::direct(read_root.verifying_key()),
-            AdmissionPolicy::Open,
-        );
-        let mut server_store = MemoryRepo::default();
-        let payload = Bytes::from_source(b"restricted collection bearer payload".to_vec());
-        let payload_handle = server_store.put::<UnknownBlob, _>(payload.clone()).unwrap();
-        let unrelated = Bytes::from_source(b"resident but outside the collection".to_vec());
-        let unrelated_handle = server_store.put::<UnknownBlob, _>(unrelated).unwrap();
-        let collection = server_store
-            .collection("restricted-bearer-provider", policy.clone())
-            .unwrap();
-        let entity = Id::new([1; 16]).unwrap();
-        let attribute = Id::new([2; 16]).unwrap();
-        let value = Inline::<Handle<UnknownBlob>>::new(payload_handle.raw);
-        let mut facts = TribleSet::new();
-        facts.insert(&Trible::new(
-            ExclusiveId::force_ref(&entity),
-            &attribute,
-            &value,
-        ));
-        let commit = server_store
-            .commit(
-                collection,
-                &server_key,
-                Fragment::from_parts(facts, TribleSet::new(), MemoryBlobStore::new()),
-            )
-            .unwrap();
-        assert!(
-            payload_handle.raw < commit.data().raw,
-            "fixture exercises child WANT before its restricted parent"
-        );
-
-        let mut reader_store = MemoryRepo::default();
-        let reader_collection = reader_store
-            .collection("restricted-bearer-provider", policy.clone())
-            .unwrap();
-        assert_eq!(reader_collection.handle(), collection.handle());
-        store_bundle(
-            &mut reader_store,
-            bundle(
-                &read_root,
-                &reader_key,
-                CapabilityAction::new(ACTION_READ),
-                collection.handle(),
-            ),
-        );
-
-        let mut unauthorized_store = MemoryRepo::default();
-        let unauthorized_collection = unauthorized_store
-            .collection("restricted-bearer-provider", policy)
-            .unwrap();
-        assert_eq!(unauthorized_collection.handle(), collection.handle());
-        let unrelated_store = MemoryRepo::default();
-
-        let server_id = server_key.verifying_key().to_bytes();
-        let unrelated_id = unrelated_key.verifying_key().to_bytes();
-        let mut server = bring_up_with_payload(
-            &net,
-            &server_key,
-            server_store,
-            Vec::new(),
-            ReconcileDirection::WriteOnly,
-            BlobReplication::Full,
-        );
-        let mut reader = bring_up_with_payload(
-            &net,
-            &reader_key,
-            reader_store,
-            vec![unrelated_id],
-            ReconcileDirection::ReadOnly,
-            BlobReplication::Full,
-        );
-        let mut unauthorized = bring_up(
-            &net,
-            &unauthorized_key,
-            unauthorized_store,
-            vec![unrelated_id],
-            ReconcileDirection::ReadOnly,
-        );
-        let mut unrelated = bring_up(
-            &net,
-            &unrelated_key,
-            unrelated_store,
-            vec![server_id],
-            ReconcileDirection::Bidirectional,
-        );
-        for peer in [&mut server, &mut reader, &mut unauthorized] {
-            peer.activate_collection(collection.handle());
-        }
-        advance(
-            &clock,
-            &mut [&mut server, &mut reader, &mut unauthorized, &mut unrelated],
-            4,
-        )
-        .await;
-
-        let stats = reconcile_once(
-            &clock,
-            &mut Reconciler::default(),
-            &mut server,
-            &mut [&mut reader, &mut unauthorized, &mut unrelated],
-        )
-        .await;
-        assert_eq!(
-            stats.fulfilled, 1,
-            "the WriteOnly server resolves the ReadOnly peer's claim through Blob(H)"
-        );
-        advance(
-            &clock,
-            &mut [&mut server, &mut reader, &mut unauthorized, &mut unrelated],
-            32,
-        )
-        .await;
-
-        let reader_snapshot = reader.snapshot().unwrap();
-        assert_eq!(reader_snapshot.records().unwrap().count(), 1);
-        assert_eq!(
-            reader_collection.admitted(&reader_snapshot).unwrap().len(),
-            1
-        );
-        assert_eq!(
-            unauthorized.snapshot().unwrap().records().unwrap().count(),
-            0,
-            "knowing C without READ(C) must not reveal collection evidence"
-        );
-        advance(&clock, &mut [&mut server, &mut reader], 5).await;
-        assert!(reader.try_local(commit.data().raw).is_some());
-        assert_eq!(reader.try_local(payload_handle.raw), Some(payload.clone()));
-
-        let mut unrelated_fetch = Box::pin(reader.fetch_wanted_blob(unrelated_handle.raw));
-        let unrelated_got = loop {
-            tokio::select! {
-                result = &mut unrelated_fetch => break result,
-                () = SimNet::step(&clock, std::time::Duration::from_millis(100)) => {
-                    server.refresh();
-                }
-            }
-        };
-        drop(unrelated_fetch);
-        assert_eq!(
-            unrelated_got,
-            Some(Bytes::from_source(
-                b"resident but outside the collection".to_vec()
-            )),
-            "H alone authorizes exact bytes unrelated to every collection"
-        );
-
-        let mut wrong_fetch = Box::pin(reader.fetch_wanted_blob([0xEE; 32]));
-        let wrong_got = loop {
-            tokio::select! {
-                result = &mut wrong_fetch => break result,
-                () = SimNet::step(&clock, std::time::Duration::from_millis(100)) => {
-                    server.refresh();
-                }
-            }
-        };
-        assert_eq!(
-            wrong_got, None,
-            "an unrelated bearer handle finds no provider"
-        );
-
-        let mut unauthorized_fetch = Box::pin(unauthorized.fetch_wanted_blob(payload_handle.raw));
-        let unauthorized_got = loop {
-            tokio::select! {
-                result = &mut unauthorized_fetch => break result,
-                () = SimNet::step(&clock, std::time::Duration::from_millis(100)) => {
-                    server.refresh();
-                }
-            }
-        };
-        assert_eq!(
-            unauthorized_got,
-            Some(payload),
-            "neither requester nor provider needs collection READ authority"
         );
     }));
 }

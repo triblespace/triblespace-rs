@@ -9,7 +9,6 @@ use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use triblespace_core::collection::CollectionHandle;
 use triblespace_core::repo::pile::Pile;
-use triblespace_net::inventory::BlobReplication;
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
@@ -68,21 +67,6 @@ impl From<DirectionArg> for ReconcileDirection {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum PayloadArg {
-    Demand,
-    Full,
-}
-
-impl From<PayloadArg> for BlobReplication {
-    fn from(payload: PayloadArg) -> Self {
-        match payload {
-            PayloadArg::Demand => Self::Demand,
-            PayloadArg::Full => Self::Full,
-        }
-    }
-}
-
 #[derive(Parser)]
 pub enum Command {
     /// Show this node's network identity.
@@ -106,9 +90,6 @@ pub enum Command {
         /// Whether to pull collections, serve them, or do both.
         #[arg(long, value_enum, default_value = "bidirectional")]
         direction: DirectionArg,
-        /// Whether to fetch blobs on demand or mirror admitted resident closure.
-        #[arg(long, value_enum, default_value = "demand")]
-        payload: PayloadArg,
         /// Maximum DHT provider-announcement attempts for this process.
         ///
         /// Zero disables announcements without disabling exact-blob serving.
@@ -133,7 +114,6 @@ pub fn run(command: Command) -> Result<()> {
             key,
             collections,
             direction,
-            payload,
             provider_publication_budget,
             duration,
             quiescent_for,
@@ -144,7 +124,6 @@ pub fn run(command: Command) -> Result<()> {
             collections,
             ReconcileQos {
                 direction: direction.into(),
-                blobs: payload.into(),
             },
             provider_publication_budget,
             duration,

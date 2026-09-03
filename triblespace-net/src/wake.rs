@@ -23,13 +23,13 @@ use triblespace_core::collection::CollectionHandle;
 pub const COLLECTION_WAKE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.wake";
 
 /// Current dense wake-envelope and signature-transcript version.
-pub const COLLECTION_WAKE_VERSION: u8 = 3;
+pub const COLLECTION_WAKE_VERSION: u8 = 4;
 
 /// Exact number of bytes in a collection wake.
-pub const COLLECTION_WAKE_WIRE_LEN: usize = 1 + 32 + 32 + 32 + 16 + 64;
+pub const COLLECTION_WAKE_WIRE_LEN: usize = 1 + 32 + 32 + 16 + 64;
 
 const COLLECTION_WAKE_TRANSCRIPT_LEN: usize =
-    COLLECTION_WAKE_TRANSCRIPT_DOMAIN.len() + 1 + 32 + 32 + 32 + 32 + 16;
+    COLLECTION_WAKE_TRANSCRIPT_DOMAIN.len() + 1 + 32 + 32 + 32 + 16;
 
 /// An opaque root naming the state an origin can reconcile for one collection.
 ///
@@ -41,31 +41,17 @@ const COLLECTION_WAKE_TRANSCRIPT_LEN: usize =
 /// repair against the signed [`CollectionWake::origin`] and obtains the current
 /// component summaries there.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CollectionWakeRoot {
-    semantic: [u8; 32],
-    payload: [u8; 32],
-}
+pub struct CollectionWakeRoot([u8; 32]);
 
 impl CollectionWakeRoot {
     /// Wrap one opaque anti-entropy root.
     pub const fn new(bytes: [u8; 32]) -> Self {
-        Self {
-            semantic: bytes,
-            payload: [0; 32],
-        }
-    }
-
-    pub const fn with_payload(semantic: [u8; 32], payload: [u8; 32]) -> Self {
-        Self { semantic, payload }
+        Self(bytes)
     }
 
     /// Return the root bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.semantic
-    }
-
-    pub const fn payload_bytes(&self) -> &[u8; 32] {
-        &self.payload
+        &self.0
     }
 }
 
@@ -142,17 +128,14 @@ impl CollectionWake {
         let mut root = [0; 32];
         root.copy_from_slice(&bytes[33..65]);
 
-        let mut payload = [0; 32];
-        payload.copy_from_slice(&bytes[65..97]);
-
         let mut nonce = [0; 16];
-        nonce.copy_from_slice(&bytes[97..113]);
+        nonce.copy_from_slice(&bytes[65..81]);
 
         let mut signature = [0; 64];
-        signature.copy_from_slice(&bytes[113..]);
+        signature.copy_from_slice(&bytes[81..]);
         let wake = Self {
             origin,
-            root: CollectionWakeRoot::with_payload(root, payload),
+            root: CollectionWakeRoot::new(root),
             nonce,
             signature,
         };
@@ -191,9 +174,8 @@ impl CollectionWake {
         bytes[0] = COLLECTION_WAKE_VERSION;
         bytes[1..33].copy_from_slice(self.origin.as_bytes());
         bytes[33..65].copy_from_slice(self.root.as_bytes());
-        bytes[65..97].copy_from_slice(self.root.payload_bytes());
-        bytes[97..113].copy_from_slice(&self.nonce);
-        bytes[113..].copy_from_slice(&self.signature);
+        bytes[65..81].copy_from_slice(&self.nonce);
+        bytes[81..].copy_from_slice(&self.signature);
         bytes
     }
 
@@ -305,7 +287,7 @@ impl CollectionWakePlane {
         );
         let gossip = Gossip::builder()
             // Stock gossip enforces a 512-byte minimum. The typed API below
-            // emits only the 177-byte envelope and rejects every other size.
+            // emits only the 145-byte envelope and rejects every other size.
             .max_message_size(iroh_gossip::proto::MIN_MAX_MESSAGE_SIZE)
             .spawn(endpoint.clone());
         Self {
@@ -522,8 +504,6 @@ fn wake_transcript(
     offset += 32;
     transcript[offset..offset + 32].copy_from_slice(root.as_bytes());
     offset += 32;
-    transcript[offset..offset + 32].copy_from_slice(root.payload_bytes());
-    offset += 32;
     transcript[offset..].copy_from_slice(&nonce);
     transcript
 }
@@ -545,7 +525,7 @@ mod tests {
         let collection = collection(0x11);
         let wake = CollectionWake::sign(
             collection,
-            CollectionWakeRoot::with_payload([0x22; 32], [0x24; 32]),
+            CollectionWakeRoot::new([0x22; 32]),
             [0x23; 16],
             &key(7),
         );

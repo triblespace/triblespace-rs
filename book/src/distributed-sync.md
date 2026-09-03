@@ -81,12 +81,11 @@ or roster. Open READ remains explicitly non-enumerable.
 
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
-proof store would disclose unrelated capability structure. Adding the optional
-Full-replica resident forest gives the complete repair algebra `Record ×
-AuthorizationEvidence × Resident`, while every component remains scoped to C.
-The receiver always derives its admitted view locally; record and proof arrival
-therefore commute, and a publisher need not possess or present its own WRITE
-grant merely to replicate an inert signed record.
+proof store would disclose unrelated capability structure. The complete repair
+algebra is therefore `Record × AuthorizationEvidence`, with both components
+scoped to C. The receiver always derives its admitted view locally; record and
+proof arrival therefore commute, and a publisher need not possess or present
+its own WRITE grant merely to replicate an inert signed record.
 
 Unsigned MERGE and DERIVE records remain optional local computation evidence.
 They do not participate in the semantic repair root or ordinary collection repair.
@@ -100,10 +99,10 @@ silently widening every collection's semantic repair surface.
 The `iroh-gossip` topic ID is a domain-separated one-way image of the collection
 handle. Anyone who knows C can derive and join that topic, while generic gossip
 routers do not learn raw C. There is no authorization handshake merely to hear
-that something changed. The application payload is fixed width (177 bytes):
+that something changed. The application payload is fixed width (145 bytes):
 
 ```text
-version:u8 || endpoint_origin:32 || semantic_root:32 || payload_root:32 || nonce:16 || signature:64
+version:u8 || endpoint_origin:32 || repair_root:32 || nonce:16 || signature:64
 ```
 
 The collection handle is not repeated in the envelope, but it is included in
@@ -133,27 +132,25 @@ wake origins—a node opens one bidirectional collection-repair stream to that
 origin. Its hello names C and may carry a bounded native READ proof forest for
 cold bootstrap. The server admits the TLS-authenticated client only from
 complete READ(C) evidence in its pinned local projection before returning any
-manifest. Unknown hello proofs are signature/root checked, stored inertly, and
-their claim handles become ordinary durable `Blob(H)` WANTs. The current
-session remains rejected; after H-only acquisition and a new coherent snapshot,
-an ordinary retry can succeed. For `Open` READ the forest is empty. A
+manifest. Unknown hello proofs are signature/root checked and stored inertly.
+The current session remains rejected; if a later authorization consumer follows
+a missing claim handle, ordinary exact-H acquisition and a new coherent
+snapshot can make a retry succeed. For `Open` READ the bootstrap is empty. A
 WRITE-only publisher needs no READ authority merely to serve an authorized
-replica. Cold completion depends only on ordinary H-provider reachability and
-the local durable-WANT reconciler making progress.
+replica.
 
 The server loads one immutable repair overlay for C and applies the
 descriptor's exact READ policy at one instant. Rejection returns no manifest.
-On admission it returns record, authorization-evidence, and disclosure-forest
-PATCH summaries plus the same opaque roots. The client may then walk only
-differing prefixes and receive missing leaf bodies:
+On admission it returns record and authorization-evidence PATCH summaries plus
+the same opaque root. The client may then walk only differing prefixes and
+receive missing leaf bodies:
 
 - canonical signature-valid `COMMIT(C)` records, whether active or inert;
 - native structurally relevant READ(C)/WRITE(C) proofs.
 
-Landing a proof schedules each claim handle through the existing H-only DHT
-path. The claim bytes never travel in the collection session. Records may land
-before their WRITE closure and remain harmlessly inactive until a later
-snapshot derives admission.
+The claim bytes never travel in the collection session. Records may land before
+their WRITE closure and remain harmlessly inactive until a later snapshot
+derives admission.
 
 The exact-repair scheduler samples at a 30-second cadence. Participant leases
 last five minutes and every successful repair, including an identical result,
@@ -164,24 +161,14 @@ unsuccessful recovery with exponential backoff from one to 60 seconds. This
 makes healthy steady-state DHT lookup load zero while preserving bounded
 recovery after restarts and partitions.
 
-The disclosure forest uses unit-valued 80-byte keys
-`depth || parent_H || aligned_index || child_H`. Roots are authenticated
-descriptor/data/metadata handles from admitted COMMITs. A child becomes trusted
-only after the receiver verifies its exact aligned occurrence in a trusted,
-hash-verified parent. The remote PATCH is an availability oracle, never
-authority for arbitrary handles. Demand peers ignore the payload wake root;
-Full peers incrementally follow both roots under the same bounded session.
-
 Every request pins the manifest's expected component root. The server serves
 the whole stream from one immutable overlay lease, so responses cannot splice
 two moments together and need no historical-root cache. The client validates
 node summaries, intrinsic leaf keys, record bodies, proof signatures, and claim
 handles before insertion.
 
-Exact-content GET is not part of this collection stream. Full custody validates
-reachability through the authenticated disclosure forest before retaining
-payloads, while an independent exact-content request is authorized solely by
-knowledge of H.
+Exact-content GET is not part of this collection stream. An independent
+exact-content request is authorized solely by knowledge of H.
 
 Repair is one-way pull. Two peers converge by each eventually pulling after a
 wake or periodic sweep. This keeps authorization and failure local to one
@@ -273,7 +260,7 @@ WRITE, retention, or membership semantics.
 
 ## Wire surface
 
-Protocol version 21 keeps the direct operation set narrow:
+Protocol version 22 keeps the direct operation set narrow:
 
 | Operation | Code | Meaning |
 |---|---:|---|
@@ -281,7 +268,7 @@ Protocol version 21 keeps the direct operation set narrow:
 | `PROVIDER_PUT` | `0x06` | renew this endpoint's opaque provider lease |
 | `PROVIDER_GET` | `0x07` | obtain bounded candidates for one opaque key |
 | `FIND_NODE` | `0x0C` | iterative XOR-DHT routing step |
-| `COLLECTION_REPAIR` | `0x0D` | receiver-authorized semantic and Full PATCH repair |
+| `COLLECTION_REPAIR` | `0x0D` | receiver-authorized record and authorization-evidence PATCH repair |
 
 There is deliberately no store manifest, global inventory authorization,
 push-broadcast record, receipt RPC, remote mutable head, or unpublish operation.
@@ -291,18 +278,14 @@ The CLI selects explicit collections and bootstrap peers:
 ```text
 trible pile net sync DATA.pile \
     --collection COLLECTION_HANDLE [--collection COLLECTION_HANDLE ...] \
-    [--peers ENDPOINT_TICKET ...] [--direction bidirectional|read-only|write-only] \
-    [--payload demand|full]
+    [--peers ENDPOINT_TICKET ...] [--direction bidirectional|read-only|write-only]
 ```
 
 Direction gates only the collection loop: `ReadOnly` pulls collection repair,
 `WriteOnly` serves it, and `Bidirectional` does both. Every direction may
 announce and serve resident exact blobs under bearer handle H, and may service
-durable `Blob(H)` WANTs through KDF(H). Thus a WriteOnly collection server can
-acquire claim handles exposed by a cold ReadOnly client's native proof without
-joining the collection as a repair client. These QoS choices do not
-participate in collection identity or change which evidence is semantically
-valid.
+durable `Blob(H)` WANTs through KDF(H). These QoS choices do not participate in
+collection identity or change which evidence is semantically valid.
 
 ## Convergence and failure model
 

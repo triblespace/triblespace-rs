@@ -100,19 +100,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retains a finer accelerated cover; callers maintain each mapping hop
   explicitly with the same foundational support.
 
-- Rebuild only Full-replica disclosure forests whose semantics can change with
-  a resident-blob delta. A frozen resident-handle set makes additions and
-  removals exact: new direct roots are selected immediately, distinct prior
-  reachable parents are scanned once against the usually small added set, and
-  removed handles are projected directly from the canonical forests. Prior
-  unreadable-parent evidence scopes retry after a repaired duplicate occurrence,
-  while physical duplicate no-ops reuse every unaffected forest. Full repair
-  page checkpoints remain scoped per collection. Within one immutable refresh,
-  overlapping rebuilt forests share aligned child discovery while retaining
-  independent reachability and authenticated forest entries; candidate words
-  are hash-semijoined against the frozen resident set instead of probing the
-  persistent occurrence PATCH individually.
-
 ### Added
 
 - Add `CollectionSnapshotExt::collection_at` so a caller can bind admission
@@ -174,20 +161,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add a stock `iroh-gossip` collection wake plane on the existing endpoint and
   router. A domain-separated one-way image of the collection handle is the
-  topic, while C remains its discovery capability; a dense 177-byte non-serde
-  nonce-v3 envelope carries only version, strictly signed endpoint origin,
-  separate opaque semantic/payload roots, fresh nonce, and signature. Payload synchronization
-  remains separate and capability-gated.
+  topic, while C remains its discovery capability; a dense 145-byte non-serde
+  nonce-v4 envelope carries only version, strictly signed endpoint origin, one
+  opaque repair root, fresh nonce, and signature. Payload synchronization
+  remains separate and bearer-addressed.
 
 - Add an immutable per-collection repair overlay: exact signed COMMIT records and
   every complete, structurally relevant native READ(C) or WRITE(C) proof form
   two canonical grow-only PATCHes and one opaque, domain-separated wake digest.
   Authorization evidence inventory is independent of wall-clock expiry,
   quorum completeness, and current mode admission. Repair sends native proof
-  bodies only; missing claim handles become ordinary durable `Blob(H)` requests
-  over the existing H-only DHT path. A bounded native READ proof forest may
-  cold-bootstrap a server for a later retry, but never admits the same immutable
-  session or transports claim bytes. Core also exposes deterministic finite
+  bodies only; missing claim handles remain inert until an actual consumer
+  follows them through the ordinary exact-H path. A bounded native READ proof
+  forest may cold-bootstrap a server for a later retry, but never admits the
+  same immutable session or transports claim bytes. Core also exposes deterministic finite
   READ-audience enumeration while representing open READ as non-enumerable.
 
 - Add the policy-independent collection-delta element for a future
@@ -2248,15 +2235,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Activate a `pile net sync` collection cohort through one coherent serving
-  snapshot instead of rebuilding the increasingly large Full-replica view
-  once per `--collection` argument during startup.
+  snapshot instead of rebuilding the serving view once per `--collection`
+  argument during startup.
 
 - Replace the global 8-bit provider-cover rendezvous with exact full-width
   derived-key DHT PUT/GET leases. Directory requests never carry bearer blob
   handles, while unrelated artifacts no longer collapse onto 256 fixed
   hotspots. Exact-content publication covers every served resident blob and
   remains independent of collection READ policy. The incompatible wire uses a
-  new pile-sync ALPN generation, currently `/triblespace/pile-sync/21`.
+  new pile-sync ALPN generation, currently `/triblespace/pile-sync/22`.
 
 - Make nonempty exact-derived network attachment fail closed when refreshing
   discovers a conflicting store scope, rather than clearing the serving view

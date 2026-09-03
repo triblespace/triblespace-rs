@@ -3,12 +3,9 @@
 //! One bidirectional stream pins one [`CollectionRepairManifest`]. The client
 //! may send bounded native READ(C) bootstrap proofs before admission, then an
 //! admitted client walks the record and authorization-evidence PATCHes
-//! interactively beneath those exact roots. The same admitted stream may
-//! request an exact handle from that collection's resident Full-replica
-//! disclosure forest. No global inventory, historical-root cache, repeated
-//! authorization exchange, or blob list participates in this protocol.
+//! interactively beneath those exact roots. Blob acquisition is a separate
+//! bearer-addressed protocol and never participates in collection repair.
 
-use anybytes::Bytes;
 use anyhow::{Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{CapabilityProof, MAX_CAPABILITY_PROOF_BYTES};
@@ -41,7 +38,6 @@ const REPAIR_REJECTED: u8 = 0x01;
 const REPAIR_UNAVAILABLE: u8 = 0x02;
 
 const REQUEST_NODE: u8 = 0x01;
-const REQUEST_BLOB: u8 = 0x02;
 const REQUEST_DONE: u8 = 0xFF;
 
 const NODE_FOUND: u8 = 0x00;
@@ -49,12 +45,11 @@ const NODE_PREFIX_ABSENT: u8 = 0x01;
 const NODE_LEAF: u8 = 0x00;
 const NODE_BRANCH: u8 = 0x01;
 
-/// One of the three grow-only PATCHes in collection repair.
+/// One of the two grow-only PATCHes in collection repair.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum CollectionRepairComponent {
     Record,
     AuthorizationEvidence,
-    Resident,
 }
 
 impl CollectionRepairComponent {
@@ -62,7 +57,6 @@ impl CollectionRepairComponent {
         match self {
             Self::Record => 32,
             Self::AuthorizationEvidence => 32,
-            Self::Resident => 80,
         }
     }
 
@@ -70,7 +64,6 @@ impl CollectionRepairComponent {
         match self {
             Self::Record => 0,
             Self::AuthorizationEvidence => 1,
-            Self::Resident => 2,
         }
     }
 
@@ -78,7 +71,6 @@ impl CollectionRepairComponent {
         match byte {
             0 => Ok(Self::Record),
             1 => Ok(Self::AuthorizationEvidence),
-            2 => Ok(Self::Resident),
             other => bail!("unknown collection repair component {other:#x}"),
         }
     }
@@ -96,7 +88,6 @@ pub(crate) struct CollectionRepairManifest {
     pub(crate) wake_root: [u8; 32],
     pub(crate) records: PatchSummary,
     pub(crate) authorization_evidence: PatchSummary,
-    pub(crate) resident: PatchSummary,
 }
 
 impl CollectionRepairManifest {
@@ -104,7 +95,6 @@ impl CollectionRepairManifest {
         match component {
             CollectionRepairComponent::Record => self.records,
             CollectionRepairComponent::AuthorizationEvidence => self.authorization_evidence,
-            CollectionRepairComponent::Resident => self.resident,
         }
     }
 }
@@ -125,7 +115,6 @@ pub(crate) enum CollectionRepairCommand {
         prefix: Vec<u8>,
         expected_digest: [u8; 32],
     },
-    Blob([u8; 32]),
     Done,
 }
 
@@ -234,7 +223,6 @@ pub(crate) async fn send_repair_admission<W: AsyncWrite + Unpin>(
             send_hash(send, &manifest.wake_root).await?;
             send_summary(send, manifest.records).await?;
             send_summary(send, manifest.authorization_evidence).await?;
-            send_summary(send, manifest.resident).await?;
         }
         CollectionRepairAdmission::Rejected => send_u8(send, REPAIR_REJECTED).await?,
         CollectionRepairAdmission::Unavailable => send_u8(send, REPAIR_UNAVAILABLE).await?,
@@ -250,7 +238,6 @@ pub(crate) async fn recv_repair_admission<R: AsyncRead + Unpin>(
             wake_root: recv_hash(recv).await?,
             records: recv_summary(recv).await?,
             authorization_evidence: recv_summary(recv).await?,
-            resident: recv_summary(recv).await?,
         }),
         REPAIR_REJECTED => CollectionRepairAdmission::Rejected,
         REPAIR_UNAVAILABLE => CollectionRepairAdmission::Unavailable,
@@ -314,14 +301,6 @@ pub(crate) async fn send_repair_done<W: AsyncWrite + Unpin>(send: &mut W) -> Res
     send_u8(send, REQUEST_DONE).await
 }
 
-pub(crate) async fn send_repair_blob_request<W: AsyncWrite + Unpin>(
-    send: &mut W,
-    handle: [u8; 32],
-) -> Result<()> {
-    send_u8(send, REQUEST_BLOB).await?;
-    send_hash(send, &handle).await
-}
-
 pub(crate) async fn recv_repair_command<R: AsyncRead + Unpin>(
     recv: &mut R,
 ) -> Result<CollectionRepairCommand> {
@@ -344,52 +323,8 @@ pub(crate) async fn recv_repair_command<R: AsyncRead + Unpin>(
                 expected_digest,
             })
         }
-        REQUEST_BLOB => Ok(CollectionRepairCommand::Blob(recv_hash(recv).await?)),
         other => bail!("unknown collection repair command {other:#x}"),
     }
-}
-
-/// Return one exact resident member without ending the authenticated session.
-/// `u64::MAX` means no bytes are available for the requested exact handle in
-/// this snapshot.
-pub(crate) async fn send_repair_blob_response<W: AsyncWrite + Unpin>(
-    send: &mut W,
-    bytes: Option<&[u8]>,
-) -> Result<()> {
-    match bytes {
-        Some(bytes) => {
-            send_u64_be(
-                send,
-                u64::try_from(bytes.len()).expect("an addressable blob length fits u64"),
-            )
-            .await?;
-            send.write_all(bytes)
-                .await
-                .map_err(|error| anyhow!("send collection blob: {error}"))?;
-        }
-        None => send_u64_be(send, u64::MAX).await?,
-    }
-    Ok(())
-}
-
-pub(crate) async fn recv_repair_blob_response<R: AsyncRead + Unpin>(
-    recv: &mut R,
-) -> Result<Option<Bytes>> {
-    let length = recv_u64_be(recv).await?;
-    if length == u64::MAX {
-        return Ok(None);
-    }
-    if length > crate::protocol::MAX_EXACT_BLOB_BYTES {
-        bail!(
-            "collection blob response exceeds the {}-byte transport bound",
-            crate::protocol::MAX_EXACT_BLOB_BYTES
-        );
-    }
-    let length = usize::try_from(length)
-        .map_err(|_| anyhow!("collection blob length does not fit this address space"))?;
-    Ok(Some(
-        crate::protocol::recv_exact_blob_body(recv, length).await?,
-    ))
 }
 
 pub(crate) async fn send_repair_node_response<W: AsyncWrite + Unpin>(
@@ -580,7 +515,6 @@ mod tests {
             wake_root: [4; 32],
             records: PatchSummary::new(Some([5; 32]), 7).unwrap(),
             authorization_evidence: PatchSummary::new(None, 0).unwrap(),
-            resident: PatchSummary::new(Some([6; 32]), 9).unwrap(),
         };
         let sent_hello = hello.clone();
         let writer = tokio::spawn(async move {
@@ -671,5 +605,15 @@ mod tests {
             expected_response
         );
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn collection_repair_rejects_the_retired_inline_blob_command() {
+        let mut retired_blob_command = [0x02].as_slice();
+        let error = recv_repair_command(&mut retired_blob_command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "unknown collection repair command 0x2");
     }
 }

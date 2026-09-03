@@ -9,7 +9,7 @@ use anybytes::Bytes;
 use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
-    CollectionHandle, CollectionRecord,
+    CollectionRecord,
 };
 
 /// A changed immutable local serving observation.
@@ -18,11 +18,7 @@ use triblespace_core::collection::{
 /// notices update exact-handle wake subscriptions and periodic repair roots.
 pub(crate) struct SnapshotNotice {
     /// Exact active collection handles and their opaque semantic repair roots.
-    pub(crate) collections: Vec<(
-        triblespace_core::collection::CollectionHandle,
-        [u8; 32],
-        [u8; 32],
-    )>,
+    pub(crate) collections: Vec<(triblespace_core::collection::CollectionHandle, [u8; 32])>,
     /// Whether an immutable serving snapshot is now installed.
     pub(crate) installed: bool,
 }
@@ -45,18 +41,9 @@ pub(crate) enum NetEvent {
         bytes: Bytes,
     },
     CollectionRecord(CollectionRecord),
-    /// One native authorization proof. Named claims travel as ordinary blobs.
+    /// One native authorization proof. Named claims remain ordinary immutable
+    /// dependencies and are fetched only when a consumer follows them.
     CapabilityProof(CapabilityProof),
-    /// One validated Full-replica page. The store side admits and flushes the
-    /// page atomically at the network boundary, refreshes only its operational
-    /// blob reader, then acknowledges it. A final page is the sole checkpoint
-    /// that rebuilds and publishes the authoritative serving snapshot.
-    FullPage {
-        collection: CollectionHandle,
-        blobs: Vec<([u8; 32], Bytes)>,
-        final_page: bool,
-        ack: tokio::sync::oneshot::Sender<()>,
-    },
 }
 
 impl NetEvent {
@@ -67,9 +54,6 @@ impl NetEvent {
             Self::CollectionRecord(CollectionRecord::Merge(_)) => 1 + COLLECTION_MERGE_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Derive(_)) => 1 + COLLECTION_DERIVE_BYTES_LEN,
             Self::CapabilityProof(proof) => proof.as_bytes().len(),
-            Self::FullPage { blobs, .. } => blobs.iter().fold(0_usize, |total, (_, bytes)| {
-                total.saturating_add(bytes.len())
-            }),
         }
     }
 }
@@ -90,17 +74,6 @@ impl std::fmt::Debug for NetEvent {
                 .debug_tuple("CapabilityProof")
                 .field(proof)
                 .finish(),
-            Self::FullPage {
-                collection,
-                blobs,
-                final_page,
-                ..
-            } => formatter
-                .debug_struct("FullPage")
-                .field("collection", collection)
-                .field("blobs", &blobs.len())
-                .field("final_page", final_page)
-                .finish_non_exhaustive(),
         }
     }
 }

@@ -3,13 +3,13 @@
 //! TLS authenticates endpoint identities, but establishing a transport
 //! connection grants no team or collection authority. Each semantic repair is
 //! one stream admitted from the server's complete local READ(C) closure. A
-//! client's bounded native-proof bootstrap only seeds later ordinary H
-//! acquisition and retry. DHT routing and provider-directory operations
-//! discover collection participants through an opaque KDF(C). Exact bytes use
+//! client's bounded native-proof bootstrap is retained as inert authorization
+//! evidence for later coherent observations. DHT routing and provider-directory
+//! operations discover collection participants through an opaque KDF(C). Exact bytes use
 //! a separate H-only DHT rendezvous and mutual key-confirmation stream;
 //! collection identity never participates.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -22,13 +22,11 @@ use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::{UnknownBlob, simplearchive::SimpleArchive};
 use triblespace_core::capability::CapabilityProof;
-use triblespace_core::collection::{
-    CollectionHandle, CollectionRecord, collection_writer_is_admitted_by_policy_at,
-};
+use triblespace_core::collection::CollectionHandle;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
-use triblespace_core::repo::{BlobChildren, BlobStoreGet, BlobStoreList, StoreChanges, StoreRead};
+use triblespace_core::repo::{BlobStoreGet, StoreChanges, StoreRead};
 
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetCommand, NetEvent, NetEventBatch, SnapshotNotice};
@@ -36,14 +34,10 @@ use crate::collection_activation::{
     CollectionReadBootstrapError, CollectionRepairOverlay, CollectionRepairOverlayError,
     collection_read_bootstrap_proofs_at, collection_repair_overlay,
 };
-use crate::collection_session::{
-    DisclosureForestPatch, FullReplicaCursor, FullReplicaState, pull_collection,
-    serve_collection_repair,
-};
+use crate::collection_session::{pull_collection, serve_collection_repair};
 use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, OP_COLLECTION_REPAIR};
 use crate::identity::iroh_secret;
-use crate::inventory::{BlobReplication, ReconcileQos};
-use crate::patch_repair::PatchSummary;
+use crate::inventory::ReconcileQos;
 use crate::protocol::{
     OP_FIND_NODE, OP_GET_BLOB, OP_PROVIDER_GET, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL,
     PROVIDER_PUT_OK, RawHash, op_find_node, op_get_blob, op_provider_get, op_provider_put,
@@ -107,8 +101,6 @@ where
 pub(crate) struct CollectionSnapshot {
     repair: Arc<CollectionRepairOverlay>,
     read_bootstrap: Arc<[CapabilityProof]>,
-    full: Arc<FullReplicaState>,
-    blobs: Arc<dyn BlobSnapshotReader>,
 }
 
 impl CollectionSnapshot {
@@ -123,407 +115,33 @@ impl CollectionSnapshot {
 
 type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionSnapshot>>;
 
-type ResidentChildEdge = (u64, RawHash);
-type ResidentBlobSet = HashSet<RawHash>;
-
-const HANDLE_PREFIX_BITMAP_WORDS: usize = (1 << 16) / u64::BITS as usize;
-
-/// Exact membership on the usually small newly-resident side of a refresh.
-///
-/// Every aligned candidate pays only one 16-bit bitmap probe. A full 32-byte
-/// comparison happens only when some newly resident handle shares that prefix;
-/// there is no hash computation and neither false positives nor false
-/// negatives.
-struct AddedBlobMatcher {
-    handles: Vec<RawHash>,
-    prefixes: Vec<u64>,
-}
-
-impl AddedBlobMatcher {
-    fn new(mut handles: Vec<RawHash>) -> Self {
-        handles.sort_unstable();
-        handles.dedup();
-        let mut prefixes = vec![0; HANDLE_PREFIX_BITMAP_WORDS];
-        for handle in &handles {
-            let prefix = usize::from(u16::from_be_bytes([handle[0], handle[1]]));
-            prefixes[prefix / u64::BITS as usize] |= 1 << (prefix % u64::BITS as usize);
-        }
-        Self { handles, prefixes }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.handles.is_empty()
-    }
-
-    fn contains_handle(&self, handle: &RawHash) -> bool {
-        self.handles.binary_search(handle).is_ok()
-    }
-
-    #[inline(always)]
-    fn contains_chunk(&self, chunk: &[u8]) -> bool {
-        let prefix = usize::from(u16::from_be_bytes([chunk[0], chunk[1]]));
-        if self.prefixes[prefix / u64::BITS as usize] & (1 << (prefix % u64::BITS as usize)) == 0 {
-            return false;
-        }
-        self.contains_prefixed_chunk(chunk)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn contains_prefixed_chunk(&self, chunk: &[u8]) -> bool {
-        self.handles
-            .binary_search_by(|handle| handle.as_slice().cmp(chunk))
-            .is_ok()
-    }
-}
-
-#[derive(Default)]
-struct BlobDeltaInvalidationStats {
-    #[cfg(test)]
-    added: usize,
-    #[cfg(test)]
-    removed: usize,
-    #[cfg(test)]
-    unique_parents: usize,
-    #[cfg(test)]
-    parent_scans: usize,
-    #[cfg(test)]
-    word_probes: usize,
-    #[cfg(test)]
-    matched_parents: usize,
-    #[cfg(test)]
-    invalidated_collections: usize,
-}
-
-/// Freeze the exact resident-handle relation once for one immutable store
-/// observation.
-///
-/// Full-replica discovery is a hash semijoin between the aligned 32-byte words
-/// of reachable blobs and this set. Building the set once avoids asking the
-/// store's persistent occurrence trie the same negative membership question
-/// for every arbitrary word in a large blob.
-fn resident_blob_set<R>(snapshot: &R) -> Result<ResidentBlobSet, R::Err>
-where
-    R: BlobStoreList,
-{
-    let mut resident = ResidentBlobSet::new();
-    for info in snapshot.blobs() {
-        resident.insert(info?.handle.raw);
-    }
-    Ok(resident)
-}
-
-#[derive(Default)]
-struct FullReplicaChildCache {
-    edges: HashMap<RawHash, Vec<ResidentChildEdge>>,
-    unreadable: HashSet<RawHash>,
-    #[cfg(test)]
-    scans: usize,
-    #[cfg(test)]
-    membership_probes: usize,
-}
-
-impl FullReplicaChildCache {
-    fn new() -> Self {
-        Self::default()
-    }
-}
-
-/// Discover the resident aligned child handles of one blob once per immutable
-/// store observation.
-///
-/// Reachability remains collection-local: callers still apply their own
-/// `visited` set and choose the canonical parent edge for their forest. This
-/// cache shares only the expensive, collection-independent fact that a given
-/// parent byte string contains a resident handle at a given aligned offset.
-fn resident_child_edges<'a, R>(
-    snapshot: &R,
-    parent: RawHash,
-    resident: &ResidentBlobSet,
-    cache: &'a mut FullReplicaChildCache,
-) -> (&'a [ResidentChildEdge], bool)
-where
-    R: BlobStoreGet,
-{
-    if !cache.edges.contains_key(&parent) {
-        #[cfg(test)]
-        {
-            cache.scans += 1;
-        }
-        let mut edges = Vec::new();
-        match snapshot.get::<Bytes, UnknownBlob>(Inline::new(parent)) {
-            Ok(bytes) => {
-                for (index, chunk) in bytes.chunks_exact(32).enumerate() {
-                    let child: RawHash = chunk.try_into().expect("fixed-width chunk");
-                    #[cfg(test)]
-                    {
-                        cache.membership_probes += 1;
-                    }
-                    if resident.contains(&child) {
-                        edges.push((index as u64, child));
-                    }
-                }
-            }
-            Err(_) => {
-                cache.unreadable.insert(parent);
-            }
-        }
-        cache.edges.insert(parent, edges);
-    }
-    (
-        cache.edges.get(&parent).unwrap(),
-        cache.unreadable.contains(&parent),
-    )
-}
-
-fn build_full_replica_state<R>(
-    snapshot: &R,
-    repair: &CollectionRepairOverlay,
-    resident: &ResidentBlobSet,
-    child_cache: &mut FullReplicaChildCache,
-    instant: hifitime::Epoch,
-) -> FullReplicaState
-where
-    R: BlobStoreGet,
-{
-    let mut direct_roots = HashSet::new();
-    direct_roots.insert(repair.collection().raw);
-    let bundles = repair
-        .authorization_evidence()
-        .bundles()
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut admitted = BTreeMap::new();
-    for record in repair.records().records() {
-        let CollectionRecord::Commit(commit) = record else {
-            continue;
-        };
-        if !*admitted.entry(commit.public_key().raw).or_insert_with(|| {
-            VerifyingKey::from_bytes(&commit.public_key().raw).is_ok_and(|writer| {
-                collection_writer_is_admitted_by_policy_at(
-                    repair.collection(),
-                    repair.policy(),
-                    writer,
-                    &bundles,
-                    instant,
-                )
-            })
-        }) {
-            continue;
-        }
-        direct_roots.insert(commit.data().raw);
-        direct_roots.insert(commit.metadata().raw);
-    }
-    let mut forest_keys = Vec::new();
-    let mut visited = HashSet::new();
-    let mut unreadable_parents = HashSet::new();
-    let mut level = direct_roots.iter().copied().collect::<Vec<_>>();
-    level.sort_unstable();
-    level.retain(|handle| resident.contains(handle));
-    for handle in &level {
-        let mut key = [0; 80];
-        key[8..40].copy_from_slice(handle);
-        key[40..48].copy_from_slice(&u64::MAX.to_be_bytes());
-        key[48..].copy_from_slice(handle);
-        forest_keys.push(key);
-        visited.insert(*handle);
-    }
-    let mut depth = 0_u64;
-    while !level.is_empty() {
-        let mut next = BTreeMap::<[u8; 32], ([u8; 32], u64)>::new();
-        for parent in &level {
-            let (edges, unreadable) =
-                resident_child_edges(snapshot, *parent, resident, child_cache);
-            if unreadable {
-                unreadable_parents.insert(*parent);
-            }
-            for (index, child) in edges.iter().copied() {
-                if visited.contains(&child) {
-                    continue;
-                }
-                next.entry(child).or_insert((*parent, index));
-            }
-        }
-        let Some(next_depth) = depth.checked_add(1) else {
-            break;
-        };
-        depth = next_depth;
-        level = Vec::with_capacity(next.len());
-        for (child, (parent, index)) in next {
-            let mut key = [0; 80];
-            key[..8].copy_from_slice(&depth.to_be_bytes());
-            key[8..40].copy_from_slice(&parent);
-            key[40..48].copy_from_slice(&index.to_be_bytes());
-            key[48..].copy_from_slice(&child);
-            forest_keys.push(key);
-            visited.insert(child);
-            level.push(child);
-        }
-    }
-    FullReplicaState {
-        forest: DisclosureForestPatch::from_keys(forest_keys),
-        direct_roots,
-        unreadable_parents,
-    }
-}
-
 /// Immutable host observation indexed exactly by active collection handle.
 ///
 /// Each value pins the repair product: record PATCH × native
-/// authorization-evidence PATCH × optional Full disclosure forest. No global
-/// team inventory, proof list, or blob manifest is retained.
+/// authorization-evidence PATCH. No global team inventory, proof list, or
+/// blob manifest is retained.
 pub(crate) struct StoreSnapshot {
     collections: CollectionSnapshotIndex,
     blobs: Arc<dyn BlobSnapshotReader>,
     bearer_locators: Arc<BearerLocatorIndex>,
-    resident_blobs: Option<Arc<ResidentBlobSet>>,
     observed_at: hifitime::Epoch,
     next_authorization_change: Option<hifitime::Epoch>,
-}
-
-/// Identify exactly which prior Full forests a semantic resident-blob delta
-/// can change without retaining the enormous relation of absent aligned words.
-///
-/// If a new vertex becomes reachable, the first new vertex on its root path is
-/// either a newly resident direct root or is named by an already reachable
-/// parent. Removals can matter only when the removed vertex was reachable.
-/// Consequently the existing forest is complete positive evidence: additions
-/// require one shared streaming semijoin against old reachable parent bytes,
-/// while removals need only a forest projection.
-fn blob_delta_invalidations<R>(
-    snapshot: &R,
-    previous: &StoreSnapshot,
-    previous_resident: &ResidentBlobSet,
-    resident: &ResidentBlobSet,
-) -> (HashSet<RawHash>, BlobDeltaInvalidationStats)
-where
-    R: BlobStoreGet,
-{
-    let added = AddedBlobMatcher::new(resident.difference(previous_resident).copied().collect());
-    let removed = previous_resident
-        .difference(resident)
-        .copied()
-        .collect::<HashSet<_>>();
-    #[cfg(test)]
-    let mut stats = BlobDeltaInvalidationStats::default();
-    #[cfg(not(test))]
-    let stats = BlobDeltaInvalidationStats::default();
-    #[cfg(test)]
-    {
-        stats.added = added.handles.len();
-        stats.removed = removed.len();
-    }
-    let prior = previous
-        .collections
-        .iter_ordered()
-        .filter_map(|key| {
-            previous
-                .collections
-                .get(key)
-                .cloned()
-                .map(|collection| (*key, collection))
-        })
-        .collect::<Vec<_>>();
-    let mut invalidated = HashSet::new();
-    let mut reachable_parents = HashSet::new();
-    for (collection, prior) in &prior {
-        if !prior.full.unreadable_parents.is_empty() {
-            invalidated.insert(*collection);
-        }
-        if prior
-            .full
-            .direct_roots
-            .iter()
-            .any(|root| added.contains_handle(root))
-        {
-            invalidated.insert(*collection);
-        }
-        if added.is_empty() && removed.is_empty() {
-            continue;
-        }
-        for entry in prior.full.forest.iter_ordered() {
-            let reachable: RawHash = entry[48..].try_into().expect("forest child width");
-            if !removed.is_empty() && removed.contains(&reachable) {
-                invalidated.insert(*collection);
-            }
-            if !added.is_empty() {
-                reachable_parents.insert(reachable);
-            }
-        }
-    }
-
-    if added.is_empty() {
-        #[cfg(test)]
-        {
-            stats.invalidated_collections = invalidated.len();
-        }
-        return (invalidated, stats);
-    }
-
-    #[cfg(test)]
-    {
-        stats.unique_parents = reachable_parents.len();
-    }
-    let mut ordered_parents = reachable_parents.into_iter().collect::<Vec<_>>();
-    ordered_parents.sort_unstable();
-    let mut matched_parents = HashSet::new();
-    for parent in ordered_parents {
-        let Ok(bytes) = snapshot.get::<Bytes, UnknownBlob>(Inline::new(parent)) else {
-            continue;
-        };
-        #[cfg(test)]
-        {
-            stats.parent_scans += 1;
-        }
-        for chunk in bytes.chunks_exact(32) {
-            #[cfg(test)]
-            {
-                stats.word_probes += 1;
-            }
-            if added.contains_chunk(chunk) {
-                matched_parents.insert(parent);
-                break;
-            }
-        }
-    }
-    #[cfg(test)]
-    {
-        stats.matched_parents = matched_parents.len();
-    }
-
-    if !matched_parents.is_empty() {
-        for (collection, prior) in &prior {
-            if prior.full.forest.iter_ordered().any(|entry| {
-                let reachable: RawHash = entry[48..].try_into().expect("forest child width");
-                matched_parents.contains(&reachable)
-            }) {
-                invalidated.insert(*collection);
-            }
-        }
-    }
-    #[cfg(test)]
-    {
-        stats.invalidated_collections = invalidated.len();
-    }
-    (invalidated, stats)
 }
 
 impl StoreSnapshot {
     pub(crate) fn from_store_changes<R>(
         snapshot: R,
         active: &ActiveCollections,
-        full_dirty: &ActiveCollections,
         local: VerifyingKey,
         previous_store: Option<&R>,
         previous: Option<&Self>,
         changes: StoreChanges,
         authorization_changed: bool,
-        full_replication: bool,
         next_authorization_change: Option<hifitime::Epoch>,
         instant: hifitime::Epoch,
     ) -> anyhow::Result<Self>
     where
-        R: StoreRead + BlobChildren + Clone,
+        R: StoreRead + Clone,
     {
         let mut collections = CollectionSnapshotIndex::new();
         let bearer_locators = match (previous_store, previous) {
@@ -543,32 +161,6 @@ impl StoreSnapshot {
             || changes.contains(StoreChanges::COLLECTION_RECORDS)
             || changes.contains(StoreChanges::CAPABILITY_PROOFS)
             || authorization_changed;
-        let mut full_child_cache = FullReplicaChildCache::new();
-        let resident_blobs = if !full_replication {
-            None
-        } else if changes.contains(StoreChanges::BLOBS)
-            || previous
-                .and_then(|prior| prior.resident_blobs.as_ref())
-                .is_none()
-        {
-            Some(Arc::new(resident_blob_set(&snapshot)?))
-        } else {
-            previous.and_then(|prior| prior.resident_blobs.clone())
-        };
-        let resident_delta_known = previous
-            .and_then(|prior| prior.resident_blobs.as_ref())
-            .is_some();
-        let blob_invalidated = match (
-            changes.contains(StoreChanges::BLOBS),
-            previous,
-            previous.and_then(|prior| prior.resident_blobs.as_deref()),
-            resident_blobs.as_deref(),
-        ) {
-            (true, Some(previous), Some(previous_resident), Some(resident)) => {
-                blob_delta_invalidations(&snapshot, previous, previous_resident, resident).0
-            }
-            _ => HashSet::new(),
-        };
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
             if snapshot
@@ -629,37 +221,9 @@ impl StoreSnapshot {
                     Err(error) => return Err(anyhow::Error::new(error)),
                 }
             };
-            let full = if !full_replication {
-                Arc::new(FullReplicaState {
-                    forest: DisclosureForestPatch::new(),
-                    direct_roots: HashSet::new(),
-                    unreadable_parents: HashSet::new(),
-                })
-            } else if let Some(prior) = prior.as_ref().filter(|prior| {
-                resident_delta_known
-                    && !authorization_changed
-                    && Arc::ptr_eq(&repair, &prior.repair)
-                    && (!changes.contains(StoreChanges::BLOBS)
-                        || blob_invalidated.get(&collection.raw).is_none())
-                    && full_dirty.get(&collection.raw).is_none()
-            }) {
-                prior.full.clone()
-            } else {
-                Arc::new(build_full_replica_state(
-                    &snapshot,
-                    &repair,
-                    resident_blobs
-                        .as_ref()
-                        .expect("resident set was frozen before Full discovery"),
-                    &mut full_child_cache,
-                    instant,
-                ))
-            };
             let value = Arc::new(CollectionSnapshot {
                 repair,
                 read_bootstrap,
-                full,
-                blobs: blob_reader.clone(),
             });
             collections.insert(&PatchEntry::with_value(raw, value));
         }
@@ -667,7 +231,6 @@ impl StoreSnapshot {
             collections,
             blobs: blob_reader,
             bearer_locators,
-            resident_blobs,
             observed_at: instant,
             next_authorization_change,
         })
@@ -694,17 +257,9 @@ impl StoreSnapshot {
             .filter_map(move |key| valid.then(|| self.collections.get(key).cloned()).flatten())
     }
 
-    fn notices(&self) -> Vec<(CollectionHandle, [u8; 32], [u8; 32])> {
+    fn notices(&self) -> Vec<(CollectionHandle, [u8; 32])> {
         self.collections()
-            .map(|collection| {
-                (
-                    collection.collection(),
-                    collection.wake_root(),
-                    PatchSummary::from_patch(&collection.full.forest)
-                        .root()
-                        .unwrap_or([0; 32]),
-                )
-            })
+            .map(|collection| (collection.collection(), collection.wake_root()))
             .collect()
     }
 
@@ -723,7 +278,6 @@ impl StoreSnapshot {
 
 type SharedSnapshot = Arc<StoreSnapshot>;
 type SnapshotSlot = Arc<Mutex<Option<SharedSnapshot>>>;
-type OperationalBlobSlot = Arc<Mutex<Option<Arc<dyn BlobSnapshotReader>>>>;
 
 /// The async capability cloned into lazy readers.
 pub(crate) trait NetCapability: Send + Sync {
@@ -1025,7 +579,6 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: SnapshotSlot,
-    operational_blobs: OperationalBlobSlot,
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
     id: EndpointId,
 }
@@ -1039,22 +592,11 @@ impl NetSender {
         self.snapshot.lock().unwrap().clone()
     }
 
-    pub(crate) fn update_operational_blobs<R>(&self, snapshot: R)
-    where
-        R: BlobStoreGet + Clone + Send + 'static,
-    {
-        *self.operational_blobs.lock().unwrap() =
-            Some(Arc::new(CloneableBlobSnapshotReader(Mutex::new(snapshot))));
-    }
-
     pub(crate) fn update_snapshot(&self, snapshot: StoreSnapshot, active: &ActiveCollections) {
         let mut notices = snapshot.notices();
         for raw in active.iter_ordered() {
-            if !notices
-                .iter()
-                .any(|(collection, _, _)| collection.raw == *raw)
-            {
-                notices.push((CollectionHandle::new(*raw), [0; 32], [0; 32]));
+            if !notices.iter().any(|(collection, _)| collection.raw == *raw) {
+                notices.push((CollectionHandle::new(*raw), [0; 32]));
             }
         }
         let retired = self.snapshot.lock().unwrap().replace(Arc::new(snapshot));
@@ -1120,7 +662,6 @@ pub struct HostWiring {
     cmd_rx: mpsc::Receiver<NetCommand>,
     evt_tx: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
-    operational_blobs: OperationalBlobSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
 }
 
@@ -1135,13 +676,11 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(crate::channel::MAX_ADMISSION_BRIDGE_BATCHES);
     let snapshot = Arc::new(Mutex::new(None));
-    let operational_blobs = Arc::new(Mutex::new(None));
     let (cap_tx, cap_rx) = tokio::sync::watch::channel(None);
     (
         NetSender {
             cmd_tx,
             snapshot: snapshot.clone(),
-            operational_blobs: operational_blobs.clone(),
             cap: cap_rx,
             id,
         },
@@ -1150,7 +689,6 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
             cmd_rx,
             evt_tx,
             snapshot,
-            operational_blobs,
             cap_tx,
         },
     )
@@ -1221,7 +759,6 @@ struct RepairOutcome {
     target: RepairTarget,
     success: bool,
     more: bool,
-    full_cursor: Option<FullReplicaCursor>,
 }
 
 struct PublicationOutcome {
@@ -1467,8 +1004,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut in_flight = HashSet::new();
     let mut failures: HashMap<RepairTarget, (u32, crate::clock::Mono)> = HashMap::new();
     let mut discovery: HashMap<[u8; 32], DiscoveryState> = HashMap::new();
-    let mut full_cursors: HashMap<RepairTarget, FullReplicaCursor> = HashMap::new();
-    let mut current_roots: HashMap<[u8; 32], ([u8; 32], [u8; 32])> = HashMap::new();
+    let mut current_roots: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
     let mut next_period = crate::clock::mono_now();
     let mut next_discovery = crate::clock::mono_now();
     let mut publisher = ProviderPublisher::new(crate::clock::mono_now());
@@ -1497,22 +1033,21 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         immediate.clear();
                         pending.clear();
                         failures.clear();
-                        full_cursors.clear();
                         for (_, topic) in wake_topics.drain() {
                             let _ = topic.send(WakeCommand::Shutdown);
                         }
                         continue;
                     }
                     let mut observed = HashSet::new();
-                    for (collection, semantic_root, payload_root) in notice.collections {
+                    for (collection, semantic_root) in notice.collections {
                         observed.insert(collection.raw);
                         if !current_roots.contains_key(&collection.raw) {
                             let now = crate::clock::mono_now();
                             discovery.insert(collection.raw, DiscoveryState::new(now));
                             next_discovery = next_discovery.min(now);
                         }
-                        let roots = (semantic_root, payload_root);
-                        let changed = current_roots.insert(collection.raw, roots) != Some(roots);
+                        let changed = current_roots.insert(collection.raw, semantic_root)
+                            != Some(semantic_root);
                         let topic = wake_topics.entry(collection.raw).or_insert_with(|| {
                             spawn_wake_topic(
                                 wake_plane.clone(),
@@ -1522,15 +1057,13 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                             )
                         });
                         if changed && semantic_root != [0; 32] {
-                            let _ = topic.send(WakeCommand::Observe(
-                                CollectionWakeRoot::with_payload(semantic_root, payload_root),
-                            ));
+                            let _ = topic
+                                .send(WakeCommand::Observe(CollectionWakeRoot::new(semantic_root)));
                         }
                     }
                     current_roots.retain(|collection, _| observed.contains(collection));
                     discovery.retain(|collection, _| observed.contains(collection));
                     retain_active_repair_state(&mut failures, &observed);
-                    retain_active_repair_state(&mut full_cursors, &observed);
                     participants
                         .lock()
                         .unwrap()
@@ -1591,12 +1124,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             );
             if current_roots
                 .get(&collection.raw)
-                .is_some_and(|(semantic, payload)| {
-                    *semantic != [0; 32]
-                        && (semantic != wake.root().as_bytes()
-                            || (matches!(config.qos.blobs, BlobReplication::Full)
-                                && payload != wake.root().payload_bytes()))
-                })
+                .is_some_and(|semantic| *semantic != [0; 32] && semantic != wake.root().as_bytes())
             {
                 enqueue_repair(
                     &mut immediate,
@@ -1612,12 +1140,10 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             in_flight.remove(&outcome.target);
             if !current_roots.contains_key(&outcome.target.collection.raw) {
                 failures.remove(&outcome.target);
-                full_cursors.remove(&outcome.target);
                 continue;
             }
             if outcome.target.peer == my_id {
                 failures.remove(&outcome.target);
-                full_cursors.remove(&outcome.target);
                 continue;
             }
             if outcome.success {
@@ -1633,13 +1159,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     .entry(outcome.target.collection.raw)
                     .or_insert_with(|| DiscoveryState::new(now))
                     .observe_success(now);
-                if outcome.more {
-                    if let Some(cursor) = outcome.full_cursor {
-                        full_cursors.insert(outcome.target, cursor);
-                    }
-                } else {
-                    full_cursors.remove(&outcome.target);
-                }
                 if outcome.more {
                     enqueue_repair(&mut immediate, &mut pending, outcome.target);
                 }
@@ -1820,38 +1339,25 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 let transport = transport.clone();
                 let pool = pool.clone();
                 let events = wiring.evt_tx.clone();
-                let operational_blobs = wiring.operational_blobs.clone();
                 let repair_tx = repair_tx.clone();
-                let full = matches!(config.qos.blobs, BlobReplication::Full);
-                let full_cursor = full_cursors.get(&target).cloned();
                 tokio::spawn(async move {
                     let result = tokio::time::timeout(
                         REPAIR_DEADLINE,
-                        reconcile_collection_peer(
-                            &transport,
-                            &pool,
-                            target,
-                            local,
-                            full_cursor,
-                            &operational_blobs,
-                            &events,
-                            full,
-                        ),
+                        reconcile_collection_peer(&transport, &pool, target, local, &events),
                     )
                     .await;
-                    let (success, more, full_cursor) = match result {
-                        Ok(Ok((more, cursor))) => (true, more, cursor),
+                    let (success, more) = match result {
+                        Ok(Ok(more)) => (true, more),
                         Ok(Err(error)) => {
                             debug!(%error, "collection repair failed");
-                            (false, false, None)
+                            (false, false)
                         }
-                        Err(_) => (false, false, None),
+                        Err(_) => (false, false),
                     };
                     let _ = repair_tx.send(RepairOutcome {
                         target,
                         success,
                         more,
-                        full_cursor,
                     });
                 });
             }
@@ -1928,25 +1434,13 @@ async fn reconcile_collection_peer<T: Transport>(
     pool: &SharedPool<T::Conn>,
     target: RepairTarget,
     local: Arc<CollectionSnapshot>,
-    prior_cursor: Option<FullReplicaCursor>,
-    operational_blobs: &OperationalBlobSlot,
     events: &tokio::sync::mpsc::Sender<NetEventBatch>,
-    full: bool,
-) -> anyhow::Result<(bool, Option<FullReplicaCursor>)> {
+) -> anyhow::Result<bool> {
     let connection = pool_get(transport, pool, target.peer).await?;
-    let reader = operational_blobs
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or_else(|| local.blobs.clone());
     let delta = match pull_collection(
         connection.conn(),
         &local.repair,
         local.read_bootstrap.iter().cloned().collect(),
-        &local.full,
-        prior_cursor.as_ref(),
-        |hash| reader.get_blob(hash),
-        full,
     )
     .await
     {
@@ -1963,24 +1457,8 @@ async fn reconcile_collection_peer<T: Transport>(
     for record in delta.records {
         admissions.push(NetEvent::CollectionRecord(record)).await?;
     }
-    if !delta.blobs.is_empty() || (full && !delta.more) {
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        admissions
-            .push(NetEvent::FullPage {
-                collection: target.collection,
-                blobs: delta.blobs,
-                final_page: !delta.more,
-                ack: ack_tx,
-            })
-            .await?;
-        admissions.flush().await?;
-        ack_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("store side dropped Full page before durability"))?;
-        return Ok((delta.more, delta.full_cursor));
-    }
     admissions.flush().await?;
-    Ok((delta.more, delta.full_cursor))
+    Ok(delta.more)
 }
 
 impl<T: Transport> ProviderClient<T> {
@@ -2294,29 +1772,15 @@ impl SnapshotHandler {
         match op {
             OP_COLLECTION_REPAIR => {
                 if !self.serve_collections {
-                    let _ =
-                        serve_collection_repair(recv, send, peer, |_| None, |_, _| None).await?;
+                    let _ = serve_collection_repair(recv, send, peer, |_| None).await?;
                 } else {
                     let snapshot = self.snapshot.lock().unwrap().clone();
-                    let blob_snapshot = snapshot.clone();
-                    let bootstrap = serve_collection_repair(
-                        recv,
-                        send,
-                        peer,
-                        move |collection| {
-                            snapshot
-                                .as_ref()
-                                .and_then(|snapshot| snapshot.collection(collection))
-                                .map(|collection| {
-                                    (collection.repair.clone(), collection.full.clone())
-                                })
-                        },
-                        move |_collection, hash| {
-                            blob_snapshot
-                                .as_ref()
-                                .and_then(|snapshot| snapshot.get_blob(&hash))
-                        },
-                    )
+                    let bootstrap = serve_collection_repair(recv, send, peer, move |collection| {
+                        snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.collection(collection))
+                            .map(|collection| collection.repair.clone())
+                    })
                     .await?;
                     let mut admissions = AdmissionBatcher::new(&self.events);
                     for proof in bootstrap {
@@ -2425,54 +1889,23 @@ fn op_name(op: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap, HashSet};
-    use std::sync::Arc;
+    use std::collections::{BTreeSet, HashMap};
 
-    use anybytes::Bytes;
-    use ed25519_dalek::SigningKey;
-    use iroh_base::EndpointId;
-    use triblespace_core::blob::Blob;
-    use triblespace_core::blob::MemoryBlobStore;
-    use triblespace_core::blob::encodings::{UnknownBlob, simplearchive::SimpleArchive};
-    use triblespace_core::capability::{
-        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-        CapabilityResource,
-    };
-    use triblespace_core::collection::{
-        ACTION_WRITE, AdmissionPolicy, Collection, CollectionCommit, CollectionData,
-        CollectionHandle, CollectionPolicy, CollectionRecord, CollectionStore, CollectionStoreExt,
-        empty_metadata_handle,
-    };
-    use triblespace_core::id::{ExclusiveId, Id};
-    use triblespace_core::inline::Inline;
-    use triblespace_core::inline::encodings::hash::Handle;
-    use triblespace_core::patch::{Entry as PatchEntry, PATCH};
-    use triblespace_core::repo::hybridstore::HybridStore;
-    use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{
-        BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofStore, SnapshotSource,
-        StoreChanges, StoreSnapshot as CoreStoreSnapshot,
-    };
-    use triblespace_core::trible::{Fragment, Trible, TribleSet};
-
-    use crate::channel::{NetEvent, NetEventBatch};
-    use crate::inventory::{BlobReplication, ReconcileQos};
-    use crate::peer::Peer;
     use crate::provider::{
         MAX_PROVIDERS_PER_KEY, ProviderObservation, ProviderPublisher, ProviderPutResult,
         PublicationResult,
     };
     use crate::routing::K;
     use crate::transport::PeerId;
+    use ed25519_dalek::SigningKey;
+    use iroh_base::EndpointId;
+    use triblespace_core::collection::CollectionHandle;
 
     use super::{
-        ActiveCollections, AddedBlobMatcher, COLLECTION_PARTICIPANT_LEASE, DiscoveryState,
-        FullReplicaChildCache, FullReplicaState, MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS,
-        ProviderPublicationBudget, RepairTarget, StoreSnapshot, WakeBootstrapPeers,
-        blob_delta_invalidations, build_full_replica_state, canonical_provider_subset,
-        collection_repair_overlay, enqueue_repair, forget_participant, has_repair_candidate,
-        live_participants, observe_participant, resident_blob_set, resident_child_edges,
-        retain_active_repair_state,
+        COLLECTION_PARTICIPANT_LEASE, DiscoveryState, MAX_COLLECTION_PARTICIPANTS,
+        MAX_PENDING_REPAIRS, ProviderPublicationBudget, RepairTarget, WakeBootstrapPeers,
+        canonical_provider_subset, enqueue_repair, forget_participant, has_repair_candidate,
+        live_participants, observe_participant, retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -2482,496 +1915,6 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap()
-    }
-
-    fn fragment(seed: u8, value: Inline<Handle<UnknownBlob>>) -> Fragment {
-        let entity = Id::new([seed; 16]).unwrap();
-        let attribute = Id::new([seed.wrapping_add(1); 16]).unwrap();
-        let mut facts = TribleSet::new();
-        facts.insert(&Trible::new(
-            ExclusiveId::force_ref(&entity),
-            &attribute,
-            &value,
-        ));
-        Fragment::from_parts(facts, TribleSet::new(), MemoryBlobStore::new())
-    }
-
-    fn active(
-        collections: impl IntoIterator<
-            Item = Collection<triblespace_core::blob::encodings::simplearchive::SimpleArchive>,
-        >,
-    ) -> ActiveCollections {
-        let mut active = PATCH::new();
-        for collection in collections {
-            active.insert(&PatchEntry::new(&collection.handle().raw));
-        }
-        active
-    }
-
-    fn full(
-        snapshot: &StoreSnapshot,
-        collection: Collection<triblespace_core::blob::encodings::simplearchive::SimpleArchive>,
-    ) -> Arc<FullReplicaState> {
-        snapshot
-            .collection(collection.handle())
-            .unwrap()
-            .full
-            .clone()
-    }
-
-    fn observed_at() -> hifitime::Epoch {
-        hifitime::Epoch::from_gregorian_utc_at_midnight(2026, 1, 1)
-    }
-
-    #[test]
-    fn added_blob_matcher_is_exact_across_empty_and_shared_prefixes() {
-        let first = [0x11; 32];
-        let mut same_prefix = [0x11; 32];
-        same_prefix[31] = 0x12;
-        let other = [0x22; 32];
-        let matcher = AddedBlobMatcher::new(vec![other, first, same_prefix, first]);
-
-        assert!(matcher.contains_handle(&first));
-        assert!(matcher.contains_chunk(&same_prefix));
-        assert!(matcher.contains_chunk(&other));
-        let mut absent_same_prefix = first;
-        absent_same_prefix[30] = 0x99;
-        assert!(!matcher.contains_chunk(&absent_same_prefix));
-        assert!(!matcher.contains_chunk(&[0x33; 32]));
-        assert!(!AddedBlobMatcher::new(Vec::new()).contains_chunk(&[0; 32]));
-    }
-
-    #[test]
-    fn resident_child_cache_reuses_schema_agnostic_aligned_discovery() {
-        let mut store = MemoryRepo::default();
-        let child = store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"resident child".to_vec()))
-            .unwrap();
-        let mut parent_bytes = vec![0xA5; 96];
-        parent_bytes[32..64].copy_from_slice(&child.raw);
-        let parent = store
-            .put::<UnknownBlob, _>(Bytes::from_source(parent_bytes))
-            .unwrap();
-        let snapshot = store.snapshot().unwrap();
-        let resident = resident_blob_set(&snapshot).unwrap();
-        let mut cache = FullReplicaChildCache::new();
-
-        let expected = snapshot
-            .get::<Bytes, UnknownBlob>(parent)
-            .unwrap()
-            .chunks_exact(32)
-            .enumerate()
-            .filter_map(|(index, chunk)| {
-                let child = <[u8; 32]>::try_from(chunk).unwrap();
-                snapshot
-                    .contains_blob(Inline::<Handle<UnknownBlob>>::new(child))
-                    .unwrap()
-                    .then_some((index as u64, child))
-            })
-            .collect::<Vec<_>>();
-        let (first, first_unreadable) =
-            resident_child_edges(&snapshot, parent.raw, &resident, &mut cache);
-        let first_ptr = first.as_ptr();
-        assert!(!first_unreadable);
-        assert_eq!(first, expected);
-        assert_eq!(first, &[(1, child.raw)]);
-        let (second, second_unreadable) =
-            resident_child_edges(&snapshot, parent.raw, &resident, &mut cache);
-
-        assert_eq!(first_ptr, second.as_ptr());
-        assert!(!second_unreadable);
-        assert_eq!(cache.scans, 1);
-        assert_eq!(cache.membership_probes, 3);
-    }
-
-    #[test]
-    fn resident_child_cache_retains_unreadable_parent_evidence() {
-        let mut store = MemoryRepo::default();
-        let snapshot = store.snapshot().unwrap();
-        let parent = [0xE7; 32];
-        let resident = HashSet::from([parent]);
-        let mut cache = FullReplicaChildCache::new();
-
-        let (edges, unreadable) = resident_child_edges(&snapshot, parent, &resident, &mut cache);
-        assert!(edges.is_empty());
-        assert!(unreadable);
-        let (_, unreadable_again) = resident_child_edges(&snapshot, parent, &resident, &mut cache);
-        assert!(unreadable_again);
-        assert_eq!(cache.scans, 1);
-    }
-
-    #[test]
-    fn physical_blob_noop_retries_only_the_owner_of_an_unreadable_parent() {
-        let key = SigningKey::from_bytes(&[0x3A; 32]);
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let mut store = MemoryRepo::default();
-        let affected = store
-            .collection("unreadable-parent-owner", policy.clone())
-            .unwrap();
-        let untouched = store.collection("unreadable-parent-other", policy).unwrap();
-        store
-            .commit(affected, &key, fragment(22, Inline::new([0xB1; 32])))
-            .unwrap();
-        store
-            .commit(untouched, &key, fragment(23, Inline::new([0xB2; 32])))
-            .unwrap();
-        let active = active([affected, untouched]);
-        let clean = ActiveCollections::new();
-        let store_snapshot = store.snapshot().unwrap();
-        let baseline = StoreSnapshot::from_store_changes(
-            store_snapshot.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            None,
-            None,
-            StoreChanges::ALL,
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-
-        // Model a prior read failure without constructing a corrupt backend:
-        // the positive repair evidence is the only state relevant to this
-        // invalidation rule.
-        let affected_prior = baseline.collection(affected.handle()).unwrap();
-        let untouched_prior = baseline.collection(untouched.handle()).unwrap();
-        let affected_full = Arc::new(FullReplicaState {
-            forest: affected_prior.full.forest.clone(),
-            direct_roots: affected_prior.full.direct_roots.clone(),
-            unreadable_parents: HashSet::from([[0xE7; 32]]),
-        });
-        let mut collections = super::CollectionSnapshotIndex::new();
-        collections.insert(&PatchEntry::with_value(
-            &affected.handle().raw,
-            Arc::new(super::CollectionSnapshot {
-                repair: affected_prior.repair.clone(),
-                read_bootstrap: affected_prior.read_bootstrap.clone(),
-                full: affected_full.clone(),
-                blobs: affected_prior.blobs.clone(),
-            }),
-        ));
-        collections.insert(&PatchEntry::with_value(
-            &untouched.handle().raw,
-            Arc::new(super::CollectionSnapshot {
-                repair: untouched_prior.repair.clone(),
-                read_bootstrap: untouched_prior.read_bootstrap.clone(),
-                full: untouched_prior.full.clone(),
-                blobs: untouched_prior.blobs.clone(),
-            }),
-        ));
-        let prior = StoreSnapshot {
-            collections,
-            blobs: baseline.blobs.clone(),
-            bearer_locators: baseline.bearer_locators.clone(),
-            resident_blobs: baseline.resident_blobs.clone(),
-            observed_at: baseline.observed_at,
-            next_authorization_change: baseline.next_authorization_change,
-        };
-        let resident = prior.resident_blobs.as_deref().unwrap();
-        let (invalidated, stats) =
-            blob_delta_invalidations(&store_snapshot, &prior, resident, resident);
-        assert_eq!(stats.added, 0);
-        assert_eq!(stats.removed, 0);
-        assert_eq!(stats.parent_scans, 0);
-        assert_eq!(stats.invalidated_collections, 1);
-        assert!(invalidated.contains(&affected.handle().raw));
-        assert!(!invalidated.contains(&untouched.handle().raw));
-
-        let refreshed = StoreSnapshot::from_store_changes(
-            store_snapshot.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            Some(&store_snapshot),
-            Some(&prior),
-            StoreChanges::BLOBS,
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        assert!(!Arc::ptr_eq(&affected_full, &full(&refreshed, affected)));
-        assert!(Arc::ptr_eq(
-            &untouched_prior.full,
-            &full(&refreshed, untouched)
-        ));
-    }
-
-    #[test]
-    fn full_forests_share_discovery_but_keep_collection_local_reachability() {
-        let key = SigningKey::from_bytes(&[0x37; 32]);
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let mut store = MemoryRepo::default();
-        let child = store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"shared collection child".to_vec()))
-            .unwrap();
-        let first = store
-            .collection("shared-scan-first", policy.clone())
-            .unwrap();
-        let second = store.collection("shared-scan-second", policy).unwrap();
-        let first_commit = store.commit(first, &key, fragment(9, child)).unwrap();
-        let second_commit = store.commit(second, &key, fragment(9, child)).unwrap();
-        assert_eq!(first_commit.data(), second_commit.data());
-
-        let snapshot = store.snapshot().unwrap();
-        let resident = resident_blob_set(&snapshot).unwrap();
-        let first_repair = collection_repair_overlay(&snapshot, first.handle()).unwrap();
-        let second_repair = collection_repair_overlay(&snapshot, second.handle()).unwrap();
-        let mut baseline_first_cache = FullReplicaChildCache::new();
-        let baseline_first = build_full_replica_state(
-            &snapshot,
-            &first_repair,
-            &resident,
-            &mut baseline_first_cache,
-            observed_at(),
-        );
-        let mut baseline_second_cache = FullReplicaChildCache::new();
-        let baseline_second = build_full_replica_state(
-            &snapshot,
-            &second_repair,
-            &resident,
-            &mut baseline_second_cache,
-            observed_at(),
-        );
-        let baseline_scans = baseline_first_cache.scans + baseline_second_cache.scans;
-        let baseline_probes =
-            baseline_first_cache.membership_probes + baseline_second_cache.membership_probes;
-
-        let mut shared_cache = FullReplicaChildCache::new();
-        let first_full = build_full_replica_state(
-            &snapshot,
-            &first_repair,
-            &resident,
-            &mut shared_cache,
-            observed_at(),
-        );
-        let second_full = build_full_replica_state(
-            &snapshot,
-            &second_repair,
-            &resident,
-            &mut shared_cache,
-            observed_at(),
-        );
-        let forest_entries = first_full.forest.len() + second_full.forest.len();
-
-        eprintln!(
-            "full replica fixture: discovery scans {baseline_scans} -> {}, membership probes {baseline_probes} -> {}, forest entries {forest_entries} -> {forest_entries}",
-            shared_cache.scans, shared_cache.membership_probes,
-        );
-
-        assert!(shared_cache.scans < baseline_scans);
-        assert!(shared_cache.membership_probes < baseline_probes);
-        assert_eq!(first_full.forest, baseline_first.forest);
-        assert_eq!(second_full.forest, baseline_second.forest);
-        assert_eq!(
-            forest_entries,
-            baseline_first.forest.len() + baseline_second.forest.len(),
-            "sharing discovery must not share or suppress collection-local forest entries"
-        );
-        assert!(first_full.direct_roots.contains(&first.handle().raw));
-        assert!(!first_full.direct_roots.contains(&second.handle().raw));
-        assert!(second_full.direct_roots.contains(&second.handle().raw));
-        assert!(!second_full.direct_roots.contains(&first.handle().raw));
-        assert!(
-            first_full
-                .forest
-                .iter_ordered()
-                .any(|entry| entry[48..] == child.raw)
-        );
-        assert!(
-            second_full
-                .forest
-                .iter_ordered()
-                .any(|entry| entry[48..] == child.raw)
-        );
-    }
-
-    #[test]
-    fn inactive_commit_payload_is_not_a_full_disclosure_root() {
-        let root = SigningKey::from_bytes(&[0x41; 32]);
-        let writer = SigningKey::from_bytes(&[0x42; 32]);
-        let policy = CollectionPolicy::new(
-            AdmissionPolicy::Open,
-            AdmissionPolicy::direct(root.verifying_key()),
-        );
-        let mut store = MemoryRepo::default();
-        let collection = store.collection("inactive-full-root", policy).unwrap();
-        let payload = store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"inactive payload".to_vec()))
-            .unwrap();
-        let commit = CollectionRecord::Commit(CollectionCommit::sign(
-            &writer,
-            collection.handle(),
-            CollectionData::new(payload.raw),
-            empty_metadata_handle(),
-        ));
-        store.insert(commit).unwrap();
-
-        let before_snapshot = store.snapshot().unwrap();
-        let before_resident = resident_blob_set(&before_snapshot).unwrap();
-        let before_repair =
-            collection_repair_overlay(&before_snapshot, collection.handle()).unwrap();
-        let mut before_cache = FullReplicaChildCache::new();
-        let before_full = build_full_replica_state(
-            &before_snapshot,
-            &before_repair,
-            &before_resident,
-            &mut before_cache,
-            observed_at(),
-        );
-        assert_eq!(before_repair.records().len(), 1);
-        assert!(!before_full.direct_roots.contains(&payload.raw));
-
-        let grant = CapabilityProofBundle::issue_root(
-            &root,
-            CapabilityClaim::root(
-                CapabilityAtom::new(
-                    CapabilityAction::new(ACTION_WRITE),
-                    CapabilityResource::from(collection.handle()),
-                ),
-                CapabilityMode::Invoke,
-                None,
-            ),
-            writer.verifying_key(),
-        )
-        .unwrap();
-        let (proof, claims) = grant.into_parts();
-        for claim in claims {
-            store.put::<SimpleArchive, _>(claim).unwrap();
-        }
-        store.insert_proof(proof).unwrap();
-
-        let after_snapshot = store.snapshot().unwrap();
-        let after_resident = resident_blob_set(&after_snapshot).unwrap();
-        let after_repair = collection_repair_overlay(&after_snapshot, collection.handle()).unwrap();
-        let mut after_cache = FullReplicaChildCache::new();
-        let after_full = build_full_replica_state(
-            &after_snapshot,
-            &after_repair,
-            &after_resident,
-            &mut after_cache,
-            observed_at(),
-        );
-        assert_eq!(
-            before_repair.records().summary(),
-            after_repair.records().summary()
-        );
-        assert!(after_full.direct_roots.contains(&payload.raw));
-    }
-
-    #[test]
-    fn delta_semijoin_selects_shared_owners_and_rebuild_recovers_a_batch_cascade() {
-        let key = SigningKey::from_bytes(&[0x38; 32]);
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let leaf_blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"cascade leaf".to_vec()));
-        let leaf = leaf_blob.get_handle();
-        let parent_blob = Blob::<UnknownBlob>::new(Bytes::from_source(leaf.raw.to_vec()));
-        let parent = parent_blob.get_handle();
-        let mut store = MemoryRepo::default();
-        let first = store
-            .collection("delta-shared-first", policy.clone())
-            .unwrap();
-        let second = store
-            .collection("delta-shared-second", policy.clone())
-            .unwrap();
-        let untouched = store.collection("delta-untouched", policy).unwrap();
-        let first_commit = store.commit(first, &key, fragment(19, parent)).unwrap();
-        let second_commit = store.commit(second, &key, fragment(19, parent)).unwrap();
-        store
-            .commit(untouched, &key, fragment(20, Inline::new([0xD0; 32])))
-            .unwrap();
-        assert_eq!(first_commit.data(), second_commit.data());
-
-        let active = active([first, second, untouched]);
-        let clean = ActiveCollections::new();
-        let before_store = store.snapshot().unwrap();
-        let before = StoreSnapshot::from_store_changes(
-            before_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            None,
-            None,
-            StoreChanges::ALL,
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        let first_before = full(&before, first);
-        let second_before = full(&before, second);
-        let untouched_before = full(&before, untouched);
-
-        store.put::<UnknownBlob, _>(parent_blob).unwrap();
-        store.put::<UnknownBlob, _>(leaf_blob).unwrap();
-        store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"unrelated delta member".to_vec()))
-            .unwrap();
-        let after_store = store.snapshot().unwrap();
-        let resident = resident_blob_set(&after_store).unwrap();
-        let (invalidated, stats) = blob_delta_invalidations(
-            &after_store,
-            &before,
-            before.resident_blobs.as_deref().unwrap(),
-            &resident,
-        );
-        assert_eq!(stats.added, 3);
-        assert_eq!(stats.removed, 0);
-        assert_eq!(stats.parent_scans, stats.unique_parents);
-        assert_eq!(stats.matched_parents, 1);
-        assert_eq!(stats.invalidated_collections, 2);
-        assert!(invalidated.contains(&first.handle().raw));
-        assert!(invalidated.contains(&second.handle().raw));
-        assert!(!invalidated.contains(&untouched.handle().raw));
-
-        let after = StoreSnapshot::from_store_changes(
-            after_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            Some(&before_store),
-            Some(&before),
-            after_store.changes_since(&before_store),
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        assert!(!Arc::ptr_eq(&first_before, &full(&after, first)));
-        assert!(!Arc::ptr_eq(&second_before, &full(&after, second)));
-        assert!(Arc::ptr_eq(&untouched_before, &full(&after, untouched)));
-        for collection in [first, second] {
-            let selective = full(&after, collection);
-            assert!(
-                selective
-                    .forest
-                    .iter_ordered()
-                    .any(|entry| entry[48..] == parent.raw)
-            );
-            assert!(
-                selective
-                    .forest
-                    .iter_ordered()
-                    .any(|entry| entry[48..] == leaf.raw)
-            );
-            let repair = collection_repair_overlay(&after_store, collection.handle()).unwrap();
-            let mut oracle_cache = FullReplicaChildCache::new();
-            let oracle = build_full_replica_state(
-                &after_store,
-                &repair,
-                &resident,
-                &mut oracle_cache,
-                observed_at(),
-            );
-            assert_eq!(selective.forest, oracle.forest);
-            assert_eq!(selective.direct_roots, oracle.direct_roots);
-        }
     }
 
     #[test]
@@ -3105,486 +2048,6 @@ mod tests {
         assert_eq!(
             forward.iter().copied().collect::<BTreeSet<_>>().len(),
             forward.len()
-        );
-    }
-
-    #[test]
-    fn full_forests_rebuild_only_for_semantic_blob_deltas_or_explicit_dirty_marks() {
-        let key = SigningKey::from_bytes(&[0x31; 32]);
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let mut store = MemoryRepo::default();
-        let first = store
-            .collection("selective-full-first", policy.clone())
-            .unwrap();
-        let second = store.collection("selective-full-second", policy).unwrap();
-        store
-            .commit(first, &key, fragment(1, Inline::new([0xA1; 32])))
-            .unwrap();
-        store
-            .commit(second, &key, fragment(2, Inline::new([0xA2; 32])))
-            .unwrap();
-        let active = active([first, second]);
-        let clean = ActiveCollections::new();
-        let first_store = store.snapshot().unwrap();
-        let first_serving = StoreSnapshot::from_store_changes(
-            first_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            None,
-            None,
-            StoreChanges::ALL,
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        let first_before = full(&first_serving, first);
-        let second_before = full(&first_serving, second);
-
-        store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"unrelated cache bytes".to_vec()))
-            .unwrap();
-        store
-            .commit(first, &key, fragment(3, Inline::new([0xA3; 32])))
-            .unwrap();
-        let second_store = store.snapshot().unwrap();
-        let second_serving = StoreSnapshot::from_store_changes(
-            second_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            Some(&first_store),
-            Some(&first_serving),
-            second_store.changes_since(&first_store),
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        let first_changed = full(&second_serving, first);
-        let second_changed = full(&second_serving, second);
-        assert!(!Arc::ptr_eq(&first_before, &first_changed));
-        assert!(Arc::ptr_eq(&second_before, &second_changed));
-
-        store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"another unrelated cache blob".to_vec()))
-            .unwrap();
-        let third_store = store.snapshot().unwrap();
-        let third_serving = StoreSnapshot::from_store_changes(
-            third_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            Some(&second_store),
-            Some(&second_serving),
-            third_store.changes_since(&second_store),
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        assert!(Arc::ptr_eq(&first_changed, &full(&third_serving, first)));
-        assert!(Arc::ptr_eq(&second_changed, &full(&third_serving, second)));
-
-        let mut dirty = ActiveCollections::new();
-        dirty.insert(&PatchEntry::new(&second.handle().raw));
-        let dirty_serving = StoreSnapshot::from_store_changes(
-            third_store.clone(),
-            &active,
-            &dirty,
-            key.verifying_key(),
-            Some(&third_store),
-            Some(&third_serving),
-            StoreChanges::NONE,
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        assert!(Arc::ptr_eq(
-            &full(&third_serving, first),
-            &full(&dirty_serving, first)
-        ));
-        assert!(!Arc::ptr_eq(
-            &full(&third_serving, second),
-            &full(&dirty_serving, second)
-        ));
-    }
-
-    #[test]
-    fn enabling_full_replication_builds_the_previously_absent_forest() {
-        let key = SigningKey::from_bytes(&[0x3B; 32]);
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let mut store = MemoryRepo::default();
-        let collection = store.collection("enable-full", policy).unwrap();
-        store
-            .commit(collection, &key, fragment(24, Inline::new([0xB3; 32])))
-            .unwrap();
-        let active = active([collection]);
-        let clean = ActiveCollections::new();
-        let store_snapshot = store.snapshot().unwrap();
-        let demand = StoreSnapshot::from_store_changes(
-            store_snapshot.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            None,
-            None,
-            StoreChanges::ALL,
-            false,
-            false,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        let demand_full = full(&demand, collection);
-        assert!(demand.resident_blobs.is_none());
-        assert!(demand_full.forest.is_empty());
-
-        let replicated = StoreSnapshot::from_store_changes(
-            store_snapshot.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            Some(&store_snapshot),
-            Some(&demand),
-            StoreChanges::NONE,
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        assert!(replicated.resident_blobs.is_some());
-        assert!(!Arc::ptr_eq(&demand_full, &full(&replicated, collection)));
-        assert!(!full(&replicated, collection).forest.is_empty());
-    }
-
-    #[test]
-    fn generic_blob_arrival_advances_an_active_full_forest() {
-        let key = SigningKey::from_bytes(&[0x35; 32]);
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let child_bytes = Bytes::from_source(b"bearer-fetched child".to_vec());
-        let child = Blob::<UnknownBlob>::new(child_bytes.clone()).get_handle();
-        let mut store = MemoryRepo::default();
-        let collection = store.collection("generic-full-arrival", policy).unwrap();
-        store.commit(collection, &key, fragment(11, child)).unwrap();
-        let active = active([collection]);
-        let clean = ActiveCollections::new();
-        let before_store = store.snapshot().unwrap();
-        let before = StoreSnapshot::from_store_changes(
-            before_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            None,
-            None,
-            StoreChanges::ALL,
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        let before_payload = before.notices()[0].2;
-        assert!(
-            !full(&before, collection)
-                .forest
-                .iter_ordered()
-                .any(|entry| entry[48..] == child.raw)
-        );
-
-        store.put::<UnknownBlob, _>(child_bytes).unwrap();
-        let after_store = store.snapshot().unwrap();
-        let after = StoreSnapshot::from_store_changes(
-            after_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            Some(&before_store),
-            Some(&before),
-            after_store.changes_since(&before_store),
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-
-        assert_ne!(before_payload, after.notices()[0].2);
-        assert!(
-            full(&after, collection)
-                .forest
-                .iter_ordered()
-                .any(|entry| entry[48..] == child.raw)
-        );
-    }
-
-    #[test]
-    fn removed_reachable_handle_invalidates_its_owner_and_matches_full_rebuild() {
-        let key = SigningKey::from_bytes(&[0x39; 32]);
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let mut store = HybridStore::new(MemoryBlobStore::new(), MemoryRepo::default());
-        let child = store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"removable child".to_vec()))
-            .unwrap();
-        let collection = store.collection("delta-removal", policy).unwrap();
-        store.commit(collection, &key, fragment(21, child)).unwrap();
-        let active = active([collection]);
-        let clean = ActiveCollections::new();
-        let before_store = store.snapshot().unwrap();
-        let before = StoreSnapshot::from_store_changes(
-            before_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            None,
-            None,
-            StoreChanges::ALL,
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        let before_full = full(&before, collection);
-        assert!(
-            before_full
-                .forest
-                .iter_ordered()
-                .any(|entry| entry[48..] == child.raw)
-        );
-
-        let retained = store
-            .blobs
-            .snapshot()
-            .unwrap()
-            .blobs()
-            .map(|info| info.unwrap().handle)
-            .filter(|handle| handle.raw != child.raw)
-            .collect::<Vec<_>>();
-        store.blobs.keep(retained);
-        let after_store = store.snapshot().unwrap();
-        let resident = resident_blob_set(&after_store).unwrap();
-        let (invalidated, stats) = blob_delta_invalidations(
-            &after_store,
-            &before,
-            before.resident_blobs.as_deref().unwrap(),
-            &resident,
-        );
-        assert_eq!(stats.added, 0);
-        assert_eq!(stats.removed, 1);
-        assert_eq!(stats.parent_scans, 0);
-        assert!(invalidated.contains(&collection.handle().raw));
-
-        let after = StoreSnapshot::from_store_changes(
-            after_store.clone(),
-            &active,
-            &clean,
-            key.verifying_key(),
-            Some(&before_store),
-            Some(&before),
-            after_store.changes_since(&before_store),
-            false,
-            true,
-            None,
-            observed_at(),
-        )
-        .unwrap();
-        let selective = full(&after, collection);
-        assert!(!Arc::ptr_eq(&before_full, &selective));
-        assert!(
-            !selective
-                .forest
-                .iter_ordered()
-                .any(|entry| entry[48..] == child.raw)
-        );
-        let repair = collection_repair_overlay(&after_store, collection.handle()).unwrap();
-        let mut oracle_cache = FullReplicaChildCache::new();
-        let oracle = build_full_replica_state(
-            &after_store,
-            &repair,
-            &resident,
-            &mut oracle_cache,
-            observed_at(),
-        );
-        assert_eq!(selective.forest, oracle.forest);
-        assert_eq!(selective.direct_roots, oracle.direct_roots);
-    }
-
-    #[tokio::test]
-    async fn nonfinal_full_page_retains_collection_route_until_checkpoint() {
-        let key = SigningKey::from_bytes(&[0x32; 32]);
-        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let child_bytes = Bytes::from_source(b"late collection child".to_vec());
-        let child = Blob::<UnknownBlob>::new(child_bytes.clone());
-        let child_handle = child.get_handle();
-        let mut store = MemoryRepo::default();
-        let collection = store.collection("full-page-route", policy.clone()).unwrap();
-        let untouched = store.collection("full-page-untouched", policy).unwrap();
-        store
-            .commit(collection, &key, fragment(4, child_handle))
-            .unwrap();
-        store
-            .commit(untouched, &key, fragment(5, Inline::new([0xA5; 32])))
-            .unwrap();
-        let (sender, receiver, wiring) = super::wire(id);
-        let observer = sender.clone();
-        let mut peer = Peer::with_wiring(
-            store,
-            ReconcileQos {
-                direction: crate::inventory::ReconcileDirection::Bidirectional,
-                blobs: BlobReplication::Full,
-            },
-            sender,
-            receiver,
-        );
-        peer.activate_collections([collection.handle(), untouched.handle()]);
-        let before = observer.current_snapshot().unwrap();
-        let untouched_before = full(&before, untouched);
-
-        let (first_ack, mut first_acked) = tokio::sync::oneshot::channel();
-        let mut first_page = NetEventBatch::default();
-        first_page
-            .try_push(NetEvent::FullPage {
-                collection: collection.handle(),
-                blobs: vec![(child_handle.raw, child_bytes)],
-                final_page: false,
-                ack: first_ack,
-            })
-            .unwrap();
-        wiring.evt_tx.send(first_page).await.unwrap();
-        peer.refresh();
-        assert!(first_acked.try_recv().is_ok());
-        assert!(Arc::ptr_eq(&before, &observer.current_snapshot().unwrap()));
-
-        let (final_ack, mut final_acked) = tokio::sync::oneshot::channel();
-        let mut final_page = NetEventBatch::default();
-        final_page
-            .try_push(NetEvent::FullPage {
-                collection: collection.handle(),
-                blobs: Vec::new(),
-                final_page: true,
-                ack: final_ack,
-            })
-            .unwrap();
-        wiring.evt_tx.send(final_page).await.unwrap();
-        peer.refresh();
-        assert!(final_acked.try_recv().is_ok());
-        let after = observer.current_snapshot().unwrap();
-        assert!(!Arc::ptr_eq(&before, &after));
-        assert!(
-            Arc::ptr_eq(&untouched_before, &full(&after, untouched)),
-            "a checkpointed arrival must preserve an unrelated Full forest"
-        );
-        assert!(
-            full(&after, collection)
-                .forest
-                .iter_ordered()
-                .any(|key| key[48..] == child_handle.raw)
-        );
-    }
-
-    #[tokio::test]
-    async fn published_blob_arrival_invalidates_only_its_reachable_full_forest() {
-        let key = SigningKey::from_bytes(&[0x34; 32]);
-        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let child_bytes = Bytes::from_source(b"cross-collection partial child".to_vec());
-        let child = Blob::<UnknownBlob>::new(child_bytes.clone());
-        let child_handle = child.get_handle();
-        let mut store = MemoryRepo::default();
-        let partial = store
-            .collection("full-page-partial", policy.clone())
-            .unwrap();
-        let completed = store.collection("full-page-completed", policy).unwrap();
-        store
-            .commit(partial, &key, fragment(9, child_handle))
-            .unwrap();
-        store
-            .commit(completed, &key, fragment(10, Inline::new([0xAA; 32])))
-            .unwrap();
-        let (sender, receiver, wiring) = super::wire(id);
-        let observer = sender.clone();
-        let mut peer = Peer::with_wiring(
-            store,
-            ReconcileQos {
-                direction: crate::inventory::ReconcileDirection::Bidirectional,
-                blobs: BlobReplication::Full,
-            },
-            sender,
-            receiver,
-        );
-        peer.activate_collections([partial.handle(), completed.handle()]);
-        let before = observer.current_snapshot().unwrap();
-        let partial_before = full(&before, partial);
-        let completed_before = full(&before, completed);
-
-        let (partial_ack, mut partial_acked) = tokio::sync::oneshot::channel();
-        let (completed_ack, mut completed_acked) = tokio::sync::oneshot::channel();
-        let mut interleaved = NetEventBatch::default();
-        interleaved
-            .try_push(NetEvent::FullPage {
-                collection: partial.handle(),
-                blobs: vec![(child_handle.raw, child_bytes)],
-                final_page: false,
-                ack: partial_ack,
-            })
-            .unwrap();
-        interleaved
-            .try_push(NetEvent::FullPage {
-                collection: completed.handle(),
-                blobs: Vec::new(),
-                final_page: true,
-                ack: completed_ack,
-            })
-            .unwrap();
-        wiring.evt_tx.send(interleaved).await.unwrap();
-        peer.refresh();
-        assert!(partial_acked.try_recv().is_ok());
-        assert!(completed_acked.try_recv().is_ok());
-        let interleaved_snapshot = observer.current_snapshot().unwrap();
-        assert!(!Arc::ptr_eq(
-            &partial_before,
-            &full(&interleaved_snapshot, partial)
-        ));
-        assert!(Arc::ptr_eq(
-            &completed_before,
-            &full(&interleaved_snapshot, completed)
-        ));
-        assert!(
-            full(&interleaved_snapshot, partial)
-                .forest
-                .iter_ordered()
-                .any(|key| key[48..] == child_handle.raw)
-        );
-
-        let (final_ack, mut final_acked) = tokio::sync::oneshot::channel();
-        let mut final_page = NetEventBatch::default();
-        final_page
-            .try_push(NetEvent::FullPage {
-                collection: partial.handle(),
-                blobs: Vec::new(),
-                final_page: true,
-                ack: final_ack,
-            })
-            .unwrap();
-        wiring.evt_tx.send(final_page).await.unwrap();
-        peer.refresh();
-        assert!(final_acked.try_recv().is_ok());
-        let after = observer.current_snapshot().unwrap();
-        assert!(!Arc::ptr_eq(&partial_before, &full(&after, partial)));
-        assert!(
-            full(&after, partial)
-                .forest
-                .iter_ordered()
-                .any(|key| key[48..] == child_handle.raw)
         );
     }
 
