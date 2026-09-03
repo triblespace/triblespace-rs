@@ -29,7 +29,7 @@ use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
 use triblespace_core::trible::{Fragment, TribleSet};
 
-use crate::path_summary_union::{self, RegularPathMapping};
+use crate::path_summary_union;
 use crate::{Automaton, PathIndex, PathSummaryBlob, Step, Transition};
 
 #[derive(Default)]
@@ -109,11 +109,7 @@ fn test_paths(
 ) -> (Collection<SimpleArchive>, Collection<PathSummaryBlob>) {
     let source = store.collection(name, policy(authority())).unwrap();
     let target = store
-        .derive(
-            source,
-            RegularPathMapping::new(automaton),
-            policy(authority()),
-        )
+        .derive::<PathSummaryBlob>(source, automaton, policy(authority()))
         .unwrap();
     (source, target)
 }
@@ -241,9 +237,9 @@ fn source_and_target_policies_are_independent() {
     let mut store = CollectionOnly::default();
     let source = store.collection("paths", policy(authority())).unwrap();
     let target = store
-        .derive(
+        .derive::<PathSummaryBlob>(
             source,
-            RegularPathMapping::new(plus()),
+            plus(),
             policy(SigningKey::from_bytes(&[2; 32]).verifying_key()),
         )
         .unwrap();
@@ -254,9 +250,9 @@ fn source_and_target_policies_are_independent() {
         )
         .unwrap();
     let other_target = store
-        .derive(
+        .derive::<PathSummaryBlob>(
             other_source,
-            RegularPathMapping::new(plus()),
+            plus(),
             policy(SigningKey::from_bytes(&[2; 32]).verifying_key()),
         )
         .unwrap();
@@ -293,7 +289,7 @@ fn empty_support_is_local_bottom_and_writes_nothing() {
     let blobs = store.0.blobs.len();
     let record_count = records(&mut store).len();
     let support = support(&mut store, source, []);
-    let snapshot = block_on(store.maintain_exact::<RegularPathMapping>(target, &support)).unwrap();
+    let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
     assert_eq!(index(&snapshot, target, &support).accepted_pair_count(), 0);
     assert_eq!(store.0.blobs.len(), blobs);
     assert_eq!(records(&mut store).len(), record_count);
@@ -319,7 +315,7 @@ fn missing_then_maintain_closes_cross_fragment_path() {
         }) if unsupported_members.len() == 2
     ));
 
-    let after = block_on(store.maintain_exact::<RegularPathMapping>(target, &support)).unwrap();
+    let after = block_on(store.maintain_exact(target, &support)).unwrap();
     assert_cross_fragment_path(&index(&after, target, &support));
 }
 
@@ -335,7 +331,7 @@ fn exact_old_support_ignores_a_later_commit_and_equation() {
     publish(&mut store, first);
     publish(&mut store, second);
     let old_support = support(&mut store, source, [first, second]);
-    block_on(store.maintain_exact::<RegularPathMapping>(target, &old_support)).unwrap();
+    block_on(store.maintain_exact(target, &old_support)).unwrap();
 
     let later = put_data(&mut store, &edge(3, 4));
     let third = signed_commit(&mut store, source, 3, &later);
@@ -367,7 +363,7 @@ fn duplicate_payload_provenance_shares_one_derive() {
     publish(&mut store, first);
     publish(&mut store, second);
     let support = support(&mut store, source, [first, first, second]);
-    block_on(store.ensure_exact::<RegularPathMapping>(target, &support)).unwrap();
+    block_on(store.ensure_exact(target, &support)).unwrap();
     let derives = records(&mut store)
         .into_iter()
         .filter(|record| {
@@ -401,7 +397,7 @@ fn resident_source_merge_is_lowered_once() {
         .unwrap();
     let support = support(&mut store, source, [first, second]);
 
-    let snapshot = block_on(store.maintain_exact::<RegularPathMapping>(target, &support)).unwrap();
+    let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
     assert_cross_fragment_path(&index(&snapshot, target, &support));
     let inputs: Vec<_> = records(&mut store)
         .into_iter()

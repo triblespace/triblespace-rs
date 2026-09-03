@@ -168,7 +168,7 @@ use std::sync::Arc;
 use triblespace::core::collection::{
     AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
 };
-use triblespace_paths::{PathIndex, RegularPathMapping};
+use triblespace_paths::{PathIndex, PathSummaryBlob};
 
 let source_policy = CollectionPolicy::new(
     AdmissionPolicy::direct(source_reader),
@@ -179,20 +179,14 @@ let index_policy = CollectionPolicy::new(
     AdmissionPolicy::direct(index_writer),
 );
 let source = store.collection("social", source_policy)?;
-let paths = store.derive_with(
-    source,
-    RegularPathMapping::new(friend_automaton),
-    index_policy,
-)?;
+let paths = store.derive::<PathSummaryBlob>(source, friend_automaton, index_policy)?;
 
 let before = store.snapshot()?;
 let instant = triblespace::core::clock::epoch_now();
 let support = source.admitted_at(&before, instant)?;
 drop(before);
 
-let after = store
-    .maintain_exact_with::<RegularPathMapping>(paths, &support)
-    .await?;
+let after = store.maintain_exact(paths, &support).await?;
 let observed = after.collection_exact(paths, &support)?;
 let index: Arc<PathIndex> = observed.view()?;
 ```
@@ -266,7 +260,7 @@ would miss such paths. Merge order remains irrelevant because closure is
 derived only after the canonical semilattice join.
 
 The low-level `path_summary_union` module exposes the concrete law directly.
-`store.derive_with(source, RegularPathMapping::new(automaton), policy)` identifies
+`store.derive::<PathSummaryBlob>(source, automaton, policy)` identifies
 one target lattice by the handle of the collection it summarises, the
 `PathSummaryBlob` representation, the canonical automaton fingerprint, and its
 independent policy.

@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blob and interpret `PathSummaryBlob` members through that immutable child.
   The existing 32-byte fingerprint header is already the BLAKE3 handle of the
   canonical wire, so summary bytes and handles remain unchanged; new mapping
-  fragments carry the automaton blob in their attachment closure.
+  fragments carry the automaton blob in their attachment closure. Make
+  `PathSummaryBlob` own this canonical derivation with `Automaton` as its
+  runtime argument, removing the separate `RegularPathMapping` witness from
+  derive, ensure, and maintain calls without changing persisted descriptors.
 - Let active exact collection realization recover from a dangling immediate
   `DERIVE` whose output cannot be acquired. When its source input is resident,
   the unusable equation remains semantically invisible and the canonical

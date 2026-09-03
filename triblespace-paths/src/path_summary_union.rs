@@ -27,7 +27,7 @@ use triblespace_core::collection::descriptor;
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
-    CollectionData, CollectionEncoding, CollectionMapping, CollectionOperationError, Cover,
+    CollectionData, CollectionDerivation, CollectionEncoding, CollectionOperationError, Cover,
     TryFromCover, TryFromCoverError,
 };
 use triblespace_core::id::{ExclusiveId, Id};
@@ -277,62 +277,43 @@ impl CollectionEncoding for PathSummaryBlob {
     }
 }
 
-/// Canonical lowering from fact-union members to path-summary members.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RegularPathMapping {
-    automaton: Automaton,
-    automaton_handle: Inline<Handle<PathAutomatonBlob>>,
-}
-
-impl RegularPathMapping {
-    /// Bind one canonical regular-path mapping to its complete automaton.
-    pub fn new(automaton: Automaton) -> Self {
-        let automaton_handle = PathAutomatonBlob::encode(&automaton).get_handle();
-        Self {
-            automaton,
-            automaton_handle,
-        }
-    }
-
-    /// Automaton carried by this concrete mapping instance.
-    pub fn automaton(&self) -> &Automaton {
-        &self.automaton
-    }
-}
-
-impl CollectionMapping for RegularPathMapping {
+impl CollectionDerivation for PathSummaryBlob {
     type Source = SimpleArchive;
-    type Target = PathSummaryBlob;
+    type Argument = Automaton;
 
-    fn fragment(&self) -> Fragment {
-        mapping_fragment(&self.automaton)
+    fn fragment(automaton: &Self::Argument) -> Fragment {
+        mapping_fragment(automaton)
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+    fn bind(
+        _source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self::Argument, CollectionOperationError> {
         require_regular_path_mapping(target)?;
-        Ok(Self::new(automaton_from_descriptor(target)?))
+        automaton_from_descriptor(target)
     }
 
     fn map<R>(
-        &self,
+        automaton: &Self::Argument,
         source: &Blob<SimpleArchive>,
         reader: &R,
-    ) -> Result<Blob<PathSummaryBlob>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
     {
+        let automaton_handle = PathAutomatonBlob::encode(automaton).get_handle();
         let resident = reader
-            .metadata(self.automaton_handle)
+            .metadata(automaton_handle)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
             .is_some();
         if !resident {
             return Err(CollectionOperationError::MissingDependency(Handle::<
                 PathAutomatonBlob,
             >::to_hash(
-                self.automaton_handle,
+                automaton_handle,
             )));
         }
-        derive_element(source, &self.automaton).map_err(|source| match source {
+        derive_element(source, automaton).map_err(|source| match source {
             RegularPathMappingError::Summary(PathSummaryBlobError::CapacityOverflow) => {
                 CollectionOperationError::Capacity(source.to_string())
             }
@@ -895,7 +876,7 @@ mod tests {
         let expected_handle = expected_automaton.get_handle();
         let historical_mapping =
             mapping_fragment_with_fingerprint(&automaton, Inline::new(expected_handle.raw));
-        let attached_mapping = mapping_fragment(&automaton);
+        let attached_mapping = <PathSummaryBlob as CollectionDerivation>::fragment(&automaton);
         assert_eq!(attached_mapping.facts(), historical_mapping.facts());
         assert_eq!(attached_mapping.root(), historical_mapping.root());
 

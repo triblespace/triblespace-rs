@@ -17,7 +17,7 @@ use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
 use triblespace_paths::{
-    automaton_fingerprint, GraphEdge, PathExpr, PathIndex, RegularPathMapping, Step,
+    automaton_fingerprint, GraphEdge, PathExpr, PathIndex, PathSummaryBlob, Step,
 };
 
 fn vertex(byte: u8) -> RawInline {
@@ -99,11 +99,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     let mut store = MemoryRepo::default();
     let source = store.collection(name, policy.clone()).unwrap();
     let target = store
-        .derive(
-            source,
-            RegularPathMapping::new(expression.compile()),
-            policy,
-        )
+        .derive::<PathSummaryBlob>(source, expression.compile(), policy)
         .unwrap();
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);
@@ -115,7 +111,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     let support = source
         .admitted_at(&snapshot, triblespace_core::clock::epoch_now())
         .unwrap();
-    let snapshot = block_on(store.maintain_exact::<RegularPathMapping>(target, &support)).unwrap();
+    let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
     let index: Arc<PathIndex> = snapshot
         .collection_exact(target, &support)
         .unwrap()
