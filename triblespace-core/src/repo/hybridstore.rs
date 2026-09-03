@@ -20,7 +20,7 @@ use crate::repo::SnapshotSource;
 use crate::repo::StorageFlush;
 use crate::repo::StoreChanges;
 use crate::repo::StoreSnapshot;
-use crate::repo::{WantRequest, WantStore};
+use crate::repo::{WantRead, WantRequest, WantStore};
 use std::error::Error;
 use std::fmt;
 
@@ -41,8 +41,8 @@ pub struct HybridStore<B, R> {
 /// [`HybridStore`].
 ///
 /// Blob capabilities come exclusively from `blobs`; collection and proof
-/// capabilities come exclusively from `records`. Wants remain mutable
-/// local operational state and are intentionally absent. The record
+/// capabilities come exclusively from `records`. Wants come from the frozen
+/// blob-side observation. The record
 /// half is sampled first and the blob half second, mirroring dependency-first
 /// publication: every semantic record observed by a conforming writer can
 /// therefore see the blobs published before it.
@@ -65,6 +65,9 @@ where
         let mut changes = StoreChanges::NONE;
         if blob_changes.contains(StoreChanges::BLOBS) {
             changes = changes.union(StoreChanges::BLOBS);
+        }
+        if blob_changes.contains(StoreChanges::WANTS) {
+            changes = changes.union(StoreChanges::WANTS);
         }
         for component in [
             StoreChanges::COLLECTION_RECORDS,
@@ -375,17 +378,22 @@ where
 {
     type WantError = B::WantError;
 
-    type WantIter<'a>
-        = B::WantIter<'a>
-    where
-        B: 'a,
-        R: 'a;
-
     fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
         self.blobs.want(request)
     }
+}
 
-    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
+impl<B, R> WantRead for HybridSnapshot<B, R>
+where
+    B: WantRead,
+{
+    type WantsError = B::WantsError;
+    type WantIter<'a>
+        = B::WantIter<'a>
+    where
+        Self: 'a;
+
+    fn wants<'a>(&'a self) -> Result<Self::WantIter<'a>, Self::WantsError> {
         self.blobs.wants()
     }
 }
@@ -492,15 +500,19 @@ mod tests {
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
 
         hybrid.want(request).unwrap();
+        let snapshot = hybrid.snapshot().unwrap();
         assert_eq!(
-            hybrid
+            snapshot
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
             vec![request]
         );
-        assert_eq!(hybrid.blobs.wants().unwrap().count(), 1);
-        assert_eq!(hybrid.records.wants().unwrap().count(), 0);
+        assert_eq!(hybrid.blobs.snapshot().unwrap().wants().unwrap().count(), 1);
+        assert_eq!(
+            hybrid.records.snapshot().unwrap().wants().unwrap().count(),
+            0
+        );
     }
 }

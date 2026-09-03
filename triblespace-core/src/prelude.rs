@@ -94,6 +94,7 @@ pub use crate::repo::Store;
 pub use crate::repo::StoreChanges;
 pub use crate::repo::StoreRead;
 pub use crate::repo::StoreSnapshot;
+pub use crate::repo::WantRead;
 pub use crate::repo::WantRequest;
 pub use crate::repo::WantRequestDecodeError;
 pub use crate::repo::WantStore;

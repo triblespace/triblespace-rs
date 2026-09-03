@@ -76,9 +76,12 @@ impl StoreChanges {
     pub const COLLECTION_RECORDS: Self = Self(1 << 1);
     /// Complete capability proofs may have changed.
     pub const CAPABILITY_PROOFS: Self = Self(1 << 2);
+    /// Durable WANT requests may have changed.
+    pub const WANTS: Self = Self(1 << 3);
     /// Every sync-visible component may have changed.
-    pub const ALL: Self =
-        Self(Self::BLOBS.0 | Self::COLLECTION_RECORDS.0 | Self::CAPABILITY_PROOFS.0);
+    pub const ALL: Self = Self(
+        Self::BLOBS.0 | Self::COLLECTION_RECORDS.0 | Self::CAPABILITY_PROOFS.0 | Self::WANTS.0,
+    );
 
     /// Whether every bit in `change` is present.
     pub const fn contains(self, change: Self) -> bool {
@@ -401,7 +404,13 @@ where
 
 /// Immutable read surface of a complete repository snapshot.
 pub trait StoreRead:
-    StoreSnapshot + BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead + CapabilityProofRead
+    StoreSnapshot
+    + BlobStoreGet
+    + BlobStoreList
+    + BlobStoreMeta
+    + CollectionRead
+    + CapabilityProofRead
+    + WantRead
 {
 }
 
@@ -412,6 +421,7 @@ impl<R> StoreRead for R where
         + BlobStoreMeta
         + CollectionRead
         + CapabilityProofRead
+        + WantRead
 {
 }
 
@@ -835,13 +845,27 @@ fn read_want_field(bytes: &[u8; WANT_REQUEST_BYTES_LEN], index: usize) -> [u8; I
         .expect("validated fixed-width want request field")
 }
 
-/// Storage backend for durable typed wants.
+/// Immutable enumeration of one frozen durable-WANT observation.
+pub trait WantRead {
+    /// Error while enumerating the frozen request set.
+    type WantsError: Error + Debug + Send + Sync + 'static;
+
+    /// Iterator over the frozen grow-only request set.
+    type WantIter<'a>: Iterator<Item = Result<WantRequest, Self::WantsError>>
+    where
+        Self: 'a;
+
+    /// List the request set captured by this observation.
+    fn wants<'a>(&'a self) -> Result<Self::WantIter<'a>, Self::WantsError>;
+}
+
+/// Insertion capability for durable typed wants.
 ///
 /// Wants are an idempotent grow-only set, independent of legacy named-pin
 /// evidence and native collection records. A backend may support either
 /// capability without supporting the other. Repeated [`want`](Self::want)
-/// calls for one exact request have no additional effect, and
-/// [`wants`](Self::wants) enumerates the set. Exact-content requests are
+/// calls for one exact request have no additional effect. Frozen enumeration
+/// is exposed separately through [`WantRead`]. Exact-content requests are
 /// identified solely by their bearer handle.
 ///
 /// Forgetting is deliberately not a counter-record operation. A physical
@@ -853,16 +877,8 @@ pub trait WantStore {
     /// Error type for want operations.
     type WantError: Error + Debug + Send + Sync + 'static;
 
-    /// Iterator over the current grow-only request set.
-    type WantIter<'a>: Iterator<Item = Result<WantRequest, Self::WantError>>
-    where
-        Self: 'a;
-
     /// Add durable interest in `request` idempotently.
     fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError>;
-
-    /// List the current request set.
-    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError>;
 }
 
 #[cfg(test)]

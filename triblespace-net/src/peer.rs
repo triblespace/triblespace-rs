@@ -608,8 +608,8 @@ mod tests {
         CapabilityResource,
     };
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
-    use triblespace_core::repo::CapabilityProofRead;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{CapabilityProofRead, WantRead};
 
     use crate::channel::NetEventBatch;
 
@@ -629,7 +629,7 @@ mod tests {
         let missing = Inline::<Handle<UnknownBlob>>::new([0x5a; 32]);
 
         assert!(peer.acquire(missing).await.unwrap().is_none());
-        assert!(peer.store().wants().unwrap().next().is_none());
+        assert!(peer.snapshot().unwrap().wants().unwrap().next().is_none());
     }
 
     #[test]
@@ -719,8 +719,8 @@ mod tests {
 
         peer.try_refresh().unwrap();
         let mut store = peer.into_store();
-        assert_eq!(store.wants().unwrap().count(), 0);
         let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.wants().unwrap().count(), 0);
         assert_eq!(
             snapshot
                 .proofs()

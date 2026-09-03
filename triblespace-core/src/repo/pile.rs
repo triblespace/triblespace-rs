@@ -2460,6 +2460,7 @@ pub struct PileSnapshot {
     collection_records: CollectionRecordIndex,
     collection_records_by_collection: CollectionRecordCollectionIndex,
     capability_proofs: CapabilityProofIndex,
+    wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
 }
 
 /// Census of retired LWW WANT input relative to the current monotone set.
@@ -2489,6 +2490,7 @@ impl PileSnapshot {
         collection_records: CollectionRecordIndex,
         collection_records_by_collection: CollectionRecordCollectionIndex,
         capability_proofs: CapabilityProofIndex,
+        wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
     ) -> Self {
         Self {
             mmap,
@@ -2498,6 +2500,7 @@ impl PileSnapshot {
             collection_records,
             collection_records_by_collection,
             capability_proofs,
+            wants,
         }
     }
 
@@ -2620,6 +2623,9 @@ impl super::StoreSnapshot for PileSnapshot {
         if previous.capability_proofs != self.capability_proofs {
             changes = changes.union(super::StoreChanges::CAPABILITY_PROOFS);
         }
+        if previous.wants != self.wants {
+            changes = changes.union(super::StoreChanges::WANTS);
+        }
         changes
     }
 }
@@ -2638,6 +2644,7 @@ impl super::SnapshotSource for Pile {
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
             self.capability_proofs.clone(),
+            self.wants.clone(),
         ))
     }
 }
@@ -4280,18 +4287,29 @@ impl super::PinSnapshotSource for Pile {
 
 impl WantStore for Pile {
     type WantError = PileWriteError;
-    type WantIter<'a> = PileWantIter;
-
     /// Add `request` idempotently; call [`Pile::flush`] to make it
     /// crash-durable.
     fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
         self.write_want_marker(request)
     }
+}
 
-    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
-        // Ensure newly appended records are applied before enumerating so
-        // external writers are visible to callers (mirrors `pins`).
-        self.refresh()?;
+#[cfg(test)]
+impl Pile {
+    pub(crate) fn wants(&mut self) -> Result<PileWantIter, PileWriteError> {
+        let snapshot = self.snapshot().map_err(|error| match error {
+            ReadError::IoError(error) => PileWriteError::IoError(error),
+            error => panic!("test WANT snapshot failed: {error}"),
+        })?;
+        super::WantRead::wants(&snapshot)
+    }
+}
+
+impl super::WantRead for PileSnapshot {
+    type WantsError = PileWriteError;
+    type WantIter<'a> = PileWantIter;
+
+    fn wants<'a>(&'a self) -> Result<Self::WantIter<'a>, Self::WantsError> {
         let cloned = self.wants.clone();
         Ok(PileWantIter {
             inner: cloned.into_iter_ordered(),
@@ -4871,6 +4889,7 @@ mod tests {
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
     use crate::repo::{
         BlobStoreMeta, RetentionRoots, SnapshotSource, StorageClose, StoreChanges, StoreSnapshot,
+        WantRead,
     };
     use crate::trible::TribleSet;
 
@@ -8645,8 +8664,10 @@ mod tests {
         let after_external_want = observer.snapshot().unwrap();
         assert_eq!(
             after_external_want.changes_since(&empty),
-            StoreChanges::NONE
+            StoreChanges::WANTS
         );
+        assert!(empty.wants().unwrap().next().is_none());
+        assert_eq!(after_external_want.wants().unwrap().count(), 1);
 
         writer
             .put::<UnknownBlob, _>(Blob::new(Bytes::from_source(vec![0xB2; 17])))

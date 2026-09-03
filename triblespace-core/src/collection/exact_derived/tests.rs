@@ -23,6 +23,7 @@ use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use crate::repo::{
     BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
     CapabilityProofRead, CapabilityProofStore, SnapshotSource, StoreChanges, StoreSnapshot,
+    WantRead,
 };
 use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -407,6 +408,15 @@ impl Drop for GuardSnapshot {
 impl StoreSnapshot for GuardSnapshot {
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
+    }
+}
+
+impl WantRead for GuardSnapshot {
+    type WantsError = <MemoryRepoSnapshot as WantRead>::WantsError;
+    type WantIter<'a> = <MemoryRepoSnapshot as WantRead>::WantIter<'a>;
+
+    fn wants<'a>(&'a self) -> Result<Self::WantIter<'a>, Self::WantsError> {
+        self.inner.wants()
     }
 }
 

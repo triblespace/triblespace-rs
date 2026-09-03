@@ -19,7 +19,7 @@ use triblespace_core::collection::{
 };
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, CapabilityProofStore, SnapshotSource, StorageFlush,
-    StoreRead, WantRequest, WantStore,
+    StoreRead, WantRead, WantRequest, WantStore,
 };
 
 use crate::peer::Peer;
@@ -91,14 +91,21 @@ impl Reconciler {
         // This is also the explicit external-Pile reobservation and inventory
         // admission boundary.
         peer.refresh();
-        let requests: Vec<WantRequest> = {
-            let mut store = peer.store();
-            match store.wants() {
-                Ok(wants) => wants.filter_map(Result::ok).collect(),
-                Err(error) => {
-                    tracing::warn!(?error, "WANT enumeration failed; skipping reconcile pass");
-                    return stats;
-                }
+        let snapshot = match peer.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "store snapshot unavailable; skipping reconcile pass"
+                );
+                return stats;
+            }
+        };
+        let requests: Vec<WantRequest> = match snapshot.wants() {
+            Ok(wants) => wants.filter_map(Result::ok).collect(),
+            Err(error) => {
+                tracing::warn!(?error, "WANT enumeration failed; skipping reconcile pass");
+                return stats;
             }
         };
         stats.wants = requests.len();
@@ -126,18 +133,6 @@ impl Reconciler {
             .copied()
             .map(CollectionRecordSelector::Operation)
             .collect();
-        let snapshot = match peer.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    "store snapshot unavailable; skipping reconcile pass"
-                );
-                stats.missing = operation_wants.len() + blob_wants.len();
-                stats.pending = stats.missing;
-                return stats;
-            }
-        };
         let answered_operations: HashSet<_> = {
             match snapshot.select_records(&selectors) {
                 Ok(records) => records

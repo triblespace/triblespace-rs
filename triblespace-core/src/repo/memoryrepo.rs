@@ -20,7 +20,7 @@ use crate::prelude::*;
 use crate::repo::proof::{CapabilityProofRead, CapabilityProofStore};
 use crate::repo::{
     BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, SnapshotSource,
-    StoreChanges, StoreSnapshot, WantRequest, WantStore,
+    StoreChanges, StoreSnapshot, WantRead, WantRequest, WantStore,
 };
 
 use crate::inline::encodings::hash::Handle;
@@ -51,13 +51,13 @@ pub struct MemoryRepo {
 ///
 /// The blob snapshot and all semantic indexes are frozen together, so
 /// collection admission, capability verification, and payload decoding cannot
-/// observe different prefixes. Local wants are operational state and
-/// intentionally excluded.
+/// observe different prefixes.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MemoryRepoSnapshot {
     blobs: MemoryBlobStoreSnapshot,
     collection_records: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
+    wants: HashSet<WantRequest>,
 }
 
 impl StoreSnapshot for MemoryRepoSnapshot {
@@ -72,6 +72,9 @@ impl StoreSnapshot for MemoryRepoSnapshot {
         if previous.capability_proofs != self.capability_proofs {
             changes = changes.union(StoreChanges::CAPABILITY_PROOFS);
         }
+        if previous.wants != self.wants {
+            changes = changes.union(StoreChanges::WANTS);
+        }
         changes
     }
 }
@@ -85,6 +88,7 @@ impl SnapshotSource for MemoryRepo {
             blobs: self.blobs.snapshot()?,
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
+            wants: self.wants.clone(),
         })
     }
 }
@@ -400,14 +404,24 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
 impl WantStore for MemoryRepo {
     type WantError = Infallible;
 
-    type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, Self::WantError>>;
-
     fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
         self.wants.insert(request);
         Ok(())
     }
+}
 
-    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
+#[cfg(test)]
+impl MemoryRepo {
+    fn wants(&mut self) -> Result<std::vec::IntoIter<Result<WantRequest, Infallible>>, Infallible> {
+        self.snapshot()?.wants()
+    }
+}
+
+impl WantRead for MemoryRepoSnapshot {
+    type WantsError = Infallible;
+    type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, Self::WantsError>>;
+
+    fn wants<'a>(&'a self) -> Result<Self::WantIter<'a>, Self::WantsError> {
         // Want enumeration feeds sync-daemon fetch order, and HashSet's
         // per-instance seed would break deterministic simulation replay.
         let mut requests: Vec<WantRequest> = self.wants.iter().copied().collect();
@@ -767,11 +781,11 @@ mod tests {
         let mut repo = MemoryRepo::default();
         let empty = repo.snapshot().unwrap();
 
-        // WANT is local operational policy, not advertised inventory.
         repo.want(WantRequest::blob(handle(1))).unwrap();
         let after_want = repo.snapshot().unwrap();
-        assert!(empty == after_want);
-        assert_eq!(after_want.changes_since(&empty), StoreChanges::NONE,);
+        assert!(empty.wants().unwrap().next().is_none());
+        assert_eq!(after_want.wants().unwrap().count(), 1);
+        assert_eq!(after_want.changes_since(&empty), StoreChanges::WANTS);
 
         repo.put::<UTF8String, _>("revision fixture".to_owned())
             .unwrap();

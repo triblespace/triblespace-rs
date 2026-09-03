@@ -38,7 +38,7 @@ use super::proof::{CapabilityProofRead, CapabilityProofStore};
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
     RetentionRoots, SnapshotSource, StorageClose, StoreChanges, StoreSnapshot, TransferError,
-    WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
+    WantRead, WantRequest, WantStore, WANT_REQUEST_BYTES_LEN,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -260,8 +260,11 @@ impl Yard {
         let mut want_state = WantState::default();
         for generation in generations.iter_mut().rev() {
             for segment in &mut generation.segments {
+                let path = segment.path.clone();
                 let requests = segment
                     .pile_mut()
+                    .snapshot()
+                    .map_err(|err| YardOpenError::Pile { path, err })?
                     .wants()
                     .map_err(update_err_io)?
                     .collect::<Result<Vec<_>, _>>()
@@ -860,8 +863,6 @@ impl CollectionStore for Yard {
 impl WantStore for Yard {
     type WantError = PileWriteError;
 
-    type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, PileWriteError>>;
-
     /// Assert one exact request and persist its marker to the young
     /// generation's pile, so it survives a restart ([`Yard::open`] reloads
     /// it).
@@ -877,12 +878,18 @@ impl WantStore for Yard {
             .want(request);
         Ok(())
     }
+}
 
-    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
-        let items: Vec<Result<WantRequest, PileWriteError>> = {
-            let want_state = self.want_state.lock().expect("want mutex poisoned");
-            want_state.requests().into_iter().map(Ok).collect()
-        };
+#[cfg(test)]
+impl Yard {
+    fn wants(
+        &mut self,
+    ) -> Result<std::vec::IntoIter<Result<WantRequest, std::convert::Infallible>>, ReadError> {
+        let items = self
+            .snapshot()?
+            .wants()
+            .expect("infallible")
+            .collect::<Vec<_>>();
         Ok(items.into_iter())
     }
 }
@@ -935,7 +942,12 @@ impl SnapshotSource for Yard {
                 });
             }
         }
-        Ok(YardSnapshot { generations })
+        let wants = self
+            .want_state
+            .lock()
+            .expect("want mutex poisoned")
+            .requests();
+        Ok(YardSnapshot { generations, wants })
     }
 }
 
@@ -982,6 +994,19 @@ struct YardGenerationSnapshot {
 #[derive(Debug, Clone)]
 pub struct YardSnapshot {
     generations: Vec<YardGenerationSnapshot>,
+    wants: Vec<WantRequest>,
+}
+
+impl WantRead for YardSnapshot {
+    type WantsError = std::convert::Infallible;
+    type WantIter<'a> = std::iter::Map<
+        std::slice::Iter<'a, WantRequest>,
+        fn(&WantRequest) -> Result<WantRequest, Self::WantsError>,
+    >;
+
+    fn wants<'a>(&'a self) -> Result<Self::WantIter<'a>, Self::WantsError> {
+        Ok(self.wants.iter().map(|request| Ok(*request)))
+    }
 }
 
 impl YardSnapshot {
@@ -1033,16 +1058,22 @@ impl StoreSnapshot for YardSnapshot {
             return StoreChanges::ALL;
         }
 
-        previous.generations.iter().zip(&self.generations).fold(
-            StoreChanges::NONE,
-            |mut changes, (previous, current)| {
+        previous
+            .generations
+            .iter()
+            .zip(&self.generations)
+            .fold(StoreChanges::NONE, |mut changes, (previous, current)| {
                 changes = changes.union(current.snapshot.changes_since(&previous.snapshot));
                 if previous.live != current.live {
                     changes = changes.union(StoreChanges::BLOBS);
                 }
                 changes
-            },
-        )
+            })
+            .union(if previous.wants != self.wants {
+                StoreChanges::WANTS
+            } else {
+                StoreChanges::NONE
+            })
     }
 }
 
@@ -1543,7 +1574,9 @@ mod tests {
         )))
         .unwrap();
         let after_want = yard.snapshot().unwrap();
-        assert_eq!(after_want.changes_since(&empty), StoreChanges::NONE);
+        assert!(empty.wants().unwrap().next().is_none());
+        assert_eq!(after_want.wants().unwrap().count(), 1);
+        assert_eq!(after_want.changes_since(&empty), StoreChanges::WANTS);
 
         yard.put::<RawBytes, _>(raw_blob(b"revision fixture"))
             .unwrap();
@@ -1554,7 +1587,7 @@ mod tests {
         let after_collect = yard.snapshot().unwrap();
         assert_eq!(
             after_collect.changes_since(&after_blob),
-            StoreChanges::BLOBS,
+            StoreChanges::BLOBS.union(StoreChanges::WANTS),
         );
     }
 
