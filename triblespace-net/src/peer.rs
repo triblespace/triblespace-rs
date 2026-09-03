@@ -556,6 +556,48 @@ where
     }
 }
 
+impl<S> CollectionStore for Peer<S>
+where
+    S: BlobStore
+        + CollectionStore
+        + CapabilityProofStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
+    S::Snapshot: StoreRead + BlobChildren,
+{
+    type InsertError = <S as CollectionStore>::InsertError;
+
+    fn insert(
+        &mut self,
+        record: triblespace_core::collection::CollectionRecord,
+    ) -> Result<(), Self::InsertError> {
+        self.store.lock().expect("store mutex").insert(record)
+    }
+}
+
+impl<S> CapabilityProofStore for Peer<S>
+where
+    S: BlobStore
+        + CollectionStore
+        + CapabilityProofStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
+    S::Snapshot: StoreRead + BlobChildren,
+{
+    type InsertError = <S as CapabilityProofStore>::InsertError;
+
+    fn insert_proof(
+        &mut self,
+        proof: triblespace_core::capability::CapabilityProof,
+    ) -> Result<(), Self::InsertError> {
+        self.store.lock().expect("store mutex").insert_proof(proof)
+    }
+}
+
 impl<S> BlobStorePut for Peer<S>
 where
     S: BlobStore
@@ -611,11 +653,22 @@ mod tests {
     };
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{CapabilityProofRead, WantRead};
+    use triblespace_core::repo::{CapabilityProofRead, Store, WantRead};
 
     use crate::channel::NetEventBatch;
 
     use super::*;
+
+    #[test]
+    fn peer_is_a_live_collection_store() {
+        fn assert_live_collection_store<S>()
+        where
+            S: Store + AsyncBlobStoreAcquire,
+        {
+        }
+
+        assert_live_collection_store::<Peer<MemoryRepo>>();
+    }
 
     #[tokio::test]
     async fn active_acquire_miss_does_not_record_a_want() {
