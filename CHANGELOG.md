@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ensure_with`, and `maintain_with` seam for downstream mappings between two
   foreign encoding types that Rust's orphan rule prevents either crate from
   attaching to the target.
+- Retain each canonical regular-path automaton as a typed content-addressed
+  blob and interpret `PathSummaryBlob` members through that immutable child.
+  The existing 32-byte fingerprint header is already the BLAKE3 handle of the
+  canonical wire, so summary bytes and handles remain unchanged; new mapping
+  fragments carry the automaton blob in their attachment closure.
 - Let active exact collection realization recover from a dangling immediate
   `DERIVE` whose output cannot be acquired. When its source input is resident,
   the unusable equation remains semantically invisible and the canonical

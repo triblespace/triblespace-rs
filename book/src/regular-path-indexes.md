@@ -226,10 +226,14 @@ exactly the foundational support represented by it.
    payload set; and
 2. the target frontier has a complete resident target `Cover`.
 
-Only then does `view::<Arc<PathIndex>>()` use the target descriptor's embedded
-automaton, join the selected summaries, and close them once into the endpoint
-relation. The automaton is descriptor context, not mutable state retained in a
-lifecycle facade.
+Only then does `view::<Arc<PathIndex>>()` load the canonical automaton blob
+named by every selected summary, join those summaries, and close them once
+into the endpoint relation. For the empty cover, the descriptor names the same
+blob so the canonical bottom remains available. The mapping descriptor carries
+the automaton facts for source-to-target derivation and retains its blob in the
+descriptor closure; interpretation otherwise uses the immutable
+content-addressed representation dependency rather than mutable state retained
+in a lifecycle facade.
 
 `CollectionStoreExt::ensure{_exact}` asynchronously acquires exact missing
 dependencies and publishes missing `DERIVE` work only; `maintain{_exact}`
@@ -277,7 +281,7 @@ paths(∅) = ⊥
 paths(a ∪ b) = paths(a) ⊔ paths(b)
 ```
 
-The bottom is an explicit 48-byte summary: automaton fingerprint, state count,
+The bottom is an explicit 48-byte summary: automaton-blob handle, state count,
 and zero vertex and arc counts. Derivation is therefore total even for an empty
 source or a non-nullable source with no matching labels.
 

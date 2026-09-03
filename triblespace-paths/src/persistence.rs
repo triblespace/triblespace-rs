@@ -6,7 +6,7 @@ use triblespace_core::blob::{Blob, BlobEncoding};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::id_hex;
 use triblespace_core::inline::encodings::genid::GenId;
-use triblespace_core::inline::encodings::hash::{Blake3, Hash};
+use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::encodings::iu256::U256BE;
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::{self, MetaDescribe};
@@ -16,12 +16,16 @@ use triblespace_core::trible::Fragment;
 use crate::{Automaton, GraphEdge, PathError, PathSummary, Step};
 
 const HEADER_LEN: usize = 48;
-const FINGERPRINT_VERSION: u32 = 1;
-// The automaton wire domain separator is the bytes of the stable
+const AUTOMATON_BLOB_HEADER_LEN: usize = 40;
+const AUTOMATON_BLOB_VERSION: u32 = 1;
+// The automaton blob domain separator is the bytes of the stable
 // path-summary-v2 algorithm anchor `341216BFE738E2D82BFFF96F52E7FE06`, minted
 // with `trible genid` on 2026-07-28 when canonical summaries were restricted
-// to matched support plus nullable identity.
-const AUTOMATON_FINGERPRINT_DOMAIN: [u8; 16] = [
+// to matched support plus nullable identity. This is deliberately the exact
+// wire previously hashed by `automaton_fingerprint`: retaining those bytes as
+// a blob turns every existing fingerprint into its content handle without
+// changing one path-summary byte.
+const AUTOMATON_BLOB_DOMAIN: [u8; 16] = [
     0x34, 0x12, 0x16, 0xbf, 0xe7, 0x38, 0xe2, 0xd8, 0x2b, 0xff, 0xf9, 0x6f, 0x52, 0xe7, 0xfe, 0x06,
 ];
 
@@ -55,6 +59,90 @@ attributes! {
     /// transitions have one; exclusion transitions have zero or more. Minted
     /// with `trible genid` on 2026-08-29.
     "FD88EA3256CD24545BEB7759E7DBA6FA" as pub path_transition_label: U256BE;
+}
+
+/// Canonical portable bytes of one fixed epsilon-free path automaton.
+///
+/// A [`PathSummaryBlob`] stores this blob's content handle in its first 32
+/// bytes. The automaton is therefore an immutable representation dependency,
+/// not descriptor-local decoding state. The canonical wire is byte-for-byte
+/// the input historically used by [`automaton_fingerprint`], preserving every
+/// existing summary handle.
+pub struct PathAutomatonBlob;
+
+impl BlobEncoding for PathAutomatonBlob {}
+
+impl MetaDescribe for PathAutomatonBlob {
+    fn describe() -> Fragment {
+        // Minted with `trible genid` on 2026-09-04:
+        // 5360AFD4486A38C31C5D73A290D8B54A
+        let id: Id = id_hex!("5360AFD4486A38C31C5D73A290D8B54A");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name: "path-automaton-v1",
+            metadata::description: "Canonical portable epsilon-free path automaton: fixed domain and version, state count, ordered initial and accepting state sets, and ordered labeled transitions. Its content handle is embedded by PathSummaryBlob as an immutable representation dependency.",
+            metadata::tag: metadata::KIND_BLOB_ENCODING,
+        }
+    }
+}
+
+/// Failure to decode one canonical [`PathAutomatonBlob`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PathAutomatonBlobError {
+    /// The fixed prefix or one count-delimited section is truncated.
+    BadLength,
+    /// The blob does not carry the canonical path-automaton domain.
+    WrongDomain,
+    /// The blob uses an unknown canonical wire version.
+    UnsupportedVersion(u32),
+    /// A transition carries an unknown step opcode.
+    InvalidOpcode(u8),
+    /// An exact forward or reverse transition does not carry one label.
+    InvalidExactLabelCount,
+    /// State numbers or mandatory state sets do not form an automaton.
+    InvalidAutomaton(crate::AutomatonError),
+    /// The decoded automaton re-encodes to different bytes.
+    NonCanonical,
+}
+
+impl fmt::Display for PathAutomatonBlobError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadLength => formatter.write_str("path-automaton blob has an invalid length"),
+            Self::WrongDomain => formatter.write_str("path-automaton blob has the wrong domain"),
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported path-automaton blob version {version}"
+                )
+            }
+            Self::InvalidOpcode(opcode) => {
+                write!(
+                    formatter,
+                    "path-automaton transition has invalid opcode {opcode}"
+                )
+            }
+            Self::InvalidExactLabelCount => formatter
+                .write_str("an exact path-automaton transition must carry exactly one label"),
+            Self::InvalidAutomaton(source) => source.fmt(formatter),
+            Self::NonCanonical => {
+                formatter.write_str("path-automaton blob is not canonically encoded")
+            }
+        }
+    }
+}
+
+impl Error for PathAutomatonBlobError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidAutomaton(source) => Some(source),
+            Self::BadLength
+            | Self::WrongDomain
+            | Self::UnsupportedVersion(_)
+            | Self::InvalidOpcode(_)
+            | Self::InvalidExactLabelCount
+            | Self::NonCanonical => None,
+        }
+    }
 }
 
 /// Canonical direct-product summary bytes for one fixed automaton.
@@ -130,6 +218,25 @@ impl Error for PathSummaryBlobError {
 }
 
 impl PathSummaryBlob {
+    /// Read the canonical automaton dependency embedded at offset zero.
+    ///
+    /// The 32 bytes were historically described as the automaton fingerprint.
+    /// Because that fingerprint hashes the exact canonical
+    /// [`PathAutomatonBlob`] bytes, it is also the typed content handle without
+    /// any format change.
+    pub fn automaton_handle(
+        blob: &Blob<Self>,
+    ) -> Result<Inline<Handle<PathAutomatonBlob>>, PathSummaryBlobError> {
+        if blob.bytes.len() < HEADER_LEN {
+            return Err(PathSummaryBlobError::BadLength);
+        }
+        Ok(Inline::new(
+            blob.bytes.as_ref()[..32]
+                .try_into()
+                .expect("checked 32-byte automaton handle"),
+        ))
+    }
+
     /// Canonical bottom element for one fixed automaton.
     pub fn empty(automaton: &Automaton) -> Blob<Self> {
         let summary = PathSummary::from_edges(automaton.clone(), std::iter::empty::<GraphEdge>());
@@ -166,10 +273,10 @@ impl PathSummaryBlob {
             .checked_add(vertex_bytes)
             .and_then(|length| length.checked_add(arc_bytes))
             .ok_or(PathSummaryBlobError::CapacityOverflow)?;
-        let fingerprint = automaton_fingerprint(summary.automaton());
+        let automaton = PathAutomatonBlob::encode(summary.automaton()).get_handle();
 
         let mut bytes = Vec::with_capacity(capacity);
-        bytes.extend_from_slice(&fingerprint.raw);
+        bytes.extend_from_slice(&automaton.raw);
         bytes.extend_from_slice(&summary.automaton().state_count().to_le_bytes());
         bytes.extend_from_slice(&vertex_count.to_le_bytes());
         bytes.extend_from_slice(&arc_count.to_le_bytes());
@@ -263,8 +370,8 @@ fn validate_header(
     if bytes.len() < HEADER_LEN {
         return Err(PathSummaryBlobError::BadLength);
     }
-    let expected_fingerprint = automaton_fingerprint(automaton);
-    if bytes[..32] != expected_fingerprint.raw {
+    let expected_automaton = PathAutomatonBlob::encode(automaton).get_handle();
+    if bytes[..32] != expected_automaton.raw {
         return Err(PathSummaryBlobError::DifferentAutomaton);
     }
     let state_count = read_u32(bytes, 32);
@@ -354,8 +461,7 @@ fn transition_wire(transition: &crate::Transition) -> Vec<u8> {
     bytes
 }
 
-/// Stable wire fingerprint of a canonical fixed automaton.
-pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
+fn automaton_wire(automaton: &Automaton) -> Vec<u8> {
     let initial = automaton.initial_states().collect::<Vec<_>>();
     let accepting = automaton.accepting_states().collect::<Vec<_>>();
     let mut transitions = automaton
@@ -366,8 +472,8 @@ pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
     transitions.sort_unstable();
 
     let mut wire = Vec::new();
-    wire.extend_from_slice(&AUTOMATON_FINGERPRINT_DOMAIN);
-    push_u32(&mut wire, FINGERPRINT_VERSION);
+    wire.extend_from_slice(&AUTOMATON_BLOB_DOMAIN);
+    push_u32(&mut wire, AUTOMATON_BLOB_VERSION);
     push_u32(&mut wire, automaton.state_count());
     push_u32(
         &mut wire,
@@ -390,7 +496,153 @@ pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
     for transition in transitions {
         wire.extend_from_slice(&transition);
     }
-    Inline::new(Blake3::digest(&wire))
+    wire
+}
+
+struct AutomatonWireReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> AutomatonWireReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], PathAutomatonBlobError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(PathAutomatonBlobError::BadLength)?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(PathAutomatonBlobError::BadLength)?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn u8(&mut self) -> Result<u8, PathAutomatonBlobError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, PathAutomatonBlobError> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("four checked bytes"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, PathAutomatonBlobError> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?.try_into().expect("eight checked bytes"),
+        ))
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+impl PathAutomatonBlob {
+    /// Encode one canonical automaton into its portable content-addressed form.
+    pub fn encode(automaton: &Automaton) -> Blob<Self> {
+        Blob::new(automaton_wire(automaton).into())
+    }
+
+    /// Decode and verify one canonical automaton blob.
+    pub fn decode(blob: &Blob<Self>) -> Result<Automaton, PathAutomatonBlobError> {
+        let bytes = blob.bytes.as_ref();
+        if bytes.len() < AUTOMATON_BLOB_HEADER_LEN {
+            return Err(PathAutomatonBlobError::BadLength);
+        }
+
+        let mut wire = AutomatonWireReader::new(bytes);
+        if wire.take(AUTOMATON_BLOB_DOMAIN.len())? != AUTOMATON_BLOB_DOMAIN {
+            return Err(PathAutomatonBlobError::WrongDomain);
+        }
+        let version = wire.u32()?;
+        if version != AUTOMATON_BLOB_VERSION {
+            return Err(PathAutomatonBlobError::UnsupportedVersion(version));
+        }
+        let state_count = wire.u32()?;
+        let initial_count = wire.u32()? as usize;
+        let accepting_count = wire.u32()? as usize;
+        let transition_count =
+            usize::try_from(wire.u64()?).map_err(|_| PathAutomatonBlobError::BadLength)?;
+
+        let state_bytes = initial_count
+            .checked_add(accepting_count)
+            .and_then(|count| count.checked_mul(4))
+            .ok_or(PathAutomatonBlobError::BadLength)?;
+        if state_bytes > wire.remaining() {
+            return Err(PathAutomatonBlobError::BadLength);
+        }
+        let mut initial = Vec::with_capacity(initial_count);
+        for _ in 0..initial_count {
+            initial.push(wire.u32()?);
+        }
+        let mut accepting = Vec::with_capacity(accepting_count);
+        for _ in 0..accepting_count {
+            accepting.push(wire.u32()?);
+        }
+
+        // Every transition needs at least from, to, opcode, and label count.
+        // Bound the allocation before trusting the count from untrusted bytes.
+        if transition_count > wire.remaining() / 17 {
+            return Err(PathAutomatonBlobError::BadLength);
+        }
+        let mut transitions = Vec::with_capacity(transition_count);
+        for _ in 0..transition_count {
+            let from = wire.u32()?;
+            let to = wire.u32()?;
+            let opcode = wire.u8()?;
+            let label_count =
+                usize::try_from(wire.u64()?).map_err(|_| PathAutomatonBlobError::BadLength)?;
+            let label_bytes = label_count
+                .checked_mul(16)
+                .ok_or(PathAutomatonBlobError::BadLength)?;
+            if label_bytes > wire.remaining() {
+                return Err(PathAutomatonBlobError::BadLength);
+            }
+            let mut labels = Vec::with_capacity(label_count);
+            for _ in 0..label_count {
+                labels.push(wire.take(16)?.try_into().expect("sixteen checked bytes"));
+            }
+            let step = match (opcode, labels.as_slice()) {
+                (0, [label]) => Step::Forward(*label),
+                (1, [label]) => Step::Reverse(*label),
+                (0 | 1, _) => return Err(PathAutomatonBlobError::InvalidExactLabelCount),
+                (2, labels) => Step::ForwardExcept(labels.to_vec()),
+                (3, labels) => Step::ReverseExcept(labels.to_vec()),
+                (opcode, _) => return Err(PathAutomatonBlobError::InvalidOpcode(opcode)),
+            };
+            transitions.push(crate::Transition::new(from, to, step));
+        }
+        if !wire.is_empty() {
+            return Err(PathAutomatonBlobError::BadLength);
+        }
+
+        let automaton = Automaton::new(state_count, initial, accepting, transitions)
+            .map_err(PathAutomatonBlobError::InvalidAutomaton)?;
+        if automaton_wire(&automaton) != bytes {
+            return Err(PathAutomatonBlobError::NonCanonical);
+        }
+        Ok(automaton)
+    }
+}
+
+/// Content handle of the canonical automaton wire, exposed under its historic
+/// fingerprint schema.
+///
+/// The raw bytes are also an `Inline<Handle<PathAutomatonBlob>>`; the Hash
+/// return type is retained because this function and the existing mapping fact
+/// predate the retained automaton blob.
+pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
+    Inline::new(PathAutomatonBlob::encode(automaton).get_handle().raw)
 }
 
 #[cfg(test)]
@@ -429,6 +681,52 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn automaton_blob_retains_the_historic_fingerprint_wire() {
+        let automaton = Automaton::new(
+            3,
+            [0, 1],
+            [1, 2],
+            [
+                Transition::new(0, 1, Step::Forward(label(7))),
+                Transition::new(1, 2, Step::ReverseExcept(vec![label(9), label(8)])),
+            ],
+        )
+        .unwrap();
+        let blob = PathAutomatonBlob::encode(&automaton);
+
+        assert_eq!(blob.get_handle().raw, automaton_fingerprint(&automaton).raw);
+        assert_eq!(PathAutomatonBlob::decode(&blob).unwrap(), automaton);
+
+        let summary = PathSummary::from_edges(automaton, [edge(1, 7, 2)]);
+        let summary = PathSummaryBlob::encode(&summary).unwrap();
+        assert_eq!(
+            PathSummaryBlob::automaton_handle(&summary).unwrap(),
+            blob.get_handle()
+        );
+    }
+
+    #[test]
+    fn automaton_blob_rejects_noncanonical_and_trailing_bytes() {
+        let automaton = Automaton::new(3, [0, 1], [2], []).unwrap();
+        let canonical = PathAutomatonBlob::encode(&automaton);
+
+        let mut noncanonical = canonical.bytes.as_ref().to_vec();
+        noncanonical[40..44].copy_from_slice(&1u32.to_le_bytes());
+        noncanonical[44..48].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            PathAutomatonBlob::decode(&Blob::new(noncanonical.into())).unwrap_err(),
+            PathAutomatonBlobError::NonCanonical,
+        );
+
+        let mut trailing = canonical.bytes.as_ref().to_vec();
+        trailing.push(0);
+        assert_eq!(
+            PathAutomatonBlob::decode(&Blob::new(trailing.into())).unwrap_err(),
+            PathAutomatonBlobError::BadLength,
+        );
     }
 
     #[test]

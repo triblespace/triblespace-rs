@@ -27,8 +27,8 @@ use triblespace_core::collection::descriptor;
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
-    CollectionEncoding, CollectionMapping, CollectionOperationError, Cover, TryFromCover,
-    TryFromCoverError,
+    CollectionData, CollectionEncoding, CollectionMapping, CollectionOperationError, Cover,
+    TryFromCover, TryFromCoverError,
 };
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::id_hex;
@@ -40,9 +40,10 @@ use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 use crate::persistence::{
-    automaton_fingerprint, path_automaton_accepting_state, path_automaton_fingerprint,
-    path_automaton_initial_state, path_automaton_state_count, path_automaton_transition,
-    path_transition_from, path_transition_kind, path_transition_label, path_transition_to,
+    path_automaton_accepting_state, path_automaton_fingerprint, path_automaton_initial_state,
+    path_automaton_state_count, path_automaton_transition, path_transition_from,
+    path_transition_kind, path_transition_label, path_transition_to, PathAutomatonBlob,
+    PathAutomatonBlobError,
 };
 use crate::{
     Automaton, GraphEdge, PathError, PathIndex, PathSummary, PathSummaryBlob, PathSummaryBlobError,
@@ -97,7 +98,12 @@ impl MetaDescribe for RegularPathMappingV1 {
 }
 
 fn mapping_fragment(automaton: &Automaton) -> Fragment {
-    mapping_fragment_with_fingerprint(automaton, automaton_fingerprint(automaton))
+    let automaton_blob = PathAutomatonBlob::encode(automaton);
+    let fingerprint = Inline::new(automaton_blob.get_handle().raw);
+    let mut fragment = mapping_fragment_with_fingerprint(automaton, fingerprint);
+    let attached = fragment.put::<PathAutomatonBlob, _>(automaton_blob);
+    debug_assert_eq!(attached.raw, fingerprint.raw);
+    fragment
 }
 
 fn mapping_fragment_with_fingerprint(
@@ -143,8 +149,63 @@ fn transition_fragment(transition: &Transition) -> Fragment {
     }
 }
 
-/// Bind the canonical path-summary encoding to the automaton carried by each
-/// concrete descriptor's mapping fragment.
+fn descriptor_automaton_handle(
+    descriptor_fragment: &Fragment,
+) -> Result<Inline<Handle<PathAutomatonBlob>>, CollectionOperationError> {
+    let raw =
+        descriptor::mapping_argument(descriptor_fragment.facts(), path_automaton_fingerprint.id())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
+            .ok_or_else(|| {
+                CollectionOperationError::Fatal(
+                    "regular-path mapping is missing path_automaton_fingerprint".to_owned(),
+                )
+            })?;
+    Ok(Inline::new(raw))
+}
+
+fn require_member_automaton(
+    descriptor: &Fragment,
+    member: &Blob<PathSummaryBlob>,
+) -> Result<Inline<Handle<PathAutomatonBlob>>, CollectionOperationError> {
+    let expected = descriptor_automaton_handle(descriptor)?;
+    let actual = PathSummaryBlob::automaton_handle(member)
+        .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+    if actual != expected {
+        return Err(CollectionOperationError::Fatal(
+            "path-summary member names an automaton outside its collection".to_owned(),
+        ));
+    }
+    Ok(actual)
+}
+
+fn resident_automaton<R>(
+    handle: Inline<Handle<PathAutomatonBlob>>,
+    reader: &R,
+) -> Result<Automaton, CollectionOperationError>
+where
+    R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+{
+    let resident = reader
+        .metadata(handle)
+        .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
+        .is_some();
+    if !resident {
+        return Err(CollectionOperationError::MissingDependency(Handle::<
+            PathAutomatonBlob,
+        >::to_hash(
+            handle
+        )));
+    }
+    let blob: Blob<PathAutomatonBlob> = reader
+        .get(handle)
+        .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+    PathAutomatonBlob::decode(&blob)
+        .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+}
+
+/// Bind the canonical path-summary collection to the automaton named by its
+/// mapping while loading representation semantics from each member's exact
+/// immutable automaton child.
 impl CollectionEncoding for PathSummaryBlob {
     fn validate_descriptor(descriptor: &Fragment) -> Result<(), CollectionOperationError> {
         let source = descriptor::source(descriptor.facts())
@@ -160,27 +221,58 @@ impl CollectionEncoding for PathSummaryBlob {
     fn validate_member<R>(
         descriptor: &Fragment,
         member: &Blob<Self>,
-        _reader: &R,
+        reader: &R,
     ) -> Result<(), CollectionOperationError>
     where
-        R: triblespace_core::repo::BlobStoreGet,
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
     {
-        let automaton = automaton_from_descriptor(descriptor)?;
+        let handle = require_member_automaton(descriptor, member)?;
+        let automaton = resident_automaton(handle, reader)?;
         PathSummaryBlob::decode(member.clone(), &automaton)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
         Ok(())
+    }
+
+    fn missing_representation_dependencies<R>(
+        member: CollectionData,
+        reader: &R,
+    ) -> Result<Vec<CollectionData>, CollectionOperationError>
+    where
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+    {
+        let root = reader
+            .get::<Blob<Self>, Self>(Handle::<Self>::from_hash(member))
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        let automaton = PathSummaryBlob::automaton_handle(&root)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
+        let resident = reader
+            .metadata(automaton)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
+            .is_some();
+        Ok(if resident {
+            Vec::new()
+        } else {
+            vec![Handle::<PathAutomatonBlob>::to_hash(automaton)]
+        })
     }
 
     fn join_members<R>(
         descriptor: &Fragment,
         low: &Blob<Self>,
         high: &Blob<Self>,
-        _reader: &R,
+        reader: &R,
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
-        R: triblespace_core::repo::BlobStoreGet,
+        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
     {
-        let automaton = automaton_from_descriptor(descriptor)?;
+        let low_automaton = require_member_automaton(descriptor, low)?;
+        let high_automaton = require_member_automaton(descriptor, high)?;
+        if low_automaton != high_automaton {
+            return Err(CollectionOperationError::Fatal(
+                "cannot join path summaries for different automata".to_owned(),
+            ));
+        }
+        let automaton = resident_automaton(low_automaton, reader)?;
         PathSummaryBlob::join(low, high, &automaton).map_err(summary_operation_error)
     }
 }
@@ -189,12 +281,17 @@ impl CollectionEncoding for PathSummaryBlob {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegularPathMapping {
     automaton: Automaton,
+    automaton_handle: Inline<Handle<PathAutomatonBlob>>,
 }
 
 impl RegularPathMapping {
     /// Bind one canonical regular-path mapping to its complete automaton.
     pub fn new(automaton: Automaton) -> Self {
-        Self { automaton }
+        let automaton_handle = PathAutomatonBlob::encode(&automaton).get_handle();
+        Self {
+            automaton,
+            automaton_handle,
+        }
     }
 
     /// Automaton carried by this concrete mapping instance.
@@ -213,19 +310,28 @@ impl CollectionMapping for RegularPathMapping {
 
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         require_regular_path_mapping(target)?;
-        Ok(Self {
-            automaton: automaton_from_descriptor(target)?,
-        })
+        Ok(Self::new(automaton_from_descriptor(target)?))
     }
 
     fn map<R>(
         &self,
         source: &Blob<SimpleArchive>,
-        _reader: &R,
+        reader: &R,
     ) -> Result<Blob<PathSummaryBlob>, CollectionOperationError>
     where
         R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
     {
+        let resident = reader
+            .metadata(self.automaton_handle)
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
+            .is_some();
+        if !resident {
+            return Err(CollectionOperationError::MissingDependency(Handle::<
+                PathAutomatonBlob,
+            >::to_hash(
+                self.automaton_handle,
+            )));
+        }
         derive_element(source, &self.automaton).map_err(|source| match source {
             RegularPathMappingError::Summary(PathSummaryBlobError::CapacityOverflow) => {
                 CollectionOperationError::Capacity(source.to_string())
@@ -321,9 +427,11 @@ impl TryFromCover<PathSummaryBlob> for PathSummaryView {
 /// Failure to close one realized path-summary cover into its endpoint index.
 #[derive(Debug)]
 pub enum PathIndexViewError {
-    /// The target descriptor did not carry one valid regular-path automaton.
+    /// The target descriptor did not name one regular-path automaton.
     Descriptor(CollectionOperationError),
-    /// A selected summary did not decode under the descriptor's automaton.
+    /// The named automaton blob was not canonically encoded.
+    Automaton(PathAutomatonBlobError),
+    /// A selected summary did not decode under its named automaton.
     Summary(PathSummaryBlobError),
     /// Closing the joined summary into the accepted endpoint relation failed.
     Index(PathError),
@@ -333,6 +441,7 @@ impl fmt::Display for PathIndexViewError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Descriptor(source) => source.fmt(formatter),
+            Self::Automaton(source) => source.fmt(formatter),
             Self::Summary(source) => source.fmt(formatter),
             Self::Index(source) => source.fmt(formatter),
         }
@@ -343,6 +452,7 @@ impl Error for PathIndexViewError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Descriptor(source) => Some(source),
+            Self::Automaton(source) => Some(source),
             Self::Summary(source) => Some(source),
             Self::Index(source) => Some(source),
         }
@@ -360,8 +470,44 @@ impl TryFromCover<PathSummaryBlob> for Arc<PathIndex> {
     where
         R: triblespace_core::repo::BlobStoreGet,
     {
-        let automaton = automaton_from_descriptor(descriptor)
+        let expected_automaton = descriptor_automaton_handle(descriptor)
             .map_err(PathIndexViewError::Descriptor)
+            .map_err(TryFromCoverError::View)?;
+        // A non-empty physical cover carries its own representation context:
+        // follow the immutable child named by a member. The descriptor remains
+        // the collection's admission expectation and supplies the only
+        // possible anchor for the empty cover.
+        let automaton_handle = match cover.members().next() {
+            Some(handle) => {
+                let member = Handle::<PathSummaryBlob>::to_hash(handle);
+                let blob = snapshot
+                    .get(handle)
+                    .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+                let actual = PathSummaryBlob::automaton_handle(&blob)
+                    .map_err(PathIndexViewError::Summary)
+                    .map_err(TryFromCoverError::View)?;
+                if actual != expected_automaton {
+                    return Err(TryFromCoverError::View(PathIndexViewError::Descriptor(
+                        CollectionOperationError::Fatal(
+                            "path-summary member names an automaton outside its collection"
+                                .to_owned(),
+                        ),
+                    )));
+                }
+                actual
+            }
+            None => expected_automaton,
+        };
+        let automaton_member = Handle::<PathAutomatonBlob>::to_hash(automaton_handle);
+        let automaton_blob =
+            snapshot
+                .get(automaton_handle)
+                .map_err(|source| TryFromCoverError::MemberGet {
+                    member: automaton_member,
+                    source,
+                })?;
+        let automaton = PathAutomatonBlob::decode(&automaton_blob)
+            .map_err(PathIndexViewError::Automaton)
             .map_err(TryFromCoverError::View)?;
         let mut joined = PathSummaryBlob::empty(&automaton);
         for handle in cover.members() {
@@ -442,15 +588,9 @@ fn automaton_from_descriptor(
     }
     let automaton = Automaton::new(state_count, initial, accepting, transitions)
         .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-    let expected = automaton_fingerprint(&automaton);
-    let actual = descriptor::mapping_argument(facts, path_automaton_fingerprint.id())
-        .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-    let actual = actual.ok_or_else(|| {
-        CollectionOperationError::Fatal(
-            "regular-path mapping is missing path_automaton_fingerprint".to_owned(),
-        )
-    })?;
-    if actual != expected.raw {
+    let expected = PathAutomatonBlob::encode(&automaton).get_handle();
+    let actual = descriptor_automaton_handle(descriptor_fragment)?;
+    if actual != expected {
         return Err(CollectionOperationError::Fatal(
             "regular-path mapping automaton facts do not match its fingerprint".to_owned(),
         ));
@@ -576,6 +716,7 @@ mod tests {
     use triblespace_core::inline::RawInline;
     use triblespace_core::metadata;
     use triblespace_core::prelude::entity;
+    use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
     use triblespace_core::trible::Fragment;
     use triblespace_core::trible::TribleSet;
 
@@ -619,7 +760,15 @@ mod tests {
     }
 
     fn summary_descriptor(source: CollectionHandle, automaton: &Automaton) -> Fragment {
-        summary_descriptor_with_fingerprint(source, automaton, automaton_fingerprint(automaton))
+        let policy = policy();
+        entity! { _ @
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: source,
+            collection_read_policy*: policy.read().fragment(),
+            collection_write_policy*: policy.write().fragment(),
+            collection_representation*: <PathSummaryBlob as MetaDescribe>::describe(),
+            collection_mapping*: mapping_fragment(automaton),
+        }
     }
 
     fn summary_descriptor_with_fingerprint(
@@ -741,6 +890,19 @@ mod tests {
         .unwrap();
         let source = collection_of(&source_collection());
         let descriptor = summary_descriptor(source, &automaton);
+
+        let expected_automaton = PathAutomatonBlob::encode(&automaton);
+        let expected_handle = expected_automaton.get_handle();
+        let historical_mapping =
+            mapping_fragment_with_fingerprint(&automaton, Inline::new(expected_handle.raw));
+        let attached_mapping = mapping_fragment(&automaton);
+        assert_eq!(attached_mapping.facts(), historical_mapping.facts());
+        assert_eq!(attached_mapping.root(), historical_mapping.root());
+
+        let mut attachments = descriptor.blobs().clone();
+        let attachment_snapshot = attachments.snapshot().unwrap();
+        let attached: Blob<PathAutomatonBlob> = attachment_snapshot.get(expected_handle).unwrap();
+        assert_eq!(attached.bytes, expected_automaton.bytes);
 
         assert_eq!(
             descriptor::mapping(descriptor.facts()),
