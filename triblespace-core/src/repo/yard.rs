@@ -1573,7 +1573,7 @@ mod tests {
         let after_collect = yard.snapshot().unwrap();
         assert_eq!(
             after_collect.changes_since(&after_blob),
-            StoreChanges::BLOBS.union(StoreChanges::WANTS),
+            StoreChanges::BLOBS,
         );
     }
 
