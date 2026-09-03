@@ -40,9 +40,9 @@ pub use crate::blob::IntoBlob;
 pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;
 pub use crate::collection::{
-    Collection, CollectionEncoding, CollectionRead, CollectionSnapshot, CollectionSnapshotExt,
-    CollectionStore, CollectionStoreExt, Cover, Support, TryFromCover, TryFromCoverError,
-    VerifyingKey,
+    Collection, CollectionDerivation, CollectionEncoding, CollectionMapping, CollectionRead,
+    CollectionSnapshot, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Cover, Support,
+    TryFromCover, TryFromCoverError, VerifyingKey,
 };
 pub use crate::id::fucid;
 pub use crate::id::genid;

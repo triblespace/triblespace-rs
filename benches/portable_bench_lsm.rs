@@ -70,12 +70,9 @@ use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::encodings::utf8string::UTF8String;
-use triblespace_core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace_core::collection::{
     AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
@@ -766,10 +763,10 @@ fn main() {
                 .collection(name, policy.clone())
                 .expect("register source collection");
             let raw = store
-                .derive(source, SimpleToSuccinctMapping, policy.clone())
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
                 .expect("register raw Succinct projection");
             let accelerated = store
-                .derive(raw, RawToRank9AcceleratedMapping, policy.clone())
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy.clone())
                 .expect("register accelerated Succinct projection");
             for chunk in &chunks {
                 store
@@ -783,12 +780,10 @@ fn main() {
             drop(snapshot);
 
             let t = Instant::now();
-            block_on(store.maintain_exact::<SimpleToSuccinctMapping>(raw, &support))
+            block_on(store.maintain_exact(raw, &support))
                 .expect("maintain exact raw Succinct cover");
-            let snapshot = block_on(
-                store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support),
-            )
-            .expect("maintain exact accelerated Succinct cover");
+            let snapshot = block_on(store.maintain_exact(accelerated, &support))
+                .expect("maintain exact accelerated Succinct cover");
             let attached = snapshot
                 .collection_exact(accelerated, &support)
                 .expect("observe exact accelerated Succinct cover");

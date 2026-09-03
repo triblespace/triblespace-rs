@@ -2,8 +2,8 @@
 //! [`SimpleArchive`](crate::blob::encodings::simplearchive::SimpleArchive).
 //!
 //! SimpleArchive and raw SuccinctArchive each own canonical set union for
-//! their bytes. The concrete mapping between them witnesses that the
-//! canonical conversion preserves those joins:
+//! their bytes. The target-owned derivation witnesses that the canonical
+//! conversion preserves those joins:
 //!
 //! ```text
 //! succinct(a ∪ b) = succinct(a) ∪ succinct(b)
@@ -39,7 +39,7 @@ use crate::metadata::MetaDescribe;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
 
 use super::{
-    CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMapping,
+    CollectionData, CollectionDerivation, CollectionDerive, CollectionEncoding, CollectionHandle,
     CollectionMerge, CollectionOperationError,
 };
 
@@ -272,19 +272,18 @@ fn mapping_fragment() -> Fragment {
     }
 }
 
-/// Bound canonical SimpleArchive-to-SuccinctArchive mapping.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SimpleToSuccinctMapping;
-
-impl CollectionMapping for SimpleToSuccinctMapping {
+impl CollectionDerivation for SuccinctArchiveBlob {
     type Source = SimpleArchive;
-    type Target = SuccinctArchiveBlob;
+    type Argument = ();
 
-    fn fragment(&self) -> Fragment {
+    fn fragment(_argument: &Self::Argument) -> Fragment {
         mapping_fragment()
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+    fn bind(
+        _source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self::Argument, CollectionOperationError> {
         let actual = descriptor_facts::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
         let expected = Some(SIMPLE_TO_SUCCINCT_MAPPING_V1);
@@ -295,11 +294,11 @@ impl CollectionMapping for SimpleToSuccinctMapping {
                 format!("{:X}", expected.expect("mapping algorithm")),
             )));
         }
-        Ok(Self)
+        Ok(())
     }
 
     fn map<R>(
-        &self,
+        _argument: &Self::Argument,
         source: &Blob<SimpleArchive>,
         _reader: &R,
     ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError>
@@ -376,19 +375,18 @@ fn rank9_accelerated_mapping_fragment() -> Fragment {
     }
 }
 
-/// Bound canonical raw-to-accelerated SuccinctArchive mapping.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RawToRank9AcceleratedMapping;
-
-impl CollectionMapping for RawToRank9AcceleratedMapping {
+impl CollectionDerivation for Rank9AcceleratedSuccinctArchiveBlob {
     type Source = SuccinctArchiveBlob;
-    type Target = Rank9AcceleratedSuccinctArchiveBlob;
+    type Argument = ();
 
-    fn fragment(&self) -> Fragment {
+    fn fragment(_argument: &Self::Argument) -> Fragment {
         rank9_accelerated_mapping_fragment()
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+    fn bind(
+        _source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self::Argument, CollectionOperationError> {
         let actual = descriptor_facts::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
         let expected = Some(current_rank9_accelerated_mapping_algorithm());
@@ -399,11 +397,11 @@ impl CollectionMapping for RawToRank9AcceleratedMapping {
                 format!("{:X}", expected.expect("mapping algorithm")),
             )));
         }
-        Ok(Self)
+        Ok(())
     }
 
     fn map<R>(
-        &self,
+        _argument: &Self::Argument,
         source: &Blob<SuccinctArchiveBlob>,
         _reader: &R,
     ) -> Result<Blob<Rank9AcceleratedSuccinctArchiveBlob>, CollectionOperationError>
@@ -609,7 +607,8 @@ impl Error for SuccinctArchiveUnionValidationError {
 ///
 #[cfg(test)]
 pub(crate) fn descriptor(source: CollectionHandle, policy: CollectionPolicy) -> Fragment {
-    descriptor_facts::deriving(source, &SimpleToSuccinctMapping, policy)
+    let mapping = crate::collection::CanonicalDerivation::<SuccinctArchiveBlob>::new(());
+    descriptor_facts::deriving_with(source, &mapping, policy)
 }
 
 /// Return the canonical empty raw SuccinctArchive artifact.

@@ -128,13 +128,20 @@ SuccinctArchive, the root embeds its exact raw source handle. Its canonical join
 names the corresponding raw union as an immutable dependency and succeeds once
 that blob is resident.
 
-### Collection Mapping
-A parameterized source-to-target conversion exposed by `CollectionMapping`
-through its associated `Source` and `Target` encodings. Its mapping entity is
-embedded in the target descriptor and names both a stable algorithm and its concrete
-parameters. It maps ordinary source blobs to ordinary target blobs. The
-mathematical contract is a join homomorphism over their logical values:
+### Collection Derivation
+A parameterized source-to-target conversion owned by the target encoding's
+`CollectionDerivation` implementation. Its associated `Source` fixes the
+incoming encoding, while `Argument` carries the concrete runtime parameters in
+the target descriptor's mapping entity. It maps ordinary source blobs to
+ordinary target blobs. The mathematical contract is a join homomorphism over
+their logical values:
 `f(a ⊔ b) = f(a) ⊔ f(b)`.
+
+When neither encoding crate can own that implementation, `CollectionMapping`
+is the coherence-safe explicit extension seam. The `derive_with`,
+`ensure_with`, and `maintain_with` operations select such a mapping value or
+type; both surfaces execute the same derivation engine and persist the same
+descriptor facts.
 
 ### Collection Store
 A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is

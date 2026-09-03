@@ -58,7 +58,9 @@ use super::{
     DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ,
     ACTION_WRITE,
 };
-use super::{AdmissionPolicy, CollectionMapping, CollectionPolicy};
+use super::{
+    AdmissionPolicy, CanonicalDerivation, CollectionDerivation, CollectionMapping, CollectionPolicy,
+};
 
 /// Failure to discover the resident capability evidence used for collection
 /// admission.
@@ -1998,9 +2000,30 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 
     /// Create and register one canonical derived collection.
     ///
-    /// The mapping value owns its concrete parameters and description; its
-    /// associated target encoding owns the target representation.
-    fn derive<M>(
+    /// The target encoding owns its canonical source relation; `argument`
+    /// carries only the runtime values embedded in this concrete mapping.
+    fn derive<T>(
+        &mut self,
+        source: Collection<T::Source>,
+        argument: T::Argument,
+        policy: CollectionPolicy,
+    ) -> Result<Collection<T>, CollectionRegistrationError<<Self as BlobStorePut>::PutError>>
+    where
+        T: CollectionDerivation,
+    {
+        self.derive_with::<CanonicalDerivation<T>>(
+            source,
+            CanonicalDerivation::new(argument),
+            policy,
+        )
+    }
+
+    /// Create and register one collection through an explicit mapping value.
+    ///
+    /// This lower-level extension point remains available when Rust's orphan
+    /// rule prevents either encoding crate from owning the canonical
+    /// [`CollectionDerivation`] implementation.
+    fn derive_with<M>(
         &mut self,
         source: Collection<M::Source>,
         mapping: M,
@@ -2009,7 +2032,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     where
         M: CollectionMapping,
     {
-        self.register_collection::<M::Target>(descriptor::deriving(
+        self.register_collection::<M::Target>(descriptor::deriving_with(
             source.handle(),
             &mapping,
             policy,
@@ -2025,7 +2048,20 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// cross-lattice `DERIVE` work is published. The returned store snapshot
     /// observes everything published by this work and by any concurrent
     /// writer before that final observation.
-    fn ensure<M>(
+    fn ensure<T>(
+        &mut self,
+        target: Collection<T>,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
+    where
+        T: CollectionDerivation,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<T>: InlineEncoding,
+    {
+        self.ensure_with::<CanonicalDerivation<T>>(target)
+    }
+
+    /// Ensure the admitted support through one explicit mapping type.
+    fn ensure_with<M>(
         &mut self,
         target: Collection<M::Target>,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
@@ -2042,7 +2078,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             let mut frontier = OperationFrontier::new(before);
             let support =
                 admitted_support_with_acquisition(self, target, &frontier, instant).await?;
-            super::exact_derived::ensure_exact_in_frontier::<Self, M>(
+            super::exact_derived::ensure_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
                 &support,
@@ -2061,7 +2097,21 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// and policy. Existing equations may be reused, but this operation only
     /// publishes missing `DERIVE` work. Any exact missing dependency may be
     /// acquired by the live store before the operation gives up.
-    fn ensure_exact<M>(
+    fn ensure_exact<T>(
+        &mut self,
+        target: Collection<T>,
+        support: &Support,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
+    where
+        T: CollectionDerivation,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<T>: InlineEncoding,
+    {
+        self.ensure_exact_with::<CanonicalDerivation<T>>(target, support)
+    }
+
+    /// Ensure one explicit support through one explicit mapping type.
+    fn ensure_exact_with<M>(
         &mut self,
         target: Collection<M::Target>,
         support: &Support,
@@ -2077,7 +2127,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 CollectionRealizationError::storage("freeze exact ensure frontier", error)
             })?;
             let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::ensure_exact_in_frontier::<Self, M>(
+            super::exact_derived::ensure_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
                 &support,
@@ -2098,7 +2148,20 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// size-tier rule runs to its stable LSM fixed point, publishing each
     /// useful carry independently on the way. The live store may acquire exact
     /// dependencies while doing so.
-    fn maintain<M>(
+    fn maintain<T>(
+        &mut self,
+        target: Collection<T>,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
+    where
+        T: CollectionDerivation,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<T>: InlineEncoding,
+    {
+        self.maintain_with::<CanonicalDerivation<T>>(target)
+    }
+
+    /// Ensure and maintain the admitted support through an explicit mapping.
+    fn maintain_with<M>(
         &mut self,
         target: Collection<M::Target>,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
@@ -2115,7 +2178,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             let mut frontier = OperationFrontier::new(before);
             let support =
                 admitted_support_with_acquisition(self, target, &frontier, instant).await?;
-            super::exact_derived::maintain_exact_in_frontier::<Self, M>(
+            super::exact_derived::maintain_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
                 &support,
@@ -2130,7 +2193,21 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 
     /// Ensure one explicit foundational support, then maintain its target LSM
     /// cover to the same deterministic fixed point as [`Self::maintain`].
-    fn maintain_exact<M>(
+    fn maintain_exact<T>(
+        &mut self,
+        target: Collection<T>,
+        support: &Support,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
+    where
+        T: CollectionDerivation,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<T>: InlineEncoding,
+    {
+        self.maintain_exact_with::<CanonicalDerivation<T>>(target, support)
+    }
+
+    /// Ensure and maintain one support through an explicit mapping type.
+    fn maintain_exact_with<M>(
         &mut self,
         target: Collection<M::Target>,
         support: &Support,
@@ -2146,7 +2223,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 CollectionRealizationError::storage("freeze exact maintenance frontier", error)
             })?;
             let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::maintain_exact_in_frontier::<Self, M>(
+            super::exact_derived::maintain_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
                 &support,

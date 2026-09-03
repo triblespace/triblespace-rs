@@ -13,9 +13,6 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshot, CollectionSnapshotExt,
     CollectionStoreExt,
@@ -91,13 +88,11 @@ fn observe(
     // Every mapping edge receives the same foundational support. Maintaining
     // the delta first lets complete maintenance reuse all persisted work.
     if let Some(changed) = changed_support.as_ref() {
-        block_on(store.maintain_exact::<SimpleToSuccinctMapping>(raw, changed))?;
-        block_on(store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, changed))?;
+        block_on(store.maintain_exact(raw, changed))?;
+        block_on(store.maintain_exact(accelerated, changed))?;
     }
-    block_on(store.maintain_exact::<SimpleToSuccinctMapping>(raw, &current_support))?;
-    let snapshot = block_on(
-        store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &current_support),
-    )?;
+    block_on(store.maintain_exact(raw, &current_support))?;
+    let snapshot = block_on(store.maintain_exact(accelerated, &current_support))?;
     let next = snapshot.collection_exact(accelerated, &current_support)?;
 
     let titles = match changed_support {
@@ -147,8 +142,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
-    let raw = store.derive(collection, SimpleToSuccinctMapping, policy.clone())?;
-    let accelerated = store.derive(raw, RawToRank9AcceleratedMapping, policy)?;
+    let raw = store.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+    let accelerated = store.derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)?;
     let mut checkpoint = None;
 
     let first = observe(

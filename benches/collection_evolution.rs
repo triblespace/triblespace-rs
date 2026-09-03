@@ -44,9 +44,6 @@ use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::Blob;
-use triblespace_core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionRecord,
     CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt, Cover, CoverAdvanceError,
@@ -257,12 +254,10 @@ fn maintain_succinct_exact(
     support: &Support,
     collections: &Collections,
 ) -> CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
-    block_on(store.maintain_exact::<SimpleToSuccinctMapping>(collections.raw, support))
+    block_on(store.maintain_exact(collections.raw, support))
         .expect("maintain exact raw Succinct collection");
-    let snapshot = block_on(
-        store.maintain_exact::<RawToRank9AcceleratedMapping>(collections.accelerated, support),
-    )
-    .expect("maintain exact accelerated Succinct collection");
+    let snapshot = block_on(store.maintain_exact(collections.accelerated, support))
+        .expect("maintain exact accelerated Succinct collection");
     snapshot
         .collection_exact(collections.accelerated, support)
         .expect("observe exact accelerated Succinct collection")
@@ -595,10 +590,10 @@ fn register_collections(store: &mut MemoryRepo) -> Collections {
         .collection(benchmark_name(), policy.clone())
         .expect("register benchmark source collection");
     let raw = store
-        .derive(source, SimpleToSuccinctMapping, policy.clone())
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
         .expect("register raw Succinct projection");
     let accelerated = store
-        .derive(raw, RawToRank9AcceleratedMapping, policy)
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
         .expect("register accelerated Succinct projection");
     Collections {
         source,

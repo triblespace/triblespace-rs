@@ -160,8 +160,11 @@ above it.
 
 The collection value is its canonical descriptor handle, and the storage
 backend owns I/O and durability. `store.collection(name, policy)` constructs
-and registers a canonical root descriptor. `store.derive(source, mapping,
-policy)` does the same for a derived descriptor. `store.commit(collection,
+and registers a canonical root descriptor. `store.derive::<Target>(source,
+argument, policy)` does the same for a target-owned canonical derivation.
+Mappings between two foreign encoding types use the explicit
+`store.derive_with(source, mapping, policy)` coherence seam.
+`store.commit(collection,
 signer, fragment)` publishes attachments, canonical data, canonical metadata,
 and the signed native record in dependency order. Local publication performs
 no authorization check and no implicit flush: authorization governs which

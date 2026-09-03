@@ -3,16 +3,15 @@ use futures::executor::block_on;
 use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
+use triblespace_core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+};
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
     CapabilityResource, CapabilityValidity,
 };
 use triblespace_core::collection::succinctarchive_union;
-use triblespace_core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRead,
     CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, ACTION_WRITE,
@@ -98,7 +97,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     let target_policy = source_policy.clone();
     let source = store.collection("typed-api-source", source_policy).unwrap();
     let target = store
-        .derive(source, SimpleToSuccinctMapping, target_policy)
+        .derive::<SuccinctArchiveBlob>(source, (), target_policy)
         .unwrap();
 
     store
@@ -108,7 +107,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     let source_cover = source
         .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
         .unwrap();
-    let ensured = block_on(store.ensure::<SimpleToSuccinctMapping>(target)).unwrap();
+    let ensured = block_on(store.ensure(target)).unwrap();
     let collection = ensured.collection_exact(target, &source_cover).unwrap();
 
     // Later source growth cannot silently change the support paired with the
@@ -127,10 +126,9 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
 
     // The explicit-support ensure and admitted-support maintenance paths share
     // the same immutable snapshot result shape.
-    block_on(store.ensure_exact::<SimpleToSuccinctMapping>(target, &source_cover)).unwrap();
-    block_on(store.maintain::<SimpleToSuccinctMapping>(target)).unwrap();
-    let maintained =
-        block_on(store.maintain_exact::<SimpleToSuccinctMapping>(target, &source_cover)).unwrap();
+    block_on(store.ensure_exact(target, &source_cover)).unwrap();
+    block_on(store.maintain(target)).unwrap();
+    let maintained = block_on(store.maintain_exact(target, &source_cover)).unwrap();
     let collection = maintained.collection_exact(target, &source_cover).unwrap();
     assert_eq!(collection.support(), &source_cover);
     assert_eq!(
@@ -153,10 +151,10 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .collection("typed-api-exact-source", policy.clone())
         .unwrap();
     let raw = store
-        .derive(source, SimpleToSuccinctMapping, policy.clone())
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
         .unwrap();
     let accelerated = store
-        .derive(raw, RawToRank9AcceleratedMapping, policy)
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
         .unwrap();
     store
         .commit(source, &authority, Fragment::from(expected.clone()))
@@ -165,17 +163,13 @@ fn exact_apis_accept_a_derived_source_encoding() {
     let support = source
         .admitted_at(&store.snapshot().unwrap(), Epoch::from_tai_seconds(0.0))
         .unwrap();
-    block_on(store.ensure_exact::<SimpleToSuccinctMapping>(raw, &support)).unwrap();
-    let ensured =
-        block_on(store.ensure_exact::<RawToRank9AcceleratedMapping>(accelerated, &support))
-            .unwrap();
+    block_on(store.ensure_exact(raw, &support)).unwrap();
+    let ensured = block_on(store.ensure_exact(accelerated, &support)).unwrap();
     let observed = ensured.collection_exact(accelerated, &support).unwrap();
     assert_eq!(observed.support(), &support);
     assert_eq!(observed.cover().len(), 1);
 
-    let maintained =
-        block_on(store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support))
-            .unwrap();
+    let maintained = block_on(store.maintain_exact(accelerated, &support)).unwrap();
     let materialized = maintained
         .collection_exact(accelerated, &support)
         .unwrap()
@@ -259,7 +253,7 @@ fn collection_at_returns_the_maximal_resident_partial_realization() {
         .collection("typed-api-partial-source", policy.clone())
         .unwrap();
     let target = store
-        .derive(source, SimpleToSuccinctMapping, policy)
+        .derive::<SuccinctArchiveBlob>(source, (), policy)
         .unwrap();
 
     store
@@ -268,7 +262,7 @@ fn collection_at_returns_the_maximal_resident_partial_realization() {
     let first_support = source
         .admitted_at(&store.snapshot().unwrap(), Epoch::from_tai_seconds(0.0))
         .unwrap();
-    block_on(store.ensure_exact::<SimpleToSuccinctMapping>(target, &first_support)).unwrap();
+    block_on(store.ensure_exact(target, &first_support)).unwrap();
     store
         .commit(source, &authority, Fragment::from(second))
         .unwrap();

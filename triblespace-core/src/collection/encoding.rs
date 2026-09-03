@@ -6,8 +6,8 @@
 //!
 //! - a [`CollectionEncoding`] owns the canonical bytes, validation, and join
 //!   within one collection;
-//! - a [`CollectionMapping`] owns one parameterized, join-preserving
-//!   conversion from a source encoding to a target encoding;
+//! - a [`CollectionDerivation`] lets one target encoding own its canonical,
+//!   parameterized, join-preserving conversion from one source encoding;
 //! - [`Collection`] binds an encoding to one exact, content-addressed
 //!   descriptor.
 //!
@@ -66,7 +66,7 @@ impl Error for CollectionOperationError {}
 /// Collection members are always ordinary typed [`Blob`] values. An encoding
 /// validates its own bytes and owns one canonical intra-shape join. Derived
 /// collections are ordinary lattices connected to their source by a
-/// join-preserving [`CollectionMapping`], not a weaker kind of collection.
+/// join-preserving [`CollectionDerivation`], not a weaker kind of collection.
 /// The logical join remains total at the [`Cover`](super::Cover) level: when
 /// one physical member cannot represent the result, `Capacity` retains a finer
 /// cover of members with the same value.
@@ -205,29 +205,33 @@ where
     }
 }
 
-/// One parameterized mapping between collection encodings.
+/// The canonical incoming derivation owned by one target encoding.
 ///
-/// A concrete mapping binds the mapping fragment embedded in the target
-/// descriptor, then maps physical source members. Canonical builders normally
-/// derive the mapping entity id, but binding validates its algorithm and
-/// parameters rather than its minting history. Implementations
-/// must be a join homomorphism:
+/// The target names its one source encoding and the runtime argument carried
+/// by the mapping fragment embedded in its descriptor. Canonical builders
+/// normally derive the mapping entity id, but binding validates its algorithm
+/// and argument rather than its minting history. Implementations must be a
+/// join homomorphism:
 ///
 /// `map(a join b) = map(a) join map(b)`.
-pub trait CollectionMapping: Sized {
+pub trait CollectionDerivation: CollectionEncoding {
     /// Canonical source encoding.
     type Source: CollectionEncoding;
-    /// Canonical target encoding.
-    type Target: CollectionEncoding;
+    /// Runtime argument which distinguishes concrete mappings of this
+    /// canonical source-to-target relation.
+    type Argument;
 
     /// Canonical concrete mapping fragment embedded in a target descriptor.
     ///
-    /// Parameterized mappings carry their parameters in `self`; zero-sized
-    /// mappings simply return their one canonical algorithm fragment.
-    fn fragment(&self) -> Fragment;
+    /// Parameterized derivations carry their argument in this fragment;
+    /// parameter-free derivations use `()`.
+    fn fragment(argument: &Self::Argument) -> Fragment;
 
     /// Bind and validate the concrete mapping named by the target descriptor.
-    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError>;
+    fn bind(
+        source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self::Argument, CollectionOperationError>;
 
     /// Compute the canonical target image of one source member.
     ///
@@ -237,12 +241,79 @@ pub trait CollectionMapping: Sized {
     /// immutable dependencies named by `source`; ambient store contents are
     /// not semantic inputs to the mapping.
     fn map<R>(
+        argument: &Self::Argument,
+        source: &Blob<Self::Source>,
+        reader: &R,
+    ) -> Result<Blob<Self>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta;
+}
+
+/// One explicit parameterized mapping between collection encodings.
+///
+/// This is the coherence-safe extension point for mappings whose source and
+/// target encodings are both owned elsewhere. Prefer [`CollectionDerivation`]
+/// when a target encoding owns one canonical incoming derivation; explicit
+/// mappings are selected through the `*_with` collection-store methods.
+/// Implementations must be a join homomorphism:
+///
+/// `map(a join b) = map(a) join map(b)`.
+pub trait CollectionMapping: Sized {
+    /// Canonical source encoding.
+    type Source: CollectionEncoding;
+    /// Canonical target encoding.
+    type Target: CollectionEncoding;
+
+    /// Canonical concrete mapping fragment embedded in a target descriptor.
+    fn fragment(&self) -> Fragment;
+
+    /// Bind and validate the concrete mapping named by the target descriptor.
+    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError>;
+
+    /// Compute the canonical target image of one source member.
+    fn map<R>(
         &self,
         source: &Blob<Self::Source>,
         reader: &R,
     ) -> Result<Blob<Self::Target>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta;
+}
+
+/// Internal adapter from a target-owned derivation to the explicit mapping
+/// engine. Keeping this wrapper private leaves downstream coherence open.
+pub(crate) struct CanonicalDerivation<T: CollectionDerivation> {
+    argument: T::Argument,
+}
+
+impl<T: CollectionDerivation> CanonicalDerivation<T> {
+    pub(crate) fn new(argument: T::Argument) -> Self {
+        Self { argument }
+    }
+}
+
+impl<T: CollectionDerivation> CollectionMapping for CanonicalDerivation<T> {
+    type Source = T::Source;
+    type Target = T;
+
+    fn fragment(&self) -> Fragment {
+        T::fragment(&self.argument)
+    }
+
+    fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        T::bind(source, target).map(Self::new)
+    }
+
+    fn map<R>(
+        &self,
+        source: &Blob<Self::Source>,
+        reader: &R,
+    ) -> Result<Blob<Self::Target>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        T::map(&self.argument, source, reader)
+    }
 }
 
 /// A descriptor does not denote the encoding requested by its Rust type.

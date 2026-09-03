@@ -123,9 +123,10 @@ lifecycle. Current Apple M4 end-to-end measurement showed no useful benefit
 from retaining that policy surface.
 
 The exact Succinct collection lattice is instead blob-native and does not call
-a branch-index merge. `SimpleToSuccinctMapping` consumes and produces canonical
-collection blobs directly; the low-level freeze backend remains available for
-accelerating that mapping without adding another lifecycle facade.
+a branch-index merge. `SuccinctArchiveBlob` owns the canonical derivation from
+`SimpleArchive` and consumes and produces canonical collection blobs directly;
+the low-level freeze backend remains available for accelerating that mapping
+without adding another lifecycle facade.
 
 Repository builds patch CubeCL 0.10's runtime and WGPU crates to the project's
 fork, which exposes immutable external-buffer registration for mmap-to-Metal

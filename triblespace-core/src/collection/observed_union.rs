@@ -76,7 +76,7 @@ use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 #[cfg(test)]
 use super::CollectionPolicy;
 use super::{
-    CollectionEncoding, CollectionMapping, CollectionOperationError, TryFromCover,
+    CollectionDerivation, CollectionEncoding, CollectionOperationError, TryFromCover,
     TryFromCoverError,
 };
 use crate::repo::BlobStoreGet;
@@ -267,7 +267,8 @@ pub(crate) fn descriptor(
     observes: Id,
     policy: CollectionPolicy,
 ) -> Fragment {
-    crate::collection::descriptor::deriving(source, &ObserveStatesMapping::new(observes), policy)
+    let mapping = crate::collection::CanonicalDerivation::<ObservedSetBlob>::new(observes);
+    crate::collection::descriptor::deriving_with(source, &mapping, policy)
 }
 
 /// Canonical fact-to-observed-state mapping algorithm, version 1.
@@ -343,28 +344,18 @@ impl CollectionEncoding for ObservedSetBlob {
     }
 }
 
-/// Bound projection from one fact-set member to its observed-state set.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObserveStatesMapping {
-    observes: Id,
-}
-
-impl ObserveStatesMapping {
-    /// Project subjects that carry this observation-edge attribute.
-    pub const fn new(observes: Id) -> Self {
-        Self { observes }
-    }
-}
-
-impl CollectionMapping for ObserveStatesMapping {
+impl CollectionDerivation for ObservedSetBlob {
     type Source = SimpleArchive;
-    type Target = ObservedSetBlob;
+    type Argument = Id;
 
-    fn fragment(&self) -> Fragment {
-        mapping_fragment(self.observes)
+    fn fragment(observes: &Self::Argument) -> Fragment {
+        mapping_fragment(*observes)
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+    fn bind(
+        _source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self::Argument, CollectionOperationError> {
         let observes = observed_attribute(target)?;
         let actual = crate::collection::descriptor::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
@@ -374,18 +365,18 @@ impl CollectionMapping for ObserveStatesMapping {
                 actual.map(|id| format!("{id:X}")),
             )));
         }
-        Ok(Self { observes })
+        Ok(observes)
     }
 
     fn map<R>(
-        &self,
+        observes: &Self::Argument,
         source: &Blob<SimpleArchive>,
         _reader: &R,
     ) -> Result<Blob<ObservedSetBlob>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        derive_element(source, self.observes)
+        derive_element(source, *observes)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
@@ -649,11 +640,7 @@ mod tests {
         let mut store = MemoryRepo::default();
         let source = store.collection(&name, source_policy.clone()).unwrap();
         let target = store
-            .derive(
-                source,
-                ObserveStatesMapping::new(metadata::supersedes.id()),
-                target_policy.clone(),
-            )
+            .derive::<ObservedSetBlob>(source, metadata::supersedes.id(), target_policy.clone())
             .unwrap();
         let snapshot = store.snapshot().unwrap();
         let source_descriptor =

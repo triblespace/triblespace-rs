@@ -6,9 +6,8 @@
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use rand::rngs::OsRng;
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace::core::collection::{
     AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
@@ -60,16 +59,14 @@ fn main() {
     // Build any missing canonical raw Succinct shards and their exact Rank9
     // fibers, then query the admitted physical cover directly.
     let raw = pile
-        .derive(collection, SimpleToSuccinctMapping, policy.clone())
+        .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
         .expect("register raw Succinct projection");
     let accelerated = pile
-        .derive(raw, RawToRank9AcceleratedMapping, policy)
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
         .expect("register Rank9-accelerated projection");
-    block_on(pile.maintain_exact::<SimpleToSuccinctMapping>(raw, &support))
-        .expect("maintain exact raw Succinct collection");
-    let snapshot =
-        block_on(pile.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, &support))
-            .expect("maintain exact Rank9-accelerated collection");
+    block_on(pile.maintain_exact(raw, &support)).expect("maintain exact raw Succinct collection");
+    let snapshot = block_on(pile.maintain_exact(accelerated, &support))
+        .expect("maintain exact Rank9-accelerated collection");
     let archive = snapshot
         .collection_exact(accelerated, &support)
         .expect("observe exact Rank9-accelerated collection");

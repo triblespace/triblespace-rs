@@ -79,7 +79,7 @@ use super::simplearchive_union;
 #[cfg(test)]
 use super::CollectionPolicy;
 use super::{
-    CollectionEncoding, CollectionMapping, CollectionOperationError, TryFromCover,
+    CollectionDerivation, CollectionEncoding, CollectionOperationError, TryFromCover,
     TryFromCoverError,
 };
 
@@ -382,11 +382,9 @@ pub(crate) fn descriptor(
     orders: Id,
     policy: CollectionPolicy,
 ) -> Fragment {
-    crate::collection::descriptor::deriving(
-        source,
-        &RegisterCoordinatesMapping::new(identity, orders),
-        policy,
-    )
+    let mapping =
+        crate::collection::CanonicalDerivation::<LwwRegisterBlob>::new((identity, orders));
+    crate::collection::descriptor::deriving_with(source, &mapping, policy)
 }
 
 /// Canonical stated-register coordinate projection algorithm, version 1.
@@ -466,29 +464,18 @@ impl CollectionEncoding for LwwRegisterBlob {
     }
 }
 
-/// Bound projection from facts to the two canonical LWW coordinate halves.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RegisterCoordinatesMapping {
-    identity: Id,
-    orders: Id,
-}
-
-impl RegisterCoordinatesMapping {
-    /// Project these identity and ordering attributes into register coordinates.
-    pub const fn new(identity: Id, orders: Id) -> Self {
-        Self { identity, orders }
-    }
-}
-
-impl CollectionMapping for RegisterCoordinatesMapping {
+impl CollectionDerivation for LwwRegisterBlob {
     type Source = SimpleArchive;
-    type Target = LwwRegisterBlob;
+    type Argument = (Id, Id);
 
-    fn fragment(&self) -> Fragment {
-        mapping_fragment(self.identity, self.orders)
+    fn fragment(&(identity, orders): &Self::Argument) -> Fragment {
+        mapping_fragment(identity, orders)
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+    fn bind(
+        _source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self::Argument, CollectionOperationError> {
         let (identity, orders) = register_attributes(target)?;
         let actual = crate::collection::descriptor::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
@@ -498,18 +485,18 @@ impl CollectionMapping for RegisterCoordinatesMapping {
                 actual.map(|id| format!("{id:X}")),
             )));
         }
-        Ok(Self { identity, orders })
+        Ok((identity, orders))
     }
 
     fn map<R>(
-        &self,
+        &(identity, orders): &Self::Argument,
         source: &Blob<SimpleArchive>,
         _reader: &R,
     ) -> Result<Blob<LwwRegisterBlob>, CollectionOperationError>
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        derive_element(source, self.identity, self.orders)
+        derive_element(source, identity, orders)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
@@ -965,9 +952,9 @@ mod tests {
         let mut store = MemoryRepo::default();
         let source = store.collection(&name, source_policy.clone()).unwrap();
         let target = store
-            .derive(
+            .derive::<LwwRegisterBlob>(
                 source,
-                RegisterCoordinatesMapping::new(state_of.id(), written_at.id()),
+                (state_of.id(), written_at.id()),
                 target_policy.clone(),
             )
             .unwrap();
@@ -1000,9 +987,9 @@ mod tests {
             .collection("maintained-lww", direct_policy(team))
             .unwrap();
         let target = store
-            .derive(
+            .derive::<LwwRegisterBlob>(
                 source,
-                RegisterCoordinatesMapping::new(state_of.id(), written_at.id()),
+                (state_of.id(), written_at.id()),
                 direct_policy(team),
             )
             .unwrap();
@@ -1020,8 +1007,7 @@ mod tests {
             .unwrap();
         let support = Support::from_data(source, [identity_commit.data(), order_commit.data()]);
 
-        let snapshot =
-            block_on(store.maintain_exact::<RegisterCoordinatesMapping>(target, &support)).unwrap();
+        let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
         let ensured: LwwIndex = snapshot
             .collection_exact(target, &support)
             .unwrap()

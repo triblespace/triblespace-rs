@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make each derived target encoding own its canonical `Source`, runtime
+  `Argument`, descriptor binding, and member map through
+  `CollectionDerivation`. `derive::<Target>(source, argument, policy)` still
+  returns an ordinary `Collection<Target>`, while `ensure` and `maintain` now
+  infer the derivation directly from that target and require no public mapping
+  witness type. Preserve `CollectionMapping` and the explicit `derive_with`,
+  `ensure_with`, and `maintain_with` seam for downstream mappings between two
+  foreign encoding types that Rust's orphan rule prevents either crate from
+  attaching to the target.
 - Let active exact collection realization recover from a dangling immediate
   `DERIVE` whose output cannot be acquired. When its source input is resident,
   the unusable equation remains semantically invisible and the canonical

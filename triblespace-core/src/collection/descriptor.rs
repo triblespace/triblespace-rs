@@ -108,12 +108,16 @@ where
     }
 }
 
-/// Build a derived descriptor around one concrete mapping instance.
+/// Build a derived descriptor around one explicit mapping value.
 ///
 /// The mapping Fragment is spread into the same descriptor archive. Its root
 /// is linked from the descriptor and all algorithm descriptions, parameters,
-/// and attachments therefore travel with the collection identity.
-pub(crate) fn deriving<M>(
+/// and attachments therefore travel with the collection identity. This
+/// lower-level form also serves downstream mappings between encodings whose
+/// crates cannot implement the target-owned
+/// [`CollectionDerivation`](super::CollectionDerivation) trait because of
+/// Rust's orphan rule.
+pub(crate) fn deriving_with<M>(
     source: CollectionHandle,
     mapping: &M,
     policy: CollectionPolicy,

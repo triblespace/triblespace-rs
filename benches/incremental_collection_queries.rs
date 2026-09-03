@@ -39,9 +39,6 @@ use futures::executor::block_on;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshot, CollectionSnapshotExt,
     CollectionStoreExt, Support,
@@ -135,10 +132,10 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     }
 
     let raw = store
-        .derive(collection, SimpleToSuccinctMapping, policy.clone())
+        .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
         .expect("register raw Succinct projection");
     let accelerated = store
-        .derive(raw, RawToRank9AcceleratedMapping, policy)
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
         .expect("register accelerated Succinct projection");
     Fixture {
         store,
@@ -156,9 +153,8 @@ fn maintain_succinct(
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     support: &Support,
 ) -> MemoryRepoSnapshot {
-    block_on(store.maintain_exact::<SimpleToSuccinctMapping>(raw, support))
-        .expect("maintain exact raw Succinct cover");
-    block_on(store.maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, support))
+    block_on(store.maintain_exact(raw, support)).expect("maintain exact raw Succinct cover");
+    block_on(store.maintain_exact(accelerated, support))
         .expect("maintain exact accelerated Succinct cover")
 }
 

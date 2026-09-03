@@ -4,6 +4,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
@@ -11,7 +12,6 @@ use triblespace_core::capability::{
     CapabilityProofBundle, CapabilityRequest, CapabilityResource,
 };
 use triblespace_core::collection::descriptor;
-use triblespace_core::collection::succinctarchive_union::SimpleToSuccinctMapping;
 use triblespace_core::collection::{
     collection_read_audience_at, grant_collection_read, grant_collection_write, AdmissionPolicy,
     Collection, CollectionDescriptorError, CollectionOpenError, CollectionPolicy,
@@ -191,7 +191,7 @@ fn typed_collection_reads_its_descriptor_local_policy() {
     let mut store = MemoryRepo::default();
     let source = store.collection("policy-source", source_policy).unwrap();
     let target = store
-        .derive(source, SimpleToSuccinctMapping, target_policy.clone())
+        .derive::<SuccinctArchiveBlob>(source, (), target_policy.clone())
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
@@ -207,11 +207,7 @@ fn typed_collection_open_rejects_the_wrong_encoding() {
         .collection("source", policy(root.verifying_key()))
         .unwrap();
     let registered = store
-        .derive(
-            source,
-            SimpleToSuccinctMapping,
-            policy(root.verifying_key()),
-        )
+        .derive::<SuccinctArchiveBlob>(source, (), policy(root.verifying_key()))
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();

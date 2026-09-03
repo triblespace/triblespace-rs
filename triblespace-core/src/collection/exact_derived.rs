@@ -28,6 +28,8 @@ use super::{
     CollectionHandle, CollectionMapping, CollectionOperationError, CollectionRead,
     CollectionRecord, CollectionResolutionError, CollectionSemantics, Cover, Support,
 };
+#[cfg(test)]
+use super::{CanonicalDerivation, CollectionDerivation};
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -701,7 +703,7 @@ where
 /// records. A missing immediate-source cover is an error: downstream ensure
 /// never constructs upstream blobs.
 #[cfg(test)]
-fn ensure_exact_resident<S, M>(
+fn ensure_exact_resident_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -714,7 +716,7 @@ where
         CollectionRealizationError::storage("freeze exact mapping frontier", error)
     })?;
     let mut frontier = OperationFrontier::new(snapshot);
-    ensure_exact_resident_in_frontier::<S, M>(
+    ensure_exact_resident_in_frontier_with::<S, M>(
         store,
         target,
         support,
@@ -723,7 +725,20 @@ where
     )
 }
 
-fn ensure_exact_resident_in_frontier<S, M>(
+#[cfg(test)]
+fn ensure_exact_resident<S, T>(
+    store: &mut S,
+    target: Collection<T>,
+    support: &Support,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    T: CollectionDerivation,
+{
+    ensure_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, support)
+}
+
+fn ensure_exact_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -808,7 +823,7 @@ where
 /// Ensure one mapping and then carry its target lattice to the deterministic
 /// LSM fixed point.
 #[cfg(test)]
-fn maintain_exact_resident<S, M>(
+fn maintain_exact_resident_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -821,7 +836,7 @@ where
         CollectionRealizationError::storage("freeze exact maintenance frontier", error)
     })?;
     let mut frontier = OperationFrontier::new(snapshot);
-    maintain_exact_resident_in_frontier::<S, M>(
+    maintain_exact_resident_in_frontier_with::<S, M>(
         store,
         target,
         support,
@@ -830,7 +845,20 @@ where
     )
 }
 
-fn maintain_exact_resident_in_frontier<S, M>(
+#[cfg(test)]
+fn maintain_exact_resident<S, T>(
+    store: &mut S,
+    target: Collection<T>,
+    support: &Support,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    T: CollectionDerivation,
+{
+    maintain_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, support)
+}
+
+fn maintain_exact_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -841,7 +869,7 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    ensure_exact_resident_in_frontier::<S, M>(store, target, support, unavailable, frontier)?;
+    ensure_exact_resident_in_frontier_with::<S, M>(store, target, support, unavailable, frontier)?;
     super::exact_target_compaction::maintain_target(store, target, support, frontier)
 }
 
@@ -865,7 +893,7 @@ where
         .map(|bytes| bytes.is_some())
 }
 
-pub(crate) async fn ensure_exact_in_frontier<S, M>(
+pub(crate) async fn ensure_exact_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -878,7 +906,7 @@ where
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     loop {
-        match ensure_exact_resident_in_frontier::<S, M>(
+        match ensure_exact_resident_in_frontier_with::<S, M>(
             store,
             target,
             support,
@@ -898,7 +926,7 @@ where
     }
 }
 
-pub(crate) async fn maintain_exact_in_frontier<S, M>(
+pub(crate) async fn maintain_exact_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
@@ -911,7 +939,7 @@ where
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     loop {
-        match maintain_exact_resident_in_frontier::<S, M>(
+        match maintain_exact_resident_in_frontier_with::<S, M>(
             store,
             target,
             support,

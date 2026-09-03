@@ -299,8 +299,14 @@ never a second history or a new authority root.
 
 ## Derive another representation
 
-Suppose `f` is a canonical join homomorphism, represented in the API by a
-`CollectionMapping` whose associated types are `Source` and `Target`:
+Suppose `f` is a canonical join homomorphism. Its target encoding implements
+`CollectionDerivation`, naming one canonical `Source` encoding and a runtime
+`Argument` carried by the concrete mapping descriptor:
+
+If a downstream crate owns neither the source nor target encoding, Rust's
+orphan rule prevents that target-owned implementation. It can instead provide
+an explicit `CollectionMapping` and select the same engine through
+`derive_with`, `ensure_with`, and `maintain_with`.
 
 ```text
 f(a ⊔ b) = f(a) ⊔ f(b)
@@ -325,17 +331,19 @@ SimpleArchive --DERIVE--> SuccinctArchiveBlob --DERIVE-->
 ```
 
 ```rust,ignore
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::blob::encodings::succinctarchive::{
-    OrderedUniverse, UnionArchive,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    UnionArchive,
 };
 
 let source = storage.collection("models", source_policy)?;
-let raw = storage.derive(source, SimpleToSuccinctMapping, raw_policy)?;
-let accelerated = storage.derive(raw, RawToRank9AcceleratedMapping, accelerated_policy)?;
+let raw = storage.derive::<SuccinctArchiveBlob>(source, (), raw_policy)?;
+let accelerated = storage.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+    raw,
+    (),
+    accelerated_policy,
+)?;
 
 let before = storage.snapshot()?;
 let instant = triblespace::core::clock::epoch_now();
@@ -344,12 +352,9 @@ drop(before);
 
 // Each edge receives the same foundational Support. Work never flows upward.
 storage
-    .maintain_exact::<SimpleToSuccinctMapping>(raw, &support)
+    .maintain_exact(raw, &support)
     .await?;
-let after = storage.maintain_exact::<RawToRank9AcceleratedMapping>(
-    accelerated,
-    &support,
-).await?;
+let after = storage.maintain_exact(accelerated, &support).await?;
 
 let observed = after.collection_exact(accelerated, &support)?;
 let facts: UnionArchive<OrderedUniverse> = observed.view()?;

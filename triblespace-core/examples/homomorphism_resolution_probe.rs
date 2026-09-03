@@ -105,7 +105,7 @@ fn build(
     );
     let mut store = MemoryRepo::default();
     let source = store.collection("source", policy.clone()).unwrap();
-    let target = store.derive(source, ProbeMapping, policy).unwrap();
+    let target = store.derive_with(source, ProbeMapping, policy).unwrap();
     let source_collection = source.handle();
     let target_collection = target.handle();
     let leaf_data: Vec<_> = (0..leaves)
