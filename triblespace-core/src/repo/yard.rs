@@ -30,7 +30,10 @@ use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
 use crate::patch::{Entry, IdentitySchema, PATCH};
 use anybytes::Bytes;
 
+#[cfg(test)]
+use super::pile::assert_record_kind_description_resident;
 use super::pile::{
+    blob_record_kind, capability_proof_record_kind, collection_record_kind, want_record_kind,
     CapabilityProofInsertError, CollectionInsertError, GetBlobError, InsertError, Pile,
     PileSnapshot, PileWriteError, ReadError,
 };
@@ -43,6 +46,16 @@ use super::{
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
 type WantIndex = PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>;
+
+fn retain_kind_if_present(
+    retention: &mut RetentionRoots,
+    present: &HandleSet,
+    kind: super::pile::RecordKind,
+) {
+    if present.get(&kind.raw).is_some() {
+        retention.retain_recursive(kind);
+    }
+}
 
 #[derive(Debug, Default)]
 struct WantState {
@@ -532,12 +545,17 @@ impl Yard {
         let retention = self
             .retention_with_capability_proofs(&snapshot, &present, &retention)
             .map_err(YardCollectError::CapabilityProofs)?;
-        let retention = self.retention_with_wants(&present, &retention);
-        let strong_keep = self.strong_keep_set(&snapshot, &retention);
+        let mut retention = self.retention_with_wants(&present, &retention);
+        let mut strong_keep = self.strong_keep_set(&snapshot, &retention);
+        if strong_keep.intersect(&present).len() != 0 {
+            retain_kind_if_present(&mut retention, &present, blob_record_kind());
+            strong_keep = self.strong_keep_set(&snapshot, &retention);
+        }
         Ok((snapshot, strong_keep))
     }
 
-    /// Add every resident direct reference of every native collection record.
+    /// Add every resident direct reference and physical kind description of
+    /// every native collection record.
     fn retention_with_collection_records(
         &self,
         snapshot: &YardSnapshot,
@@ -547,6 +565,7 @@ impl Yard {
         let mut combined = retention.clone();
         let records = snapshot.records()?.collect::<Result<Vec<_>, _>>()?;
         for record in records {
+            retain_kind_if_present(&mut combined, present, collection_record_kind(record));
             for handle in record.blob_references() {
                 if present.get(&handle.raw).is_some() {
                     combined.retain_recursive(handle);
@@ -556,7 +575,8 @@ impl Yard {
         Ok(combined)
     }
 
-    /// Add every resident claim reference of every native proof record.
+    /// Add every resident claim reference and physical kind description of
+    /// every native proof record.
     fn retention_with_capability_proofs(
         &self,
         snapshot: &YardSnapshot,
@@ -567,6 +587,9 @@ impl Yard {
         let proofs = snapshot
             .proofs()?
             .collect::<Result<Vec<_>, YardCapabilityProofError>>()?;
+        if !proofs.is_empty() {
+            retain_kind_if_present(&mut combined, present, capability_proof_record_kind());
+        }
         for proof in proofs {
             for handle in proof.blob_references() {
                 if present.get(&handle.raw).is_some() {
@@ -577,7 +600,8 @@ impl Yard {
         Ok(combined)
     }
 
-    /// Add every resident direct reference of every retained WANT record.
+    /// Add every resident direct reference and physical kind description of
+    /// every retained WANT record.
     fn retention_with_wants(
         &self,
         present: &HandleSet,
@@ -589,6 +613,9 @@ impl Yard {
             .lock()
             .expect("want mutex poisoned")
             .requests();
+        if !requests.is_empty() {
+            retain_kind_if_present(&mut combined, present, want_record_kind());
+        }
         for request in requests {
             for handle in request.blob_references() {
                 if present.get(&handle.raw).is_some() {
@@ -1522,7 +1549,7 @@ mod tests {
     use crate::collection::{
         empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionMerge,
     };
-    use crate::repo::pile::{PileRecordContent, PileRecords};
+    use crate::repo::pile::{description_blobs, PileRecordContent, PileRecords};
     use crate::trible::TribleSet;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
@@ -1548,6 +1575,14 @@ mod tests {
 
     fn raw_blob(bytes: &'static [u8]) -> Bytes {
         Bytes::from_source(bytes.to_vec())
+    }
+
+    fn publish_record_kind_descriptions(yard: &mut Yard) {
+        for blob in description_blobs() {
+            let expected = blob.get_handle();
+            let actual = yard.put::<UnknownBlob, _>(blob).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -1801,6 +1836,7 @@ mod tests {
     fn capability_proofs_union_generations_root_claims_and_survive_reclaim() {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
+        publish_record_kind_descriptions(&mut yard);
         let attachment = yard
             .put::<RawBytes, _>(raw_blob(b"proof-owned attachment"))
             .unwrap();
@@ -1842,10 +1878,14 @@ mod tests {
         let reader = yard.snapshot().unwrap();
         assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_ok());
         assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
+        assert_record_kind_description_resident(&reader, capability_proof_record_kind());
+        assert_record_kind_description_resident(&reader, blob_record_kind());
         drop(reader);
 
         yard.reclaim().unwrap();
         let snapshot = yard.snapshot().unwrap();
+        assert_record_kind_description_resident(&snapshot, capability_proof_record_kind());
+        assert_record_kind_description_resident(&snapshot, blob_record_kind());
         assert_eq!(
             snapshot
                 .proofs()
@@ -1934,7 +1974,8 @@ mod tests {
 
     #[test]
     fn native_commits_root_owned_blobs_and_reclaim_preserves_every_record_kind() {
-        let (dir, mut yard) = yard_with(1, YardConfig::default());
+        let (_dir, mut yard) = yard_with(1, YardConfig::default());
+        publish_record_kind_descriptions(&mut yard);
         let attachment = yard
             .put::<RawBytes, _>(raw_blob(b"commit-owned attachment"))
             .unwrap();
@@ -1987,13 +2028,19 @@ mod tests {
             .get::<Blob<SimpleArchive>, SimpleArchive>(collection)
             .is_ok());
         assert!(reader.get::<Bytes, RawBytes>(equation_owned).is_ok());
+        for record in records.iter().copied() {
+            assert_record_kind_description_resident(&reader, collection_record_kind(record));
+        }
+        assert_record_kind_description_resident(&reader, blob_record_kind());
         drop(reader);
 
         yard.reclaim().unwrap();
-        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 5);
-        let actual = yard
-            .snapshot()
-            .unwrap()
+        let snapshot = yard.snapshot().unwrap();
+        for record in records.iter().copied() {
+            assert_record_kind_description_resident(&snapshot, collection_record_kind(record));
+        }
+        assert_record_kind_description_resident(&snapshot, blob_record_kind());
+        let actual = snapshot
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -2478,12 +2525,19 @@ mod tests {
     #[test]
     fn want_markers_survive_reclaim() {
         let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
+        publish_record_kind_descriptions(&mut yard);
 
         let want = Blob::<RawBytes>::new(raw_blob(b"wanted, absent")).get_handle();
         yard.want(WantRequest::blob(want)).unwrap();
         let cached = Blob::<RawBytes>::new(raw_blob(b"cached blob")).get_handle();
         yard.want(WantRequest::blob(cached)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cached blob")).unwrap();
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        let reader = yard.snapshot().unwrap();
+        assert_record_kind_description_resident(&reader, want_record_kind());
+        assert_record_kind_description_resident(&reader, blob_record_kind());
+        drop(reader);
 
         // Rewrite the young pile: only live blobs are transferred, so the
         // marker records are dropped — and must be re-recorded.
@@ -2511,6 +2565,8 @@ mod tests {
         );
         let reader = reopened.snapshot().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached blob"));
+        assert_record_kind_description_resident(&reader, want_record_kind());
+        assert_record_kind_description_resident(&reader, blob_record_kind());
     }
 
     #[test]

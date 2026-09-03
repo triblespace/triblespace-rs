@@ -72,6 +72,93 @@ use crate::repo::{
 mod record_kind;
 pub use record_kind::{described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD};
 
+/// Self-description handle of the physical pile frame used for `record`.
+///
+/// Kept crate-visible so Yard can apply the same physical ownership rule
+/// while retaining semantic records across its constituent piles.
+pub(crate) fn collection_record_kind(record: CollectionRecord) -> RecordKind {
+    Inline::new(match record {
+        CollectionRecord::Commit(_) => record_kind::KIND_COLLECTION_COMMIT,
+        CollectionRecord::Merge(_) => record_kind::KIND_COLLECTION_MERGE,
+        CollectionRecord::Derive(_) => record_kind::KIND_COLLECTION_DERIVE,
+    })
+}
+
+/// Self-description handle of a physical capability-proof frame.
+pub(crate) fn capability_proof_record_kind() -> RecordKind {
+    Inline::new(record_kind::KIND_AUTH_PROOF)
+}
+
+/// Self-description handle of a physical WANT frame.
+pub(crate) fn want_record_kind() -> RecordKind {
+    Inline::new(record_kind::KIND_WANT)
+}
+
+/// Self-description handle of a physical BLOB frame.
+pub(crate) fn blob_record_kind() -> RecordKind {
+    Inline::new(record_kind::KIND_BLOB)
+}
+
+#[cfg(test)]
+pub(crate) fn assert_record_kind_description_resident<R>(reader: &R, kind: RecordKind)
+where
+    R: crate::repo::BlobStoreGet,
+{
+    use crate::blob::encodings::utf8string::UTF8String;
+    use crate::prelude::{find, pattern};
+    use crate::trible::TribleSet;
+
+    let description = reader
+        .get::<TribleSet, SimpleArchive>(kind)
+        .unwrap_or_else(|_| {
+            panic!(
+                "record-kind archive {} is absent",
+                hex::encode_upper(kind.raw)
+            )
+        });
+    let text_handles = find!(
+        (
+            name: Inline<Handle<UTF8String>>,
+            layout: Inline<Handle<UTF8String>>
+        ),
+        pattern!(&description, [{
+            crate::metadata::name: ?name,
+            crate::metadata::description: ?layout
+        }])
+    )
+    .collect::<Vec<_>>();
+    assert_eq!(text_handles.len(), 1);
+    for (name, layout) in text_handles {
+        for handle in [name, layout] {
+            assert!(
+                reader
+                    .get::<anybytes::View<str>, UTF8String>(handle)
+                    .is_ok(),
+                "record-kind description child {} is absent",
+                hex::encode_upper(handle.raw)
+            );
+        }
+    }
+}
+
+/// Self-description handle of a physical active-pin frame.
+fn pin_head_record_kind() -> RecordKind {
+    Inline::new(record_kind::KIND_PIN_HEAD)
+}
+
+fn retain_record_kind_if_resident(
+    roots: &mut super::RetentionRoots,
+    reader: &PileSnapshot,
+    kind: RecordKind,
+) {
+    if reader
+        .contains_blob(kind)
+        .expect("PileSnapshot residency lookup is infallible")
+    {
+        roots.retain_recursive(kind);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The supported legacy surface is exactly what shipped in **v0.46.4** (tagged
 // 2026-06-10, the last released version): the three V1 markers below. Those
@@ -4690,7 +4777,12 @@ impl Pile {
     /// member, input, or output handle it names recursively, independently of
     /// signature validity, admission, or algebraic usefulness. Every canonical
     /// complete proof similarly owns each resident claim it names, and every
-    /// preserved WANT owns each resident handle in its request. Missing
+    /// preserved WANT owns each resident handle in its request. Each emitted
+    /// non-BLOB frame also owns the resident description of its own record
+    /// kind. A BLOB frame does not root itself merely by existing, but once an
+    /// independent root selects any BLOB frame for output, that frame owns the
+    /// resident description of the BLOB kind. Discarded historical frames do
+    /// not contribute roots. Missing
     /// references remain missing and never cause a fetch or make the rewrite
     /// fail merely because a sibling reference is absent. Byte-distinct legacy
     /// V3 collection headers are copied
@@ -4742,6 +4834,15 @@ impl Pile {
         };
 
         let mut roots = explicit.clone();
+        if !strong_pins.is_empty() {
+            retain_record_kind_if_resident(&mut roots, &reader, pin_head_record_kind());
+        }
+        if !capability_proofs.is_empty() {
+            retain_record_kind_if_resident(&mut roots, &reader, capability_proof_record_kind());
+        }
+        if !preserved_wants.is_empty() {
+            retain_record_kind_if_resident(&mut roots, &reader, want_record_kind());
+        }
         for raw in &strong_pins {
             let head = *strong_pins
                 .get(raw)
@@ -4757,6 +4858,7 @@ impl Pile {
             let record = collection_records
                 .get(key)
                 .expect("collection key from PATCH snapshot must retain its value");
+            retain_record_kind_if_resident(&mut roots, &reader, collection_record_kind(*record));
             for handle in record.blob_references() {
                 if reader
                     .contains_blob(handle)
@@ -4786,7 +4888,16 @@ impl Pile {
                 }
             }
         }
-        let keep = roots.expanded(&reader);
+        let mut keep = roots.expanded(&reader);
+        let emits_blob = keep.iter().any(|handle| {
+            reader
+                .contains_blob(*handle)
+                .expect("PileSnapshot residency lookup is infallible")
+        });
+        if emits_blob {
+            retain_record_kind_if_resident(&mut roots, &reader, blob_record_kind());
+            keep = roots.expanded(&reader);
+        }
         let retained_blobs = keep.len();
 
         for copied in super::transfer(&reader, destination, keep) {
@@ -5867,6 +5978,130 @@ mod tests {
         assert!(resolved >= 17);
         drop(reader);
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn retained_rewrite_keeps_descriptions_of_every_emitted_non_blob_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "kind-retention-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "kind-retention-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+        source.publish_record_kind_descriptions().unwrap();
+
+        source
+            .append_legacy_pin_for_test(collection_test_id(71), None, Some(Inline::new([72; 32])))
+            .unwrap();
+        source
+            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
+                [73; 32],
+            )))
+            .unwrap();
+        let collection_records = collection_test_records();
+        for record in collection_records.iter().copied() {
+            source.insert(record).unwrap();
+        }
+        let (proof, _) = capability_fixture(74, [75; 32]);
+        source.insert_proof(proof).unwrap();
+
+        source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Preserve,
+            )
+            .unwrap();
+
+        let reader = destination.snapshot().unwrap();
+        let mut expected = vec![
+            pin_head_record_kind(),
+            want_record_kind(),
+            capability_proof_record_kind(),
+        ];
+        expected.extend(collection_records.into_iter().map(collection_record_kind));
+        for kind in expected {
+            assert_record_kind_description_resident(&reader, kind);
+        }
+        assert_record_kind_description_resident(&reader, blob_record_kind());
+
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn blob_frames_do_not_self_root_the_blob_kind_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "blob-kind-source.pile");
+        let empty_destination_path = fresh_empty_pile_path(&dir, "blob-kind-empty.pile");
+        let rooted_destination_path = fresh_empty_pile_path(&dir, "blob-kind-rooted.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut empty_destination = Pile::open(&empty_destination_path).unwrap();
+        let mut rooted_destination = Pile::open(&rooted_destination_path).unwrap();
+        source.publish_record_kind_descriptions().unwrap();
+        let payload = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"independently rooted".to_vec()))
+            .unwrap();
+
+        let stats = source
+            .rewrite_retained_into(
+                &mut empty_destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+
+        assert_eq!(stats.retained_blobs, 0);
+        assert!(!empty_destination
+            .snapshot()
+            .unwrap()
+            .contains_blob(blob_record_kind())
+            .unwrap());
+
+        let mut roots = RetentionRoots::new();
+        roots.retain_direct(payload);
+        source
+            .rewrite_retained_into(&mut rooted_destination, &roots, WantRewritePolicy::Drop)
+            .unwrap();
+        let reader = rooted_destination.snapshot().unwrap();
+        assert!(reader.contains_blob(payload).unwrap());
+        assert_record_kind_description_resident(&reader, blob_record_kind());
+        drop(reader);
+
+        empty_destination.close().unwrap();
+        rooted_destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn dropped_wants_do_not_root_their_historical_kind_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "dropped-want-kind-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "dropped-want-kind-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+        source.publish_record_kind_descriptions().unwrap();
+        source
+            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
+                [76; 32],
+            )))
+            .unwrap();
+
+        source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+
+        let reader = destination.snapshot().unwrap();
+        assert!(reader.wants().unwrap().next().is_none());
+        assert!(!reader.contains_blob(want_record_kind()).unwrap());
+        assert!(!reader.contains_blob(blob_record_kind()).unwrap());
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
     }
 
     #[test]
