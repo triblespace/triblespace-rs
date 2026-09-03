@@ -254,8 +254,9 @@ impl<D> CollectionResolution<D> {
     ///
     /// This includes accepted equations whose membership prerequisites are
     /// not active yet. Unauthorized commits are absent, as are pending and
-    /// rejected claims. Strong retention consumes only commit records in this
-    /// set; admitted unsigned equations remain collectable cache work.
+    /// rejected claims. This set is a semantic result only: physical retention
+    /// follows structural references from every retained native record and
+    /// does not consume admission results.
     pub fn admitted_claims(&self) -> &BTreeSet<CollectionRecord> {
         &self.admitted_claims
     }

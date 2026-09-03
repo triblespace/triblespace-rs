@@ -4324,12 +4324,12 @@ impl crate::repo::BlobStoreMeta for PileSnapshot {
 
 /// How a source pile's active wants participate in a retained rewrite.
 ///
-/// Wants are demand markers, not ownership roots. Preserving them copies
-/// the marker into the destination but does not retain or copy the requested
-/// blob unless an explicit or strong-pin root reaches it independently.
+/// A preserved WANT is an ordinary retained record and therefore owns every
+/// resident blob handle it names recursively. Dropping one omits both the
+/// record and those structural ownership edges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WantRewritePolicy {
-    /// Recreate every active want marker without promoting its target.
+    /// Recreate every active WANT and retain its resident reference closure.
     Preserve,
     /// Omit want markers from the destination.
     Drop,
@@ -4679,16 +4679,14 @@ impl Pile {
     /// The source is refreshed once; blobs, strong pins, collection records,
     /// complete proofs, inert legacy collection headers, and wants are then
     /// taken from that coherent applied-prefix
-    /// snapshot. Strictly verified V4
-    /// commits retain their resident descriptor, data, and metadata recursively;
-    /// an invalid commit authenticates none of its fields. A valid commit whose
-    /// dependency is not resident is still copied as durable ground truth, but
-    /// the absent dependency is not manufactured into a transfer root. Later
-    /// synchronization may satisfy it. Every canonical complete proof is
-    /// preserved, but only proofs whose edge signatures verify strictly retain
-    /// their resident claim handles recursively; a malformed signature owns
-    /// nothing. Merge and derive records are algebraic evidence rather than
-    /// ownership edges. Byte-distinct legacy V3 collection headers are copied
+    /// snapshot. Every native collection record owns each resident descriptor,
+    /// member, input, or output handle it names recursively, independently of
+    /// signature validity, admission, or algebraic usefulness. Every canonical
+    /// complete proof similarly owns each resident claim it names, and every
+    /// preserved WANT owns each resident handle in its request. Missing
+    /// references remain missing and never cause a fetch or make the rewrite
+    /// fail merely because a sibling reference is absent. Byte-distinct legacy
+    /// V3 collection headers are copied
     /// exactly but remain semantically inert. The destination may already
     /// contain identical blobs, records, proofs, headers, and strong-pin
     /// mappings, making retries idempotent, but a differently mapped
@@ -4724,6 +4722,17 @@ impl Pile {
             .map_err(PileRewriteError::Source)?;
         let legacy_collection_headers = self.legacy_collection_headers.clone();
         let source_wants = self.wants.clone();
+        let preserved_wants: Vec<_> = if wants == WantRewritePolicy::Preserve {
+            source_wants
+                .into_iter_ordered()
+                .map(|bytes| {
+                    WantRequest::from_bytes(bytes)
+                        .expect("Pile only indexes structurally decoded canonical want requests")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let mut roots = explicit.clone();
         for raw in &strong_pins {
@@ -4741,27 +4750,7 @@ impl Pile {
             let record = collection_records
                 .get(key)
                 .expect("collection key from PATCH snapshot must retain its value");
-            let CollectionRecord::Commit(commit) = record else {
-                continue;
-            };
-            if commit.verify_strict().is_err() {
-                // Structural decoding is deliberately weaker than authority:
-                // preserve the immutable record below for diagnostics and
-                // future replication, but let none of its attacker-controlled
-                // fields affect local lifetime.
-                continue;
-            }
-
-            // Unlike explicit policy roots, native COMMIT dependencies may be
-            // absent on a partially synchronized node. Observe only this
-            // coherent store snapshot; do not issue a demand read, and do not
-            // turn absence into a root which would make every later rewrite
-            // fail. `reachable` already applies the same resident-only rule to
-            // recursive descendants.
-            let descriptor = Inline::<Handle<UnknownBlob>>::new(commit.collection().raw);
-            let data = Inline::<Handle<UnknownBlob>>::new(commit.data().raw);
-            let metadata = commit.metadata().transmute();
-            for handle in [descriptor, data, metadata] {
+            for handle in record.blob_references() {
                 if reader
                     .contains_blob(handle)
                     .expect("PileSnapshot residency lookup is infallible")
@@ -4771,16 +4760,22 @@ impl Pile {
             }
         }
         for proof in &capability_proofs {
-            if proof.verify_signatures().is_err() {
-                continue;
-            }
-            for claim in proof.claim_handles() {
-                let claim = Inline::<Handle<UnknownBlob>>::new(claim.raw);
+            for claim in proof.blob_references() {
                 if reader
                     .contains_blob(claim)
                     .expect("PileSnapshot residency lookup is infallible")
                 {
-                    roots.retain_direct(claim);
+                    roots.retain_recursive(claim);
+                }
+            }
+        }
+        for request in &preserved_wants {
+            for handle in request.blob_references() {
+                if reader
+                    .contains_blob(handle)
+                    .expect("PileSnapshot residency lookup is infallible")
+                {
+                    roots.retain_recursive(handle);
                 }
             }
         }
@@ -4836,25 +4831,15 @@ impl Pile {
                 .map_err(PileRewriteError::CapabilityProof)?;
         }
 
-        let mut preserved_wants = 0usize;
-        if wants == WantRewritePolicy::Preserve {
-            for bytes in source_wants.into_iter_ordered() {
-                destination
-                    .want(
-                        WantRequest::from_bytes(bytes).expect(
-                            "Pile only indexes structurally decoded canonical want requests",
-                        ),
-                    )
-                    .map_err(PileRewriteError::Want)?;
-                preserved_wants += 1;
-            }
+        for request in &preserved_wants {
+            destination.want(*request).map_err(PileRewriteError::Want)?;
         }
 
         destination.flush().map_err(PileRewriteError::Flush)?;
         Ok(PileRewriteStats {
             retained_blobs,
             strong_pins: strong_pins.len() as usize,
-            wants: preserved_wants,
+            wants: preserved_wants.len(),
             capability_proofs: capability_proof_count,
         })
     }
@@ -5282,7 +5267,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_rewrite_preserves_all_proofs_but_only_verified_claim_roots() {
+    fn retained_rewrite_preserves_all_proofs_and_their_resident_claim_closures() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "proof-retention-source.pile");
         let destination_path = fresh_empty_pile_path(&dir, "proof-retention-destination.pile");
@@ -5312,22 +5297,20 @@ mod tests {
                 WantRewritePolicy::Drop,
             )
             .unwrap();
-        assert_eq!(stats.retained_blobs, 1);
+        assert_eq!(stats.retained_blobs, 4);
         assert_eq!(stats.capability_proofs, 2);
 
         let reader = destination.snapshot().unwrap();
         assert!(reader
             .get::<Blob<SimpleArchive>, _>(valid_claim_handle)
             .is_ok());
-        assert!(reader
-            .get::<Blob<UnknownBlob>, _>(valid_attachment)
-            .is_err());
+        assert!(reader.get::<Blob<UnknownBlob>, _>(valid_attachment).is_ok());
         assert!(reader
             .get::<Blob<SimpleArchive>, _>(invalid_claim_handle)
-            .is_err());
+            .is_ok());
         assert!(reader
             .get::<Blob<UnknownBlob>, _>(invalid_attachment)
-            .is_err());
+            .is_ok());
         drop(reader);
 
         let stored = destination
@@ -6882,8 +6865,8 @@ mod tests {
 
         let mut explicit = RetentionRoots::new();
         explicit.retain_recursive(collection_data);
-        // Record hashes are algebraic descriptions, not ownership edges: the
-        // record survives but its obsolete input does not.
+        // This caller-selected descriptive blob is deliberately a direct root,
+        // so its hash-shaped bytes do not become structural ownership edges.
         explicit.retain_direct(collection_record);
 
         let stats = source
@@ -6892,7 +6875,7 @@ mod tests {
         assert_eq!(
             stats,
             PileRewriteStats {
-                retained_blobs: 5,
+                retained_blobs: 6,
                 strong_pins: 1,
                 wants: 1,
                 capability_proofs: 0,
@@ -6906,10 +6889,11 @@ mod tests {
             collection_attachment,
             collection_data,
             collection_record,
+            want_target,
         ] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
         }
-        for collected in [obsolete_input, want_target, orphan] {
+        for collected in [obsolete_input, orphan] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(collected).is_err());
         }
         assert_eq!(
@@ -6931,7 +6915,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_rewrite_ignores_invalid_commit_owned_resident_blobs() {
+    fn retained_rewrite_keeps_invalid_commit_resident_references() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "invalid-commit-source.pile");
         let destination_path = fresh_empty_pile_path(&dir, "invalid-commit-destination.pile");
@@ -6973,7 +6957,7 @@ mod tests {
                 WantRewritePolicy::Drop,
             )
             .unwrap();
-        assert_eq!(stats.retained_blobs, 0);
+        assert_eq!(stats.retained_blobs, 3);
         assert_eq!(
             destination
                 .snapshot()
@@ -6988,15 +6972,15 @@ mod tests {
         let reader = destination.snapshot().unwrap();
         assert!(matches!(
             reader.get::<Blob<UnknownBlob>, _>(forged_data),
-            Err(GetBlobError::BlobNotFound)
+            Ok(_)
         ));
         assert!(matches!(
             reader.get::<Blob<SimpleArchive>, _>(forged_metadata),
-            Err(GetBlobError::BlobNotFound)
+            Ok(_)
         ));
         assert!(matches!(
             reader.get::<Blob<SimpleArchive>, _>(descriptor_handle),
-            Err(GetBlobError::BlobNotFound)
+            Ok(_)
         ));
 
         drop(reader);
@@ -7122,7 +7106,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_rewrite_preserves_native_records_and_commit_owned_blobs() {
+    fn retained_rewrite_preserves_native_records_and_their_owned_blobs() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "collection-source.pile");
         let destination_path = fresh_empty_pile_path(&dir, "collection-destination.pile");
@@ -7141,6 +7125,9 @@ mod tests {
         assert_eq!(metadata, empty_metadata_handle());
         let orphan = source
             .put::<UnknownBlob, _>(Bytes::from_source(b"unowned".to_vec()))
+            .unwrap();
+        let equation_owned = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"equation-owned".to_vec()))
             .unwrap();
 
         let descriptor = named_for_tests("retained", collection_test_id(11));
@@ -7161,7 +7148,7 @@ mod tests {
             CollectionRecord::Commit(commit),
             CollectionRecord::Merge(CollectionMerge::new(
                 descriptor_handle,
-                collection_test_hash(14),
+                Inline::new(equation_owned.raw),
                 collection_test_hash(15),
                 collection_test_hash(16),
             )),
@@ -7183,7 +7170,7 @@ mod tests {
                 WantRewritePolicy::Drop,
             )
             .unwrap();
-        assert_eq!(stats.retained_blobs, 4);
+        assert_eq!(stats.retained_blobs, 5);
 
         let actual_records = destination
             .snapshot()
@@ -7199,6 +7186,7 @@ mod tests {
             data,
             metadata.transmute(),
             descriptor_handle.transmute(),
+            equation_owned,
         ] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
         }

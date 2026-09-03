@@ -155,8 +155,9 @@ The re-encode is semantic and in source order, which is what makes it faithful:
   cells, and kinds no longer interpreted. This includes retired derivation
   record generations whose old wire shape cannot express the current
   collection algebra. Current native `MERGE` and `DERIVE` records are grow-only
-  materialized work and are preserved exactly; their result blobs remain
-  subject only to ordinary Yard/GC policy.
+  materialized work and are preserved exactly; like every retained current
+  native record, they strongly own each independently resident direct blob
+  reference recursively.
 
 A commit's signature covers a domain-separated transcript over its fields, not
 the bytes of its frame, so re-encoding cannot invalidate one. That is a claim
@@ -559,13 +560,13 @@ the same proof ID are a collision and fail. Exact lookup is only by proof ID;
 the store does not discover proofs from keys or claim handles, and record
 presence grants no authority.
 
-Conservative rewrites preserve every canonical proof record. A proof whose
-direct signatures verify makes each resident claim handle in its body a
-direct blob root. The proof already names every ancestral claim, so opaque
-claim fields are not scanned recursively. A missing claim remains absent, and
-an invalidly signed proof roots nothing. Full semantic verification still
-needs the external trust root, expected leaf, instant, request, and exact
-ordered claim blobs.
+Conservative rewrites preserve every canonical proof record. Each proof makes
+every independently resident claim handle in its body a recursive blob root,
+without consulting signature validity or semantic authorization. Missing
+claims remain absent without fetching and do not suppress resident siblings.
+Full semantic verification still needs the external trust root, expected leaf,
+instant, request, and exact ordered claim blobs; physical retention grants no
+authority.
 
 ## Retired Team-Era Records
 
@@ -729,10 +730,11 @@ the corresponding native `MERGE` or `DERIVE` receipt already defined by
 persists those questions independently of whether a local or remote worker
 eventually supplies the receipt.
 
-Forgetting is a physical storage-policy operation. Yard may trim cache demand
-from its in-memory budget and then rewrite only surviving requests during
-reclaim; it never appends a negative fact. Operation wants are not cache
-entries and remain durable until a deliberate rewrite omits them.
+Forgetting is a physical storage-policy operation. Every retained WANT owns
+each independently resident handle named by its request recursively. Yard does
+not weaken this edge through a recency or byte budget; a deliberate physical
+rewrite may instead omit the WANT and its ownership edges. No negative record
+is appended.
 
 Four former current-frame kinds—the blob assertion/retraction pair
 `EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346` /

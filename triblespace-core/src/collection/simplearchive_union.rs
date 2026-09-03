@@ -772,9 +772,8 @@ mod tests {
     use crate::blob::{BlobEncoding, IntoBlob};
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::{
-        discover_collection_records, empty_metadata_handle, plan_collection_retention,
-        resolve_collection_semantics, CollectionClaimValidation, CollectionDerive,
-        CollectionStoreExt,
+        discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
+        CollectionClaimValidation, CollectionDerive, CollectionStoreExt,
     };
     use crate::inline::InlineEncoding;
     use crate::macros::entity;
@@ -1092,10 +1091,6 @@ mod tests {
                 .semantics()
                 .members(identity_for_tests(&descriptor))
                 .is_none());
-            let roots = plan_collection_retention(&discovered, &resolution, &reader).unwrap();
-            assert!(roots.is_empty());
-            assert!(roots.expanded(&reader).is_empty());
-
             let content: Blob<SimpleArchive> = reader
                 .get::<Blob<SimpleArchive>, SimpleArchive>(withheld.data().transmute())
                 .unwrap();

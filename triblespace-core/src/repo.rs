@@ -445,13 +445,10 @@ pub trait BlobStoreKeep {
 /// - **recursive** roots own their resident descendants, discovered through
 ///   [`reachable`].
 ///
-/// The distinction matters for self-describing ledgers and other descriptive
-/// blobs. A descriptive blob can contain hashes that name algebraic inputs
-/// without owning them. Treating it as a recursive root would pin historical
-/// physical inputs and defeat compaction; callers retain such a blob directly
-/// while retaining selected owned data and metadata recursively. Native
-/// collection records live in [`crate::collection::CollectionStore`] rather
-/// than in this blob-root set.
+/// These caller-selected roots supplement native-record ownership. Every
+/// retained collection record, capability proof, and WANT owns its resident
+/// direct references recursively; backends discover those edges separately
+/// from this explicit policy value and without semantic admission.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RetentionRoots {
     direct: BTreeSet<[u8; INLINE_LEN]>,
@@ -847,10 +844,11 @@ fn read_want_field(bytes: &[u8; WANT_REQUEST_BYTES_LEN], index: usize) -> [u8; I
 /// [`wants`](Self::wants) enumerates the set. Exact-content requests are
 /// identified solely by their bearer handle.
 ///
-/// Forgetting is deliberately not a record operation. A storage policy such
-/// as [`crate::repo::yard::Yard`] may omit cache demand while physically
-/// rewriting its store, but it cannot append a counter-record whose later
-/// concatenation would retract another replica's demand.
+/// Forgetting is deliberately not a counter-record operation. A physical
+/// rewrite may omit a WANT deliberately, but while the record is retained it
+/// strongly owns every independently resident direct blob reference. No
+/// appended negative fact may retract another replica's demand after pile
+/// concatenation.
 pub trait WantStore {
     /// Error type for want operations.
     type WantError: Error + Debug + Send + Sync + 'static;

@@ -368,17 +368,7 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
                 .collection_records
                 .get(key)
                 .expect("collection key from PATCH must retain its value");
-            let CollectionRecord::Commit(commit) = record else {
-                continue;
-            };
-            if commit.verify_strict().is_err() {
-                continue;
-            }
-            for root in [
-                Inline::<Handle<UnknownBlob>>::new(commit.collection().raw),
-                Inline::<Handle<UnknownBlob>>::new(commit.data().raw),
-                commit.metadata().transmute(),
-            ] {
+            for root in record.blob_references() {
                 if crate::repo::BlobStoreList::contains_blob(&reader, root).unwrap_or(false) {
                     roots.retain_recursive(root);
                 }
@@ -389,13 +379,16 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
                 .capability_proofs
                 .get(key)
                 .expect("proof key from PATCH must retain its value");
-            if proof.verify_signatures().is_err() {
-                continue;
+            for root in proof.blob_references() {
+                if crate::repo::BlobStoreList::contains_blob(&reader, root).unwrap_or(false) {
+                    roots.retain_recursive(root);
+                }
             }
-            for claim in proof.claim_handles() {
-                let claim: Inline<Handle<UnknownBlob>> = claim.transmute();
-                if crate::repo::BlobStoreList::contains_blob(&reader, claim).unwrap_or(false) {
-                    roots.retain_direct(claim);
+        }
+        for request in &self.wants {
+            for root in request.blob_references() {
+                if crate::repo::BlobStoreList::contains_blob(&reader, root).unwrap_or(false) {
+                    roots.retain_recursive(root);
                 }
             }
         }
@@ -461,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_proofs_are_an_idempotent_set_and_root_verified_claims() {
+    fn capability_proofs_are_an_idempotent_set_and_retain_claims() {
         use crate::repo::{BlobStoreGet, BlobStoreKeep};
 
         let mut repo = MemoryRepo::default();
@@ -503,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_proof_claim_roots_do_not_follow_coincident_resource_handles() {
+    fn capability_proof_claim_roots_retain_their_resident_closure() {
         use crate::repo::{BlobStoreGet, BlobStoreKeep};
 
         let mut repo = MemoryRepo::default();
@@ -535,7 +528,7 @@ mod tests {
             .is_ok());
         assert!(snapshot
             .get::<Blob<UnknownBlob>, _>(coincident_resource)
-            .is_err());
+            .is_ok());
     }
 
     /// Wants form an idempotent grow-only set. Enumeration is sorted (stable
@@ -681,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_collection_commits_and_owned_closure_survive_memory_keep() {
+    fn collection_commits_and_owned_closure_survive_memory_keep() {
         use ed25519_dalek::SigningKey;
 
         use crate::blob::encodings::utf8string::UTF8String;
@@ -719,6 +712,52 @@ mod tests {
         assert!(reader
             .get::<Blob<UnknownBlob>, _>(orphan.transmute())
             .is_err());
+    }
+
+    #[test]
+    fn equations_and_wants_own_each_resident_reference_independently() {
+        use crate::repo::{BlobStoreGet, BlobStoreKeep};
+
+        let mut repo = MemoryRepo::default();
+        let child = repo
+            .put::<UnknownBlob, _>(Bytes::from_source(b"recursive child".to_vec()))
+            .unwrap();
+        let merge_input = repo
+            .put::<UnknownBlob, _>(Bytes::from_source(child.raw.to_vec()))
+            .unwrap();
+        let merge_output = repo
+            .put::<UnknownBlob, _>(Bytes::from_source(b"merge output".to_vec()))
+            .unwrap();
+        let descriptor = repo
+            .put::<UnknownBlob, _>(Bytes::from_source(b"descriptor".to_vec()))
+            .unwrap();
+        let wanted_input = repo
+            .put::<UnknownBlob, _>(Bytes::from_source(b"wanted input".to_vec()))
+            .unwrap();
+        let orphan = repo
+            .put::<UnknownBlob, _>(Bytes::from_source(b"orphan".to_vec()))
+            .unwrap();
+
+        repo.insert(CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.transmute(),
+            Inline::new(merge_input.raw),
+            Inline::new([0xff; 32]),
+            Inline::new(merge_output.raw),
+        )))
+        .unwrap();
+        repo.want(WantRequest::derive(
+            descriptor.transmute(),
+            Inline::new(wanted_input.raw),
+        ))
+        .unwrap();
+
+        repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());
+
+        let reader = repo.snapshot().unwrap();
+        for retained in [child, merge_input, merge_output, descriptor, wanted_input] {
+            assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
+        }
+        assert!(reader.get::<Blob<UnknownBlob>, _>(orphan).is_err());
     }
 
     #[test]

@@ -116,13 +116,13 @@ both bind the expected leaf.
 
 Claims are ordinary blobs. The native proof record is the direct lifetime edge
 for its claim closure: conservative collection preserves every canonical proof
-record, and a proof whose signatures verify makes each resident claim handle an
-exact direct root. Every ancestral claim is already named explicitly by the
-proof, so the collector does not scan opaque claim values or follow parent
-handles recursively. A missing claim remains missing and can be fetched later;
-an invalidly signed proof roots no blob. Trust-root selection and semantic
-claim verification remain caller responsibilities, not garbage-collector
-policy.
+record and makes every independently resident claim handle a recursive root.
+The collector does not verify signatures or authorization before applying this
+structural ownership rule, and it follows resident handles found inside each
+claim through the ordinary conservative blob walk. A missing claim remains
+missing without fetching or weakening ownership of resident siblings.
+Trust-root selection and semantic claim verification remain caller
+responsibilities; retaining evidence grants no authority.
 
 There is no second retention collection. Storing a proof and its claims is
 enough. The storage layer publishes claim blobs before the proof record so an

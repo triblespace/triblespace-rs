@@ -8,7 +8,6 @@
 //! [`Yard::reclaim`](crate::repo::yard::Yard::reclaim) after collection when the logically evicted blobs should
 //! also be physically removed from disk.
 
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
@@ -43,36 +42,17 @@ use super::{
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
-type WantIndex = PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema, WantEntry>;
-
-#[derive(Debug, Clone, Copy)]
-enum WantEntry {
-    /// One exact bearer blob request.
-    Blob { last_used: u64 },
-    /// One merge or derive question, which has no blob-retention projection.
-    Operation,
-}
+type WantIndex = PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>;
 
 #[derive(Debug, Default)]
 struct WantState {
-    /// Every request is keyed by its complete canonical identity. Blob
-    /// requests additionally carry per-request recency.
+    /// Every request is keyed by its complete canonical identity.
     requests: WantIndex,
-    clock: u64,
 }
 
 impl WantState {
     fn want(&mut self, request: WantRequest) {
-        let value = if request.blob_handle().is_some() {
-            self.clock = self.clock.wrapping_add(1).max(1);
-            WantEntry::Blob {
-                last_used: self.clock,
-            }
-        } else {
-            WantEntry::Operation
-        };
-        self.requests
-            .replace(&Entry::with_value(&request.to_bytes(), value));
+        self.requests.insert(&Entry::new(&request.to_bytes()));
     }
 
     fn requests(&self) -> Vec<WantRequest> {
@@ -84,64 +64,10 @@ impl WantState {
             })
             .collect()
     }
-
-    fn trim_to_present_budget(&mut self, present: &HandleSet, budget: usize) -> HandleSet {
-        // Blob requests are already unique by H. Keep the aggregation here so
-        // operation requests remain excluded from the retention budget.
-        let mut by_handle = BTreeMap::<[u8; INLINE_LEN], u64>::new();
-        for bytes in &self.requests {
-            let request = WantRequest::from_bytes(*bytes)
-                .expect("Yard WANT index contains canonical request bytes");
-            let Some(handle) = request.blob_handle() else {
-                continue;
-            };
-            if present.get(&handle.raw).is_some() {
-                let entry = *self
-                    .requests
-                    .get(bytes)
-                    .expect("key from PATCH iterator must resolve in the same PATCH");
-                let WantEntry::Blob { last_used } = entry else {
-                    panic!("blob request in Yard WANT index has operation metadata");
-                };
-                by_handle
-                    .entry(handle.raw)
-                    .and_modify(|seen| *seen = (*seen).max(last_used))
-                    .or_insert(last_used);
-            }
-        }
-
-        let mut candidates: Vec<_> = by_handle.into_iter().collect();
-        candidates.sort_by_key(|(_, last_used)| Reverse(*last_used));
-
-        let mut handles = HandleSet::new();
-        for (raw, _) in candidates.into_iter().take(budget) {
-            handles.insert(&Entry::new(&raw));
-        }
-
-        let mut retained = WantIndex::new();
-        for bytes in &self.requests {
-            let request = WantRequest::from_bytes(*bytes)
-                .expect("Yard WANT index contains canonical request bytes");
-            let keep = request
-                .blob_handle()
-                .is_none_or(|handle| handles.get(&handle.raw).is_some());
-            if keep {
-                let value = *self
-                    .requests
-                    .get(bytes)
-                    .expect("key from PATCH iterator must resolve in the same PATCH");
-                retained.insert(&Entry::with_value(bytes, value));
-            }
-        }
-        self.requests = retained;
-        handles
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct YardConfig {
-    /// Maximum number of wanted blobs retained in the young cache.
-    pub want_budget: usize,
     /// Strong survivor budget for the youngest level.
     pub strong_level_budget: usize,
     /// Per-level strong budget multiplier.
@@ -151,7 +77,6 @@ pub struct YardConfig {
 impl Default for YardConfig {
     fn default() -> Self {
         Self {
-            want_budget: 1024,
             strong_level_budget: 1024,
             fanout: 10,
         }
@@ -396,28 +321,18 @@ impl Yard {
     }
 
     /// Recompute the keep set with explicit policy roots and logically collect
-    /// cold wants and orphans.
+    /// unowned blobs.
     ///
     /// The supplied roots are strong for this pass. Direct roots retain only
-    /// themselves; recursive roots retain their resident descendants. Callers
-    /// must supply the same policy on every later collection pass for the
-    /// corresponding data to remain live. Strictly verified native collection
-    /// commits add their resident data and metadata as recursive roots, and
-    /// signature-valid complete proofs add their resident claim handles.
-    /// Invalid evidence authenticates nothing, dangling dependencies remain
-    /// for later synchronization, and unsigned equations add no roots. Pass an
-    /// empty [`RetentionRoots`] explicitly when native evidence supplies the
-    /// only desired strong roots.
+    /// themselves; recursive roots retain their resident descendants. Every
+    /// retained native collection record, capability proof, and WANT adds all
+    /// of its resident direct references as recursive roots. This structural
+    /// ownership is independent of signatures, admission, or algebraic
+    /// usefulness. Missing references remain missing and never trigger a fetch
+    /// or prevent resident siblings from surviving. Pass an empty
+    /// [`RetentionRoots`] explicitly when native records supply the only roots.
     pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
-        let (_snapshot, strong_keep, present) = self.retention_observation(retention)?;
-        let want_keep = self
-            .want_state
-            .lock()
-            .expect("want mutex poisoned")
-            .trim_to_present_budget(&present, self.config.want_budget);
-
-        let mut keep = strong_keep;
-        keep.union(want_keep);
+        let (_snapshot, keep) = self.retention_observation(retention)?;
         for generation in &mut self.generations {
             for segment in &mut generation.segments {
                 segment.live = segment.live.intersect(&keep);
@@ -429,8 +344,8 @@ impl Yard {
     /// Run one compaction pass with explicit policy roots.
     ///
     /// Strong survivors descend when a level exceeds its strong budget. The
-    /// whole surviving tier moves together; wanted survivors remain evictable
-    /// under the want budget after they descend. Pass an empty
+    /// whole surviving tier moves together. WANT references are ordinary
+    /// strong survivors for as long as their record is retained. Pass an empty
     /// [`RetentionRoots`] explicitly when native evidence supplies the only
     /// desired strong roots.
     pub fn compact(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
@@ -439,7 +354,7 @@ impl Yard {
         let mut dumped = Vec::new();
 
         {
-            let (snapshot, strong_keep, _present) = self.retention_observation(retention)?;
+            let (snapshot, strong_keep) = self.retention_observation(retention)?;
 
             for level in 0..last {
                 let strong_here = self.generations[level].segments[0]
@@ -449,12 +364,9 @@ impl Yard {
                     continue;
                 }
 
-                // Overflow: dump the whole tier down — strong *and* wanted
-                // survivors. `collect(retention)` above already dropped dead, so the
-                // segment's `live` is exactly the survivors. Wanted content descends to
-                // use space in lower tiers rather than being pinned to the
-                // youngest generation; it stays evictable everywhere and is
-                // dropped by the want budget under pressure.
+                // Overflow: dump the whole tier down. `collect(retention)`
+                // above already dropped dead, so the segment's `live` is
+                // exactly the structural survivors.
                 let movers = self.generations[level].segments[0].live.clone();
                 let handles: Vec<_> = movers
                     .clone()
@@ -602,7 +514,7 @@ impl Yard {
     fn retention_observation(
         &mut self,
         retention: &RetentionRoots,
-    ) -> Result<(YardSnapshot, HandleSet, HandleSet), YardCollectError> {
+    ) -> Result<(YardSnapshot, HandleSet), YardCollectError> {
         let snapshot = self.snapshot().map_err(YardCollectError::Snapshot)?;
         let opaque_records = snapshot.opaque_record_count();
         if opaque_records != 0 {
@@ -612,22 +524,18 @@ impl Yard {
         }
         let present = snapshot.live_set();
         let retention = self
-            .retention_with_native_commits(&snapshot, &present, retention)
+            .retention_with_collection_records(&snapshot, &present, retention)
             .map_err(YardCollectError::CollectionRecords)?;
         let retention = self
             .retention_with_capability_proofs(&snapshot, &present, &retention)
             .map_err(YardCollectError::CapabilityProofs)?;
+        let retention = self.retention_with_wants(&present, &retention);
         let strong_keep = self.strong_keep_set(&snapshot, &retention);
-        Ok((snapshot, strong_keep, present))
+        Ok((snapshot, strong_keep))
     }
 
-    /// Add the resident ownership edges carried by strictly verified native
-    /// commits. Invalid signatures authenticate no fields. A valid commit is
-    /// preserved as a native record even when one of its dependencies is not
-    /// live locally, but only its live descriptor, data, and metadata become
-    /// recursive roots; unsigned merge/derive equations are evidence only and
-    /// never own their inputs.
-    fn retention_with_native_commits(
+    /// Add every resident direct reference of every native collection record.
+    fn retention_with_collection_records(
         &self,
         snapshot: &YardSnapshot,
         present: &HandleSet,
@@ -636,17 +544,7 @@ impl Yard {
         let mut combined = retention.clone();
         let records = snapshot.records()?.collect::<Result<Vec<_>, _>>()?;
         for record in records {
-            let CollectionRecord::Commit(commit) = record else {
-                continue;
-            };
-            if commit.verify_strict().is_err() {
-                continue;
-            }
-
-            let descriptor = Inline::<Handle<UnknownBlob>>::new(commit.collection().raw);
-            let data = Inline::<Handle<UnknownBlob>>::new(commit.data().raw);
-            let metadata = commit.metadata().transmute();
-            for handle in [descriptor, data, metadata] {
+            for handle in record.blob_references() {
                 if present.get(&handle.raw).is_some() {
                     combined.retain_recursive(handle);
                 }
@@ -655,9 +553,7 @@ impl Yard {
         Ok(combined)
     }
 
-    /// Add resident claim ownership edges carried by strictly signature-valid
-    /// complete proofs. Structurally canonical but invalid proofs remain
-    /// replicated evidence and authenticate no lifetime roots.
+    /// Add every resident claim reference of every native proof record.
     fn retention_with_capability_proofs(
         &self,
         snapshot: &YardSnapshot,
@@ -669,23 +565,41 @@ impl Yard {
             .proofs()?
             .collect::<Result<Vec<_>, YardCapabilityProofError>>()?;
         for proof in proofs {
-            if proof.verify_signatures().is_err() {
-                continue;
-            }
-            for claim in proof.claim_handles() {
-                let claim = Inline::<Handle<UnknownBlob>>::new(claim.raw);
-                if present.get(&claim.raw).is_some() {
-                    combined.retain_direct(claim);
+            for handle in proof.blob_references() {
+                if present.get(&handle.raw).is_some() {
+                    combined.retain_recursive(handle);
                 }
             }
         }
         Ok(combined)
     }
 
+    /// Add every resident direct reference of every retained WANT record.
+    fn retention_with_wants(
+        &self,
+        present: &HandleSet,
+        retention: &RetentionRoots,
+    ) -> RetentionRoots {
+        let mut combined = retention.clone();
+        let requests = self
+            .want_state
+            .lock()
+            .expect("want mutex poisoned")
+            .requests();
+        for request in requests {
+            for handle in request.blob_references() {
+                if present.get(&handle.raw).is_some() {
+                    combined.retain_recursive(handle);
+                }
+            }
+        }
+        combined
+    }
+
     fn strong_keep_set(&self, reader: &YardSnapshot, retention: &RetentionRoots) -> HandleSet {
         let mut keep = HandleSet::new();
-        // Explicit policy roots remain strong even if the same handle or an
-        // owned descendant also has a stale want marker.
+        // Explicit policy and native-record roots share the same structural
+        // ownership law after root discovery.
         for handle in retention.expanded(reader) {
             keep.insert(&Entry::new(&handle.raw));
         }
@@ -950,11 +864,11 @@ impl WantStore for Yard {
 
     /// Assert one exact request and persist its marker to the young
     /// generation's pile, so it survives a restart ([`Yard::open`] reloads
-    /// it). Blob requests also refresh per-request LRU recency.
+    /// it).
     ///
-    /// Automatic lazy reads call this only on a miss. Explicit callers may
-    /// also want an already-resident blob; that assertion is persisted and
-    /// makes the resident copy subject to the yard's bounded want policy.
+    /// Calling this for an already-resident reference is still meaningful:
+    /// the assertion is persisted and owns every resident handle named by the
+    /// request recursively. Ordinary reads never mint WANT records.
     fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
         self.generations[0].active_mut().pile_mut().want(request)?;
         self.want_state
@@ -1907,7 +1821,7 @@ mod tests {
 
         yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.snapshot().unwrap();
-        assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_err());
+        assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_ok());
         assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
         drop(reader);
 
@@ -1934,7 +1848,7 @@ mod tests {
             vec![proof]
         );
         let reader = reopened.snapshot().unwrap();
-        assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_err());
+        assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_ok());
         assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
         drop(reader);
         reopened.close().unwrap();
@@ -2012,8 +1926,8 @@ mod tests {
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
         assert_eq!(metadata, empty_metadata_handle());
-        let equation_only = yard
-            .put::<RawBytes, _>(raw_blob(b"mentioned only by unsigned equations"))
+        let equation_owned = yard
+            .put::<RawBytes, _>(raw_blob(b"owned by unsigned equations"))
             .unwrap();
 
         let descriptor = named_for_tests("retained", pin_id(32));
@@ -2029,14 +1943,14 @@ mod tests {
             CollectionRecord::Commit(commit),
             CollectionRecord::Merge(CollectionMerge::new(
                 collection,
-                Inline::new(equation_only.raw),
+                Inline::new(equation_owned.raw),
                 Inline::new([35; 32]),
                 Inline::new([36; 32]),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
                 identity_for_tests(&named_for_tests("derived", pin_id(38))),
                 Inline::new([36; 32]),
-                Inline::new(equation_only.raw),
+                Inline::new(equation_owned.raw),
             )),
         ];
         for record in records.iter().copied() {
@@ -2053,11 +1967,11 @@ mod tests {
         assert!(reader
             .get::<Blob<SimpleArchive>, SimpleArchive>(collection)
             .is_ok());
-        assert!(reader.get::<Bytes, RawBytes>(equation_only).is_err());
+        assert!(reader.get::<Bytes, RawBytes>(equation_owned).is_ok());
         drop(reader);
 
         yard.reclaim().unwrap();
-        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 4);
+        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 5);
         let actual = yard
             .snapshot()
             .unwrap()
@@ -2071,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_native_commit_cannot_keep_resident_yard_blobs_live() {
+    fn invalid_native_commit_still_owns_its_resident_blob_references() {
         let (dir, mut yard) = yard_with(1, YardConfig::default());
         let forged_data = yard
             .put::<RawBytes, _>(raw_blob(b"invalid commit data"))
@@ -2098,12 +2012,13 @@ mod tests {
 
         yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.snapshot().unwrap();
-        assert!(!reader.contains_blob(forged_data).unwrap());
-        assert!(!reader.contains_blob(forged_metadata).unwrap());
+        assert!(reader.contains_blob(forged_data).unwrap());
+        assert!(reader.contains_blob(forged_metadata).unwrap());
+        assert!(reader.contains_blob(collection).unwrap());
         drop(reader);
 
         yard.reclaim().unwrap();
-        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 0);
+        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 3);
         let mut actual = yard
             .snapshot()
             .unwrap()
@@ -2157,18 +2072,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_keep_and_want_evict_gc() {
-        let (_dir, mut yard) = yard_with(
-            1,
-            YardConfig {
-                want_budget: 0,
-                ..YardConfig::default()
-            },
-        );
+    fn explicit_keep_and_want_both_root_resident_blobs() {
+        let (_dir, mut yard) = yard_with(1, YardConfig::default());
         let strong = yard.put::<RawBytes, _>(raw_blob(b"strong")).unwrap();
-        // demand-born wanted: wanted while absent, then fetched, then LRU-
-        // evicted under a zero budget — a genuine cache eviction, not an
-        // orphan sweep.
         let wanted = Blob::<RawBytes>::new(raw_blob(b"wanted")).get_handle();
         yard.want(WantRequest::blob(wanted)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"wanted")).unwrap();
@@ -2179,25 +2085,14 @@ mod tests {
         let reader = yard.snapshot().unwrap();
 
         assert_eq!(get_raw(&reader, strong).unwrap(), raw_blob(b"strong"));
-        assert!(matches!(
-            get_raw(&reader, wanted),
-            Err(YardGetError::NotFound)
-        ));
+        assert_eq!(get_raw(&reader, wanted).unwrap(), raw_blob(b"wanted"));
     }
 
     #[test]
     fn explicit_retention_distinguishes_owned_and_descriptive_edges() {
-        let (_dir, mut yard) = yard_with(
-            1,
-            YardConfig {
-                want_budget: 0,
-                ..YardConfig::default()
-            },
-        );
+        let (_dir, mut yard) = yard_with(1, YardConfig::default());
         let owned_child =
             Blob::<UnknownBlob>::new(Bytes::from_source(b"owned child".to_vec())).get_handle();
-        // Even an evictable cache want cannot veto an explicit policy
-        // root: collection retention has already decided this edge is owned.
         yard.want(WantRequest::blob(owned_child)).unwrap();
         yard.put::<UnknownBlob, _>(Bytes::from_source(b"owned child".to_vec()))
             .unwrap();
@@ -2256,18 +2151,15 @@ mod tests {
     }
 
     #[test]
-    fn compaction_tenures_retained_and_lets_wants_descend() {
+    fn compaction_tenures_explicit_and_want_owned_blobs() {
         let (_dir, mut yard) = yard_with(
             3,
             YardConfig {
-                want_budget: 10,
                 strong_level_budget: 0,
                 fanout: 1,
             },
         );
         let strong = yard.put::<RawBytes, _>(raw_blob(b"tenured")).unwrap();
-        // `wanted` is demand-born: wanted while absent, then fetched, so it is
-        // a genuine cache entry — not a resident downgrade, which no-ops.
         let wanted = Blob::<RawBytes>::new(raw_blob(b"cache")).get_handle();
         yard.want(WantRequest::blob(wanted)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cache")).unwrap();
@@ -2276,10 +2168,8 @@ mod tests {
 
         yard.compact(&roots).unwrap();
 
-        // With a zero strong budget everything overflows downward; wanted now
-        // rides the flow to the bottom alongside strong (it is not pinned to
-        // the youngest generation), and stays there because it is within the
-        // want budget.
+        // With a zero strong budget everything overflows downward; the WANT
+        // reference obeys the same strong ownership and tiering law.
         assert!(!yard.contains_in_generation(0, strong));
         assert!(!yard.contains_in_generation(1, strong));
         assert!(yard.contains_in_generation(2, strong));
@@ -2293,7 +2183,6 @@ mod tests {
         let (_dir, paths, mut yard) = yard_with_paths(
             2,
             YardConfig {
-                want_budget: 0,
                 strong_level_budget: 0,
                 fanout: 1,
             },
@@ -2330,7 +2219,6 @@ mod tests {
     #[test]
     fn compact_reanchors_old_only_wants_before_reclaiming_an_old_tier() {
         let config = YardConfig {
-            want_budget: 10,
             strong_level_budget: 1,
             fanout: 1,
         };
@@ -2376,13 +2264,7 @@ mod tests {
 
     #[test]
     fn reclaim_rewrites_generation_to_live_blobs_only() {
-        let (_dir, paths, mut yard) = yard_with_paths(
-            1,
-            YardConfig {
-                want_budget: 0,
-                ..YardConfig::default()
-            },
-        );
+        let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
 
         let live = yard
             .put::<RawBytes, _>(Bytes::from_source(vec![b'L'; 512]))
@@ -2605,11 +2487,8 @@ mod tests {
     }
 
     #[test]
-    fn operation_wants_survive_reclaim_without_retaining_their_digest_fields() {
-        let config = YardConfig {
-            want_budget: 0,
-            ..YardConfig::default()
-        };
+    fn operation_wants_survive_reclaim_and_retain_resident_references() {
+        let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(1, config);
         let input_blob = yard
             .put::<RawBytes, _>(raw_blob(b"an operation input digest is not a blob root"))
@@ -2623,7 +2502,7 @@ mod tests {
         yard.want(derive).unwrap();
 
         yard.collect(&RetentionRoots::new()).unwrap();
-        assert!(!yard.contains_in_generation(0, input_blob));
+        assert!(yard.contains_in_generation(0, input_blob));
         yard.reclaim().unwrap();
         drop(yard);
 
@@ -2636,15 +2515,12 @@ mod tests {
                 .unwrap(),
             vec![merge, derive]
         );
-        assert!(!reopened.contains_in_generation(0, input_blob));
+        assert!(reopened.contains_in_generation(0, input_blob));
     }
 
     #[test]
-    fn collect_then_reclaim_forgets_evicted_blob_demand_without_a_counter_record() {
-        let config = YardConfig {
-            want_budget: 0,
-            ..YardConfig::default()
-        };
+    fn collect_then_reclaim_preserves_grow_only_wants_and_their_resident_closure() {
+        let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(1, config);
         let cached = Blob::<RawBytes>::new(raw_blob(b"evict this cached value")).get_handle();
         yard.want(WantRequest::blob(cached)).unwrap();
@@ -2659,11 +2535,9 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            vec![operation]
+            vec![WantRequest::blob(cached), operation]
         );
 
-        // Collection only changed policy state; reclaim is the physical
-        // forgetting boundary that rewrites exactly the surviving request set.
         yard.reclaim().unwrap();
         drop(yard);
         let mut reopened = Yard::open(paths.clone(), config).unwrap();
@@ -2673,9 +2547,9 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            vec![operation]
+            vec![WantRequest::blob(cached), operation]
         );
-        assert!(!reopened.contains_in_generation(0, cached));
+        assert!(reopened.contains_in_generation(0, cached));
         drop(reopened);
 
         let records = PileRecords::open(&paths[0])
@@ -2687,7 +2561,7 @@ mod tests {
                 .iter()
                 .filter(|record| matches!(record.content, PileRecordContent::Want { .. }))
                 .count(),
-            1
+            2
         );
         assert!(!records.iter().any(|record| matches!(
             record.content,

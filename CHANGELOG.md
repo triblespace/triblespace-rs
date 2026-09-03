@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make physical blob lifetime a structural law shared by MemoryRepo, Pile, and
+  Yard. Every retained COMMIT, MERGE, DERIVE, authorization proof, and WANT now
+  owns each independently resident direct blob reference recursively, without
+  fetching, signature/admission filtering, or failure for missing sibling
+  references. Remove the collection-specific retention planner and Yard's
+  weak/budgeted WANT eviction path.
 - Keep native authorization-proof repair independent of blob demand: receiving
   a proof no longer creates `Blob(H)` WANTs for its claim references.
 - Replace separate collection WRITE evidence with one collection-scoped
@@ -58,9 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trible pile migrate <pile> run monotone-wants` resolves their old log once
   and appends only missing current positives; semantic reframe does the same,
   while ordinary compaction drops retired frames. Yard unions wants across all
-  generations, trims only evictable cache demand in memory, and makes that
-  forgetting physical by re-recording survivors during reclaim. Operation
-  wants remain durable.
+  generations and treats each retained request's resident direct references as
+  recursive ownership roots until a deliberate physical rewrite omits the
+  request.
 
 - Retire the obsolete team-era repository state. `Store` snapshots no longer
   require `PeerRead`, mutable stores no longer require `PeerStore`, and Pile,

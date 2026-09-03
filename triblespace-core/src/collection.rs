@@ -42,8 +42,6 @@ pub mod policy;
 pub mod records;
 /// Stateless semantic admission, closure, provenance, and physical-cover view.
 pub mod resolution;
-/// Strong retention planning for authorized collection commits.
-pub mod retention;
 /// Canonical `SimpleArchive` set-union collection kind.
 pub mod simplearchive_union;
 /// Native grow-only storage for collection-calculus records.
@@ -68,7 +66,6 @@ pub use exact_derived::CollectionRealizationError;
 pub use policy::*;
 pub use records::*;
 pub use resolution::*;
-pub use retention::*;
 pub use simplearchive_union::{PreparedCollectionCommit, StagedCollectionCommit};
 pub use store::*;
 pub use view::*;
