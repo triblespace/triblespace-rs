@@ -320,29 +320,21 @@ where
                             tracing::warn!(?error, "admitting collection repair record failed")
                         }
                     },
-                    NetEvent::CapabilityProof(proof) => {
-                        for claim in proof.claim_handles() {
-                            if let Err(error) = store.want(WantRequest::blob(claim)) {
-                                tracing::warn!(?error, "recording authorization claim WANT failed");
-                                return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                    "recording authorization claim WANT failed: {error:?}"
-                                )));
-                            }
-                            self.pending_network_flush = true;
+                    // Proof repair carries evidence, not blob demand. Referenced
+                    // claims stay inert until an actual consumer follows them
+                    // through the ordinary H-addressed blob data plane.
+                    NetEvent::CapabilityProof(proof) => match store.insert_proof(proof) {
+                        Ok(()) => self.pending_network_flush = true,
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "admitting collection authorization proof failed"
+                            );
+                            return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
+                                "admitting collection authorization proof failed: {error:?}"
+                            )));
                         }
-                        match store.insert_proof(proof) {
-                            Ok(()) => self.pending_network_flush = true,
-                            Err(error) => {
-                                tracing::warn!(
-                                    ?error,
-                                    "admitting collection authorization proof failed"
-                                );
-                                return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                    "admitting collection authorization proof failed: {error:?}"
-                                )));
-                            }
-                        }
-                    }
+                    },
                 }
             }
         }
@@ -871,7 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_authorization_proof_records_ordinary_claim_blob_wants() {
+    async fn native_authorization_proof_does_not_assert_claim_blob_demand() {
         let key = SigningKey::from_bytes(&[94; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, wiring) = host::wire(id);
@@ -896,10 +888,6 @@ mod tests {
         .unwrap()
         .proof()
         .clone();
-        let expected = proof
-            .claim_handles()
-            .map(WantRequest::blob)
-            .collect::<Vec<_>>();
         let mut batch = NetEventBatch::default();
         batch
             .try_push(NetEvent::CapabilityProof(proof.clone()))
@@ -908,14 +896,7 @@ mod tests {
 
         peer.try_refresh().unwrap();
         let mut store = peer.into_store();
-        assert_eq!(
-            store
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            expected
-        );
+        assert_eq!(store.wants().unwrap().count(), 0);
         let snapshot = store.snapshot().unwrap();
         assert_eq!(
             snapshot

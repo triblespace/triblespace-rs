@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Keep native authorization-proof repair independent of blob demand: receiving
+  a proof no longer creates `Blob(H)` WANTs for its claim references.
 - Replace separate collection WRITE evidence with one collection-scoped
   authorization-evidence projection containing structurally relevant native
   READ(C) and WRITE(C) proofs. Repair transports proof records only; every

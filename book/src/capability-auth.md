@@ -159,9 +159,11 @@ collection-evidence disclosure boundary. A collection repair server evaluates
 the TLS-authenticated endpoint against complete READ(C) paths already in its
 pinned collection-scoped authorization projection. The request may additionally
 carry bounded native proofs for cold bootstrap. They cannot admit the current
-immutable session: the server stores them inertly, demands their claim handles
-through ordinary exact blob acquisition, and evaluates them only from a later
-coherent snapshot.
+immutable session: the server stores them inertly and evaluates them only from
+a later coherent snapshot. Merely receiving a proof neither fetches nor
+asserts demand for the claim blobs it names. An actual consumer which follows
+a missing claim handle resolves H through the ordinary blob data plane, exactly
+like every other content-addressed dependency.
 Collection repair likewise carries every structurally valid signed COMMIT(C)
 without asking the sender to prove WRITE. The receiver derives activity from
 its own snapshot, so a grant and its commit may arrive in either order and the
@@ -189,13 +191,13 @@ it names.
 
 Capability proof records are durable local set evidence, but there is no global
 proof inventory or claim-specific WANT. Collection-scoped repair
-unions native proof records with complete resident claim closure which are
+projects native proof records whose complete resident claim closures are
 structurally relevant to exact READ(C) or WRITE(C). Its PATCH leaves contain
-only canonical proof bytes. A received proof records ordinary durable
-`Blob(H)` WANTs for every missing claim handle; the existing H-only provider
-path acquires those blobs, and a later coherent snapshot can then derive
-authority. Portable bundles remain application-level invitation artifacts,
-not a network representation.
+only canonical proof bytes. Proof receipt does not fetch or WANT its referenced
+claims. If later evaluation follows a missing claim handle, it resolves H
+through the generic H-addressed blob data plane; an explicit WANT may delegate
+durable fulfillment but is never protocol bookkeeping. Portable bundles remain
+application-level invitation artifacts, not a network representation.
 
 This separation is intentional:
 
