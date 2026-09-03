@@ -24,7 +24,7 @@ use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 use triblespace_core::trible::{Fragment, Trible, TribleSet};
 
 use triblespace_search::nvfp4::{
-    EmbeddingAttributeToNvFp4, NvFp4CosineIndex, NvFp4CosineSet, SimilarityHit,
+    NvFp4CosineIndex, NvFp4CosineSet, NvFp4EmbeddingAttribute, SimilarityHit,
 };
 use triblespace_search::schemas::Embedding;
 
@@ -189,9 +189,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let source = store.collection("nvfp4-corpus-source", policy.clone())?;
-    let target = store.derive(
+    let target = store.derive::<NvFp4CosineSet<Embedding>>(
         source,
-        EmbeddingAttributeToNvFp4::<Embedding>::new(attribute.id(), corpus.dimension)?,
+        NvFp4EmbeddingAttribute::new(attribute.id(), corpus.dimension)?,
         policy,
     )?;
     store.commit(source, &authority, Fragment::from(facts))?;
@@ -200,8 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     drop(snapshot);
 
     let construction_start = Instant::now();
-    let snapshot =
-        block_on(store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support))?;
+    let snapshot = block_on(store.maintain_exact(target, &support))?;
     let construction = construction_start.elapsed();
     let collection = snapshot.collection_exact(target, &support)?;
     let snapshot = collection.snapshot();

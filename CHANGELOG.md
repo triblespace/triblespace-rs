@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ensure_with`, and `maintain_with` seam for downstream mappings between two
   foreign encoding types that Rust's orphan rule prevents either crate from
   attaching to the target.
+- Make `NvFp4CosineSet<E>` own its canonical `SimpleArchive` derivation, with
+  `NvFp4EmbeddingAttribute` carrying the selected attribute and dimension as
+  runtime descriptor arguments. This removes the public per-edge mapping
+  witness without changing descriptor or member bytes.
 - Retain each canonical regular-path automaton as a typed content-addressed
   blob and interpret `PathSummaryBlob` members through that immutable child.
   The existing 32-byte fingerprint header is already the BLAKE3 handle of the

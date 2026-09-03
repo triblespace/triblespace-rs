@@ -19,7 +19,7 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 use triblespace_core::trible::{Fragment, Trible, TribleSet};
 
-use triblespace_search::nvfp4::{EmbeddingAttributeToNvFp4, NvFp4CosineIndex};
+use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet, NvFp4EmbeddingAttribute};
 use triblespace_search::schemas::Embedding;
 
 fn direct_policy(authority: &SigningKey) -> CollectionPolicy {
@@ -52,9 +52,9 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
 
     let source = store.collection("nvfp4-source", policy.clone()).unwrap();
     let target = store
-        .derive(
+        .derive::<NvFp4CosineSet<Embedding>>(
             source,
-            EmbeddingAttributeToNvFp4::<Embedding>::new(attribute.id(), 3).unwrap(),
+            NvFp4EmbeddingAttribute::new(attribute.id(), 3).unwrap(),
             policy,
         )
         .unwrap();
@@ -67,9 +67,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
         .admitted_at(&snapshot, triblespace_core::clock::epoch_now())
         .unwrap();
     drop(snapshot);
-    let snapshot =
-        block_on(store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support))
-            .unwrap();
+    let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
     let collection = snapshot.collection_exact(target, &support).unwrap();
     let index: NvFp4CosineIndex<Embedding> = collection.view().unwrap();
     let snapshot = collection.snapshot();

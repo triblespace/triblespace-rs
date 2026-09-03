@@ -42,7 +42,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::{
-    CollectionEncoding, CollectionMapping, CollectionOperationError, Cover, TryFromCover,
+    CollectionDerivation, CollectionEncoding, CollectionOperationError, Cover, TryFromCover,
     TryFromCoverError,
 };
 use triblespace_core::id::{id_hex, ExclusiveId, Id};
@@ -583,16 +583,17 @@ pub struct NvFp4CosineIndex<E: BlobEncoding> {
     _encoding: PhantomData<E>,
 }
 
-/// Bound projection of one handle-valued SimpleArchive attribute.
+/// The source attribute and logical dimension selected by an NVFP4 derivation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EmbeddingAttributeToNvFp4<E: BlobEncoding> {
+pub struct NvFp4EmbeddingAttribute {
     attribute: Id,
     dimension: NonZeroUsize,
-    _encoding: PhantomData<E>,
 }
 
-impl<E: BlobEncoding> EmbeddingAttributeToNvFp4<E> {
-    /// Select `attribute` as typed `Handle<E>` values of exactly `dimension`.
+impl NvFp4EmbeddingAttribute {
+    /// Select one handle-valued attribute with exactly `dimension` components.
+    ///
+    /// The target [`NvFp4CosineSet<E>`] supplies the exact handle encoding.
     pub fn new(attribute: Id, dimension: usize) -> Result<Self, NvFp4Error> {
         let dimension = NonZeroUsize::new(dimension)
             .ok_or_else(|| NvFp4Error::new("embedding dimension must be positive"))?;
@@ -601,7 +602,6 @@ impl<E: BlobEncoding> EmbeddingAttributeToNvFp4<E> {
         Ok(Self {
             attribute,
             dimension,
-            _encoding: PhantomData,
         })
     }
 
@@ -707,20 +707,23 @@ fn mapping_dimension_facts(facts: &TribleSet) -> Result<usize, CollectionOperati
     Ok(dimension)
 }
 
-impl<E> CollectionMapping for EmbeddingAttributeToNvFp4<E>
+impl<E> CollectionDerivation for NvFp4CosineSet<E>
 where
     E: BlobEncoding,
     View<[f32]>: TryFromBlob<E>,
     <View<[f32]> as TryFromBlob<E>>::Error: fmt::Display + Send + Sync + 'static,
 {
     type Source = SimpleArchive;
-    type Target = NvFp4CosineSet<E>;
+    type Argument = NvFp4EmbeddingAttribute;
 
-    fn fragment(&self) -> Fragment {
-        mapping_fragment::<E>(self.attribute, self.dimension.get())
+    fn fragment(argument: &Self::Argument) -> Fragment {
+        mapping_fragment::<E>(argument.attribute, argument.dimension.get())
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+    fn bind(
+        _source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self::Argument, CollectionOperationError> {
         let actual = triblespace_core::collection::descriptor::mapping_algorithm(target.facts())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
         if actual != Some(EMBEDDING_ATTRIBUTE_TO_NVFP4) {
@@ -738,18 +741,17 @@ where
         }
         let attribute = mapping_attribute(target)?;
         let dimension = mapping_dimension(target)?;
-        Ok(Self {
+        Ok(NvFp4EmbeddingAttribute {
             attribute,
             dimension: NonZeroUsize::new(dimension).expect("checked positive"),
-            _encoding: PhantomData,
         })
     }
 
     fn map<R>(
-        &self,
+        argument: &Self::Argument,
         source: &Blob<SimpleArchive>,
         reader: &R,
-    ) -> Result<Blob<Self::Target>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
@@ -758,7 +760,7 @@ where
 
         let mut handles = BTreeSet::new();
         for raw in source.bytes.as_ref().chunks_exact(TRIBLE_LEN) {
-            if raw[16..32] == self.attribute[..] {
+            if raw[16..32] == argument.attribute[..] {
                 handles.insert(raw[32..64].try_into().expect("32-byte trible value"));
             }
         }
@@ -784,11 +786,11 @@ where
                 ))
             })?;
             rows.push(
-                StoredRow::quantize(raw, embedding.as_ref(), self.dimension.get())
+                StoredRow::quantize(raw, embedding.as_ref(), argument.dimension.get())
                     .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?,
             );
         }
-        encode_rows::<E>(self.dimension.get(), rows)
+        encode_rows::<E>(argument.dimension.get(), rows)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
@@ -1397,8 +1399,7 @@ mod tests {
     fn mapping_is_a_join_homomorphism_with_overlap_and_empty() {
         const DIMENSION: usize = 3;
         let attribute = Attribute::<Handle<Embedding>>::named("nvfp4-homomorphism");
-        let mapping =
-            EmbeddingAttributeToNvFp4::<Embedding>::new(attribute.id(), DIMENSION).unwrap();
+        let argument = NvFp4EmbeddingAttribute::new(attribute.id(), DIMENSION).unwrap();
         let mut store = MemoryRepo::default();
         let first = store.put::<Embedding, _>(vec![1.0f32, 0.0, 0.0]).unwrap();
         let shared = store.put::<Embedding, _>(vec![0.0f32, 1.0, 0.0]).unwrap();
@@ -1410,13 +1411,18 @@ mod tests {
         let mut union = left.clone();
         union += right.clone();
 
-        let mapped_left = mapping.map(&left.to_blob(), &snapshot).unwrap();
-        let mapped_right = mapping.map(&right.to_blob(), &snapshot).unwrap();
-        let mapped_union = mapping.map(&union.to_blob(), &snapshot).unwrap();
+        let mapped_left =
+            NvFp4CosineSet::<Embedding>::map(&argument, &left.to_blob(), &snapshot).unwrap();
+        let mapped_right =
+            NvFp4CosineSet::<Embedding>::map(&argument, &right.to_blob(), &snapshot).unwrap();
+        let mapped_union =
+            NvFp4CosineSet::<Embedding>::map(&argument, &union.to_blob(), &snapshot).unwrap();
         let joined = join_members(&mapped_left, &mapped_right, DIMENSION).unwrap();
         assert_eq!(mapped_union.bytes.as_ref(), joined.bytes.as_ref());
 
-        let empty = mapping.map(&TribleSet::new().to_blob(), &snapshot).unwrap();
+        let empty =
+            NvFp4CosineSet::<Embedding>::map(&argument, &TribleSet::new().to_blob(), &snapshot)
+                .unwrap();
         let with_empty = join_members(&mapped_left, &empty, DIMENSION).unwrap();
         assert_eq!(mapped_left.bytes.as_ref(), with_empty.bytes.as_ref());
     }
@@ -1487,9 +1493,9 @@ mod tests {
             .collection("nvfp4-lazy-source", policy.clone())
             .unwrap();
         let target = source_store
-            .derive(
+            .derive::<NvFp4CosineSet<Embedding>>(
                 source,
-                EmbeddingAttributeToNvFp4::<Embedding>::new(attribute.id(), DIMENSION).unwrap(),
+                NvFp4EmbeddingAttribute::new(attribute.id(), DIMENSION).unwrap(),
                 policy,
             )
             .unwrap();
@@ -1505,10 +1511,7 @@ mod tests {
             .admitted_at(&source_snapshot, triblespace_core::clock::epoch_now())
             .unwrap();
         drop(source_snapshot);
-        let source_snapshot = block_on(
-            source_store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support),
-        )
-        .unwrap();
+        let source_snapshot = block_on(source_store.maintain_exact(target, &support)).unwrap();
         let collection = source_snapshot.collection_exact(target, &support).unwrap();
         let target_cover = collection.cover().clone();
         let source_snapshot = collection.snapshot();
