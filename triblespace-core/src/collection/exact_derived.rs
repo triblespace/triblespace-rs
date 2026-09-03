@@ -480,56 +480,51 @@ where
     })
 }
 
-/// Attach one target collection to the immutable state actually visible in a
-/// snapshot.
+/// Attach one target collection for exact caller-supplied support.
 ///
-/// With `Some(support)`, attachment is exact and fails unless all requested
-/// support is resident in the target. With `None`, the foundation's admitted
-/// support is used as the search boundary, but the result contains only the
-/// maximal resident target antichain and exactly the foundational support it
-/// represents. A static snapshot never promises a future derivation.
-pub(crate) fn attach_collection<R, E>(
+/// This fails unless all requested support is resident in the target. Exact
+/// support is independent of authorization time, so this frozen-snapshot path
+/// deliberately has no clock input.
+pub(crate) fn attach_collection_exact<R, E>(
     snapshot: &R,
     target: Collection<E>,
-    requested: Option<&Support>,
+    requested: &Support,
 ) -> Result<(Support, Cover<E>), CollectionRealizationError>
 where
     R: StoreRead,
     E: CollectionEncoding,
 {
-    attach_collection_at(snapshot, target, requested, crate::clock::epoch_now())
+    let lineage = load_lineage(snapshot, target)?;
+    let resolved = resolve_target(snapshot, target, &lineage, requested)?;
+    if !resolved.is_exact_for(requested) {
+        return Err(resolved.incomplete_error(requested));
+    }
+    Ok((resolved.support, resolved.cover))
 }
 
 /// Attach one target collection using one caller-supplied authorization instant.
+///
+/// The foundation's admitted support is the search boundary, but the result
+/// contains only the maximal resident target antichain and exactly the
+/// foundational support it represents. A static snapshot never promises a
+/// future derivation.
 pub(crate) fn attach_collection_at<R, E>(
     snapshot: &R,
     target: Collection<E>,
-    requested: Option<&Support>,
     instant: hifitime::Epoch,
 ) -> Result<(Support, Cover<E>), CollectionRealizationError>
 where
     R: StoreRead,
     E: CollectionEncoding,
 {
-    let exact = requested.is_some();
     let lineage = load_lineage(snapshot, target)?;
-    let admitted;
-    let requested = match requested {
-        Some(requested) => requested,
-        None => {
-            admitted = lineage
-                .foundation
-                .admitted_at(snapshot, instant)
-                .map_err(|error| {
-                    CollectionRealizationError::storage("admit foundational support", error)
-                })?;
-            &admitted
-        }
-    };
-    let resolved = resolve_target(snapshot, target, &lineage, requested)?;
-    if exact && !resolved.is_exact_for(requested) {
-        return Err(resolved.incomplete_error(requested));
-    }
+    let admitted = lineage
+        .foundation
+        .admitted_at(snapshot, instant)
+        .map_err(|error| {
+            CollectionRealizationError::storage("admit foundational support", error)
+        })?;
+    let resolved = resolve_target(snapshot, target, &lineage, &admitted)?;
     Ok((resolved.support, resolved.cover))
 }
 

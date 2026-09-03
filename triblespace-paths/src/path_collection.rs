@@ -193,7 +193,12 @@ fn support(
         }
         store.insert_proof(proof).unwrap();
     }
-    collection.admitted(&store.snapshot().unwrap()).unwrap()
+    collection
+        .admitted_at(
+            &store.snapshot().unwrap(),
+            triblespace_core::clock::epoch_now(),
+        )
+        .unwrap()
 }
 
 fn records(store: &mut CollectionOnly) -> Vec<CollectionRecord> {

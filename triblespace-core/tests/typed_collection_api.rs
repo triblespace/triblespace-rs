@@ -70,11 +70,15 @@ fn simplearchive_collection_round_trips_typed_views() {
     );
 
     let snapshot = store.snapshot().unwrap();
-    let cover = collection.admitted(&snapshot).unwrap();
+    let cover = collection
+        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
+        .unwrap();
     assert_eq!(cover.collection(), collection);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![expected_member]);
 
-    let materialized: TribleSet = collection.read(&snapshot).unwrap();
+    let materialized: TribleSet = collection
+        .read_at(&snapshot, Epoch::from_tai_seconds(0.0))
+        .unwrap();
     assert_eq!(materialized, expected);
 }
 
@@ -101,7 +105,9 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
     let snapshot = store.snapshot().unwrap();
-    let source_cover = source.admitted(&snapshot).unwrap();
+    let source_cover = source
+        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
+        .unwrap();
     let ensured = block_on(store.ensure::<SimpleToSuccinctMapping>(target)).unwrap();
     let collection = ensured.collection_exact(target, &source_cover).unwrap();
 
@@ -156,7 +162,9 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
 
-    let support = source.admitted(&store.snapshot().unwrap()).unwrap();
+    let support = source
+        .admitted_at(&store.snapshot().unwrap(), Epoch::from_tai_seconds(0.0))
+        .unwrap();
     block_on(store.ensure_exact::<SimpleToSuccinctMapping>(raw, &support)).unwrap();
     let ensured =
         block_on(store.ensure_exact::<RawToRank9AcceleratedMapping>(accelerated, &support))
@@ -257,7 +265,9 @@ fn collection_at_returns_the_maximal_resident_partial_realization() {
     store
         .commit(source, &authority, Fragment::from(first.clone()))
         .unwrap();
-    let first_support = source.admitted(&store.snapshot().unwrap()).unwrap();
+    let first_support = source
+        .admitted_at(&store.snapshot().unwrap(), Epoch::from_tai_seconds(0.0))
+        .unwrap();
     block_on(store.ensure_exact::<SimpleToSuccinctMapping>(target, &first_support)).unwrap();
     store
         .commit(source, &authority, Fragment::from(second))

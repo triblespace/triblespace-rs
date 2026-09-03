@@ -63,7 +63,9 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let support = source.admitted(&snapshot).unwrap();
+    let support = source
+        .admitted_at(&snapshot, triblespace_core::clock::epoch_now())
+        .unwrap();
     drop(snapshot);
     let snapshot =
         block_on(store.maintain_exact::<EmbeddingAttributeToNvFp4<Embedding>>(target, &support))

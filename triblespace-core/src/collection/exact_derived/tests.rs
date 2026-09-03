@@ -712,7 +712,7 @@ fn two_hops_reuse_one_invariant_foundational_support() {
     ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
     ensure_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
     let snapshot = store.snapshot().unwrap();
-    let (observed_support, cover) = attach_collection(&snapshot, second, Some(&support)).unwrap();
+    let (observed_support, cover) = attach_collection_exact(&snapshot, second, &support).unwrap();
 
     assert_eq!(observed_support, support);
     assert_eq!(cover.len(), 1);
@@ -742,7 +742,8 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
     ensure_exact_resident::<_, FirstMapping>(&mut store, first, &left_support).unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let (observed, cover) = attach_collection(&snapshot, first, None).unwrap();
+    let (observed, cover) =
+        attach_collection_at(&snapshot, first, hifitime::Epoch::from_tai_seconds(0.0)).unwrap();
     assert_eq!(observed, left_support);
     assert_eq!(cover.len(), 1);
 }
@@ -755,7 +756,9 @@ fn duplicate_commit_fibers_collapse_to_one_support_member() {
     publish_root(&mut store, root, &source, 2);
 
     let snapshot = store.snapshot().unwrap();
-    let admitted = root.admitted(&snapshot).unwrap();
+    let admitted = root
+        .admitted_at(&snapshot, hifitime::Epoch::from_tai_seconds(0.0))
+        .unwrap();
     assert_eq!(admitted.len(), 1);
     assert_eq!(admitted.members().next(), Some(source.get_handle()));
     assert_eq!(admitted.commits(&snapshot).unwrap().len(), 2);
@@ -801,7 +804,7 @@ fn exact_ensure_acquires_explicit_foundational_support_without_want() {
 
     assert_eq!(store.acquired, vec![data(&source)]);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
-    let (observed, cover) = attach_collection(&snapshot, first, Some(&support)).unwrap();
+    let (observed, cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
     assert_eq!(observed, support);
     assert_eq!(cover.len(), 1);
 }
@@ -974,7 +977,7 @@ fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
     );
 
     let snapshot = store.inner.snapshot().unwrap();
-    let (_, cover) = attach_collection(&snapshot, second, Some(&support)).unwrap();
+    let (_, cover) = attach_collection_exact(&snapshot, second, &support).unwrap();
     assert_eq!(cover.len(), 1);
 }
 
@@ -1148,7 +1151,7 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
     ensure_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let (_, first_cover) = attach_collection(&snapshot, first, Some(&support)).unwrap();
+    let (_, first_cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
     let mut children = first_cover.members().map(|handle| {
         snapshot
             .get::<Blob<FirstEncoding>, FirstEncoding>(handle)
@@ -1190,7 +1193,7 @@ fn optional_target_dependency_keeps_the_finer_cover() {
 
     maintain_exact_resident::<_, FirstMapping>(&mut store, first, &support).unwrap();
     let snapshot = store.snapshot().unwrap();
-    let (_, cover) = attach_collection(&snapshot, first, Some(&support)).unwrap();
+    let (_, cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
     assert_eq!(cover.len(), 2);
     drop(snapshot);
     let first_result = store.snapshot().unwrap();
@@ -1215,7 +1218,7 @@ fn target_maintenance_publishes_only_horizontal_target_merges() {
     maintain_exact_resident::<_, SecondMapping>(&mut store, second, &support).unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let (_, cover) = attach_collection(&snapshot, second, Some(&support)).unwrap();
+    let (_, cover) = attach_collection_exact(&snapshot, second, &support).unwrap();
     assert_eq!(cover.len(), 1);
     let all = records(&mut store);
     assert!(all.iter().any(|record| matches!(

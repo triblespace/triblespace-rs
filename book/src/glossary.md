@@ -93,7 +93,7 @@ them rather than accepting caller-forged hash sets.
 
 ### Collection Admission
 The read-time signer decision performed by
-`collection.admitted(&store_snapshot)`. Each WRITE-policy root acts directly;
+`collection.admitted_at(&store_snapshot, instant)`. Each WRITE-policy root acts directly;
 resident proof paths rooted in the policy's canonical root set are considered
 at one clock instant for the exact `ACTION_WRITE`/collection atom. A writer is
 admitted only when it has the policy's required distinct root support. Invalid,

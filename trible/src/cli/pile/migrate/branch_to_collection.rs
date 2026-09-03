@@ -547,7 +547,7 @@ mod tests {
         expected_union += fact(3);
         let snapshot = pile.snapshot()?;
         let materialized: TribleSet = collection
-            .read(&snapshot)
+            .read_at(&snapshot, hifitime::Epoch::from_tai_seconds(0.0))
             .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
         assert_eq!(materialized, expected_union);
 
@@ -600,7 +600,7 @@ mod tests {
         assert!(!mappings.is_empty(), "migration still publishes locally");
         let snapshot = pile.snapshot()?;
         assert!(collection
-            .admitted(&snapshot)
+            .admitted_at(&snapshot, hifitime::Epoch::from_tai_seconds(0.0))
             .map_err(|error| anyhow!("read unauthorized cover: {error}"))?
             .is_empty());
         assert!(snapshot
@@ -672,7 +672,7 @@ mod tests {
 
         let snapshot = pile.snapshot()?;
         let materialized: TribleSet = collection
-            .read(&snapshot)
+            .read_at(&snapshot, hifitime::Epoch::from_tai_seconds(0.0))
             .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
         assert_eq!(materialized, fact(9));
         pile.close()?;

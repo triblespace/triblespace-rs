@@ -125,7 +125,7 @@ mod readme_example {
         storage.commit(library, &key, initial)?;
 
         let snapshot = storage.snapshot()?;
-        let catalog: TribleSet = library.read(&snapshot)?;
+        let catalog: TribleSet = library.read_at(&snapshot, crate::core::clock::epoch_now())?;
         let title = "Dune";
 
         for (f, l, quote) in find!(
@@ -167,7 +167,7 @@ mod readme_example {
         )?;
 
         let snapshot = storage.snapshot()?;
-        let catalog: TribleSet = library.read(&snapshot)?;
+        let catalog: TribleSet = library.read_at(&snapshot, crate::core::clock::epoch_now())?;
         let mut names: Vec<String> = find!(
             first: String,
             pattern!(&catalog, [{ _?author @ literature::firstname: ?first }])

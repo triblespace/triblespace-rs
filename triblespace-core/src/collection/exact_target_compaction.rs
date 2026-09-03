@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, Store};
 
-use super::exact_derived::{attach_collection, data_identity, CollectionRealizationError};
+use super::exact_derived::{attach_collection_exact, data_identity, CollectionRealizationError};
 use super::operation_snapshot::OperationFrontier;
 use super::{
     Collection, CollectionData, CollectionEncoding, CollectionMerge, CollectionOperationError,
@@ -44,7 +44,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open target-maintenance snapshot", error)
         })?);
-        let (_, cover) = attach_collection(&snapshot, target, Some(support))?;
+        let (_, cover) = attach_collection_exact(&snapshot, target, support)?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
             return Err(CollectionRealizationError::Stalled { cover: identity });

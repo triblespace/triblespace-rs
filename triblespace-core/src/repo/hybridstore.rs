@@ -471,7 +471,9 @@ mod tests {
             .commit(target, &signing_key, Fragment::empty())
             .unwrap();
         let snapshot = hybrid.snapshot().unwrap();
-        let facts: TribleSet = target.read(&snapshot).unwrap();
+        let facts: TribleSet = target
+            .read_at(&snapshot, hifitime::Epoch::from_tai_seconds(0.0))
+            .unwrap();
         assert_eq!(facts.len(), 0);
         assert_eq!(commit.collection(), target.handle());
         assert!(hybrid.blobs.blobs.len() >= 2);

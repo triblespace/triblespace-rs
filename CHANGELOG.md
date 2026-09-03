@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make authorization time an explicit input to every frozen collection read.
+  Remove the hidden-current-clock `Collection` conveniences in favor of their
+  existing `*_at` forms, and make exact-support attachment clock-free. Live
+  `ensure` and `maintain` operations continue to sample one instant at their
+  mutable store boundary.
 - Rename the peer's effect-neutral exact-byte transport from
   `fetch_wanted_blob` to `fetch_blob`, and abort an entire reconciliation pass
   when its frozen collection-record observation fails instead of treating the

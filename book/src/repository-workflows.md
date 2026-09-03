@@ -111,7 +111,8 @@ let commit = storage.commit(
     entity! { metadata::name: "first-model" },
 )?;
 let snapshot = storage.snapshot()?;
-let cover = models.admitted(&snapshot)?;
+let instant = triblespace::core::clock::epoch_now();
+let cover = models.admitted_at(&snapshot, instant)?;
 assert!(cover.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
 storage.flush()?;
 ```
@@ -204,7 +205,8 @@ available explicit cover member.
 
 Local publication remains unconditional. A publisher which needs to predict
 whether an authority-aware observation will admit a signer can freeze a store
-snapshot and call `collection.writer_is_admitted(&snapshot, signer)`: it checks
+snapshot, sample one instant, and call
+`collection.writer_is_admitted_at(&snapshot, signer, instant)`: it checks
 the descriptor WRITE policy and resident exact authorization evidence without scanning
 collection commits or publishing anything.
 
@@ -239,11 +241,12 @@ Both forms keep the chosen target cover inseparable from the store snapshot
 which established its residency. `view` invokes `TryFromCover<E>` solely
 through that frozen observation. For a `SimpleArchive`, `V = TribleSet`; for a
 `SuccinctArchiveBlob`, `V` may be an mmap-backed union retaining selected
-shards. `collection.read::<V, _>(&snapshot)` remains a concise root-collection
-read when the intermediate support and physical cover are irrelevant.
+shards. `collection.read_at::<V, _>(&snapshot, instant)` remains a concise
+root-collection read when the intermediate support and physical cover are
+irrelevant.
 
 Consumers which need the exact strictly verified COMMIT roots selected during
-admission use `collection.admitted_with_commits(&snapshot)`; later claims over
+admission use `collection.admitted_with_commits_at(&snapshot, instant)`; later claims over
 the same payload remain broader provenance rather than retroactive roots.
 
 This is a coherent **known-prefix** observation, not a global latest

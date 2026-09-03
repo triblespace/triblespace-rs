@@ -52,7 +52,7 @@ fn main() {
     // target frontier without reading the commits' data or metadata blobs.
     let snapshot = pile.snapshot().expect("freeze pile snapshot");
     let support = collection
-        .admitted(&snapshot)
+        .admitted_at(&snapshot, triblespace::core::clock::epoch_now())
         .expect("discover exact support");
     assert_eq!(support.len(), 3);
     drop(snapshot);

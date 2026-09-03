@@ -324,7 +324,10 @@ fn write_grant_is_root_checked_commit_last_and_activates_recipient_commits() {
         .unwrap();
     let commit = store.commit(collection, &writer, fragment(36)).unwrap();
     let snapshot = store.snapshot().unwrap();
-    assert!(collection.admitted(&snapshot).unwrap().is_empty());
+    assert!(collection
+        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
+        .unwrap()
+        .is_empty());
     drop(snapshot);
     store.events.clear();
 
@@ -359,7 +362,9 @@ fn write_grant_is_root_checked_commit_last_and_activates_recipient_commits() {
             Epoch::from_tai_seconds(0.0),
         )
         .unwrap());
-    let admitted = collection.admitted(&snapshot).unwrap();
+    let admitted = collection
+        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
+        .unwrap();
     assert_eq!(admitted.len(), 1);
     assert!(admitted.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
 }

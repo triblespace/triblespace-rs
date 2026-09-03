@@ -140,7 +140,8 @@ append order is never an implicit winner.
 
 ```rust,ignore
 let snapshot = storage.snapshot()?;
-let admitted = library.admitted(&snapshot)?;
+let instant = triblespace::core::clock::epoch_now();
+let admitted = library.admitted_at(&snapshot, instant)?;
 let available = admitted.available(&snapshot)?;
 let missing = admitted.difference(&available)?;
 assert!(missing.is_empty());
@@ -167,18 +168,20 @@ for (first, last, quote) in find!(
 ```
 
 `storage.snapshot()` freezes blobs, collection records, capability proofs, and
-backend state at one coherent known prefix. `library.admitted(&snapshot)` then
+backend state at one coherent known prefix. The caller samples one authorization
+instant, and `library.admitted_at(&snapshot, instant)` then
 applies the descriptor's WRITE policy in that same observation and returns the
 exact semantic payload cover. `available` returns the greatest subset of those
 same semantic members which has a complete resident realization, so equality
 with `admitted` means the full value is local and `difference` names missing
 semantic support. `materialize` privately selects a support-equivalent physical
 decomposition and constructs the logical value through the same immutable
-snapshot. `library.read(&snapshot)` is the convenience form of admission and
-materialization.
+snapshot. `library.read_at(&snapshot, instant)` is the concise form of admission
+and materialization at the same explicit instant.
 
 Consumers which need the exact strictly verified COMMIT roots selected by the
-admission decision can call `library.admitted_with_commits(&snapshot)`. Later
+admission decision can call
+`library.admitted_with_commits_at(&snapshot, instant)`. Later
 provenance for an exact cover is available through `cover.commits(&snapshot)`.
 Duplicate signed claims for one payload collapse to one cover member; authors,
 signatures, and metadata remain provenance rather than payload identity.

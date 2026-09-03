@@ -196,7 +196,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     store.commit(source, &authority, Fragment::from(facts))?;
     let snapshot = store.snapshot()?;
-    let support = source.admitted(&snapshot)?;
+    let support = source.admitted_at(&snapshot, triblespace_core::clock::epoch_now())?;
     drop(snapshot);
 
     let construction_start = Instant::now();

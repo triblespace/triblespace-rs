@@ -186,7 +186,8 @@ let paths = store.derive(
 )?;
 
 let before = store.snapshot()?;
-let support = source.admitted(&before)?;
+let instant = triblespace::core::clock::epoch_now();
+let support = source.admitted_at(&before, instant)?;
 drop(before);
 
 let after = store

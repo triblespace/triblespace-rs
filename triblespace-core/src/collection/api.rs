@@ -1565,18 +1565,6 @@ impl<L: CollectionEncoding> Collection<L> {
         Ok(evidence.authorizes(subject, instant))
     }
 
-    /// Decide whether `subject` is admitted at the current clock instant.
-    pub fn writer_is_admitted<S>(
-        self,
-        snapshot: &S,
-        subject: VerifyingKey,
-    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
-    where
-        S: BlobStoreGet + BlobStoreList + CapabilityProofRead,
-    {
-        self.writer_is_admitted_at(snapshot, subject, clock::epoch_now())
-    }
-
     /// Decide whether `subject` is admitted as a reader at `instant`.
     ///
     /// This is the disclosure boundary corresponding to the descriptor's READ
@@ -1624,18 +1612,6 @@ impl<L: CollectionEncoding> Collection<L> {
         collection_reader_is_admitted_by_at(snapshot, self.handle(), subject, bundles, instant)
     }
 
-    /// Decide whether `subject` is admitted as a reader now.
-    pub fn reader_is_admitted<S>(
-        self,
-        snapshot: &S,
-        subject: VerifyingKey,
-    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
-    where
-        S: BlobStoreGet + BlobStoreList + CapabilityProofRead,
-    {
-        self.reader_is_admitted_at(snapshot, subject, clock::epoch_now())
-    }
-
     /// Discover the exact payload cover admitted at `instant`.
     ///
     /// The result is the semantic COMMIT frontier. It deliberately does not
@@ -1656,20 +1632,6 @@ impl<L: CollectionEncoding> Collection<L> {
         discover_admitted_cover_at(snapshot, self, instant).map(|(_, _, cover)| cover)
     }
 
-    /// Discover the exact payload cover admitted at the current clock instant.
-    pub fn admitted<S>(
-        self,
-        snapshot: &S,
-    ) -> Result<
-        Cover<L>,
-        CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
-    >
-    where
-        S: BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
-    {
-        self.admitted_at(snapshot, clock::epoch_now())
-    }
-
     /// Discover an admitted cover and the exact COMMIT roots selected by the
     /// same authorization decision.
     pub fn admitted_with_commits_at<S>(
@@ -1685,20 +1647,6 @@ impl<L: CollectionEncoding> Collection<L> {
     {
         let (_, discovered, cover) = discover_admitted_cover_at(snapshot, self, instant)?;
         Ok((cover, discovered.commits().to_vec()))
-    }
-
-    /// Discover an admitted cover and its exact roots at the current instant.
-    pub fn admitted_with_commits<S>(
-        self,
-        snapshot: &S,
-    ) -> Result<
-        (Cover<L>, Vec<CollectionCommit>),
-        CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
-    >
-    where
-        S: BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
-    {
-        self.admitted_with_commits_at(snapshot, clock::epoch_now())
     }
 
     /// Read one logical value admitted at `instant` through one immutable
@@ -1724,21 +1672,6 @@ impl<L: CollectionEncoding> Collection<L> {
             discovered,
             admitted,
         )
-    }
-
-    /// Read one logical value, sampling the clock exactly once.
-    pub fn read<V, S>(
-        self,
-        snapshot: &S,
-    ) -> Result<
-        V,
-        CollectionReadError<S::RecordsError, S::ProofsError, S::GetError<Infallible>, V::Error>,
-    >
-    where
-        S: BlobStoreGet + BlobStoreList + BlobStoreMeta + CapabilityProofRead + CollectionRead,
-        V: TryFromCover<L>,
-    {
-        self.read_at(snapshot, clock::epoch_now())
     }
 }
 
@@ -1995,8 +1928,7 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         E: CollectionEncoding,
         Handle<E>: InlineEncoding,
     {
-        let (support, cover) =
-            super::exact_derived::attach_collection_at(self, target, None, instant)?;
+        let (support, cover) = super::exact_derived::attach_collection_at(self, target, instant)?;
         Ok(CollectionSnapshot::new(self.clone(), support, cover))
     }
 
@@ -2014,7 +1946,7 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         Handle<E>: InlineEncoding,
     {
         let (support, cover) =
-            super::exact_derived::attach_collection(self, target, Some(support))?;
+            super::exact_derived::attach_collection_exact(self, target, support)?;
         Ok(CollectionSnapshot::new(self.clone(), support, cover))
     }
 }

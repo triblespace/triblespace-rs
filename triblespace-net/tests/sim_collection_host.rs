@@ -249,7 +249,12 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         advance(&clock, &mut [&mut server, &mut reader], 3).await;
         let before = reader.snapshot().unwrap();
         assert_eq!(before.records().unwrap().count(), 0);
-        assert!(reader_collection.admitted(&before).unwrap().is_empty());
+        assert!(
+            reader_collection
+                .admitted_at(&before, clock::epoch_now())
+                .unwrap()
+                .is_empty()
+        );
 
         let bootstrap = reconcile_once(
             &clock,
@@ -276,7 +281,12 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         advance(&clock, &mut [&mut server, &mut reader], 32).await;
         let repaired = reader.snapshot().unwrap();
         assert_eq!(repaired.records().unwrap().count(), 1);
-        assert!(reader_collection.admitted(&repaired).unwrap().is_empty());
+        assert!(
+            reader_collection
+                .admitted_at(&repaired, clock::epoch_now())
+                .unwrap()
+                .is_empty()
+        );
 
         assert!(
             acquire_once(
@@ -298,10 +308,21 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         let after = reader.snapshot().unwrap();
         assert_eq!(after.records().unwrap().count(), 1);
         assert_eq!(after.proofs().unwrap().count(), 2);
-        assert_eq!(reader_collection.admitted(&after).unwrap().len(), 1);
+        assert_eq!(
+            reader_collection
+                .admitted_at(&after, clock::epoch_now())
+                .unwrap()
+                .len(),
+            1
+        );
         let publisher = server.snapshot().unwrap();
         assert_eq!(publisher.proofs().unwrap().count(), 1);
-        assert!(collection.admitted(&publisher).unwrap().is_empty());
+        assert!(
+            collection
+                .admitted_at(&publisher, clock::epoch_now())
+                .unwrap()
+                .is_empty()
+        );
     }));
 }
 
@@ -440,7 +461,10 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
             "the WRITE proof record repairs before its claim blobs",
         );
         assert!(
-            reader_collection.admitted(&dangling).unwrap().is_empty(),
+            reader_collection
+                .admitted_at(&dangling, clock::epoch_now())
+                .unwrap()
+                .is_empty(),
             "a frozen snapshot hides a proof whose referenced claims are absent",
         );
         drop(dangling);
@@ -471,7 +495,10 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
         assert_eq!(reader.snapshot().unwrap().wants().unwrap().count(), 0);
         let reader_snapshot = reader.snapshot().unwrap();
         assert_eq!(
-            reader_collection.admitted(&reader_snapshot).unwrap().len(),
+            reader_collection
+                .admitted_at(&reader_snapshot, clock::epoch_now())
+                .unwrap()
+                .len(),
             1
         );
         let writer_snapshot = writer_only.snapshot().unwrap();
