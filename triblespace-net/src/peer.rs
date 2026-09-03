@@ -255,13 +255,15 @@ where
     }
 
     /// Discover and fetch the exact bytes named by bearer handle `H`.
-    pub async fn fetch_wanted_blob(&self, hash: RawHash) -> Option<Bytes> {
+    pub async fn fetch_blob(&self, hash: RawHash) -> Option<Bytes> {
         self.sender
             .fetch_blob(hash, host::INTERACTIVE_FETCH_DEADLINE)
             .await
     }
 
-    pub async fn fetch_wanted_blob_with_deadline(
+    /// Discover and fetch the exact bytes named by bearer handle `H`, bounded
+    /// by the caller's deadline.
+    pub async fn fetch_blob_with_deadline(
         &self,
         hash: RawHash,
         budget: std::time::Duration,
@@ -507,7 +509,7 @@ where
         if let Some(bytes) = self.try_local(hash) {
             return Ok(Some(bytes));
         }
-        let Some(raw) = self.fetch_wanted_blob(hash).await else {
+        let Some(raw) = self.fetch_blob(hash).await else {
             return Ok(None);
         };
         {

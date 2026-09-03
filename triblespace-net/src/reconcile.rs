@@ -1,8 +1,8 @@
 //! Service durable exact-content and collection-operation WANTs.
 //!
-//! Collection repair converges signed COMMITs and scoped authorization evidence,
-//! not unsigned MERGE/DERIVE receipts. WRITE admission remains a receiver-local
-//! derived check. This reconciler never claims global absence:
+//! Collection repair is a separate raw-record exchange. This reconciler
+//! services durable exact-content and collection-operation demand without
+//! deciding WRITE admission or claiming global absence:
 //! an operation WANT is satisfied iff at least one matching local receipt is
 //! visible; otherwise it remains pending while the local store evolves.
 //! `Blob(H)` uses H-derived global provider discovery. No collection,
@@ -136,16 +136,14 @@ impl Reconciler {
             .copied()
             .map(CollectionRecordSelector::Operation)
             .collect();
-        let answered_operations: HashSet<_> = {
-            match snapshot.select_records(&selectors) {
-                Ok(records) => records
-                    .into_iter()
-                    .filter_map(want_request_for_record)
-                    .collect(),
-                Err(error) => {
-                    tracing::warn!(?error, "operation receipt selection failed");
-                    HashSet::new()
-                }
+        let answered_operations = match answered_operations(&snapshot, &selectors) {
+            Ok(answered) => answered,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "operation receipt observation failed; skipping reconcile pass"
+                );
+                return ReconcileStats::default();
             }
         };
         let missing_operations = operation_wants
@@ -220,10 +218,7 @@ impl Reconciler {
             }
             let handle = request.blob_handle().expect("blob WANT").raw;
             stats.attempted += 1;
-            let Some(bytes) = peer
-                .fetch_wanted_blob_with_deadline(handle, remaining)
-                .await
-            else {
+            let Some(bytes) = peer.fetch_blob_with_deadline(handle, remaining).await else {
                 self.record_unavailable(request);
                 stats.pending += 1;
                 continue;
@@ -270,6 +265,20 @@ impl Reconciler {
     }
 }
 
+fn answered_operations<R>(
+    snapshot: &R,
+    selectors: &BTreeSet<CollectionRecordSelector>,
+) -> Result<HashSet<WantRequest>, R::RecordsError>
+where
+    R: CollectionRead,
+{
+    Ok(snapshot
+        .select_records(selectors)?
+        .into_iter()
+        .filter_map(want_request_for_record)
+        .collect())
+}
+
 fn want_request_for_record(record: CollectionRecord) -> Option<WantRequest> {
     match record {
         CollectionRecord::Commit(_) => None,
@@ -288,6 +297,30 @@ mod tests {
     use super::*;
     use triblespace_core::collection::{CollectionDerive, CollectionMerge};
     use triblespace_core::inline::Inline;
+
+    struct FailingCollectionRead;
+
+    impl CollectionRead for FailingCollectionRead {
+        type RecordsError = std::io::Error;
+        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Self::RecordsError>>;
+
+        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            Err(std::io::Error::other("collection observation failed"))
+        }
+    }
+
+    #[test]
+    fn operation_observation_failure_aborts_projection() {
+        let collection = Inline::new([1; 32]);
+        let a = Inline::new([2; 32]);
+        let b = Inline::new([3; 32]);
+        let selectors = BTreeSet::from([CollectionRecordSelector::Operation(WantRequest::merge(
+            collection, a, b,
+        ))]);
+
+        let error = answered_operations(&FailingCollectionRead, &selectors).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
 
     #[test]
     fn receipts_project_to_exact_input_only_wants() {

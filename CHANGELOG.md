@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Rename the peer's effect-neutral exact-byte transport from
+  `fetch_wanted_blob` to `fetch_blob`, and abort an entire reconciliation pass
+  when its frozen collection-record observation fails instead of treating the
+  partial observation as an empty receipt set.
 - Make physical blob lifetime a structural law shared by MemoryRepo, Pile, and
   Yard. Every retained COMMIT, MERGE, DERIVE, authorization proof, and WANT now
   owns each independently resident direct blob reference recursively, without
