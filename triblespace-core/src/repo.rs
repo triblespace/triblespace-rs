@@ -698,6 +698,31 @@ impl WantRequest {
         Self::Derive { target, input }
     }
 
+    /// Blob handles named directly by this durable request.
+    ///
+    /// WANT is an ordinary structural lifetime record: when retained it owns
+    /// whichever of these handles are resident, recursively. The method does
+    /// not fetch absent bytes or turn them into subordinate wants.
+    pub fn blob_references(self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
+        let mut references = arrayvec::ArrayVec::<_, 3>::new();
+        match self {
+            Self::Blob { handle } => references.push(handle),
+            Self::Merge {
+                collection,
+                low,
+                high,
+            } => references.extend([
+                collection.transmute(),
+                Handle::<UnknownBlob>::from_hash(low),
+                Handle::<UnknownBlob>::from_hash(high),
+            ]),
+            Self::Derive { target, input } => {
+                references.extend([target.transmute(), Handle::<UnknownBlob>::from_hash(input)])
+            }
+        }
+        references.into_iter()
+    }
+
     /// Encode this request into its exact tagged 97-byte representation.
     pub fn to_bytes(self) -> [u8; WANT_REQUEST_BYTES_LEN] {
         let mut bytes = [0; WANT_REQUEST_BYTES_LEN];
@@ -900,6 +925,34 @@ mod want_request_tests {
         let bytes = request.to_bytes();
         assert_eq!(bytes[0], WANT_REQUEST_KIND_DERIVE_V2);
         assert_eq!(WantRequest::from_bytes(bytes), Ok(request));
+    }
+
+    #[test]
+    fn wants_enumerate_every_direct_blob_reference() {
+        let blob = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([1; INLINE_LEN]));
+        let merge = WantRequest::merge(collection(2), data(3), data(4));
+        let derive = WantRequest::derive(collection(5), data(6));
+
+        assert_eq!(
+            blob.blob_references()
+                .map(|handle| handle.raw)
+                .collect::<Vec<_>>(),
+            vec![[1; INLINE_LEN]],
+        );
+        assert_eq!(
+            merge
+                .blob_references()
+                .map(|handle| handle.raw)
+                .collect::<Vec<_>>(),
+            vec![[2; INLINE_LEN], [3; INLINE_LEN], [4; INLINE_LEN]],
+        );
+        assert_eq!(
+            derive
+                .blob_references()
+                .map(|handle| handle.raw)
+                .collect::<Vec<_>>(),
+            vec![[5; INLINE_LEN], [6; INLINE_LEN]],
+        );
     }
 
     #[test]

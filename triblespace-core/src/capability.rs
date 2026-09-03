@@ -31,6 +31,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::{Duration, Epoch};
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, IntoBlob, TryFromBlob};
 use crate::id::{id_hex, ExclusiveId, Id};
 use crate::inline::encodings::genid::GenId;
@@ -806,6 +807,16 @@ impl CapabilityProof {
                 raw.copy_from_slice(&edge[SIGNATURE_LEN..SIGNATURE_LEN + CLAIM_HANDLE_LEN]);
                 Inline::new(raw)
             })
+    }
+
+    /// Blob handles named directly by this native proof record.
+    ///
+    /// This is structural ownership information only. Retention deliberately
+    /// does not depend on signature validity or semantic authorization.
+    pub fn blob_references(
+        &self,
+    ) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> + DoubleEndedIterator + '_ {
+        self.claim_handles().map(Inline::transmute)
     }
 
     /// Strictly verify every direct `K S C K` edge signature.
@@ -2114,6 +2125,10 @@ mod tests {
         assert_eq!(
             proof.claim_handles().collect::<Vec<_>>(),
             vec![proof.leaf_claim()]
+        );
+        assert_eq!(
+            proof.blob_references().collect::<Vec<_>>(),
+            vec![proof.leaf_claim().transmute()]
         );
         assert_eq!(proof.leaf_issuer(), root.verifying_key());
         assert_eq!(proof.leaf_key(), leaf.verifying_key());

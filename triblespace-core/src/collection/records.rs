@@ -25,6 +25,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::attribute::Attribute;
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::utf8string::UTF8String;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::id::Id;
 use crate::id_hex;
@@ -473,6 +474,20 @@ impl CollectionCommit {
         (self.signature_r, self.signature_s)
     }
 
+    /// Blob handles named directly by this record.
+    ///
+    /// This is structural ownership information, not a validity or admission
+    /// decision. A retained commit owns every one of these handles when it is
+    /// resident, even when the commit's signature is invalid or another
+    /// referenced handle is absent.
+    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 3] {
+        [
+            self.collection.transmute(),
+            Handle::<UnknownBlob>::from_hash(self.data),
+            self.metadata.transmute(),
+        ]
+    }
+
     /// Encode this record into its exact dense 192-byte layout.
     pub fn to_bytes(&self) -> [u8; COLLECTION_COMMIT_BYTES_LEN] {
         commit_bytes(
@@ -554,6 +569,19 @@ impl CollectionMerge {
         self.result
     }
 
+    /// Blob handles named directly by this record.
+    ///
+    /// A retained equation owns its descriptor, both inputs, and result when
+    /// those blobs are resident. Residency of each handle is independent.
+    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 4] {
+        [
+            self.collection.transmute(),
+            Handle::<UnknownBlob>::from_hash(self.low),
+            Handle::<UnknownBlob>::from_hash(self.high),
+            Handle::<UnknownBlob>::from_hash(self.result),
+        ]
+    }
+
     /// Encode this equation into its exact dense 128-byte layout.
     pub fn to_bytes(&self) -> [u8; COLLECTION_MERGE_BYTES_LEN] {
         merge_bytes(self.collection, self.low, self.high, self.result)
@@ -613,6 +641,18 @@ impl CollectionDerive {
         self.output
     }
 
+    /// Blob handles named directly by this record.
+    ///
+    /// A retained equation owns its target descriptor, input, and output when
+    /// those blobs are resident. Residency of each handle is independent.
+    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 3] {
+        [
+            self.collection.transmute(),
+            Handle::<UnknownBlob>::from_hash(self.input),
+            Handle::<UnknownBlob>::from_hash(self.output),
+        ]
+    }
+
     /// Encode this equation into its exact dense 96-byte layout.
     pub fn to_bytes(&self) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
         derive_bytes(self.collection, self.input, self.output)
@@ -631,6 +671,21 @@ pub enum CollectionRecord {
 }
 
 impl CollectionRecord {
+    /// Blob handles named directly by this native record.
+    ///
+    /// The returned handles express physical ownership only. Callers must not
+    /// filter them through signature validity, collection admission, or
+    /// algebraic usefulness before applying retention.
+    pub fn blob_references(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
+        let mut references = arrayvec::ArrayVec::<_, 4>::new();
+        match self {
+            Self::Commit(record) => references.extend(record.blob_references()),
+            Self::Merge(record) => references.extend(record.blob_references()),
+            Self::Derive(record) => references.extend(record.blob_references()),
+        }
+        references.into_iter()
+    }
+
     /// Decode the self-tagged dense form used by generic record stores.
     ///
     /// The first byte identifies the variant; the remainder is that variant's
@@ -1021,6 +1076,36 @@ mod tests {
         assert_eq!(
             CollectionRecord::from_bytes(&[99]),
             Err(RecordDecodeError::UnknownKind(99))
+        );
+    }
+
+    #[test]
+    fn native_records_enumerate_every_direct_blob_reference() {
+        let metadata = Inline::<Handle<SimpleArchive>>::new([3; 32]);
+        let commit = CollectionCommit::sign(&fixture_key(), collection(1), hash(2), metadata);
+        let merge = CollectionMerge::new(collection(4), hash(5), hash(6), hash(7));
+        let derive = CollectionDerive::new(collection(8), hash(9), hash(10));
+
+        assert_eq!(
+            CollectionRecord::Commit(commit)
+                .blob_references()
+                .map(|handle| handle.raw)
+                .collect::<Vec<_>>(),
+            vec![[1; 32], [2; 32], [3; 32]],
+        );
+        assert_eq!(
+            CollectionRecord::Merge(merge)
+                .blob_references()
+                .map(|handle| handle.raw)
+                .collect::<Vec<_>>(),
+            vec![[4; 32], [5; 32], [6; 32], [7; 32]],
+        );
+        assert_eq!(
+            CollectionRecord::Derive(derive)
+                .blob_references()
+                .map(|handle| handle.raw)
+                .collect::<Vec<_>>(),
+            vec![[8; 32], [9; 32], [10; 32]],
         );
     }
 
