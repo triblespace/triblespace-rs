@@ -4294,17 +4294,6 @@ impl WantStore for Pile {
     }
 }
 
-#[cfg(test)]
-impl Pile {
-    pub(crate) fn wants(&mut self) -> Result<PileWantIter, PileWriteError> {
-        let snapshot = self.snapshot().map_err(|error| match error {
-            ReadError::IoError(error) => PileWriteError::IoError(error),
-            error => panic!("test WANT snapshot failed: {error}"),
-        })?;
-        super::WantRead::wants(&snapshot)
-    }
-}
-
 impl super::WantRead for PileSnapshot {
     type WantsError = PileWriteError;
     type WantIter<'a> = PileWantIter;
@@ -5588,6 +5577,8 @@ mod tests {
         assert_eq!(reopened.legacy_pin_head_for_test(branch_id).unwrap(), None);
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -5743,6 +5734,8 @@ mod tests {
         assert_eq!(result.legacy_pin_head_for_test(cleared).unwrap(), None);
         assert_eq!(
             result
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -6218,7 +6211,13 @@ mod tests {
             reopened.legacy_pin_head_for_test(branch_restored).unwrap(),
             Some(branch_head)
         );
-        assert!(reopened.wants().unwrap().next().is_none());
+        assert!(reopened
+            .snapshot()
+            .unwrap()
+            .wants()
+            .unwrap()
+            .next()
+            .is_none());
         assert_eq!(
             reopened.want_cutover_status().unwrap(),
             WantCutoverStatus {
@@ -6230,6 +6229,8 @@ mod tests {
         );
         reopened.migrate_retired_wants().unwrap();
         let wants = reopened
+            .snapshot()
+            .unwrap()
             .wants()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -6921,6 +6922,8 @@ mod tests {
         );
         assert_eq!(
             destination
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -8775,13 +8778,25 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.want(WantRequest::blob(wanted)).unwrap();
-        let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
+        let pinned: HashSet<_> = pile
+            .snapshot()
+            .unwrap()
+            .wants()
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
         assert!(pinned.contains(&WantRequest::blob(wanted)));
         pile.close().unwrap();
 
         let mut reopened: Pile = Pile::open(&path).unwrap();
         reopened.amputate().unwrap();
-        let pinned: HashSet<_> = reopened.wants().unwrap().map(|r| r.unwrap()).collect();
+        let pinned: HashSet<_> = reopened
+            .snapshot()
+            .unwrap()
+            .wants()
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
         assert_eq!(pinned.len(), 1);
         assert!(
             pinned.contains(&WantRequest::blob(wanted)),
@@ -8804,7 +8819,9 @@ mod tests {
         pile.want(derive).unwrap();
         pile.flush().unwrap();
         assert_eq!(
-            pile.wants()
+            pile.snapshot()
+                .unwrap()
+                .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -8833,6 +8850,8 @@ mod tests {
         reopened.refresh().unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -8856,7 +8875,9 @@ mod tests {
         pile.want(merge).unwrap();
         pile.want(derive).unwrap();
         assert_eq!(
-            pile.wants()
+            pile.snapshot()
+                .unwrap()
+                .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -8868,6 +8889,8 @@ mod tests {
         reopened.refresh().unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -8987,7 +9010,7 @@ mod tests {
         }
 
         let mut pile = Pile::open(&path).unwrap();
-        assert!(pile.wants().unwrap().next().is_none());
+        assert!(pile.snapshot().unwrap().wants().unwrap().next().is_none());
         // One request already has a fresh marker; cutover appends only the two
         // missing positives rather than rewriting the pile.
         pile.want(merge).unwrap();
@@ -9009,7 +9032,9 @@ mod tests {
         );
         let expected = vec![a, merge, derive];
         assert_eq!(
-            pile.wants()
+            pile.snapshot()
+                .unwrap()
+                .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -9028,6 +9053,8 @@ mod tests {
         let mut reopened: Pile = Pile::open(&path).unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -9118,7 +9145,13 @@ mod tests {
             Some(h1.transmute())
         );
 
-        let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
+        let pinned: HashSet<_> = pile
+            .snapshot()
+            .unwrap()
+            .wants()
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
         assert_eq!(pinned.len(), 1);
         assert!(pinned.contains(&WantRequest::blob(want)));
         pile.close().unwrap();

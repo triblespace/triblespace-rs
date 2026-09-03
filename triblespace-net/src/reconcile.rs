@@ -101,10 +101,13 @@ impl Reconciler {
                 return stats;
             }
         };
-        let requests: Vec<WantRequest> = match snapshot.wants() {
-            Ok(wants) => wants.filter_map(Result::ok).collect(),
+        let requests: Vec<WantRequest> = match snapshot
+            .wants()
+            .and_then(|wants| wants.collect::<Result<Vec<_>, _>>())
+        {
+            Ok(wants) => wants,
             Err(error) => {
-                tracing::warn!(?error, "WANT enumeration failed; skipping reconcile pass");
+                tracing::warn!(?error, "WANT observation failed; skipping reconcile pass");
                 return stats;
             }
         };

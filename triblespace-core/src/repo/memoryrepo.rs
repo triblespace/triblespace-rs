@@ -410,13 +410,6 @@ impl WantStore for MemoryRepo {
     }
 }
 
-#[cfg(test)]
-impl MemoryRepo {
-    fn wants(&mut self) -> Result<std::vec::IntoIter<Result<WantRequest, Infallible>>, Infallible> {
-        self.snapshot()?.wants()
-    }
-}
-
 impl WantRead for MemoryRepoSnapshot {
     type WantsError = Infallible;
     type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, Self::WantsError>>;
@@ -550,7 +543,7 @@ mod tests {
     #[test]
     fn wants_are_grow_only_and_idempotent() {
         let mut repo = MemoryRepo::default();
-        assert_eq!(repo.wants().unwrap().count(), 0);
+        assert_eq!(repo.snapshot().unwrap().wants().unwrap().count(), 0);
 
         let first = WantRequest::blob(handle(1));
         let second = WantRequest::blob(handle(2));
@@ -558,11 +551,17 @@ mod tests {
         repo.want(first).unwrap();
         // Reasserting an existing want is idempotent.
         repo.want(first).unwrap();
-        let wants: Vec<_> = repo.wants().unwrap().map(Result::unwrap).collect();
+        let wants: Vec<_> = repo
+            .snapshot()
+            .unwrap()
+            .wants()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(wants, vec![first, second], "sorted enumeration");
 
         repo.want(first).unwrap();
-        assert_eq!(repo.wants().unwrap().count(), 2);
+        assert_eq!(repo.snapshot().unwrap().wants().unwrap().count(), 2);
     }
 
     #[test]

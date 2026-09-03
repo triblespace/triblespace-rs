@@ -880,20 +880,6 @@ impl WantStore for Yard {
     }
 }
 
-#[cfg(test)]
-impl Yard {
-    fn wants(
-        &mut self,
-    ) -> Result<std::vec::IntoIter<Result<WantRequest, std::convert::Infallible>>, ReadError> {
-        let items = self
-            .snapshot()?
-            .wants()
-            .expect("infallible")
-            .collect::<Vec<_>>();
-        Ok(items.into_iter())
-    }
-}
-
 impl Drop for Yard {
     fn drop(&mut self) {
         for generation in &mut self.generations {
@@ -1602,7 +1588,7 @@ mod tests {
             before.get::<Bytes, RawBytes>(handle),
             Err(YardGetError::NotFound)
         ));
-        assert!(yard.wants().unwrap().next().is_none());
+        assert!(yard.snapshot().unwrap().wants().unwrap().next().is_none());
 
         assert_eq!(yard.put::<RawBytes, _>(bytes).unwrap(), handle);
         assert!(matches!(
@@ -1615,7 +1601,7 @@ mod tests {
             after.get::<Bytes, RawBytes>(handle).unwrap().as_ref(),
             b"snapshot boundary"
         );
-        assert!(yard.wants().unwrap().next().is_none());
+        assert!(yard.snapshot().unwrap().wants().unwrap().next().is_none());
     }
 
     #[test]
@@ -2287,6 +2273,8 @@ mod tests {
         let mut reopened = Yard::open(paths, config).unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -2433,6 +2421,8 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -2459,6 +2449,8 @@ mod tests {
 
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
         let wanted: BTreeSet<_> = reopened
+            .snapshot()
+            .unwrap()
             .wants()
             .unwrap()
             .map(|result| match result.unwrap() {
@@ -2500,6 +2492,8 @@ mod tests {
         drop(yard);
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
         let wanted: BTreeSet<_> = reopened
+            .snapshot()
+            .unwrap()
             .wants()
             .unwrap()
             .map(|result| match result.unwrap() {
@@ -2542,6 +2536,8 @@ mod tests {
         let mut reopened = Yard::open(paths, config).unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -2564,7 +2560,9 @@ mod tests {
 
         yard.collect(&RetentionRoots::new()).unwrap();
         assert_eq!(
-            yard.wants()
+            yard.snapshot()
+                .unwrap()
+                .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
@@ -2576,6 +2574,8 @@ mod tests {
         let mut reopened = Yard::open(paths.clone(), config).unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -2626,6 +2626,8 @@ mod tests {
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -2663,6 +2665,8 @@ mod tests {
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
         assert_eq!(
             reopened
+                .snapshot()
+                .unwrap()
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
