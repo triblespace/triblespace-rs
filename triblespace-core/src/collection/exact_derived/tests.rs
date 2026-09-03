@@ -6,14 +6,21 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
+use futures::executor::block_on;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use crate::capability::{CapabilityProof, CapabilityProofId};
+use crate::capability::{
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
+    CapabilityProofBundle, CapabilityProofId, CapabilityResource,
+};
 use crate::collection::{
     AdmissionPolicy, CollectionCommit, CollectionMerge, CollectionPolicy, CollectionRead,
-    CollectionRecordFingerprint, CollectionRecordSelector, CollectionStore, CollectionStoreExt,
+    CollectionRecordFingerprint, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt, ACTION_WRITE,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -21,9 +28,9 @@ use crate::inline::{Inline, InlineEncoding};
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use crate::repo::{
-    BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    CapabilityProofRead, CapabilityProofStore, SnapshotSource, StoreChanges, StoreSnapshot,
-    WantRead,
+    async_store::AsyncBlobStoreAcquire, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList,
+    BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
+    StoreChanges, StoreSnapshot, WantRead,
 };
 use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -536,6 +543,9 @@ struct GuardStore {
     insert_calls: usize,
     reject_put_at: Option<usize>,
     reject_insert_at: Option<usize>,
+    acquirable: BTreeMap<CollectionData, Bytes>,
+    acquired: Vec<CollectionData>,
+    inject_record_on_acquire: Option<CollectionRecord>,
 }
 
 impl GuardStore {
@@ -549,15 +559,55 @@ impl GuardStore {
             insert_calls: 0,
             reject_put_at: None,
             reject_insert_at: None,
+            acquirable: BTreeMap::new(),
+            acquired: Vec::new(),
+            inject_record_on_acquire: None,
         }
     }
 
-    fn assert_no_snapshot(&self) {
+    fn offer<E: BlobEncoding>(&mut self, blob: &Blob<E>)
+    where
+        Handle<E>: InlineEncoding,
+    {
+        self.acquirable.insert(data(blob), blob.bytes.clone());
+    }
+
+    fn assert_only_control_snapshot(&self) {
         assert_eq!(
             self.live.load(Ordering::SeqCst),
-            0,
-            "write while a store snapshot is live",
+            1,
+            "write while a residency snapshot is live, or without the frozen control snapshot",
         );
+    }
+}
+
+impl AsyncBlobStoreAcquire for GuardStore {
+    type AcquireError = GuardStoreError;
+
+    fn acquire(
+        &mut self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
+        self.assert_only_control_snapshot();
+        let member = Handle::<UnknownBlob>::to_hash(handle);
+        self.acquired.push(member);
+        let result = match self.acquirable.get(&member).cloned() {
+            Some(bytes) => self
+                .inner
+                .put::<UnknownBlob, _>(bytes.clone())
+                .map_err(|error| GuardStoreError::Backend(error.to_string()))
+                .map(|_| Some(bytes)),
+            None => Ok(None),
+        };
+        let result = result.and_then(|bytes| {
+            if let Some(record) = self.inject_record_on_acquire.take() {
+                self.inner
+                    .insert(record)
+                    .map_err(|error| GuardStoreError::Backend(error.to_string()))?;
+            }
+            Ok(bytes)
+        });
+        std::future::ready(result)
     }
 }
 
@@ -570,7 +620,7 @@ impl BlobStorePut for GuardStore {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        self.assert_no_snapshot();
+        self.assert_only_control_snapshot();
         let blob = item.to_blob();
         self.put_calls += 1;
         self.events
@@ -603,7 +653,7 @@ impl CollectionStore for GuardStore {
     type InsertError = GuardStoreError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        self.assert_no_snapshot();
+        self.assert_only_control_snapshot();
         self.insert_calls += 1;
         self.events.push(WriteEvent::Insert(record));
         if self.reject_insert_at == Some(self.insert_calls) {
@@ -619,7 +669,7 @@ impl CapabilityProofStore for GuardStore {
     type InsertError = GuardStoreError;
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
-        self.assert_no_snapshot();
+        self.assert_only_control_snapshot();
         self.inner
             .insert_proof(proof)
             .map_err(|error| GuardStoreError::Backend(error.to_string()))
@@ -712,7 +762,7 @@ fn duplicate_commit_fibers_collapse_to_one_support_member() {
 }
 
 #[test]
-fn ensure_drops_every_snapshot_and_stores_the_blob_before_derive() {
+fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
     inner.put::<SimpleArchive, _>(source.clone()).unwrap();
@@ -740,7 +790,128 @@ fn ensure_drops_every_snapshot_and_stores_the_blob_before_derive() {
 }
 
 #[test]
-fn maintenance_drops_every_snapshot_and_stores_the_blob_before_merge() {
+fn exact_async_ensure_acquires_explicit_foundational_support_without_want() {
+    let (inner, root, first, _second) = collections();
+    let source = archive(1, 1);
+    let support = support(root, std::slice::from_ref(&source));
+    let mut store = GuardStore::new(inner);
+    store.offer(&source);
+
+    let snapshot = block_on(store.ensure_exact_async::<FirstMapping>(first, &support)).unwrap();
+
+    assert_eq!(store.acquired, vec![data(&source)]);
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+    let (observed, cover) = attach_collection(&snapshot, first, Some(&support)).unwrap();
+    assert_eq!(observed, support);
+    assert_eq!(cover.len(), 1);
+}
+
+#[test]
+fn async_ensure_hydrates_only_the_bounded_admitted_commit_frontier() {
+    let (mut inner, root, first, _second) = collections();
+    let source = archive(1, 1);
+    let metadata = inner
+        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+        .unwrap();
+    inner
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[42; 32]),
+            root.handle(),
+            data(&source),
+            metadata,
+        )))
+        .unwrap();
+    let mut store = GuardStore::new(inner);
+    store.offer(&source);
+    let concurrent = archive(9, 9);
+    store
+        .inner
+        .put::<SimpleArchive, _>(concurrent.clone())
+        .unwrap();
+    store.inject_record_on_acquire = Some(CollectionRecord::Commit(CollectionCommit::sign(
+        &SigningKey::from_bytes(&[43; 32]),
+        root.handle(),
+        data(&concurrent),
+        metadata,
+    )));
+
+    let snapshot = block_on(store.ensure_async::<FirstMapping>(first)).unwrap();
+
+    assert_eq!(store.acquired, vec![data(&source)]);
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+    let observed = snapshot
+        .collection_at(first, hifitime::Epoch::from_tai_seconds(0.0))
+        .unwrap();
+    assert_eq!(
+        observed.support().data_members().collect::<Vec<_>>(),
+        vec![data(&source)]
+    );
+    assert_eq!(observed.cover().len(), 1);
+}
+
+#[test]
+fn async_ensure_hydrates_relevant_proof_before_authorized_commit_payload() {
+    let authority = SigningKey::from_bytes(&[43; 32]);
+    let writer = SigningKey::from_bytes(&[44; 32]);
+    let restricted = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let mut inner = MemoryRepo::default();
+    let root = inner.collection("restricted-root", restricted).unwrap();
+    let first = inner.derive(root, FirstMapping, policy()).unwrap();
+    let source = archive(2, 2);
+    let metadata = inner
+        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+        .unwrap();
+    inner
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &writer,
+            root.handle(),
+            data(&source),
+            metadata,
+        )))
+        .unwrap();
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(root.handle()),
+    );
+    let bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        writer.verifying_key(),
+    )
+    .unwrap();
+    let (proof, claims) = bundle.into_parts();
+    inner.insert_proof(proof).unwrap();
+
+    let claim_members = claims.iter().map(data).collect::<Vec<_>>();
+    let mut store = GuardStore::new(inner);
+    for claim in &claims {
+        store.offer(claim);
+    }
+    store.offer(&source);
+
+    let snapshot = block_on(store.ensure_async::<FirstMapping>(first)).unwrap();
+
+    assert_eq!(
+        &store.acquired[..claim_members.len()],
+        claim_members.as_slice(),
+        "proof closure is acquired before payload authorization",
+    );
+    assert_eq!(store.acquired.last(), Some(&data(&source)));
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+    let observed = snapshot
+        .collection_at(first, hifitime::Epoch::from_tai_seconds(0.0))
+        .unwrap();
+    assert_eq!(
+        observed.support().data_members().collect::<Vec<_>>(),
+        vec![data(&source)]
+    );
+}
+
+#[test]
+fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge() {
     let (mut inner, root, first, second) = collections();
     let left = archive(1, 1);
     let right = archive(2, 2);

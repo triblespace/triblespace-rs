@@ -11,12 +11,17 @@ use std::error::Error;
 use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
-use crate::repo::{BlobStoreGet, BlobStoreMeta, Store, StoreRead};
+use crate::repo::async_store::AsyncBlobStoreAcquire;
+use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, Store, StoreRead};
 use crate::trible::Fragment;
 
-use super::discovery::discover_collection_equations_for_lineage;
+use super::discovery::{
+    discover_collection_equations_for_lineage, discover_collection_equations_for_lineage_raw,
+};
+use super::operation_snapshot::OperationFrontier;
 use super::{
     collection_complete_physical_cover, descriptor, resolve_collection_semantics_from_roots,
     Collection, CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
@@ -174,7 +179,7 @@ fn load_lineage<R, E>(
     target: Collection<E>,
 ) -> Result<Lineage, CollectionRealizationError>
 where
-    R: BlobStoreGet,
+    R: BlobStoreGet + BlobStoreList,
     E: CollectionEncoding,
 {
     let mut descriptors = BTreeMap::new();
@@ -189,6 +194,14 @@ where
                 "collection descriptor ancestry contains a cycle at {}",
                 hex::encode_upper(cursor.raw),
             )));
+        }
+
+        if !snapshot.contains_blob(cursor).map_err(|error| {
+            CollectionRealizationError::storage("inspect collection descriptor residency", error)
+        })? {
+            return Err(CollectionRealizationError::MissingDependency {
+                member: Handle::<SimpleArchive>::to_hash(cursor),
+            });
         }
 
         let loaded = super::api::load_collection_descriptor(snapshot, cursor).map_err(|error| {
@@ -270,13 +283,22 @@ fn resolve_lineage<R>(
     support: &Support,
 ) -> Result<CollectionSemantics, CollectionRealizationError>
 where
-    R: CollectionRead,
+    R: BlobStoreList + CollectionRead,
 {
     require_support(lineage, support)?;
     let discovered = discover_collection_equations_for_lineage(snapshot, &lineage.collections)
         .map_err(|error| {
             CollectionRealizationError::storage("discover collection lineage", error)
         })?;
+    resolve_discovered_lineage(lineage, support, &discovered)
+}
+
+fn resolve_discovered_lineage(
+    lineage: &Lineage,
+    support: &Support,
+    discovered: &super::DiscoveredCollectionRecords,
+) -> Result<CollectionSemantics, CollectionRealizationError> {
+    require_support(lineage, support)?;
     let roots: BTreeSet<_> = support
         .data_members()
         .map(|member| (lineage.foundation.handle(), member))
@@ -313,6 +335,73 @@ where
     }
 }
 
+/// Find one absent direct dependency of a raw equation which contributes to
+/// the requested foundational support.
+///
+/// This is acquisition planning only. Dangling equations remain invisible to
+/// semantic resolution until a later snapshot observes all of their direct
+/// references. A contradictory raw frontier is therefore ignored here and is
+/// diagnosed only if its records become complete enough to enter semantics.
+fn relevant_missing_dependency<R>(
+    snapshot: &R,
+    lineage: &Lineage,
+    support: &Support,
+) -> Result<Option<CollectionData>, CollectionRealizationError>
+where
+    R: BlobStoreList + CollectionRead,
+{
+    let discovered = discover_collection_equations_for_lineage_raw(snapshot, &lineage.collections)
+        .map_err(|error| {
+            CollectionRealizationError::storage("discover raw collection frontier", error)
+        })?;
+    let Ok(semantics) = resolve_discovered_lineage(lineage, support, &discovered) else {
+        return Ok(None);
+    };
+    let requested: BTreeSet<_> = support.data_members().collect();
+
+    let mut records = discovered
+        .merges()
+        .iter()
+        .copied()
+        .map(CollectionRecord::Merge)
+        .chain(
+            discovered
+                .derives()
+                .iter()
+                .copied()
+                .map(CollectionRecord::Derive),
+        )
+        .collect::<Vec<_>>();
+    records.sort_unstable_by_key(CollectionRecord::fingerprint);
+
+    for record in records {
+        let (collection, result) = match record {
+            CollectionRecord::Merge(merge) => (merge.collection(), merge.result()),
+            CollectionRecord::Derive(derive) => (derive.collection(), derive.output()),
+            CollectionRecord::Commit(_) => unreachable!("equation frontier excludes COMMIT"),
+        };
+        if semantics
+            .supporting_data(collection, result)
+            .is_disjoint(&requested)
+        {
+            continue;
+        }
+        for reference in record.blob_references() {
+            if !snapshot.contains_blob(reference).map_err(|error| {
+                CollectionRealizationError::storage(
+                    "inspect raw equation dependency residency",
+                    error,
+                )
+            })? {
+                return Ok(Some(
+                    Handle::<crate::blob::encodings::UnknownBlob>::to_hash(reference),
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
 struct TargetResolution<E: CollectionEncoding> {
     semantics: CollectionSemantics,
     support: Support,
@@ -344,7 +433,7 @@ fn resolve_target<R, E>(
     requested: &Support,
 ) -> Result<TargetResolution<E>, CollectionRealizationError>
 where
-    R: BlobStoreGet + BlobStoreMeta + CollectionRead,
+    R: BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead,
     E: CollectionEncoding,
 {
     let semantics = resolve_lineage(snapshot, lineage, requested)?;
@@ -461,6 +550,18 @@ where
 {
     let lineage = load_lineage(snapshot, target)?;
     require_support(&lineage, support)?;
+    // Explicit foundational support is itself an exact-H acquisition plan.
+    // A frozen snapshot never fetches it, but it must report the first absent
+    // member precisely so the active async runner can acquire and resnapshot
+    // instead of collapsing absence into a generic incomplete-cover result.
+    for member in support.data_members() {
+        let reference = Handle::<SimpleArchive>::from_hash(member);
+        if !snapshot.contains_blob(reference).map_err(|error| {
+            CollectionRealizationError::storage("inspect foundational support residency", error)
+        })? {
+            return Err(CollectionRealizationError::MissingDependency { member });
+        }
+    }
     let source_handle = lineage
         .source_by_target
         .get(&target.handle())
@@ -483,6 +584,15 @@ where
         ))
     })?;
     let target_resolution = resolve_target(snapshot, target, &lineage, support)?;
+    // A warm exact target needs no acquisition planning. Consult the raw
+    // dangling equation frontier only after the semantic snapshot proves that
+    // work remains; this keeps resident maintenance at one indexed semantic
+    // probe per LSM round.
+    if !target_resolution.is_exact_for(support) {
+        if let Some(member) = relevant_missing_dependency(snapshot, &lineage, support)? {
+            return Err(CollectionRealizationError::MissingDependency { member });
+        }
+    }
     Ok(MappingProbe {
         source: Collection::from_handle(source_handle),
         mapping,
@@ -580,13 +690,30 @@ where
     S: Store,
     M: CollectionMapping,
 {
+    let snapshot = store.snapshot().map_err(|error| {
+        CollectionRealizationError::storage("freeze exact mapping frontier", error)
+    })?;
+    let mut frontier = OperationFrontier::new(snapshot);
+    ensure_exact_in_frontier::<S, M>(store, target, support, &mut frontier)
+}
+
+pub(crate) fn ensure_exact_in_frontier<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    support: &Support,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    M: CollectionMapping,
+{
     let mut blocked = BTreeMap::<CollectionData, String>::new();
     let mut published = BTreeSet::<CollectionData>::new();
 
     loop {
-        let snapshot = store.snapshot().map_err(|error| {
+        let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open exact mapping snapshot", error)
-        })?;
+        })?);
         let probe = probe_mapping::<_, M>(&snapshot, target, support)?;
         if probe.target_resolution.is_exact_for(support) {
             return Ok(());
@@ -608,9 +735,9 @@ where
                     cover: repeated_cover,
                 });
             }
-            let snapshot = store.snapshot().map_err(|error| {
+            let snapshot = frontier.view(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("open mapping dependency snapshot", error)
-            })?;
+            })?);
             let output = mapping.map(&input, &snapshot);
             drop(snapshot);
             let output = match output {
@@ -634,15 +761,15 @@ where
             store.put::<M::Target, _>(output).map_err(|error| {
                 CollectionRealizationError::storage("store derived target member", error)
             })?;
-            store
-                .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    target.handle(),
-                    input_data,
-                    output_data,
-                )))
-                .map_err(|error| {
-                    CollectionRealizationError::storage("publish target DERIVE", error)
-                })?;
+            let record = CollectionRecord::Derive(CollectionDerive::new(
+                target.handle(),
+                input_data,
+                output_data,
+            ));
+            store.insert(record).map_err(|error| {
+                CollectionRealizationError::storage("publish target DERIVE", error)
+            })?;
+            frontier.include_record(record);
             published.insert(input_data);
         }
         if replan {
@@ -662,8 +789,91 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    ensure_exact::<S, M>(store, target, support)?;
-    super::exact_target_compaction::maintain_target(store, target, support)
+    let snapshot = store.snapshot().map_err(|error| {
+        CollectionRealizationError::storage("freeze exact maintenance frontier", error)
+    })?;
+    let mut frontier = OperationFrontier::new(snapshot);
+    maintain_exact_in_frontier::<S, M>(store, target, support, &mut frontier)
+}
+
+pub(crate) fn maintain_exact_in_frontier<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    support: &Support,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    M: CollectionMapping,
+{
+    ensure_exact_in_frontier::<S, M>(store, target, support, frontier)?;
+    super::exact_target_compaction::maintain_target(store, target, support, frontier)
+}
+
+pub(crate) async fn acquire_missing<S>(
+    store: &mut S,
+    attempted: &mut BTreeSet<CollectionData>,
+    member: CollectionData,
+) -> Result<bool, CollectionRealizationError>
+where
+    S: AsyncBlobStoreAcquire,
+{
+    if !attempted.insert(member) {
+        return Ok(false);
+    }
+    store
+        .acquire(Handle::<UnknownBlob>::from_hash(member))
+        .await
+        .map_err(|error| {
+            CollectionRealizationError::storage("acquire exact blob dependency", error)
+        })
+        .map(|bytes| bytes.is_some())
+}
+
+pub(crate) async fn ensure_exact_async_in_frontier<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    support: &Support,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    M: CollectionMapping,
+{
+    let mut attempted = BTreeSet::new();
+    loop {
+        match ensure_exact_in_frontier::<S, M>(store, target, support, frontier) {
+            Err(CollectionRealizationError::MissingDependency { member }) => {
+                if !acquire_missing(store, &mut attempted, member).await? {
+                    return Err(CollectionRealizationError::MissingDependency { member });
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+pub(crate) async fn maintain_exact_async_in_frontier<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    support: &Support,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    M: CollectionMapping,
+{
+    let mut attempted = BTreeSet::new();
+    loop {
+        match maintain_exact_in_frontier::<S, M>(store, target, support, frontier) {
+            Err(CollectionRealizationError::MissingDependency { member }) => {
+                if !acquire_missing(store, &mut attempted, member).await? {
+                    return Err(CollectionRealizationError::MissingDependency { member });
+                }
+            }
+            result => return result,
+        }
+    }
 }
 
 pub(super) fn data_identity<E: CollectionEncoding>(blob: &Blob<E>) -> CollectionData {

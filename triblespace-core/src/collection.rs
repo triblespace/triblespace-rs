@@ -37,6 +37,7 @@ pub mod lww_register;
 /// Maintained observed-set projection — the monotone half of register
 /// resolution, derived and joined by the store.
 pub mod observed_union;
+mod operation_snapshot;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;
 pub mod records;

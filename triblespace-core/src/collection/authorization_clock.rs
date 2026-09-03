@@ -6,21 +6,26 @@
 use hifitime::{Duration, Epoch};
 
 use crate::capability::CapabilityClaim;
-use crate::repo::{BlobChildren, CapabilityProofRead};
+use crate::repo::{BlobChildren, BlobStoreList, CapabilityProofRead};
 
-use super::api::load_resident_proof_bundles;
+use super::api::{load_resident_proof_bundles, CollectionEvidenceDiscoveryError};
 
 /// Earliest future instant at which any resident capability claim can change
 /// authorization.
 pub fn next_authorization_change_at<S>(
     snapshot: &S,
     instant: Epoch,
-) -> Result<Option<Epoch>, S::ProofsError>
+) -> Result<Option<Epoch>, CollectionEvidenceDiscoveryError<S::ProofsError>>
 where
-    S: BlobChildren + CapabilityProofRead,
+    S: BlobChildren + BlobStoreList + CapabilityProofRead,
 {
-    let proofs = snapshot.proofs()?.collect::<Result<Vec<_>, _>>()?;
+    let proofs = snapshot
+        .proofs()
+        .map_err(CollectionEvidenceDiscoveryError::Proofs)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CollectionEvidenceDiscoveryError::Proofs)?;
     Ok(load_resident_proof_bundles(snapshot, proofs)
+        .map_err(CollectionEvidenceDiscoveryError::Resident)?
         .iter()
         .flat_map(|bundle| bundle.claims())
         .filter_map(|claim| CapabilityClaim::from_blob(claim.clone()).ok())

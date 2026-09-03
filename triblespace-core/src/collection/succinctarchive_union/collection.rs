@@ -159,7 +159,7 @@ mod tests {
     use crate::inline::encodings::hash::Handle;
     use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
+    use crate::repo::{BlobStorePut, SnapshotSource};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     use super::super::{RawToRank9AcceleratedMapping, SimpleToSuccinctMapping};
@@ -454,6 +454,16 @@ mod tests {
         store
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fc)
             .unwrap();
+        // Equation visibility requires every direct endpoint to be resident.
+        // Keep the fine accelerated members structurally incomplete by
+        // withholding their raw children; only the complete compacted member
+        // can materialize the requested semantic roots.
+        store
+            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fa.clone())
+            .unwrap();
+        store
+            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fb)
+            .unwrap();
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
                 accelerated_collection.handle(),
@@ -685,7 +695,12 @@ mod tests {
         let snapshot = store
             .ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &first_support)
             .unwrap();
-        let observed = snapshot.collection(accelerated_collection).unwrap();
+        let observed = snapshot
+            .collection_at(
+                accelerated_collection,
+                hifitime::Epoch::from_tai_seconds(0.0),
+            )
+            .unwrap();
         assert_eq!(observed.support(), &first_support);
         assert!(snapshot
             .collection_exact(accelerated_collection, &full_support)
@@ -697,7 +712,12 @@ mod tests {
         let snapshot = store
             .ensure_exact::<RawToRank9AcceleratedMapping>(accelerated_collection, &full_support)
             .unwrap();
-        let observed = snapshot.collection(accelerated_collection).unwrap();
+        let observed = snapshot
+            .collection_at(
+                accelerated_collection,
+                hifitime::Epoch::from_tai_seconds(0.0),
+            )
+            .unwrap();
         assert_eq!(observed.support(), &full_support);
         let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
         assert_eq!(view.iter().count(), 2);

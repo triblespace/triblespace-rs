@@ -21,7 +21,7 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::{
     ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionDescriptorError, CollectionHandle,
-    CollectionPolicy, CollectionRead, CollectionReadAudience, CollectionRecord, RecordDecodeError,
+    CollectionPolicy, CollectionRead, CollectionReadAudience, RecordDecodeError,
     collection_read_audience_by_policy_at, descriptor,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
@@ -142,7 +142,7 @@ impl CollectionRepairOverlay {
         &self.policy
     }
 
-    /// Structurally valid signed COMMITs naming this collection.
+    /// Structurally valid collection records naming this collection.
     ///
     /// WRITE admission is deliberately derived by each receiver from this
     /// component and its local authorization closure, so records and proofs
@@ -376,7 +376,7 @@ where
     }
 }
 
-/// Freeze exact signature-valid COMMITs and the structurally relevant
+/// Freeze exact collection records and the structurally relevant
 /// READ(C)/WRITE(C) proof PATCH for `C`.
 ///
 /// Missing or malformed descriptors fail closed. Invalid, incomplete, or
@@ -407,8 +407,7 @@ where
                 }
             })?;
     let records = collection_record_patch(snapshot, collection)
-        .map_err(CollectionRepairOverlayError::Records)?
-        .filter(|record| matches!(record, CollectionRecord::Commit(_)));
+        .map_err(CollectionRepairOverlayError::Records)?;
     Ok(CollectionRepairOverlay {
         collection,
         policy,
@@ -891,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_receipts_do_not_participate_in_semantic_repair() {
+    fn merge_and_derive_equations_participate_in_collection_repair() {
         let writer = key(3);
         let mut store = MemoryRepo::default();
         let collection = store
@@ -930,15 +929,25 @@ mod tests {
         let after_snapshot = store.snapshot().unwrap();
         let after = collection_repair_overlay(&after_snapshot, collection.handle()).unwrap();
 
-        assert_eq!(before.records().summary(), after.records().summary());
-        assert_eq!(before.wake_root(), after.wake_root());
-        assert_eq!(after.records().len(), 1);
+        assert_ne!(before.records().summary(), after.records().summary());
+        assert_ne!(before.wake_root(), after.wake_root());
+        assert_eq!(after.records().len(), 3);
         assert_eq!(
             after
                 .records()
                 .get(CollectionRecord::Commit(commit).fingerprint()),
             Some(CollectionRecord::Commit(commit))
         );
+        assert!(after.records().records().any(|record| matches!(
+            record,
+            CollectionRecord::Merge(merge)
+                if merge.collection() == collection.handle()
+        )));
+        assert!(after.records().records().any(|record| matches!(
+            record,
+            CollectionRecord::Derive(derive)
+                if derive.collection() == collection.handle()
+        )));
     }
 
     #[test]

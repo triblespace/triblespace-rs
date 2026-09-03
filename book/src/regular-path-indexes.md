@@ -212,7 +212,7 @@ and one unit of derivation work. Their authorship, signatures, and metadata are
 queryable, possibly absent provenance through `cover.commits(&snapshot)` and are
 intentionally unnecessary for replay or path semantics.
 
-`snapshot.collection(paths)` never writes or executes collection algebra. It
+`snapshot.collection_at(paths, instant)` never writes or executes collection algebra. It
 follows existing source `MERGE`, path-summary `MERGE`, and source-to-target
 `DERIVE` equations and returns the maximal complete resident target cover plus
 exactly the foundational support represented by it.

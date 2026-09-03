@@ -13,12 +13,14 @@ use triblespace_core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
-    ACTION_WRITE,
+    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRead,
+    CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
+use triblespace_core::repo::{
+    BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
+};
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 fn one_fact(seed: u8) -> TribleSet {
@@ -288,4 +290,111 @@ fn collection_at_returns_the_maximal_resident_partial_realization() {
             .collect::<TribleSet>(),
         first
     );
+}
+
+#[test]
+fn dangling_commit_is_raw_but_semantically_visible_only_in_a_later_snapshot() {
+    let authority = SigningKey::from_bytes(&[47; 32]);
+    let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+    let payload = one_fact(17).to_blob();
+    let payload_handle = payload.get_handle();
+    let mut store = MemoryRepo::default();
+    let collection = store.collection("typed-api-dangling", policy).unwrap();
+    let metadata = store
+        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+        .unwrap();
+    let commit = CollectionCommit::sign(
+        &authority,
+        collection.handle(),
+        Handle::<SimpleArchive>::to_hash(payload_handle),
+        metadata,
+    );
+    store.insert(CollectionRecord::Commit(commit)).unwrap();
+
+    let before = store.snapshot().unwrap();
+    assert_eq!(
+        before
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![CollectionRecord::Commit(commit)]
+    );
+    assert!(collection
+        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
+        .unwrap()
+        .is_empty());
+
+    store.put::<SimpleArchive, _>(payload).unwrap();
+    let after = store.snapshot().unwrap();
+    assert_eq!(
+        collection
+            .admitted_at(&after, Epoch::from_tai_seconds(0.0))
+            .unwrap()
+            .members()
+            .collect::<Vec<_>>(),
+        vec![payload_handle]
+    );
+    assert!(collection
+        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn dangling_capability_proof_is_raw_but_semantically_visible_only_later() {
+    let root = SigningKey::from_bytes(&[48; 32]);
+    let writer = SigningKey::from_bytes(&[49; 32]);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(root.verifying_key()),
+    );
+    let expected = one_fact(18);
+    let expected_member = expected.clone().to_blob().get_handle();
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection("typed-api-dangling-proof", policy)
+        .unwrap();
+    store
+        .commit(collection, &writer, Fragment::from(expected))
+        .unwrap();
+    let bundle = CapabilityProofBundle::issue_root(
+        &root,
+        CapabilityClaim::root(write_atom(collection), CapabilityMode::Invoke, None),
+        writer.verifying_key(),
+    )
+    .unwrap();
+    let (proof, claims) = bundle.into_parts();
+    store.insert_proof(proof.clone()).unwrap();
+
+    let before = store.snapshot().unwrap();
+    assert_eq!(
+        before
+            .proofs()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![proof]
+    );
+    assert!(collection
+        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
+        .unwrap()
+        .is_empty());
+
+    for claim in claims {
+        store.put::<SimpleArchive, _>(claim).unwrap();
+    }
+    let after = store.snapshot().unwrap();
+    assert_eq!(
+        collection
+            .admitted_at(&after, Epoch::from_tai_seconds(0.0))
+            .unwrap()
+            .members()
+            .collect::<Vec<_>>(),
+        vec![expected_member]
+    );
+    assert!(collection
+        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
+        .unwrap()
+        .is_empty());
 }

@@ -13,8 +13,11 @@ use std::fmt;
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::blob::encodings::UnknownBlob;
 use crate::inline::encodings::ed25519::ED25519PublicKey;
+use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
+use crate::repo::BlobStoreList;
 
 use super::{
     CollectionCommit, CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMerge,
@@ -107,6 +110,13 @@ impl DiscoveredCollectionRecords {
 pub enum CollectionDiscoveryError<RecordsError> {
     /// The store could not start or complete record enumeration.
     Records(RecordsError),
+    /// The frozen blob index could not answer direct-reference residency.
+    Residency {
+        /// Exact direct reference whose residency was being inspected.
+        reference: Inline<Handle<UnknownBlob>>,
+        /// Backend observation failure.
+        source: Box<dyn Error + Send + Sync + 'static>,
+    },
 }
 
 impl<RecordsError> fmt::Display for CollectionDiscoveryError<RecordsError>
@@ -116,6 +126,11 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Records(error) => write!(f, "failed to enumerate collection records: {error}"),
+            Self::Residency { reference, source } => write!(
+                f,
+                "failed to inspect resident collection-record reference {}: {source}",
+                hex::encode_upper(reference.raw),
+            ),
         }
     }
 }
@@ -127,6 +142,7 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Records(error) => Some(error),
+            Self::Residency { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -171,6 +187,37 @@ where
     Ok(discovered)
 }
 
+/// Whether every blob named directly by one raw collection record belongs to
+/// this immutable blob snapshot.
+///
+/// Raw record storage deliberately preserves dangling evidence for repair.
+/// Semantic discovery crosses the stronger boundary here: an equation or
+/// commit cannot affect a snapshot until its complete direct closure was
+/// already resident when that snapshot was frozen. Absence is inert; failure
+/// to observe the blob index is propagated rather than confused with a
+/// partial semantic result. The raw [`CollectionRead`] surface remains
+/// available to repair dangling records independently.
+fn record_references_are_resident<S>(
+    snapshot: &S,
+    record: CollectionRecord,
+) -> Result<bool, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: BlobStoreList + CollectionRead,
+{
+    for reference in record.blob_references() {
+        let resident = snapshot.contains_blob(reference).map_err(|source| {
+            CollectionDiscoveryError::Residency {
+                reference,
+                source: Box::new(source),
+            }
+        })?;
+        if !resident {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Discover every stored equation whose collection belongs to one descriptor
 /// lineage.
 ///
@@ -181,6 +228,34 @@ where
 /// support and close the whole chain without treating an intermediate
 /// physical cover as a new denotational root.
 pub(crate) fn discover_collection_equations_for_lineage<S>(
+    snapshot: &S,
+    lineage: &BTreeSet<CollectionHandle>,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: BlobStoreList + CollectionRead,
+{
+    let raw = discover_collection_equations_for_lineage_raw(snapshot, lineage)?;
+    let mut discovered = DiscoveredCollectionRecords::default();
+    for record in raw.merges {
+        if record_references_are_resident(snapshot, CollectionRecord::Merge(record))? {
+            discovered.merges.push(record);
+        }
+    }
+    for record in raw.derives {
+        if record_references_are_resident(snapshot, CollectionRecord::Derive(record))? {
+            discovered.derives.push(record);
+        }
+    }
+    discovered.canonicalize();
+    Ok(discovered)
+}
+
+/// Discover the bounded raw equation frontier for active acquisition.
+///
+/// Unlike semantic discovery this intentionally preserves dangling records;
+/// callers use their direct references to acquire exact immutable content,
+/// then resnapshot before interpreting the equations.
+pub(crate) fn discover_collection_equations_for_lineage_raw<S>(
     snapshot: &S,
     lineage: &BTreeSet<CollectionHandle>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
@@ -224,7 +299,7 @@ pub(crate) fn discover_collection_equations_for_cover<S, L>(
     cover: &Cover<L>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionRead,
+    S: BlobStoreList + CollectionRead,
     L: CollectionEncoding,
 {
     let selectors = BTreeSet::from([CollectionRecordSelector::MergeCollection(
@@ -240,7 +315,7 @@ pub(crate) fn discover_collection_claims_for_cover<S, L>(
     cover: &Cover<L>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionRead,
+    S: BlobStoreList + CollectionRead,
     L: CollectionEncoding,
 {
     let selectors: BTreeSet<_> = cover
@@ -256,7 +331,7 @@ fn discover_collection_records_for_cover_selectors<S, L>(
     selectors: &BTreeSet<CollectionRecordSelector>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionRead,
+    S: BlobStoreList + CollectionRead,
     L: CollectionEncoding,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
@@ -266,6 +341,9 @@ where
         .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
+        if !record_references_are_resident(snapshot, record)? {
+            continue;
+        }
         match record {
             CollectionRecord::Commit(record)
                 if record.collection() == cover.collection().handle()
@@ -407,7 +485,7 @@ pub(crate) fn discover_collection_records_authorized<S, F>(
     mut is_member: F,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionRead,
+    S: BlobStoreList + CollectionRead,
     F: FnMut(&Inline<ED25519PublicKey>) -> bool,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
@@ -418,6 +496,9 @@ where
 
     for record in records {
         let record = record.map_err(CollectionDiscoveryError::Records)?;
+        if !record_references_are_resident(snapshot, record)? {
+            continue;
+        }
         match record {
             CollectionRecord::Commit(record)
                 if record.collection() == collection && is_member(&record.public_key()) =>
@@ -494,12 +575,20 @@ where
 mod tests {
     use super::*;
 
+    use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::collection::{empty_metadata_handle, Collection, CollectionData, Support};
+    use crate::blob::encodings::UnknownBlob;
+    use crate::blob::Blob;
+    use crate::collection::{
+        empty_metadata_handle, AdmissionPolicy, Collection, CollectionData, CollectionPolicy,
+        CollectionStore, CollectionStoreExt, Support,
+    };
     use crate::inline::encodings::hash::Handle;
     use crate::inline::Inline;
+    use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::{BlobStorePut, SnapshotSource};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct ProbeRecordsError(&'static str);
@@ -629,6 +718,56 @@ mod tests {
         assert!(left.is_subset(&foreign).is_err());
     }
 
+    #[test]
+    fn dangling_equations_are_raw_but_semantically_visible_only_later() {
+        let mut store = MemoryRepo::default();
+        let target = store
+            .collection(
+                "dangling-equations",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let low = store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"low".to_vec()))
+            .unwrap();
+        let high = store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"high".to_vec()))
+            .unwrap();
+        let output = Bytes::from_source(b"output".to_vec());
+        let output_handle = Blob::<UnknownBlob>::new(output.clone()).get_handle();
+        let merge = CollectionRecord::Merge(CollectionMerge::new(
+            target.handle(),
+            Handle::<UnknownBlob>::to_hash(low),
+            Handle::<UnknownBlob>::to_hash(high),
+            Handle::<UnknownBlob>::to_hash(output_handle),
+        ));
+        let derive = CollectionRecord::Derive(CollectionDerive::new(
+            target.handle(),
+            Handle::<UnknownBlob>::to_hash(low),
+            Handle::<UnknownBlob>::to_hash(output_handle),
+        ));
+        store.insert(merge).unwrap();
+        store.insert(derive).unwrap();
+        let lineage = BTreeSet::from([target.handle()]);
+
+        let before = store.snapshot().unwrap();
+        let raw = discover_collection_equations_for_lineage_raw(&before, &lineage).unwrap();
+        assert_eq!(raw.merges().len(), 1);
+        assert_eq!(raw.derives().len(), 1);
+        let semantic = discover_collection_equations_for_lineage(&before, &lineage).unwrap();
+        assert!(semantic.merges().is_empty());
+        assert!(semantic.derives().is_empty());
+
+        store.put::<UnknownBlob, _>(output).unwrap();
+        let after = store.snapshot().unwrap();
+        let semantic = discover_collection_equations_for_lineage(&after, &lineage).unwrap();
+        assert_eq!(semantic.merges().len(), 1);
+        assert_eq!(semantic.derives().len(), 1);
+        let still_before = discover_collection_equations_for_lineage(&before, &lineage).unwrap();
+        assert!(still_before.merges().is_empty());
+        assert!(still_before.derives().is_empty());
+    }
+
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
@@ -690,7 +829,7 @@ mod tests {
         };
 
         let lineage = BTreeSet::from([source.handle(), target.handle()]);
-        let discovered = discover_collection_equations_for_lineage(&store, &lineage).unwrap();
+        let discovered = discover_collection_equations_for_lineage_raw(&store, &lineage).unwrap();
 
         let mut expected_merges = vec![source_merge, target_merge];
         expected_merges.sort_unstable();

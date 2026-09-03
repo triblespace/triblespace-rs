@@ -217,18 +217,23 @@ watermark. Ask it what representation is actually readable at that instant:
 
 ```rust,ignore
 let snapshot = store.snapshot()?;
-let observed = snapshot.collection(collection)?;
+let instant = triblespace::core::clock::epoch_now();
+let observed = snapshot.collection_at(collection, instant)?;
 let support = observed.support();
 let cover = observed.cover();
 let value: V = observed.view()?;
 ```
 
-`snapshot.collection(target)` admits the foundational commits, selects the
+`snapshot.collection_at(target, instant)` admits the foundational commits at
+one explicit authorization instant, selects the
 maximal complete resident target antichain, and returns only the part of the
 foundational support represented by that antichain. Admitted but not yet
 derived data is absent: an immutable snapshot never promises work which will
 happen later. `snapshot.collection_exact(target, &support)` is the assertion
 form and fails unless that exact foundational support is completely realized.
+There is deliberately no hidden current-clock form: identical operations on
+one frozen store snapshot must have identical results even while wall time
+passes.
 
 Both forms keep the chosen target cover inseparable from the store snapshot
 which established its residency. `view` invokes `TryFromCover<E>` solely
@@ -245,6 +250,22 @@ This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear in this call or a later
 one. A mutating `ensure` or `maintain` operation returns a new store snapshot;
 the caller may then ask that snapshot for the collection it actually contains.
+
+Raw record readers still expose dangling native records and proofs for repair.
+Semantic snapshot operations do not: a `COMMIT`, `MERGE`, `DERIVE`, or
+authorization proof is invisible until all of its direct blob references are
+resident in that exact frozen snapshot. Snapshot operations never acquire,
+wait, write, or emit `WANT`. Record retention is a separate lifetime rule: a
+retained non-blob record strongly retains every directly referenced blob which
+is resident, but does not fetch an absent one. A `WANT` is itself only an
+explicit durable demand record, never automatic cache-miss bookkeeping.
+
+Stores which implement active acquisition expose `ensure_async` and
+`maintain_async` (and their exact-support forms). They may fetch only the exact
+missing handles in the operation's frozen raw frontier, publish derived work,
+and return a fresh snapshot; they never emit `WANT`. The synchronous forms are
+the resident-only runner for local stores: the same plan either completes from
+that store or reports its missing dependency.
 
 Exact replay does not need a publishing key, re-run admission, or retain any
 signed commit or metadata. The typed cover names the exact descriptor and
@@ -330,7 +351,7 @@ let observed = after.collection_exact(accelerated, &support)?;
 let facts: UnionArchive<OrderedUniverse> = observed.view()?;
 ```
 
-- `snapshot.collection` is read-only, performs no collection algebra, and binds
+- `snapshot.collection_at` is read-only, performs no collection algebra, and binds
   the maximal resident target cover to the immutable snapshot which observed
   it. Taking support from the foundational collection observation excludes
   admitted COMMITs whose payloads are not resident at that boundary.

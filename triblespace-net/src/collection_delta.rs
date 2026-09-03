@@ -47,26 +47,6 @@ impl CollectionRecordPatch {
         self.records.is_empty()
     }
 
-    pub(crate) fn filter(
-        &self,
-        mut keep: impl FnMut(CollectionRecord) -> bool,
-    ) -> CollectionRecordPatch {
-        let mut records = PATCH::new();
-        for id in self.records.iter_ordered() {
-            let record = *self
-                .records
-                .get(id)
-                .expect("an ordered collection record key retains its value");
-            if keep(record) {
-                records.insert(&PatchEntry::with_value(id, record));
-            }
-        }
-        CollectionRecordPatch {
-            collection: self.collection,
-            records,
-        }
-    }
-
     /// Look up one record by its full-width physical fingerprint.
     pub fn get(&self, fingerprint: CollectionRecordFingerprint) -> Option<CollectionRecord> {
         self.records.get(&fingerprint.raw()).copied()

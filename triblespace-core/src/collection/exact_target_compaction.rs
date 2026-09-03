@@ -11,6 +11,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, Store};
 
 use super::exact_derived::{attach_collection, data_identity, CollectionRealizationError};
+use super::operation_snapshot::OperationFrontier;
 use super::{
     Collection, CollectionData, CollectionEncoding, CollectionMerge, CollectionOperationError,
     CollectionRecord, Cover, Support,
@@ -30,6 +31,7 @@ pub(super) fn maintain_target<S, E>(
     store: &mut S,
     target: Collection<E>,
     support: &Support,
+    frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
@@ -39,9 +41,9 @@ where
     let mut seen = BTreeSet::new();
 
     loop {
-        let snapshot = store.snapshot().map_err(|error| {
+        let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open target-maintenance snapshot", error)
-        })?;
+        })?);
         let (_, cover) = attach_collection(&snapshot, target, Some(support))?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
@@ -53,7 +55,7 @@ where
         let Some((descriptor, tiers)) = prepared else {
             return Ok(());
         };
-        if !publish_carry_round(store, target, &descriptor, tiers, &mut blocked)? {
+        if !publish_carry_round(store, target, &descriptor, tiers, &mut blocked, frontier)? {
             return Ok(());
         }
     }
@@ -123,6 +125,7 @@ fn publish_carry_round<S, E>(
     descriptor: &crate::trible::Fragment,
     tiers: BTreeMap<u32, BTreeSet<CollectionData>>,
     blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
+    frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<bool, CollectionRealizationError>
 where
     S: Store,
@@ -141,9 +144,9 @@ where
                 members.insert(high_data);
                 continue;
             }
-            let snapshot = store.snapshot().map_err(|error| {
+            let snapshot = frontier.view(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("open target-carry snapshot", error)
-            })?;
+            })?);
             let low = snapshot
                 .get(Handle::<E>::from_hash(low_data))
                 .map_err(|error| {
@@ -162,16 +165,16 @@ where
                     store.put::<E, _>(output).map_err(|error| {
                         CollectionRealizationError::storage("store merged target member", error)
                     })?;
-                    store
-                        .insert(CollectionRecord::Merge(CollectionMerge::new(
-                            target.handle(),
-                            low_data,
-                            high_data,
-                            result,
-                        )))
-                        .map_err(|error| {
-                            CollectionRealizationError::storage("publish target MERGE", error)
-                        })?;
+                    let record = CollectionRecord::Merge(CollectionMerge::new(
+                        target.handle(),
+                        low_data,
+                        high_data,
+                        result,
+                    ));
+                    store.insert(record).map_err(|error| {
+                        CollectionRealizationError::storage("publish target MERGE", error)
+                    })?;
+                    frontier.include_record(record);
                     published = true;
                 }
                 Err(CollectionOperationError::Fatal(reason)) => {

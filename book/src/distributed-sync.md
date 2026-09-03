@@ -50,15 +50,16 @@ proof evidence may activate an old commit without rewriting or retracting it.
 
 For one collection, semantic repair derives two independent grow-only sets:
 
-- every structurally valid signed `COMMIT` naming exact C, independent of its
-  signer's current WRITE(C) admission; and
+- every structurally valid native collection record naming exact C: signed
+  `COMMIT`s independent of current WRITE(C) admission, plus unsigned `MERGE`
+  and `DERIVE` equations; and
 - every native proof with complete resident claim closure which is structurally
   relevant to exact READ(C) or WRITE(C) and begins at that action policy's
   roots.
 
-Each set is represented by an immutable BLAKE3-Merkle PATCH. COMMITs
-are keyed physically by the full 32-byte fingerprint of their exact canonical
-record value; authorization evidence is keyed by its 32-byte proof ID and its
+Each set is represented by an immutable BLAKE3-Merkle PATCH. Collection
+records are keyed physically by the full 32-byte fingerprint of their exact
+canonical value; authorization evidence is keyed by its 32-byte proof ID and its
 repair leaf is only the canonical native proof body. Claim blobs remain
 ordinary H-addressed content. The opaque semantic repair root
 commits to C, both PATCH roots, and both leaf counts under a versioned domain.
@@ -87,12 +88,12 @@ scoped to C. The receiver always derives its admitted view locally; record and
 proof arrival therefore commute, and a publisher need not possess or present
 its own WRITE grant merely to replicate an inert signed record.
 
-Unsigned MERGE and DERIVE records remain optional local computation evidence.
-They do not participate in the semantic repair root or ordinary collection repair.
-Once present in a local record store, an equation is reusable materialized LSM
-work; warm readers do not execute its join or mapping again. Remote receipt
-reuse, if introduced, needs an explicit bounded request mechanism rather than
-silently widening every collection's semantic repair surface.
+Unsigned MERGE and DERIVE records remain computation evidence, but they are
+first-class members of the exact-C record PATCH and ordinary collection
+repair. Once present in a record store, an equation is reusable materialized
+LSM work; warm readers do not execute its join or mapping again. A frozen
+semantic view nevertheless ignores a repaired equation until all of its direct
+blob references were resident in that same snapshot.
 
 ## Opaque wakes over stock gossip
 
