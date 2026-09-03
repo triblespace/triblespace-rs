@@ -345,7 +345,9 @@ fn resolve_discovered_lineage(
 fn relevant_missing_dependency<R>(
     snapshot: &R,
     lineage: &Lineage,
+    target: CollectionHandle,
     support: &Support,
+    unavailable: &BTreeSet<CollectionData>,
 ) -> Result<Option<CollectionData>, CollectionRealizationError>
 where
     R: BlobStoreList + CollectionRead,
@@ -375,6 +377,25 @@ where
     records.sort_unstable_by_key(CollectionRecord::fingerprint);
 
     for record in records {
+        if let CollectionRecord::Derive(derive) = record {
+            let input = Handle::<UnknownBlob>::from_hash(derive.input());
+            if derive.collection() == target
+                && unavailable.contains(&derive.output())
+                && snapshot.contains_blob(input).map_err(|error| {
+                    CollectionRealizationError::storage(
+                        "inspect recoverable target DERIVE input residency",
+                        error,
+                    )
+                })?
+            {
+                // An absent output is useful acquisition evidence, but it is
+                // not an obligation. Once exact acquisition has failed, a
+                // resident immediate input lets the canonical mapping
+                // reproduce the output. Ignore this unusable equation so the
+                // ordinary source-residual path gets that chance.
+                continue;
+            }
+        }
         let (collection, result) = match record {
             CollectionRecord::Merge(merge) => (merge.collection(), merge.result()),
             CollectionRecord::Derive(derive) => (derive.collection(), derive.output()),
@@ -538,6 +559,7 @@ fn probe_mapping<R, M>(
     snapshot: &R,
     target: Collection<M::Target>,
     support: &Support,
+    unavailable: &BTreeSet<CollectionData>,
 ) -> Result<MappingProbe<M>, CollectionRealizationError>
 where
     R: StoreRead,
@@ -584,7 +606,9 @@ where
     // work remains; this keeps resident maintenance at one indexed semantic
     // probe per LSM round.
     if !target_resolution.is_exact_for(support) {
-        if let Some(member) = relevant_missing_dependency(snapshot, &lineage, support)? {
+        if let Some(member) =
+            relevant_missing_dependency(snapshot, &lineage, target.handle(), support, unavailable)?
+        {
             return Err(CollectionRealizationError::MissingDependency { member });
         }
     }
@@ -690,13 +714,20 @@ where
         CollectionRealizationError::storage("freeze exact mapping frontier", error)
     })?;
     let mut frontier = OperationFrontier::new(snapshot);
-    ensure_exact_resident_in_frontier::<S, M>(store, target, support, &mut frontier)
+    ensure_exact_resident_in_frontier::<S, M>(
+        store,
+        target,
+        support,
+        &BTreeSet::new(),
+        &mut frontier,
+    )
 }
 
 fn ensure_exact_resident_in_frontier<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
+    unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -710,7 +741,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open exact mapping snapshot", error)
         })?);
-        let probe = probe_mapping::<_, M>(&snapshot, target, support)?;
+        let probe = probe_mapping::<_, M>(&snapshot, target, support, unavailable)?;
         if probe.target_resolution.is_exact_for(support) {
             return Ok(());
         }
@@ -790,20 +821,27 @@ where
         CollectionRealizationError::storage("freeze exact maintenance frontier", error)
     })?;
     let mut frontier = OperationFrontier::new(snapshot);
-    maintain_exact_resident_in_frontier::<S, M>(store, target, support, &mut frontier)
+    maintain_exact_resident_in_frontier::<S, M>(
+        store,
+        target,
+        support,
+        &BTreeSet::new(),
+        &mut frontier,
+    )
 }
 
 fn maintain_exact_resident_in_frontier<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     support: &Support,
+    unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     M: CollectionMapping,
 {
-    ensure_exact_resident_in_frontier::<S, M>(store, target, support, frontier)?;
+    ensure_exact_resident_in_frontier::<S, M>(store, target, support, unavailable, frontier)?;
     super::exact_target_compaction::maintain_target(store, target, support, frontier)
 }
 
@@ -838,11 +876,21 @@ where
     M: CollectionMapping,
 {
     let mut attempted = BTreeSet::new();
+    let mut unavailable = BTreeSet::new();
     loop {
-        match ensure_exact_resident_in_frontier::<S, M>(store, target, support, frontier) {
+        match ensure_exact_resident_in_frontier::<S, M>(
+            store,
+            target,
+            support,
+            &unavailable,
+            frontier,
+        ) {
             Err(CollectionRealizationError::MissingDependency { member }) => {
-                if !acquire_missing(store, &mut attempted, member).await? {
+                if attempted.contains(&member) {
                     return Err(CollectionRealizationError::MissingDependency { member });
+                }
+                if !acquire_missing(store, &mut attempted, member).await? {
+                    unavailable.insert(member);
                 }
             }
             result => return result,
@@ -861,11 +909,21 @@ where
     M: CollectionMapping,
 {
     let mut attempted = BTreeSet::new();
+    let mut unavailable = BTreeSet::new();
     loop {
-        match maintain_exact_resident_in_frontier::<S, M>(store, target, support, frontier) {
+        match maintain_exact_resident_in_frontier::<S, M>(
+            store,
+            target,
+            support,
+            &unavailable,
+            frontier,
+        ) {
             Err(CollectionRealizationError::MissingDependency { member }) => {
-                if !acquire_missing(store, &mut attempted, member).await? {
+                if attempted.contains(&member) {
                     return Err(CollectionRealizationError::MissingDependency { member });
+                }
+                if !acquire_missing(store, &mut attempted, member).await? {
+                    unavailable.insert(member);
                 }
             }
             result => return result,

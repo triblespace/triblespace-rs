@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Let active exact collection realization recover from a dangling immediate
+  `DERIVE` whose output cannot be acquired. When its source input is resident,
+  the unusable equation remains semantically invisible and the canonical
+  mapping deterministically reconstructs and republishes the output.
 - Make authorization time an explicit input to every frozen collection read.
   Remove the hidden-current-clock `Collection` conveniences in favor of their
   existing `*_at` forms, and make exact-support attachment clock-free. Live

@@ -810,6 +810,44 @@ fn exact_ensure_acquires_explicit_foundational_support_without_want() {
 }
 
 #[test]
+fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
+    let (mut inner, root, first, _second) = collections();
+    let source = archive(1, 1);
+    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    let support = support(root, std::slice::from_ref(&source));
+    let snapshot = inner.snapshot().unwrap();
+    let output = FirstMapping.map(&source, &snapshot).unwrap();
+    drop(snapshot);
+    let output_data = data(&output);
+    let pending = CollectionDerive::new(first.handle(), data(&source), output_data);
+    inner.insert(CollectionRecord::Derive(pending)).unwrap();
+    drop(output);
+
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+    let snapshot = block_on(store.maintain_exact::<FirstMapping>(first, &support)).unwrap();
+
+    assert_eq!(store.acquired, vec![output_data]);
+    assert_eq!(FIRST_MAP_CALLS.get(), 1);
+    assert!(snapshot
+        .metadata(Handle::<FirstEncoding>::from_hash(output_data))
+        .unwrap()
+        .is_some());
+    let (observed, cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
+    assert_eq!(observed, support);
+    assert_eq!(cover.data_members().collect::<Vec<_>>(), vec![output_data]);
+    drop(snapshot);
+    assert_eq!(
+        records(&mut store.inner)
+            .iter()
+            .filter(|record| **record == CollectionRecord::Derive(pending))
+            .count(),
+        1,
+        "deterministic recovery reuses the pending equation",
+    );
+}
+
+#[test]
 fn async_ensure_hydrates_only_the_bounded_admitted_commit_frontier() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
