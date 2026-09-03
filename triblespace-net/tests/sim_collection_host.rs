@@ -24,7 +24,7 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
     BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource, StorageFlush,
-    WantRequest, WantStore,
+    WantRead, WantRequest, WantStore,
 };
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
@@ -449,8 +449,8 @@ fn durable_bearer_want_materializes_without_any_collection() {
         );
         assert_eq!(reader.try_local(payload_handle.raw), Some(payload));
         let wants: BTreeSet<_> = {
-            let mut store = reader.store();
-            store.wants().unwrap().map(Result::unwrap).collect()
+            let snapshot = reader.snapshot().unwrap();
+            snapshot.wants().unwrap().map(Result::unwrap).collect()
         };
         assert_eq!(wants, BTreeSet::from([wanted, absent]));
     }));
