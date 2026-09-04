@@ -102,6 +102,17 @@ fn bring_up(
     peers: Vec<[u8; 32]>,
     direction: ReconcileDirection,
 ) -> Peer<MemoryRepo> {
+    bring_up_with_publication_budget(net, endpoint, store, peers, direction, None)
+}
+
+fn bring_up_with_publication_budget(
+    net: &SimNet,
+    endpoint: &SigningKey,
+    store: MemoryRepo,
+    peers: Vec<[u8; 32]>,
+    direction: ReconcileDirection,
+    provider_publication_budget: Option<u64>,
+) -> Peer<MemoryRepo> {
     let id = endpoint.verifying_key().to_bytes();
     let harness = net.join(endpoint);
     let (sender, receiver, wiring) =
@@ -119,7 +130,7 @@ fn bring_up(
                 })
                 .collect(),
             qos,
-            provider_publication_budget: None,
+            provider_publication_budget,
         },
         wiring,
     ));
@@ -664,6 +675,110 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
             0,
             "WRITE(C) without READ(C) must not learn even the collection manifest"
         );
+    }));
+}
+
+#[test]
+fn collection_wake_recovery_survives_a_partition_without_dht_or_restart() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC75, SimConfig::default());
+        let server_key = key(51);
+        let reader_key = key(52);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::Open,
+            AdmissionPolicy::direct(server_key.verifying_key()),
+        );
+
+        let mut first_facts = TribleSet::new();
+        let mut first_raw = [1; triblespace_core::trible::TRIBLE_LEN];
+        first_raw[16..32].fill(2);
+        first_facts.insert(
+            &triblespace_core::trible::Trible::force_raw(first_raw)
+                .expect("non-nil entity and attribute"),
+        );
+
+        let mut server_store = MemoryRepo::default();
+        let collection = register(&mut server_store, policy.clone());
+        let first_payload = server_store
+            .put::<SimpleArchive, _>(first_facts.to_blob())
+            .unwrap();
+        server_store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &server_key,
+                collection.handle(),
+                Handle::<SimpleArchive>::to_hash(first_payload),
+                first_payload,
+            )))
+            .unwrap();
+
+        let mut reader_store = MemoryRepo::default();
+        let reader_collection = register(&mut reader_store, policy);
+        assert_eq!(reader_collection.handle(), collection.handle());
+
+        let server_id = server_key.verifying_key().to_bytes();
+        let reader_id = reader_key.verifying_key().to_bytes();
+        let mut server = bring_up_with_publication_budget(
+            &net,
+            &server_key,
+            server_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+            Some(0),
+        );
+        let mut reader = bring_up_with_publication_budget(
+            &net,
+            &reader_key,
+            reader_store,
+            vec![server_id],
+            ReconcileDirection::ReadOnly,
+            Some(0),
+        );
+        server.activate_collection(collection.handle());
+        reader.activate_collection(collection.handle());
+
+        advance(&clock, &mut [&mut server, &mut reader], 5).await;
+        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 1);
+
+        net.partition(server_id, reader_id);
+        let mut second_facts = TribleSet::new();
+        let mut second_raw = [3; triblespace_core::trible::TRIBLE_LEN];
+        second_raw[16..32].fill(4);
+        second_facts.insert(
+            &triblespace_core::trible::Trible::force_raw(second_raw)
+                .expect("non-nil entity and attribute"),
+        );
+        let second_payload = server
+            .put::<SimpleArchive, _>(second_facts.to_blob())
+            .unwrap();
+        server
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &server_key,
+                collection.handle(),
+                Handle::<SimpleArchive>::to_hash(second_payload),
+                second_payload,
+            )))
+            .unwrap();
+        server.refresh();
+
+        // Let the signed wake be lost, periodic repair fail, and at least one
+        // recovery resubscription happen while the partition is still closed.
+        advance(&clock, &mut [&mut server, &mut reader], 40).await;
+        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 1);
+
+        // Healing alone must suffice: there is no DHT publication, new write,
+        // process restart, or direct collection repair to a configured route.
+        net.heal(server_id, reader_id);
+        advance(&clock, &mut [&mut server, &mut reader], 95).await;
+        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 2);
     }));
 }
 
