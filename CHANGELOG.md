@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature-valid proofs rooted in READ(C), emits no WANT, and excludes
   concurrently arriving proofs until the next call. Reuse the same
   candidate-proof hydration for WRITE admission.
+- Cover the cold collection-bootstrap path where a recipient knows only a
+  collection handle and one issuer endpoint: issuer-held complete READ(C)
+  evidence admits repair, while the transferred native proof's claims and the
+  repaired payload remain ordinary exact-H acquisitions and create no WANT.
 - Make each derived target encoding own its canonical `Source`, runtime
   `Argument`, descriptor binding, and member map through
   `CollectionDerivation`. `derive::<Target>(source, argument, policy)` still

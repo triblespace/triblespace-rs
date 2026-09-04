@@ -174,6 +174,163 @@ async fn acquire_once(
 }
 
 #[test]
+fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC70, SimConfig::default());
+        let issuer_key = key(71);
+        let recipient_key = key(72);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(issuer_key.verifying_key()),
+            AdmissionPolicy::direct(issuer_key.verifying_key()),
+        );
+
+        let mut issuer_store = MemoryRepo::default();
+        let collection = register(&mut issuer_store, policy);
+        store_bundle(
+            &mut issuer_store,
+            bundle(
+                &issuer_key,
+                &recipient_key,
+                CapabilityAction::new(ACTION_READ),
+                collection.handle(),
+            ),
+        );
+        let payload_handle = issuer_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        issuer_store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &issuer_key,
+                collection.handle(),
+                Handle::<SimpleArchive>::to_hash(payload_handle),
+                payload_handle,
+            )))
+            .unwrap();
+        let issuer_id = issuer_key.verifying_key().to_bytes();
+        let mut issuer = bring_up(
+            &net,
+            &issuer_key,
+            issuer_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+        );
+        let mut recipient = bring_up(
+            &net,
+            &recipient_key,
+            MemoryRepo::default(),
+            vec![issuer_id],
+            ReconcileDirection::ReadOnly,
+        );
+        issuer.activate_collection(collection.handle());
+        recipient.activate_collection(collection.handle());
+
+        // The recipient begins with only C and one issuer endpoint. An initial
+        // exact-H lookup also gives the issuer's provider leases a reachable
+        // DHT replica; a retry then obtains the self-describing C bytes.
+        let descriptor = acquire_once(
+            &clock,
+            &mut recipient,
+            Inline::new(collection.handle().raw),
+            &mut [&mut issuer],
+        )
+        .await;
+        if descriptor.is_none() {
+            advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
+            assert!(
+                acquire_once(
+                    &clock,
+                    &mut recipient,
+                    Inline::new(collection.handle().raw),
+                    &mut [&mut issuer],
+                )
+                .await
+                .is_some()
+            );
+        }
+        let recipient_collection = {
+            let snapshot = recipient.snapshot().unwrap();
+            Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap()
+        };
+
+        // With C resident, normal collection repair uses the issuer's complete
+        // READ(C) closure to admit this endpoint and sends only native proof
+        // and collection records.
+        advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
+        let dangling = recipient.snapshot().unwrap();
+        assert_eq!(dangling.records().unwrap().count(), 1);
+        let received = dangling
+            .proofs()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(received.len(), 1);
+        assert!(
+            !recipient_collection
+                .reader_is_admitted_at(&dangling, recipient_key.verifying_key(), clock::epoch_now())
+                .unwrap(),
+            "the repaired proof stays inert until exact-H supplies its claims",
+        );
+        assert_eq!(dangling.wants().unwrap().count(), 0);
+        drop(dangling);
+
+        // The proof's claims and committed payload remain ordinary exact-H
+        // bearer reads. Repair manufactures no durable WANT.
+        for claim in received[0].claim_handles() {
+            assert!(
+                acquire_once(
+                    &clock,
+                    &mut recipient,
+                    Inline::new(claim.raw),
+                    &mut [&mut issuer],
+                )
+                .await
+                .is_some(),
+                "the discovered proof's claim follows the ordinary exact-H path",
+            );
+        }
+        assert!(
+            acquire_once(
+                &clock,
+                &mut recipient,
+                Inline::new(payload_handle.raw),
+                &mut [&mut issuer],
+            )
+            .await
+            .is_some(),
+            "the repaired commit payload follows the ordinary exact-H path",
+        );
+
+        let ready = recipient.snapshot().unwrap();
+        assert!(
+            recipient_collection
+                .reader_is_admitted_at(&ready, recipient_key.verifying_key(), clock::epoch_now())
+                .unwrap()
+        );
+        assert_eq!(
+            recipient_collection
+                .admitted_at(&ready, clock::epoch_now())
+                .unwrap()
+                .len(),
+            1,
+        );
+        let facts = recipient_collection
+            .read_at::<TribleSet, _>(&ready, clock::epoch_now())
+            .unwrap();
+        assert!(facts.is_empty());
+        assert_eq!(ready.wants().unwrap().count(), 0);
+    }));
+}
+
+#[test]
 fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
     let _guard = test_guard();
     let clock = virtual_clock();
